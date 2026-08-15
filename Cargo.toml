@@ -29,7 +29,7 @@ unicode-bidi = "0.3"
 oar-ocr = { version = "0.9", default-features = false, features = ["download-binaries", "simd"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # CLI subcommands: self-update, doctor.
 tar = "0.4"
 semver = "1"
@@ -52,7 +52,7 @@ windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli"] }
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 
 [profile.release]
 lto = "fat"
