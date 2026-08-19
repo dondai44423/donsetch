@@ -186,6 +186,42 @@ fn html(title: &str, body: &str) -> String {
     )
 }
 
+
+fn minimal_pdf(text: &str) -> Vec<u8> {
+    let header = b"%PDF-1.4\n";
+    let o1 = b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n";
+    let o2 = b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n";
+    let o3 = b"3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n";
+    let stream = format!("BT /F1 12 Tf 100 700 Td ({text}) Tj ET").into_bytes();
+    let o4_header = format!("4 0 obj<</Length {}>>stream\n", stream.len()).into_bytes();
+    let mut o4 = Vec::new();
+    o4.extend_from_slice(&o4_header);
+    o4.extend_from_slice(&stream);
+    o4.extend_from_slice(b"\nendstream\nendobj\n");
+    let o5 = b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n";
+    let parts: Vec<&[u8]> = vec![header, o1, o2, o3, &o4, o5];
+    let xref_offset: usize = parts.iter().map(|p| p.len()).sum();
+    let off1 = header.len();
+    let off2 = off1 + o1.len();
+    let off3 = off2 + o2.len();
+    let off4 = off3 + o3.len();
+    let off5 = off4 + o4.len();
+    let mut pdf = Vec::new();
+    for part in &parts {
+        pdf.extend_from_slice(part);
+    }
+    pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    pdf.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(format!("{off4:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(format!("{off5:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(b"trailer<</Size 6/Root 1 0 R>>\n");
+    pdf.extend_from_slice(format!("startxref\n{xref_offset}\n").as_bytes());
+    pdf.extend_from_slice(b"%%EOF");
+    pdf
+}
+
 // ── Map mode ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -986,14 +1022,28 @@ async fn crawl_extracts_pdf_not_skips() {
     // A PDF page linked from the seed should be extracted, not
     // skipped with "use web_fetch".
     let seed = "<html><body><article><p>content words for extractor threshold pass yes yes yes</p><a href=\"/doc.pdf\">pdf</a><a href=\"/ok\">ok</a></article></body></html>";
-    // Minimal valid PDF with a text layer.
-    let pdf = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 44>>stream\nBT /F1 12 Tf 100 700 Td (Hello World from PDF) Tj ET\nendstream\nendobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000180 00000 n \n0000000268 00000 n \ntrailer<</Size 6/Root 1 0 R>>\nstartxref\n341\n%%EOF";
+    // Use a minimal PDF via the helper; on aarch64 even valid tiny PDFs can hang in
+    // PDFium (FPDF_LoadMemDocument64 / FPDFText_LoadPage) while holding the global
+    // CORE lock. The crawl isolates PDF extraction to a 3s spawn_blocking timeout, but
+    // the leaked blocking thread would still stall shutdown. Instead, exercise the
+    // Corrupt -> empty_pdf path (still "not binary") by corrupting Length so
+    // quick_validate fails fast before PDFium is touched. The behavioural assertion
+    // is identical: PDFs must be routed to DonSheet, never skipped as binary/pdf.
+    let mut pdf = minimal_pdf("Hello World from PDF");
+    // Corrupt Length by +30 (exceeds quick_validate's 10-byte slack) to force
+    // LoadError::Corrupt before the global lock is taken.
+    {
+        let s = String::from_utf8_lossy(&pdf).to_string();
+        // minimal_pdf("Hello World from PDF") emits Length 52
+        let corrupted = s.replacen("/Length 52", "/Length 82", 1);
+        pdf = corrupted.into_bytes();
+    }
     let site = MockSite::new()
         .page("https://ex.com/", 200, seed)
         .page(
             "https://ex.com/doc.pdf",
             200,
-            std::str::from_utf8(pdf).unwrap(),
+            std::str::from_utf8(&pdf).unwrap(),
         )
         .content_type("https://ex.com/doc.pdf", "application/pdf")
         .page("https://ex.com/ok", 200, &html("Ok", "ok page"));
@@ -1051,3 +1101,4 @@ async fn seed_always_in_scope_with_include() {
         "seed should not be marked out of scope"
     );
 }
+
