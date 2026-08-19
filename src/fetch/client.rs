@@ -199,6 +199,13 @@ impl Fetcher {
                 out.headers = headers;
                 out.body = body;
                 out.cache = CacheState::Revalidated;
+                // fetch_once_via already scored the bare 304, where
+                // detect() sees an empty body and has no 3xx arm — it
+                // returns Blocked. Re-score the merged body, as the
+                // CacheCheck::Fresh arm does for its cached body;
+                // otherwise every revalidated page comes back as
+                // "Blocked status=200".
+                out.verdict = walls::detect(out.status, &out.headers, &out.body);
                 out.elapsed = started.elapsed();
                 out.redirects = redirects;
                 return Ok(out);
