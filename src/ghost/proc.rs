@@ -94,10 +94,15 @@ impl Proc {
             // Process handle with the access rights we need:
             //   PROCESS_SUSPEND_RESUME  — NtSuspendProcess / NtResumeProcess
             //   PROCESS_SET_QUOTA       — AssignProcessToJobObject
+            //   PROCESS_TERMINATE       — AssignProcessToJobObject also requires
+            //                             this; without it the call fails with
+            //                             ERROR_ACCESS_DENIED and the job stays
+            //                             empty, so KILL_ON_JOB_CLOSE kills nothing
             //   PROCESS_QUERY_LIMITED_INFORMATION — status checks
             let proc_handle = thr::OpenProcess(
                 thr::PROCESS_SUSPEND_RESUME
                     | thr::PROCESS_SET_QUOTA
+                    | thr::PROCESS_TERMINATE
                     | thr::PROCESS_QUERY_LIMITED_INFORMATION,
                 0,
                 pid,
@@ -140,7 +145,14 @@ impl Proc {
             // still work via the process handle; only the death-reap
             // safety net is lost.
             if job::AssignProcessToJobObject(job_h, proc_handle) == 0 {
-                // Non-fatal: log via the error channel's debug only.
+                // Non-fatal for the fetch itself, but the job is now empty:
+                // KILL_ON_JOB_CLOSE has nothing to kill, so the browser tree
+                // outlives donsetch and orphaned Chrome processes pile up.
+                // Warn unconditionally — silent degradation is what hid this.
+                eprintln!(
+                    "[ghost] AssignProcessToJobObject failed: {} — browser tree will not be reaped on exit, leaving orphaned Chrome processes",
+                    fnd::GetLastError()
+                );
             }
             Ok(Self {
                 proc_handle,

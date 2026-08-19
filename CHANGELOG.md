@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.5] - 2026-08-19
+
+### Fixed
+
+- **Windows: orphaned Chrome processes after every fetch (#11)**: `AssignProcessToJobObject` requires both `PROCESS_SET_QUOTA` **and** `PROCESS_TERMINATE` on the process handle, but only the former was requested. The call failed with `ERROR_ACCESS_DENIED`, leaving the Job Object empty — so `KILL_ON_JOB_CLOSE` had nothing to kill when the handle dropped, and the whole browser tree outlived donsetch. Because the orphans inherit donsetch's stdout, any pipeline calling donsetch would also block until they were killed by hand, which looked like donsetch itself hanging.
+
+- **Silent Job Object assignment failure**: the failure branch was empty, so this degraded silently. It now warns unconditionally and names the consequence, matching the existing convention for failure-with-fallback messages.
+
 ## [2.3.4] - 2026-08-19
 
 ### Added
