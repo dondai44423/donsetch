@@ -533,7 +533,11 @@ pub(crate) fn base64(input: &str) -> String {
             .fold(0u32, |acc, (i, &c)| acc | ((c as u32) << (16 - 8 * i)));
         for i in 0..4 {
             let shift = 18 - 6 * i;
-            let pad = chunk.len() * 8 < shift + 6;
+            // Padding goes at the END: output char `i` covers bits
+            // [i*6, i*6+6). It is padding only when the chunk has no
+            // bits that far in. Testing `shift` instead gets this
+            // backwards, since shift counts down as i counts up.
+            let pad = i * 6 >= chunk.len() * 8;
             out.push(if pad {
                 '='
             } else {
@@ -547,6 +551,30 @@ pub(crate) fn base64(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_rfc4648_vectors() {
+        // RFC 4648 §10 — covers every input-length remainder.
+        assert_eq!(base64(""), "");
+        assert_eq!(base64("f"), "Zg==");
+        assert_eq!(base64("fo"), "Zm8=");
+        assert_eq!(base64("foo"), "Zm9v");
+        assert_eq!(base64("foob"), "Zm9vYg==");
+        assert_eq!(base64("fooba"), "Zm9vYmE=");
+        assert_eq!(base64("foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_credentials_pad_at_the_end() {
+        // Regression: the final partial group was emitted as padding
+        // first, data after — "dXNlcjpwYXNz==QA" instead of
+        // "dXNlcjpwYXNzd2Q=". Only credentials whose length was an exact
+        // multiple of 3 survived, so most basic-auth and proxy-auth
+        // headers went out corrupted.
+        assert_eq!(base64("user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64("user:passw"), "dXNlcjpwYXNzdw==");
+        assert_eq!(base64("user:passwd"), "dXNlcjpwYXNzd2Q=");
+    }
 
     #[test]
     fn parse_bare_http() {

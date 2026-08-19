@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.7] - 2026-08-19
+
+### Fixed
+
+- **Basic auth and proxy auth headers were corrupted by a base64 bug (#15)**: the encoder placed its `=` padding at the start of the final group instead of the end, so `user:passwd` encoded as `dXNlcjpwYXNz==QA` rather than `dXNlcjpwYXNzd2Q=`. Only credentials whose byte length was an exact multiple of 3 came out valid; everything else was rejected by the server. Covered by RFC 4648 test vectors.
+
 ## [2.3.6] - 2026-08-19
 
 ### Added
