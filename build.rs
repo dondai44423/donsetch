@@ -194,6 +194,30 @@ fn main() {
         }
     }
 
+    // ── Windows main-thread stack size ────────────────────────
+    //
+    // On Windows the main thread's stack size comes from the PE header,
+    // which defaults to 1MB. Linux gives 8MB. donsetch runs its whole
+    // future tree on the main thread via tokio's block_on, and the
+    // fetch_tool state machine does not fit in 1MB unoptimized — a debug
+    // build dies with 0xc00000fd (STATUS_STACK_OVERFLOW) inside __chkstk
+    // before entering the function body, with no usable backtrace since
+    // a stack overflow is not a panic. Release only fits because
+    // optimization shrinks the frame, which is luck, not headroom.
+    //
+    // Ask the linker for Linux's 8MB so the ceiling stops being
+    // profile-dependent. Transparent to the user, like the LLD flag above.
+    if is_windows {
+        let abi = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if abi == "gnu" {
+            // MinGW: GNU ld spelling.
+            println!("cargo:rustc-link-arg=-Wl,--stack,8388608");
+        } else {
+            // MSVC link.exe.
+            println!("cargo:rustc-link-arg=/STACK:8388608");
+        }
+    }
+
     // ── aarch64 + ONNX warning ────────────────────────────────
     //
     // ONNX Runtime (via `ort`/`oar-ocr`) is statically linked. Its C++

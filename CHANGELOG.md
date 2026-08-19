@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.7] - 2026-08-19
+
+### Fixed
+
+- **Windows: debug builds die with `STATUS_STACK_OVERFLOW` (#18)**: the main thread's stack comes from the PE header — 1MB by default, against Linux's 8MB. DonSeTch runs its whole future tree there via tokio's `block_on`, and `fetch_tool`'s frame does not fit unoptimized: `cargo build` produced a binary that aborted in `__chkstk` before the function body ran. Release fit only because optimization shrank the frame. `build.rs` now requests 8MB (`/STACK` on MSVC, `-Wl,--stack` on MinGW), so the ceiling no longer depends on the build profile.
+
 ## [2.3.6] - 2026-08-19
 
 ### Added
