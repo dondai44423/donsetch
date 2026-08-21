@@ -268,9 +268,9 @@ dependencies = [
 
 [[package]]
 name = "boring"
-version = "5.1.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b573999d5cb0fdb9e9bb495058981752547b6475ba5e346247ebbd329917549"
+checksum = "47bf58283ad1560da95ab8dcbb6c71e18a89df30e6011e3582ddf755abe55c4a"
 dependencies = [
  "bitflags",
  "boring-sys",
@@ -281,9 +281,9 @@ dependencies = [
 
 [[package]]
 name = "boring-sys"
-version = "5.1.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc39169cb8fa025002661c8d9148ed38a896908e4d308bb0cb55303f66e95d4"
+checksum = "6993efa9d9f0ebf3b0c02c8e868cfe37d0854cd021d51204480a91ce23d6e444"
 dependencies = [
  "bindgen",
  "cmake",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "donsetch"
-version = "2.4.0"
+version = "2.4.1"
 dependencies = [
  "boring",
  "boring-sys",
