@@ -121,6 +121,18 @@ fn relevance(query: &str, docs: &[(String, String)]) -> Vec<f64> {
         .collect()
 }
 
+/// Collapse every whitespace run — newlines included — into a
+/// single space. HTML-scraped engines already do this in
+/// `engines::text`, but JSON-sourced hits arrive raw: MDN
+/// summaries, BYOK provider snippets (Exa returns page text),
+/// GitHub descriptions. A newline inside a snippet breaks the
+/// three-space indent of the markdown list, so normalize once
+/// here — the one point every source flows through — rather
+/// than per parser, where the next engine would miss it.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Merge all engine hits into one ranked list.
 /// `trust` maps engine -> 0.0..=2.0 (learned EWMA).
 pub fn merge(
@@ -163,6 +175,11 @@ pub fn merge(
             engine_family(engine).to_string()
         };
         for hit in hits {
+            // Normalized once per hit: every comparison below is
+            // length-based, so mixing raw and collapsed strings
+            // would pick winners by whitespace count.
+            let hit_title = collapse_ws(&hit.title);
+            let hit_snippet = collapse_ws(&hit.snippet);
             let key = norm_key(&hit.url);
             let contribution = tw / (RRF_K + hit.rank as f64 + 1.0);
             let best = family_best
@@ -170,24 +187,24 @@ pub fn merge(
                 .or_insert(0.0);
             *best = best.max(contribution);
             let entry = groups.entry(key).or_insert_with(|| Merged {
-                title: hit.title.clone(),
+                title: hit_title.clone(),
                 url: hit.url.clone(),
-                snippet: hit.snippet.clone(),
+                snippet: hit_snippet.clone(),
                 sources: Vec::new(),
                 score: 0.0,
                 published: None,
             });
             // Keep the longest snippet (most informative),
             // skipping redirect stubs.
-            if hit.snippet.len() > entry.snippet.len() && !hit.snippet.starts_with("Redirecting") {
-                entry.snippet = hit.snippet.clone();
+            if hit_snippet.len() > entry.snippet.len() && !hit_snippet.starts_with("Redirecting") {
+                entry.snippet = hit_snippet.clone();
             }
             // Best title: breadcrumbs ("a › b › c") and
             // URL-echoes are longer than real titles — keep
             // the shortest CLEAN candidate.
             let bad = |t: &str| t.contains(" › ") || t.starts_with("http") || t.len() < 3;
-            if !bad(&hit.title) && (bad(&entry.title) || hit.title.len() < entry.title.len()) {
-                entry.title = hit.title.clone();
+            if !bad(&hit_title) && (bad(&entry.title) || hit_title.len() < entry.title.len()) {
+                entry.title = hit_title.clone();
             }
             if entry.published.is_none() && hit.published.is_some() {
                 entry.published = hit.published.clone();
@@ -479,6 +496,46 @@ mod tests {
         let out = merge(&[], "anything", Intent::Web, &trust, 10);
         assert!(out.is_empty());
         assert!(is_weak(&out, 0));
+    }
+
+    #[test]
+    fn whitespace_is_collapsed_in_title_and_snippet() {
+        // JSON-sourced hits (MDN summaries, BYOK page text,
+        // GitHub descriptions) arrive with raw newlines. The
+        // markdown list indents snippets by three spaces, so an
+        // embedded newline breaks the layout.
+        let mut raw = hit("https://developer.mozilla.org/en-US/docs/Web/API/fetch", 0);
+        raw.title = "fetch()\n  global function".into();
+        raw.snippet = "Starts the process\nof fetching a resource,\treturning a promise.".into();
+        let per = vec![("mdn".to_string(), vec![raw])];
+        let trust = std::collections::HashMap::new();
+        let out = merge(&per, "fetch api", Intent::Web, &trust, 10);
+        assert_eq!(out[0].title, "fetch() global function");
+        assert_eq!(
+            out[0].snippet,
+            "Starts the process of fetching a resource, returning a promise."
+        );
+    }
+
+    #[test]
+    fn longest_snippet_wins_after_collapsing() {
+        // Length comparison must run on collapsed strings: a
+        // padded-with-newlines short snippet must not beat a
+        // genuinely longer one.
+        let mut padded = hit("https://a.com/x", 0);
+        padded.snippet = "short\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n".into();
+        let mut real = hit("https://a.com/x", 1);
+        real.snippet = "a genuinely longer and more informative snippet".into();
+        let per = vec![
+            ("brave".to_string(), vec![padded]),
+            ("ddg".to_string(), vec![real]),
+        ];
+        let trust = std::collections::HashMap::new();
+        let out = merge(&per, "x", Intent::Web, &trust, 10);
+        assert_eq!(
+            out[0].snippet,
+            "a genuinely longer and more informative snippet"
+        );
     }
 
     #[test]
