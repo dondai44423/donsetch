@@ -122,24 +122,32 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
         timeout-minutes: 30
 
       # Verify the binary actually runs — catches broken cross-target
       # builds, missing DLLs, and link-time issues that don't show
-      # up as compile errors.
-      - name: Verify binary runs
+      # up as compile errors. Also asserts the binary reports the
+      # tagged version: a missed Cargo.toml bump fails here instead
+      # of shipping assets that lie about their version.
+      - name: Verify binary runs and reports the tag version
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
           BIN=donsetch
           if [ -f donsetch.exe ]; then BIN=donsetch.exe; fi
-          output=$(./$BIN 2>&1 || true)
+          output=$(./$BIN --version 2>&1 || true)
           if [ -z "$output" ]; then
             echo "ERROR: binary produced no output"
             exit 1
           fi
           echo "OK: $(echo "$output" | head -1)"
+          TAGVER="${GITHUB_REF_NAME#v}"
+          if ! echo "$output" | grep -q "$TAGVER"; then
+            echo "ERROR: binary does not report the tagged version $TAGVER"
+            echo "Did you bump Cargo.toml before tagging?"
+            exit 1
+          fi
 
       # ── Package ──────────────────────────────────────────────
       # All platforms: tar.gz. Windows includes pdfium.dll alongside
@@ -197,10 +205,34 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      # Curated release notes: extract this version's section from
+      # CHANGELOG.md so the release page reads like the changelog,
+      # not like a commit log. GitHub's auto-generated notes are
+      # appended below it.
+      - name: Build release notes from CHANGELOG
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys
+          tag = os.environ["TAG_VERSION"].lstrip("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[" + re.escape(tag) + r"\] - .*?$", text, re.M)
+          if not m:
+              sys.exit(f"CHANGELOG.md has no [{tag}] section — add it before tagging")
+          start = m.end()
+          nxt = re.search(r"^## \[.*?\]", text[start:], re.M)
+          section = text[start:start + nxt.start()] if nxt else text[start:]
+          header = f"DonSeTch v{tag}\n\n"
+          open("RELEASE_BODY.md", "w", encoding="utf-8").write(header + section.strip() + "\n")
+          print(f"RELEASE_BODY.md: {len(section.splitlines())} lines from [{tag}]")
+          EOF
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           draft: true
+          body_path: RELEASE_BODY.md
           generate_release_notes: true
           files: |
             artifacts/donsetch-*.tar.gz

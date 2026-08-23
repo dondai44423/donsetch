@@ -118,7 +118,11 @@ function startServer(): Promise<void> {
     }
 
     try {
-      proc = spawn(binaryPath, ["mcp"], {
+      // --supervised: crash-only daemon. If the MCP server is SIGKILLed
+      // (OOM, crash), the supervisor respawns it and replays in-flight
+      // requests — pi users never see a dead tool until the process
+      // itself dies.
+      proc = spawn(binaryPath, ["mcp", "--supervised"], {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
         windowsHide: true,
@@ -196,20 +200,58 @@ function startServer(): Promise<void> {
   });
 }
 
-function sendRequest(method: string, params: any, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
+function sendRequest(
+  method: string,
+  params: any,
+  timeoutMs = CALL_TIMEOUT_MS,
+  signal?: AbortSignal
+): Promise<any> {
   return new Promise((resolve, reject) => {
     if (!proc?.stdin?.writable) {
       reject(new Error("donsetch MCP server not running"));
       return;
     }
     const id = nextId++;
+    let settled = false;
+    const finish = (fn: (v: any) => void, v: any) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      fn(v);
+    };
     const timer = setTimeout(() => {
-      if (pending.has(id)) {
-        pending.delete(id);
-        reject(new Error(`MCP request timeout (${timeoutMs}ms): ${method}`));
+      if (pending.delete(id)) {
+        finish(reject, new Error(`MCP request timeout (${timeoutMs}ms): ${method}`));
       }
     }, timeoutMs);
-    pending.set(id, { resolve, reject, timer });
+    // v3 real MCP cancellation: forward pi's abort to the server so the
+    // in-flight fetch/crawl actually stops server-side, then settle
+    // locally. The caller maps this to a graceful "Cancelled" result.
+    const onAbort = () => {
+      if (pending.delete(id)) {
+        clearTimeout(timer);
+        sendNotification("notifications/cancelled", { id, reason: "client aborted" });
+        finish(reject, new Error("cancelled"));
+      }
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    pending.set(id, {
+      resolve: (v: any) => {
+        clearTimeout(timer);
+        finish(resolve, v);
+      },
+      reject: (e: any) => {
+        clearTimeout(timer);
+        finish(reject, e);
+      },
+      timer,
+    });
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     proc.stdin.write(msg + "\n");
   });
@@ -221,8 +263,8 @@ function sendNotification(method: string, params: any): void {
   proc.stdin.write(msg + "\n");
 }
 
-async function callMcpTool(name: string, args: any): Promise<any> {
-  return sendRequest("tools/call", { name, arguments: args ?? {} });
+async function callMcpTool(name: string, args: any, signal?: AbortSignal): Promise<any> {
+  return sendRequest("tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS, signal);
 }
 
 function killServer(): void {
@@ -384,7 +426,7 @@ export default function (pi: ExtensionAPI) {
           }
 
           try {
-            const result = await callMcpTool(toolName, params);
+            const result = await callMcpTool(toolName, params, _signal);
             // Join all content text blocks, skipping [meta] blocks.
             // [meta] blocks contain compact metadata for clients
             // (Claude Code, VSCode) that drop text when
@@ -411,13 +453,15 @@ export default function (pi: ExtensionAPI) {
             } else if (toolName === "web_fetch") {
               details.source = getFetchSource(sc);
               details.status = getFetchStatus(sc);
+              if (sc?.stitched) details.stitched = sc.stitched;
             } else if (toolName === "web_crawl") {
               details.pages = countCrawlPages(text);
             }
 
-            // For errors, extract error text
+            // For errors, extract error text + v3 stable error code
             if (isErr) {
               details.error = getPreview(text, 60);
+              if (sc?.code) details.code = sc.code;
             } else {
               details.preview = getPreview(text);
             }
@@ -428,6 +472,15 @@ export default function (pi: ExtensionAPI) {
               isError: isErr,
             };
           } catch (err: any) {
+            // User pressed Esc in pi: we already told the server to stop
+            // (notifications/cancelled). Graceful non-error result, per
+            // pi's extension contract for aborted calls.
+            if (err.message === "cancelled") {
+              return {
+                content: [{ type: "text", text: "Cancelled" }],
+                details: { mcpTool: toolName, cancelled: true },
+              };
+            }
             return {
               content: [{ type: "text", text: `donsetch MCP call failed: ${err.message}` }],
               details: { mcpTool: toolName, isError: true, error: err.message },
@@ -469,6 +522,7 @@ export default function (pi: ExtensionAPI) {
             else if (d.source === "ghost") parts.push("via ghost");
             if (d.status === "blocked") parts.push("blocked");
             else if (d.status === "thin") parts.push("thin");
+            if (d.stitched) parts.push(`stitched \u00D7${d.stitched}`);
             meta = parts.join(" \u00B7 ");
           } else if (toolName === "web_search") {
             const count = d.results ?? 0;
@@ -481,8 +535,10 @@ export default function (pi: ExtensionAPI) {
 
           // Build line 2: preview or error
           let line2 = "";
-          if (isErr) {
-            line2 = d.error || "failed";
+          if (d.cancelled) {
+            line2 = "cancelled";
+          } else if (isErr) {
+            line2 = d.code ? `[${d.code}] ${d.error || "failed"}` : d.error || "failed";
           } else if (toolName === "web_search" && d.topResult) {
             line2 = truncate(d.topResult, 70);
           } else if (d.preview) {

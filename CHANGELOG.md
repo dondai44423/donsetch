@@ -71,6 +71,7 @@ A keyless adapter registry for the sites agents actually hit. Fetch-level rewrit
 ### Fixed
 
 - **Daemon-abort panic in jsdata blob discovery (fuzzer find, CI fuzz gate)**: a known-global assignment (`__NUXT__ = `) matching at the very end of a page whose preceding byte was invalid UTF-8 (decoded to a 3-byte replacement char) advanced the scan cursor past the string / mid-character — `html[from..]` panicked. The cursor now floors to the next char boundary, clamped to the string length. Found by the new CI fuzz gate on its first green-config run; regression-tested with the crash input.
+- **Windows tier-1 boot hang in the browser version probe (#36, @problaems)**: startup spawned a real browser (`--version --headless=new`) with no timeout to learn its version — on Chrome 129 the spawn hangs (crash-looping GPU/network services) and blocks every command at boot, leaving an orphaned process tree. The probe now reads the version from the browser's own registry key (`HKCU\Software\<Browser>\BLBeacon\version` — zero spawns, honours `DONGHOST_CHROME` families incl. Thorium/Edge) and hard-caps any spawned fallback at 3s with a whole-tree kill. Review follow-ups: non-Windows build stub, child cleanup on an early-out path, unit tests for the version parser.
 
 ### Added (M6 — foundation)
 
@@ -79,6 +80,8 @@ A keyless adapter registry for the sites agents actually hit. Fetch-level rewrit
 - **Memory soak gate**: 200 full-pipeline extractions + 10k handle churn + 800 page-history records with RSS growth asserted bounded (`tests/soak.rs`) — a creeping daemon is a build failure, not a surprise.
 - **Crash-only supervisor**: `donsetch mcp --supervised` proxies stdio over a supervised child daemon — a panic-abort (or a SIGKILL) restarts the daemon (500ms backoff, 5-crash give-up), held requests are replayed, idle deaths are caught within 500ms, and the MCP session survives. Live-verified: SIGKILL mid-session, all requests answered after restart.
 - **Homebrew tap**: `brew tap dondai44423/donsetch && brew install donsetch` (formula staged, published with the release).
+- **Release workflow hardening**: release builds are `--locked` (deps can't drift mid-release); every platform binary must *report the tagged version* before packaging — a missed `Cargo.toml` bump fails the release job, not the user's `--version`; GitHub release notes are generated from `CHANGELOG.md` (curated) with commit-log notes appended, not the bare commit log.
+- **pi agent extension v3**: tools now run under the crash-only supervisor (`mcp --supervised` — a SIGKILLed daemon no longer kills the pi session); pi's Esc/cancel forwards real MCP cancellation so server-side fetch/crawl work actually stops; tool cards surface v3 stable error codes (`[deadline.hit] …`) and `stitched ×N` pagination. Tool definitions are discovered live from the binary, so `pi update --extensions` picks up all of v3 with no extension-side pinning.
 
 ### Decision
 
