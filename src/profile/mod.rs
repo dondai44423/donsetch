@@ -279,6 +279,14 @@ fn probe_registry_major() -> Option<u32> {
     None
 }
 
+/// Non-Windows: there is no registry to consult — fall through to
+/// the spawned probe directly. (Stub keeps `probe_installed_major`
+/// platform-symmetric.)
+#[cfg(not(windows))]
+fn probe_registry_major() -> Option<u32> {
+    None
+}
+
 /// Read a REG_SZ value from the Windows registry without spawning
 /// anything. Returns `None` on any failure (missing key, wrong type,
 /// access denied).
@@ -379,7 +387,16 @@ fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
     // Read stdout on a side thread so we can still enforce the timeout
     // if the browser never exits (the read would otherwise block us).
     let pid = child.id();
-    let pipe = child.stdout.take()?;
+    let pipe = match child.stdout.take() {
+        Some(p) => p,
+        None => {
+            // Can't happen (stdout is always piped above), but never
+            // leave a spawned child running on the early-out path.
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
     let stdout = std::thread::spawn(move || {
         let mut buf = String::new();
         let mut rd = pipe;
@@ -474,5 +491,28 @@ mod locale_tests {
             accept_language_for("example.com", "/docs"),
             "en-US,en;q=0.9"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::parse_version_major;
+
+    #[test]
+    fn parses_known_banner_shapes() {
+        assert_eq!(parse_version_major("Chromium 151.0.7922.108 Arch Linux"), Some(151));
+        assert_eq!(parse_version_major("Google Chrome 150.0.7204.184"), Some(150));
+        assert_eq!(parse_version_major("Microsoft Edge 151.0.7922.72"), Some(151));
+        // Registry shape: bare version string.
+        assert_eq!(parse_version_major("151.0.7922.72"), Some(151));
+    }
+
+    #[test]
+    fn rejects_non_versions() {
+        assert_eq!(parse_version_major(""), None);
+        assert_eq!(parse_version_major("no numbers here"), None);
+        // Plausibility band: 20..=400 — rejects years, build ids, ports.
+        assert_eq!(parse_version_major("Chrome 1985.1"), None);
+        assert_eq!(parse_version_major("Chrome 100000"), None);
     }
 }
