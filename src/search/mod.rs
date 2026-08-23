@@ -1090,6 +1090,35 @@ pub fn render_markdown(
                 md.push_str(&format!("   {}\n", r.url));
             }
         }
+        // Provenance, text-side. Which engines returned a URL is the
+        // signal that separates two equally plausible results: three
+        // independent indexes agreeing usually means canonical, a
+        // lone vertical hit often means tangential. Until now it
+        // existed only in structuredContent, so a client that drops
+        // that field could not tell the two apart.
+        //
+        // NAMES, not a count: `consensus` in the JSON is
+        // sources.len(), which double-counts an engine that returned
+        // the URL at two ranks (live: ddg, yahoo, yahoo, brave = 4
+        // for 3 engines). Ranking counts index FAMILIES instead, so
+        // deduped names are both cheaper to read and more honest
+        // than the number — and they say WHICH source, which a count
+        // never can.
+        let mut engines: Vec<&str> = Vec::new();
+        for (engine, _) in &r.sources {
+            if !engines.contains(&engine.as_str()) {
+                engines.push(engine);
+            }
+        }
+        if !engines.is_empty() {
+            // 2dp, not the JSON's 3: this is a blended heuristic, and
+            // 0.831 reads like a measurement.
+            md.push_str(&format!(
+                "   engines: {} · score: {:.2}\n",
+                engines.join(", "),
+                r.score
+            ));
+        }
     }
     if out.weak {
         md.push_str("\n*weak results: low cross-engine consensus — treat with care*\n");
@@ -1357,6 +1386,48 @@ mod tests {
         // 、 (U+3001) is the enumeration comma — it joins, so it
         // goes rather than dangling before the ellipsis.
         assert_eq!(clip_snippet("第一项、第二项、第三项", 8), "第一项、第二项…");
+    }
+
+    fn outcome(results: Vec<Merged>) -> SearchOutcome {
+        SearchOutcome {
+            results,
+            weak: false,
+            intent: Intent::Web,
+            report: Vec::new(),
+            cached: false,
+            elapsed: Duration::from_millis(10),
+            provider: None,
+            reranked: false,
+        }
+    }
+
+    #[test]
+    fn markdown_names_engines_and_score_per_result() {
+        let mut r = merged("https://tokio.rs/");
+        r.sources = vec![("bing".into(), 0), ("ddg".into(), 2)];
+        r.score = 0.8312;
+        let md = render_markdown(&outcome(vec![r]), "rust async", None, &[]);
+        assert!(
+            md.contains("engines: bing, ddg · score: 0.83"),
+            "provenance line missing:\n{md}"
+        );
+    }
+
+    #[test]
+    fn markdown_dedupes_repeated_engines() {
+        // One engine returning the same URL at two ranks must not
+        // read as extra consensus — the JSON's `consensus` count
+        // does exactly that.
+        let mut r = merged("https://tokio.rs/");
+        r.sources = vec![
+            ("ddg".into(), 0),
+            ("yahoo".into(), 1),
+            ("yahoo".into(), 4),
+            ("brave".into(), 2),
+        ];
+        let md = render_markdown(&outcome(vec![r]), "rust async", None, &[]);
+        assert!(md.contains("engines: ddg, yahoo, brave"), "{md}");
+        assert_eq!(md.matches("yahoo").count(), 1, "must dedupe:\n{md}");
     }
 
     fn merged(url: &str) -> Merged {
