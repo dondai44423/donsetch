@@ -960,6 +960,102 @@ fn site_filter(query: &str, results: &mut Vec<Merged>) {
     });
 }
 
+/// Snippet budget for the markdown list. 120 cut mid-phrase far
+/// too often — the detail that distinguishes two results sat just
+/// past the cut, and the agent paid a whole fetch to learn what the
+/// snippet nearly said. 200 is where a snippet reliably carries one
+/// complete claim; the 300 the JSON keeps is past diminishing
+/// returns at ~45 tokens per result.
+const SNIPPET_CHARS: usize = 200;
+
+/// Below this fraction (4/5) of the budget, a word-boundary cut
+/// throws away more than it saves — see `clip_snippet`.
+const CLIP_FLOOR_NUM: usize = 4;
+const CLIP_FLOOR_DEN: usize = 5;
+
+/// Trailing marks dropped before the ellipsis: each one JOINS
+/// clauses, so ending on it reads as a typo rather than a cut.
+///
+/// Sentence terminators (. ! ? 。！？) are deliberately KEPT: a cut
+/// that lands after one means the snippet ended at a complete
+/// sentence, and saying so is worth more than tidiness. Stripping
+/// them would make a clean ending look like a severed one.
+/// CJK marks are the same codepoints in Chinese and Japanese, so
+/// one list serves both: 、and ，join clauses, 《》【】「」（ open
+/// spans. 。！？ are absent on purpose — they end sentences.
+const CLIP_TRIM: &[char] = &[
+    ',', ';', ':', '-', '–', '—', '(', '[', '{', '/', '|', '…', '、', '，', '；', '：', '（', '「',
+    '『', '《', '〈', '【', '〔', '［', '｛', '·', '／', '｜', '〜',
+];
+
+/// Truncate to `max` chars on a word boundary, marking the cut with
+/// an ellipsis ONLY when text was actually dropped.
+///
+/// Trims back, never extends: extending to finish the straddling
+/// word would make the output size unbounded by `max` (one long
+/// token and a "200-char snippet" is 280), and the fragment dropped
+/// is a partial word the agent cannot use anyway.
+///
+/// The 4/5 floor bounds the pathological case: a long URL, hash or
+/// compound word straddling the boundary would otherwise back off to
+/// almost nothing, which is worse than a mid-word cut the ellipsis
+/// already flags.
+fn clip_snippet(s: &str, max: usize) -> String {
+    // Materialized rather than iterated because the window is read
+    // three ways: indexed (chars[max]), scanned BACKWARDS for the
+    // last space, and sliced for the head. `Chars` cannot be
+    // rewound, so an iterator version re-decodes UTF-8 from the
+    // start once per pass — and `rposition` is not even available
+    // on it (it needs ExactSizeIterator, which `Chars` is not),
+    // leaving manual position bookkeeping. Decode once, index
+    // freely.
+    //
+    // Char positions, not &str byte offsets, for the same reason:
+    // the budget and the floor are counted in chars, so `rfind`'s
+    // byte index would need converting before every comparison —
+    // and mixing the two on multi-byte text is where UTF-8 bugs
+    // breed.
+    //
+    // max + 1 and no further: the only index past the window we
+    // inspect is chars[max], the "does the next char end a word?"
+    // test. Collecting the whole string would allocate 4 bytes a
+    // char for input we discard — BYOK snippets carry raw page
+    // text and run to thousands of chars.
+    let chars: Vec<char> = s.chars().take(max + 1).collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    // The char PAST the window decides whether the window already
+    // ends cleanly. If it is whitespace, the last word inside is
+    // whole and backing off would drop a complete word for nothing.
+    let cut = if chars[max].is_whitespace() {
+        max
+    } else {
+        match chars[..max].iter().rposition(|c| c.is_whitespace()) {
+            Some(pos) if pos * CLIP_FLOOR_DEN >= max * CLIP_FLOOR_NUM => pos,
+            _ => max,
+        }
+    };
+    let mut head: String = chars[..cut].iter().collect();
+    // trim_end_matches only slices — it is the `.to_string()` that
+    // would copy. Truncating to the trimmed length shortens in
+    // place instead, leaving one allocation for the whole function.
+    let keep = head
+        .trim_end_matches(|c: char| c.is_whitespace() || CLIP_TRIM.contains(&c))
+        .len();
+    head.truncate(keep);
+    // Only whitespace left behind means nothing was really dropped;
+    // an ellipsis there would promise content that does not exist.
+    // Iterates the ORIGINAL string, not the bounded window: a
+    // Vec capped at max + 1 cannot answer "is everything after
+    // the cut whitespace?". `all` short-circuits on the first
+    // non-whitespace, so this is O(1) in practice.
+    if s.chars().skip(cut).all(char::is_whitespace) {
+        return head;
+    }
+    format!("{head}…")
+}
+
 /// Markdown rendering for the MCP/CLI surface.
 pub fn render_markdown(
     out: &SearchOutcome,
@@ -975,7 +1071,7 @@ pub fn render_markdown(
         let host = rank::host_of(&r.url);
         md.push_str(&format!("{}. **{}** — {}\n", i + 1, r.title, host));
         if !r.snippet.is_empty() {
-            let snip: String = r.snippet.chars().take(120).collect();
+            let snip = clip_snippet(&r.snippet, SNIPPET_CHARS);
             md.push_str(&format!("   {snip}\n"));
         }
         // v3 handles: the position handle (S1, S2, …) replaces the
@@ -1131,6 +1227,136 @@ mod tests {
             cache_ttl(Intent::Web, "rust ownership explained"),
             Duration::from_secs(1800)
         );
+    }
+
+    // ── snippet truncation ───────────────────────────────────
+    // A small budget keeps the expectations readable; the logic
+    // is identical at SNIPPET_CHARS.
+
+    #[test]
+    fn clip_leaves_short_snippets_alone() {
+        assert_eq!(clip_snippet("short one", 20), "short one");
+    }
+
+    #[test]
+    fn clip_leaves_exactly_full_snippets_unmarked() {
+        let exact = "a".repeat(20);
+        // Nothing dropped, so no ellipsis may be promised.
+        assert_eq!(clip_snippet(&exact, 20), exact);
+    }
+
+    #[test]
+    fn clip_keeps_whole_window_when_next_char_is_space() {
+        // The 21st char is a space: the window already ends on a
+        // word boundary, so backing off would drop "ddddd" for
+        // nothing. This is the edge case a naive "last space
+        // inside the window" rule gets wrong.
+        assert_eq!(
+            clip_snippet("aaaa bbbb cccc ddddd eee", 20),
+            "aaaa bbbb cccc ddddd…"
+        );
+    }
+
+    #[test]
+    fn clip_omits_ellipsis_when_only_whitespace_follows() {
+        assert_eq!(
+            clip_snippet("aaaa bbbb cccc ddddd ", 20),
+            "aaaa bbbb cccc ddddd"
+        );
+    }
+
+    #[test]
+    fn clip_backs_off_to_word_boundary() {
+        // Straddling word, last space at 16 of 20 — exactly the
+        // 4/5 floor, so the partial word goes.
+        assert_eq!(
+            clip_snippet("aaaaaaaaaaaaaaaa bbbbbbbbbb", 20),
+            "aaaaaaaaaaaaaaaa…"
+        );
+    }
+
+    #[test]
+    fn clip_hard_cuts_just_below_the_floor() {
+        // Same shape, space one char earlier (15 of 20): below the
+        // floor, so a mid-word cut beats losing a quarter of the
+        // budget.
+        assert_eq!(
+            clip_snippet("aaaaaaaaaaaaaaa bbbbbbbbbb", 20),
+            "aaaaaaaaaaaaaaa bbbb…"
+        );
+    }
+
+    #[test]
+    fn clip_hard_cuts_when_backing_off_would_cost_too_much() {
+        // Last space at 4 of 20: backing off would return a
+        // quarter of the budget. A mid-word cut the ellipsis
+        // flags is the better trade.
+        assert_eq!(
+            clip_snippet("aaaa bbbbbbbbbbbbbbbbbbbb", 20),
+            "aaaa bbbbbbbbbbbbbbb…"
+        );
+    }
+
+    #[test]
+    fn clip_hard_cuts_a_single_long_token() {
+        assert_eq!(
+            clip_snippet(&"x".repeat(30), 20),
+            format!("{}…", "x".repeat(20))
+        );
+    }
+
+    #[test]
+    fn clip_strips_joining_punctuation_before_the_ellipsis() {
+        // Without the trim this reads "aaaaaaaaaaaaaaa,…", which
+        // looks like a typo rather than a truncation.
+        assert_eq!(
+            clip_snippet("aaaaaaaaaaaaaaa, bbbbbbbbbb", 20),
+            "aaaaaaaaaaaaaaa…"
+        );
+    }
+
+    #[test]
+    fn clip_keeps_a_sentence_terminator() {
+        // A cut landing after '.' means the snippet ended on a
+        // COMPLETE sentence — stripping it would make a clean
+        // ending look severed.
+        assert_eq!(
+            clip_snippet("Tokio is a runtime. Axum builds on it.", 20),
+            "Tokio is a runtime.…"
+        );
+    }
+
+    /// Sōseki's opening line — 3-byte chars, and no spaces at
+    /// all, which is the real reason Japanese is the right test:
+    /// there is no word boundary to back off to, so every cut is
+    /// a hard cut and byte slicing would panic outright.
+    const JA: &str = "「吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。何でも薄暗いじめじめした所でニャーニャー泣いていた事だけは記憶している。」";
+
+    #[test]
+    fn clip_counts_chars_not_bytes() {
+        assert_eq!(
+            clip_snippet(JA, 20),
+            "「吾輩は猫である。名前はまだ無い。どこで…"
+        );
+    }
+
+    #[test]
+    fn clip_keeps_a_cjk_sentence_terminator() {
+        // Cut lands right after 。 (U+3002) — the same codepoint
+        // in Chinese and Japanese. It ends a sentence, so it stays.
+        assert_eq!(clip_snippet(JA, 17), "「吾輩は猫である。名前はまだ無い。…");
+    }
+
+    #[test]
+    fn clip_keeps_chinese_terminators_and_strips_chinese_separators() {
+        // ！ (U+FF01) ends a sentence — kept.
+        assert_eq!(
+            clip_snippet("这是一个测试。第二句话！第三句", 12),
+            "这是一个测试。第二句话！…"
+        );
+        // 、 (U+3001) is the enumeration comma — it joins, so it
+        // goes rather than dangling before the ellipsis.
+        assert_eq!(clip_snippet("第一项、第二项、第三项", 8), "第一项、第二项…");
     }
 
     fn merged(url: &str) -> Merged {
