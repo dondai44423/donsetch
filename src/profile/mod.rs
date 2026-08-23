@@ -500,9 +500,18 @@ mod probe_tests {
 
     #[test]
     fn parses_known_banner_shapes() {
-        assert_eq!(parse_version_major("Chromium 151.0.7922.108 Arch Linux"), Some(151));
-        assert_eq!(parse_version_major("Google Chrome 150.0.7204.184"), Some(150));
-        assert_eq!(parse_version_major("Microsoft Edge 151.0.7922.72"), Some(151));
+        assert_eq!(
+            parse_version_major("Chromium 151.0.7922.108 Arch Linux"),
+            Some(151)
+        );
+        assert_eq!(
+            parse_version_major("Google Chrome 150.0.7204.184"),
+            Some(150)
+        );
+        assert_eq!(
+            parse_version_major("Microsoft Edge 151.0.7922.72"),
+            Some(151)
+        );
         // Registry shape: bare version string.
         assert_eq!(parse_version_major("151.0.7922.72"), Some(151));
     }
