@@ -45,7 +45,7 @@ pub struct Proc {
     job: fnd::HANDLE,
 }
 
-/// ntdll process suspend/resume — always loaded, linked directly.
+// ntdll process suspend/resume — always loaded, linked directly.
 #[cfg(windows)]
 #[link(name = "ntdll")]
 unsafe extern "system" {

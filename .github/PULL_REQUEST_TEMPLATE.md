@@ -13,8 +13,8 @@
 
 ## Checks
 
-- [ ] `cargo test --release` passes (249+ tests)
-- [ ] `cargo clippy --release -- -Dwarnings` passes (zero warnings)
+- [ ] `cargo test --release --features ocr,rerank` passes (622+ tests)
+- [ ] `cargo clippy --release --all-targets --features ocr,rerank -- -Dwarnings` passes (zero warnings)
 - [ ] `cargo fmt --all -- --check` passes
 - [ ] CI is green on all 3 platforms (Linux, macOS, Windows)
 

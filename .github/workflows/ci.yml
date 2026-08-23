@@ -75,7 +75,10 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98
         with:
           targets: ${{ matrix.target }}
-          components: ${{ matrix.os == 'ubuntu-latest' && 'clippy, rustfmt' || '' }}
+          # Minimal profile: clippy/rustfmt exist only where named.
+          # Clippy also runs on Windows — ghost/proc.rs is entirely
+          # #[cfg(windows)], so a Linux-only lint pass never sees it.
+          components: ${{ (matrix.os == 'ubuntu-latest' && 'clippy, rustfmt') || (matrix.os == 'windows-latest' && 'clippy') || '' }}
 
       - name: Install Go
         uses: actions/setup-go@v7
@@ -131,9 +134,17 @@ jobs:
         run: cargo test ${{ matrix.features }} --target ${{ matrix.target }} -- ${{ matrix.test-skip }}
         timeout-minutes: 15
 
+      # Two platforms, because ~32 cfg sites are Windows-exclusive
+      # (all of ghost/proc.rs) and Linux clippy never compiles them.
+      # macOS adds only one exclusive site — its other paths are
+      # `unix` (shared with Linux) or `not(linux_like)` (shared with
+      # Windows), so both are already covered here.
+      #
+      # --all-targets pulls in #[cfg(test)] modules and tests/*.rs,
+      # which the default lib+bins pass leaves unlinted.
       - name: Clippy
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy ${{ matrix.features }} -- -Dwarnings
+        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
+        run: cargo clippy ${{ matrix.features }} --all-targets -- -Dwarnings
 
       - name: Format check
         if: matrix.os == 'ubuntu-latest'

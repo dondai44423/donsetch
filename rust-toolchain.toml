@@ -1,0 +1,9 @@
+# Pin the toolchain for local builds, matching the CI/release pin
+# (dtolnay/rust-toolchain@1.98). v3.0.0 pinned the CI side to end
+# local-vs-CI clippy drift, but nothing pinned the contributor's
+# side: a local clippy older or newer than CI's reports a different
+# lint set, so `-Dwarnings` can be red here and green there — or,
+# worse, the reverse. rustup installs the components on first use.
+[toolchain]
+channel = "1.98"
+components = ["clippy", "rustfmt"]

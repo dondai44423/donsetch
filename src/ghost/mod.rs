@@ -269,6 +269,10 @@ impl Ghost {
         profile: &BrowserProfile,
         display: Option<&str>,
     ) -> Result<Self, FetchError> {
+        // Unused on macOS/Windows (Xvfb is Linux-only) — clippy -Dwarnings errors on it.
+        #[cfg(not(linux_like))]
+        let _ = display;
+
         let bin = chrome_binary()?;
         let dir = profile_dir();
         std::fs::create_dir_all(&dir)

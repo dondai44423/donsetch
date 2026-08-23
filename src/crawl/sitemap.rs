@@ -46,15 +46,11 @@ impl Robots {
                     in_star_group = v == "*" || v.to_lowercase().contains("donsetch");
                     seen_any_group = true;
                 }
-                "disallow" if in_star_group => {
-                    if !v.is_empty() {
-                        r.disallow.push(v.to_string());
-                    }
+                "disallow" if in_star_group && !v.is_empty() => {
+                    r.disallow.push(v.to_string());
                 }
-                "allow" if in_star_group => {
-                    if !v.is_empty() {
-                        r.allow.push(v.to_string());
-                    }
+                "allow" if in_star_group && !v.is_empty() => {
+                    r.allow.push(v.to_string());
                 }
                 "crawl-delay" if in_star_group => {
                     r.crawl_delay = v.parse::<f64>().ok();
