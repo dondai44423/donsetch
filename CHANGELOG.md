@@ -5,6 +5,19 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-08-23
+
+The search-legibility release: signals the merge already computed now reach the text channel, where every client can read them.
+
+### Changed
+
+- **Snippets are 200 chars, cut on a word boundary.** 120 ended mid-word almost every time — `sequence transduc`, `All You Nee`, `the attention ` on a live query. The cost was not lost context but a wasted `web_fetch` to learn what the snippet nearly said. The cut trims back rather than extending, so output stays bounded by the budget; if the character past the window is whitespace the window already ends cleanly and is kept whole; backing off is abandoned when it would cost more than a fifth of the budget, since a long URL or an unbroken CJK run would otherwise strip the snippet to nothing. The ellipsis is appended only when text was actually dropped, so it never promises content that does not exist. Trailing marks that join clauses (`, ; : 、 ， 「 《 【`) are removed before it; sentence terminators (`. ! ? 。！？`, shared codepoints across Chinese and Japanese) stay, because a cut landing after one means the snippet ended on a complete sentence.
+- **Each result names the engines behind it**, with its blended score: `engines: bing, ddg · score: 0.83`. Which indexes agreed is what separates two equally plausible results — independent engines converging usually means canonical, a lone vertical hit often means tangential — and it was previously visible only in `structuredContent`. Names rather than a count: `consensus` there is `sources.len()`, which double-counts an engine that returned the URL at two ranks, while ranking counts index families. Deduped names are the honest version, and say *which* source.
+
+### Fixed
+
+- **Whitespace in titles and snippets is collapsed at merge.** HTML-scraped engines normalized already; JSON-sourced hits did not — MDN summaries, BYOK provider snippets (Exa returns raw page text) and GitHub descriptions arrived with embedded newlines, breaking the three-space indent of the markdown list. Normalizing once in `rank::merge`, the single point every source flows through, also fixes the "longest snippet wins" and "shortest clean title wins" comparisons, which previously ranked on whitespace count: a newline-padded short snippet could beat a genuinely longer one.
+
 ## [3.1.0] - 2026-08-23
 
 The focus release: the `focus` parameter rebuilt from flat BM25 block scoring to hierarchical section-aware scoring. Plus a homebrew tap URL fix.

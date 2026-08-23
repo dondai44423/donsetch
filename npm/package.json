@@ -1,6 +1,6 @@
 {
   "name": "donsetch",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Web fetch, search and crawl for AI agents. Zero API keys. Chrome-true TLS.",
   "license": "AGPL-3.0-only",
   "author": "Bishesh Bhandari",
