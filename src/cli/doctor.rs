@@ -215,29 +215,14 @@ async fn check_tls(fetcher: &Fetcher) -> CheckResult {
 fn check_chrome() -> CheckResult {
     match crate::ghost::chrome_binary() {
         Ok(path) => {
-            // Try to get the browser version.
-            // On Windows and macOS, --version without --headless may open
-            // a GUI window. Pass --headless=new + temp --user-data-dir so
-            // Chrome exits silently (same fix as probe_installed_major).
-            let mut cmd = std::process::Command::new(&path);
-            cmd.arg("--version");
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::null());
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            {
-                let tmp = std::env::temp_dir().join("donsetch-chrome-probe");
-                let _ = std::fs::create_dir_all(&tmp);
-                cmd.arg("--headless=new");
-                cmd.arg(format!("--user-data-dir={}", tmp.display()));
-                cmd.arg("--no-first-run");
-                cmd.arg("--no-default-browser-check");
-            }
-            let version = cmd
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown version".into());
+            // Browser version via the shared probe — registry first
+            // (zero spawn), then a hard-capped `--version` spawn that
+            // kills the whole tree on timeout. Never opens a window,
+            // never hangs, never leaves an orphaned browser behind.
+            let version = match crate::profile::probe_installed_major() {
+                Some(major) => format!("{major}.0.0.0 (probed)"),
+                None => "unknown version".into(),
+            };
             CheckResult::Pass(format!("{version} at {path}"))
         }
         Err(_) => CheckResult::Fail(

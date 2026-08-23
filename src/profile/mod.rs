@@ -199,48 +199,256 @@ pub fn accept_language_for(host: &str, path: &str) -> &'static str {
 
 /// Probe the installed browser's major version. Cached after first call.
 ///
-/// On Windows, `chrome.exe --version` without `--headless` opens a
-/// visible GUI window (and may pop the profile picker since no
-/// `--user-data-dir` is passed). We pass `--headless=new` plus a temp
-/// `--user-data-dir` so Chrome prints the version and exits without
-/// any visible window. The result is cached in a `OnceLock` so the
-/// probe runs at most once per process.
+/// Two strategies, tried in order:
+///
+/// 1. **Registry read (Windows).** Chromium-family browsers persist
+///    their own version under `HKCU\Software\<Name>\BLBeacon\version`
+///    (Google Chrome, Chromium, Microsoft Edge, Thorium, …). Reading
+///    it costs zero browser launches — no window, no hang, no orphaned
+///    processes. This is the tier-1-friendly path: tier 1 never needs
+///    to spawn a real browser just to know what version to claim.
+/// 2. **Spawned `--version` probe, hard timeboxed.** Only reached
+///    when the registry has nothing (custom forks with no BLBeacon
+///    entry). The child is killed — whole tree on Windows — if it
+///    does not answer within `PROBE_SPAWN_TIMEOUT`, so a wedged
+///    browser can never block tier 1 startup or leave processes behind.
+///
+/// The result is cached in a `OnceLock` so the probe runs at most
+/// once per process.
 static PROBED_MAJOR: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+/// Hard cap on the spawned `--version` probe. Chrome 129 on Windows
+/// is known to hang (or crash-loop its network/GPU services) under
+/// `--headless=new`; without this cap tier 1 blocks forever at boot.
+const PROBE_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub fn probe_installed_major() -> Option<u32> {
     *PROBED_MAJOR.get_or_init(|| {
-        let bin = crate::ghost::chrome_binary().ok()?;
-        let mut cmd = std::process::Command::new(&bin);
-        cmd.arg("--version");
-        // On Windows and macOS, --version without --headless may open a
-        // GUI window. Pass --headless=new + a temp --user-data-dir so Chrome
-        // exits silently. Harmless on Linux (ignores --headless with --version).
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        {
-            let tmp = std::env::temp_dir().join("donsetch-chrome-probe");
-            let _ = std::fs::create_dir_all(&tmp);
-            cmd.arg("--headless=new");
-            cmd.arg(format!("--user-data-dir={}", tmp.display()));
-            cmd.arg("--no-first-run");
-            cmd.arg("--no-default-browser-check");
+        // Fast path: read what browser wrote about itself. No spawn.
+        if let Some(major) = probe_registry_major() {
+            return Some(major);
         }
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::null());
-        let out = cmd.output().ok()?;
-        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        // "Chromium 151.0.7922.108 Arch Linux" / "Google Chrome 150..."
-        // / "Microsoft Edge 151..."
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        for t in tokens {
-            if let Some(first) = t.split('.').next()
-                && let Ok(major) = first.parse::<u32>()
-                && (20..=400).contains(&major)
-            {
-                return Some(major);
+        // Fallback: ask the binary, but never let it hang or orphan.
+        probe_spawned_major()
+    })
+}
+
+/// Windows: read the major version from the browser's own
+/// `BLBeacon\version` registry value. Honours `DONGHOST_CHROME` by
+/// probing the browser family it names first.
+#[cfg(windows)]
+fn probe_registry_major() -> Option<u32> {
+    use windows_sys::Win32::System::Registry as reg;
+
+    // Candidate registry paths, in preference order. `DONGHOST_CHROME`
+    // names one binary — probe its family first so a Thorium fork is
+    // read from the Thorium key, not from whichever Chrome is installed.
+    let mut keys: Vec<&str> = vec![
+        "Software\\Google\\Chrome\\BLBeacon",
+        "Software\\Chromium\\BLBeacon",
+        "Software\\Microsoft\\Edge\\BLBeacon",
+        "Software\\Thorium\\BLBeacon",
+    ];
+    // Sort DONGHOST_CHROME's family to the front if it doesn't already
+    // lead — cheap, and makes the explicit choice authoritative.
+    if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
+        let p = p.to_string_lossy().to_lowercase();
+        for (family, key) in [
+            ("thorium", "Software\\Thorium\\BLBeacon"),
+            ("chrome", "Software\\Google\\Chrome\\BLBeacon"),
+            ("chromium", "Software\\Chromium\\BLBeacon"),
+            ("edge", "Software\\Microsoft\\Edge\\BLBeacon"),
+        ] {
+            if p.contains(family) {
+                if let Some(pos) = keys.iter().position(|k| *k == key) {
+                    keys.remove(pos);
+                    keys.insert(0, key);
+                }
+                break;
             }
         }
-        None
-    })
+    }
+
+    for key in keys {
+        if let Some(v) = registry_string(reg::HKEY_CURRENT_USER, key, "version")
+            && let Some(major) = parse_version_major(&v)
+        {
+            return Some(major);
+        }
+    }
+    None
+}
+
+/// Read a REG_SZ value from the Windows registry without spawning
+/// anything. Returns `None` on any failure (missing key, wrong type,
+/// access denied).
+#[cfg(windows)]
+fn registry_string(
+    hive: windows_sys::Win32::System::Registry::HKEY,
+    key_path: &str,
+    value_name: &str,
+) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry as reg;
+
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let path = wide(key_path);
+    let name = wide(value_name);
+
+    let mut hkey = std::ptr::null_mut();
+    // SAFETY: RegOpenKeyExW with a nul-terminated wide path and a
+    // valid out-param. KEY_READ only — no write access requested.
+    let rc = unsafe { reg::RegOpenKeyExW(hive, path.as_ptr(), 0, reg::KEY_READ, &mut hkey) };
+    if rc != 0 || hkey.is_null() {
+        return None;
+    }
+
+    let mut buf = [0u8; 256];
+    let mut size = buf.len() as u32;
+    let mut typ: u32 = 0;
+    // SAFETY: RegQueryValueExW into a fixed buffer with size in/out.
+    let rc = unsafe {
+        reg::RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null(),
+            &mut typ,
+            buf.as_mut_ptr(),
+            &mut size,
+        )
+    };
+    // SAFETY: the handle is valid; close it in all paths.
+    unsafe { reg::RegCloseKey(hkey) };
+
+    if rc != 0 || typ != reg::REG_SZ {
+        return None;
+    }
+    // REG_SZ is stored as UTF-16LE (one NUL-terminated wchar per
+    // char). Treat the bytes as UTF-16, not UTF-8 — reading them raw
+    // yields interleaved NULs that break version parsing.
+    let sz = (size as usize).min(buf.len());
+    let units: Vec<u16> = buf[..sz]
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let s = String::from_utf16_lossy(&units)
+        .trim_end_matches('\0')
+        .to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Spawned `--version` probe, hard-capped by `PROBE_SPAWN_TIMEOUT`.
+/// On timeout the whole process tree is killed so no orphaned browser
+/// processes survive.
+pub(crate) fn probe_spawned_major() -> Option<u32> {
+    let bin = crate::ghost::chrome_binary().ok()?;
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--version");
+    // On Windows and macOS, `--version` without `--headless` opens a
+    // real GUI window. Pass `--headless=new` + a scratch profile so any
+    // spawn that does happen stays invisible. Harmless on Linux (the
+    // flag is ignored alongside `--version`).
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let tmp = std::env::temp_dir().join("donsetch-chrome-probe");
+        let _ = std::fs::create_dir_all(&tmp);
+        cmd.arg("--headless=new");
+        cmd.arg(format!("--user-data-dir={}", tmp.display()));
+        cmd.arg("--no-first-run");
+        cmd.arg("--no-default-browser-check");
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    spawn_probe_with_timeout(cmd)
+}
+
+/// Run the built `--version` command, read its stdout, and return the
+/// first plausible major version. Never runs longer than
+/// `PROBE_SPAWN_TIMEOUT`; on timeout, kills the whole process tree.
+fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
+    use std::io::Read;
+
+    let mut child = cmd.spawn().ok()?;
+
+    // Read stdout on a side thread so we can still enforce the timeout
+    // if the browser never exits (the read would otherwise block us).
+    let pid = child.id();
+    let pipe = child.stdout.take()?;
+    let stdout = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut rd = pipe;
+        let _ = rd.read_to_string(&mut buf);
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + PROBE_SPAWN_TIMEOUT;
+    let mut reaped: Option<std::process::ExitStatus> = None;
+    while reaped.is_none() {
+        match child.try_wait() {
+            Ok(Some(status)) => reaped = Some(status),
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if reaped.is_none() && std::time::Instant::now() >= deadline {
+            // Wedged browser — kill the whole tree, not just the parent.
+            kill_probe_tree(Some(pid));
+            let _ = child.kill();
+            reaped = child.wait().ok();
+            break;
+        }
+        if reaped.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    if reaped.is_none() {
+        // Err branch above killed nothing; be safe.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let out = stdout.join().unwrap_or_default();
+
+    parse_version_major(&out)
+}
+
+/// Kill the probe process and its children (Windows: taskkill /T so
+/// the whole tree dies; Unix: kill the process group-less child — its
+/// renderers exit when the browser dies).
+fn kill_probe_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(windows)]
+    {
+        // taskkill /T /F kills the process and all descendants.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// Parse the first plausible major version out of a `<name> <major>` line.
+pub(crate) fn parse_version_major(line: &str) -> Option<u32> {
+    let line = line.trim();
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    for t in tokens {
+        if let Some(first) = t.split('.').next()
+            && let Ok(major) = first.parse::<u32>()
+            && (20..=400).contains(&major)
+        {
+            return Some(major);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
