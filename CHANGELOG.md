@@ -5,6 +5,12 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **HTTP transport (streamable-HTTP):** `donsetch mcp --http` (or `DONSETCH_TRANSPORT=http`) serves MCP over HTTP: JSON-RPC POST at `/mcp`, the GET SSE stream and DELETE session end that strict streamable-HTTP clients (OpenCode among them) require, and `GET /health` for probes. Both transports dispatch through the same handler, so tools behave identically to stdio. Sessions: `initialize` returns an `Mcp-Session-Id` header; clients that echo it get a dedicated cancellation registry (`notifications/cancelled` aborts in-flight calls, same semantics as stdio), session-less clients share a default registry. Session ids are 16-char random base62 tokens; idle sessions are dropped after 30 minutes, the table is bounded at 1024 with oldest-first eviction, and `DELETE /mcp` ends a session immediately. Hardening: optional bearer auth (`DONSETCH_HTTP_TOKEN`, constant-time compare), per-request timeout (`DONSETCH_HTTP_TIMEOUT_SECS`, default 300, returns a JSON-RPC error on expiry), CORS off by default with `DONSETCH_HTTP_CORS=1` to opt in (MCP clients are processes, not browsers; a permissive default would let any webpage in a local browser read responses from a localhost instance). Graceful shutdown: SIGTERM/SIGINT stops accepting requests, drains in-flight ones, and shuts the daemon down so no Chrome processes are orphaned.
+
 ## [3.2.5] - 2026-08-28
 
 The AVX fix release. ONNX Runtime is now dynamically loaded at runtime instead of statically linked, fixing SIGILL crashes on non-AVX CPUs (pre-2011 Intel, QEMU default, Docker VMs without AVX passthrough).

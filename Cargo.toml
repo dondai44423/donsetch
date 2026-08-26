@@ -22,6 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
+# HTTP server for MCP HTTP transport (axum, SSE)
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 libc = "0.2"
 dirs = "6"
 unicode-bidi = "0.3"

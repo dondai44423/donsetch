@@ -19,13 +19,32 @@ async fn main() {
 
         // ── Management ──
         "mcp" => {
-            // v3 crash-only design: `--supervised` spawns a child
-            // daemon and proxies stdio; a panic-abort (release runs
-            // panic=abort — one dead request would otherwise kill
-            // the whole MCP session) restarts the child instead.
-            // Persistent state (handles, history, profiles) reloads
-            // from disk; the client sees a blip, not a death.
-            if args.iter().any(|a| a == "--supervised") {
+            // Transport selection: the --http flag wins, then the
+            // DONSETCH_TRANSPORT env (stdio|http) for launchers that
+            // can't pass flags, then stdio. Host/port: flags, then
+            // env, then defaults.
+            let env_http = std::env::var("DONSETCH_TRANSPORT").as_deref() == Ok("http");
+            if args.iter().any(|a| a == "--http") || env_http {
+                let host = get_arg_value(&args, "--host")
+                    .or_else(|| std::env::var("DONSETCH_HTTP_HOST").ok())
+                    .unwrap_or("127.0.0.1".to_string());
+                let port = get_arg_value(&args, "--port")
+                    .or_else(|| std::env::var("DONSETCH_HTTP_PORT").ok())
+                    .unwrap_or("8765".to_string())
+                    .parse()
+                    .unwrap_or(8765);
+                eprintln!("[mcp] starting HTTP server on {}:{}", host, port);
+                if let Err(e) = mcp::http::run(host, port).await {
+                    eprintln!("mcp HTTP server: {e}");
+                    std::process::exit(1);
+                }
+            } else if args.iter().any(|a| a == "--supervised") {
+                // v3 crash-only design: `--supervised` spawns a child
+                // daemon and proxies stdio; a panic-abort (release runs
+                // panic=abort — one dead request would otherwise kill
+                // the whole MCP session) restarts the child instead.
+                // Persistent state (handles, history, profiles) reloads
+                // from disk; the client sees a blip, not a death.
                 eprintln!("[supervisor] donsetch mcp --supervised");
                 if let Err(e) = mcp::supervisor::run() {
                     eprintln!("[supervisor] {e}");
@@ -146,9 +165,28 @@ async fn route_help(cmd: &str) {
             println!("  Shows build info and checks for updates.");
         }
         "mcp" => {
-            println!("Usage: donsetch mcp");
+            println!("Usage: donsetch mcp [--http] [--host HOST] [--port PORT] [--supervised]");
             println!();
-            println!("  Starts the MCP server on stdio (JSON-RPC). Connect from your MCP client.");
+            println!("  Starts the MCP server (stdio or HTTP mode).");
+            println!();
+            println!("Options:");
+            println!("  --http              Start HTTP server instead of stdio");
+            println!("  --host HOST         Bind to this address (default: 127.0.0.1)");
+            println!("  --port PORT         Listen on this port (default: 8765)");
+            println!("  --supervised        Run with crash-recovery supervisor (stdio only)");
+            println!();
+            println!("Stdio mode (default): JSON-RPC over stdin/stdout");
+            println!("HTTP mode: JSON-RPC POST at http://HOST:PORT/mcp (plus the");
+            println!("            GET SSE stream and DELETE session end required by");
+            println!("            streamable-HTTP clients)");
+            println!();
+            println!("Environment (flags win over env):");
+            println!("  DONSETCH_TRANSPORT=http       Same as --http (stdio is the default)");
+            println!("  DONSETCH_HTTP_HOST=HOST       Same as --host");
+            println!("  DONSETCH_HTTP_PORT=PORT       Same as --port");
+            println!("  DONSETCH_HTTP_TOKEN=TOKEN     Require Authorization: Bearer TOKEN on /mcp");
+            println!("  DONSETCH_HTTP_TIMEOUT_SECS=N  Per-request timeout (default 300)");
+            println!("  DONSETCH_HTTP_CORS=1          Allow cross-origin requests (default off)");
         }
         "tools" => {
             println!("Usage: donsetch tools");
@@ -159,6 +197,30 @@ async fn route_help(cmd: &str) {
             cli::tool::print_top_help();
         }
     }
+}
+
+/// Helper function to extract argument value from args.
+/// Returns None if the argument is not present or has no value.
+fn get_arg_value(args: &[String], flag: &str) -> Option<String> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            // Check if there's a next argument that's not another flag
+            if let Some(next) = iter.peek()
+                && !next.starts_with("--")
+            {
+                return Some((**next).clone());
+            }
+            return None;
+        }
+        // Handle --flag=value format
+        if let Some(rest) = arg.strip_prefix(flag)
+            && let Some(rest) = rest.strip_prefix("=")
+        {
+            return Some(rest.to_string());
+        }
+    }
+    None
 }
 
 // ── Dev commands ─────────────────────────────────────────────

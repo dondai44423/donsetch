@@ -231,6 +231,75 @@ Or use `npx` without global install:
 
 Works with Claude Code, Cursor, OpenCode, Pi, Windsurf, and any client that speaks MCP. Three tools: `web_fetch`, `web_search`, `web_crawl`.
 
+### HTTP transport (remote clients and debugging)
+
+DonSeTch also speaks MCP over HTTP (the streamable-HTTP transport:
+JSON-RPC via POST, plus the GET SSE stream and DELETE session end that
+strict clients expect). Both transports dispatch through the same
+handler, so tools behave identically. HTTP is opt-in:
+
+```bash
+# Flags
+donsetch mcp --http --host 0.0.0.0 --port 8765
+
+# Env vars (identical effect; flags win over env when both are set)
+DONSETCH_TRANSPORT=http DONSETCH_HTTP_HOST=0.0.0.0 donsetch mcp
+```
+
+MCP clients connect to `http://localhost:8765/mcp`:
+
+```json
+{
+  "mcpServers": {
+    "donsetch": { "url": "http://localhost:8765/mcp" }
+  }
+}
+```
+
+**Testing with curl:**
+
+```bash
+# Health check (always unauthenticated, for probes)
+curl http://localhost:8765/health
+
+# Test the MCP endpoint
+curl -X POST http://localhost:8765/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+**Sessions and cancellation.** The `initialize` response carries an
+`Mcp-Session-Id` header. Echo it back on subsequent requests to get a
+dedicated cancellation registry: posting `notifications/cancelled`
+with the session header while a tool call is in flight aborts it (same
+semantics as stdio). Session-less clients share one default registry —
+cancellation still works, but request ids share a namespace. Unknown
+or expired session ids get a 404. Sessions idle for 30 minutes are
+dropped; `DELETE /mcp` with the session header ends one immediately.
+
+```bash
+# Cancel request 42 during a long call (with a session header)
+curl -X POST http://localhost:8765/mcp \
+  -H "Content-Type: application/json" \
+  -H "Mcp-Session-Id: <from initialize>" \
+  -d '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":42}}'
+```
+
+**Environment variables** (HTTP mode):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DONSETCH_TRANSPORT` | `stdio` | `stdio` or `http` — same as the `--http` flag |
+| `DONSETCH_HTTP_HOST` | `127.0.0.1` | Bind address (use `0.0.0.0` to accept remote clients) |
+| `DONSETCH_HTTP_PORT` | `8765` | Listen port — same as `--port` |
+| `DONSETCH_HTTP_TOKEN` | unset | When set, `/mcp` requires `Authorization: Bearer <token>`; `/health` stays open |
+| `DONSETCH_HTTP_TIMEOUT_SECS` | `300` | Per-request timeout; timed-out calls return a JSON-RPC error |
+| `DONSETCH_HTTP_CORS` | off | `1`/`true`/`on` allows cross-origin requests. Off by default: MCP clients are processes, not browsers, and a permissive layer would let any webpage in a local browser read responses from a localhost instance |
+
+On SIGTERM/SIGINT the server stops accepting new requests, drains
+in-flight ones, and shuts the daemon down (no orphan Chrome
+processes).
+
 ### CLI (for humans and scripts)
 
 ```bash

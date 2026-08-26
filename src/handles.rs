@@ -94,13 +94,23 @@ pub fn handles_enabled() -> bool {
     !matches!(std::env::var("DONSETCH_URL_HANDLES").as_deref(), Ok("off"))
 }
 
-/// Generate a random, unguessable handle ID: prefix + 8 base62 chars.
+/// Generate a random, unguessable handle ID: prefix + 8 base62 chars
+/// (see [`random_base62`]).
+fn gen_id(prefix: char) -> String {
+    let mut id = String::with_capacity(ID_LEN + 1);
+    id.push(prefix);
+    id.push_str(&random_base62(ID_LEN));
+    id
+}
+
+/// Random `len`-char base62 string.
 ///
 /// Entropy sources (all process-internal, invisible to a remote
 /// page): nanosecond timestamp, PID, atomic counter, ASLR stack
 /// address. SHA-256 output is indistinguishable from random to
-/// anyone who cannot observe the input.
-fn gen_id(prefix: char) -> String {
+/// anyone who cannot observe the input. Shared by handle IDs
+/// (`S…`/`L…`) and MCP HTTP session ids.
+pub(crate) fn random_base62(len: usize) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = SystemTime::now()
@@ -118,9 +128,8 @@ fn gen_id(prefix: char) -> String {
     hasher.update(stack_addr.to_le_bytes());
     let digest = hasher.finalize();
 
-    let mut id = String::with_capacity(ID_LEN + 1);
-    id.push(prefix);
-    for i in 0..ID_LEN {
+    let mut id = String::with_capacity(len);
+    for i in 0..len {
         id.push(BASE62[digest[i] as usize % 62] as char);
     }
     id
