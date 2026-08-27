@@ -1,0 +1,72 @@
+# Build a DonSeTch binary compatible with older-glibc distros.
+#
+# Why this exists: official release binaries are produced on newer
+# runners and link against GLIBC 2.38/2.39, so they fail on
+# distributions like Debian 12 (GLIBC 2.36) with:
+#   version `GLIBC_2.38' not found
+# Building on ubuntu-22.04 (glibc 2.35) produces a binary that runs on
+# Debian 12 and anything newer, without musl's other tradeoffs.
+#
+# Also pins LIBCLANG_PATH to the distro libclang: Homebrew-style or
+# very-new LLVM builds can require a newer glibc than the runner base,
+# which makes bindgen fail during boring-sys's build script.
+
+name: build-debian12
+
+on:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/build-debian12.yml', 'src/**', 'Cargo.toml', 'Cargo.lock', 'build.rs']
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: donsetch-linux-x64-debian12
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        run: rustup toolchain install 1.98 --profile minimal
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm cmake golang-go libclang-dev clang
+          echo "LIBCLANG_PATH=/usr/lib/llvm-14/lib" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke test (version + doctor network check)
+        run: |
+          ./target/release/donsetch version
+          ./target/release/donsetch doctor || true
+
+      - name: Verify binary runs without new-glibc symbols
+        run: |
+          # Fail if the binary requires any glibc newer than Debian 12's 2.36
+          MAX=$(objdump -T target/release/donsetch \
+            | grep -o 'GLIBC_[0-9.]*' | sort -u | sort -V | tail -1)
+          echo "highest GLIBC symbol requirement: $MAX"
+          case "$(printf 'GLIBC_2.36\n%s\n' "$MAX" | sort -V | tail -1)" in
+            GLIBC_2.36) echo "OK: compatible with Debian 12" ;;
+            *) echo "ERROR: binary requires $MAX > 2.36"; exit 1 ;;
+          esac
+
+      - name: Package
+        run: |
+          cd target/release
+          tar czf donsetch-linux-x64-debian12.tar.gz donsetch
+          sha256sum donsetch-linux-x64-debian12.tar.gz > donsetch-linux-x64-debian12.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: donsetch-linux-x64-debian12
+          path: |
+            target/release/donsetch-linux-x64-debian12.tar.gz
+            target/release/donsetch-linux-x64-debian12.tar.gz.sha256
