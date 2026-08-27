@@ -5,6 +5,12 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Container-aware semantic-reranker parallelism:** on Linux, the ONNX intra-op pool is automatically clamped when cgroup v1/v2 quota or CPU affinity exposes less effective parallelism than the host's physical core count. `DONSEEK_RERANK_THREADS` remains available as a cross-platform explicit override; unconstrained hosts preserve ONNX's native default and affinity behavior.
+
 ## [3.2.5] - 2026-08-28
 
 The AVX fix release. ONNX Runtime is now dynamically loaded at runtime instead of statically linked, fixing SIGILL crashes on non-AVX CPUs (pre-2011 Intel, QEMU default, Docker VMs without AVX passthrough).

@@ -43,6 +43,7 @@ psl = { version = "=2.1.226" }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"], optional = true }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 ndarray = { version = "0.17", optional = true }
+num_cpus = { version = "1.17", optional = true }
 
 [features]
 # No default features — the core tool (fetch, search, crawl, PDF)
@@ -52,7 +53,7 @@ ndarray = { version = "0.17", optional = true }
 # builds explicitly enable both with `--features ocr,rerank`.
 default = []
 ocr = ["dep:oar-ocr", "dep:image", "reqwest/blocking"]
-rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "reqwest/blocking"]
+rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/blocking"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry"] }

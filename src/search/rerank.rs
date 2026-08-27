@@ -34,6 +34,9 @@ mod inner {
     /// Max sequence length for the MiniLM cross-encoder.
     const MAX_SEQ_LEN: usize = 512;
 
+    /// ONNX Runtime accepts the thread count as a C `int`.
+    const MAX_INTRA_THREADS: usize = i32::MAX as usize;
+
     const MODEL_URL: &str = "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model_quantized.onnx";
     const MODEL_SHA256: &str = "e9d8ebf845c413e981c175bfe49a3bfa9b3dcce2a3ba54875ee5df5a58639fbe";
     const TOKENIZER_URL: &str =
@@ -46,7 +49,140 @@ mod inner {
         tokenizer: Tokenizer,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ThreadSelection {
+        Environment {
+            threads: usize,
+        },
+        Automatic {
+            threads: usize,
+            effective: usize,
+            physical: usize,
+        },
+        OnnxDefault {
+            effective: Option<usize>,
+            physical: usize,
+        },
+    }
+
+    impl ThreadSelection {
+        fn threads(self) -> Option<usize> {
+            match self {
+                Self::Environment { threads } | Self::Automatic { threads, .. } => Some(threads),
+                Self::OnnxDefault { .. } => None,
+            }
+        }
+    }
+
+    enum ThreadOverride<'a> {
+        Unset,
+        Value(&'a str),
+        InvalidUnicode,
+    }
+
     static RERANKER: OnceLock<Option<Reranker>> = OnceLock::new();
+
+    /// Parse an explicit ONNX intra-op thread limit.
+    fn parse_intra_threads(raw: &str) -> Result<usize, String> {
+        let raw = raw.trim();
+        let threads = raw.parse::<usize>().map_err(|_| {
+            format!("DONSEEK_RERANK_THREADS must be an integer between 1 and {MAX_INTRA_THREADS}")
+        })?;
+        if !(1..=MAX_INTRA_THREADS).contains(&threads) {
+            return Err(format!(
+                "DONSEEK_RERANK_THREADS must be an integer between 1 and {MAX_INTRA_THREADS}"
+            ));
+        }
+        Ok(threads)
+    }
+
+    /// Bound ONNX only when the process has less effective parallelism than
+    /// the machine has physical cores. This covers cgroup quotas and affinity
+    /// limits while preserving ONNX's native default (including affinity) on
+    /// unconstrained hosts.
+    fn automatic_intra_threads(effective: Option<usize>, physical: usize) -> ThreadSelection {
+        match effective.filter(|&threads| threads > 0 && threads < physical) {
+            Some(threads) => ThreadSelection::Automatic {
+                threads,
+                effective: threads,
+                physical,
+            },
+            None => ThreadSelection::OnnxDefault {
+                effective,
+                physical,
+            },
+        }
+    }
+
+    fn select_intra_threads(
+        override_value: ThreadOverride<'_>,
+        effective: Option<usize>,
+        physical: usize,
+    ) -> (ThreadSelection, Option<String>) {
+        match override_value {
+            ThreadOverride::Value(raw) => match parse_intra_threads(raw) {
+                Ok(threads) => (ThreadSelection::Environment { threads }, None),
+                Err(e) => (
+                    automatic_intra_threads(effective, physical),
+                    Some(format!("{e}; using automatic selection")),
+                ),
+            },
+            ThreadOverride::InvalidUnicode => (
+                automatic_intra_threads(effective, physical),
+                Some(
+                    "DONSEEK_RERANK_THREADS must contain valid UTF-8; using automatic selection"
+                        .to_string(),
+                ),
+            ),
+            ThreadOverride::Unset => (automatic_intra_threads(effective, physical), None),
+        }
+    }
+
+    fn configured_intra_threads() -> ThreadSelection {
+        let effective = std::thread::available_parallelism().ok().map(|n| n.get());
+        let physical = num_cpus::get_physical();
+        let raw = std::env::var("DONSEEK_RERANK_THREADS");
+        let override_value = match raw.as_deref() {
+            Ok(raw) => ThreadOverride::Value(raw),
+            Err(std::env::VarError::NotPresent) => ThreadOverride::Unset,
+            Err(std::env::VarError::NotUnicode(_)) => ThreadOverride::InvalidUnicode,
+        };
+        let (selection, warning) = select_intra_threads(override_value, effective, physical);
+        if let Some(warning) = warning {
+            eprintln!("[rerank] invalid configuration: {warning}");
+        }
+        selection
+    }
+
+    fn log_thread_selection(selection: ThreadSelection) {
+        match selection {
+            ThreadSelection::Environment { threads } => eprintln!(
+                "[rerank] ONNX intra-op threads: {} (source: DONSEEK_RERANK_THREADS)",
+                threads
+            ),
+            ThreadSelection::Automatic {
+                threads,
+                effective,
+                physical,
+            } => eprintln!(
+                "[rerank] ONNX intra-op threads: {} (source: automatic, effective: {}, physical: {})",
+                threads, effective, physical
+            ),
+            ThreadSelection::OnnxDefault {
+                effective,
+                physical,
+            } => match effective {
+                Some(effective) => eprintln!(
+                    "[rerank] ONNX intra-op threads: default (effective: {effective}, physical: {})",
+                    physical
+                ),
+                None => eprintln!(
+                    "[rerank] ONNX intra-op threads: default (effective parallelism unavailable, physical: {})",
+                    physical
+                ),
+            },
+        }
+    }
 
     /// Returns the cache directory for reranker model files.
     fn cache_dir() -> PathBuf {
@@ -172,13 +308,32 @@ mod inner {
         }));
 
         let session = match Session::builder() {
-            Ok(mut b) => match b.commit_from_file(&model_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[rerank] session load failed: {e}");
-                    return None;
+            Ok(mut b) => {
+                let selection = configured_intra_threads();
+                if let Some(threads) = selection.threads() {
+                    b = match b.with_intra_threads(threads) {
+                        Ok(b) => {
+                            log_thread_selection(selection);
+                            b
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[rerank] failed to set ONNX thread limit: {e}; using ONNX default"
+                            );
+                            e.recover()
+                        }
+                    };
+                } else {
+                    log_thread_selection(selection);
                 }
-            },
+                match b.commit_from_file(&model_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[rerank] session load failed: {e}");
+                        return None;
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("[rerank] session builder failed: {e}");
                 return None;
@@ -496,6 +651,80 @@ mod inner {
                 blend[0] - blend[1] < rrf_n[0] - rrf_n[1],
                 "xenc should narrow the gap even if it doesn't flip"
             );
+        }
+
+        #[test]
+        fn rerank_threads_accepts_positive_integers() {
+            assert_eq!(parse_intra_threads("1").unwrap(), 1);
+            assert_eq!(parse_intra_threads("2").unwrap(), 2);
+            assert_eq!(parse_intra_threads(" 64 ").unwrap(), 64);
+            assert_eq!(
+                parse_intra_threads(&MAX_INTRA_THREADS.to_string()).unwrap(),
+                MAX_INTRA_THREADS
+            );
+        }
+
+        #[test]
+        fn rerank_threads_rejects_invalid_values() {
+            for raw in ["", "0", "-1", "1.5", "two", "2147483648"] {
+                assert!(parse_intra_threads(raw).is_err(), "accepted {raw:?}");
+            }
+        }
+
+        #[test]
+        fn rerank_threads_auto_clamps_constrained_processes() {
+            assert_eq!(
+                automatic_intra_threads(Some(2), 8),
+                ThreadSelection::Automatic {
+                    threads: 2,
+                    effective: 2,
+                    physical: 8,
+                }
+            );
+            assert_eq!(automatic_intra_threads(Some(1), 8).threads(), Some(1));
+        }
+
+        #[test]
+        fn rerank_threads_auto_preserves_unconstrained_onnx_default() {
+            for selection in [
+                automatic_intra_threads(Some(8), 4),
+                automatic_intra_threads(Some(4), 4),
+                automatic_intra_threads(None, 8),
+                automatic_intra_threads(Some(0), 8),
+            ] {
+                assert_eq!(selection.threads(), None);
+                assert!(matches!(selection, ThreadSelection::OnnxDefault { .. }));
+            }
+        }
+
+        #[test]
+        fn rerank_threads_environment_override_wins() {
+            let (selection, warning) = select_intra_threads(ThreadOverride::Value("1"), Some(2), 8);
+            assert_eq!(selection.threads(), Some(1));
+            assert!(matches!(
+                selection,
+                ThreadSelection::Environment { threads: 1 }
+            ));
+            assert_eq!(warning, None);
+        }
+
+        #[test]
+        fn rerank_threads_invalid_override_falls_back_to_auto() {
+            for override_value in [
+                ThreadOverride::Value("invalid"),
+                ThreadOverride::InvalidUnicode,
+            ] {
+                let (selection, warning) = select_intra_threads(override_value, Some(2), 8);
+                assert_eq!(selection.threads(), Some(2));
+                assert!(matches!(selection, ThreadSelection::Automatic { .. }));
+                assert!(warning.is_some());
+            }
+
+            let (selection, warning) =
+                select_intra_threads(ThreadOverride::Value("invalid"), Some(8), 4);
+            assert_eq!(selection.threads(), None);
+            assert!(matches!(selection, ThreadSelection::OnnxDefault { .. }));
+            assert!(warning.is_some());
         }
     }
 }
