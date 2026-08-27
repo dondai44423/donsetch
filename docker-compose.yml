@@ -1,0 +1,60 @@
+# DonSeTch MCP server — docker compose
+#
+# stdio mode, for MCP clients that launch the server as a subprocess
+# (Claude Code, Cursor, etc.):
+#
+#   docker compose build
+#   docker compose run --rm donsetch
+#
+# and point your MCP client at the wrapper command:
+#   docker run -i --rm donsetch-mcp donsetch mcp --supervised
+
+services:
+  donsetch:
+    build:
+      context: .
+      # Uncomment to include Chrome for tier 2 browser escalation:
+      # args:
+      #   INSTALL_CHROME: "true"
+    image: donsetch-mcp:latest
+    container_name: donsetch
+
+    environment:
+      # ── Fetch/search tuning ─────────────────────────────────────
+      # Optional: disable disk persistence for self-improving fetch state
+      # DONSEEK_NO_DISK_STATE: "1"
+
+      # Optional: Chrome path for tier 2 browser escalation
+      # (if built with INSTALL_CHROME=true)
+      # DONGHOST_CHROME: "/usr/bin/chromium"
+
+      # Optional: search proxy rotation (comma-separated)
+      # DONSEEK_PROXIES: "http://proxy1:8080,socks5://proxy2:1080"
+
+      NO_COLOR: "1"
+
+    # Room to finish long in-flight tier-2 fetches on
+    # `docker compose stop` before the SIGKILL.
+    stop_grace_period: 45s
+
+    # Reap zombie processes (PID 1 init).
+    init: true
+
+    volumes:
+      # Persist the fetch/search cache and ghost browser profile across runs
+      - donsetch-cache:/home/donsetch/.cache/donsetch
+
+    # DNS settings to avoid ad-blocking interference if needed
+    # dns:
+    #   - 1.1.1.1
+    #   - 9.9.9.9
+
+    # Memory ceiling: OCR + semantic reranking peak around 1-2GB
+    # under heavy crawls. Adjust to taste; 2g is a comfortable ceiling.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+volumes:
+  donsetch-cache:

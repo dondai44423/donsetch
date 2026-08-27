@@ -176,6 +176,91 @@ Binary lands at `target/release/donsetch`. First build takes ~2 min (compiling B
 
 </details>
 
+### Option 5 — Docker
+
+For isolated deployment, a consistent runtime environment, and easy updates:
+
+```bash
+git clone https://github.com/dondai44423/donsetch.git
+cd donsetch
+docker compose build
+```
+
+**Optional build choice — Chromium.** The default image excludes
+Chromium; tier 2 browser escalation only activates when a browser is
+configured. To bake Chromium in (~+350MB) for tier 2 bot-wall bypass:
+
+```bash
+docker build --build-arg INSTALL_CHROME=true -t donsetch-mcp .
+```
+
+Then point the server at it at runtime with
+`-e DONGHOST_CHROME=/usr/bin/chromium` (the bundled compose file ships
+this as a commented entry).
+
+**stdio (default transport).** MCP clients launch the server as a
+subprocess:
+
+```bash
+docker run -i --rm --init donsetch-mcp donsetch mcp --supervised
+```
+
+stdio MCP client config (Docker flavor):
+
+```json
+{
+  "mcpServers": {
+    "donsetch": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "--init", "donsetch-mcp", "donsetch", "mcp", "--supervised"]
+    }
+  }
+}
+```
+
+OpenCode uses a stricter MCP schema — a `type` discriminator, a single
+`command` array, and an explicit `enabled` — in
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "donsetch": {
+      "type": "local",
+      "command": ["docker", "run", "-i", "--rm", "--init", "donsetch-mcp", "donsetch", "mcp", "--supervised"],
+      "enabled": true,
+      "timeout": 120000
+    }
+  }
+}
+```
+
+`timeout` is optional but recommended: OpenCode defaults MCP requests
+to 5 seconds, and tier 1 fetches regularly run longer.
+
+Or via the bundled compose service (adds the persistent cache volume
+and resource limits):
+
+```bash
+docker compose run --rm donsetch
+```
+
+**Docker Compose options.** The bundled `docker-compose.yml`:
+
+- A cache volume persisting fetch/search state across restarts.
+- A 2GB memory ceiling (OCR + reranking peak around 1–2GB under heavy
+  crawls) and an init process to reap zombies.
+- A 45-second stop grace period so in-flight tier-2 fetches finish on
+  `docker compose stop`.
+
+**Architecture notes.** Multi-stage build (`rust:slim` →
+`debian:trixie-slim`, kept on the same glibc generation — ort-sys's
+prebuilt ONNX Runtime needs glibc 2.38+ symbols on both sides), all
+features enabled, PDFium acquired at build time by the repo's own
+`build.rs` (sha256-verified), Go installed per-target-arch for
+BoringSSL's build system (amd64 and arm64). Single ~36MB binary in a
+minimal runtime image — no Python, no Playwright.
+
 ---
 
 ## 🔀 HTTP Proxy

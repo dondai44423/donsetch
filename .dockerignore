@@ -1,0 +1,54 @@
+# Docker ignore patterns for DonSeTch
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.github
+
+# Rust
+target/
+**/target/
+
+# Fuzzing (development-only)
+fuzz/
+
+# Benchmarks (development-only)
+bench/
+
+# Scripts (development-only)
+scripts/
+
+# Assets (not needed for runtime)
+assets/
+
+# npm package (installed separately)
+npm/
+
+# Documentation (not needed for runtime)
+docs/
+*.md
+!README.md
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker files (don't copy into image)
+docker-compose*.yml
+.dockerignore
+Dockerfile*
+
+# Development files
+*.log
+.env.*
+!.env.example
