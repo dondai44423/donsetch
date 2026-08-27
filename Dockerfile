@@ -17,7 +17,8 @@
 #   Cursor/OpenCode: stdio MCP configuration
 #
 # Note: build.rs downloads and sha256-verifies the PDFium static archive
-# at build time, exactly as the upstream CI does (curl + tar are needed).
+# and the ONNX Runtime archive at build time, exactly as the upstream CI
+# does (curl + tar are needed).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Optional: install Chrome for tier 2 browser escalation (bot-wall bypass).
@@ -103,6 +104,20 @@ RUN set -eu; \
 ENV CARGO_TERM_COLOR=always
 RUN cargo build --release --features ocr,rerank --locked
 
+# Stage the ONNX Runtime shared library for the runtime image. Since
+# 3.2.5, ort loads ONNX Runtime dynamically: when ocr/rerank are
+# enabled, build.rs builds vendor/onnx/libonnxruntime.so from the pyke
+# CDN archive and the binary dlopens it at runtime (searched next to
+# the executable first, then the cache dir). Stage only the .so — the
+# vendor/onnx dir also holds the large static archive, which the
+# runtime image does not need. arm64 has no ONNX prebuilt: stage an
+# empty dir there so the runtime COPY is a no-op and ocr/rerank
+# self-disable at runtime with a notice instead of failing the build.
+RUN mkdir -p /stage-onnx \
+    && if [ -f vendor/onnx/libonnxruntime.so ]; then \
+           cp vendor/onnx/libonnxruntime.so /stage-onnx/; \
+       fi
+
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 # Minimal Debian image for runtime — trixie, matching the builder stage's
 # glibc generation (see the glibc note on the builder stage above)
@@ -124,6 +139,13 @@ RUN if [ "$INSTALL_CHROME" = "true" ]; then \
 
 # Copy binary from builder
 COPY --from=builder /build/target/release/donsetch /usr/local/bin/donsetch
+
+# ONNX Runtime shared library (ocr + rerank features, dynamic since
+# 3.2.5). The binary looks for it next to the executable first, then
+# $cache_dir/onnx/ — /usr/local/bin satisfies the first even when an
+# older cache volume shadows the second. Empty dir on arm64: nothing
+# is copied and the features degrade at runtime.
+COPY --from=builder /stage-onnx/ /usr/local/bin/
 
 # Verify binary works
 RUN donsetch --version
