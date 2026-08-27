@@ -274,7 +274,12 @@ pub async fn ghost_fetch(
         tokio::time::sleep(Duration::from_millis(poll)).await;
         html = match ghost.outer_html().await {
             Ok(h) => h,
-            Err(_) => continue,
+            Err(e) => {
+                if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                    eprintln!("[ghost_fetch] outer_html err at t={:?}: {e}", start.elapsed());
+                }
+                continue;
+            }
         };
         // Mid-navigation guard.
         let cur = ghost.current_url().await.unwrap_or_default();

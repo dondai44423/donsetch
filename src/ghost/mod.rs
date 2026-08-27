@@ -617,6 +617,32 @@ impl Ghost {
             .await?;
         }
 
+        // Session warmup — Debian 12 chromium 151 (observed): the
+        // FIRST session-scoped navigation's CDP response is deferred
+        // until a one-time ~26s barrier after browser start (the
+        // DevTools-visible face of this build's slow first-paint
+        // readiness: SwiftShader-GL + few cores stretches it to the
+        // vanilla --dump-dom wall time); every response queued
+        // behind it flushes at that mark, and all later commands
+        // answer in milliseconds. Absorb that cost here, once per
+        // launch, instead of burning the caller's render window on
+        // the first tier-2 fetch. The warmup target must be a real
+        // HTTPS URL: about:blank and data: URLs do not trip (and so
+        // do not absorb) the barrier. It flows through the same
+        // Fetch request guard as any other navigation, so the SSRF
+        // posture is unchanged. Failures are tolerated — healthy
+        // Chrome answers instantly and pays only a trivial page load.
+        {
+            let _ = cdp
+                .call_with_timeout(
+                    Some(&session),
+                    "Page.navigate",
+                    json!({ "url": "https://example.com/" }),
+                    35,
+                )
+                .await;
+        }
+
         Ok(Self {
             child,
             proc,
@@ -702,12 +728,27 @@ impl Ghost {
         // render, ghost_fetch and actions all flow through here, so
         // tier=2 cannot bypass it.
         crate::fetch::guards::ensure_url_safe(url).await?;
-        // Fire the navigation. Tolerate a missing/errant response:
-        // the URL poll below is the real completion signal.
-        let _ = self
+        // Dispatch navigation and absorb the settle window.
+        //
+        // Debian 12 chromium 151 (observed in testing): session-
+        // scoped CDP responses queue behind a settling navigation
+        // — Page.navigate's response can lag tens of seconds on
+        // trivial pages while the URL advance itself is <1s
+        // (browser-level Target.getTargetInfo answers in ms), and
+        // every subsequent session-scoped call shares that queue.
+        //
+        // So: await the response but cap it well below the generic
+        // 20s CDP timeout. The cap buys most of the settle window;
+        // whatever residue remains is absorbed by the HTML poll
+        // loop below, whose deadline runs concurrently. Real
+        // failures surface via the poll loop, and the escalation-
+        // level retry rides the warmed session.
+        if let Err(_e) = self
             .cdp
-            .call(Some(&self.session), "Page.navigate", json!({ "url": url }))
-            .await;
+            .call_with_timeout(Some(&self.session), "Page.navigate", json!({ "url": url }), 8)
+            .await
+        {
+        }
         // Poll the target URL until it advances off the initial
         // blank page (about:blank is what createTarget starts at).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -737,10 +778,16 @@ impl Ghost {
 
     /// Current document HTML. DOM domain only — no Runtime,
     /// no script execution.
+    ///
+    /// Both calls are bounded to 3s per leg: session-scoped CDP
+    /// responses can queue for many seconds behind a settling
+    /// navigation (Debian chromium 151). A bounded miss just costs
+    /// one poll iteration; an unbounded one eats the whole render
+    /// window and turns a recoverable stall into a hard failure.
     pub async fn outer_html(&self) -> Result<String, FetchError> {
         let root = self
             .cdp
-            .call(Some(&self.session), "DOM.getDocument", json!({}))
+            .call_with_timeout(Some(&self.session), "DOM.getDocument", json!({}), 3)
             .await?
             .get("root")
             .and_then(|r| r.get("nodeId"))
@@ -748,10 +795,11 @@ impl Ghost {
             .ok_or_else(|| FetchError::ghost("no root node"))?;
         Ok(self
             .cdp
-            .call(
+            .call_with_timeout(
                 Some(&self.session),
                 "DOM.getOuterHTML",
                 json!({ "nodeId": root }),
+                5,
             )
             .await?
             .get("outerHTML")

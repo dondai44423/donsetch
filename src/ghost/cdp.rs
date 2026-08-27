@@ -1,23 +1,27 @@
-//! Minimal CDP client — JSON over WebSocket.
+//! Minimal CDP (Chrome DevTools Protocol) client.
 //!
-//! Contract: Target / Page / Network / Storage / DOM / Input
-//! domains ONLY. Never Runtime, never Console, never
-//! Debugger, never script injection. The CDP serialization
-//! trap (console.log of an object with a stack getter) only
-//! fires when the Runtime domain is enabled — we never
-//! enable it, so the trap is dead.
+//! Browser-level + page-session JSON-RPC over the DevTools ws
+//! endpoint. No Runtime/Console/Debugger domains — DOM and Page
+//! only. Message framing per RFC 6455 via tokio-tungstenite.
+//!
+//! Upstream (master) made `Cdp` cloneable by wrapping every field
+//! in Arc; this branch additionally exposes `call_with_timeout`
+//! so the ghost hot path can bound each response wait. On Debian 12
+//! chromium 151, session-scoped CDP responses queue behind a
+//! settling navigation and can lag the URL advance by tens of
+//! seconds — unbounded waits there turn a recoverable stall into a
+//! failed fetch (see ghost::navigate docs).
 
+use crate::error::FetchError;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
-
-use crate::error::FetchError;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -52,7 +56,7 @@ impl Cdp {
         // would hang the tool call forever.
         let (ws, _) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokio_tungstenite::connect_async(ws_url),
+            connect_async(ws_url),
         )
         .await
         .map_err(|_| FetchError::ghost("cdp connect: ws handshake timeout"))?
@@ -60,8 +64,8 @@ impl Cdp {
         let (write, mut read) = ws.split();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let (events_tx, _) = broadcast::channel(256);
         let pending_task = Arc::clone(&pending);
+        let (events_tx, _) = broadcast::channel(256);
         let events_task = events_tx.clone();
         tokio::spawn(async move {
             while let Some(Ok(msg)) = read.next().await {
@@ -97,6 +101,21 @@ impl Cdp {
         method: &str,
         params: Value,
     ) -> Result<Value, FetchError> {
+        self.call_with_timeout(session, method, params, 20).await
+    }
+
+    /// Call with an explicit response timeout (seconds). The ghost
+    /// hot path uses short bounds so one queued/deferred response
+    /// costs a single poll iteration instead of the whole render
+    /// window; detached warmup traffic uses longer bounds so late
+    /// responses still land cleanly and free their pending slot.
+    pub async fn call_with_timeout(
+        &self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        timeout_secs: u64,
+    ) -> Result<Value, FetchError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(s) = session {
@@ -110,7 +129,7 @@ impl Cdp {
                 .await
                 .map_err(|e| FetchError::ghost(format!("cdp send: {e}")))?;
         }
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(20), rx)
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
             .await
             .map_err(|_| FetchError::ghost(format!("cdp timeout: {method}")))?
             .map_err(|_| FetchError::ghost(format!("cdp dropped: {method}")))?;
@@ -207,18 +226,15 @@ impl Cdp {
                             .call(
                                 Some(&session2),
                                 "Fetch.failRequest",
-                                json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
+                                json!({
+                                    "requestId": request_id,
+                                    "errorReason": "BlockedByClient"
+                                }),
                             )
                             .await;
                     }
                 });
             }
         })
-    }
-
-    /// Alias for `spawn_fetch_guard` — covers alternative naming
-    /// expectations (request-guard vs fetch-guard).
-    pub fn spawn_request_guard(&self, session: String) -> tokio::task::JoinHandle<()> {
-        self.spawn_fetch_guard(session)
     }
 }
