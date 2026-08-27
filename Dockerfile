@@ -144,6 +144,14 @@ WORKDIR /home/donsetch
 # The server resolves it as $HOME/.cache/donsetch (XDG_CACHE_HOME is
 # honoured too); no env var is needed. VOLUME makes plain `docker run`
 # persist it in an anonymous volume.
+
+# Chromium's sandbox cannot initialize inside a default Docker container
+# (no unprivileged user namespaces): the browser dies at launch before the
+# DevTools handshake. Upstream's documented container escape hatch
+# (`DONGHOST_NO_SANDBOX=1`, see ghost docs) is therefore the correct
+# default for this image. The container boundary + non-root user provide
+# the isolation the sandbox would on a host.
+ENV DONGHOST_NO_SANDBOX=1
 VOLUME /home/donsetch/.cache/donsetch
 
 # Set Chrome path if Chrome was installed
