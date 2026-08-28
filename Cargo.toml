@@ -66,7 +66,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [build-dependencies]
 sha2 = "0.11"
-lzma-rust2 = "0.11"
+lzma-rust2 = "0.15"
 
 [profile.release]
 lto = "fat"
