@@ -110,6 +110,22 @@ pub struct Searcher {
     prewarms: std::sync::Arc<std::sync::Mutex<PrewarmCache>>,
 }
 
+#[cfg(feature = "rerank")]
+/// Run synchronous ranking outside Tokio's async worker set.
+///
+/// Semantic reranking can enter ONNX inference and wait on the shared session
+/// mutex. The ranking API stays synchronous, so the blocking pool is the narrow
+/// boundary that keeps unrelated async work progressing.
+async fn run_blocking_ranking<F, T>(job: F) -> Result<T, FetchError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(job)
+        .await
+        .map_err(|e| FetchError::Http(format!("search: ranking worker failed: {e}")))
+}
+
 /// v3 F1: search→fetch warm handoff store.
 pub struct PrewarmCache {
     entries: HashMap<String, PrewarmEntry>,
@@ -602,6 +618,15 @@ impl Searcher {
         // max_results for the response. Without this, a first
         // search with max=2 caches only 2 results, and a later
         // search with max=10 returns the stale 2 from cache.
+        // With semantic reranking enabled, merge includes synchronous ONNX
+        // inference. Core builds keep the existing inline fast path below.
+        #[cfg(feature = "rerank")]
+        let mut results = {
+            let query = query.to_string();
+            run_blocking_ranking(move || rank::merge(&per_engine, &query, intent, &trust, 12))
+                .await?
+        };
+        #[cfg(not(feature = "rerank"))]
         let mut results = rank::merge(&per_engine, query, intent, &trust, 12);
         let weak = rank::is_weak(&results, total);
 
@@ -1255,6 +1280,22 @@ impl Drop for InflightGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "rerank")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_ranking_keeps_the_async_executor_responsive() {
+        let (tick_sender, tick_receiver) = std::sync::mpsc::channel();
+
+        let (worker_result, ()) = tokio::join!(
+            run_blocking_ranking(move || tick_receiver.recv_timeout(Duration::from_secs(1))),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tick_sender.send(()).expect("blocking worker should wait");
+            }
+        );
+
+        assert!(worker_result.expect("blocking job should join").is_ok());
+    }
 
     #[test]
     fn governor_shrinks_width_under_stress() {
