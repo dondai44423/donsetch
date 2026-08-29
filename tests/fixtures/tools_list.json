@@ -112,7 +112,7 @@
       "name": "web_fetch"
     },
     {
-      "description": "Web search — returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nResults list random handles: each result shows an S-handle (fetch the S-handle shown next to a result; raw URLs in structuredContent for citation). Domains known to need the browser carry a ⚠ needs-browser hint — pick a faster source or budget time before fetching. A *degraded:* footer names any engines that failed — silent quality loss is visible.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over; structuredContent.provider names what served (null = local keyless).\n\ndeadline_ms caps the fan-out (honest deadline error, never a hang).\n\nResponse: numbered markdown list (N. **Title** — domain / snippet / S-handle / engines+score). structuredContent = {intent, weak, cached, elapsed_ms, provider, results:[{title,url,snippet,score,consensus,engines}], engines:[{engine,status,hits,ms}]}. Key signals: weak=true = low consensus, treat with care; consensus = independent engines agreeing (authority); engines[].status = per-engine health.\n\nAfter search: fetch the best result via its S-handle — enrichment pre-fetches top results, so the next fetch is near-instant (prewarmed_by_search=true)",
+      "description": "Web search — returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nResults list random handles: each result shows an S-handle (fetch the S-handle shown next to a result; raw URLs in structuredContent for citation). Domains known to need the browser carry a ⚠ needs-browser hint — pick a faster source or budget time before fetching. A *degraded:* footer names any engines that failed — silent quality loss is visible.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over; structuredContent.provider names what served (null = local keyless).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nSingle-query response: numbered markdown list and structuredContent = {intent, weak, cached, elapsed_ms, provider, results:[...], engines:[...]}. Multi-query response: one Search section per query and structuredContent = {query_count, ok, errors, elapsed_ms, searches:[{query, ...single-query fields}]}. Key signals: weak=true = low consensus, treat with care; consensus = independent engines agreeing (authority); engines[].status = per-engine health.\n\nAfter search: fetch the best result via its S-handle — enrichment pre-fetches top results, so the next fetch is near-instant (prewarmed_by_search=true)",
       "inputSchema": {
         "properties": {
           "deadline_ms": {
@@ -138,6 +138,14 @@
           "query": {
             "description": "Search query.",
             "type": "string"
+          },
+          "query_variants": {
+            "description": "Optional alternate formulations of the same information need (max 2). DonSeTch searches the base query and variants in parallel and returns one clearly separated result set per query. Use for ambiguous, multilingual, exploratory, or hard-to-recall searches; never put a guessed answer in a variant.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 2,
+            "type": "array"
           }
         },
         "required": [

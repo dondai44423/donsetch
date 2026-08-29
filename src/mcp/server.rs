@@ -3276,14 +3276,18 @@ async fn bind_search_handles(
     daemon: &Arc<Daemon>,
     out: &crate::search::SearchOutcome,
 ) -> Vec<String> {
+    let urls: Vec<String> = out.results.iter().map(|r| r.url.clone()).collect();
+    bind_search_urls(daemon, &urls).await
+}
+
+async fn bind_search_urls(daemon: &Arc<Daemon>, urls: &[String]) -> Vec<String> {
     // When handles are disabled (DONSETCH_URL_HANDLES=off), return
     // empty vec — search results show raw URLs instead.
     if !crate::handles::handles_enabled() {
         return Vec::new();
     }
-    let urls: Vec<String> = out.results.iter().map(|r| r.url.clone()).collect();
     let mut ht = daemon.handles.lock().await;
-    let hs = ht.set_search_results(&urls);
+    let hs = ht.set_search_results(urls);
     // Search handles are in-memory only — no flush.
     hs
 }
@@ -3293,9 +3297,9 @@ async fn search_tool(daemon: &Arc<Daemon>, args: &Value, mut ctx: Option<ToolCtx
         .get("deadline_ms")
         .and_then(Value::as_u64)
         .map(|ms| std::time::Duration::from_millis(ms.clamp(500, 600_000)));
-    let query = match args.get("query").and_then(Value::as_str) {
-        Some(q) if !q.trim().is_empty() => q.to_string(),
-        _ => return tool_error("search: query required"),
+    let queries = match parse_search_queries(args) {
+        Ok(queries) => queries,
+        Err(message) => return tool_error(message),
     };
     let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(7) as usize;
     let intent = match args.get("intent").and_then(Value::as_str) {
@@ -3307,13 +3311,65 @@ async fn search_tool(daemon: &Arc<Daemon>, args: &Value, mut ctx: Option<ToolCtx
         _ => None,
     };
 
-    run_with_budget(
-        search_inner(daemon, &query, max, intent),
-        deadline,
-        ctx.as_mut(),
-        || search_deadline_error(&query),
-    )
-    .await
+    if queries.len() == 1 {
+        let query = &queries[0];
+        run_with_budget(
+            search_inner(daemon, query, max, intent),
+            deadline,
+            ctx.as_mut(),
+            || search_deadline_error(query),
+        )
+        .await
+    } else {
+        let deadline_queries = queries.clone();
+        run_with_budget(
+            search_batch_inner(daemon, &queries, max, intent),
+            deadline,
+            ctx.as_mut(),
+            move || search_batch_deadline_error(&deadline_queries),
+        )
+        .await
+    }
+}
+
+/// Parse the required base query and at most two explicit alternate
+/// formulations. DonSeTch never invents variants: the calling agent has the
+/// task context and can express ambiguity without a local language model.
+fn parse_search_queries(args: &Value) -> Result<Vec<String>, String> {
+    let base = args
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|query| !query.trim().is_empty())
+        .ok_or_else(|| "search: query required".to_string())?;
+    // Preserve the original base query exactly. This keeps the established
+    // single-query path and cache key behavior unchanged.
+    let mut queries = vec![base.to_string()];
+
+    let Some(variants) = args.get("query_variants") else {
+        return Ok(queries);
+    };
+    let variants = variants
+        .as_array()
+        .ok_or_else(|| "search: query_variants must be an array of strings".to_string())?;
+    if variants.len() > 2 {
+        return Err("search: query_variants accepts at most 2 entries".to_string());
+    }
+    for variant in variants {
+        let variant = variant
+            .as_str()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .ok_or_else(|| {
+                "search: every query_variants entry must be a non-empty string".to_string()
+            })?;
+        if !queries
+            .iter()
+            .any(|existing| existing.trim().eq_ignore_ascii_case(variant))
+        {
+            queries.push(variant.to_string());
+        }
+    }
+    Ok(queries)
 }
 
 /// Honest deadline error for search (v3 D1).
@@ -3331,6 +3387,29 @@ fn search_deadline_error(query: &str) -> Value {
     )
 }
 
+fn search_batch_deadline_error(queries: &[String]) -> Value {
+    let mut trace = Trace::default();
+    trace.step("search", "query-variants", "deadline", 0);
+    tool_error_structured(
+        format!(
+            "search: deadline_ms exceeded while running {} query variants",
+            queries.len()
+        ),
+        "transient",
+        Some(json!({
+            "queries": queries,
+            "escalation": trace.value(),
+            "next_action": "retry with a higher deadline_ms, fewer query_variants, or a single query",
+        })),
+    )
+}
+
+#[derive(Debug)]
+struct SearchFailure {
+    cause: String,
+    byok_tried: bool,
+}
+
 /// The search pipeline: BYOK providers (if configured) with
 /// local-engine fallback, or local-first when keys say so.
 /// No deadline/cancel logic here — the wrapper owns the clock.
@@ -3340,6 +3419,134 @@ async fn search_inner(
     max: usize,
     intent: Option<Intent>,
 ) -> Value {
+    match search_outcome(daemon, query, max, intent).await {
+        Ok(out) => render_search_outcome(daemon, &out, query).await,
+        Err(failure) => search_error(query, &failure.cause, failure.byok_tried),
+    }
+}
+
+async fn render_search_outcome(
+    daemon: &Arc<Daemon>,
+    out: &crate::search::SearchOutcome,
+    query: &str,
+) -> Value {
+    let hs = bind_search_handles(daemon, out).await;
+    let hints = route_hints(daemon, out).await;
+    let md = search::render_markdown(out, query, Some(&hs), &hints);
+    let meta = search::render_meta(out);
+    json!({
+        "content": [{ "type": "text", "text": md }],
+        "structuredContent": meta,
+    })
+}
+
+/// Execute explicit query variants concurrently but keep every result set
+/// separate. Cross-query score fusion would create a second, unbenchmarked
+/// ranker; grouped evidence lets the calling model compare formulations while
+/// each query retains DonSeTch's existing ranking semantics.
+async fn search_batch_inner(
+    daemon: &Arc<Daemon>,
+    queries: &[String],
+    max: usize,
+    intent: Option<Intent>,
+) -> Value {
+    let started = std::time::Instant::now();
+    let futures = queries
+        .iter()
+        .map(|query| search_outcome(daemon, query, max, intent));
+    let outcomes = futures_util::future::join_all(futures).await;
+    let ok = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    if ok == 0 {
+        let errors = queries
+            .iter()
+            .zip(outcomes.iter())
+            .filter_map(|(query, outcome)| match outcome {
+                Ok(_) => None,
+                Err(failure) => Some(json!({"query": query, "error": failure.cause})),
+            })
+            .collect::<Vec<_>>();
+        return tool_error_structured(
+            format!("search: all {} query variants failed", queries.len()),
+            "transient",
+            Some(json!({
+                "queries": queries,
+                "errors": errors,
+                "next_action": "retry once, then reduce to the strongest single query",
+            })),
+        );
+    }
+
+    // Mint one global set of handles so every S-handle in every section keeps
+    // resolving after the batch completes. Binding each sub-search separately
+    // would leave clients with ambiguous per-section numbering/state.
+    let urls = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .flat_map(|out| out.results.iter().map(|result| result.url.clone()))
+        .collect::<Vec<_>>();
+    let handles = bind_search_urls(daemon, &urls).await;
+    let mut handle_offset = 0usize;
+    let mut markdown = format!(
+        "*{} explicit query formulations searched in parallel; result sets are kept separate.*\n\n",
+        queries.len()
+    );
+    let mut searches = Vec::with_capacity(queries.len());
+
+    for (query, outcome) in queries.iter().zip(outcomes.iter()) {
+        if !markdown.ends_with("\n\n") {
+            markdown.push_str("\n\n");
+        }
+        match outcome {
+            Ok(out) => {
+                let count = out.results.len();
+                let query_handles = if handles.is_empty() {
+                    None
+                } else {
+                    Some(&handles[handle_offset..handle_offset + count])
+                };
+                handle_offset += count;
+                let hints = route_hints(daemon, out).await;
+                markdown.push_str(&search::render_markdown(out, query, query_handles, &hints));
+                markdown.push_str("\n---\n");
+                let mut meta = search::render_meta(out);
+                meta["query"] = json!(query);
+                searches.push(meta);
+            }
+            Err(failure) => {
+                markdown.push_str(&format!(
+                    "# Search: {query}\n\n*failed: {}*\n\n---\n",
+                    failure.cause
+                ));
+                searches.push(json!({
+                    "query": query,
+                    "error": failure.cause,
+                    "results": [],
+                }));
+            }
+        }
+    }
+
+    json!({
+        "content": [{ "type": "text", "text": markdown }],
+        "structuredContent": {
+            "query_count": queries.len(),
+            "ok": ok,
+            "errors": queries.len() - ok,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "searches": searches,
+        },
+    })
+}
+
+/// The search pipeline without presentation. Keeping acquisition separate lets
+/// multi-query mode share one deadline and one final handle table while the
+/// single-query response stays byte-for-byte compatible.
+async fn search_outcome(
+    daemon: &Arc<Daemon>,
+    query: &str,
+    max: usize,
+    intent: Option<Intent>,
+) -> Result<crate::search::SearchOutcome, SearchFailure> {
     // Reload from disk first — picks up keys added/removed
     // via CLI while the daemon was running.
     daemon.byok.reload();
@@ -3349,16 +3556,7 @@ async fn search_inner(
     // BYOK-first mode: try providers, fall back to local.
     if byok_configured && !local_first {
         match daemon.byok.search(query, max, intent).await {
-            Ok(out) => {
-                let hs = bind_search_handles(daemon, &out).await;
-                let hints = route_hints(daemon, &out).await;
-                let md = search::render_markdown(&out, query, Some(&hs), &hints);
-                let meta = search::render_meta(&out);
-                return json!({
-                    "content": [{ "type": "text", "text": md }],
-                    "structuredContent": meta,
-                });
-            }
+            Ok(out) => return Ok(out),
             Err(e) => {
                 if std::env::var_os("DONSEEK_DEBUG").is_some() {
                     eprintln!("[byok] all providers exhausted, falling back to local: {e}");
@@ -3370,16 +3568,7 @@ async fn search_inner(
 
     // Local search (primary in local-first mode, fallback in BYOK-first).
     match daemon.searcher.search(query, max, intent).await {
-        Ok(out) => {
-            let hs = bind_search_handles(daemon, &out).await;
-            let hints = route_hints(daemon, &out).await;
-            let md = search::render_markdown(&out, query, Some(&hs), &hints);
-            let meta = search::render_meta(&out);
-            json!({
-                "content": [{ "type": "text", "text": md }],
-                "structuredContent": meta,
-            })
-        }
+        Ok(out) => Ok(out),
         Err(e) => {
             // Local failed — if BYOK is configured and we're in
             // local-first mode, try BYOK as a last resort.
@@ -3388,20 +3577,17 @@ async fn search_inner(
                     eprintln!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
                 match daemon.byok.search(query, max, intent).await {
-                    Ok(out) => {
-                        let hs = bind_search_handles(daemon, &out).await;
-                        let hints = route_hints(daemon, &out).await;
-                        let md = search::render_markdown(&out, query, Some(&hs), &hints);
-                        let meta = search::render_meta(&out);
-                        json!({
-                            "content": [{ "type": "text", "text": md }],
-                            "structuredContent": meta,
-                        })
-                    }
-                    Err(e2) => search_error(query, &format!("local ({e}); byok ({e2})"), true),
+                    Ok(out) => Ok(out),
+                    Err(e2) => Err(SearchFailure {
+                        cause: format!("local ({e}); byok ({e2})"),
+                        byok_tried: true,
+                    }),
                 }
             } else {
-                search_error(query, &e.to_string(), false)
+                Err(SearchFailure {
+                    cause: e.to_string(),
+                    byok_tried: false,
+                })
             }
         }
     }
@@ -3641,6 +3827,57 @@ mod stitch_tests {
             "# My Story\nhttps://example.com/p2\n> Same description\n\nPart two content here.";
         assert_eq!(strip_part_frontmatter(part), "Part two content here.");
         assert_eq!(strip_part_frontmatter("Just content"), "Just content");
+    }
+}
+
+#[cfg(test)]
+mod search_variant_tests {
+    use super::parse_search_queries;
+    use serde_json::json;
+
+    #[test]
+    fn single_query_contract_is_unchanged() {
+        assert_eq!(
+            parse_search_queries(&json!({"query": "  rust ownership  "})).unwrap(),
+            vec!["  rust ownership  "]
+        );
+    }
+
+    #[test]
+    fn variants_are_trimmed_and_case_insensitive_duplicates_are_removed() {
+        assert_eq!(
+            parse_search_queries(&json!({
+                "query": "  rust async trait patterns  ",
+                "query_variants": [
+                    "async fn in trait rust",
+                    "RUST ASYNC TRAIT PATTERNS"
+                ]
+            }))
+            .unwrap(),
+            vec!["  rust async trait patterns  ", "async fn in trait rust"]
+        );
+    }
+
+    #[test]
+    fn variants_are_bounded_and_strictly_typed() {
+        assert!(
+            parse_search_queries(&json!({
+                "query": "base",
+                "query_variants": ["one", "two", "three"]
+            }))
+            .unwrap_err()
+            .contains("at most 2")
+        );
+        assert!(
+            parse_search_queries(&json!({"query": "base", "query_variants": "one"}))
+                .unwrap_err()
+                .contains("array of strings")
+        );
+        assert!(
+            parse_search_queries(&json!({"query": "base", "query_variants": [""]}))
+                .unwrap_err()
+                .contains("non-empty string")
+        );
     }
 }
 
