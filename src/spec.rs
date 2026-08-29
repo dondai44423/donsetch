@@ -37,6 +37,8 @@ pub enum ParamKind {
     Enum(&'static [&'static str]),
     /// JSON array of strings; CLI repeatable + comma-splittable.
     StrList,
+    /// Bounded JSON array of strings; CLI repeatable + comma-splittable.
+    StrListMax(usize),
     /// JSON boolean; CLI flag whose presence sets `true`.
     SetTrue,
     /// JSON boolean; CLI flag whose presence sets `false`
@@ -259,6 +261,14 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         help: "Search query.",
     },
     ParamSpec {
+        name: "query_variants",
+        flag: "query-variant",
+        kind: ParamKind::StrListMax(2),
+        cli: CliKind::Flag,
+        required: false,
+        help: "Optional alternate formulations of the same information need (max 2). DonSeTch searches the base query and variants in parallel and returns one clearly separated result set per query. Use for ambiguous, multilingual, exploratory, or hard-to-recall searches; never put a guessed answer in a variant.",
+    },
+    ParamSpec {
         name: "max_results",
         flag: "max-results",
         kind: ParamKind::Usize,
@@ -422,12 +432,13 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_search",
         cli_cmd: "search",
         summary: "Web search — 5 keyless engines merged + reranked, or your API keys",
-        description: "Web search — returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nResults list random handles: each result shows an S-handle (fetch the S-handle shown next to a result; raw URLs in structuredContent for citation). Domains known to need the browser carry a ⚠ needs-browser hint — pick a faster source or budget time before fetching. A *degraded:* footer names any engines that failed — silent quality loss is visible.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over; structuredContent.provider names what served (null = local keyless).\n\ndeadline_ms caps the fan-out (honest deadline error, never a hang).\n\nResponse: numbered markdown list (N. **Title** — domain / snippet / S-handle / engines+score). structuredContent = {intent, weak, cached, elapsed_ms, provider, results:[{title,url,snippet,score,consensus,engines}], engines:[{engine,status,hits,ms}]}. Key signals: weak=true = low consensus, treat with care; consensus = independent engines agreeing (authority); engines[].status = per-engine health.\n\nAfter search: fetch the best result via its S-handle — enrichment pre-fetches top results, so the next fetch is near-instant (prewarmed_by_search=true)",
+        description: "Web search — returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nResults list random handles: each result shows an S-handle (fetch the S-handle shown next to a result; raw URLs in structuredContent for citation). Domains known to need the browser carry a ⚠ needs-browser hint — pick a faster source or budget time before fetching. A *degraded:* footer names any engines that failed — silent quality loss is visible.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over; structuredContent.provider names what served (null = local keyless).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nSingle-query response: numbered markdown list and structuredContent = {intent, weak, cached, elapsed_ms, provider, results:[...], engines:[...]}. Multi-query response: one Search section per query and structuredContent = {query_count, ok, errors, elapsed_ms, searches:[{query, ...single-query fields}]}. Key signals: weak=true = low consensus, treat with care; consensus = independent engines agreeing (authority); engines[].status = per-engine health.\n\nAfter search: fetch the best result via its S-handle — enrichment pre-fetches top results, so the next fetch is near-instant (prewarmed_by_search=true)",
         params: SEARCH_PARAMS,
         examples: &[
             "donsetch search rust async trait objects",
             "donsetch search \"exact phrase\" --intent code",
             "donsetch search site:github.com tokio --max-results 10",
+            "donsetch search \"Donna Luisa Suite 9 access\" --query-variant \"Donna Luisa Suite 9 stairs\"",
         ],
     },
     ToolSpec {
@@ -477,15 +488,18 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
                 continue;
             }
             ParamKind::Usize => "integer",
-            ParamKind::StrList | ParamKind::JsonStr => "array",
+            ParamKind::StrList | ParamKind::StrListMax(_) | ParamKind::JsonStr => "array",
             ParamKind::SetTrue | ParamKind::SetFalse => "boolean",
         };
         schema.insert("type".into(), json!(ty));
         if let ParamKind::Enum(variants) = p.kind {
             schema.insert("enum".into(), json!(variants));
         }
-        if p.kind == ParamKind::StrList {
+        if matches!(p.kind, ParamKind::StrList | ParamKind::StrListMax(_)) {
             schema.insert("items".into(), json!({ "type": "string" }));
+        }
+        if let ParamKind::StrListMax(max) = p.kind {
+            schema.insert("maxItems".into(), json!(max));
         }
         if p.kind == ParamKind::JsonStr {
             schema.insert("items".into(), json!({ "type": "object" }));
@@ -565,6 +579,10 @@ fn cli_arg(p: &ParamSpec) -> Arg {
                     .value_name("GLOB")
                     .action(ArgAction::Append)
                     .value_delimiter(','),
+                ParamKind::StrListMax(_) => arg
+                    .value_name("VALUE")
+                    .action(ArgAction::Append)
+                    .value_delimiter(','),
                 ParamKind::SetTrue => arg.action(ArgAction::SetTrue),
                 ParamKind::SetFalse => arg.action(ArgAction::SetFalse),
             }
@@ -611,7 +629,7 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
                         map.insert(p.name.into(), json!(v));
                     }
                 }
-                ParamKind::StrList => {
+                ParamKind::StrList | ParamKind::StrListMax(_) => {
                     let items: Vec<&str> = m
                         .get_many::<String>(p.name)
                         .map(|v| v.map(String::as_str).collect())
@@ -634,4 +652,52 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
         }
     }
     Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search_tool() -> &'static ToolSpec {
+        TOOLS
+            .iter()
+            .find(|tool| tool.name == "web_search")
+            .expect("web_search spec")
+    }
+
+    #[test]
+    fn search_variants_use_a_strict_array_schema() {
+        let schema = mcp_schema(search_tool());
+        let variants = &schema["inputSchema"]["properties"]["query_variants"];
+        assert_eq!(variants["type"], "array");
+        assert_eq!(variants["items"]["type"], "string");
+        assert_eq!(variants["maxItems"], 2);
+        assert!(
+            !schema["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("query_variants"))
+        );
+    }
+
+    #[test]
+    fn cli_collects_repeated_search_variants() {
+        let tool = search_tool();
+        let matches = cli_command(tool)
+            .try_get_matches_from([
+                "search",
+                "Donna Luisa Suite 9 access",
+                "--query-variant",
+                "Donna Luisa Suite 9 stairs",
+                "--query-variant",
+                "Donna Luisa Suite 9 gradini",
+            ])
+            .expect("valid search CLI");
+        let args = matches_to_json(tool, &matches);
+        assert_eq!(args["query"], "Donna Luisa Suite 9 access");
+        assert_eq!(
+            args["query_variants"],
+            json!(["Donna Luisa Suite 9 stairs", "Donna Luisa Suite 9 gradini"])
+        );
+    }
 }
