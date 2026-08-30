@@ -112,6 +112,14 @@ pub async fn search(
     if status == 401 || status == 403 {
         return Err(KeyError::InvalidKey);
     }
+    if status == 402 {
+        return Err(KeyError::CreditDepleted);
+    }
+    // SerpApi is documented to use 429 for both per-second rate
+    // limiting and monthly-plan exhaustion; message-sniffing here
+    // (like serper.rs's generic 4xx branch below) is unverified
+    // against a live account — adjust the substrings if a real
+    // account's wording differs.
     if status == 429 {
         let lower = text.to_lowercase();
         if lower.contains("run out") || lower.contains("plan") || lower.contains("quota") {
