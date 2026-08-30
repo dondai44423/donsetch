@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SerpApi BYOK provider:** `donsetch keys add serpapi <key>` wires
+  up [SerpApi](https://serpapi.com) as a Google-SERP BYOK backend,
+  alongside the existing Serper.dev provider. Routes by intent like
+  the other providers: `google_scholar` engine for paper queries,
+  `tbm=nws` for news.
+
 ### Fixed
 
 - **Xvfb install hint printed on macOS/Windows every session

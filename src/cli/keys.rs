@@ -9,7 +9,7 @@
 //!   donsetch keys import <path>            Import keys from a file
 //!   donsetch keys clear                     Remove all keys
 //!
-//! Providers: tavily, exa, serper, tinyfish, parallel, brightdata, unlocker
+//! Providers: tavily, exa, serper, serpapi, tinyfish, parallel, brightdata, unlocker
 
 use super::{bold, dim, green, red};
 
@@ -465,6 +465,7 @@ fn print_help() {
     println!("    tavily     Tavily Search API (api.tavily.com)");
     println!("    exa        Exa AI Search (api.exa.ai)");
     println!("    serper     Serper.dev Google SERP (google.serper.dev)");
+    println!("    serpapi    SerpApi Google SERP (serpapi.com)");
     println!("    tinyfish   TinyFish Search (api.search.tinyfish.ai)");
     println!("    parallel   Parallel AI Search (api.parallel.ai) — fast mode");
     println!("    brightdata Bright Data SERP API (api.brightdata.com)");

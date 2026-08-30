@@ -1,7 +1,7 @@
 //! Bring Your Own Keys (BYOK) — provider search with key rotation.
 //!
 //! When the user configures API keys for external search providers
-//! (Tavily, Exa, Serper.dev, TinyFish, Parallel AI, Bright Data), the entire local 5-engine
+//! (Tavily, Exa, Serper.dev, SerpApi, TinyFish, Parallel AI, Bright Data), the entire local 5-engine
 //! search system is bypassed. The provider handles everything:
 //! search, IP, rate limiting. DonSeTch just sends the query and
 //! normalizes the results.
@@ -16,6 +16,7 @@
 mod brightdata;
 mod exa;
 mod parallel;
+mod serpapi;
 mod serper;
 pub mod store;
 mod tavily;
@@ -254,6 +255,7 @@ async fn dispatch(
         "tavily" => tavily::search(client, key, query, max, intent).await,
         "exa" => exa::search(client, key, query, max, intent).await,
         "serper" => serper::search(client, key, query, max, intent).await,
+        "serpapi" => serpapi::search(client, key, query, max, intent).await,
         "tinyfish" => tinyfish::search(client, key, query, max, intent).await,
         "parallel" => parallel::search(client, key, query, max, intent).await,
         "brightdata" => brightdata::search(client, key, query, max, intent).await,
