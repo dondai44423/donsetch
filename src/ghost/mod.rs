@@ -302,7 +302,7 @@ fn playwright_candidates_for_root(root: &std::path::Path) -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn known_chrome_paths() -> Vec<PathBuf> {
-    [
+    let mut paths: Vec<PathBuf> = [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
         "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
@@ -1510,6 +1510,11 @@ mod sandbox_tests {
         );
     }
 
+    // Exercises the chrome-linux64/chrome-linux suffixes returned by
+    // playwright_entry_suffixes() on this cfg — see that function's
+    // own gate. Fails on macOS/Windows if run there since those
+    // platforms probe a different suffix set entirely.
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn playwright_discovers_chrome_linux64_layout() {
         // Regression for issue #84: Playwright moved Chromium into
@@ -1546,6 +1551,26 @@ mod sandbox_tests {
             "headless shell, firefox and webkit must never be discovered as Chrome"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn known_chrome_paths_includes_hardcoded_app_bundles() {
+        // Regression: known_chrome_paths() failed to compile on
+        // macOS (E0425: cannot find value `paths`) after the
+        // Playwright-discovery addition dropped the `let mut paths
+        // =` binding on the hardcoded-paths collect().
+        let paths = known_chrome_paths();
+        for expected in [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == std::path::Path::new(expected)),
+                "missing hardcoded path {expected}, got: {paths:?}"
+            );
+        }
     }
 
     #[test]

@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **macOS build broken by the Playwright-discovery change above:**
+  `known_chrome_paths()` on macOS referenced an undefined `paths`
+  variable (`E0425`) — the hardcoded-app-bundle list's `.collect()`
+  was never bound to a `let`, so the build failed on every macOS
+  target. Also un-broke `playwright_discovers_chrome_linux64_layout`,
+  which wasn't OS-gated and failed on Windows/macOS CI runners since
+  it asserts against the Linux-only `chrome-linux64` layout.
 - **Xvfb install hint printed on macOS/Windows every session
   (issue #81):** the "install xvfb" advice belongs to Linux-family
   systems only; headful off-screen Chrome is the native mode on
