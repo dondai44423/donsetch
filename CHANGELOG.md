@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PLAYWRIGHT_BROWSERS_PATH` and `XDG_CACHE_HOME`, and does it via
   one shared helper on all three platforms. The headless-shell
   registry stays excluded on purpose (strictly weaker CDP target).
+- **Selectable browser backend:** `DONSETCH_BROWSER_BACKEND` now supports
+  `chromium` for the original shipped behavior, `headless` to force the
+  original Chromium binary into `--headless=new`, and `cloakbrowser` for the
+  CloakBrowser backend. `auto` remains available for automatic resolution.
+- **Explicit CloakBrowser backend:** DonGhost resolves Chromium versus
+  CloakBrowser explicitly, accepts `CLOAKBROWSER_BINARY_PATH` without network
+  access, and supports opt-in (`DONSETCH_CLOAK_AUTO_DOWNLOAD=1`) public binary
+  installation with signed-manifest, version, checksum, and archive-path
+  verification. Source/path/version and deep fingerprint status are visible in
+  `doctor` and `status`; CloakBrowser payloads remain outside releases and
+  Docker images.
 
 ### Fixed
 

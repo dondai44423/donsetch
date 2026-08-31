@@ -93,8 +93,14 @@ impl GhostManager {
             .map(|p| p.to_string_lossy().contains("com.termux"))
             .unwrap_or(false);
 
-        // Start Xvfb on Linux if available (and not Termux).
-        let xvfb = if !is_termux && super::xvfb::is_available() {
+        // A forced headless backend does not need a virtual display. Avoid
+        // starting Xvfb so the selection is explicit in both process and args.
+        let xvfb = if super::cloak::headless_mode_requested() {
+            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                eprintln!("[ghost] headless backend selected, skipping Xvfb");
+            }
+            None
+        } else if !is_termux && super::xvfb::is_available() {
             match super::xvfb::Xvfb::start().await {
                 Ok(xvfb) => {
                     let disp = xvfb.display_env();

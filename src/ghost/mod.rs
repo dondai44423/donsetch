@@ -16,6 +16,7 @@
 pub mod actions;
 pub mod cache;
 pub mod cdp;
+pub mod cloak;
 pub mod manager;
 pub mod ops;
 pub mod proc;
@@ -106,26 +107,47 @@ pub fn sandbox_opt_in_enabled() -> bool {
     std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1")
 }
 
-/// Locate a Chrome-family binary. Env override first, then
-/// platform-specific known paths, then PATH search. No `which`
-/// subprocess — works on Linux, macOS, and Windows.
+/// Resolve the Chromium-family binary used by DonGhost.
+///
+/// `DONSETCH_BROWSER_BACKEND=chromium|headless|cloakbrowser|auto` selects the
+/// backend. `chromium` preserves the original headful/off-screen behavior;
+/// `headless` uses the same original binary with `--headless=new` forced.
+/// Auto mode prefers a local CloakBrowser override, then system Chromium;
+/// CloakBrowser downloading is opt-in via `DONSETCH_CLOAK_AUTO_DOWNLOAD=1`.
+pub fn resolve_browser() -> Result<cloak::BrowserResolution, FetchError> {
+    cloak::resolve_browser().map_err(FetchError::ghost)
+}
+
+/// Resolve the configured browser without downloading a public binary.
+pub fn resolve_browser_without_download() -> Result<cloak::BrowserResolution, FetchError> {
+    cloak::resolve_browser_without_download().map_err(FetchError::ghost)
+}
+
+/// Locate the selected browser binary. Kept as the narrow compatibility API
+/// for existing profile/version probing and status callers.
 pub fn chrome_binary() -> Result<String, FetchError> {
+    Ok(resolve_browser()?.path.to_string_lossy().into_owned())
+}
+
+fn chromium_binary() -> Result<String, String> {
     if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        return Ok(p.to_string_lossy().into_owned());
+        let path = PathBuf::from(p);
+        if !is_executable(&path) {
+            return Err(format!(
+                "DONGHOST_CHROME is not an executable: {}",
+                path.display()
+            ));
+        }
+        return Ok(path.to_string_lossy().into_owned());
     }
-    // Known install locations (most reliable, no PATH needed).
     for path in known_chrome_paths() {
         if is_executable(&path) {
-            // Snap wrappers (/snap/bin/chromium → /usr/bin/snap) are
-            // executable but don't reliably pass CDP flags through
-            // Snap's confinement. Resolve to the real binary.
             if let Some(real) = resolve_snap_chrome(&path) {
                 return Ok(real.to_string_lossy().into_owned());
             }
             return Ok(path.to_string_lossy().into_owned());
         }
     }
-    // PATH search.
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             for name in chrome_names() {
@@ -136,9 +158,7 @@ pub fn chrome_binary() -> Result<String, FetchError> {
             }
         }
     }
-    Err(FetchError::ghost(
-        "no chromium/chrome binary found (set DONGHOST_CHROME)",
-    ))
+    Err("no chromium/chrome binary found (set DONGHOST_CHROME)".into())
 }
 
 #[cfg(linux_like)]
@@ -385,8 +405,8 @@ impl Ghost {
     /// on macOS/Windows where Xvfb is unavailable.
     ///
     /// Clean by construction: no automation flags, UA pinned to
-    /// the DonShadow profile so harvested cookies stay valid
-    /// when tier 1 reuses them (cf_clearance binds IP+UA).
+    /// the DonShadow profile so harvested cookies stay valid when
+    /// tier 1 reuses them (cf_clearance binds IP+UA).
     pub async fn launch(
         profile: &BrowserProfile,
         display: Option<&str>,
@@ -395,7 +415,10 @@ impl Ghost {
         #[cfg(not(linux_like))]
         let _ = display;
 
-        let bin = chrome_binary()?;
+        let browser = tokio::task::spawn_blocking(resolve_browser)
+            .await
+            .map_err(|e| FetchError::ghost(format!("browser resolution task failed: {e}")))??;
+        let bin = browser.path.to_string_lossy().into_owned();
 
         // ── Profile lock: prevent cross-process collision ──
         // Multiple donsetch processes (CLI + MCP daemon, parallel
@@ -447,8 +470,6 @@ impl Ghost {
 
         std::fs::create_dir_all(&dir)
             .map_err(|e| FetchError::ghost(format!("profile dir: {e}")))?;
-        // Only clear stale SingletonLock files when we hold the
-        // profile lock. If we are on a temp profile the shared
         // dir's lock belongs to a LIVE Chrome; removing its
         // SingletonLock corrupts that instance's session and
         // triggers the "Something went wrong" dialog.
@@ -459,6 +480,15 @@ impl Ghost {
         }
         let mut cmd = Command::new(bin);
         let mut chrome_args: Vec<String> = default_chrome_args(&dir, profile);
+        let force_headless = browser.backend == cloak::BrowserBackend::HeadlessChromium;
+        if browser.backend == cloak::BrowserBackend::CloakBrowser {
+            let platform = match profile.platform {
+                crate::profile::Platform::Linux => "linux",
+                crate::profile::Platform::Windows => "windows",
+                crate::profile::Platform::MacOs => "macos",
+            };
+            chrome_args.push(format!("--fingerprint-platform={platform}"));
+        }
         // Opt-in escape hatch for environments where sandbox is
         // unavailable (e.g. containers without user-namespace support
         // or AppArmor restrictions). Never enabled by default —
@@ -498,7 +528,9 @@ impl Ghost {
 
         #[cfg(linux_like)]
         {
-            if let Some(disp) = display {
+            if force_headless {
+                chrome_args.push("--headless=new".into());
+            } else if let Some(disp) = display {
                 // Linux + Xvfb: headful on virtual display.
                 cmd.env("DISPLAY", disp);
                 chrome_args.push("--ozone-platform=x11".into());
@@ -510,6 +542,11 @@ impl Ghost {
                 // the only option without a display.
                 chrome_args.push("--headless=new".into());
             }
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if force_headless {
+            chrome_args.push("--headless=new".into());
         }
 
         // Unknown platforms (not Linux/Android/macOS/Windows): headless

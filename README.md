@@ -149,6 +149,46 @@ loader hang in some paths, tracked in CI).
 
 </details>
 
+### Selectable Ghost browser backend
+
+DonSeTch supports the original Chromium browser and CloakBrowser. The original
+Chromium backend remains the default behavior: headful on Xvfb/off-screen when
+available, with `--headless=new` only when no display is available.
+
+Set `DONSETCH_BROWSER_BACKEND` explicitly when choosing the runtime:
+
+```bash
+# Original Chromium backend (preserves the shipped behavior)
+DONSETCH_BROWSER_BACKEND=chromium donsetch doctor
+
+# Original Chromium binary, forced into headless mode
+DONSETCH_BROWSER_BACKEND=headless donsetch doctor --deep
+
+# CloakBrowser
+DONSETCH_BROWSER_BACKEND=cloakbrowser \
+  CLOAKBROWSER_BINARY_PATH=/path/to/chrome donsetch doctor --deep
+```
+
+Accepted aliases are `original` for `chromium` and `original-headless` for
+`headless`. `auto` is also accepted: it uses a configured local CloakBrowser
+path when present, otherwise the original Chromium backend. CloakBrowser
+downloads remain disabled unless explicitly enabled.
+
+For a local CloakBrowser build, `CLOAKBROWSER_BINARY_PATH` is used without any
+network access. Public downloads are opt-in only:
+
+```bash
+DONSETCH_BROWSER_BACKEND=cloakbrowser \
+  DONSETCH_CLOAK_AUTO_DOWNLOAD=1 donsetch doctor --deep
+```
+
+The installer downloads the platform archive from CloakBrowser's public GitHub
+release, verifies its detached Ed25519-signed `SHA256SUMS`, binds the manifest
+to the requested Chromium version, checks the archive SHA-256, rejects unsafe
+archive paths, and caches the executable below DonSeTch's cache directory.
+`CLOAKBROWSER_VERSION` pins a full numeric version. CloakBrowser binaries are
+not bundled in DonSeTch releases or Docker images.
+
 **Verify the install:**
 
 ```bash

@@ -30,10 +30,12 @@ services:
       # Optional: disable disk persistence for self-improving fetch state
       # DONSEEK_NO_DISK_STATE: "1"
 
-      # Optional: Chrome path for tier 2 browser escalation
-      # (if built with INSTALL_CHROME=true)
-      # DONGHOST_CHROME: "/usr/bin/chromium"
-
+      # Optional browser backend: auto, chromium, headless, or cloakbrowser
+      # DONSETCH_BROWSER_BACKEND: "headless"
+      # Optional local CloakBrowser binary; no download is performed by default
+      # CLOAKBROWSER_BINARY_PATH: "/opt/cloakbrowser/chrome"
+      # Opt-in public signed binary download (usually prefer a mounted path)
+      # DONSETCH_CLOAK_AUTO_DOWNLOAD: "1"
       # Optional: search proxy rotation (comma-separated)
       # DONSEEK_PROXIES: "http://proxy1:8080,socks5://proxy2:1080"
 

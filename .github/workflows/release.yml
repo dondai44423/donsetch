@@ -252,12 +252,11 @@ jobs:
           echo "OK: binary runs on non-AVX CPU (QEMU qemu64)"
           echo "$output" | head -1
 
-      # ── Package ──────────────────────────────────────────────
+      # Package only DonSeTch release assets. CloakBrowser remains a
+      # user-managed runtime dependency and is never bundled here.
       # All platforms: tar.gz. Windows includes pdfium.dll alongside
       # donsetch.exe. Using tar.gz (not zip) for all platforms means
-      # the npm install.js postinstall only needs one extraction
-      # method (tar xzf), and tar is built into Windows 10+.
-      # The binary is already stripped (strip=true in release profile).
+      # the npm install.js postinstall only needs one extraction method.
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'

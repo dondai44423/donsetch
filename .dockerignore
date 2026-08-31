@@ -48,6 +48,16 @@ docker-compose*.yml
 .dockerignore
 Dockerfile*
 
+# CloakBrowser is a user-managed runtime dependency. Never send downloaded
+# archives or binaries to Docker build context; the image only contains
+# DonSeTch itself and an optional system Chromium installation.
+cloakbrowser/
+**/cloakbrowser-*.tar.gz
+**/cloakbrowser-*.zip
+**/Chromium.app/
+**/chromium-*/chrome
+**/chromium-*/chrome.exe
+
 # Development files
 *.log
 .env.*

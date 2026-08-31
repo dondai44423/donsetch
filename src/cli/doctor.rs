@@ -114,7 +114,7 @@ pub async fn run() {
     }
 
     // 4. Chrome/Chromium.
-    report!("Chrome/Chromium", check_chrome());
+    report!("Chrome/Chromium", check_chrome().await);
 
     // 5. Xvfb (Linux headful stealth prerequisite).
     report!("Xvfb", check_xvfb());
@@ -267,22 +267,30 @@ async fn check_tls(fetcher: &Fetcher) -> CheckResult {
     }
 }
 
-fn check_chrome() -> CheckResult {
-    match crate::ghost::chrome_binary() {
-        Ok(path) => {
-            // Browser version via the shared probe — registry first
-            // (zero spawn), then a hard-capped `--version` spawn that
-            // kills the whole tree on timeout. Never opens a window,
-            // never hangs, never leaves an orphaned browser behind.
-            let version = match crate::profile::probe_installed_major() {
-                Some(major) => format!("{major}.0.0.0 (probed)"),
-                None => "unknown version".into(),
-            };
-            CheckResult::Pass(format!("{version} at {path}"))
+async fn check_chrome() -> CheckResult {
+    let result = tokio::task::spawn_blocking(crate::ghost::resolve_browser).await;
+    match result {
+        Ok(Ok(browser)) => {
+            let version = browser
+                .version
+                .map(|v| format!("{v}.0.0.0"))
+                .unwrap_or_else(|| "unknown version".into());
+            CheckResult::Pass(format!(
+                "{} at {} ({}; {})",
+                version,
+                browser.path.display(),
+                browser.backend.as_str(),
+                browser.source
+            ))
         }
-        Err(_) => CheckResult::Fail(
-            "not found".into(),
-            "Install Chrome/Chromium, or set DONGHOST_CHROME to a browser path".into(),
+        Ok(Err(error)) => CheckResult::Fail(
+            error.to_string(),
+            "Install Chromium, set DONGHOST_CHROME, or set CLOAKBROWSER_BINARY_PATH. ".to_string()
+                + "Set DONSETCH_CLOAK_AUTO_DOWNLOAD=1 to fetch the signed CloakBrowser binary.",
+        ),
+        Err(error) => CheckResult::Fail(
+            format!("browser resolution task failed: {error}"),
+            "Retry the check; browser resolution could not be started.".into(),
         ),
     }
 }
@@ -295,6 +303,10 @@ fn check_chrome() -> CheckResult {
 fn check_xvfb() -> CheckResult {
     #[cfg(linux_like)]
     {
+        // A forced headless backend deliberately does not need Xvfb.
+        if crate::ghost::cloak::headless_mode_requested() {
+            return CheckResult::Pass("not needed (headless backend)".into());
+        }
         // Termux (Android) has no X11 by default. Xvfb is not
         // needed — Ghost uses --headless=new mode.
         if std::env::var_os("PREFIX")
@@ -322,17 +334,19 @@ fn check_xvfb() -> CheckResult {
         CheckResult::Pass("not needed on this platform".into())
     }
 }
-
 /// The REAL browser test: launch Chromium exactly as tier 2
 /// would (same flags, same Xvfb dance), run the fingerprint
 /// selftest page, kill. Bounded to 40s. This is what turns
-/// "Chromium found" into "tier 2 proven on this machine" —
 /// the 50-case report's "a feature that works only when the
 /// user guesses the hidden prerequisite is not finished".
 async fn check_browser_launch() -> CheckResult {
     let inner = async {
         // Same Xvfb handling as GhostManager: start/reuse :99.
-        let xvfb = crate::ghost::xvfb::Xvfb::start().await.ok();
+        let xvfb = if crate::ghost::cloak::headless_mode_requested() {
+            None
+        } else {
+            crate::ghost::xvfb::Xvfb::start().await.ok()
+        };
         let display = xvfb.as_ref().map(|x| x.display_env());
         let profile = BrowserProfile::host_default();
         let t0 = std::time::Instant::now();
@@ -344,14 +358,12 @@ async fn check_browser_launch() -> CheckResult {
                 }
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
-                    "Tier 2 (browser fallback) will not work. Install Chromium + Xvfb, or set DONGHOST_CHROME".into(),
+                    "Tier 2 browser fallback will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
                 );
             }
         };
         let launch_ms = t0.elapsed().as_millis();
 
-        // Fingerprint selftest: local page reads back
-        // navigator.webdriver and friends from the live browser.
         let fp = crate::ghost::ops::selftest(&mut ghost).await;
         ghost.kill().await;
         if let Some(x) = xvfb {
@@ -361,18 +373,28 @@ async fn check_browser_launch() -> CheckResult {
             Ok(json_str) => {
                 let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
                 let webdriver = v.get("webdriver").and_then(|w| w.as_bool());
-                match webdriver {
-                    Some(false) => CheckResult::Pass(format!(
-                        "launched in {launch_ms}ms, fingerprint clean (webdriver=false)"
-                    )),
-                    Some(true) => CheckResult::Warn(
-                        "launched, but webdriver=true — stealth patches not applied".into(),
-                    ),
-                    None => CheckResult::Pass(format!("launched in {launch_ms}ms, selftest ok")),
+                let deep_clean = webdriver == Some(false)
+                    && v.get("hasChrome").and_then(|x| x.as_bool()) == Some(true)
+                    && v.get("plugins")
+                        .and_then(|x| x.as_u64())
+                        .is_some_and(|n| n > 0)
+                    && v.get("ua")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|ua| !ua.contains("HeadlessChrome"));
+                if deep_clean {
+                    CheckResult::Pass(format!(
+                        "launched in {launch_ms}ms, deep fingerprint clean (webdriver=false, chrome=true, plugins>0)"
+                    ))
+                } else {
+                    CheckResult::Warn(format!(
+                        "launched in {launch_ms}ms, deep fingerprint incomplete: webdriver={webdriver:?}, chrome={:?}, plugins={:?}",
+                        v.get("hasChrome"),
+                        v.get("plugins")
+                    ))
                 }
             }
             Err(e) => CheckResult::Warn(format!(
-                "launched in {launch_ms}ms, but selftest failed: {e}"
+                "launched in {launch_ms}ms, deep fingerprint selftest failed: {e}"
             )),
         }
     };

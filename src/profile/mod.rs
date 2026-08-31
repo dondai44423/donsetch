@@ -351,17 +351,16 @@ fn registry_string(
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Spawned `--version` probe, hard-capped by `PROBE_SPAWN_TIMEOUT`.
-/// On timeout the whole process tree is killed so no orphaned browser
-/// processes survive.
-pub(crate) fn probe_spawned_major() -> Option<u32> {
-    let bin = crate::ghost::chrome_binary().ok()?;
-    let mut cmd = std::process::Command::new(&bin);
+/// Probe a specific Chromium-family executable without changing the selected
+/// backend. Used by the browser resolver for Chromium and CloakBrowser alike.
+pub(crate) fn probe_version_at_path(path: &str) -> Option<u32> {
+    probe_version_string_at_path(path).and_then(|v| parse_version_major(&v))
+}
+
+/// Probe a specific executable and return its full dotted Chromium version.
+pub(crate) fn probe_version_string_at_path(path: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new(path);
     cmd.arg("--version");
-    // On Windows and macOS, `--version` without `--headless` opens a
-    // real GUI window. Pass `--headless=new` + a scratch profile so any
-    // spawn that does happen stays invisible. Harmless on Linux (the
-    // flag is ignored alongside `--version`).
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let tmp = std::env::temp_dir().join("donsetch-chrome-probe");
@@ -376,10 +375,16 @@ pub(crate) fn probe_spawned_major() -> Option<u32> {
     spawn_probe_with_timeout(cmd)
 }
 
-/// Run the built `--version` command, read its stdout, and return the
-/// first plausible major version. Never runs longer than
-/// `PROBE_SPAWN_TIMEOUT`; on timeout, kills the whole process tree.
-fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
+/// Spawned `--version` probe, hard-capped by `PROBE_SPAWN_TIMEOUT`.
+pub(crate) fn probe_spawned_major() -> Option<u32> {
+    let bin = crate::ghost::chrome_binary().ok()?;
+    probe_version_at_path(&bin)
+}
+
+/// Run the built `--version` command, read its stdout, and return it.
+/// Never runs longer than `PROBE_SPAWN_TIMEOUT`; on timeout, kills the
+/// whole process tree.
+fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<String> {
     use std::io::Read;
 
     let mut child = cmd.spawn().ok()?;
@@ -430,9 +435,27 @@ fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<u32> {
     }
     let out = stdout.join().unwrap_or_default();
 
-    parse_version_major(&out)
+    Some(out)
 }
 
+/// Parse the first full dotted Chromium version from a version banner.
+pub(crate) fn parse_version_string(line: &str) -> Option<String> {
+    line.split_whitespace().find_map(|token| {
+        let parts: Vec<_> = token.split('.').collect();
+        if parts.len() >= 4
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+            && parts[0]
+                .parse::<u32>()
+                .is_ok_and(|major| (20..=400).contains(&major))
+        {
+            Some(token.to_string())
+        } else {
+            None
+        }
+    })
+}
 /// Kill the probe process and its children (Windows: taskkill /T so
 /// the whole tree dies; Unix: kill the process group-less child — its
 /// renderers exit when the browser dies).
@@ -496,7 +519,7 @@ mod locale_tests {
 
 #[cfg(test)]
 mod probe_tests {
-    use super::parse_version_major;
+    use super::{parse_version_major, parse_version_string};
 
     #[test]
     fn parses_known_banner_shapes() {
@@ -514,6 +537,15 @@ mod probe_tests {
         );
         // Registry shape: bare version string.
         assert_eq!(parse_version_major("151.0.7922.72"), Some(151));
+    }
+
+    #[test]
+    fn parses_full_version() {
+        assert_eq!(
+            parse_version_string("Chromium 146.0.7680.177.5 Arch Linux"),
+            Some("146.0.7680.177.5".into())
+        );
+        assert_eq!(parse_version_string("not a version"), None);
     }
 
     #[test]
