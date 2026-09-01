@@ -46,16 +46,21 @@ pub const REAP_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 #[cfg(windows)]
 pub const WINLOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 /// Windows profile lockfile: how often a held lockfile's mtime is
-/// refreshed. Must stay comfortably below WINLOCK_STALE_AFTER — a
-/// Ghost only freezes after FREEZE_AFTER idle and only reaps after
-/// REAP_AFTER *frozen*, so a continuously-busy Ghost (never idle
-/// long enough to freeze) can hold the lock far longer than
-/// WINLOCK_STALE_AFTER without ever being reaped. Without a
-/// heartbeat, a second daemon starting mid-way would see the
-/// lockfile's un-refreshed creation-time mtime, mistake the
-/// still-live holder for an abandoned one, and steal the profile
-/// out from under it — exactly the collision this lock exists to
-/// prevent.
+/// refreshed. Must stay comfortably below WINLOCK_STALE_AFTER.
+///
+/// FREEZE_AFTER/REAP_AFTER don't apply here: GhostGuard::drop kills
+/// the Ghost outright on every guard drop on Windows (see
+/// manager.rs), so the lock is normally held only for a single
+/// call's duration. The real trigger is one long-running call: an
+/// `actions` script allows up to MAX_STEPS steps with individual
+/// wait_selector/wait_text polls capped at 60s each (see
+/// actions.rs), so a single guarded call can legitimately run well
+/// past WINLOCK_STALE_AFTER without the Ghost being anywhere near
+/// dead. Without a heartbeat, a second daemon starting mid-call
+/// would see the lockfile's un-refreshed creation-time mtime,
+/// mistake the still-live holder for an abandoned one, and steal
+/// the profile out from under it — exactly the collision this lock
+/// exists to prevent.
 #[cfg(windows)]
 pub const WINLOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -89,10 +94,10 @@ pub struct Ghost {
     /// shared profile.
     #[cfg(windows)]
     winlock: Option<std::path::PathBuf>,
-    /// Refreshes `winlock`'s mtime on an interval so a live,
-    /// continuously-busy Ghost never looks abandoned to another
-    /// daemon's staleness check (see WINLOCK_HEARTBEAT). Aborted
-    /// in Drop, same as fetch_guard.
+    /// Refreshes `winlock`'s mtime on an interval so a Ghost held
+    /// through one long-running call never looks abandoned to
+    /// another daemon's staleness check (see WINLOCK_HEARTBEAT).
+    /// Aborted in Drop, same as fetch_guard.
     #[cfg(windows)]
     winlock_heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
@@ -505,15 +510,29 @@ impl Ghost {
                         // age: >10min old is taken as orphaned.
                         let _ = f;
                         let lock_path = crate::paths::cache_dir().join("ghost-profile.winlock");
+                        // FILE_SHARE_DELETE (0x4, alongside the usual
+                        // READ|WRITE) explicitly, not relied on as a
+                        // default: without it, Drop's remove_file could
+                        // hit a sharing violation if it races the
+                        // heartbeat's own brief open() on another
+                        // thread, leaving the lockfile behind after a
+                        // clean exit.
                         let take_lock = |p: &std::path::Path| {
+                            use std::os::windows::fs::OpenOptionsExt;
                             std::fs::OpenOptions::new()
                                 .write(true)
                                 .create_new(true)
+                                .share_mode(0x1 | 0x2 | 0x4)
                                 .open(p)
                         };
                         match take_lock(&lock_path) {
                             Ok(_f) => (profile_dir(), None, Some(lock_path)),
                             Err(_) => {
+                                // Sub-second precision (a full Duration
+                                // compare, not `.as_secs() > 600` as
+                                // before) — the boundary shifts by
+                                // under a second either way, moot at a
+                                // 10-minute threshold.
                                 let stale = std::fs::metadata(&lock_path)
                                     .and_then(|m| m.modified())
                                     .ok()
@@ -560,9 +579,16 @@ impl Ghost {
         #[cfg(windows)]
         let winlock_heartbeat = winlock.clone().map(|p| {
             tokio::spawn(async move {
+                use std::os::windows::fs::OpenOptionsExt;
                 loop {
                     tokio::time::sleep(WINLOCK_HEARTBEAT).await;
-                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) {
+                    // FILE_SHARE_DELETE so this brief handle never
+                    // blocks Drop's remove_file on another thread.
+                    if let Ok(f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .share_mode(0x1 | 0x2 | 0x4)
+                        .open(&p)
+                    {
                         let _ = f.set_modified(std::time::SystemTime::now());
                     }
                 }
@@ -1871,12 +1897,12 @@ mod sandbox_tests {
     #[cfg(windows)]
     #[test]
     fn winlock_heartbeat_has_safety_margin_under_stale_threshold() {
-        // A continuously-busy Ghost only freezes after FREEZE_AFTER
-        // idle and only reaps after REAP_AFTER *frozen* — so it can
-        // hold the winlock file far longer than WINLOCK_STALE_AFTER
-        // without ever being reaped. Without a heartbeat comfortably
+        // A single long-running actions call (up to MAX_STEPS steps,
+        // each wait_selector/wait_text capped at 60s) can hold the
+        // winlock file far longer than WINLOCK_STALE_AFTER while the
+        // Ghost is nowhere near dead. Without a heartbeat comfortably
         // faster than the staleness window, a second daemon starting
-        // mid-way would mistake the still-live holder for an
+        // mid-call would mistake the still-live holder for an
         // abandoned one and steal the profile out from under it.
         assert!(
             WINLOCK_HEARTBEAT.as_secs() * 3 < WINLOCK_STALE_AFTER.as_secs(),

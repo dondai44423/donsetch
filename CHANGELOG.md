@@ -56,15 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lock left by a dead daemon recovers by age (10 min).
 - **Windows profile lockfile could be stolen out from under a live
   daemon:** the lockfile's mtime was never refreshed after
-  creation, so a continuously-busy Ghost (which only freezes after
-  20s idle and only reaps after 10min *frozen* — it can run far
-  longer than that without ever hitting either) could hold the
-  lock well past the 10-minute staleness window. A second daemon
-  starting mid-way would see the un-refreshed mtime, mistake the
-  still-live holder for abandoned, and steal the profile — the
-  exact collision the lock exists to prevent. The lockfile's mtime
-  now gets refreshed every 2 minutes for as long as a Ghost holds
-  it.
+  creation. Windows kills the Ghost on every guard drop (unlike
+  Linux/Xvfb's warm-freeze path), so the lock is normally held for
+  one call's duration — but a single long `actions` script (up to
+  16 steps, each wait capped at 60s) can legitimately outlast the
+  10-minute staleness window while the Ghost is nowhere near dead.
+  A second daemon starting mid-call would see the un-refreshed
+  mtime, mistake the still-live holder for abandoned, and steal the
+  profile — the exact collision the lock exists to prevent. The
+  lockfile's mtime now gets refreshed every 2 minutes for as long
+  as a Ghost holds it, opened with FILE_SHARE_DELETE so the
+  refresh can never block cleanup on exit.
 - **Browser fingerprint noise:** the ghost no longer runs Chrome
   default apps or extensions, killing the surprise-component
   detection class (enumerable extensions, default-app traffic)
