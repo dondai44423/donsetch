@@ -21,6 +21,7 @@ const CLOAK_REPOSITORY: &str = "CloakHQ/CloakBrowser";
 const CLOAK_VERSION: &str = "146.0.7680.177.5";
 const CLOAK_SIGNING_KEY: &str = "MKFKwIhUcKWq5xTuNA0Ovg99njcDEcEJvmWYYhApvaU=";
 const CLOAK_DOWNLOAD_OPT_IN: &str = "DONSETCH_CLOAK_AUTO_DOWNLOAD";
+const DOWNLOAD_ATTEMPTS: u8 = 3;
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,25 +148,26 @@ fn resolve_chromium(backend: BrowserBackend) -> Result<BrowserResolution, String
 }
 
 fn resolve_cloak(allow_download: bool) -> Result<BrowserResolution, String> {
-    let (path, source) = if let Some(raw) = std::env::var_os("CLOAKBROWSER_BINARY_PATH") {
+    let (path, source, version) = if let Some(raw) = std::env::var_os("CLOAKBROWSER_BINARY_PATH") {
         let path = PathBuf::from(raw);
         validate_binary(&path)
             .map_err(|e| format!("CLOAKBROWSER_BINARY_PATH `{}` invalid: {e}", path.display()))?;
-        (path, "explicit")
+        let version = crate::profile::probe_version_at_path(&path.to_string_lossy());
+        (path, "explicit", version)
     } else {
-        let version = requested_version()?;
-        if let Some(path) = cached_binary(&version) {
-            (path, "cache")
+        let requested = requested_version()?;
+        let version = version_major(&requested).ok();
+        if let Some(path) = cached_binary(&requested) {
+            (path, "cache", version)
         } else if !allow_download || !auto_download_enabled() {
             return Err(format!(
-                "CloakBrowser binary not found; set CLOAKBROWSER_BINARY_PATH or "
-                    "{CLOAK_DOWNLOAD_OPT_IN}=1 to download the signed public binary"
+                "CloakBrowser binary not found; set CLOAKBROWSER_BINARY_PATH or {}=1 to download the signed public binary",
+                CLOAK_DOWNLOAD_OPT_IN
             ));
         } else {
-            (install_public_binary()?, "downloaded")
+            (install_public_binary()?, "downloaded", version)
         }
     };
-    let version = crate::profile::probe_version_at_path(&path.to_string_lossy());
     Ok(BrowserResolution {
         backend: BrowserBackend::CloakBrowser,
         path,
@@ -269,10 +271,7 @@ fn archive_name(tag: &str) -> &'static str {
 }
 fn cached_binary(version: &str) -> Option<PathBuf> {
     let path = binary_path(&cache_dir().join(format!("chromium-{version}")));
-    (validate_binary(&path).is_ok()
-        && crate::profile::probe_version_string_at_path(&path.to_string_lossy())
-            .is_some_and(|actual| actual == version))
-    .then_some(path)
+    validate_binary(&path).is_ok().then_some(path)
 }
 fn install_public_binary() -> Result<PathBuf, String> {
     let tag = platform_tag()?;
@@ -322,15 +321,8 @@ fn install_public_binary() -> Result<PathBuf, String> {
                 "archive SHA-256 mismatch for {name}: expected {expected_hash}, got {actual_hash}"
             ));
         }
-        match crate::profile::probe_version_string_at_path(&expected.to_string_lossy()) {
-            Some(actual_version) if actual_version == version => {}
-            Some(actual_version) => {
-                return Err(format!(
-                    "downloaded binary version mismatch: manifest={version}, binary={actual_version}"
-                ));
-            }
-            None => return Err("downloaded binary did not report a usable version".into()),
-        }
+        extract_archive(&archive_path, &root)?;
+        validate_binary(&expected).map_err(|e| format!("downloaded binary invalid: {e}"))?;
         Ok(expected.clone())
     })();
     let _ = fs::remove_file(&archive_path);
@@ -400,6 +392,26 @@ fn temporary_path(label: &str) -> PathBuf {
 }
 
 fn download_to(client: &Client, url: &str, path: &Path) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match download_to_once(client, url, path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(path);
+                last_error = Some(error);
+                if attempt < DOWNLOAD_ATTEMPTS {
+                    std::thread::sleep(Duration::from_secs(2 * u64::from(attempt)));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "archive download failed after {DOWNLOAD_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown download error".into())
+    ))
+}
+
+fn download_to_once(client: &Client, url: &str, path: &Path) -> Result<(), String> {
     let mut response = client
         .get(url)
         .send()
@@ -557,7 +569,8 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         }
         digest.update(&buf[..n]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    let digest = digest.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(test)]

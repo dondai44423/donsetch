@@ -359,6 +359,10 @@ pub(crate) fn probe_version_at_path(path: &str) -> Option<u32> {
 
 /// Probe a specific executable and return its full dotted Chromium version.
 pub(crate) fn probe_version_string_at_path(path: &str) -> Option<String> {
+    probe_version_string_at_path_result(path).ok()
+}
+
+pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, String> {
     let mut cmd = std::process::Command::new(path);
     cmd.arg("--version");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -375,19 +379,15 @@ pub(crate) fn probe_version_string_at_path(path: &str) -> Option<String> {
     spawn_probe_with_timeout(cmd)
 }
 
-/// Spawned `--version` probe, hard-capped by `PROBE_SPAWN_TIMEOUT`.
-pub(crate) fn probe_spawned_major() -> Option<u32> {
-    let bin = crate::ghost::chrome_binary().ok()?;
-    probe_version_at_path(&bin)
-}
-
 /// Run the built `--version` command, read its stdout, and return it.
 /// Never runs longer than `PROBE_SPAWN_TIMEOUT`; on timeout, kills the
 /// whole process tree.
-fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<String> {
+fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Result<String, String> {
     use std::io::Read;
 
-    let mut child = cmd.spawn().ok()?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn browser version probe: {e}"))?;
 
     // Read stdout on a side thread so we can still enforce the timeout
     // if the browser never exits (the read would otherwise block us).
@@ -399,7 +399,7 @@ fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<String> {
             // leave a spawned child running on the early-out path.
             let _ = child.kill();
             let _ = child.wait();
-            return None;
+            return Err("browser version probe had no stdout pipe".into());
         }
     };
     let stdout = std::thread::spawn(move || {
@@ -434,8 +434,18 @@ fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Option<String> {
         let _ = child.wait();
     }
     let out = stdout.join().unwrap_or_default();
+    match reaped {
+        Some(status) if status.success() => Ok(out),
+        Some(status) => Err(format!("browser version probe exited with {status}")),
+        None => Err("browser version probe did not exit".into()),
+    }
+}
 
-    Some(out)
+/// Resolve without downloading: this synchronous probe runs from async entry
+/// points, and the blocking installer must stay inside its dedicated check.
+pub(crate) fn probe_spawned_major() -> Option<u32> {
+    let browser = crate::ghost::resolve_browser_without_download().ok()?;
+    probe_version_at_path(&browser.path.to_string_lossy())
 }
 
 /// Parse the first full dotted Chromium version from a version banner.
