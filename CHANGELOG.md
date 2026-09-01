@@ -54,6 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DevTools line. A create_new profile lockfile now mirrors the
   unix flock: the loser diverges to a temp profile, and a stale
   lock left by a dead daemon recovers by age (10 min).
+- **Windows profile lockfile could be stolen out from under a live
+  daemon:** the lockfile's mtime was never refreshed after
+  creation, so a continuously-busy Ghost (which only freezes after
+  20s idle and only reaps after 10min *frozen* — it can run far
+  longer than that without ever hitting either) could hold the
+  lock well past the 10-minute staleness window. A second daemon
+  starting mid-way would see the un-refreshed mtime, mistake the
+  still-live holder for abandoned, and steal the profile — the
+  exact collision the lock exists to prevent. The lockfile's mtime
+  now gets refreshed every 2 minutes for as long as a Ghost holds
+  it.
 - **Browser fingerprint noise:** the ghost no longer runs Chrome
   default apps or extensions, killing the surprise-component
   detection class (enumerable extensions, default-app traffic)

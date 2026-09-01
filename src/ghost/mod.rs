@@ -41,6 +41,24 @@ pub const FREEZE_AFTER: std::time::Duration = std::time::Duration::from_secs(20)
 /// Frozen this long → reap entirely.
 pub const REAP_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Windows profile lockfile: age past which an unheld lockfile is
+/// treated as orphaned by a dead daemon and recovered.
+#[cfg(windows)]
+pub const WINLOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+/// Windows profile lockfile: how often a held lockfile's mtime is
+/// refreshed. Must stay comfortably below WINLOCK_STALE_AFTER — a
+/// Ghost only freezes after FREEZE_AFTER idle and only reaps after
+/// REAP_AFTER *frozen*, so a continuously-busy Ghost (never idle
+/// long enough to freeze) can hold the lock far longer than
+/// WINLOCK_STALE_AFTER without ever being reaped. Without a
+/// heartbeat, a second daemon starting mid-way would see the
+/// lockfile's un-refreshed creation-time mtime, mistake the
+/// still-live holder for an abandoned one, and steal the profile
+/// out from under it — exactly the collision this lock exists to
+/// prevent.
+#[cfg(windows)]
+pub const WINLOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub struct Ghost {
     child: Child,
     proc: proc::Proc,
@@ -71,6 +89,12 @@ pub struct Ghost {
     /// shared profile.
     #[cfg(windows)]
     winlock: Option<std::path::PathBuf>,
+    /// Refreshes `winlock`'s mtime on an interval so a live,
+    /// continuously-busy Ghost never looks abandoned to another
+    /// daemon's staleness check (see WINLOCK_HEARTBEAT). Aborted
+    /// in Drop, same as fetch_guard.
+    #[cfg(windows)]
+    winlock_heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Persistent profile dir: aged state passes challenges
@@ -494,7 +518,7 @@ impl Ghost {
                                     .and_then(|m| m.modified())
                                     .ok()
                                     .and_then(|t| t.elapsed().ok())
-                                    .is_some_and(|e| e.as_secs() > 600);
+                                    .is_some_and(|e| e > WINLOCK_STALE_AFTER);
                                 if stale {
                                     let _ = std::fs::remove_file(&lock_path);
                                     if take_lock(&lock_path).is_ok() {
@@ -530,6 +554,20 @@ impl Ghost {
         };
         #[cfg(windows)]
         let winlock: Option<std::path::PathBuf> = _winlock_opt;
+        // Keep the winlock's mtime fresh for as long as this Ghost
+        // holds it — see WINLOCK_HEARTBEAT's doc comment for why
+        // this can't just rely on WINLOCK_STALE_AFTER alone.
+        #[cfg(windows)]
+        let winlock_heartbeat = winlock.clone().map(|p| {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(WINLOCK_HEARTBEAT).await;
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) {
+                        let _ = f.set_modified(std::time::SystemTime::now());
+                    }
+                }
+            })
+        });
 
         std::fs::create_dir_all(&dir)
             .map_err(|e| FetchError::ghost(format!("profile dir: {e}")))?;
@@ -840,6 +878,8 @@ impl Ghost {
             fetch_guard: Some(fetch_guard),
             #[cfg(windows)]
             winlock,
+            #[cfg(windows)]
+            winlock_heartbeat,
         })
     }
 
@@ -1568,6 +1608,12 @@ impl Drop for Ghost {
         // Child was dropped without killing Chrome.
         self.proc.kill_group();
         sweep_crashpad();
+        // Stop refreshing the winlock's mtime before removing it —
+        // same abort-then-cleanup order as fetch_guard above.
+        #[cfg(windows)]
+        if let Some(handle) = self.winlock_heartbeat.take() {
+            handle.abort();
+        }
         // Release the Windows profile-exclusion lockfile (unix
         // flock releases itself when this handle closes).
         #[cfg(windows)]
@@ -1820,6 +1866,22 @@ mod sandbox_tests {
                 "missing hardcoded path {expected}, got: {paths:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn winlock_heartbeat_has_safety_margin_under_stale_threshold() {
+        // A continuously-busy Ghost only freezes after FREEZE_AFTER
+        // idle and only reaps after REAP_AFTER *frozen* — so it can
+        // hold the winlock file far longer than WINLOCK_STALE_AFTER
+        // without ever being reaped. Without a heartbeat comfortably
+        // faster than the staleness window, a second daemon starting
+        // mid-way would mistake the still-live holder for an
+        // abandoned one and steal the profile out from under it.
+        assert!(
+            WINLOCK_HEARTBEAT.as_secs() * 3 < WINLOCK_STALE_AFTER.as_secs(),
+            "heartbeat interval must stay comfortably below the staleness window"
+        );
     }
 
     #[test]
