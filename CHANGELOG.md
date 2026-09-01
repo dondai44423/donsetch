@@ -109,10 +109,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   false there even though joining it onto the extraction dir still
   escapes it (Windows path-join semantics replace everything past
   the prefix for any rooted push). Practical impact is narrow: the
-  archive comes from a single pinned repository and is SHA256-
-  verified against a checksum baked into this binary before
-  extraction ever starts, so exploiting this needs a compromise of
-  that supply chain, not just an untrusted archive. Switched the
+  archive's hash is checked against a manifest that is itself
+  Ed25519-signed and verified against a public key pinned in this
+  binary, before extraction ever starts — exploiting this needs a
+  compromise of that signing key or release process, not just an
+  untrusted archive. Switched the
   guard to `has_root()`, which `is_absolute()` is itself defined as
   on Unix (no behavior change there) and is the correct, broader
   check on Windows.
