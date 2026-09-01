@@ -5,6 +5,82 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Session vault: logins survive daemon restarts, crashes, and a
+  `kill -9`.** Every tier-2 run now harvests login/session cookies
+  (after actions/solve fetches, and again at reap time) into
+  `ghost-state.json`: junk-filtered, deduped, capped, atomic write
+  like the rest of the state file. Every browser launch replants
+  them before the first navigation, batch CDP call with a
+  per-cookie fallback for older builds. A session established today
+  is still there next week, even if the daemon died hard in
+  between. Live-verified three ways: cookie + Local Storage across
+  separate processes; a full freeze -> reap -> relaunch cycle in
+  one daemon; and with Chromium's Cookies DB file deleted outright
+  while the session still came back from the vault.
+
+### Fixed
+
+- **prebuilts refused to start on Ubuntu 22.04 LTS (issue #93):**
+  the release legs built on a glibc 2.39 runner, so both npm and
+  GitHub release binaries demanded `GLIBC_2.39` and every 22.04
+  host died at first launch. Linux legs now build on
+  ubuntu-22.04 (glibc 2.35 baseline), pinned to lld (bfd 2.38
+  chokes on rustc 1.98's `.crel` relocations), and a new hard CI
+  gate objdumps the built bytes and fails the release if any
+  symbol exceeds 2.35: a regressed glibc leak now dies in CI,
+  not on a user's VM. README carries the verified build recipe.
+- **Session vault discipline:** replay and reap-harvest ride ONLY
+  the shared profile, so a temp-profile divergence run can never
+  borrow or overwrite the canonical session (a vendor that binds
+  sessions to fingerprints would see one login on two profiles);
+  tier 1 boots with the vault at daemon start, so a JS-less domain
+  gets an authenticated plain-HTTP fetch on the first request
+  after a restart; plain renders harvest too, not just solve and
+  actions.
+- **Cookie harvests could stall a finished fetch:** solve and
+  actions harvested with the 20s generic CDP timeout, so a wedged
+  browser added a 20s tail to a completed response. All harvest
+  sites now carry explicit 3-5s bounds and degrade to no-vault
+  instead of stalling.
+- **Crawl renders kept their cookies to themselves:** a login set
+  during a crawl's JS-render now lands in the session vault and
+  the tier-1 jar like every other tier-2 flow.
+- **Windows daemon collision on the shared profile:** two
+  daemons fought Chromium's singleton and the loser died without a
+  DevTools line. A create_new profile lockfile now mirrors the
+  unix flock: the loser diverges to a temp profile, and a stale
+  lock left by a dead daemon recovers by age (10 min).
+- **Browser fingerprint noise:** the ghost no longer runs Chrome
+  default apps or extensions, killing the surprise-component
+  detection class (enumerable extensions, default-app traffic)
+  without touching the browser surface sites actually check.
+- **Ghost reap used to discard the session's newest cookies (and
+  could eat a login).** The reap SIGKILLed the process group with
+  no shutdown handshake, so the cookie checkpoint Chromium only
+  makes on clean exit never hit disk. Reap now thaws, harvests the
+  session vault, sends `Browser.close`, waits a bounded 6s for the
+  clean exit, and only then falls back to the hard kill. Same CDP
+  path on all three platforms. A profile's Cookies DB that had
+  sat untouched since 2026-08-30 now checkpoints on every exit.
+- **selftest pages littered the persistent browser profile** when
+  a daemon died mid-check; they now live in the system temp dir.
+- **Seven std mutex lock sites still panicked the daemon if the
+  lock was poisoned** (panic = abort build): converted to the same
+  poison-safe pattern as the earlier sweep.
+- **`focus_match` compound-term check crossed word boundaries:** the
+  crawl frontier's hard focus gate matched a compound query term
+  (e.g. `auto-complete`) against any URL/anchor text containing it
+  as a raw substring, so `auto-completed` (a different word once
+  stemming strips `-ed`) falsely counted as a match. The full-form
+  check is now a contiguous token-subsequence match instead of a
+  string `contains`, closing the same word-boundary gap the
+  existing fragment-based check (added in v2.3.1) already guarded
+  against.
+
 ## [3.4.4] - 2026-08-31
 
 ### Added

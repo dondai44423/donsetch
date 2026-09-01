@@ -65,6 +65,12 @@ pub struct Ghost {
     /// `fetch::guards::ensure_url_safe` before it hits the network.
     /// Aborted in Drop so it cannot leak after Chrome is reaped.
     fetch_guard: Option<tokio::task::JoinHandle<()>>,
+
+    /// Windows profile-exclusion lockfile path (unix uses flock
+    /// instead). Removed in Drop so the next daemon can take the
+    /// shared profile.
+    #[cfg(windows)]
+    winlock: Option<std::path::PathBuf>,
 }
 
 /// Persistent profile dir: aged state passes challenges
@@ -94,6 +100,11 @@ pub fn default_chrome_args(
         "--disable-component-update".into(),
         "--disable-sync".into(),
         "--disable-translate".into(),
+        // Vanilla-browser surface: no surprise extension set
+        // (extensions are enumerable fingerprints), no default
+        // apps phoning home behind the page being fetched.
+        "--disable-default-apps".into(),
+        "--disable-extensions".into(),
         "--mute-audio".into(),
         "--disk-cache-size=1".into(),
         "--disable-gpu-shader-disk-cache".into(),
@@ -442,31 +453,83 @@ impl Ghost {
             .open(&lockfile)
             .ok();
 
-        let (dir, temp_profile) = match profile_lock.as_ref() {
-            Some(f) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::io::AsRawFd;
-                    let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                    if got == 0 {
-                        (profile_dir(), None)
-                    } else {
-                        let t = std::env::temp_dir()
-                            .join(format!("donsetch-ghost-{}", std::process::id()));
-                        (t.clone(), Some(t))
+        let (dir, temp_profile, _winlock_opt) = {
+            let (dir_s, temp_s, _wl) = match profile_lock.as_ref() {
+                Some(f) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        let got =
+                            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                        if got == 0 {
+                            (profile_dir(), None, None::<std::path::PathBuf>)
+                        } else {
+                            let t = std::env::temp_dir()
+                                .join(format!("donsetch-ghost-{}", std::process::id()));
+                            (t.clone(), Some(t), None::<std::path::PathBuf>)
+                        }
+                    }
+                    #[cfg(windows)]
+                    {
+                        // Windows flock(2) doppelgänger: an exclusive
+                        // create_new lockfile. Two daemons on the shared
+                        // profile fight Chromium's own singleton, and
+                        // the loser gets no DevTools line at all; the
+                        // lockfile loser diverges to a temp profile
+                        // exactly like the unix flock path. A stale
+                        // file (dead daemon left it) is recovered by
+                        // age: >10min old is taken as orphaned.
+                        let _ = f;
+                        let lock_path = crate::paths::cache_dir().join("ghost-profile.winlock");
+                        let take_lock = |p: &std::path::Path| {
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(p)
+                        };
+                        match take_lock(&lock_path) {
+                            Ok(_f) => (profile_dir(), None, Some(lock_path)),
+                            Err(_) => {
+                                let stale = std::fs::metadata(&lock_path)
+                                    .and_then(|m| m.modified())
+                                    .ok()
+                                    .and_then(|t| t.elapsed().ok())
+                                    .is_some_and(|e| e.as_secs() > 600);
+                                if stale {
+                                    let _ = std::fs::remove_file(&lock_path);
+                                    if take_lock(&lock_path).is_ok() {
+                                        (profile_dir(), None, Some(lock_path))
+                                    } else {
+                                        let t = std::env::temp_dir()
+                                            .join(format!("donsetch-ghost-{}", std::process::id()));
+                                        (t.clone(), Some(t), None::<std::path::PathBuf>)
+                                    }
+                                } else {
+                                    let t = std::env::temp_dir()
+                                        .join(format!("donsetch-ghost-{}", std::process::id()));
+                                    (t.clone(), Some(t), None::<std::path::PathBuf>)
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(any(unix, windows)))]
+                    {
+                        let _ = f;
+                        (profile_dir(), None, None::<std::path::PathBuf>)
                     }
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = f;
-                    (profile_dir(), None)
+                None => {
+                    let t =
+                        std::env::temp_dir().join(format!("donsetch-ghost-{}", std::process::id()));
+                    (t.clone(), Some(t), None::<std::path::PathBuf>)
                 }
-            }
-            None => {
-                let t = std::env::temp_dir().join(format!("donsetch-ghost-{}", std::process::id()));
-                (t.clone(), Some(t))
-            }
+            };
+            let dir = dir_s;
+            let temp_profile = temp_s;
+            (dir, temp_profile, _wl)
         };
+        #[cfg(windows)]
+        let winlock: Option<std::path::PathBuf> = _winlock_opt;
 
         std::fs::create_dir_all(&dir)
             .map_err(|e| FetchError::ghost(format!("profile dir: {e}")))?;
@@ -599,6 +662,16 @@ impl Ghost {
         .ok_or_else(|| FetchError::ghost("no devtools ws line"))?;
 
         let cdp = cdp::Cdp::connect(&ws_url).await?;
+        // Replant the session vault: login/session cookies harvested
+        // from earlier browser runs. Best-effort by design: a walled
+        // or hostile cookie shape can never fail a launch. Only the
+        // SHARED profile gets the replay: a temp-profile ghost (a
+        // concurrent divergence run) must not borrow the canonical
+        // session, or a vendor that binds sessions to fingerprints
+        // sees the same login riding two profiles.
+        if temp_profile.is_none() {
+            Self::restore_session_cookies(&cdp).await;
+        }
 
         // One page target, attached flat.
         let target = cdp
@@ -765,6 +838,8 @@ impl Ghost {
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
+            #[cfg(windows)]
+            winlock,
         })
     }
 
@@ -808,7 +883,58 @@ impl Ghost {
     /// plus crashpad handlers on Unix (they daemonize into
     /// their own groups and escape the group kill; on Windows
     /// the Job Object already owns them).
+    ///
+    /// Graceful first, hard kill only as the fallback. Chromium
+    /// checkpoints the cookie DB, Local Storage, session files and
+    /// preferences only on a clean exit; a bare SIGKILL discards
+    /// every write since the last checkpoint, so a login or
+    /// storage token set during the session this daemon just ran
+    /// would silently vanish at reap. The close handshake is
+    /// send-once best-effort (a dead CDP link fails it instantly),
+    /// and the whole path is time-bounded so a hung browser can
+    /// never stall the caller. Cross-platform: Browser.close is
+    /// CDP, same on Linux/macOS/Windows.
     pub async fn kill(&mut self) {
+        if self.frozen {
+            // A SIGSTOPped tree cannot answer CDP: thaw before the
+            // handshake so it can receive it (reaper kills frozen
+            // ghosts after REAP_AFTER).
+            self.proc.thaw();
+            self.frozen = false;
+        }
+        // Vault the authenticated state before the browser can
+        // take it with it: session cookies gathered now survive
+        // whatever exit shape this reap ends up being, including
+        // the hard-kill fallback below. Bounded: a wedged CDP
+        // must not stretch the reap budget. Only the shared
+        // profile feeds the vault: a temp-profile run is a
+        // concurrent divergence and must not stamp its cookies
+        // into the canonical session.
+        if self.temp_profile.is_none()
+            && let Ok(Ok(list)) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), self.cookies()).await
+        {
+            cache::store_session_cookies(&list);
+        }
+        let cdp = self.cdp.clone();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            cdp.call(None, "Browser.close", json!({})),
+        )
+        .await;
+        // Bounded wait for the clean exit. Resolves fast in every
+        // real shape: close processed (Chromium flushes then exits),
+        // CDP already dead but the child still shutting down, or an
+        // already-exited child (thaw showed a corpse). Only a truly
+        // wedged browser spends the whole budget here.
+        if tokio::time::timeout(std::time::Duration::from_secs(6), self.child.wait())
+            .await
+            .is_ok()
+        {
+            sweep_crashpad();
+            return;
+        }
+        // Hard fallback: hung browser. Last-resort only.
         self.proc.kill_group();
         sweep_crashpad();
         let _ = self.child.wait().await;
@@ -970,12 +1096,92 @@ impl Ghost {
                         name: name.to_string(),
                         value: value.to_string(),
                         domain: domain.to_string(),
+                        path: c
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
                         expires_at: expires,
+                        secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
+                        http_only: c.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
+                        same_site: c
+                            .get("sameSite")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Lax")
+                            .to_string(),
                     });
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Replant the session vault into a fresh browser. Best-effort:
+    /// a hostile bucket or a vendor that rejects replanted cookies
+    /// must never fail a launch. Batch CDP call first, then the
+    /// per-cookie stable path as fallback (older/different builds
+    /// ship Storage.setCookies behind different rpc versions).
+    async fn restore_session_cookies(cdp: &cdp::Cdp) {
+        let list = crate::ghost::cache::load_session_cookies();
+        if list.is_empty() {
+            return;
+        }
+        let batch: Vec<serde_json::Value> = list
+            .iter()
+            .filter_map(|c| {
+                if c.domain.is_empty() {
+                    return None;
+                }
+                let mut v = serde_json::json!({
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": if c.path.is_empty() { "/".to_string() } else { c.path.clone() },
+                    "secure": c.secure,
+                    "httpOnly": c.http_only,
+                    "sameSite": if c.same_site.is_empty() { "Lax".to_string() } else { c.same_site.clone() },
+                });
+                if let Some(e) = c.expires_at {
+                    v["expires"] = serde_json::json!(e);
+                }
+                Some(v)
+            })
+            .collect();
+        if !batch.is_empty() {
+            let ok = cdp
+                .call(
+                    None,
+                    "Storage.setCookies",
+                    serde_json::json!({ "cookies": batch }),
+                )
+                .await
+                .is_ok();
+            if ok {
+                return;
+            }
+            for c in &list {
+                if c.domain.is_empty() {
+                    continue;
+                }
+                let mut params = serde_json::json!({
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": if c.path.is_empty() { "/" } else { &c.path },
+                    "secure": c.secure,
+                    "httpOnly": c.http_only,
+                    "sameSite": if c.same_site.is_empty() { "Lax" } else { &c.same_site },
+                });
+                if let Some(e) = c.expires_at {
+                    params["expires"] = serde_json::json!(e);
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    cdp.call(None, "Network.setCookie", params),
+                )
+                .await;
+            }
+        }
     }
 
     /// PNG screenshot → path (D16 byproduct).
@@ -1362,6 +1568,12 @@ impl Drop for Ghost {
         // Child was dropped without killing Chrome.
         self.proc.kill_group();
         sweep_crashpad();
+        // Release the Windows profile-exclusion lockfile (unix
+        // flock releases itself when this handle closes).
+        #[cfg(windows)]
+        if let Some(p) = &self.winlock {
+            let _ = std::fs::remove_file(p);
+        }
         // Clean up temp profile if we used one.
         if let Some(temp) = &self.temp_profile {
             let _ = std::fs::remove_dir_all(temp);

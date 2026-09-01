@@ -659,7 +659,7 @@ impl Crawler {
                         Err(_) => {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((item.url.clone(), "unparseable".into()));
                             continue 'work;
                         }
@@ -689,7 +689,7 @@ impl Crawler {
                     {
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((item.url.clone(), "unchanged (since_last)".into()));
                         continue 'work;
                     }
@@ -910,7 +910,7 @@ impl Crawler {
                         let kind = ctype.split(';').next().unwrap_or("unknown").trim();
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((item.url.clone(), format!("binary ({kind})")));
                         continue 'work;
                     }
@@ -974,7 +974,7 @@ impl Crawler {
                         Err(e) => {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((item.url.clone(), format!("extract failed: {e}")));
                             continue 'work;
                         }
@@ -1069,7 +1069,7 @@ impl Crawler {
                     if !duplicate && r.quality < opts_worker.min_quality {
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), format!("low quality ({:.2})", r.quality)));
                         continue 'work;
                     }
@@ -1092,7 +1092,7 @@ impl Crawler {
                         // harvest outlinks (seed → in-scope pages).
                         skipped
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "out of scope (navigation-only)".into()));
                     } else {
                         let done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1129,7 +1129,7 @@ impl Crawler {
                         if duplicate {
                             skipped
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push((page.url.clone(), "near-duplicate".into()));
                             continue 'work;
                         }

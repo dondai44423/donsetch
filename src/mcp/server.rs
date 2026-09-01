@@ -51,6 +51,15 @@ impl Daemon {
         let ghost_mgr = GhostManager::new().await;
         let state = Arc::new(Mutex::new(GhostState::load()));
 
+        // Tier 1 starts the session with the vault too: a domain
+        // that serves without JS gets an authenticated plain-HTTP
+        // fetch on the very first request after a restart, not
+        // only after the browser has visited it once.
+        {
+            let sessions = crate::ghost::cache::load_session_cookies();
+            fetcher.import_cookies(&sessions).await;
+        }
+
         // Build ghost escalation hook for the crawl: renders
         // JS-only pages in the headless browser so SPA sites
         // yield real content instead of empty shells. Capped at
@@ -105,6 +114,7 @@ impl Daemon {
                     }
                     if !page.cookies.is_empty() {
                         fetcher.import_cookies(&page.cookies).await;
+                        crate::ghost::cache::store_session_cookies(&page.cookies);
                     }
                     {
                         let mut s = state.lock().await;
@@ -2191,6 +2201,7 @@ async fn ghost_escalate(
     }
     if !page.cookies.is_empty() {
         daemon.fetcher.import_cookies(&page.cookies).await;
+        crate::ghost::cache::store_session_cookies(&page.cookies);
     }
     // Retry tier 1 with fresh cookies — the cheap path back to
     // normal HTTP when the gate was cookie-driven.
@@ -2337,6 +2348,7 @@ async fn ghost_escalate(
                 page.vendor.as_deref(),
                 replay_content_ok,
             );
+            crate::ghost::cache::store_session_cookies(&page.cookies);
         }
         // Don't cache challenge/wall DOMs — defense in depth alongside
         // the ghost_fetch timeout check. A challenge page that has
@@ -2591,10 +2603,12 @@ async fn fetch_with_actions(
     // route to skip-to-solve forever (the v1.1 reddit-poisoning
     // bug class). Replay is unverified in the actions flow (no
     // tier-1 retry happens) — false until the fetch path proves it.
-    if let Ok(cookies) = g.cookies().await
+    if let Ok(Ok(cookies)) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), g.cookies()).await
         && !cookies.is_empty()
     {
         daemon.fetcher.import_cookies(&cookies).await;
+        crate::ghost::cache::store_session_cookies(&cookies);
         if page.vendor.is_some() {
             daemon
                 .state

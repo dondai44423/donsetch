@@ -126,7 +126,12 @@ pub async fn solve(
             // for extra certainty; hold for 2 polls.
             clear_streak += 1;
             if clear_streak >= 2 {
-                let cookies = ghost.cookies().await.unwrap_or_default();
+                let cookies =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), ghost.cookies())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
                 ghost.touch();
                 return Ok(SolveOutcome::Solved(SolveResult {
                     cookies,
@@ -451,7 +456,12 @@ pub async fn ghost_fetch(
         if substantive && stable && past_min {
             settle_streak += 1;
             if settle_streak >= 2 {
-                let cookies = ghost.cookies().await.unwrap_or_default();
+                let cookies =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), ghost.cookies())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
                 ghost.touch();
                 return Ok(GhostPage {
                     html,
@@ -534,7 +544,11 @@ pub async fn ghost_fetch(
             took: start.elapsed(),
         });
     }
-    let cookies = ghost.cookies().await.unwrap_or_default();
+    let cookies = tokio::time::timeout(std::time::Duration::from_secs(5), ghost.cookies())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
     ghost.touch();
     Ok(GhostPage {
         html,
@@ -635,7 +649,10 @@ pub async fn render(ghost: &mut Ghost, url: &str, timeout: Duration) -> Result<S
 /// Fingerprint self-test: navigate our local page,
 /// read results back from the DOM (no Runtime ever).
 pub async fn selftest(ghost: &mut Ghost) -> Result<String, FetchError> {
-    let page = super::profile_dir().join(format!("selftest-{}.html", std::process::id()));
+    // Lives in the system temp dir, never the persistent profile:
+    // a hard-killed daemon used to leave selftest-<pid>.html
+    // litter inside the shared profile root.
+    let page = std::env::temp_dir().join(format!("donsetch-selftest-{}.html", std::process::id()));
     std::fs::write(&page, include_str!("selftest.html"))
         .map_err(|e| FetchError::ghost(format!("selftest: {e}")))?;
     let url = format!("file://{}", page.display());

@@ -32,7 +32,15 @@ pub struct CookieRecord {
     pub value: String,
     pub domain: String,
     #[serde(default)]
+    pub path: String,
+    #[serde(default)]
     pub expires_at: Option<u64>, // unix seconds; None = session
+    #[serde(default)]
+    pub secure: bool,
+    #[serde(default)]
+    pub http_only: bool,
+    #[serde(default)]
+    pub same_site: String,
 }
 
 /// Per-domain intelligence. Evolves with every fetch outcome.
@@ -41,6 +49,14 @@ pub struct DomainProfile {
     // === Cookie vault (clearance cookies only) ===
     #[serde(default)]
     pub cookies: Vec<CookieRecord>,
+    /// Session vault: login/session cookies harvested from the
+    /// browser after every tier-2 run and replayed into the next
+    /// browser launch. Distinct from `cookies` (bot-wall clearance
+    /// only): this holds the user's own authenticated state so a
+    /// login survives daemon restarts, crashes and even the
+    /// browser's own kill-without-flush.
+    #[serde(default)]
+    pub session_cookies: Vec<CookieRecord>,
     /// When tier 2 last solved (unix seconds).
     #[serde(default)]
     pub last_solved: u64,
@@ -187,6 +203,221 @@ fn filter_clearance(cookies: &[CookieRecord]) -> Vec<CookieRecord> {
         .collect()
 }
 
+// ────────────────────────── session vault ──────────────────────────
+
+/// Cap on vaulted session cookies: keeps ghost-state.json bounded
+/// even after months of multi-site browsing.
+const SESSION_MAX: usize = 500;
+
+/// Max chars one vaulted cookie value may hold: jumbo tokens are
+/// either junk or per-request blobs, never reusable login state.
+const SESSION_VALUE_MAX: usize = 8_192;
+
+/// Cookie names that are analytics/ad junk, never login state.
+/// Prefix-matched, lowercase.
+const SESSION_JUNK_PREFIXES: &[&str] = &[
+    "_ga",
+    "_gid",
+    "_gat",
+    "_gcl",
+    "_gac",
+    "__utma",
+    "__utmb",
+    "__utmc",
+    "__utmz",
+    "__utmv",
+    "__utmt",
+    "__utm",
+    "_fbp",
+    "_fbc",
+    "tdid",
+    "demdex",
+    "dpm",
+    "dextp",
+    "adobemc",
+    "mbox",
+    "s_cc",
+    "s_sq",
+    "optimizely",
+    "pardot",
+    "visitor_id",
+    "hubspotutk",
+    "intercom-id-",
+    "intercom-session-",
+    "akaalb_",
+    "akacd_",
+    // Ad-mesh session junk from real harvests (DSP sync, exchange
+    // seat ids, media sync timestamps): never login state.
+    "_hj",
+    "dsp2f_",
+    "sspz",
+    "sspr_",
+    "stx_",
+    "cnx_",
+    "nm_",
+    "st_usi",
+    "ruds",
+    "_cc_cc",
+    "_twsid",
+    "wp-wpml",
+    "_cf",
+    "wrv",
+    "seedtag",
+];
+
+/// Exact-match junk names (lowercase) too risky to prefix-match.
+const SESSION_JUNK_EXACT: &[&str] = &[
+    "tz",
+    "cpu_bucket",
+    "preferred_color_mode",
+    "countries_availability_flash_seen",
+    "ingresscookie",
+];
+
+/// Long-lived cookies named like login state are vaulted even when
+/// they carry an expiry (remember-me tokens). Lowercase substrings.
+const SESSION_AUTH_HINTS: &[&str] = &[
+    "session",
+    "sess",
+    "sid",
+    "auth",
+    "token",
+    "jwt",
+    "bearer",
+    "login",
+    "connect.sid",
+    "phpsessid",
+    "laravel_session",
+    "cfid",
+    "cftoken",
+    "cookiesupport",
+    "identity",
+    "loggedin",
+    "logged_in",
+    "remember",
+    "user_id",
+    "userid",
+    "guest",
+    "member",
+    "api_key",
+    "apikey",
+    "csrf",
+    "sid",
+];
+
+/// Would replaying this cookie plausibly restore an authenticated
+/// session? Session cookies (no expiry) are the login signature;
+/// explicit auth-shaped names pass even with an expiry. Everything
+/// else (trackers, preferences, A/B buckets) is dropped so the
+/// vault stays small and meaningful.
+pub(crate) fn is_session_worthy(c: &CookieRecord) -> bool {
+    if c.domain.is_empty() || c.value.is_empty() {
+        return false;
+    }
+    if c.value.len() > SESSION_VALUE_MAX {
+        return false;
+    }
+    if is_clearance_cookie(&c.name) {
+        return false;
+    }
+    let n = c.name.to_ascii_lowercase();
+    if SESSION_JUNK_PREFIXES.iter().any(|p| n.starts_with(p))
+        || SESSION_JUNK_EXACT.contains(&n.as_str())
+    {
+        return false;
+    }
+    if c.expires_at.is_none() {
+        return true;
+    }
+    SESSION_AUTH_HINTS.iter().any(|k| n.contains(k))
+}
+
+/// Merge one harvest into the session vault: dedupe by
+/// (name, domain), per-domain cap for safety.
+pub(crate) fn merge_session_cookies(vault: &mut Vec<CookieRecord>, harvested: &[CookieRecord]) {
+    const PER_DOMAIN_MAX: usize = 50;
+    for c in harvested {
+        if !is_session_worthy(c) {
+            continue;
+        }
+        // Same (name, domain): refresh in place (value/expiry
+        // evolve as the site rotates its session).
+        if let Some(existing) = vault
+            .iter_mut()
+            .find(|e| e.name == c.name && e.domain == c.domain)
+        {
+            *existing = c.clone();
+            continue;
+        }
+        vault.insert(0, c.clone());
+    }
+    vault.truncate(PER_DOMAIN_MAX);
+}
+
+/// Persist a fresh cookie harvest into the session vault on disk.
+/// Load-modify-save with the same atomic tmp+rename write as the
+/// rest of the state file: a mid-write crash can never corrupt the
+/// vault it updates.
+pub(crate) fn store_session_cookies(cookies: &[CookieRecord]) {
+    if cookies.is_empty() {
+        return;
+    }
+    let mut state = GhostState::load();
+    for c in cookies {
+        if !is_session_worthy(c) {
+            continue;
+        }
+        let p = state
+            .profiles
+            .entry(c.domain.trim_start_matches('.').to_string())
+            .or_default();
+        merge_session_cookies(&mut p.session_cookies, std::slice::from_ref(c));
+    }
+    // Global cap: if the vault exceeds SESSION_MAX, drop the
+    // least-recently-solved domains' session vaults first
+    // (deterministic: last_solved is the recency signal).
+    let total: usize = state
+        .profiles
+        .values()
+        .map(|p| p.session_cookies.len())
+        .sum();
+    if total > SESSION_MAX {
+        let mut keys: Vec<(u64, String)> = state
+            .profiles
+            .iter()
+            .filter(|(_, p)| !p.session_cookies.is_empty())
+            .map(|(k, p)| (p.last_solved, k.clone()))
+            .collect();
+        keys.sort_by_key(|(last, _)| *last);
+        let mut excess = total - SESSION_MAX;
+        for (_, key) in keys {
+            if excess == 0 {
+                break;
+            }
+            let p = state.profiles.get_mut(&key).expect("key from iter");
+            let drop = p.session_cookies.len().min(excess);
+            p.session_cookies.truncate(p.session_cookies.len() - drop);
+            excess -= drop;
+        }
+    }
+    state.save();
+}
+
+/// Everything currently vaulted, across all domains, for replay
+/// into a fresh browser launch.
+pub(crate) fn load_session_cookies() -> Vec<CookieRecord> {
+    let state = GhostState::load();
+    let mut out = Vec::new();
+    for p in state.profiles.values() {
+        for c in &p.session_cookies {
+            if is_session_worthy(c) {
+                out.push(c.clone());
+            }
+        }
+    }
+    out
+}
+
 // ────────────────────────── helpers ──────────────────────────
 
 pub fn now() -> u64 {
@@ -252,6 +483,16 @@ impl GhostState {
                         changed = true;
                     }
                 }
+                // The session vault's own migration: junk from
+                // earlier filter versions fades out of old state
+                // files on load instead of lingering forever.
+                for profile in state.profiles.values_mut() {
+                    let before = profile.session_cookies.len();
+                    profile.session_cookies.retain(is_session_worthy);
+                    if profile.session_cookies.len() != before {
+                        changed = true;
+                    }
+                }
                 // One-time un-poisoning (v2.2): pre-v2.2 code marked
                 // domains needs_tier2 on ANY non-content verdict —
                 // a single 404 or rate-limit forced ghost on every
@@ -313,7 +554,11 @@ impl GhostState {
                                         name: n,
                                         value: v,
                                         domain: d,
+                                        path: "/".to_string(),
                                         expires_at: None,
+                                        secure: false,
+                                        http_only: false,
+                                        same_site: "Lax".to_string(),
                                     })
                                     .collect::<Vec<_>>(),
                             ),
@@ -624,8 +869,80 @@ mod tests {
             name: name.into(),
             value: value.into(),
             domain: domain.into(),
+            path: "/".into(),
             expires_at: exp,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".into(),
         }
+    }
+
+    // ── session vault ──
+
+    #[test]
+    fn session_worthy_keeps_and_drops() {
+        // Session cookie (no expiry) = the login signature.
+        assert!(is_session_worthy(&cr("probe", "v", "a.com", None)));
+        // Auth-named with expiry = remember-me.
+        assert!(is_session_worthy(&cr(
+            "sessionid",
+            "v",
+            "a.com",
+            Some(9_999_999_999)
+        )));
+        assert!(is_session_worthy(&cr(
+            "connect.sid",
+            "v",
+            "a.com",
+            Some(9_999_999_999)
+        )));
+        // Trackers never vault regardless of expiry.
+        assert!(!is_session_worthy(&cr("_ga", "v", "a.com", None)));
+        assert!(!is_session_worthy(&cr("TDID", "v", "a.com", None)));
+        // Clearance cookies belong to the wall vault, not here.
+        assert!(!is_session_worthy(&cr("cf_clearance", "v", "a.com", None)));
+        // A preference cookie with expiry: junk.
+        assert!(!is_session_worthy(&cr(
+            "theme",
+            "dark",
+            "a.com",
+            Some(9_999_999_999)
+        )));
+        // Degenerate shapes.
+        assert!(!is_session_worthy(&cr("x", "", "a.com", None)));
+        assert!(!is_session_worthy(&cr("x", "v", "", None)));
+        // Oversized value: never a reusable session token.
+        assert!(!is_session_worthy(&cr(
+            "tok",
+            &"a".repeat(8193),
+            "a.com",
+            None
+        )));
+    }
+
+    #[test]
+    fn session_merge_dedupes_and_caps_per_domain() {
+        let mut vault = vec![cr("a", "1", "site.com", None)];
+        // Same (name, domain) refreshes in place.
+        merge_session_cookies(
+            &mut vault,
+            std::slice::from_ref(&cr("a", "2", "site.com", None)),
+        );
+        assert_eq!(vault.len(), 1);
+        assert_eq!(vault[0].value, "2");
+        // Fill past the per-domain cap: oldest entries drop.
+        let many: Vec<CookieRecord> = (0..60)
+            .map(|i| cr(&format!("c{i}"), "v", "site.com", None))
+            .collect();
+        merge_session_cookies(&mut vault, &many);
+        assert!(
+            vault.len() <= 50,
+            "per-domain cap breached: {}",
+            vault.len()
+        );
+        // Newest survive: c59 must be present, c0 must not.
+        assert!(vault.iter().any(|c| c.name == "c59"));
+        assert!(vault.iter().all(|c| c.name != "c0"));
     }
 
     // ── cookies_fresh_at ──

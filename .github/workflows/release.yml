@@ -27,6 +27,9 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual run: build + all gates, no publishing. Used to verify
+  # baseline/glibc changes without minting a tag.
+  workflow_dispatch:
 
 env:
   CARGO_INCREMENTAL: 0
@@ -41,29 +44,40 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-latest
+            # Ubuntu 22.04 = the glibc 2.35 baseline: binaries
+            # built here run on every distro from 22.04 up. A
+            # newer builder leaks its glibc requirement into the
+            # artifact (issue #93: GLIBC_2.39 binaries on 22.04).
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             features: --features ocr,rerank,http
+            rustflags: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
           - name: linux-arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             # PDF (core) is in; OCR/rerank off: the official ONNX
             # aarch64 prebuilt deadlocks at dlopen on native arm64.
             features: ''
+            # bfd 2.38 on 22.04 cannot parse .crel relocations from
+            # rustc 1.98 for aarch64 (issue #93): force lld.
+            rustflags: -C link-arg=-fuse-ld=lld
           - name: darwin-arm64
             os: macos-latest
             target: aarch64-apple-darwin
             features: --features ocr,rerank,http
+            rustflags: ''
           - name: darwin-x64
             os: macos-15-intel
             target: x86_64-apple-darwin
             # ort-sys ships no prebuilt ONNX Runtime for x86_64-apple-darwin —
             # core build (same trade-off as linux-arm64).
             features: ''
+            rustflags: ''
           - name: win32-x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             features: --features ocr,rerank,http
+            rustflags: ''
 
     steps:
       - uses: actions/checkout@v7
@@ -78,15 +92,10 @@ jobs:
         with:
           go-version: '>=1.22.0'
 
-      - name: Install NASM (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install NASM + LLD (Linux)
+        if: startsWith(matrix.os, 'ubuntu-')
         timeout-minutes: 5
-        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-
-      - name: Install LLD (Linux ARM64)
-        if: matrix.os == 'ubuntu-24.04-arm'
-        timeout-minutes: 5
-        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends lld
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm lld
 
       - name: Install NASM (macOS)
         if: startsWith(matrix.os, 'macos')
@@ -144,7 +153,7 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}-dep-${{ env.DEP_HASH }}-rel1
+          key: release-${{ matrix.target }}-dep-${{ env.DEP_HASH }}-rel2
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
 
@@ -154,9 +163,9 @@ jobs:
           # code runs on QEMU-emulated x86_64 and older CPUs.
           # ONNX Runtime AVX is handled separately via dynamic loading
           # (ort load-dynamic + build-time .so build + runtime AVX gate).
-          # GitHub Actions runners have AVX2/AVX-512; without this
-          # Rust would emit AVX instructions that crash on non-AVX CPUs.
-          RUSTFLAGS: ${{ contains(matrix.target, 'x86_64') && '-C target-cpu=x86-64' || '' }}
+          # Linux legs also pin -fuse-ld=lld per matrix.rustflags:
+          # bfd 2.38 (22.04) cannot link rustc 1.98 output (.crel).
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
         timeout-minutes: 30
 
@@ -183,11 +192,13 @@ jobs:
             exit 1
           fi
           echo "OK: $(echo "$output" | head -1)"
-          TAGVER="${GITHUB_REF_NAME#v}"
-          if ! echo "$output" | grep -q "$TAGVER"; then
-            echo "ERROR: binary does not report the tagged version $TAGVER"
-            echo "Did you bump Cargo.toml before tagging?"
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAGVER="${GITHUB_REF_NAME#v}"
+            if ! echo "$output" | grep -q "$TAGVER"; then
+              echo "ERROR: binary does not report the tagged version $TAGVER"
+              echo "Did you bump Cargo.toml before tagging?"
+              exit 1
+            fi
           fi
 
       # ── Payload integrity gates ────────────────────────────
@@ -229,6 +240,36 @@ jobs:
             exit 1
           }
           echo "payload gates ok: ${SIZE} bytes, ONNX probe: ${EXPECT}"
+
+      # ── glibc baseline gate (Linux legs) ────────────────────
+      # The binary must not demand any glibc symbol newer than
+      # 2.35 (Ubuntu 22.04). This is the hard tripwire for issue
+      # #93: building on a newer runner used to leak GLIBC_2.39
+      # into the artifact and every 22.04 install refused to start.
+      # objdump reads the ACTUAL symbol requirements of the built
+      # bytes, so a regression fails the release here, not on a
+      # user's VM.
+      - name: Verify glibc baseline
+        if: startsWith(matrix.os, 'ubuntu-')
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if ! command -v objdump >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends binutils >/dev/null 2>&1 || true
+          fi
+          MAXGLIBC=$(objdump -T donsetch | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "max GLIBC version required by the binary: $MAXGLIBC"
+          if [ -z "$MAXGLIBC" ]; then
+            echo "ERROR: no GLIBC versioned symbols found — objdump failed or binary is static"
+            exit 1
+          fi
+          HIGHER=$(printf '2.35\n%s\n' "$MAXGLIBC" | sort -V | tail -1)
+          if [ "$HIGHER" = "$MAXGLIBC" ] && [ "$MAXGLIBC" != "2.35" ]; then
+            echo "ERROR: binary requires GLIBC_$MAXGLIBC, exceeds the 2.35 baseline"
+            echo "Rebuild on the ubuntu-22.04 leg, or the dependency pulling the new symbol needs pinning"
+            exit 1
+          fi
+          echo "OK: glibc baseline <= 2.35 satisfied"
 
       # ── QEMU non-AVX verification (Linux x64 only) ──────────
       #
@@ -301,6 +342,8 @@ jobs:
   release:
     name: Create Release
     needs: build
+    # Dispatch runs exercise build + every gate without publishing.
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

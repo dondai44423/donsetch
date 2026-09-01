@@ -1,4 +1,4 @@
-//! Frontier relevance scoring — BM25-lite over anchor text + URL path
+//! Frontier relevance scoring: BM25-lite over anchor text + URL path
 //! tokens, with real Okapi IDF when a site inventory is available.
 //! The crawl spends its budget on pages that MATTER to the focus
 //! query, not on the sitemap's order.
@@ -24,7 +24,7 @@ use crate::extract::language;
 
 /// Score one candidate URL against the focus query.
 /// `anchor` = the link text where we found it ("" from sitemaps).
-/// `path` = URL path. `focus` = None means no focus — score = 0
+/// `path` = URL path. `focus` = None means no focus: score = 0
 /// and the queue falls back to sitemap/depth order.
 pub fn score_candidate(anchor: &str, path: &str, focus: Option<&str>) -> f64 {
     score_candidate_with_idf(anchor, path, focus, None)
@@ -33,7 +33,7 @@ pub fn score_candidate(anchor: &str, path: &str, focus: Option<&str>) -> f64 {
 /// Score one candidate URL against the focus query, with optional
 /// Okapi IDF from the site inventory. `anchor` = the link text
 /// where we found it ("" from sitemaps). `path` = URL path.
-/// `focus` = None means no focus — score = 0 and the queue falls
+/// `focus` = None means no focus: score = 0 and the queue falls
 /// back to sitemap/depth order. `idf` = None reproduces the
 /// pre-IDF flat weights exactly (used when no inventory exists).
 pub fn score_candidate_with_idf(
@@ -162,10 +162,15 @@ fn depth_prior(path: &str) -> f64 {
 /// Compound token handling: query terms containing `_` or `-`
 /// (e.g. `spawn_blocking`, `async-await`) are treated as compound
 /// identifiers. A compound term matches if:
-///   (a) the full compound form appears as a substring in the
-///       path or anchor (e.g. `spawn_blocking` in the path), OR
-///   (b) ALL its fragments appear in the path/anchor tokens.
-/// This prevents the stemmed fragment `block` (from splitting
+///   (a) its fragments appear as a contiguous, in-order run in the
+///       path or anchor tokens (e.g. `spawn_blocking` right next to
+///       each other in the path), OR
+///   (b) ALL its fragments appear in the path/anchor tokens, in any
+///       order.
+/// (a) is token-boundary-safe by construction: a raw string
+/// `contains` would match `auto-complete` inside `auto-completed`,
+/// a different word once stemming strips the `-ed`.
+/// (b) prevents the stemmed fragment `block` (from splitting
 /// `spawn_blocking` → `spawn` + `block`) from matching unrelated
 /// paths like `/ant-libp2p-allow-block-list/` where only `block`
 /// appears without `spawn`.
@@ -180,22 +185,28 @@ pub fn focus_match(anchor: &str, path: &str, focus: &str) -> bool {
     let path_toks = focus::tokenize(&path_text, &qlang);
     let all_toks: Vec<&String> = anchor_toks.iter().chain(path_toks.iter()).collect();
 
-    let lower_path = path.to_lowercase();
-    let lower_anchor = anchor.to_lowercase();
-
     // Split query into whitespace-separated terms.
     for term in focus.split_whitespace() {
         let lower_term = term.to_lowercase();
 
-        // Compound term (contains _ or -): check full form as
-        // substring, or ALL fragments as token matches.
+        // Compound term (contains _ or -): check full form as a
+        // contiguous token run, or ALL fragments as token matches
+        // (any order).
         if lower_term.contains('_') || lower_term.contains('-') {
-            // (a) Full compound form as substring.
-            if lower_path.contains(&lower_term) || lower_anchor.contains(&lower_term) {
+            let fragments = focus::tokenize(&lower_term, &qlang);
+            // (a) Full compound form: fragments appear contiguous
+            // and in order in the path or anchor tokens. A raw
+            // string `contains` here would cross word boundaries
+            // (e.g. "auto-complete" is a substring of
+            // "auto-completed", a different word once "-ed" is
+            // stripped). Token-subsequence matching can't.
+            if !fragments.is_empty()
+                && (contains_subsequence(&path_toks, &fragments)
+                    || contains_subsequence(&anchor_toks, &fragments))
+            {
                 return true;
             }
-            // (b) ALL fragments must match as tokens.
-            let fragments = focus::tokenize(&lower_term, &qlang);
+            // (b) ALL fragments must match as tokens, any order.
             if !fragments.is_empty() && fragments.iter().all(|ft| all_toks.contains(&ft)) {
                 return true;
             }
@@ -209,6 +220,19 @@ pub fn focus_match(anchor: &str, path: &str, focus: &str) -> bool {
     }
 
     false
+}
+
+/// True if `needle` appears as a contiguous, in-order run inside
+/// `haystack`. Used for compound-term matching: token-boundary-safe
+/// alternative to a raw string `contains`, which can match across
+/// word boundaries.
+fn contains_subsequence(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -358,6 +382,36 @@ mod tests {
             "spawn_blocking vs spawn"
         ));
         assert!(!focus_match("", "/asm_block", "spawn_blocking vs spawn"));
+    }
+
+    #[test]
+    fn focus_match_compound_substring_respects_word_boundaries() {
+        // The compound-term "full form as substring" check (case a)
+        // must not cross word boundaries: "auto-complete" is a raw
+        // substring of "auto-completed" (auto-complete[d]), but the
+        // page is about the past tense of a DIFFERENT stem
+        // ("complet", once "-ed" is stripped), not the "complete"
+        // feature.
+        assert!(
+            !focus_match("", "/features/auto-completed-suggestions", "auto-complete"),
+            "auto-complete must not match auto-completed across a word boundary"
+        );
+        // Same shape with anchor text instead of path.
+        assert!(
+            !focus_match(
+                "the field was auto-completed already",
+                "/x",
+                "auto-complete"
+            ),
+            "auto-complete must not match \"auto-completed\" in anchor text either"
+        );
+        // A real match must still work: the compound term appears
+        // as its own word, not glued to surrounding letters.
+        assert!(focus_match(
+            "",
+            "/docs/auto-complete-guide",
+            "auto-complete"
+        ));
     }
 
     #[test]

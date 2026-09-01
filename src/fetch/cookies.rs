@@ -264,7 +264,11 @@ impl CookieJar {
                 name: c.name.clone(),
                 value: c.value.clone(),
                 domain: c.domain.clone(),
+                path: "/".to_string(),
                 expires_at: c.expires_at,
+                secure: false,
+                http_only: false,
+                same_site: "Lax".to_string(),
             })
             .collect()
     }

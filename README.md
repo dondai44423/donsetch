@@ -4,6 +4,12 @@
 
 **The web, for AI agents.**
 
+<div align="center">
+<a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="dondai44423%2Fdonsetch | Trendshift" width="250" height="55"/></a>
+</div>
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
+
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-AGPL%203.0-2563eb)](LICENSE)
@@ -11,8 +17,6 @@
 [![npm](https://img.shields.io/npm/v/donsetch?color=cb3837&logo=npm)](https://www.npmjs.com/package/donsetch)
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
 
 [Install](#-install) · [Quickstart](#-quickstart) · [The 3 tools](#-the-3-tools) · [Chrome TLS](#-chrome-tls-not-chrome-like) · [Solve & Bounce](#-solve-and-bounce) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Benchmark](#-wrb-web-research-benchmark) · [Comparison](#-comparison) · [Gotchas](#-gotchas) · [Limits](#-honest-limits)
 
@@ -99,8 +103,9 @@ npm install -g donsetch
 ```
 
 Downloads the prebuilt binary for your platform from GitHub Releases
-with SHA256 verification. No build tools needed. Linux x86_64 works on
-any glibc >= 2.27 distro (Ubuntu 18.04+).
+with SHA256 verification. No build tools needed. Linux prebuilts run
+on glibc >= 2.35 (Ubuntu 22.04 LTS and newer; the bundled ONNX lib
+keeps its own 2.27 floor, so OCR/rerank work on every one of those).
 
 **Homebrew (macOS/Linux):**
 
@@ -134,6 +139,20 @@ git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
 cargo build --release --features ocr,rerank,http
 ```
+
+On Ubuntu 22.04 (or any distro with bfd 2.38): build with lld
+explicitly. bfd cannot parse the `.crel` relocations rustc 1.86+
+emits for aarch64, and the default link dies with "unknown
+architecture" errors:
+
+```bash
+sudo apt-get install -y cmake build-essential pkg-config libclang-dev clang lld nasm golang-go
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" cargo build --release
+```
+
+Same recipe works for the release-binaries-for-22.04 case: any
+prebuilt from v3.4.5+ is built on the Ubuntu 22.04 baseline and
+runs there directly.
 
 First build compiles BoringSSL (~2 min), cached after. Chromium is
 optional (tier 2 escalation); DonSeTch auto-discovers system Chromium,
