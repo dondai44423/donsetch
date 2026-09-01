@@ -17,6 +17,7 @@
 pub mod adapters;
 pub mod auth;
 pub mod cli;
+mod config;
 pub mod cpu;
 pub mod crawl;
 pub mod detect;

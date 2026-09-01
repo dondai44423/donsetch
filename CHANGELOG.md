@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **False-like private-egress values no longer disable SSRF guards:**
+  `DONSETCH_ALLOW_PRIVATE_EGRESS` previously enabled private egress from
+  presence alone, so `false`, `0`, an empty string, or an unknown value
+  bypassed the URL, DNS, and socket checks. One shared fail-closed parser now
+  accepts only `1`, `true`, or `on` (case-insensitive, with surrounding
+  whitespace ignored); malformed and non-Unicode values remain disabled.
 - **Engine trust EWMA was eroded by infra failures:** the quarantine
   gate excluded `dead-proxy`/`auth-fail`/`no-results` but the trust
   EWMA only excluded `no-results`, so dead egresses and BYOK key

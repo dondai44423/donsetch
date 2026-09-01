@@ -39,7 +39,7 @@ pub async fn happy_connect_with(
     // dial : not the name : also closes rebinding TOCTOU.
     // Escape hatch for deliberate local-egress use (CLI
     // power users, tests): DONSETCH_ALLOW_PRIVATE_EGRESS=1.
-    let addrs: Vec<SocketAddr> = if std::env::var_os("DONSETCH_ALLOW_PRIVATE_EGRESS").is_some() {
+    let addrs: Vec<SocketAddr> = if crate::fetch::guards::private_egress_allowed() {
         addrs
     } else {
         let blocked: Vec<&SocketAddr> = addrs

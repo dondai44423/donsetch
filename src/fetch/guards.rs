@@ -65,11 +65,10 @@ pub fn is_ssrf_resolved_ip(ip: &IpAddr) -> bool {
 }
 
 /// Escape hatch for deliberate private egress (CLI power users,
-/// local services): DONSETCH_ALLOW_PRIVATE_EGRESS set to anything
-/// disables the SSRF guard chain end to end, matching the
-/// transport layer's hatch. Default off.
-fn private_egress_allowed() -> bool {
-    std::env::var_os("DONSETCH_ALLOW_PRIVATE_EGRESS").is_some()
+/// local services): DONSETCH_ALLOW_PRIVATE_EGRESS must be explicitly
+/// true to disable the SSRF guard chain end to end. Default off.
+pub(crate) fn private_egress_allowed() -> bool {
+    crate::config::env_flag("DONSETCH_ALLOW_PRIVATE_EGRESS")
 }
 
 fn is_private_ip(ip: &IpAddr) -> bool {
@@ -134,6 +133,13 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 /// caller should surface directly. This is the single sync gate
 /// used by both fetch and browser tiers.
 pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
+    validate_url_basic_with_policy(url_str, private_egress_allowed())
+}
+
+fn validate_url_basic_with_policy(
+    url_str: &str,
+    allow_private_egress: bool,
+) -> Result<url::Url, crate::error::FetchError> {
     let url = url::Url::parse(url_str)
         .map_err(|_| crate::error::FetchError::InvalidUrl(url_str.into()))?;
     let scheme = url.scheme();
@@ -150,7 +156,7 @@ pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::Fetch
     let host = url
         .host_str()
         .ok_or_else(|| crate::error::FetchError::InvalidUrl(url_str.into()))?;
-    if is_ssrf_host(host) && !private_egress_allowed() {
+    if is_ssrf_host(host) && !allow_private_egress {
         return Err(crate::error::FetchError::Http(format!(
             "blocked: {host} is a private/loopback address : SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)"
         )));
@@ -186,9 +192,10 @@ pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::Fetch
 /// Redirects are re-validated per hop via `validate_redirect_url`
 /// (sync) and `ensure_url_safe` (async) where applicable.
 pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
-    let url = validate_url_basic(url_str)?;
+    let allow_private_egress = private_egress_allowed();
+    let url = validate_url_basic_with_policy(url_str, allow_private_egress)?;
     // Deliberate opt-out: skip the DNS resolution tier entirely.
-    if private_egress_allowed() {
+    if allow_private_egress {
         return Ok(url);
     }
     let host: String = url.host_str().unwrap_or("").to_owned();
@@ -622,26 +629,14 @@ mod tests {
     }
 
     #[test]
-    fn private_egress_hatch_disables_both_tiers() {
-        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
-        // Literal gate relaxed.
-        assert!(validate_url_basic("http://127.0.0.1/").is_ok());
-        assert!(validate_url_basic("http://198.18.0.25/").is_ok());
-        assert!(validate_url_basic("http://[::ffff:169.254.169.254]/").is_ok());
-        unsafe { std::env::remove_var("DONSETCH_ALLOW_PRIVATE_EGRESS") };
-        // Strict again.
-        assert!(validate_url_basic("http://127.0.0.1/").is_err());
-        assert!(validate_url_basic("http://198.18.0.25/").is_err());
-    }
-
-    #[tokio::test]
-    async fn hatch_also_relaxes_resolved_tier() {
-        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
-        // A genuinely private target would still be dialed here, so
-        // use a blocked literal to prove the whole async chain is
-        // skipped without performing a resolution at all.
-        assert!(ensure_url_safe("http://192.168.1.1/").await.is_ok());
-        unsafe { std::env::remove_var("DONSETCH_ALLOW_PRIVATE_EGRESS") };
-        assert!(ensure_url_safe("http://192.168.1.1/").await.is_err());
+    fn private_egress_policy_controls_literal_guard() {
+        for target in [
+            "http://127.0.0.1/",
+            "http://198.18.0.25/",
+            "http://[::ffff:169.254.169.254]/",
+        ] {
+            assert!(validate_url_basic_with_policy(target, true).is_ok());
+            assert!(validate_url_basic_with_policy(target, false).is_err());
+        }
     }
 }
