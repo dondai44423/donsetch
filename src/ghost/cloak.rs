@@ -470,7 +470,15 @@ fn extract_archive(archive_path: &Path, root: &Path) -> Result<(), String> {
 }
 
 fn safe_member(path: &Path) -> Result<(), String> {
-    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+    // has_root(), not is_absolute(): on Windows a path can have a
+    // root without a drive prefix (`\tmp\chrome`, or `/tmp/chrome`
+    // once the archive's forward slashes are turned into
+    // components) and is_absolute() returns false for those —
+    // joining one onto the extraction dir still replaces
+    // everything past the prefix, escaping it just the same. Unix
+    // defines is_absolute() as has_root(), so this is a no-op
+    // there.
+    if path.has_root() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         Err(format!(
             "archive path escapes extraction root: {}",
             path.display()

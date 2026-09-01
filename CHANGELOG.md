@@ -102,6 +102,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockfile's mtime now gets refreshed every 2 minutes for as long
   as a Ghost holds it, opened with FILE_SHARE_DELETE so the
   refresh can never block cleanup on exit.
+- **CloakBrowser archive extraction didn't reject rooted paths on
+  Windows:** `safe_member()`'s traversal guard used `is_absolute()`,
+  which requires a drive prefix on Windows — a path like
+  `/tmp/chrome` has a root but no prefix, so `is_absolute()` is
+  false there even though joining it onto the extraction dir still
+  escapes it (Windows path-join semantics replace everything past
+  the prefix for any rooted push). Practical impact is narrow: the
+  archive comes from a single pinned repository and is SHA256-
+  verified against a checksum baked into this binary before
+  extraction ever starts, so exploiting this needs a compromise of
+  that supply chain, not just an untrusted archive. Switched the
+  guard to `has_root()`, which `is_absolute()` is itself defined as
+  on Unix (no behavior change there) and is the correct, broader
+  check on Windows.
 - **Browser fingerprint noise:** the ghost no longer runs Chrome
   default apps or extensions, killing the surprise-component
   detection class (enumerable extensions, default-app traffic)
