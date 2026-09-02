@@ -74,6 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outline/bookmark title picked up two invisible trailing NULs. Both call
   sites now convert bytes to units first, matching the sibling
   `field_string` helper in `forms.rs`, which already did this correctly.
+- **A stray HTTP/2 RST_STREAM could abort the wrong request on a
+  reused connection:** every other per-stream frame type (HEADERS,
+  CONTINUATION, DATA) in the h2 read loop is scoped to the current
+  stream id, but RST_STREAM matched any stream id. On a pooled,
+  reused connection, a late RST_STREAM for an already-finished prior
+  stream would abort a completely unrelated new request in flight.
+  Also: the RST_STREAM sent to refuse a PUSH_PROMISE (a spec
+  violation, since we advertise `ENABLE_PUSH=0`) carried the wrong
+  payload — the current request's own stream id instead of a 4-byte
+  HTTP/2 error code (RFC 7540 §6.4); it now sends `REFUSED_STREAM`.
 
 
 ## [3.5.0] - 2026-09-01

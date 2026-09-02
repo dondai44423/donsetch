@@ -236,19 +236,32 @@ impl H2Conn {
                         break;
                     }
                 }
-                RST_STREAM => {
+                // Scoped like HEADERS/CONTINUATION/DATA above: on a
+                // pooled, reused connection, a late RST_STREAM for a
+                // PRIOR (already-finished) stream must not abort the
+                // new request currently in flight. Unmatched
+                // RST_STREAM falls through to the `_` arm below and
+                // is correctly ignored.
+                RST_STREAM if hdr.stream_id == stream_id => {
                     return Err(FetchError::Http(format!("h2 rst_stream on {stream_id}")));
                 }
                 GOAWAY => {
                     return Err(FetchError::Http("h2 goaway".into()));
                 }
                 PUSH_PROMISE => {
+                    // RFC 7540 §6.4: RST_STREAM's payload is a 4-byte
+                    // error code, not a stream id — this used to send
+                    // `stream_id`'s own bytes. We advertise
+                    // ENABLE_PUSH=0 in SETTINGS, so a conforming
+                    // server never pushes; REFUSED_STREAM tells a
+                    // non-conforming one plainly why this is refused.
+                    const REFUSED_STREAM: u32 = 0x7;
                     write_frame(
                         &mut self.stream,
                         RST_STREAM,
                         0,
                         hdr.stream_id,
-                        &stream_id.to_be_bytes(),
+                        &REFUSED_STREAM.to_be_bytes(),
                     )
                     .await
                     .ok();
