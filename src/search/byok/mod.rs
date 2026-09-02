@@ -19,6 +19,7 @@ mod brightdata;
 mod exa;
 mod parallel;
 mod serpapi;
+mod serpbase;
 mod serper;
 pub mod store;
 mod tavily;
@@ -258,6 +259,7 @@ async fn dispatch(
         "exa" => exa::search(client, key, query, max, intent).await,
         "serper" => serper::search(client, key, query, max, intent).await,
         "serpapi" => serpapi::search(client, key, query, max, intent).await,
+        "serpbase" => serpbase::search(client, key, query, max, intent).await,
         "bravesearch" => bravesearch::search(client, key, query, max, intent).await,
         "tinyfish" => tinyfish::search(client, key, query, max, intent).await,
         "parallel" => parallel::search(client, key, query, max, intent).await,

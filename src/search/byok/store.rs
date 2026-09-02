@@ -27,6 +27,7 @@ pub const PROVIDERS: &[&str] = &[
     "exa",
     "serper",
     "serpapi",
+    "serpbase",
     "bravesearch",
     "tinyfish",
     "parallel",
@@ -489,7 +490,7 @@ pub fn render_list(cfg: &ByokConfig) {
         );
         println!(
             "  Providers:       {}",
-            cli::dim("tavily, exa, serper, tinyfish, parallel, brightdata")
+            cli::dim("tavily, exa, serper, serpbase, tinyfish, parallel, brightdata")
         );
         return;
     }
