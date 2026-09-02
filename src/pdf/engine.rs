@@ -399,6 +399,19 @@ fn decode_utf16(buf: &[u16], len_units: usize) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
+/// Decode a UTF-16LE buffer using a PDFium-reported BYTE count, as
+/// returned by `FPDF_GetMetaText`/`FPDFBookmark_GetTitle` (both
+/// count bytes, including the NUL terminator — see their headers in
+/// fpdf_doc.h). `decode_utf16` above takes a UNIT count instead;
+/// passing a byte count straight through reads past the real string
+/// into the buffer's zero-initialized tail, appending trailing NULs
+/// (the buffers here are always over-allocated by a few units past
+/// what the byte count implies, matching the sibling `field_string`
+/// helper in forms.rs, which does this division correctly).
+fn decode_utf16_from_byte_count(buf: &[u16], byte_count: usize) -> String {
+    decode_utf16(buf, (byte_count / 2).min(buf.len()))
+}
+
 /// Fonts whose glyphs are pictures, not text (checkboxes, seals,
 /// logo art). Detected once at intern time.
 pub fn is_dingbat_family(name: &str) -> bool {
@@ -457,7 +470,7 @@ fn get_meta(doc: FpdfDocument, tag: &str, buf: &mut Vec<u16>) -> Option<String> 
                 return None;
             }
         }
-        let s = decode_utf16(buf, n.min(buf.len()));
+        let s = decode_utf16_from_byte_count(buf, n);
         let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
         let s = cleaned.trim();
         if s.is_empty() {
@@ -480,7 +493,7 @@ fn bookmark_title(bm: FpdfBookmark) -> String {
             buf.as_mut_ptr() as *mut c_void,
             (buf.len() * 2) as c_ulong,
         ) as usize;
-        decode_utf16(&buf, n2.min(buf.len()))
+        decode_utf16_from_byte_count(&buf, n2)
     }
 }
 
@@ -905,5 +918,56 @@ where
 
         drop(guard);
         Ok((raw, pages_out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_utf16_from_byte_count_strips_terminator_and_padding() {
+        // Mimics the real buffer shape at both call sites: "Hi" (2
+        // UTF-16 units) + a NUL terminator (1 unit) written by
+        // PDFium, followed by the caller's over-allocated slack
+        // (the `n/2 + 2` sizing convention), left zero-initialized.
+        let buf: Vec<u16> = vec![
+            'H' as u16, 'i' as u16, 0x0000, // title + NUL terminator
+            0x0000, 0x0000, // caller's slack padding
+        ];
+        // PDFium reports byte counts, not unit counts: a 2-char
+        // title + its NUL terminator is (2 + 1) * 2 = 6 bytes.
+        assert_eq!(decode_utf16_from_byte_count(&buf, 6), "Hi");
+    }
+
+    #[test]
+    fn decode_utf16_from_byte_count_handles_empty_title() {
+        let buf: Vec<u16> = vec![0x0000, 0x0000];
+        // byte_count for just the NUL terminator: 1 unit * 2 = 2.
+        assert_eq!(decode_utf16_from_byte_count(&buf, 2), "");
+    }
+
+    #[test]
+    fn decode_utf16_from_byte_count_never_reads_past_the_buffer() {
+        // A byte_count larger than the actual buffer must never
+        // panic — defensive against a hostile/corrupt PDF causing
+        // PDFium to report an implausible size.
+        let buf: Vec<u16> = vec!['x' as u16, 0x0000];
+        assert_eq!(decode_utf16_from_byte_count(&buf, 1_000_000), "x");
+    }
+
+    #[test]
+    fn decode_utf16_from_byte_count_matches_unit_count_form() {
+        // Regression for the actual bug: the byte-count form must
+        // agree with calling decode_utf16 directly with the correct
+        // UNIT count, not the byte count itself passed straight
+        // through (which is what both call sites used to do).
+        let buf: Vec<u16> = vec!['h' as u16, 'i' as u16, 0x0000, 0x0000];
+        let byte_count = 6; // (2 chars + NUL) * 2
+        let unit_count = 3; // 2 chars + NUL
+        assert_eq!(
+            decode_utf16_from_byte_count(&buf, byte_count),
+            decode_utf16(&buf, unit_count)
+        );
     }
 }
