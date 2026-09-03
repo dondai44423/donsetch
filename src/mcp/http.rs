@@ -195,8 +195,8 @@ async fn health_handler() -> impl IntoResponse {
 /// independently optional, so nothing stopped a user from enabling
 /// permissive CORS (any origin) while leaving auth off. With that
 /// combination, any webpage open in the same local browser could
-/// POST arbitrary MCP tool calls — fetch/crawl/search, including the
-/// `actions` browser-automation surface — to this server with no
+/// POST arbitrary MCP tool calls (fetch/crawl/search, including the
+/// `actions` browser-automation surface) to this server with no
 /// authentication. Fail closed instead of just warning: a startup
 /// error is impossible to miss, unlike an eprintln! in a background
 /// daemon's log.

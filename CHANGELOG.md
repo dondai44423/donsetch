@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drive-by footgun:** CORS and bearer auth on the opt-in HTTP MCP
   transport are independently optional env vars, so enabling
   permissive CORS (any origin) without also setting a token left
-  the server wide open — any webpage in a local browser could POST
+  the server wide open: any webpage in a local browser could POST
   arbitrary MCP tool calls (fetch/crawl/search, including the
   `actions` browser-automation surface) with no authentication, the
   classic "localhost server + permissive CORS" drive-by pattern.
