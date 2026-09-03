@@ -32,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for everything else. (README BYOK plugins section documents the
   contract.)
 
+### Fixed
+
+- **`DONSETCH_HTTP_CORS` without `DONSETCH_HTTP_TOKEN` was a silent
+  drive-by footgun:** CORS and bearer auth on the opt-in HTTP MCP
+  transport are independently optional env vars, so enabling
+  permissive CORS (any origin) without also setting a token left
+  the server wide open — any webpage in a local browser could POST
+  arbitrary MCP tool calls (fetch/crawl/search, including the
+  `actions` browser-automation surface) with no authentication, the
+  classic "localhost server + permissive CORS" drive-by pattern.
+  The HTTP transport now refuses to start with that combination
+  instead of silently accepting it, with an error pointing at
+  `DONSETCH_HTTP_TOKEN`.
+
 ## [3.5.1] - 2026-09-03
 
 ### Added

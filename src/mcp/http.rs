@@ -105,14 +105,6 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TIMEOUT_SECS),
     );
-    let state = HttpState {
-        daemon: Arc::clone(&daemon),
-        sessions: Arc::new(SessionTable {
-            sessions: Mutex::new(HashMap::new()),
-        }),
-        auth_token,
-        timeout,
-    };
 
     // CORS is off by default: MCP clients are processes, not browsers,
     // and a permissive layer would let any webpage open in a local
@@ -122,6 +114,16 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
         std::env::var("DONSETCH_HTTP_CORS").as_deref(),
         Ok("1" | "true" | "on")
     );
+    validate_http_config(cors_enabled, auth_enabled)?;
+
+    let state = HttpState {
+        daemon: Arc::clone(&daemon),
+        sessions: Arc::new(SessionTable {
+            sessions: Mutex::new(HashMap::new()),
+        }),
+        auth_token,
+        timeout,
+    };
 
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -186,6 +188,29 @@ async fn shutdown_signal() {
 /// Liveness probe for orchestrators and load balancers.
 async fn health_handler() -> impl IntoResponse {
     Json(json!({ "status": "ok", "transport": "http" }))
+}
+
+/// Refuse the classic "localhost server + permissive CORS = drive-by"
+/// footgun: `DONSETCH_HTTP_CORS` and `DONSETCH_HTTP_TOKEN` are
+/// independently optional, so nothing stopped a user from enabling
+/// permissive CORS (any origin) while leaving auth off. With that
+/// combination, any webpage open in the same local browser could
+/// POST arbitrary MCP tool calls — fetch/crawl/search, including the
+/// `actions` browser-automation surface — to this server with no
+/// authentication. Fail closed instead of just warning: a startup
+/// error is impossible to miss, unlike an eprintln! in a background
+/// daemon's log.
+fn validate_http_config(cors_enabled: bool, auth_enabled: bool) -> Result<(), String> {
+    if cors_enabled && !auth_enabled {
+        return Err(
+            "DONSETCH_HTTP_CORS is enabled without DONSETCH_HTTP_TOKEN: any \
+             webpage open in a local browser could drive this MCP server \
+             with no authentication. Set DONSETCH_HTTP_TOKEN to a random \
+             secret before enabling CORS."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Bearer-auth check shared by every /mcp method (health stays open).
@@ -533,6 +558,22 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn cors_without_auth_is_refused() {
+        assert!(validate_http_config(true, false).is_err());
+    }
+
+    #[test]
+    fn cors_with_auth_is_allowed() {
+        assert!(validate_http_config(true, true).is_ok());
+    }
+
+    #[test]
+    fn no_cors_is_always_allowed_regardless_of_auth() {
+        assert!(validate_http_config(false, false).is_ok());
+        assert!(validate_http_config(false, true).is_ok());
     }
 
     #[test]
