@@ -206,7 +206,8 @@ fn validate_http_config(cors_enabled: bool, auth_enabled: bool) -> Result<(), St
             "DONSETCH_HTTP_CORS is enabled without DONSETCH_HTTP_TOKEN: any \
              webpage open in a local browser could drive this MCP server \
              with no authentication. Set DONSETCH_HTTP_TOKEN to a random \
-             secret before enabling CORS."
+             secret before enabling CORS, or leave DONSETCH_HTTP_CORS unset \
+             if you don't need browser-based clients."
                 .into(),
         );
     }
