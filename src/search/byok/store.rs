@@ -64,7 +64,7 @@ impl KeyState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KeyEntry {
     pub key: String,
     pub state: KeyState,
@@ -72,6 +72,23 @@ pub struct KeyEntry {
     /// Used for rate-limit cooldown calculation.
     #[serde(default)]
     pub ts: u64,
+}
+
+/// Redacts `key` — a derived Debug would print the plaintext BYOK
+/// API key into any log/error output that formats a `KeyEntry` (or
+/// a `ProviderConfig`/`ByokConfig` containing one) with `{:?}`. The
+/// existing debug logging in `byok::mod` is careful to print only
+/// `key.chars().take(8)`, but that's a manual convention, not
+/// something the type system enforces — this closes the gap so a
+/// future `{cfg:?}`-style dump can't defeat it by accident.
+impl std::fmt::Debug for KeyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyEntry")
+            .field("key", &"***")
+            .field("state", &self.state)
+            .field("ts", &self.ts)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -629,6 +646,29 @@ fn mask_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_key_and_propagates_through_containers() {
+        let mut cfg = ByokConfig::empty();
+        cfg.add_key("tavily", "tvly-s3cret-actual-key");
+
+        let entry_out = format!("{:?}", cfg.providers[0].keys[0]);
+        assert!(
+            !entry_out.contains("tvly-s3cret-actual-key"),
+            "leaked key: {entry_out}"
+        );
+        assert!(entry_out.contains("***"));
+
+        // The derived Debug on the containing structs calls
+        // KeyEntry's own (redacted) fmt for each element — the leak
+        // must not resurface just by formatting the outer config.
+        let cfg_out = format!("{cfg:?}");
+        assert!(
+            !cfg_out.contains("tvly-s3cret-actual-key"),
+            "leaked key via container Debug: {cfg_out}"
+        );
+        assert!(cfg_out.contains("***"));
+    }
 
     #[test]
     fn add_key_creates_provider_and_sets_default() {

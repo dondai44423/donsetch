@@ -48,13 +48,29 @@ pub enum ProxyScheme {
     Socks5,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Proxy {
     pub host: String,
     pub port: u16,
     pub user: String,
     pub pass: String,
     pub scheme: ProxyScheme,
+}
+
+/// Redacts `pass` — a derived Debug would print the plaintext proxy
+/// password into any log/error output that formats a `Proxy` with
+/// `{:?}`. No such call site exists today, but nothing stops one
+/// being added later without anyone noticing the leak.
+impl std::fmt::Debug for Proxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Proxy")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pass", &"***")
+            .field("scheme", &self.scheme)
+            .finish()
+    }
 }
 
 impl Proxy {
@@ -560,6 +576,22 @@ pub(crate) fn base64(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_password() {
+        let p = Proxy {
+            host: "proxy.example.com".into(),
+            port: 8080,
+            user: "alice".into(),
+            pass: "s3cret-password".into(),
+            scheme: ProxyScheme::Http,
+        };
+        let out = format!("{p:?}");
+        assert!(!out.contains("s3cret-password"), "leaked password: {out}");
+        assert!(out.contains("proxy.example.com"));
+        assert!(out.contains("alice"));
+        assert!(out.contains("***"));
+    }
 
     #[test]
     fn base64_rfc4648_vectors() {

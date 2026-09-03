@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`Proxy` and BYOK `KeyEntry` derived a plaintext `Debug`:** neither
+  type has a live call site that formats it with `{:?}` today, but
+  nothing in the type system stopped one from being added later and
+  silently leaking a proxy password or a BYOK API key into a log or
+  error message. Both now redact the secret field behind a hand-
+  written `Debug` impl; `ProviderConfig`/`ByokConfig`'s derived
+  `Debug` picks up the redaction automatically through the nested
+  `KeyEntry`.
 
 ## [3.5.2] - 2026-09-03
 
