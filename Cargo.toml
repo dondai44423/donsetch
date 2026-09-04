@@ -25,7 +25,7 @@ futures-util = "0.3"
 # HTTP server for MCP HTTP transport (axum, SSE). Optional: gates
 # the --http flag. Adds significant compile time (axum + tower-http).
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json"], optional = true }
-tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
 libc = "0.2"
 dirs = "6"
 unicode-bidi = "0.3"
