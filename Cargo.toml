@@ -34,7 +34,7 @@ oar-ocr = { version = "0.9", default-features = false, features = ["download-bin
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Probe mode (must_contain): pattern verification against fetched
