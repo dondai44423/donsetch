@@ -19,6 +19,7 @@
 
 use std::path::Path;
 
+use crate::DISPLAY_NAME;
 use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::paths;
@@ -28,7 +29,7 @@ const REPO: &str = "dondai44423/donsetch";
 
 pub async fn run() {
     cli::init();
-    cli::print_title("DonSeTch Update");
+    cli::print_title(&format!("{DISPLAY_NAME} Update"));
 
     let current = env!("CARGO_PKG_VERSION");
     cli::print_kv("current", current);

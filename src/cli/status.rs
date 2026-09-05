@@ -5,6 +5,7 @@
 //! "I just installed it, what's the state?" command : fast, no
 //! network probes, no browser launch.
 
+use crate::DISPLAY_NAME;
 use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
@@ -16,7 +17,7 @@ const REPO: &str = "dondai44423/donsetch";
 pub async fn run() {
     cli::init();
     let current = env!("CARGO_PKG_VERSION");
-    cli::print_title(&format!("DonSeTch {current} : Status"));
+    cli::print_title(&format!("{DISPLAY_NAME} {current} : Status"));
     println!();
 
     // ── Version + update ────────────────────────────────────

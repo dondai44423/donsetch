@@ -5,6 +5,7 @@
 //! feed (no API key, no rate limits) and shows whether the current
 //! version is up to date.
 
+use crate::DISPLAY_NAME;
 use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
@@ -15,7 +16,7 @@ pub async fn run() {
     crate::cli::init();
 
     let current = env!("CARGO_PKG_VERSION");
-    cli::print_title(&format!("DonSeTch {current}"));
+    cli::print_title(&format!("{DISPLAY_NAME} {current}"));
 
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())

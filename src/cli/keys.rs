@@ -13,6 +13,7 @@
 
 use super::{bold, dim, green, red};
 
+use crate::DISPLAY_NAME;
 use crate::search::byok::plugin::{
     DEFAULT_TIMEOUT_MS, PluginConfig, tokenize_cmd, validate_plugin_name,
 };
@@ -838,14 +839,14 @@ fn print_help() {
     println!("    the next key is tried automatically.");
     println!();
     println!("  {}", bold("Fallback:"));
-    println!("    If all providers are exhausted, DonSeTch falls back");
+    println!("    If all providers are exhausted, {DISPLAY_NAME} falls back");
     println!("    to the local keyless 5-engine search system.");
     println!();
     println!("  {}", bold("Plugins (for unsupported providers):"));
     println!("    If the platform you have a key for is not natively");
     println!("    supported, register any executable that answers our");
     println!("    stdin/stdout JSON contract as a plugin, with no code");
-    println!("    changes to DonSeTch:");
+    println!("    changes to {DISPLAY_NAME}:");
     println!(
         "      {}",
         dim("donsetch keys add plugin myprovider --cmd 'python3 ~/adapter.py' --test")

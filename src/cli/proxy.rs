@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::DISPLAY_NAME;
 use crate::cli;
 use crate::transport::proxy::{self, Proxy, ProxyScheme};
 
@@ -69,7 +70,7 @@ async fn cmd_add(args: &[String]) {
         std::process::exit(1);
     }
 
-    cli::print_title("DonSeTch Proxy Add");
+    cli::print_title(&format!("{DISPLAY_NAME} Proxy Add"));
     println!();
 
     let existing = proxy::load_config();
@@ -196,7 +197,7 @@ async fn cmd_remove(args: &[String]) {
         std::process::exit(1);
     }
 
-    cli::print_title("DonSeTch Proxy Remove");
+    cli::print_title(&format!("{DISPLAY_NAME} Proxy Remove"));
     println!();
 
     let mut proxies = proxy::load_config();
@@ -261,7 +262,7 @@ async fn cmd_remove(args: &[String]) {
 }
 
 async fn cmd_list() {
-    cli::print_title("DonSeTch Proxy Configuration");
+    cli::print_title(&format!("{DISPLAY_NAME} Proxy Configuration"));
     println!();
 
     let proxies = proxy::load_config();
@@ -300,7 +301,7 @@ async fn cmd_list() {
 }
 
 async fn cmd_check() {
-    cli::print_title("DonSeTch Proxy Check");
+    cli::print_title(&format!("{DISPLAY_NAME} Proxy Check"));
     println!();
 
     let proxies = proxy::load_config();
@@ -379,7 +380,7 @@ async fn cmd_check() {
 }
 
 async fn cmd_clear() {
-    cli::print_title("DonSeTch Proxy Clear");
+    cli::print_title(&format!("{DISPLAY_NAME} Proxy Clear"));
     println!();
 
     let existing = proxy::load_config();
@@ -416,7 +417,7 @@ async fn cmd_test(args: &[String]) {
     let p = match Proxy::parse(url) {
         Ok(p) => p,
         Err(e) => {
-            cli::print_title("DonSeTch Proxy Test");
+            cli::print_title(&format!("{DISPLAY_NAME} Proxy Test"));
             println!();
             println!("  {} Invalid proxy URL: {}", cli::icon_fail(), e);
             println!();
@@ -425,7 +426,7 @@ async fn cmd_test(args: &[String]) {
         }
     };
 
-    cli::print_title("DonSeTch Proxy Test");
+    cli::print_title(&format!("{DISPLAY_NAME} Proxy Test"));
     println!();
 
     let spinner = cli::Spinner::new("Probing proxy...");
@@ -471,7 +472,7 @@ async fn cmd_import(args: &[String]) {
         }
     };
 
-    cli::print_title("DonSeTch Proxy Import");
+    cli::print_title(&format!("{DISPLAY_NAME} Proxy Import"));
     println!();
 
     let content = match std::fs::read_to_string(path) {
@@ -542,7 +543,7 @@ async fn cmd_export(args: &[String]) {
 
     match args.first() {
         Some(path) => {
-            cli::print_title("DonSeTch Proxy Export");
+            cli::print_title(&format!("{DISPLAY_NAME} Proxy Export"));
             println!();
             let content: String = proxies
                 .iter()
