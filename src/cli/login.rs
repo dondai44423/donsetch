@@ -314,14 +314,18 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
 }
 
 async fn retrieve_ws(endpoint: &str, total_ms: u64) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
+    // Async client: this loop runs inside the tokio runtime driving
+    // `donsetch login`, and `reqwest::blocking` panics (aborting the
+    // process, since this crate builds with panic = "abort") when
+    // built or dropped on a thread that already has a runtime context.
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| e.to_string())?;
     let start = std::time::Instant::now();
     loop {
-        if let Ok(resp) = client.get(endpoint).send()
-            && let Ok(v) = resp.json::<serde_json::Value>()
+        if let Ok(resp) = client.get(endpoint).send().await
+            && let Ok(v) = resp.json::<serde_json::Value>().await
             && let Some(ws) = v
                 .get("webSocketDebuggerUrl")
                 .and_then(serde_json::Value::as_str)
@@ -555,5 +559,23 @@ impl AuthLock {
 impl Drop for AuthLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `retrieve_ws` runs inside the tokio runtime driving `donsetch
+    // login`. It used to build a `reqwest::blocking::Client` there,
+    // which panics (and, with this crate's panic = "abort" release
+    // profile, aborts the process) when built or dropped on a thread
+    // that already has a runtime context.
+    #[tokio::test]
+    async fn retrieve_ws_times_out_without_panicking() {
+        let err = retrieve_ws("http://127.0.0.1:1/json/version", 300)
+            .await
+            .expect_err("nothing listens on this port");
+        assert!(err.contains("timeout"));
     }
 }

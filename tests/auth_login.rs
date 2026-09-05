@@ -381,3 +381,23 @@ fn commit_login_groups_per_domain_and_skips_noise() {
     let vault = load_session_cookies();
     assert!(!vault.iter().any(|c| c.name == "tracker"));
 }
+
+// ── pillar 9: the post-login probe must not crash the CLI's tokio
+// runtime. `probe_domain` (and `commit_login` with probing on) are
+// called synchronously from `donsetch login`'s async command handler,
+// which runs under `#[tokio::main]`. `reqwest::blocking::Client`
+// panics (and aborts, since this crate builds with panic = "abort")
+// when built/dropped on a thread that already has a tokio runtime
+// context, so this must run on a dedicated thread. ──
+
+#[tokio::test]
+async fn probe_domain_does_not_panic_inside_a_tokio_runtime() {
+    isolate_state();
+    let cookies = vec![cookie(".probe.test", "s", "v", None)];
+    // Loopback + an unprivileged port with no listener: the probe is
+    // expected to fail fast, but it must fail by returning an Err,
+    // never by panicking (and, since this crate builds with
+    // panic = "abort", never by aborting the process).
+    let result = auth::probe_domain("127.0.0.1", &cookies, Some(1));
+    assert!(result.is_err(), "expected a connection-refused Err, got Ok");
+}
