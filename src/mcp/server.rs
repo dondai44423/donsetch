@@ -378,6 +378,7 @@ fn initialize(params: &Value) -> Value {
         "instructions": tools::instructions(),
         "serverInfo": {
             "name": tools::SERVER_NAME,
+            "title": tools::SERVER_TITLE,
             "version": tools::SERVER_VERSION
         }
     })

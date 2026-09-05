@@ -87,6 +87,17 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.11"
 flate2 = "1"
 
+# cfg() on build-dependencies resolves against the HOST, not the target, so this
+# only applies when building *on* Windows -- matching the #[cfg(windows)] gate on
+# the version-resource code in build.rs. Cross-compiling to Windows from another
+# host therefore yields an exe with no version resource; if that is ever needed,
+# move this to the plain [build-dependencies] above and drop the #[cfg(windows)]
+# in build.rs.
+[target.'cfg(windows)'.build-dependencies]
+# default-features = false drops the "toml" feature, which only exists to parse
+# [package.metadata.winresource]; build.rs sets every field programmatically.
+winresource = { version = "0.1", default-features = false }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

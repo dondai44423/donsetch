@@ -22,6 +22,11 @@ pub const PROTOCOL_VERSIONS: &[&str] = &[
 ];
 
 pub const SERVER_NAME: &str = "donsetch";
+
+/// Human-readable label for UI surfaces: MCP keeps `name` programmatic and
+/// `title` for display (optional since 2025-06-18, ignored by older clients).
+/// Shared with the exe's FileDescription : see src/display_name.rs.
+pub const SERVER_TITLE: &str = crate::DISPLAY_NAME;
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The `instructions` string sent at initialize. Generated from

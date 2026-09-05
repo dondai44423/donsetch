@@ -6,6 +6,7 @@
   "protocolVersion": "2026-07-28",
   "serverInfo": {
     "name": "donsetch",
+    "title": "DonSeTch",
     "version": "<CARGO_PKG_VERSION>"
   }
 }

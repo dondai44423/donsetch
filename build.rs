@@ -199,6 +199,10 @@ fn main() {
     // always re-runs this build script and triggers the download.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/pdfium/lib");
+    // The version resource is derived from these two files alone, so a version
+    // bump or a rename must re-run this script or the exe keeps a stale one.
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src/display_name.rs");
 
     // ── LLD auto-detection (Linux) ────────────────────────────
     //
@@ -253,6 +257,10 @@ fn main() {
             println!("cargo:rustc-link-arg=/STACK:8388608");
         }
     }
+
+    // ── Windows version resource ──────────────────────────────
+    // The metadata Explorer, Task Manager and Get-Command read off the exe.
+    stamp_version_resource(&os);
 
     // ── aarch64 + ONNX note ──────────────────────────────────
     //
@@ -661,3 +669,92 @@ fn sha256_hex(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+// Shared with the crate : see src/display_name.rs. Item position: include!
+// cannot expand items inside a function body.
+#[cfg(windows)]
+include!("src/display_name.rs");
+
+/// Publisher shown by Explorer, Task Manager and UAC elevation prompts.
+///
+/// The Win32 spec marks CompanyName as required, but there is no company or
+/// publisher behind this project to claim, and an invented one would be worse
+/// than none. Maintainer: set this to `Some("...")` -- a name or handle -- and
+/// it is stamped into every Windows build; leave it `None` to omit the field.
+#[cfg(windows)]
+const COMPANY_NAME: Option<&str> = None;
+
+/// Stamp a Windows version resource (`VERSIONINFO`) into the executable.
+///
+/// Without one the binary reports no publisher, description or version in
+/// Explorer, Task Manager or `Get-Command`. Every field is derived from
+/// `Cargo.toml`, so nothing has to be maintained alongside a release. Best
+/// effort: a missing resource compiler downgrades to a warning rather than
+/// failing the build.
+///
+/// `os` is the target: a Windows host can still be building for something else.
+/// The `#[cfg(windows)]` gate is the host : see the `winresource` entry in
+/// Cargo.toml.
+#[cfg(windows)]
+fn stamp_version_resource(os: &str) {
+    if os != "windows" {
+        return;
+    }
+
+    use winresource::{VersionInfo, WindowsResource};
+
+    // `new()` already fills ProductName from the package name and both version
+    // strings from the full package version.
+    let mut res = WindowsResource::new();
+
+    // FileDescription is a short label shown to users -- Task Manager treats it
+    // as the app name -- so it takes the display title. The prose belongs in
+    // Comments, which is specified as "additional information ... for
+    // diagnostic purposes".
+    res.set("FileDescription", DISPLAY_NAME);
+    if let Some(company) = COMPANY_NAME {
+        res.set("CompanyName", company);
+    }
+    if let Ok(description) = env::var("CARGO_PKG_DESCRIPTION")
+        && !description.is_empty()
+    {
+        res.set("Comments", &description);
+    }
+    if let Ok(license) = env::var("CARGO_PKG_LICENSE")
+        && !license.is_empty()
+    {
+        res.set("LegalCopyright", &license);
+    }
+
+    // The numeric FILEVERSION is four 16-bit words, so it carries only
+    // MAJOR.MINOR.PATCH; the string field keeps the full version verbatim.
+    // Anything trailing the numbers means this is not an upstream release:
+    // rc/beta are pre-releases, anything else is a private build.
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let numeric = format!(
+        "{}.{}.{}",
+        env::var("CARGO_PKG_VERSION_MAJOR").unwrap_or_default(),
+        env::var("CARGO_PKG_VERSION_MINOR").unwrap_or_default(),
+        env::var("CARGO_PKG_VERSION_PATCH").unwrap_or_default(),
+    );
+    let suffix = version.strip_prefix(&numeric).unwrap_or_default();
+    if !suffix.is_empty() {
+        let suffix = suffix.to_ascii_lowercase();
+        if suffix.contains("rc") || suffix.contains("beta") {
+            res.set_version_info(VersionInfo::FILEFLAGS, VersionInfo::VS_FF_PRERELEASE);
+        } else {
+            // VS_FF_PRIVATEBUILD requires the PrivateBuild string to be set.
+            res.set("PrivateBuild", &version);
+            res.set_version_info(VersionInfo::FILEFLAGS, VersionInfo::VS_FF_PRIVATEBUILD);
+        }
+    }
+
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=skipping Windows version resource: {e}");
+    }
+}
+
+/// No-op off Windows: `winresource` is a host-gated build-dependency, so it is
+/// not even in the graph here.
+#[cfg(not(windows))]
+fn stamp_version_resource(_os: &str) {}
