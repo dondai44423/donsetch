@@ -359,6 +359,22 @@ pub fn probe_domain(
         .map(|c| format!("{}={}", c.name, c.value))
         .collect::<Vec<_>>()
         .join("; ");
+
+    // Dedicated plain thread: `reqwest::blocking` panics when built or
+    // dropped on a thread that already has a tokio runtime context,
+    // and `commit_login` (hence `probe_domain`) is called synchronously
+    // from `donsetch login`'s async command handler, which runs under
+    // `#[tokio::main]`. With this crate's `panic = "abort"` release
+    // profile, that panic would abort the whole process.
+    std::thread::Builder::new()
+        .name("login-probe".into())
+        .spawn(move || probe_once(&url, &cookie_header))
+        .map_err(|e| format!("probe thread spawn: {e}"))?
+        .join()
+        .map_err(|_| "probe thread panicked".to_string())?
+}
+
+fn probe_once(url: &str, cookie_header: &str) -> Result<ProbeResult, String> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(4))
         .timeout(std::time::Duration::from_secs(15))
@@ -370,8 +386,8 @@ pub fn probe_domain(
         .map_err(|e| format!("probe client: {e}"))?;
 
     let resp = client
-        .get(&url)
-        .header(reqwest::header::COOKIE, &cookie_header)
+        .get(url)
+        .header(reqwest::header::COOKIE, cookie_header)
         .send()
         .map_err(|e| format!("probe failed: {e}"))?;
     let status = resp.status();
