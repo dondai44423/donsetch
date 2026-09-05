@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Windows binaries carry a version resource:** Explorer, Task Manager,
+  UAC prompts and `Get-Command` showed no publisher, description or
+  version. `build.rs` now stamps `VERSIONINFO` derived entirely from
+  `Cargo.toml`: `FileDescription` the display name, `Comments` the
+  package description, `LegalCopyright` the license. The numeric
+  `FILEVERSION` carries `MAJOR.MINOR.PATCH`, the string field the full
+  version, and a version suffix marks the build unofficial (`rc`/`beta`
+  set `VS_FF_PRERELEASE`, anything else `VS_FF_PRIVATEBUILD`). Best
+  effort: a missing `rc.exe` warns instead of failing the build.
+  `CompanyName` is left as a disabled hook : there is no publisher to
+  claim.
+- **`serverInfo.title` in the MCP handshake:** MCP separates the
+  programmatic identifier from the display label (`title`, optional
+  since 2025-06-18), so clients that prefer it now show `DonSeTch`
+  instead of the `donsetch` package id. Older clients ignore the field.
+
 ### Fixed
 
 - **False-like private-egress values no longer disable SSRF guards:**
