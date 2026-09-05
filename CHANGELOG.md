@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2048 LRU, search cache 500, prewarms 10, HTTP sessions 1024,
   crawl governor 1024). FIFO cap of 2048, oldest-minted evicted
   first, with a discriminating bound test.
+- **Search validation failures reported the wrong error kind**:
+  `search_error` declared `errorKind: "transient"` (with an engine
+  escalation trace) for `validate_query` rejections that never
+  contacted an engine, contradicting the function's own caller
+  comment and the retry taxonomy, and mislabeling the CLI exit
+  code for a non-retryable input error. `SearchFailure` now carries
+  the kind (permanent for bad input, transient for exhausted
+  engines/providers), the permanent path drops the false escalation
+  trace, and the batch path composes kinds (any transient variant =
+  retryable batch). Four tests. Credit: mnaza (#126).
 
 ## [3.6.2] - 2026-09-05
 
