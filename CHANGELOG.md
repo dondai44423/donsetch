@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since 2025-06-18), so clients that prefer it now show `DonSeTch`
   instead of the `donsetch` package id. Older clients ignore the field.
 
+### Changed
+
+- **One source for the product name:** hardcoded in 16 places across the
+  CLI, it now lives in `src/display_name.rs` (`donsetch::DISPLAY_NAME`),
+  read by the CLI titles, the MCP title and build.rs alike : the last by
+  `include!`, since a build script cannot `use` items from the crate it
+  builds.
+
 ### Fixed
 
 - **False-like private-egress values no longer disable SSRF guards:**

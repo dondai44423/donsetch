@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use crate::DISPLAY_NAME;
 use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::paths;
@@ -39,7 +40,7 @@ pub async fn run() {
     let fix = args.iter().any(|a| a == "--fix");
     let only_mcp = args.iter().any(|a| a == "--mcp");
 
-    cli::print_title("DonSeTch Doctor");
+    cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
     println!();
 
     let mut p = 0u32; // passed

@@ -13,12 +13,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::DISPLAY_NAME;
 use crate::cli;
 
 #[allow(clippy::needless_borrows_for_generic_args)]
 pub fn run() {
     cli::init();
-    cli::print_title("DonSeTch Rollback");
+    cli::print_title(&format!("{DISPLAY_NAME} Rollback"));
 
     let current = env!("CARGO_PKG_VERSION");
     cli::print_kv("current", current);
