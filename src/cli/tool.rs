@@ -4,6 +4,7 @@
 //! calls the exact same `call_tool`, and renders the result.
 //! Zero logic duplication : all behavior lives in the core.
 
+use crate::DISPLAY_NAME;
 use crate::mcp::server::{self, Daemon};
 use crate::spec;
 use clap::error::ErrorKind as ClapErrorKind;
@@ -481,7 +482,7 @@ fn machine_meta(result: &Value, sc: &Value) -> Value {
 
 /// Print top-level help (when no subcommand given or --help).
 pub fn print_top_help() {
-    println!("donsetch : web research for AI agents: fetch, search, crawl");
+    println!("{DISPLAY_NAME} : web research for AI agents: fetch, search, crawl");
     println!();
     println!("USAGE: donsetch <command> [args]");
     println!();
