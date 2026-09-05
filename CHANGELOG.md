@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read by the CLI titles, the MCP title and build.rs alike : the last by
   `include!`, since a build script cannot `use` items from the crate it
   builds.
+- **`donsetch help` header now reads `DonSeTch`,** not the lowercase
+  `donsetch`: the invocation name is already on the `USAGE:` line below
+  it. Every `USAGE:`/`Usage:` line still shows the command exactly as
+  typed.
 
 ### Fixed
 
