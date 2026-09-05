@@ -3680,6 +3680,10 @@ fn make_ghost_hook(
 struct SearchFailure {
     cause: String,
     byok_tried: bool,
+    /// "permanent" for bad input that no retry or fallback fixes
+    /// (validate_query rejected it before any engine was contacted);
+    /// "transient" for exhausted engines/providers.
+    kind: &'static str,
 }
 
 /// The search pipeline: BYOK providers (if configured) with
@@ -3697,7 +3701,7 @@ async fn search_inner(
             maybe_pre_solve(daemon, top);
             render_search_outcome(daemon, &out).await
         }
-        Err(failure) => search_error(query, &failure.cause, failure.byok_tried),
+        Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
 }
 
@@ -3747,6 +3751,20 @@ fn search_debug_meta(out: &crate::search::SearchOutcome) -> Value {
     search::render_meta(out)
 }
 
+/// Retrying a fully-failed batch only makes sense if at least one
+/// variant failed for a transient (engine/provider) reason; if every
+/// variant was rejected by validate_query ("permanent"), no engine
+/// was ever contacted and retrying the same queries won't help.
+/// Pulled out as a pure function so this logic is testable without a
+/// live `Daemon`.
+fn batch_failure_kind<'a>(kinds: impl Iterator<Item = &'a str>) -> &'static str {
+    if kinds.into_iter().all(|k| k == "permanent") {
+        "permanent"
+    } else {
+        "transient"
+    }
+}
+
 /// Execute explicit query variants concurrently and keep every result set
 /// separate. Grouped evidence lets the calling model compare formulations
 /// while each query retains DonSeTch's established ranking semantics.
@@ -3775,13 +3793,22 @@ async fn search_batch_inner(
                 Err(failure) => Some(json!({"query": query, "error": failure.cause})),
             })
             .collect::<Vec<_>>();
+        let kind = batch_failure_kind(outcomes.iter().filter_map(|outcome| match outcome {
+            Ok(_) => None,
+            Err(f) => Some(f.kind),
+        }));
+        let next_action = if kind == "permanent" {
+            "fix the queries and search again"
+        } else {
+            "retry once, then reduce to the strongest single query"
+        };
         return tool_error_structured(
             format!("search: all {} query variants failed", queries.len()),
-            "transient",
+            kind,
             Some(json!({
                 "queries": queries,
                 "errors": errors,
-                "next_action": "retry once, then reduce to the strongest single query",
+                "next_action": next_action,
             })),
         );
     }
@@ -3873,6 +3900,7 @@ async fn search_outcome(
         return Err(SearchFailure {
             cause: problem,
             byok_tried: false,
+            kind: "permanent",
         });
     }
     // Reload from disk first : picks up keys added/removed
@@ -3909,12 +3937,14 @@ async fn search_outcome(
                     Err(e2) => Err(SearchFailure {
                         cause: format!("local ({e}); byok ({e2})"),
                         byok_tried: true,
+                        kind: "transient",
                     }),
                 }
             } else {
                 Err(SearchFailure {
                     cause: e.to_string(),
                     byok_tried: false,
+                    kind: "transient",
                 })
             }
         }
@@ -4021,7 +4051,21 @@ impl Drop for PreSolveGuard<'_> {
     }
 }
 
-fn search_error(query: &str, cause: &str, byok_tried: bool) -> Value {
+fn search_error(query: &str, cause: &str, byok_tried: bool, kind: &str) -> Value {
+    if kind == "permanent" {
+        // validate_query rejected the query before any engine or
+        // provider was ever contacted : no escalation trace to show,
+        // and retrying the same query (or adding an API key) won't
+        // help, unlike the exhausted-engines case below.
+        return tool_error_structured(
+            format!("search: {cause}"),
+            "permanent",
+            Some(json!({
+                "query": query,
+                "next_action": "fix the query and search again",
+            })),
+        );
+    }
     let mut trace = Trace::default();
     trace.step("search", "engines", "error", 0);
     if byok_tried {
@@ -4216,6 +4260,57 @@ fn fetch_error_kind(e: &FetchError) -> &'static str {
 #[cfg(test)]
 mod stitch_tests {
     use super::*;
+
+    // search_error used to hardcode errorKind: "transient" for every
+    // failure, including validate_query rejections (empty/oversized
+    // query) that never contact an engine -- contradicting its own
+    // caller's comment ("a bad query is a permanent-shaped failure")
+    // and, via exit_code_of in cli/tool.rs, handing scripts the wrong
+    // exit code for a non-retryable input error.
+    #[test]
+    fn search_error_permanent_has_no_false_escalation_trace() {
+        let v = search_error(
+            "",
+            "empty query : pass a non-empty query string",
+            false,
+            "permanent",
+        );
+        assert_eq!(v["errorKind"], "permanent");
+        assert!(
+            v["structuredContent"].get("escalation").is_none(),
+            "a validation failure never contacted an engine: no escalation trace to show"
+        );
+    }
+
+    #[test]
+    fn search_error_transient_keeps_engine_escalation_trace() {
+        let v = search_error("q", "all engines timed out", false, "transient");
+        assert_eq!(v["errorKind"], "transient");
+        assert!(v["structuredContent"].get("escalation").is_some());
+    }
+
+    #[test]
+    fn batch_failure_kind_permanent_only_when_every_variant_is() {
+        assert_eq!(
+            batch_failure_kind(["permanent", "permanent"].into_iter()),
+            "permanent"
+        );
+        assert_eq!(batch_failure_kind(["permanent"].into_iter()), "permanent");
+    }
+
+    #[test]
+    fn batch_failure_kind_transient_if_any_variant_is() {
+        // One transient variant means a retry could still succeed :
+        // the batch as a whole should be reported retryable.
+        assert_eq!(
+            batch_failure_kind(["permanent", "transient"].into_iter()),
+            "transient"
+        );
+        assert_eq!(
+            batch_failure_kind(["transient", "transient"].into_iter()),
+            "transient"
+        );
+    }
 
     #[test]
     fn rel_next_found_and_resolved() {
