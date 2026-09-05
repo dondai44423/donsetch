@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "3.6.2"
+version = "3.6.3"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
