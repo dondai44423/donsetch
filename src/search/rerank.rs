@@ -548,13 +548,30 @@ mod inner {
         if scores.len() != n {
             return;
         }
+        apply_topup_scores(results, n, &scores, NUDGE);
+    }
+
+    /// The score-nudge-and-resort half of `topup`, split out so it's
+    /// testable without a real cross-encoder model.
+    fn apply_topup_scores(
+        results: &mut [crate::search::rank::Merged],
+        n: usize,
+        scores: &[f64],
+        nudge: f64,
+    ) {
         for (r, s) in results[..n].iter_mut().zip(scores) {
             // scores are probabilities (0=irrelevant, 1=exact); the
             // 0.5-centered product keeps the nudge zero-sum around
             // the midpoint.
-            r.score += NUDGE * (s - 0.5);
+            r.score += nudge * (s - 0.5);
         }
-        results[..n].sort_by(|a, b| b.score.total_cmp(&a.score));
+        // Sort the whole slice, not just the nudged prefix: the
+        // nudge can push results[n-1] below results[n]'s untouched
+        // score (a near-tied pair straddling the depth boundary),
+        // and callers taking more than `depth` results (merge()
+        // always keeps 12; topup runs at depth=8) would otherwise
+        // get a slice that isn't sorted by score at that boundary.
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
 
     #[cfg(test)]
@@ -696,6 +713,52 @@ mod inner {
                 blend[0] - blend[1] < rrf_n[0] - rrf_n[1],
                 "xenc should narrow the gap even if it doesn't flip"
             );
+        }
+
+        fn merged(url: &str, score: f64) -> Merged {
+            Merged {
+                title: url.into(),
+                url: url.into(),
+                snippet: String::new(),
+                sources: vec![],
+                score,
+                published: None,
+            }
+        }
+
+        // apply_topup_scores used to only re-sort results[..n], leaving
+        // results[n..] untouched: a nudge that pushes results[n-1]
+        // below results[n]'s original score left the overall vector
+        // non-monotonic at that boundary. depth=n=2 here; result[1]
+        // ("boundary") starts just above result[2] ("untouched") and
+        // gets nudged down past it.
+        #[test]
+        fn apply_topup_scores_keeps_the_whole_vector_sorted() {
+            let mut results = vec![
+                merged("top", 1.0),
+                merged("boundary", 0.60),
+                merged("untouched", 0.55),
+                merged("tail", 0.1),
+            ];
+            apply_topup_scores(&mut results, 2, &[1.0, 0.0], 0.2);
+            // "top" nudged up (+0.1 -> 1.1), "boundary" nudged down
+            // (0.60 - 0.1 = 0.50), which is now below "untouched"
+            // (0.55). The whole vector must reflect that, not just
+            // the first two entries.
+            for pair in results.windows(2) {
+                assert!(
+                    pair[0].score >= pair[1].score,
+                    "not sorted: {} ({}) before {} ({})",
+                    pair[0].url,
+                    pair[0].score,
+                    pair[1].url,
+                    pair[1].score
+                );
+            }
+            assert_eq!(results[0].url, "top");
+            assert_eq!(results[1].url, "untouched");
+            assert_eq!(results[2].url, "boundary");
+            assert_eq!(results[3].url, "tail");
         }
 
         #[test]
