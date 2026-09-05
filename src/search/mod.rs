@@ -88,6 +88,17 @@ fn norm_query(q: &str) -> String {
         .join(" ")
 }
 
+/// Whether a failure `status` reflects the engine actually behaving
+/// badly (worth quarantining via `record_outcome` and eroding trust
+/// via `bump_trust`), as opposed to infra noise -- a dead egress
+/// (`"dead-proxy"`), a BYOK key problem (`"auth-fail"`), or simply no
+/// results (`"no-results"`) -- none of which are the engine's fault.
+/// A single predicate so quarantine and trust tracking can't drift
+/// out of sync with each other again.
+fn is_engine_fault(status: &str) -> bool {
+    !status.starts_with("dead") && status != "auth-fail" && status != "no-results"
+}
+
 pub struct Searcher {
     fetcher: Fetcher,
     pool: EgressPool,
@@ -640,12 +651,10 @@ impl Searcher {
                 }
                 Err((status, egress_id, was_engine)) => {
                     let base = engine.split('_').next().unwrap_or(&engine);
-                    // Dead proxies are egress failures, not
-                    // engine failures : don't quarantine.
-                    if !status.starts_with("dead")
-                        && status != "auth-fail"
-                        && status != "no-results"
-                    {
+                    // Dead proxies and auth failures are egress/BYOK
+                    // problems, not engine failures : don't quarantine
+                    // or distrust the engine over them.
+                    if is_engine_fault(&status) {
                         self.record_outcome(base, false);
                     }
                     if (was_engine || ghost_lane) && !ghost_lane {
@@ -657,7 +666,7 @@ impl Searcher {
                             self.pool.report_blocked(base, &egress_id);
                         }
                     }
-                    if (was_engine || ghost_lane) && status != "no-results" {
+                    if (was_engine || ghost_lane) && is_engine_fault(&status) {
                         self.bump_trust(base, false);
                     }
                     report.push(EngineReport {
@@ -1617,6 +1626,26 @@ impl Drop for InflightGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Egress/BYOK-auth noise must never look like the engine
+    // misbehaving: record_outcome (quarantine) and bump_trust (the
+    // ranking-weight EWMA) both gate on this predicate, and had
+    // drifted out of sync before (bump_trust used to fire on
+    // "dead-proxy"/"auth-fail" too, eroding trust for infra failures
+    // the engine had nothing to do with).
+    #[test]
+    fn is_engine_fault_excludes_infra_and_no_results() {
+        assert!(!is_engine_fault("dead-proxy"));
+        assert!(!is_engine_fault("auth-fail"));
+        assert!(!is_engine_fault("no-results"));
+        assert!(is_engine_fault("blocked:403"));
+        assert!(is_engine_fault("blocked:captcha"));
+        assert!(is_engine_fault("empty-parse"));
+        assert!(is_engine_fault("ghost-timeout"));
+        assert!(is_engine_fault("timeout"));
+        assert!(is_engine_fault("no-url"));
+        assert!(is_engine_fault("net"));
+    }
 
     #[test]
     fn google_ghost_is_its_own_family_for_ranking_math() {
