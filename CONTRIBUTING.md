@@ -23,6 +23,26 @@ cargo fmt --all -- --check    # formatting check
 
 All three must pass before a PR can merge. CI runs the same checks on Linux, macOS, and Windows.
 
+The same tasks are wrapped as [`just`](https://just.systems) recipes — `just test`, `just lint`, `just fmt-check`, `just smoke`.
+
+### Windows
+
+The recipes are POSIX shell (`2>/dev/null`, `head -c`, `cd fuzz && …`) and `just` runs them with `sh`,
+which PowerShell does not have on `PATH`. Either:
+
+- **Run `just` from a Git Bash prompt.** Works with no setup, wherever Git is installed.
+- **Stay in PowerShell** and point `just` at Git's `sh` with a wrapper in your profile.
+  `$PROFILE` holds the path — open it with the editor of your choice (`code $PROFILE`, `notepad $PROFILE`),
+  creating the file if it does not exist:
+
+  ```powershell
+  function just { just.exe --shell "C:\Program Files\Git\bin\sh.exe" @args }
+  ```
+
+  Adjust that path if Git is not at the installer default: scoop, winget per-user, and portable installs put `sh.exe` elsewhere.
+
+Do not put Git's `usr\bin` on the global `PATH` as a shortcut — it holds GNU tools whose names collide with Windows ones (`find`, `sort`, `link`), which can confuse toolchains outside this repo. Git Bash exposes them only inside its own session, which is why running `just` there is safe.
+
 ## Commit conventions
 
 Conventional Commits:
