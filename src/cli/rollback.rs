@@ -155,6 +155,19 @@ pub fn run() {
             }
             std::process::exit(1);
         }
+
+        // The previous binary gets its previous runtime lib back
+        // (update keeps it as `<lib>.bak`); the current lib becomes
+        // the roll-forward backup, same as the binary. Not fatal:
+        // the binary rollback above already succeeded.
+        for name in crate::cli::update::SIBLING_LIBS {
+            if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
+                println!(
+                    "  {} Rolled back the binary, but could not restore {name}: {e}",
+                    cli::icon_warn()
+                );
+            }
+        }
     }
 
     #[cfg(windows)]

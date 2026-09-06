@@ -369,6 +369,34 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod: {e}"))?;
 
+        // Stage the sibling runtime libs the tarball ships beside
+        // the binary (Linux: libonnxruntime.so, which onnx.rs dlopens
+        // from the exe dir first) BEFORE anything is renamed, so the
+        // one realistic failure here -- disk full on a 22MB copy --
+        // leaves the install untouched. Swapping only the binary left
+        // the old runtime next to the new build: the .so that needed
+        // GLIBC_2.38 stayed put through `-u` after the release that
+        // replaced it, so OCR/rerank stayed dead for self-updaters
+        // while `doctor` (a presence check) reported it fine. The
+        // Windows branch below already does this for pdfium.dll.
+        let mut staged_libs: Vec<&str> = Vec::new();
+        for name in SIBLING_LIBS {
+            let new_lib = temp_dir.join(name);
+            if !new_lib.exists() {
+                continue;
+            }
+            let lib_tmp = sibling_tmp(exe_dir, name);
+            if let Err(e) = std::fs::copy(&new_lib, &lib_tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                for staged in &staged_libs {
+                    let _ = std::fs::remove_file(sibling_tmp(exe_dir, staged));
+                }
+                let _ = std::fs::remove_file(&lib_tmp);
+                return Err(format!("{name}: copy: {e}"));
+            }
+            staged_libs.push(name);
+        }
+
         // Save backup (copy, not rename : keeps the original in place).
         let bak = exe_dir.join("donsetch.bak");
         if let Err(e) = std::fs::copy(&exe, &bak) {
@@ -386,8 +414,41 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
         // Atomic replace.
         std::fs::rename(&tmp, &exe).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
+            for staged in &staged_libs {
+                let _ = std::fs::remove_file(sibling_tmp(exe_dir, staged));
+            }
             format!("rename: {e}")
         })?;
+
+        // Swap the staged libs in, same shape as the binary: back up
+        // by COPY so a live lib exists at every instant, then one
+        // atomic rename. A stale .bak from an earlier update is
+        // cleared first so rollback never pairs binary N with lib
+        // N-1. The binary is already updated at this point, so a
+        // failure here is a warning naming the stale file, not an
+        // error that would make `-u` report "already up to date"
+        // with no way to refresh the lib.
+        for name in staged_libs {
+            let lib = exe_dir.join(name);
+            let lib_bak = exe_dir.join(format!("{name}.bak"));
+            let lib_tmp = sibling_tmp(exe_dir, name);
+            let _ = std::fs::remove_file(&lib_bak);
+            if lib.exists()
+                && let Err(e) = std::fs::copy(&lib, &lib_bak)
+            {
+                println!(
+                    "  {} Warning: could not back up {name} ({e}) : rollback will keep the new one",
+                    cli::icon_warn()
+                );
+            }
+            if let Err(e) = std::fs::rename(&lib_tmp, &lib) {
+                let _ = std::fs::remove_file(&lib_tmp);
+                println!(
+                    "  {} Warning: could not replace {name} ({e}) : the previous one is still in use",
+                    cli::icon_warn()
+                );
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -421,6 +482,52 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Runtime libraries a release tarball may ship beside the binary
+/// on Unix. Linux ships `libonnxruntime.so` (dlopen'd from the exe
+/// dir by onnx.rs); macOS links ONNX statically and ships nothing.
+#[cfg(unix)]
+pub(crate) const SIBLING_LIBS: &[&str] = &["libonnxruntime.so"];
+
+#[cfg(unix)]
+fn sibling_tmp(exe_dir: &Path, name: &str) -> std::path::PathBuf {
+    exe_dir.join(format!(".{name}.update.tmp"))
+}
+
+/// Rollback's counterpart to the sibling-lib refresh in
+/// `replace_binary`: swap `name` and `name.bak` so the previous
+/// binary gets its previous runtime back. No `.bak` means the last
+/// update shipped no lib (or predates this): nothing to do.
+///
+/// The current lib is stashed by hard link (copy if the filesystem
+/// refuses), so `name` exists at every instant and a crash midway
+/// costs at most the roll-forward copy.
+#[cfg(unix)]
+pub(crate) fn swap_sibling_lib(exe_dir: &Path, name: &str) -> Result<(), String> {
+    let cur = exe_dir.join(name);
+    let bak = exe_dir.join(format!("{name}.bak"));
+    if !bak.exists() {
+        return Ok(());
+    }
+    let stash = exe_dir.join(format!(".{name}.rollback.tmp"));
+    let _ = std::fs::remove_file(&stash);
+    let have_cur = cur.exists();
+    if have_cur
+        && std::fs::hard_link(&cur, &stash).is_err()
+        && let Err(e) = std::fs::copy(&cur, &stash)
+    {
+        return Err(format!("{name}: stash current: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&bak, &cur) {
+        let _ = std::fs::remove_file(&stash);
+        return Err(format!("{name}: restore backup: {e}"));
+    }
+    if have_cur && let Err(e) = std::fs::rename(&stash, &bak) {
+        let _ = std::fs::remove_file(&stash);
+        return Err(format!("{name}: keep roll-forward: {e}"));
+    }
+    Ok(())
+}
+
 /// Remove temp files from a previous interrupted update.
 /// Does NOT remove .bak files : those are managed by replace_binary
 /// and needed for rollback. Only cleans up temp artifacts.
@@ -431,7 +538,161 @@ fn cleanup_previous(exe: &Path) {
     let temp_dir = paths::cache_dir().join("update-tmp");
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    // Unix temp file (half-written binary from interrupted update).
+    // Unix temp files (half-written binary / lib from an interrupted
+    // update).
     let tmp = exe_dir.join(".donsetch.update.tmp");
     let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    for name in SIBLING_LIBS {
+        let _ = std::fs::remove_file(sibling_tmp(exe_dir, name));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-update-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap_or_default()
+    }
+
+    // The linux-x64 release tarball ships `libonnxruntime.so` beside
+    // the binary, and onnx.rs dlopens it from the exe dir first. An
+    // update that swaps only the binary leaves a stale runtime next
+    // to the new build (the Windows branch already handles its
+    // `pdfium.dll` sibling; the Unix branch had no equivalent).
+    #[test]
+    fn replace_binary_refreshes_sibling_runtime_lib() {
+        let root = scratch("replace");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let exe = exe_dir.join("donsetch");
+        std::fs::write(&exe, "old-bin").unwrap();
+        std::fs::write(exe_dir.join("libonnxruntime.so"), "old-so").unwrap();
+        std::fs::write(temp_dir.join("donsetch"), "new-bin").unwrap();
+        std::fs::write(temp_dir.join("libonnxruntime.so"), "new-so").unwrap();
+
+        replace_binary(&exe, &temp_dir).expect("replace");
+
+        assert_eq!(read(&exe), "new-bin");
+        assert_eq!(read(&exe_dir.join("donsetch.bak")), "old-bin");
+        assert_eq!(
+            read(&exe_dir.join("libonnxruntime.so")),
+            "new-so",
+            "sibling runtime lib not refreshed"
+        );
+        assert_eq!(
+            read(&exe_dir.join("libonnxruntime.so.bak")),
+            "old-so",
+            "previous runtime lib not kept for rollback"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+            assert!(
+                mode & 0o111 != 0,
+                "binary lost its executable bit: {mode:o}"
+            );
+        }
+        assert!(
+            !sibling_tmp(&exe_dir, "libonnxruntime.so").exists(),
+            "staging tmp left behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // First install had no lib beside the binary (older release, or
+    // the lib lived only in the cache dir): it appears, with no .bak.
+    #[test]
+    fn replace_binary_installs_lib_that_was_not_there_before() {
+        let root = scratch("firstlib");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let exe = exe_dir.join("donsetch");
+        std::fs::write(&exe, "old-bin").unwrap();
+        std::fs::write(temp_dir.join("donsetch"), "new-bin").unwrap();
+        std::fs::write(temp_dir.join("libonnxruntime.so"), "new-so").unwrap();
+
+        replace_binary(&exe, &temp_dir).expect("replace");
+
+        assert_eq!(read(&exe_dir.join("libonnxruntime.so")), "new-so");
+        assert!(!exe_dir.join("libonnxruntime.so.bak").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A .bak left by an earlier update must not survive: rollback
+    // would otherwise pair binary N with lib N-1.
+    #[test]
+    fn replace_binary_replaces_a_stale_lib_backup() {
+        let root = scratch("stalebak");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let exe = exe_dir.join("donsetch");
+        std::fs::write(&exe, "bin-2").unwrap();
+        std::fs::write(exe_dir.join("libonnxruntime.so"), "so-2").unwrap();
+        std::fs::write(exe_dir.join("libonnxruntime.so.bak"), "so-1").unwrap();
+        std::fs::write(temp_dir.join("donsetch"), "bin-3").unwrap();
+        std::fs::write(temp_dir.join("libonnxruntime.so"), "so-3").unwrap();
+
+        replace_binary(&exe, &temp_dir).expect("replace");
+
+        assert_eq!(read(&exe_dir.join("libonnxruntime.so")), "so-3");
+        assert_eq!(read(&exe_dir.join("libonnxruntime.so.bak")), "so-2");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A tarball without the lib (macOS, or a future static build)
+    // must leave whatever is beside the binary alone.
+    #[test]
+    fn replace_binary_leaves_lib_alone_when_tarball_has_none() {
+        let root = scratch("nolib");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let exe = exe_dir.join("donsetch");
+        std::fs::write(&exe, "old-bin").unwrap();
+        std::fs::write(exe_dir.join("libonnxruntime.so"), "old-so").unwrap();
+        std::fs::write(temp_dir.join("donsetch"), "new-bin").unwrap();
+
+        replace_binary(&exe, &temp_dir).expect("replace");
+
+        assert_eq!(read(&exe), "new-bin");
+        assert_eq!(read(&exe_dir.join("libonnxruntime.so")), "old-so");
+        assert!(!exe_dir.join("libonnxruntime.so.bak").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Rollback's counterpart: put the previous lib back beside the
+    // previous binary.
+    #[test]
+    fn swap_sibling_lib_round_trips() {
+        let root = scratch("swap");
+        std::fs::write(root.join("libonnxruntime.so"), "new-so").unwrap();
+        std::fs::write(root.join("libonnxruntime.so.bak"), "old-so").unwrap();
+
+        swap_sibling_lib(&root, "libonnxruntime.so").expect("swap");
+
+        assert_eq!(read(&root.join("libonnxruntime.so")), "old-so");
+        assert_eq!(read(&root.join("libonnxruntime.so.bak")), "new-so");
+        // No .bak: nothing to do, not an error.
+        std::fs::remove_file(root.join("libonnxruntime.so.bak")).unwrap();
+        swap_sibling_lib(&root, "libonnxruntime.so").expect("no-op");
+        assert_eq!(read(&root.join("libonnxruntime.so")), "old-so");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
