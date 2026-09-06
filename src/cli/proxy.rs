@@ -555,7 +555,9 @@ async fn cmd_export(args: &[String]) {
             } else {
                 format!("{content}\n")
             };
-            match std::fs::write(path, &content) {
+            // Lines are `scheme://user:pass@host:port`: owner-only
+            // from creation, like the config file it came from.
+            match crate::config::write_private(std::path::Path::new(path), content.as_bytes()) {
                 Ok(()) => {
                     let n = proxies.len();
                     let word = if n == 1 { "proxy" } else { "proxies" };

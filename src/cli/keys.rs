@@ -649,13 +649,12 @@ fn cmd_export(args: &[String]) {
         }
         Some(path) => {
             let p = std::path::Path::new(path);
-            match std::fs::write(p, &json) {
+            // Owner-only from creation: this file holds every key.
+            // (Write-then-chmod left it world-readable until the
+            // chmod, and for good if the chmod failed -- while the
+            // line below still claimed 0600.)
+            match crate::config::write_private(p, json.as_bytes()) {
                 Ok(_) => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
-                    }
                     let n_providers = cfg.providers.len();
                     let n_keys: usize = cfg.providers.iter().map(|p| p.keys.len()).sum();
                     println!(

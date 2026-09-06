@@ -528,12 +528,10 @@ pub fn save_config(proxies: &[Proxy]) -> std::io::Result<()> {
         content.push('\n');
     }
     let tmp = path.with_extension("txt.tmp");
-    std::fs::write(&tmp, &content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
+    // 0600 from creation: write-then-chmod left `proxies.txt.tmp`
+    // (passwords inside) world-readable between the two calls, and
+    // permanently on a crash in between.
+    crate::config::write_private(&tmp, content.as_bytes())?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
