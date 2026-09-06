@@ -416,6 +416,10 @@ mod tests {
             "final headers, not the 103's: {:?}",
             resp.headers
         );
+        // Exactly the final block's headers: the 103's link hint
+        // must not leak through, and a drain that nibbled into the
+        // next block would corrupt this set.
+        assert_eq!(resp.headers.len(), 1, "{:?}", resp.headers);
     }
 
     // A server streaming 1xx blocks forever must hit a counter, not
