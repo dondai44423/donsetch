@@ -78,22 +78,42 @@ fn tex_annotation(el: ElementRef<'_>) -> Option<String> {
     None
 }
 
+/// Recursion cap. Every other DOM walker has one (blocks 300, inline
+/// 100, score 300); this one had none, and MathML nests as deep as a
+/// page cares to make it: a couple of thousand nested <mrow> in a
+/// release build (a 10-20 KB page; a few hundred in debug) overflowed
+/// the 2 MB tokio worker stack, which is a hard abort of the daemon,
+/// not a panic. Past the cap the subtree degrades to its plain text,
+/// an iterative tree walk. Legitimate MathML nests ~20-40 deep.
+const MAX_DEPTH: usize = 100;
+
 /// Compact linear serialization of a MathML subtree. Not full
 /// LaTeX : a token-efficient linearization an LLM reads natively:
 /// `W_Q^T`, `(Q K^T)/(sqrt(d_k))`, matrices as `(a, b; c, d)`.
 fn serialize(el: ElementRef<'_>) -> String {
+    serialize_at(el, 0)
+}
+
+fn serialize_at(el: ElementRef<'_>, depth: usize) -> String {
+    if depth > MAX_DEPTH {
+        return descendants_text(el);
+    }
     let name = el.value().name();
     match name {
         // Scripted constructs: gather children positionally.
         "msup" | "msub" | "msubsup" | "munder" | "mover" | "munderover" | "mroot"
-        | "mmultiscripts" => serialize_scripted(el, name),
+        | "mmultiscripts" => serialize_scripted(el, name, depth),
         "mfrac" => {
             let kids = element_children(el);
             if kids.len() == 2 {
-                format!("({})/({})", serialize(kids[0]), serialize(kids[1]))
+                format!(
+                    "({})/({})",
+                    serialize_at(kids[0], depth + 1),
+                    serialize_at(kids[1], depth + 1)
+                )
             } else {
                 kids.iter()
-                    .map(|k| serialize(*k))
+                    .map(|k| serialize_at(*k, depth + 1))
                     .collect::<Vec<_>>()
                     .join(" ")
             }
@@ -101,7 +121,7 @@ fn serialize(el: ElementRef<'_>) -> String {
         "msqrt" => {
             let inner: String = element_children(el)
                 .iter()
-                .map(|k| serialize(*k))
+                .map(|k| serialize_at(*k, depth + 1))
                 .collect::<Vec<_>>()
                 .join("");
             format!("sqrt({inner})")
@@ -116,7 +136,7 @@ fn serialize(el: ElementRef<'_>) -> String {
                 let cells: Vec<String> = tr
                     .select(&scraper::Selector::parse("mtd").unwrap())
                     .take(12)
-                    .map(serialize_inline_of)
+                    .map(|c| serialize_at(c, depth + 1))
                     .collect();
                 if !cells.is_empty() {
                     rows.push(cells.join(", "));
@@ -146,7 +166,7 @@ fn serialize(el: ElementRef<'_>) -> String {
                         if let Some(c) = ElementRef::wrap(child) {
                             let cname = c.value().name();
                             if is_mathml_tag(cname) || is_mathml_tag(name) {
-                                out.push_str(&serialize(c));
+                                out.push_str(&serialize_at(c, depth + 1));
                             }
                         }
                     }
@@ -158,25 +178,19 @@ fn serialize(el: ElementRef<'_>) -> String {
     }
 }
 
-fn serialize_inline_of(el: ElementRef<'_>) -> String {
-    serialize(el)
-}
-
 /// Serialize msup/msub/msubsup/munder/mover/munderover/mroot with
 /// positional children: base, sub, sup.
-fn serialize_scripted(el: ElementRef<'_>, name: &str) -> String {
+fn serialize_scripted(el: ElementRef<'_>, name: &str, depth: usize) -> String {
     let kids = element_children(el);
-    let base = kids.first().map(|k| serialize(*k)).unwrap_or_default();
+    let kid = |i: usize| kids.get(i).map(|k| serialize_at(*k, depth + 1));
+    let base = kid(0).unwrap_or_default();
     let (sub, sup) = match name {
-        "msub" => (kids.get(1).map(|k| serialize(*k)), None),
-        "msup" => (None, kids.get(1).map(|k| serialize(*k))),
-        "msubsup" | "munderover" => (
-            kids.get(1).map(|k| serialize(*k)),
-            kids.get(2).map(|k| serialize(*k)),
-        ),
-        "munder" => (kids.get(1).map(|k| serialize(*k)), None),
-        "mover" => (None, kids.get(1).map(|k| serialize(*k))),
-        "mroot" => (None, kids.get(1).map(|k| serialize(*k))), // base^(index)
+        "msub" => (kid(1), None),
+        "msup" => (None, kid(1)),
+        "msubsup" | "munderover" => (kid(1), kid(2)),
+        "munder" => (kid(1), None),
+        "mover" => (None, kid(1)),
+        "mroot" => (None, kid(1)), // base^(index)
         _ => (None, None),
     };
     let mut out = base;
@@ -214,6 +228,41 @@ mod tests {
         doc.select(&scraper::Selector::parse("math").unwrap())
             .next()
             .expect("math element")
+    }
+
+    // Unbounded recursion over page-controlled nesting is a stack
+    // overflow -- a hard abort of the daemon, not a panic -- and
+    // html5ever happily builds a 20000-deep <mrow> tree from a
+    // ~250 KB page. Run on a deliberately small stack: this only
+    // passes when the walk is depth-capped (100 frames fit in 2 MiB
+    // with room to spare; 20000 do not on any build profile).
+    #[test]
+    fn deeply_nested_mathml_does_not_overflow_the_stack() {
+        const DEPTH: usize = 20_000;
+        let html = format!(
+            "<math>{}<mi>x</mi>{}</math>",
+            "<mrow>".repeat(DEPTH),
+            "</mrow>".repeat(DEPTH)
+        );
+        let out = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || latex(math_el(&html)))
+            .expect("spawn")
+            .join()
+            .expect("serialize must not overflow");
+        assert!(out.contains('x'), "{out}");
+    }
+
+    // The cap degrades to plain text, it does not drop content.
+    #[test]
+    fn past_the_depth_cap_content_is_kept_as_text() {
+        let depth = MAX_DEPTH + 50;
+        let html = format!(
+            "<math>{}<mi>deep</mi>{}</math>",
+            "<mrow>".repeat(depth),
+            "</mrow>".repeat(depth)
+        );
+        assert!(latex(math_el(&html)).contains("deep"));
     }
 
     #[test]
