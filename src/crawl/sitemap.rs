@@ -201,8 +201,64 @@ fn extract_tag(block: &str, tag: &str) -> Option<String> {
     let s = block.find(&open)?;
     let after = block[s + open.len()..].find('>')? + s + open.len() + 1;
     let e = block[after..].find(&close)? + after;
-    let v = block[after..e].trim();
-    (!v.is_empty()).then(|| v.to_string())
+    let v = xml_text(block[after..e].trim());
+    (!v.is_empty()).then_some(v)
+}
+
+/// Element text → its value: CDATA unwrapped, the XML entities
+/// decoded. The sitemap protocol requires `&` in a `<loc>` to be
+/// written `&amp;`, so taking the text literally fetched every
+/// URL with a query string as `?q=x&amp;page=2` (an `amp;page`
+/// parameter), and a CDATA-wrapped loc (WordPress/Yoast emit
+/// them) failed to parse as a URL and silently vanished.
+fn xml_text(raw: &str) -> String {
+    let raw = raw
+        .trim()
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .map(str::trim)
+        .unwrap_or(raw);
+    if !raw.contains('&') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let Some(semi) = rest.find(';').filter(|&s| s <= 10) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let entity = &rest[1..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                    Some(h) => u32::from_str_radix(h, 16).ok(),
+                    None => n.parse().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Decompress a gzip'd sitemap body (many sites ship .xml.gz).
@@ -401,5 +457,45 @@ mod tests {
     fn gunzip_passthrough_plain() {
         let plain = b"<urlset/>";
         assert_eq!(maybe_gunzip(plain), plain);
+    }
+
+    // The sitemap protocol REQUIRES `&` in a <loc> to be written
+    // `&amp;`; the value was taken literally, so every URL with a
+    // query string was fetched with an `amp;page` parameter. CDATA
+    // wrappers (WordPress/Yoast emit them) were kept verbatim and
+    // the URL then failed to parse and silently vanished.
+    #[test]
+    fn sitemap_loc_is_xml_unescaped() {
+        let xml = r#"<urlset>
+          <url><loc>https://ex.com/search?q=rust&amp;page=2</loc><lastmod>2026-01-02</lastmod></url>
+          <url><loc><![CDATA[https://ex.com/a?x=1&y=2]]></loc></url>
+          <url><loc>https://ex.com/&lt;b&gt;/&quot;q&quot;/&#39;s&#x27;/&#x2F;z</loc></url>
+          <url><loc>https://ex.com/plain</loc></url>
+        </urlset>"#;
+        let mut out = Vec::new();
+        parse_sitemap(xml, &mut out, 100);
+        let locs: Vec<&str> = out.iter().map(|e| e.loc.as_str()).collect();
+        assert_eq!(
+            locs,
+            [
+                "https://ex.com/search?q=rust&page=2",
+                "https://ex.com/a?x=1&y=2",
+                "https://ex.com/<b>/\"q\"/'s'//z",
+                "https://ex.com/plain",
+            ]
+        );
+        assert_eq!(out[0].lastmod.as_deref(), Some("2026-01-02"));
+    }
+
+    #[test]
+    fn xml_text_leaves_malformed_entities_alone() {
+        assert_eq!(xml_text("a &amp b"), "a &amp b");
+        assert_eq!(
+            xml_text("a & b &; &#; &#xZZ; &bogus;"),
+            "a & b &; &#; &#xZZ; &bogus;"
+        );
+        assert_eq!(xml_text("&amp;&amp;"), "&&");
+        assert_eq!(xml_text("<![CDATA[ x&y ]]>"), "x&y");
+        assert_eq!(xml_text("&#1114112;"), "&#1114112;"); // beyond char range
     }
 }
