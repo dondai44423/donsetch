@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "donsetch"
-version = "3.6.4"
+version = "3.6.5"
 dependencies = [
  "axum",
  "base64 0.23.1",
