@@ -11,8 +11,44 @@ use std::time::Duration;
 use futures_util::FutureExt;
 
 use super::governor::{Governor, Lane, LaneKind};
-use super::{CrawlMode, CrawlOptions, Crawler, FetchedPage, PageFetcher, StopReason};
+use super::{
+    CrawlMode, CrawlOptions, Crawler, FetchedPage, GHOST_BUDGET, PageFetcher, StopReason,
+    claim_ghost_slot,
+};
 use crate::detect::walls::Verdict;
+
+// The escalation budget is shared by every worker. A load-then-
+// fetch_sub gate let two workers pass at budget == 1 and wrap the
+// counter to usize::MAX, after which every later check passed. The
+// atomic claim must hand out exactly GHOST_BUDGET slots however many
+// threads race for them, and the counter must end at 0, not wrap.
+#[test]
+fn ghost_budget_is_claimed_exactly_budget_times_under_contention() {
+    for _ in 0..20 {
+        let budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let go = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (budget, claimed, go) = (budget.clone(), claimed.clone(), go.clone());
+                std::thread::spawn(move || {
+                    go.wait();
+                    for _ in 0..100 {
+                        if claim_ghost_slot(&budget) {
+                            claimed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(claimed.load(Ordering::SeqCst), GHOST_BUDGET);
+        assert_eq!(budget.load(Ordering::SeqCst), 0, "counter wrapped");
+        assert!(!claim_ghost_slot(&budget), "exhausted budget must refuse");
+    }
+}
 
 /// A scripted site: URL → (status, body). Missing URL = 404.
 struct MockSite {
