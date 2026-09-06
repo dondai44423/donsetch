@@ -131,6 +131,24 @@ impl Proxy {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// True when traffic goes through an HTTP CONNECT hop: these are
+    /// TLS-terminating middleboxes in interception networks, so the
+    /// fetch layer switches to the interception-safe handshake.
+    pub fn is_http_connect(&self) -> bool {
+        self.scheme == ProxyScheme::Http
+    }
+
+    /// Raw TCP dial to the proxy itself, for absolute-form plaintext
+    /// requests (http:// targets through an HTTP proxy need no tunnel).
+    pub async fn connect_tcp(&self) -> Result<TcpStream, FetchError> {
+        Ok(tokio::time::timeout(
+            PROXY_TIMEOUT,
+            TcpStream::connect((self.host.as_str(), self.port)),
+        )
+        .await
+        .map_err(|_| FetchError::Timeout)??)
+    }
+
     /// TCP to the proxy, then tunnel the target through it
     /// via HTTP CONNECT or SOCKS5 depending on scheme.
     pub async fn connect(

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fetch now survives TLS-intercepting egress networks (issue #154,
+  thanks maykura):** cloud sandboxes and corporate networks often
+  force all traffic through an HTTP proxy that re-terminates TLS with
+  its own CA. Three fixes close the whole class: (1) `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` bundles are loaded into the trust store on every
+  connector build (PEM bundles, DER files, directory scans), the one
+  thing that makes re-signed certificates verifiable; (2) requests
+  routed through an HTTP CONNECT proxy switch to an
+  interception-safe handshake (no GREASE/permute/ECH/ALPS/cert
+  compression/OCSP/SCT), because the middlebox's second TLS stack is
+  what resets exotic ClientHellos, and stealth is moot behind a MITM
+  anyway (SOCKS5 keeps the Chrome-true profile, TLS rides
+  end-to-end); (3) the env-proxy convention is documented with a
+  kill switch: HTTPS_PROXY/HTTP_PROXY/ALL_PROXY + NO_PROXY are
+  honored, DONSETCH_NO_ENV_PROXY=1 disables them, and plaintext
+  http:// through an HTTP proxy now uses raw dial + absolute-form
+  request targets (the previous CONNECT-then-relative-form path was
+  broken).
+- Handshake failures now classify instead of dumping raw
+  MidHandshakeSslStream debug fields: egress resets and cert
+  verification failures each get a one-line message naming the exact
+  fix (export the proxy, export the CA bundle), with matching
+  `tls.egress` / `tls.verify` error codes and operator-level
+  next_action text.
+- `donsetch doctor` adds a "Fetch egress" check: resolved env proxy,
+  kill-switch state, system + environment trust-store counts, and
+  SSL_CERT_FILE loadability. The network check, when it fails while
+  proxy env vars are set, now says the interception fix instead of
+  "check your connection".
+- E2E MITM test battery (tests/egress_proxy.rs): in-process HTTP
+  CONNECT proxy with a re-signing TLS server proves trusted-CA
+  success, untrusted-CA honest failure, and absolute-form plaintext,
+  on the real Fetcher.
+
 ### Fixed
 
 - **Crawl link/feed extraction could panic or drop URLs on pages

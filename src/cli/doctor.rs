@@ -109,6 +109,9 @@ pub async fn run() {
         );
     }
 
+    // 2b. Fetch egress + trust posture (local-only, always runs).
+    report!("Fetch egress", check_fetch_egress());
+
     // 3. TLS fingerprint (fast enough to keep in fast mode).
     if let Some(ref fm) = fetcher {
         report!("TLS fingerprint", check_tls(fm).await);
@@ -237,10 +240,75 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
             out.elapsed.as_secs_f64() * 1000.0,
         )),
         Ok(out) => CheckResult::Warn(format!("example.com returned HTTP {}", out.status)),
-        Err(e) => CheckResult::Fail(
-            e.to_string(),
-            "Check your network connection and DNS".into(),
-        ),
+        Err(e) => {
+            // Egress-filter environments are the one common case
+            // where a "network is fine" box still fails every
+            // fetch: curl works via the env proxy, direct sockets
+            // get reset. Surface the fix instead of a generic
+            // "check your connection".
+            let proxy_env_set = [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some());
+            let hint = if proxy_env_set {
+                "The environment exports a proxy and the direct fetch still failed: this looks like a TLS-intercepting egress network. donsetch honors the env proxy automatically (see 'Fetch egress'); if it still fails, export SSL_CERT_FILE=<the network's CA bundle> so the re-signed certificates verify, then re-run doctor."
+                    .to_string()
+            } else {
+                "Check your network connection and DNS. Behind an egress proxy? Export HTTPS_PROXY/HTTP_PROXY (donsetch honors them; NO_PROXY accepted).".into()
+            };
+            CheckResult::Fail(e.to_string(), hint)
+        }
+    }
+}
+
+/// Fetch egress + trust posture: env-proxy resolution, kill switch,
+/// and the two certificate stores the connector builds from.
+/// Local-only: no network, stays in fast mode.
+fn check_fetch_egress() -> CheckResult {
+    let kill = crate::config::env_flag("DONSETCH_NO_ENV_PROXY");
+    let resolved = if kill {
+        None
+    } else {
+        crate::transport::proxy::from_env_for("https://example.com")
+    };
+    let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
+    let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
+
+    let mut bits = Vec::new();
+    if let Some(p) = resolved {
+        bits.push(format!("egress via {} proxy {}:{} (env; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port));
+    } else {
+        bits.push(if kill {
+            "direct egress (DONSETCH_NO_ENV_PROXY=1 disables the env-proxy convention)".into()
+        } else {
+            "direct egress (no proxy env vars; export HTTPS_PROXY/HTTP_PROXY to route fetches)"
+                .into()
+        });
+    }
+    match cert_bundle {
+        Some(b) => {
+            if env_roots > 0 {
+                bits.push(format!(
+                    "trust: {sys_roots} system roots + {env_roots} from {b}"
+                ));
+                CheckResult::Pass(bits.join(" · "))
+            } else {
+                bits.push(format!("trust: {sys_roots} system roots; {b} set but yielded no parseable certs (the interception CA will NOT be trusted)"));
+                CheckResult::Warn(bits.join(" · "))
+            }
+        }
+        None => {
+            bits.push(format!(
+                "trust: {sys_roots} system roots; SSL_CERT_FILE unset"
+            ));
+            CheckResult::Pass(bits.join(" · "))
+        }
     }
 }
 

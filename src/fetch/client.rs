@@ -48,6 +48,11 @@ pub struct FetchOutcome {
 pub struct Fetcher {
     profile: BrowserProfile,
     connector: boring::ssl::SslConnector,
+    /// The interception-safe connector used for HTTP CONNECT proxy
+    /// hops: TLS-intercepting middleboxes re-terminate with a second
+    /// stack and some reset on GREASE/ALPS/compress_cert ClientHellos.
+    /// SOCKS5 tunnels do TLS end-to-end and keep Chrome-true.
+    connector_compat: boring::ssl::SslConnector,
     sessions: tls::SessionStore,
     pool: Mutex<Pool>,
     jar: Mutex<CookieJar>,
@@ -67,9 +72,11 @@ impl Fetcher {
     pub fn new(profile: BrowserProfile) -> Result<Self, FetchError> {
         let sessions = tls::new_session_store();
         let connector = tls::build_connector(&profile, sessions.clone())?;
+        let connector_compat = tls::build_connector_compat(&profile, sessions.clone())?;
         Ok(Self {
             profile,
             connector,
+            connector_compat,
             sessions,
             pool: Mutex::new(Pool::new()),
             jar: Mutex::new(CookieJar::new()),
@@ -214,7 +221,7 @@ impl Fetcher {
         // fingerprint (residential proxies don't use our Chrome-true
         // BoringSSL stack). Proxies belong on search (many engines)
         // and crawl (many pages, same host) where rate limits bite.
-        let env_proxy = if proxy.is_none() {
+        let env_proxy = if proxy.is_none() && !crate::config::env_flag("DONSETCH_NO_ENV_PROXY") {
             crate::transport::proxy::from_env_for(url_str)
         } else {
             None
@@ -534,10 +541,14 @@ impl Fetcher {
         req_headers: &[(String, String)],
         proxy: Option<&proxy::Proxy>,
     ) -> Result<FetchOutcome, FetchError> {
+        // Dial: https through an HTTP proxy goes through a CONNECT
+        // tunnel; plaintext http:// through an HTTP proxy goes RAW
+        // with an absolute-form request line (RFC 9112 3.2.2) —
+        // CONNECT is for https only. SOCKS5 tunnels both; direct
+        // dials use Happy Eyeballs.
         let tcp = match proxy {
+            Some(p) if !is_https && p.is_http_connect() => p.connect_tcp().await?,
             Some(p) => p.connect(host, port).await?,
-            // Warm = a cached TLS session for this origin: Chrome's
-            // repeat-navigation signal, and it flips TFO on (Linux).
             None => tcp::happy_connect_with(host, port, self.sessions_has(origin)).await?,
         };
 
@@ -546,8 +557,16 @@ impl Fetcher {
         // no session resumption, no ALPN.
         if !is_https {
             let mut stream = tcp;
+            // Proxied plaintext http:// uses absolute-form request
+            // targets (RFC 9112 3.2.2): the proxy needs the full
+            // origin in the request line to route it.
+            let target = if proxy.is_some() {
+                url_of("http", authority, path)
+            } else {
+                path.to_string()
+            };
             let resp =
-                tokio::time::timeout(RESPONSE_TIMEOUT, h1::get(&mut stream, path, req_headers))
+                tokio::time::timeout(RESPONSE_TIMEOUT, h1::get(&mut stream, &target, req_headers))
                     .await
                     .map_err(|_| FetchError::Timeout)??;
             return finish(
@@ -564,15 +583,31 @@ impl Fetcher {
             Some(p) => format!("{}|{}", p.id(), host),
             None => host.to_string(),
         };
+        // Http CONNECT hops get the interception-safe handshake:
+        // they are almost always TLS-terminating middleboxes whose
+        // second stack can reset on GREASE/ALPS/compress_cert, and
+        // stealth is moot there (the proxy holds the plaintext).
+        // SOCKS5 keeps the TLS end-to-end tunnel transparent, so it
+        // keeps the Chrome-true wire profile.
+        let through_http_proxy = proxy.is_some_and(|p| p.is_http_connect());
+        let (connector, handshake) = if through_http_proxy {
+            (
+                &self.connector_compat,
+                tls::HandshakeProfile::InterceptionSafe,
+            )
+        } else {
+            (&self.connector, tls::HandshakeProfile::ChromeTrue)
+        };
         let mut tls_stream = tokio::time::timeout(
             Duration::from_secs(15),
             tls::connect(
                 &self.profile,
-                &self.connector,
+                connector,
                 host,
                 tcp,
                 &self.sessions,
                 &session_key,
+                handshake,
             ),
         )
         .await

@@ -306,9 +306,33 @@ donsetch crawl https://docs.python.org --mode map --topic asyncio
 
 ## 🔀 HTTP Proxy
 
-Optional proxies for search and crawl only. The fetch system always
-uses the main home IP: proxied fetches burn the Stealth guarantee and
-the fetch tier gets no config path for them by design.
+**Search and crawl**: configure rotating proxies with `donsetch proxy add`
+or `DONSEEK_PROXIES`. Their egress lanes are reported per request
+(via= labels on the wire view).
+
+**Fetch**: no proxy by default: direct dials keep the stealth
+guarantee intact. But fetch follows the curl/openssl convention when
+the environment asks for it:
+
+- `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (uppercase or lowercase)
+  route fetches through that proxy, `NO_PROXY` exempts.
+- `DONSETCH_NO_ENV_PROXY=1` disables the convention entirely
+  (privacy purists, environment hygiene).
+- HTTP CONNECT proxies get an interception-safe handshake: no
+  GREASE/ALPS/ECH/compress-cert, because TLS-terminating middleboxes
+  (corporate MITM, cloud sandboxes) re-sign with their own stack and
+  some reset on exotic ClientHellos. SOCKS5 proxies keep the
+  Chrome-true handshake (TLS rides end-to-end).
+- `SSL_CERT_FILE` / `SSL_CERT_DIR` are loaded into the trust store:
+  in an intercepting network that bundle is the only way re-signed
+  certificates verify, exactly like curl.
+- `donsetch doctor` reports your egress posture: resolved env proxy,
+  kill-switch state, system + environment trust stores, and a live
+  network check that names the interception fix when it fails.
+
+A proxy you configured is your egress: an intercepting proxy sees
+plaintext by definition, which is the same tradeoff curl and reqwest
+make.
 
 ```bash
 donsetch proxy add <url>            # rotate-able proxy entry

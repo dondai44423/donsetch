@@ -787,14 +787,25 @@ fn friendly_fetch_error(e: &FetchError) -> String {
         FetchError::TooManyRedirects => "too many redirects (the URL loops)".into(),
         FetchError::InvalidUrl(u) => format!("invalid URL: {u}"),
         FetchError::Tls(msg) => {
-            // TLS errors: strip the raw SSL/BoringSSL internals.
-            let msg = msg.to_lowercase();
-            if msg.contains("certificate") || msg.contains("handshake") {
-                "TLS error: the server's certificate or handshake failed".into()
-            } else if msg.contains("reset") || msg.contains("eof") {
-                "connection reset by server".into()
+            // Classified errors (egress interception, cert trust) carry
+            // the actionable hint the user needs to fix their network;
+            // pass those through verbatim. Raw SSL/BoringSSL internals
+            // get flattened into short honest messages.
+            if msg.contains("egress path")
+                || msg.contains("certificate verification failed")
+                || msg.contains("TLS handshake aborted")
+                || msg.contains("TLS handshake cut short")
+            {
+                format!("TLS error: {msg}")
             } else {
-                "TLS connection failed".into()
+                let msg = msg.to_lowercase();
+                if msg.contains("certificate") || msg.contains("handshake") {
+                    "TLS error: the server's certificate or handshake failed".into()
+                } else if msg.contains("reset") || msg.contains("eof") {
+                    "connection reset by server".into()
+                } else {
+                    "TLS connection failed".into()
+                }
             }
         }
         FetchError::Io(e) => {
@@ -4158,6 +4169,12 @@ fn error_code(msg: &str, structured: Option<&Value>) -> &'static str {
         _ if v == "Paywall" => "wall.paywall",
         _ if v == "AuthWall" => "wall.auth",
         _ if v == "SoftNotFound" => "content.notfound",
+        _ if m.contains("tls error") && m.contains("certificate verification failed") => {
+            "tls.verify"
+        }
+        _ if m.contains("tls handshake aborted") || m.contains("tls handshake cut short") => {
+            "tls.egress"
+        }
         _ if m.contains("extraction failed") || m.contains("no content") => "content.extract",
         _ if m.contains("cloak") => "cloak.suspected",
         _ => "content.extract",
@@ -4225,6 +4242,12 @@ fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str) -> String 
         _ if kind == "walled" => {
             "no extractable content behind the wall : use an interactive agent browser for this site".into()
         }
+        _ if kind == "tls.verify" => {
+            "the interception CA is not trusted: export SSL_CERT_FILE pointing at the network's CA bundle and retry (donsetch doctor reports both trust stores)".into()
+        }
+        _ if kind == "tls.egress" => {
+            "the egress path is intercepting HTTPS: export HTTPS_PROXY/HTTP_PROXY to route fetches through the network proxy (env-proxy convention, DONSETCH_NO_ENV_PROXY to disable) and retry".into()
+        }
         _ => "check the URL and retry; if repeated, the site may be down or blocking".into(),
     }
 }
@@ -4266,6 +4289,20 @@ fn verdict_kind(v: Verdict, status: u16) -> &'static str {
 fn fetch_error_kind(e: &FetchError) -> &'static str {
     match e {
         FetchError::Timeout | FetchError::Io(_) => "transient",
+        FetchError::Tls(msg)
+            if msg.contains("certificate verification failed")
+                || msg.contains("trusted root")
+                || msg.contains("SSL_CERT_FILE") =>
+        {
+            "tls.verify"
+        }
+        FetchError::Tls(msg)
+            if msg.contains("egress path")
+                || msg.contains("TLS handshake aborted")
+                || msg.contains("cut short") =>
+        {
+            "tls.egress"
+        }
         _ => "permanent",
     }
 }
