@@ -5,6 +5,55 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **h1 chunked reader no longer allocates unboundedly:** a server
+  that never sends the chunk terminator (or keeps the size line
+  growing) drove an unbounded buffer in the response path. Chunk
+  size lines and trailer sections are now capped. Credit: mnaza
+  (#144).
+- **MathML serialization could overflow the stack:** deeply nested
+  XML structure recursed per node in extraction; a pathological page
+  overflowed the stack and aborted the daemon. Iterative fallback
+  on deep nesting instead. Credit: mnaza (#145).
+- **Markdown links with `)` in the URL were cut off:**
+  `[Mercury (planet)](https://en.wikipedia.org/wiki/Mercury_(planet))`
+  truncated at the first `)`. A balanced-close scan now finds the
+  real end of the destination. Credit: mnaza (#146).
+- **Search intent matching fired on substrings:** the word
+  "software" matched the `war` news marker (and similar accidents),
+  silently downgrading engines and freshness weights. Intent
+  markers now match on whole tokens. Credit: mnaza (#147).
+- **A single non-UTF-8 byte on the MCP stdin killed the daemon:** the
+  line loop exited on the parse error as if the client had closed.
+  A malformed line now receives a -32700 parse-error response and
+  the session continues. Credit: mnaza (#148).
+- **`<pre>` code blocks closed their own fence:** content showing a
+  nested ``` block (e.g. a Markdown syntax example) broke the
+  outer fence and spilled the rest of the page into the code block.
+  Fences now extend to at least the longest run of backticks in the
+  content. Credit: mnaza (#149).
+- **Docs-infobox adapter duplicated nested list items:** a nested
+  `<li>` matched both the outer list's selector and its own,
+  appearing twice and restarting ordered-list numbering. Nested
+  matches are skipped and lists render through the shared nested
+  list helper instead. Credit: mnaza (#150).
+- **String JSON-RPC ids could never be cancelled:** cancellation
+  keyed on an `i64`, while the JSON-RPC spec allows string ids
+  (UUIDs etc.), so requests from such clients ignored `notifications/
+  cancelled` forever. Cancellation keys now cover both id shapes,
+  with `7` and `"7"` kept distinct. Credit: mnaza (#151).
+- **Supervised mode dropped in-flight responses on client EOF:** a
+  one-shot client that closed stdin right after the request got
+  nothing back, because the supervisor exited on EOF and the exit
+  killed the stdout forwarder mid-response (and skipped the
+  daemon's own graceful shutdown). EOF now waits for the daemon to
+  drain and answer, with a bounded timeout, forwarding all output;
+  and the rapid-restart counter forgives old crashes. Credit: mnaza
+  (#153).
+
 ## [3.6.4] - 2026-09-05
 
 ### Fixed
