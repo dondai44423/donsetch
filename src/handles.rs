@@ -307,7 +307,13 @@ impl HandleTable {
         let mut count = 0usize;
         while let Some(rel) = md[pos..].find("](http") {
             let url_start = pos + rel + 2;
-            let Some(close_rel) = md[url_start..].find(')') else {
+            // The link closes at the first ')' that is not matched
+            // by a '(' inside the URL. Url::join leaves parens
+            // literal in paths, so `Mercury_(planet)` and
+            // `Array/map()` are common; cutting at the first ')'
+            // interned a truncated URL (a 404) and left a stray ')'
+            // in the markdown. An unbalanced ')' still closes.
+            let Some(close_rel) = balanced_close(&md[url_start..]) else {
                 break;
             };
             let url = &md[url_start..url_start + close_rel];
@@ -329,6 +335,24 @@ impl HandleTable {
         out.push_str(&md[pos..]);
         (out, count)
     }
+}
+
+/// Byte offset of the ')' that closes a markdown link URL starting
+/// at `s[0]`: the first ')' at paren depth 0. A URL with an unclosed
+/// '(' has no such ')': fall back to the first ')' at all (the old
+/// behaviour) so one odd link never stops the rewrite of the rest
+/// of the document. None only if there is no ')' anywhere.
+fn balanced_close(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' if depth == 0 => return Some(i),
+            b')' => depth -= 1,
+            _ => {}
+        }
+    }
+    s.find(')')
 }
 
 /// Check if a string matches the current handle format: prefix
@@ -458,6 +482,60 @@ mod tests {
         let (out, n) = t.replace_link_urls(md);
         assert_eq!(n, 0);
         assert_eq!(out, md);
+    }
+
+    // Url::join leaves '(' and ')' literal in paths, so every
+    // disambiguated Wikipedia title, MDN `Array.prototype.map()`
+    // and friends arrive as `[t](https://…/X_(y))`. Cutting at the
+    // FIRST ')' interned `…/X_(y` (a 404) and left a stray ')' in
+    // the markdown after every such link.
+    #[test]
+    fn replace_keeps_balanced_parens_inside_the_url() {
+        let mut t = table();
+        let md = "see [Mercury](https://en.wikipedia.org/wiki/Mercury_(planet)) and [map](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/map()) then";
+        let (out, n) = t.replace_link_urls(md);
+        assert_eq!(n, 2);
+        let planet = out.find("](L").unwrap();
+        let handle = &out[planet + 2..planet + 2 + 1 + ID_LEN];
+        assert_eq!(
+            t.resolve(handle).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Mercury_(planet)"),
+            "url interned truncated"
+        );
+        assert!(
+            out.contains(") and [map](L"),
+            "stray ')' after the first link:\n{out}"
+        );
+        assert!(out.ends_with(") then"), "{out}");
+        assert!(!out.contains("))"), "doubled close paren:\n{out}");
+        // Nested parens too.
+        let (out2, n2) = t.replace_link_urls("[x](https://h/a_((b))_c) tail");
+        assert_eq!(n2, 1);
+        assert!(out2.ends_with(") tail"), "{out2}");
+        let h2 = &out2[out2.find("](L").unwrap() + 2..][..1 + ID_LEN];
+        assert_eq!(t.resolve(h2).as_deref(), Some("https://h/a_((b))_c"));
+    }
+
+    // An unbalanced ')' inside the URL still closes the link at the
+    // first depth-0 ')', exactly as before.
+    #[test]
+    fn replace_unbalanced_close_paren_closes_the_link() {
+        let mut t = table();
+        let (out, n) = t.replace_link_urls("[m](https://x/a)b) tail");
+        assert_eq!(n, 1);
+        assert!(out.ends_with(")b) tail"), "{out}");
+        let h = &out[out.find("](L").unwrap() + 2..][..1 + ID_LEN];
+        assert_eq!(t.resolve(h).as_deref(), Some("https://x/a"));
+    }
+
+    // An unclosed '(' in one URL falls back to the first ')' and
+    // must not stop the rewrite of later links.
+    #[test]
+    fn replace_unclosed_open_paren_does_not_stall_the_rest() {
+        let mut t = table();
+        let (out, n) = t.replace_link_urls("[a](https://x/q(1) mid [b](https://y/) end");
+        assert_eq!(n, 2, "{out}");
+        assert!(out.ends_with(") end"), "{out}");
     }
 
     #[test]
