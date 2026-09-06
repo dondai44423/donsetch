@@ -19,9 +19,16 @@ pub struct Robots {
     pub disallow: Vec<String>,
     /// `Allow:` prefixes (override Disallow on longest match).
     pub allow: Vec<String>,
-    /// Site-declared request delay seconds, if any.
+    /// Site-declared request delay seconds, if any: finite,
+    /// non-negative, at most [`MAX_CRAWL_DELAY_SECS`].
     pub crawl_delay: Option<f64>,
 }
+
+/// Longest `Crawl-delay` honoured. A page a minute is already a
+/// crawl that only the deadline ends; `86400` (real sites ship
+/// it) would be a day between pages, and `inf`/`1e300` parse as
+/// valid f64 but panic in `Duration::from_secs_f64`.
+pub const MAX_CRAWL_DELAY_SECS: f64 = 60.0;
 
 impl Robots {
     pub fn parse(body: &str, base_host: &str) -> Self {
@@ -53,7 +60,11 @@ impl Robots {
                     r.allow.push(v.to_string());
                 }
                 "crawl-delay" if in_star_group => {
-                    r.crawl_delay = v.parse::<f64>().ok();
+                    r.crawl_delay = v
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|d| d.is_finite() && *d >= 0.0)
+                        .map(|d| d.min(MAX_CRAWL_DELAY_SECS));
                 }
                 "sitemap" => {
                     // Sitemap directives apply outside groups.

@@ -450,6 +450,53 @@ async fn crawl_robots_disallow_respected() {
     assert!(!hits.iter().any(|h| h.contains("/private")));
 }
 
+// `Crawl-delay` was parsed with a bare `f64` parse and fed straight
+// to `Duration::from_secs_f64`, which panics on `inf`/huge values:
+// one hostile (or sloppy) robots.txt aborted the crawl worker, and
+// a finite `86400` was honoured verbatim (a day between pages).
+#[test]
+fn robots_crawl_delay_is_finite_and_clamped() {
+    use super::sitemap::Robots;
+    for bad in ["inf", "-inf", "nan", "-5", "abc"] {
+        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {bad}\n"), "ex.com");
+        assert_eq!(r.crawl_delay, None, "{bad}");
+    }
+    let r = Robots::parse("User-agent: *\nCrawl-delay: 2.5\n", "ex.com");
+    assert_eq!(r.crawl_delay, Some(2.5));
+    for huge in ["86400", "1e300"] {
+        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {huge}\n"), "ex.com");
+        assert_eq!(
+            r.crawl_delay,
+            Some(super::sitemap::MAX_CRAWL_DELAY_SECS),
+            "{huge}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn crawl_survives_infinite_crawl_delay() {
+    let robots = "User-agent: *\nCrawl-delay: inf\n";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/ok\">ok</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, robots)
+        .page("https://ex.com/", 200, seed)
+        .page("https://ex.com/ok", 200, &html("Ok", "ok"));
+    let (fetch, _hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    o.respect_robots = true;
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        crawler.crawl("https://ex.com/", o, None),
+    )
+    .await
+    .expect("crawl must finish")
+    .unwrap();
+    assert!(r.pages.iter().any(|p| p.url.ends_with("/ok")));
+}
+
 #[tokio::test]
 async fn crawl_near_dupes_collapsed() {
     let body = html("Same", "identical body");

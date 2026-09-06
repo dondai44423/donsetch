@@ -129,8 +129,13 @@ impl Governor {
             .crawl_delay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The setter is public: re-clamp here so no caller can
+        // hand `from_secs_f64` a value it panics on.
         match *cd {
-            Some(s) if s > 0.0 => Duration::from_secs_f64(s.max(BASE_DELAY.as_secs_f64())),
+            Some(s) if s.is_finite() && s > 0.0 => Duration::from_secs_f64(
+                s.min(super::sitemap::MAX_CRAWL_DELAY_SECS)
+                    .max(BASE_DELAY.as_secs_f64()),
+            ),
             _ => BASE_DELAY,
         }
     }
@@ -403,6 +408,20 @@ mod tests {
         let w = g.wait_for("ex.com", "lane0", 1);
         assert!(w > Duration::ZERO);
         assert!(w < Duration::from_secs(3));
+    }
+
+    // `Duration::from_secs_f64` panics on non-finite or > u64::MAX
+    // seconds; the governor must never trust the value it is
+    // handed that far.
+    #[test]
+    fn absurd_crawl_delay_never_panics_and_is_capped() {
+        for d in [f64::INFINITY, f64::NAN, 1e300, -1.0, 86400.0] {
+            let g = gov(&[LaneKind::Direct]);
+            g.set_crawl_delay(Some(d));
+            g.wait_for("ex.com", "lane0", 0);
+            let w = g.wait_for("ex.com", "lane0", 1);
+            assert!(w <= Duration::from_secs(90), "{d}: {w:?}");
+        }
     }
 
     #[test]
