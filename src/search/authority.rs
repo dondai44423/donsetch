@@ -413,7 +413,11 @@ fn freshness_mult(published: &Option<String>) -> f64 {
         return 1.0;
     };
     match days_old {
-        0..=1 => 1.5,
+        // Negative = future-dated (a GMT pubDate ahead of a local
+        // clock near midnight): fresh, not stale. The lower-open arm
+        // is what makes iso_days_ago's "clamped to fresh" true; a
+        // `0..=1` arm sent every negative value to the stale 0.85.
+        ..=1 => 1.5,
         2..=3 => 1.3,
         4..=7 => 1.15,
         8..=30 => 1.0,
@@ -667,14 +671,38 @@ mod tests {
 
     #[test]
     fn freshness_tiers_parse_iso_prefix() {
-        // "2026-08-16" is a recent date → some freshness tier boost.
-        let f = freshness_mult(&Some("2026-08-16".into()));
-        assert!(
-            f >= 1.0,
-            "freshness should be >= 1.0 for a parseable date, got {f}"
-        );
+        // Relative to today: a literal date here silently walks out
+        // of the 30-day neutral tier and starts failing the build
+        // (the previous "2026-08-16" would have from 2026-09-16).
+        let now = epoch_days_now();
+        let tiers = [
+            (0, 1.5),
+            (1, 1.5),
+            (2, 1.3),
+            (3, 1.3),
+            (4, 1.15),
+            (7, 1.15),
+            (8, 1.0),
+            (30, 1.0),
+            (31, 0.85),
+            (400, 0.85),
+        ];
+        for (age, want) in tiers {
+            let iso = civil_from_days(now - age);
+            let got = freshness_mult(&Some(iso.clone()));
+            assert_eq!(got, want, "{age} days old ({iso})");
+        }
         // Unparseable → neutral.
         assert_eq!(freshness_mult(&Some("garbage".into())), 1.0);
+    }
+
+    #[test]
+    fn freshness_treats_future_dates_as_fresh() {
+        let now = epoch_days_now();
+        for ahead in [1, 2, 30] {
+            let iso = civil_from_days(now + ahead);
+            assert_eq!(freshness_mult(&Some(iso.clone())), 1.5, "{iso}");
+        }
     }
 
     #[test]
