@@ -116,7 +116,7 @@ contributions. The two tiers:
 |---|---|---|
 | Maintainer | @dondai44423 | everything |
 | Co-maintainer | @Mart-Bogdan | search, ghost, fetch, GitHub config |
-| Subsystem reviewer | @mnaza | PDF, h2 transport, cookies |
+| Co-maintainer | @mnaza | PDF, h2 transport, cookies, search BYOK |
 | Subsystem reviewer | @adaaaaaaaaaaaaaaaaaaaaaa | MCP surface, tool specs, tests |
 | Subsystem reviewer | @imonlinux | Docker image, compose, HTTP transport |
 

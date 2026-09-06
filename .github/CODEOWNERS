@@ -1,7 +1,7 @@
 * @dondai44423
 
-# Auto-request review from co-maintainer.
-/src/search/ @Mart-Bogdan
+# Auto-request review from co-maintainers.
+/src/search/ @Mart-Bogdan @mnaza
 /src/ghost/ @Mart-Bogdan
 /src/fetch/ @Mart-Bogdan
 /.github/ @Mart-Bogdan
