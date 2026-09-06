@@ -1083,61 +1083,97 @@ pub fn probe_render(text: &str, pattern: &str, is_regex: bool) -> String {
         }
     };
 
-    if is_regex {
-        match regex::RegexBuilder::new(pattern)
-            .case_insensitive(true)
-            .size_limit(1 << 20)
-            .build()
-        {
-            Ok(re) => {
-                let hits: Vec<(usize, usize)> = re
-                    .find_iter(text)
-                    .map(|m| (m.start(), m.end()))
-                    .take(50)
-                    .collect();
-                report(Some(hits))
-            }
-            Err(_) => report(None),
-        }
+    // Both modes go through one case-insensitive regex so every hit
+    // is a byte offset into `text` itself. The old substring path
+    // searched a separately lowercased copy, whose offsets drift
+    // from the real text as soon as case folding changes a byte
+    // length ('İ' -> "i̇"); and both paths then fed those BYTE
+    // offsets to a context window that treated them as CHAR indices,
+    // so on any page with non-ASCII text before the hit the excerpt
+    // landed after the match and did not contain it.
+    let source = if is_regex {
+        std::borrow::Cow::Borrowed(pattern)
     } else {
-        // Case-insensitive substring: lowercase both sides on
-        // ASCII (the dominant case) without allocating a regex.
-        let hay = text.to_lowercase();
-        let needle = pattern.to_lowercase();
-        let mut hits = Vec::new();
-        let mut from = 0;
-        while let Some(pos) = hay[from..].find(&needle) {
-            hits.push((from + pos, from + pos + needle.len()));
-            from += pos + needle.len().max(1);
-            if hits.len() >= 50 {
-                break;
-            }
+        std::borrow::Cow::Owned(regex::escape(pattern))
+    };
+    match regex::RegexBuilder::new(&source)
+        .case_insensitive(true)
+        .size_limit(1 << 20)
+        .build()
+    {
+        Ok(re) => {
+            let hits: Vec<(usize, usize)> = re
+                .find_iter(text)
+                .map(|m| (m.start(), m.end()))
+                .take(50)
+                .collect();
+            report(Some(hits))
         }
-        report(Some(hits))
+        // A literal can only fail to build by blowing the size
+        // limit (a multi-KB pattern under (?i) expands into Unicode
+        // classes); it is never "invalid", so search it as bytes
+        // instead. ASCII case-insensitive is the honest fallback:
+        // non-ASCII bytes must match exactly, which also keeps every
+        // hit on a char boundary.
+        Err(_) if !is_regex => report(Some(literal_hits(text, pattern))),
+        Err(_) => report(None),
     }
 }
 
-/// One-line context window around a match, ellipsized and
-/// whitespace-collapsed.
-fn context_around(text: &str, start: usize, end: usize, pad: usize) -> String {
-    let char_count = text.chars().count();
-    let lo = start.saturating_sub(pad);
-    let hi = (end + pad).min(char_count);
-    // Convert char indices to byte indices safely.
-    let byte_lo = char_to_byte(text, lo);
-    let byte_hi = char_to_byte(text, hi);
-    let window = &text[byte_lo..byte_hi];
-    let collapsed: String = window.split_whitespace().collect::<Vec<_>>().join(" ");
-    let prefix = if lo > 0 { "…" } else { "" };
-    let suffix = if hi < char_count { "…" } else { "" };
-    format!("{prefix}{collapsed}{suffix}")
+/// Byte-window search for a literal `needle` in `text`, ASCII
+/// case-insensitive. Non-ASCII bytes compare exactly, so a match
+/// start is always a char boundary (a UTF-8 lead byte or ASCII, never
+/// a continuation byte) and `start + needle.len()` is too.
+fn literal_hits(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    let (hay, nb) = (text.as_bytes(), needle.as_bytes());
+    if nb.is_empty() || nb.len() > hay.len() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    let mut from = 0;
+    while from + nb.len() <= hay.len() {
+        match hay[from..]
+            .windows(nb.len())
+            .position(|w| w.eq_ignore_ascii_case(nb))
+        {
+            Some(pos) => {
+                let start = from + pos;
+                hits.push((start, start + nb.len()));
+                from = start + nb.len();
+                if hits.len() >= 50 {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    hits
 }
 
-fn char_to_byte(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(text.len())
+/// One-line context window around a match, ellipsized and
+/// whitespace-collapsed. `start`/`end` are BYTE offsets into `text`
+/// (char boundaries, as regex matches are); `pad` is in chars.
+fn context_around(text: &str, start: usize, end: usize, pad: usize) -> String {
+    let byte_lo = if pad == 0 {
+        start
+    } else {
+        text[..start]
+            .char_indices()
+            .rev()
+            .nth(pad - 1)
+            .map(|(b, _)| b)
+            .unwrap_or(0)
+    };
+    let byte_hi = text[end..]
+        .char_indices()
+        .nth(pad)
+        .map(|(b, _)| end + b)
+        .unwrap_or(text.len());
+    let window = &text[byte_lo..byte_hi];
+    let collapsed: String = window.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prefix = if byte_lo > 0 { "…" } else { "" };
+    let suffix = if byte_hi < text.len() { "…" } else { "" };
+    format!("{prefix}{collapsed}{suffix}")
 }
 
 /// One-line accounting of what the focus filter dropped: block
