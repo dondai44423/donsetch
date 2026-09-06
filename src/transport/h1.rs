@@ -14,6 +14,11 @@ pub struct H1Response {
 /// Hard cap on an HTTP/1.1 response body (matches the
 /// decompression cap : bombs must fail before they allocate).
 const MAX_BODY: usize = 64 << 20;
+/// Cap on any framing line the client accumulates while looking
+/// for its terminator: the header block, a chunk-size line, the
+/// trailer section. A server that never sends the CRLF must run
+/// into this, not into the allocator.
+const MAX_LINE: usize = 1 << 20;
 
 /// Generic over any async stream : works for both TLS
 /// (`SslStream<TcpStream>`) and raw plaintext `TcpStream`
@@ -60,7 +65,7 @@ where
             header_end = pos + 4;
             break;
         }
-        if buf.len() > 1 << 20 {
+        if buf.len() > MAX_LINE {
             return Err(FetchError::Http("h1: header block too large".into()));
         }
     }
@@ -147,10 +152,18 @@ where
     let mut tmp = [0u8; 16384];
     let mut out = Vec::new();
     loop {
-        // Ensure we have a size line.
+        // Ensure we have a size line. Capped like the header block:
+        // a server that never sends the CRLF (or a chunk extension
+        // of arbitrary length) must not grow `raw` without bound --
+        // the body caps below only apply once a size has parsed, so
+        // this loop used to be the one uncapped allocation on the
+        // response path, ended only by the response timeout.
         let line_end = loop {
             if let Some(pos) = find(&raw, b"\r\n") {
                 break pos;
+            }
+            if raw.len() > MAX_LINE {
+                return Err(FetchError::Http("h1: chunk size line too large".into()));
             }
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
@@ -166,11 +179,15 @@ where
         }
         let mut rest = raw.split_off(line_end + 2);
         if size == 0 {
-            // Trailer section ends with empty line.
+            // Trailer section ends with empty line. Same cap as the
+            // header block it structurally is.
             while !rest.starts_with(b"\r\n") {
                 if let Some(pos) = find(&rest, b"\r\n\r\n") {
                     rest.truncate(pos + 4);
                     break;
+                }
+                if rest.len() > MAX_LINE {
+                    return Err(FetchError::Http("h1: trailer section too large".into()));
                 }
                 let n = stream.read(&mut tmp).await?;
                 if n == 0 {
@@ -180,6 +197,12 @@ where
             }
             break;
         }
+        // Check the running total BEFORE reading the chunk in:
+        // checked after, two back-to-back near-cap chunks peaked at
+        // `out` + `rest` = 2 x MAX_BODY before the cap fired.
+        if out.len() + size > MAX_BODY {
+            return Err(FetchError::Http("h1: chunked body exceeds cap".into()));
+        }
         while rest.len() < size + 2 {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
@@ -187,11 +210,159 @@ where
             }
             rest.extend_from_slice(&tmp[..n]);
         }
-        if out.len() + size > MAX_BODY {
-            return Err(FetchError::Http("h1: chunked body exceeds cap".into()));
-        }
         out.extend_from_slice(&rest[..size]);
         raw = rest.split_off(size + 2);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    /// A stream that serves `head` once, then an endless supply of
+    /// `filler` bytes (never EOF). Counts bytes handed out so a test
+    /// can assert the reader gave up after a bounded amount, and
+    /// fails the read itself past TEST_GUARD so a reader with no cap
+    /// fails the test instead of eating the machine.
+    struct Endless {
+        head: Vec<u8>,
+        filler: u8,
+        served: Arc<AtomicUsize>,
+    }
+
+    const TEST_GUARD: usize = 16 << 20;
+
+    impl AsyncRead for Endless {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.served.load(Ordering::Relaxed) > TEST_GUARD {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "test guard: reader accepted more than TEST_GUARD bytes",
+                )));
+            }
+            let n = buf.remaining();
+            if !self.head.is_empty() {
+                let take = n.min(self.head.len());
+                let chunk: Vec<u8> = self.head.drain(..take).collect();
+                buf.put_slice(&chunk);
+                self.served.fetch_add(take, Ordering::Relaxed);
+            } else {
+                let fill = vec![self.filler; n];
+                buf.put_slice(&fill);
+                self.served.fetch_add(n, Ordering::Relaxed);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Endless {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(data.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn endless(head: &[u8], filler: u8) -> (Endless, Arc<AtomicUsize>) {
+        let served = Arc::new(AtomicUsize::new(0));
+        (
+            Endless {
+                head: head.to_vec(),
+                filler,
+                served: served.clone(),
+            },
+            served,
+        )
+    }
+
+    // The chunk-size-line loop accumulated bytes until it saw CRLF,
+    // with no cap: a server answering `Transfer-Encoding: chunked`
+    // with an endless CRLF-free stream made the client allocate
+    // without bound (only the 30s response timeout ended it). The
+    // header-block read a few lines up has a 1 MiB cap; this loop
+    // simply lacked it.
+    #[tokio::test]
+    async fn chunk_size_line_without_crlf_is_capped() {
+        let (mut s, served) = endless(b"", b'a');
+        let err = read_chunked(&mut s, Vec::new())
+            .await
+            .expect_err("must give up");
+        assert!(err.to_string().contains("chunk size line"), "{err}");
+        assert!(
+            served.load(Ordering::Relaxed) <= MAX_LINE + 2 * 16384,
+            "read {} bytes before giving up",
+            served.load(Ordering::Relaxed)
+        );
+    }
+
+    // Same omission in the trailer loop after the terminating 0-chunk.
+    #[tokio::test]
+    async fn endless_trailers_are_capped() {
+        let (mut s, served) = endless(b"0\r\nX-Trailer: ", b'x');
+        let err = read_chunked(&mut s, Vec::new())
+            .await
+            .expect_err("must give up");
+        assert!(err.to_string().contains("trailer"), "{err}");
+        assert!(served.load(Ordering::Relaxed) <= MAX_LINE + 2 * 16384);
+    }
+
+    // A well-formed body, with a chunk extension and a trailer, still
+    // decodes and consumes exactly what it should.
+    #[tokio::test]
+    async fn well_formed_chunked_body_decodes() {
+        let wire = b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Sum: abc\r\n\r\n";
+        let mut s = tokio::io::BufReader::new(&wire[..]);
+        // BufReader<&[u8]> is AsyncRead but not AsyncWrite; wrap in a
+        // tiny adapter that forwards reads and accepts writes.
+        struct RO<R>(R);
+        impl<R: AsyncRead + Unpin> AsyncRead for RO<R> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+        impl<R: Unpin> AsyncWrite for RO<R> {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                d: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(d.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut ro = RO(&mut s);
+        let out = read_chunked(&mut ro, Vec::new()).await.expect("decode");
+        assert_eq!(out, b"hello world");
+    }
 }
