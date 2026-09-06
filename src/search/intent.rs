@@ -126,12 +126,30 @@ pub fn is_conceptual(query: &str) -> bool {
     CONCEPT.iter().any(|s| q.contains(s))
 }
 
+/// Query tokens: alphanumeric runs, keeping '+' so "c++" survives.
+fn tokens(q: &str) -> Vec<&str> {
+    q.split(|c: char| !c.is_alphanumeric() && c != '+')
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Does `signal` (one or more words) occur as a contiguous run of
+/// whole tokens? Substring matching lit "war" up on "software",
+/// "paper" on "wallpaper", "stock" on "stockholm", "dies" on
+/// "diesel" -- and a false News/Paper label drops two of the five
+/// engines and applies the stale-date penalty. The TECH list was
+/// already token-matched for exactly this reason; the other signal
+/// lists were not.
+fn has_phrase(toks: &[&str], signal: &str) -> bool {
+    let want = tokens(signal);
+    !want.is_empty() && toks.windows(want.len()).any(|w| w == want.as_slice())
+}
+
 pub fn detect(query: &str) -> Intent {
     let q = query.to_lowercase();
-    let score = |signals: &[&str]| signals.iter().filter(|s| q.contains(**s)).count();
-    let tech = q
-        .split(|c: char| !c.is_alphanumeric() && c != '+')
-        .any(|w| TECH.contains(&w));
+    let toks = tokens(&q);
+    let score = |signals: &[&str]| signals.iter().filter(|s| has_phrase(&toks, s)).count();
+    let tech = toks.iter().any(|w| TECH.contains(w));
     // Ambiguous utility words need tech context; strong
     // signals never do.
     // Asymmetric by design: a false Code label on
@@ -382,5 +400,37 @@ mod tests {
             detect("retrieval augmented generation paper"),
             Intent::Paper
         );
+    }
+
+    // Signals used to be matched as raw substrings, so "software"
+    // lit up on "war", "wallpaper" on "paper", "stockholm" on
+    // "stock", "diesel" on "dies" -- and the News/Paper label
+    // dropped two of the five engines and applied the stale-date
+    // penalty to a query about socks. Only whole tokens count.
+    #[test]
+    fn signals_match_whole_words_not_substrings() {
+        for q in [
+            "software architecture patterns",
+            "hardware wallet comparison",
+            "warm socks for winter",
+            "stockholm travel guide",
+            "diesel engine maintenance",
+            "feature selection algorithm",
+            "how to change wallpaper on android",
+            "wallpaper ideas living room",
+            "case studies in urban planning",
+        ] {
+            assert_eq!(detect(q), Intent::Web, "{q}");
+        }
+        // The real signals still fire as whole words / phrases.
+        assert_eq!(detect("breaking news ukraine war"), Intent::News);
+        assert_eq!(detect("stock market crash today"), Intent::News);
+        assert_eq!(detect("arxiv paper on attention"), Intent::Paper);
+        assert_eq!(detect("null pointer in c"), Intent::Code);
+        assert_eq!(detect("what is a monad"), Intent::Entity);
+        // A multi-word phrase must be contiguous tokens, not a
+        // substring across a word boundary ("show tools" is not
+        // "how to").
+        assert_ne!(detect("show tools for woodworking"), Intent::Code);
     }
 }
