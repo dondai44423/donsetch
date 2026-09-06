@@ -95,7 +95,15 @@ pub struct PageMeta {
 fn pdf_date(raw: &Option<String>) -> Option<String> {
     let r = raw.as_ref()?;
     let d = r.strip_prefix("D:").unwrap_or(r);
-    if d.len() >= 8 && d[..8].chars().all(|c| c.is_ascii_digit()) {
+    // Check the bytes, not a str slice: the Info dict is
+    // producer-controlled and a localized date puts a multibyte
+    // char inside the first 8 bytes, where `d[..8]` would panic.
+    // All-ASCII-digit bytes make the slices below boundary-safe.
+    let leading_digits = d
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|b| b.iter().all(u8::is_ascii_digit));
+    if leading_digits {
         Some(format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8]))
     } else if r.trim().is_empty() {
         None
