@@ -844,14 +844,27 @@ fn check_plugins() -> CheckResult {
     }
 }
 
+/// Display form of a key: enough to recognize it, never enough to
+/// use it. Char-based throughout -- the old byte slices panicked on
+/// a key with a multibyte char in the cut position (`parse_key` /
+/// `keys import` never reject non-ASCII), and showed 7 of 8 chars of
+/// a short key.
 fn mask_key(k: &str) -> String {
     let start = k.split_once("::").map(|(t, _)| t).unwrap_or(k);
-    let b = start.as_bytes();
-    if b.len() <= 8 {
-        return format!("{}***", &start[..start.len().saturating_sub(1)]);
+    let n = start.chars().count();
+    if n <= 8 {
+        let shown: String = start.chars().take(n.saturating_sub(1).min(2)).collect();
+        return format!("{shown}***");
     }
-    let head = std::str::from_utf8(&b[..6]).unwrap_or("");
-    let tail = std::str::from_utf8(&b[b.len() - 4..]).unwrap_or("");
+    let head: String = start.chars().take(6).collect();
+    let tail: String = start
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}...{tail}")
 }
 
@@ -1211,4 +1224,30 @@ async fn apply_fixes(collected: &mut [(String, String, String, String)]) -> Resu
         cli::bold("done")
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_key;
+
+    #[test]
+    fn mask_key_is_char_safe_and_never_shows_most_of_a_short_key() {
+        // 8 bytes, 7 chars, last char multibyte: `&start[..7]` panicked.
+        assert_eq!(mask_key("abcdefé"), "ab***");
+        // All-multibyte short key.
+        assert_eq!(mask_key("密钥测试"), "密钥***");
+        // Degenerate lengths.
+        assert_eq!(mask_key(""), "***");
+        assert_eq!(mask_key("a"), "***");
+        assert_eq!(mask_key("ab"), "a***");
+        // A real-length key keeps the recognizable head...tail shape.
+        assert_eq!(
+            mask_key("sk-abcdefghijklmnopqrstuvwxyz0123"),
+            "sk-abc...0123"
+        );
+        // Multibyte at both cut positions.
+        assert_eq!(mask_key("ключключключключ"), "ключкл...ключ");
+        // Bright Data `token::zone` keys mask the token only.
+        assert_eq!(mask_key("0123456789abcdef::my_zone"), "012345...cdef");
+    }
 }
