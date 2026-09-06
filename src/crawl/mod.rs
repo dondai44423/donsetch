@@ -1663,14 +1663,17 @@ fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
             break;
         };
         let after = open + 6;
-        let Some(close_rel) = xml[after..].find("</link>") else {
+        // Case-insensitive like the open-tag scan above : a
+        // case-sensitive close made "<LINK>u</LINK>" span to the
+        // next item's lowercase </link>.
+        let Some(close) = find_ascii_ci(xml, "</link>", after) else {
             break;
         };
-        let text = xml[after..after + close_rel].trim();
+        let text = xml[after..close].trim();
         if text.starts_with("http") {
             urls.push(text.to_string());
         }
-        pos = after + close_rel + 7;
+        pos = close + 7;
     }
     // Atom: <link href="URL" .../>
     if urls.len() < cap {

@@ -1207,3 +1207,20 @@ fn feed_xml_folding_char_dropped_links_old_math() {
     let urls = got.expect("atom parse panicked");
     assert_eq!(urls, vec!["https://example.com/a/İtem"]);
 }
+
+#[test]
+fn rss_uppercase_link_tags_close_case_insensitively() {
+    // The open-tag scan matches "<LINK>" case-insensitively, so the
+    // close must too: with a case-sensitive close, an uppercase item
+    // "spans" to the NEXT item's lowercase </link> (one garbage URL
+    // swallowing the real one), and with no lowercase close left in
+    // the document every remaining RSS URL is dropped.
+    let xml = "<rss><channel>\
+               <item><LINK>https://example.com/1</LINK></item>\
+               <item><link>https://example.com/2</link></item>\
+               </channel></rss>";
+    assert_eq!(
+        super::parse_feed_urls(xml, 10),
+        vec!["https://example.com/1", "https://example.com/2"]
+    );
+}
