@@ -382,7 +382,8 @@ fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                         let code: String = c.text().collect::<Vec<_>>().join("");
                         let code = code.trim_matches('\n');
                         if !code.is_empty() {
-                            out.push_str(&format!("```\n{code}\n```\n\n"));
+                            let fence = super::render::code_fence(code);
+                            out.push_str(&format!("{fence}\n{code}\n{fence}\n\n"));
                         }
                     }
                     "blockquote" => {

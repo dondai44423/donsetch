@@ -221,7 +221,8 @@ fn render_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
             "pre" => {
                 let code = plain_text(el);
                 if !code.is_empty() {
-                    out.push_str(&format!("```\n{code}\n```\n\n"));
+                    let fence = crate::extract::render::code_fence(&code);
+                    out.push_str(&format!("{fence}\n{code}\n{fence}\n\n"));
                 }
             }
             "table" => {
@@ -331,5 +332,21 @@ mod tests {
         // No infobox → no adapter.
         let plain = "<html><body><div class='mw-parser-output'><p>text</p></div></body></html>";
         assert!(extract(plain, "https://en.wikipedia.org/wiki/Plain", &opts()).is_none());
+    }
+
+    #[test]
+    fn pre_containing_a_fence_gets_a_longer_fence() {
+        // e.g. the Markdown article's own syntax example.
+        let html = WIKI.replace(
+            "<h2>History</h2>",
+            "<pre>```python\nprint(1)\n```</pre><h2>History</h2>",
+        );
+        let ex = extract(&html, "https://en.wikipedia.org/wiki/Markdown", &opts()).unwrap();
+        assert!(
+            ex.markdown
+                .contains("````\n```python\nprint(1)\n```\n````\n"),
+            "{}",
+            ex.markdown
+        );
     }
 }

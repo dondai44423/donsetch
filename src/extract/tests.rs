@@ -502,6 +502,31 @@ fn block_code_pre() {
     assert!(r.markdown.contains("println!"));
 }
 
+// A <pre> that itself contains a markdown fence (every "how to
+// write markdown" page, every README rendered in a docs site)
+// used to be wrapped in a bare ``` fence: the inner ``` closed
+// the block early and the rest of the code spilled out as prose.
+#[test]
+fn block_code_containing_backtick_fence_is_wrapped_in_a_longer_fence() {
+    let html = "<html><body><article>
+<pre><code>Use a fence:
+
+```rust
+fn main() {}
+```
+
+Then prose.</code></pre>
+</article></body></html>";
+    let r = extract_html(html);
+    let md = &r.markdown;
+    let open = md.find("````\n").expect("longer opening fence");
+    let close = md.rfind("\n````\n").expect("longer closing fence");
+    assert!(open < close);
+    let inside = &md[open..close];
+    assert!(inside.contains("```rust\nfn main() {}\n```"), "{md}");
+    assert!(inside.contains("Then prose."), "{md}");
+}
+
 #[test]
 fn block_code_whitespace_preserved() {
     let html = r#"<html><body><article>
