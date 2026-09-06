@@ -95,7 +95,13 @@ fn json_ld_find(doc: &Html, key: &str, subkey: &str) -> Option<String> {
     for script in doc.select(&sel) {
         let text: String = script.text().collect();
         let Some(ki) = text.find(key) else { continue };
-        let region = &text[ki + key.len()..text.len().min(ki + key.len() + 300)];
+        // The window end is a byte offset into text that is usually
+        // raw UTF-8 (only Wikipedia-style output \u-escapes it), so
+        // it must be pulled back onto a char boundary or the slice
+        // panics on an ordinary non-English page.
+        let start = ki + key.len();
+        let end = text.floor_char_boundary(text.len().min(start + 300));
+        let region = &text[start..end];
         let hay = if subkey.is_empty() {
             region
         } else {
@@ -130,8 +136,11 @@ fn decode_unicode_escapes(s: &str) -> String {
     while let Some(pos) = rest.find("\\u") {
         result.push_str(&rest[..pos]);
         rest = &rest[pos + 2..];
-        if rest.len() >= 4
-            && let Ok(code) = u32::from_str_radix(&rest[..4], 16)
+        // `get` (not a slice) : the 4 bytes after \u are only a
+        // valid str if they're ASCII hex, and a multibyte char in
+        // there would otherwise panic the slice.
+        if let Some(hex) = rest.get(..4)
+            && let Ok(code) = u32::from_str_radix(hex, 16)
             && let Some(ch) = char::from_u32(code)
         {
             result.push(ch);
@@ -143,4 +152,43 @@ fn decode_unicode_escapes(s: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // json_ld_find used to slice the ld+json text at a fixed +300
+    // BYTE offset after the key. Most CMSs emit raw UTF-8 in ld+json
+    // (only Wikipedia-style output \u-escapes it), so on an ordinary
+    // non-English page that offset lands inside a multibyte char
+    // about half the time -- a str-slice panic, which under this
+    // crate's panic = "abort" release profile takes the whole MCP
+    // daemon down on a plain fetch.
+    #[test]
+    fn json_ld_window_end_inside_multibyte_char_does_not_panic() {
+        // One ASCII byte then 3-byte chars: byte 300 after the key is
+        // never a char boundary (boundaries sit at 1 + 3k).
+        let pad: String = std::iter::once('x')
+            .chain(std::iter::repeat_n('年', 150))
+            .collect();
+        let html = format!(
+            r#"<html><head><script type="application/ld+json">{{"author"{pad},"name":"X"}}</script></head><body></body></html>"#
+        );
+        let doc = Html::parse_document(&html);
+        // Must not panic; the value is whatever the tolerant search
+        // finds (or nothing) -- the assertion is that we get here.
+        let _ = json_ld_find(&doc, "\"author\"", "\"name\"");
+        let _ = json_ld_find(&doc, "\"datePublished\"", "");
+    }
+
+    // decode_unicode_escapes sliced `rest[..4]` after every `\u`,
+    // which panics when a multibyte char sits inside those 4 bytes.
+    #[test]
+    fn unicode_escape_decoder_survives_multibyte_after_backslash_u() {
+        // rest = "aëüller": a(1) ë(2) ü(2) -> byte 4 is inside 'ü'.
+        assert_eq!(decode_unicode_escapes("Zo\\uaëüller"), "Zo\\uaëüller");
+        // Still decodes real escapes.
+        assert_eq!(decode_unicode_escapes("\\u7ef4\\u57fa"), "维基");
+    }
 }

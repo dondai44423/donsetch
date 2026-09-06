@@ -428,3 +428,22 @@ fn pdf_date_normalized() {
         );
     }
 }
+
+// pdf_date sliced `d[..8]` on the raw Info-dict string. A producer
+// writing a localized date (Japanese/Chinese-locale tools do) puts a
+// multibyte char inside the first 8 bytes -- a str-slice panic on a
+// producer-controlled field, which under panic = "abort" takes the
+// daemon down on a plain PDF fetch. No corpus file needed.
+#[test]
+fn pdf_date_non_ascii_does_not_panic() {
+    let raw = Some("D:202605年25日".to_string());
+    assert_eq!(
+        crate::pdf::pdf_date(&raw),
+        Some("D:202605年25日".to_string()),
+        "unparseable dates pass through verbatim"
+    );
+    assert_eq!(
+        crate::pdf::pdf_date(&Some("D:20260525080808+00'00'".to_string())),
+        Some("2026-05-25".to_string())
+    );
+}
