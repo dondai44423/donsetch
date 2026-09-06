@@ -730,15 +730,11 @@ impl Ghost {
             .stderr
             .take()
             .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
-        let mut lines = BufReader::new(stderr).lines();
-        let ws_url = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(i) = line.find("ws://") {
-                    return Some(line[i..].trim().to_string());
-                }
-            }
-            None
-        })
+        let mut reader = BufReader::new(stderr);
+        let ws_url = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            scan_for_ws_url(&mut reader),
+        )
         .await
         .map_err(|_| FetchError::ghost("devtools ws timeout"))?
         .ok_or_else(|| FetchError::ghost("no devtools ws line"))?;
@@ -1839,10 +1835,51 @@ fn b64decode(s: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Scan Chrome's stderr for the "DevTools listening on ws://…"
+/// endpoint line. Lossy per line : Chrome's pre-DevTools chatter
+/// can carry raw non-UTF-8 bytes (fontconfig/library paths on odd
+/// locales), and `Lines::next_line()` returns Err on those, which
+/// used to end the scan and fail the launch with a misleading
+/// "no devtools ws line" while Chrome was actually up. The ws line
+/// itself is pure ASCII, so lossy decoding can never corrupt it.
+async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<String> {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(i) = line.find("ws://") {
+            return Some(line[i..].trim().to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
     use crate::profile::BrowserProfile;
+
+    // Chrome's pre-DevTools stderr chatter can carry raw non-UTF-8
+    // bytes (fontconfig/library paths on odd locales). Lines::
+    // next_line() returns Err on such a line, and the old
+    // `while let Ok(Some(..))` scan treated that as end-of-stream:
+    // the launch failed with a misleading "no devtools ws line"
+    // while Chrome was actually up. Same bug class as the fixed MCP
+    // stdio loop (#148); this is the only reader of Chrome's stderr.
+    #[tokio::test]
+    async fn ws_scan_survives_non_utf8_stderr_lines() {
+        let wire: &[u8] = b"Fontconfig warning: \xff\xfe/bad/path\n\
+                            DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc\n";
+        let mut r = BufReader::new(wire);
+        assert_eq!(
+            scan_for_ws_url(&mut r).await.as_deref(),
+            Some("ws://127.0.0.1:9222/devtools/browser/abc"),
+            "a non-UTF-8 stderr line must not end the scan"
+        );
+    }
 
     #[test]
     fn default_args_do_not_contain_no_sandbox() {
