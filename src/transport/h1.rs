@@ -19,6 +19,9 @@ const MAX_BODY: usize = 64 << 20;
 /// trailer section. A server that never sends the CRLF must run
 /// into this, not into the allocator.
 const MAX_LINE: usize = 1 << 20;
+/// Cap on interim (1xx) responses skipped before the final one.
+/// Real servers send at most one or two (100 and/or 103).
+const MAX_INTERIM: usize = 8;
 
 /// Generic over any async stream : works for both TLS
 /// (`SslStream<TcpStream>`) and raw plaintext `TcpStream`
@@ -51,39 +54,68 @@ where
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
 
-    // Read until end of header block.
+    // Read header blocks until a FINAL status arrives. Interim (1xx)
+    // responses precede the real one on the same connection : 100
+    // Continue, and 103 Early Hints from CDNs (Cloudflare, Fastly)
+    // for any page with preload hints. An interim block carries no
+    // body and its headers are advisory : discard it and keep
+    // parsing. Taking the first status line as THE response handed
+    // callers a 103 with the real response bytes as an unframed
+    // "read to close" body.
     let mut buf: Vec<u8> = Vec::with_capacity(16384);
     let mut tmp = [0u8; 16384];
-    let header_end;
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(FetchError::Http("h1: eof before headers".into()));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find(&buf, b"\r\n\r\n") {
-            header_end = pos + 4;
-            break;
-        }
-        if buf.len() > MAX_LINE {
-            return Err(FetchError::Http("h1: header block too large".into()));
-        }
-    }
+    let mut interim = 0usize;
+    let (status, headers_out, header_end) = loop {
+        let header_end = loop {
+            if let Some(pos) = find(&buf, b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if buf.len() > MAX_LINE {
+                return Err(FetchError::Http("h1: header block too large".into()));
+            }
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(FetchError::Http("h1: eof before headers".into()));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        };
 
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = head.lines();
-    let status_line = lines.next().unwrap_or("");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| FetchError::Http(format!("h1: bad status line: {status_line}")))?;
-    let mut headers_out = Vec::new();
-    for line in lines {
-        if let Some((n, v)) = line.split_once(':') {
-            headers_out.push((n.trim().to_ascii_lowercase(), v.trim().to_string()));
+        let head = String::from_utf8_lossy(&buf[..header_end]);
+        let mut lines = head.lines();
+        let status_line = lines.next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| FetchError::Http(format!("h1: bad status line: {status_line}")))?;
+        if (100..200).contains(&status) {
+            // 101 means the server thinks it negotiated an upgrade
+            // this client never requested : the framing after it is
+            // not HTTP/1.1, bail instead of misparsing it.
+            if status == 101 {
+                return Err(FetchError::Http(
+                    "h1: unexpected 101 switching protocols (no upgrade requested)".into(),
+                ));
+            }
+            interim += 1;
+            // A server streaming 1xx forever must hit a counter,
+            // not the response timeout.
+            if interim > MAX_INTERIM {
+                return Err(FetchError::Http(format!(
+                    "h1: more than {MAX_INTERIM} interim responses"
+                )));
+            }
+            buf.drain(..header_end);
+            continue;
         }
-    }
+        let mut headers_out = Vec::new();
+        for line in lines {
+            if let Some((n, v)) = line.split_once(':') {
+                headers_out.push((n.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        break (status, headers_out, header_end);
+    };
 
     let mut body = buf[header_end..].to_vec();
     let is_chunked = headers_out
@@ -328,41 +360,74 @@ mod tests {
     async fn well_formed_chunked_body_decodes() {
         let wire = b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Sum: abc\r\n\r\n";
         let mut s = tokio::io::BufReader::new(&wire[..]);
-        // BufReader<&[u8]> is AsyncRead but not AsyncWrite; wrap in a
-        // tiny adapter that forwards reads and accepts writes.
-        struct RO<R>(R);
-        impl<R: AsyncRead + Unpin> AsyncRead for RO<R> {
-            fn poll_read(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.0).poll_read(cx, buf)
-            }
-        }
-        impl<R: Unpin> AsyncWrite for RO<R> {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                d: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                Poll::Ready(Ok(d.len()))
-            }
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_shutdown(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-        }
         let mut ro = RO(&mut s);
         let out = read_chunked(&mut ro, Vec::new()).await.expect("decode");
         assert_eq!(out, b"hello world");
+    }
+
+    /// Read-only stream adapter: forwards reads, accepts (discards)
+    /// writes. Lets a byte slice stand in for a server connection.
+    struct RO<R>(R);
+    impl<R: AsyncRead + Unpin> AsyncRead for RO<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+    impl<R: Unpin> AsyncWrite for RO<R> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            d: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(d.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // Interim responses (100 Continue, 103 Early Hints) precede the
+    // final response on the same connection : Cloudflare and Fastly
+    // send 103 for any page with preload hints. The parser took the
+    // first status line as THE response: callers got status 103, the
+    // hint headers, and (with no framing headers on a 103) a "read
+    // to close" body : the real response, raw, after a 30s hang on
+    // keep-alive connections.
+    #[tokio::test]
+    async fn interim_responses_are_skipped() {
+        let wire = b"HTTP/1.1 103 Early Hints\r\nlink: </s.css>; rel=preload\r\n\r\n\
+                     HTTP/1.1 100 Continue\r\n\r\n\
+                     HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
+        let mut s = RO(&wire[..]);
+        let resp = get(&mut s, "/", &[]).await.expect("fetch");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello");
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(n, v)| n == "content-length" && v == "5"),
+            "final headers, not the 103's: {:?}",
+            resp.headers
+        );
+    }
+
+    // A server streaming 1xx blocks forever must hit a counter, not
+    // spin until the response timeout.
+    #[tokio::test]
+    async fn endless_interim_responses_are_refused() {
+        let wire = b"HTTP/1.1 103 Early Hints\r\n\r\n".repeat(50);
+        let mut s = RO(&wire[..]);
+        let err = match get(&mut s, "/", &[]).await {
+            Ok(r) => panic!("must give up, got status {}", r.status),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("interim"), "{err}");
     }
 }
