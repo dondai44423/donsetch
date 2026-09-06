@@ -595,6 +595,53 @@ fn block_nested_list() {
     assert!(r.markdown.contains("Nested item"));
 }
 
+// The outer <li>'s inline render used to descend into the nested
+// <ul> as well, so every nested item appeared twice: fused into
+// its parent's line ("Has nested Nested item") and again as its
+// own indented bullet.
+#[test]
+fn block_nested_list_items_are_not_duplicated() {
+    let html = r#"<html><body><article>
+<p>Intro paragraph long enough to keep the article.</p>
+<ul>
+<li>Top level</li>
+<li>Has nested
+  <ul>
+    <li>Nested item</li>
+    <li>Second nested</li>
+  </ul>
+</li>
+<li>Last</li>
+</ul>
+</article></body></html>"#;
+    let r = extract_html(html);
+    let md = &r.markdown;
+    assert_eq!(md.matches("Nested item").count(), 1, "{md}");
+    assert_eq!(md.matches("Second nested").count(), 1, "{md}");
+    assert!(
+        md.contains("- Has nested\n  - Nested item\n  - Second nested\n- Last"),
+        "{md}"
+    );
+}
+
+// Past the indentation cap the nested list is flattened into its
+// parent's line (as before), never dropped; and text on either
+// side of a nested list keeps its word boundary.
+#[test]
+fn block_nested_list_deep_levels_and_trailing_text_survive() {
+    let html = r#"<html><body><article>
+<p>Intro paragraph long enough to keep the article.</p>
+<ul><li>L0<ul><li>L1<ul><li>L2<ul><li>L3<ul><li>L4<ul><li>L5 deep text<ul><li>L6 deeper</li></ul></li></ul></li></ul></li></ul></li></ul></li></ul></li>
+<li>Before<ul><li>Inner</li></ul>After text</li>
+</ul>
+</article></body></html>"#;
+    let r = extract_html(html);
+    let md = &r.markdown;
+    assert!(md.contains("        - L4 L5 deep text L6 deeper\n"), "{md}");
+    assert_eq!(md.matches("deep text").count(), 1, "{md}");
+    assert!(md.contains("- Before After text\n  - Inner\n"), "{md}");
+}
+
 #[test]
 fn block_definition_list() {
     let html = r#"<html><body><article>
