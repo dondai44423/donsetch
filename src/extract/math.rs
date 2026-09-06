@@ -28,6 +28,29 @@ fn is_mathml_tag(name: &str) -> bool {
             | "maction"
             | "menclose"
             | "mphantom"
+            // Layout/script tags: each has its own serialize_at arm,
+            // but the child-recursion guard consults this list too :
+            // missing entries made e.g. an msub inside an mtd (both
+            // absent) invisible, so matrix cells serialized empty.
+            | "mfrac"
+            | "msqrt"
+            | "mroot"
+            | "msub"
+            | "msup"
+            | "msubsup"
+            | "munder"
+            | "mover"
+            | "munderover"
+            | "mmultiscripts"
+            | "mprescripts"
+            | "none"
+            | "mtable"
+            | "mtr"
+            | "mlabeledtr"
+            | "mtd"
+            | "merror"
+            | "mfenced"
+            | "mglyph"
     )
 }
 
@@ -325,6 +348,21 @@ mod tests {
         );
         let l = latex(el);
         assert!(l.contains("(1, 2; 3, 4)"), "{l}");
+    }
+
+    // The child-recursion guard only follows a child when the child
+    // OR its parent is a known MathML tag : with the layout/script
+    // tags (mtd, mfrac, msub, ...) missing from the list, a scripted
+    // construct inside a table cell was invisible on both sides of
+    // the check and every such cell serialized empty.
+    #[test]
+    fn serializes_scripted_constructs_inside_matrix_cells() {
+        let el = math_el(
+            r#"<math><mtable><mtr><mtd><msub><mi>a</mi><mn>1</mn></msub></mtd><mtd><mfrac><mn>1</mn><mn>2</mn></mfrac></mtd></mtr></mtable></math>"#,
+        );
+        let l = latex(el);
+        assert!(l.contains("a_{1}"), "msub cell dropped: {l}");
+        assert!(l.contains("(1)/(2)"), "mfrac cell dropped: {l}");
     }
 
     #[test]
