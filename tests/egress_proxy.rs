@@ -246,3 +246,149 @@ async fn plaintext_http_through_env_proxy_uses_absolute_form() {
         "expected absolute-form GET, saw: {seen:?}"
     );
 }
+
+// The raw absolute-form hop has no CONNECT to carry credentials:
+// the request itself must send Proxy-Authorization, exactly like
+// curl does for plaintext http:// through an authenticated proxy.
+// Without it, every credentialed HTTP proxy (residential lanes are
+// essentially always credentialed) answers 407.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn plaintext_http_through_credentialed_proxy_sends_proxy_authorization() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let mitm = spawn_mitm().await;
+    // SAFETY: process-scoped, single-threaded with respect to env.
+    unsafe {
+        std::env::set_var("HTTP_PROXY", format!("http://u:p@{}", mitm.addr));
+        std::env::set_var("ALL_PROXY", format!("http://u:p@{}", mitm.addr));
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+    }
+
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+        donsetch::profile::Platform::Linux,
+    ))
+    .expect("fetcher builds");
+    let out = fetcher
+        .fetch("http://console.example/plain")
+        .await
+        .expect("plaintext through credentialed proxy");
+    assert_eq!(String::from_utf8_lossy(&out.body), "plain-http");
+    let seen = mitm.seen.lock().unwrap();
+    let head = seen
+        .iter()
+        .find(|h| h.starts_with("GET http://console.example/plain "))
+        .expect("absolute-form GET reached the proxy");
+    // base64("u:p") = "dTpw"
+    assert!(
+        head.to_lowercase()
+            .contains("proxy-authorization: basic dtpw"),
+        "credentialed hop must authenticate per-request, head was: {head}"
+    );
+}
+
+/// Minimal in-process SOCKS5 "proxy": accepts the no-auth handshake
+/// and then plays the ORIGIN itself (reads the HTTP head off the
+/// tunnel, records it, answers 200). What it records is exactly what
+/// the origin server would see arrive through a real tunnel.
+async fn spawn_socks5() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                continue;
+            };
+            let seen = seen2.clone();
+            tokio::spawn(async move {
+                // Greeting: VER NMETHODS METHODS... -> pick no-auth.
+                let mut hdr = [0u8; 2];
+                if tcp.read_exact(&mut hdr).await.is_err() || hdr[0] != 0x05 {
+                    return;
+                }
+                let mut methods = vec![0u8; hdr[1] as usize];
+                if tcp.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                if tcp.write_all(&[0x05, 0x00]).await.is_err() {
+                    return;
+                }
+                // CONNECT request: VER CMD RSV ATYP DST PORT.
+                let mut req = [0u8; 4];
+                if tcp.read_exact(&mut req).await.is_err() || req[3] != 0x03 {
+                    return;
+                }
+                let mut len = [0u8; 1];
+                if tcp.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let mut dst = vec![0u8; len[0] as usize + 2];
+                if tcp.read_exact(&mut dst).await.is_err() {
+                    return;
+                }
+                if tcp
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // Tunnel established: now be the origin.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match tcp.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                    if head.len() > 8192 {
+                        return;
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).to_string());
+                tcp.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsocks-plain",
+                )
+                .await
+                .ok();
+            });
+        }
+    });
+    (addr, seen)
+}
+
+// A SOCKS5 hop is a transparent tunnel to the ORIGIN: the request
+// line the origin sees must be origin-form ("GET /plain"), like
+// every browser sends. Absolute-form belongs only on the raw
+// HTTP-proxy hop; leaking it through the tunnel is a fingerprint
+// (and picky origins/CDNs reject it).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn plaintext_http_through_socks5_uses_origin_form() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let (addr, seen) = spawn_socks5().await;
+    // SAFETY: process-scoped, single-threaded with respect to env.
+    unsafe {
+        std::env::set_var("HTTP_PROXY", format!("socks5://{addr}"));
+        std::env::set_var("ALL_PROXY", format!("socks5://{addr}"));
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+    }
+
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(
+        donsetch::profile::Platform::Linux,
+    ))
+    .expect("fetcher builds");
+    let out = fetcher
+        .fetch("http://console.example/plain")
+        .await
+        .expect("plaintext through socks5");
+    assert_eq!(String::from_utf8_lossy(&out.body), "socks-plain");
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter().any(|h| h.starts_with("GET /plain ")),
+        "origin-form GET expected through the tunnel, saw: {seen:?}"
+    );
+}
