@@ -177,6 +177,20 @@ impl Proxy {
         Ok(stream)
     }
 
+    /// `Proxy-Authorization` value for this proxy, if credentialed.
+    /// CONNECT tunnels and SOCKS5 authenticate in-protocol, but the
+    /// raw absolute-form plaintext hop has no tunnel setup to carry
+    /// credentials : each request must send this header itself.
+    pub fn proxy_authorization(&self) -> Option<String> {
+        if self.user.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Basic {}",
+            base64(&format!("{}:{}", self.user, self.pass))
+        ))
+    }
+
     // ── HTTP CONNECT (RFC 7231 §4.3.6) ──
 
     async fn http_connect(
@@ -185,20 +199,18 @@ impl Proxy {
         target_host: &str,
         target_port: u16,
     ) -> Result<(), FetchError> {
-        let req = if self.user.is_empty() {
-            format!(
+        let req = match self.proxy_authorization() {
+            None => format!(
                 "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
                  Host: {target_host}:{target_port}\r\n\
                  Proxy-Connection: keep-alive\r\n\r\n"
-            )
-        } else {
-            let auth = base64(&format!("{}:{}", self.user, self.pass));
-            format!(
+            ),
+            Some(auth) => format!(
                 "CONNECT {target_host}:{target_port} HTTP/1.1\r\n\
                  Host: {target_host}:{target_port}\r\n\
-                 Proxy-Authorization: Basic {auth}\r\n\
+                 Proxy-Authorization: {auth}\r\n\
                  Proxy-Connection: keep-alive\r\n\r\n"
-            )
+            ),
         };
         tokio::time::timeout(PROXY_TIMEOUT, stream.write_all(req.as_bytes()))
             .await

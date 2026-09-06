@@ -557,13 +557,32 @@ impl Fetcher {
         // no session resumption, no ALPN.
         if !is_https {
             let mut stream = tcp;
-            // Proxied plaintext http:// uses absolute-form request
-            // targets (RFC 9112 3.2.2): the proxy needs the full
-            // origin in the request line to route it.
-            let target = if proxy.is_some() {
+            // Plaintext http:// through a raw HTTP-proxy hop uses
+            // absolute-form request targets (RFC 9112 3.2.2): the
+            // proxy needs the full origin in the request line to
+            // route it. ONLY that hop : a SOCKS5 tunnel is
+            // transparent, so the ORIGIN reads this line, and no
+            // browser sends an origin absolute-form (fingerprint;
+            // same condition as the dial above).
+            let raw_http_proxy = proxy.filter(|p| p.is_http_connect());
+            let target = if raw_http_proxy.is_some() {
                 url_of("http", authority, path)
             } else {
                 path.to_string()
+            };
+            // The raw hop has no CONNECT to carry credentials : a
+            // credentialed proxy needs Proxy-Authorization on the
+            // request itself (consumed by the proxy, never
+            // forwarded to the origin).
+            let with_auth: Vec<(String, String)>;
+            let req_headers = match raw_http_proxy.and_then(|p| p.proxy_authorization()) {
+                Some(auth) => {
+                    let mut h = req_headers.to_vec();
+                    h.push(("proxy-authorization".to_string(), auth));
+                    with_auth = h;
+                    &with_auth[..]
+                }
+                None => req_headers,
             };
             let resp =
                 tokio::time::timeout(RESPONSE_TIMEOUT, h1::get(&mut stream, &target, req_headers))
