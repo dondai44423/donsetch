@@ -4289,19 +4289,21 @@ fn verdict_kind(v: Verdict, status: u16) -> &'static str {
 fn fetch_error_kind(e: &FetchError) -> &'static str {
     match e {
         FetchError::Timeout | FetchError::Io(_) => "transient",
+        // Match on the classifier's own leading sentences, never on
+        // hint text : "SSL_CERT_FILE" appears in BOTH hints, and
+        // with it in the verify arm (checked first) every egress
+        // failure classified as tls.verify; the egress arm was dead.
         FetchError::Tls(msg)
-            if msg.contains("certificate verification failed")
-                || msg.contains("trusted root")
-                || msg.contains("SSL_CERT_FILE") =>
-        {
-            "tls.verify"
-        }
-        FetchError::Tls(msg)
-            if msg.contains("egress path")
-                || msg.contains("TLS handshake aborted")
-                || msg.contains("cut short") =>
+            if msg.starts_with("TLS handshake aborted")
+                || msg.starts_with("TLS handshake cut short") =>
         {
             "tls.egress"
+        }
+        FetchError::Tls(msg)
+            if msg.starts_with("TLS certificate verification failed")
+                || msg.contains("trusted root") =>
+        {
+            "tls.verify"
         }
         _ => "permanent",
     }
@@ -4310,6 +4312,48 @@ fn fetch_error_kind(e: &FetchError) -> &'static str {
 #[cfg(test)]
 mod stitch_tests {
     use super::*;
+
+    // fetch_error_kind's tls.verify arm matched on "SSL_CERT_FILE" :
+    // text that also appears in the egress hint appended to every
+    // aborted/cut-short handshake message, so ALL egress failures
+    // classified as tls.verify and the tls.egress arm was dead code
+    // (wrong next_action: "export SSL_CERT_FILE" instead of the
+    // proxy-routing hint the interception fix exists to give).
+    // Classify against the REAL classifier output, not hand-written
+    // strings, so the two files cannot drift apart again.
+    #[test]
+    fn tls_error_kinds_match_the_real_classifier_output() {
+        #[derive(Debug)]
+        struct E(&'static str);
+        impl std::fmt::Display for E {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for E {}
+        let classified = |raw: &'static str| {
+            FetchError::Tls(crate::transport::tls::classify_handshake_error(&E(raw)))
+        };
+        // Middlebox kills the handshake: reset / early EOF.
+        assert_eq!(
+            fetch_error_kind(&classified("connection reset by peer")),
+            "tls.egress"
+        );
+        assert_eq!(
+            fetch_error_kind(&classified("unexpected EOF during handshake")),
+            "tls.egress"
+        );
+        // Re-signed cert from an untrusted interception CA.
+        assert_eq!(
+            fetch_error_kind(&classified("certificate verify failed: unknown ca")),
+            "tls.verify"
+        );
+        // Unclassified boring text stays permanent.
+        assert_eq!(
+            fetch_error_kind(&classified("some exotic library error")),
+            "permanent"
+        );
+    }
 
     // search_error used to hardcode errorKind: "transient" for every
     // failure, including validate_query rejections (empty/oversized
