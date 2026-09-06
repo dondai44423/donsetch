@@ -169,10 +169,10 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                     &mut last_path,
                     &mut last_was_heading,
                 );
+                let fence = code_fence(code);
                 out.push_str(&format!(
-                    "```{}\n{}\n```\n\n",
-                    lang.as_deref().unwrap_or(""),
-                    code
+                    "{fence}{}\n{code}\n{fence}\n\n",
+                    lang.as_deref().unwrap_or("")
                 ));
             }
             Block::Quote { md, .. } => {
@@ -241,4 +241,39 @@ fn emit_path(
     }
     *last_path = path.to_vec();
     *last_was_heading = true;
+}
+
+/// Fence for a code block: one backtick longer than the longest
+/// backtick run inside it (min 3). A `<pre>` that itself shows a
+/// markdown fence -- every "how to write markdown" page, every
+/// README rendered by a docs site -- would otherwise close the
+/// block at its inner ``` and spill the rest as prose.
+pub(crate) fn code_fence(code: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in code.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::code_fence;
+
+    #[test]
+    fn fence_is_one_longer_than_the_longest_backtick_run() {
+        assert_eq!(code_fence("fn main() {}"), "```");
+        assert_eq!(code_fence("a `b` c"), "```");
+        assert_eq!(code_fence("a ``b`` c"), "```");
+        assert_eq!(code_fence("```rust\nx\n```"), "````");
+        assert_eq!(code_fence("x\n````\ny"), "`````");
+        assert_eq!(code_fence("`````\n"), "``````");
+        assert_eq!(code_fence(""), "```");
+    }
 }
