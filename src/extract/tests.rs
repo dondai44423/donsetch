@@ -2097,6 +2097,61 @@ fn must_contain_probe_applies_to_plain_text_passthrough() {
     assert!(out.markdown.len() < 400, "len {}", out.markdown.len());
 }
 
+// Hits were BYTE offsets (regex m.start(), or offsets into a
+// separately lowercased haystack), but context_around treated them
+// as CHAR indices. On any page with non-ASCII text before the match
+// the excerpt window landed after the real hit -- "MATCH: 1 hit"
+// followed by an excerpt that doesn't contain the pattern.
+fn probe_excerpt(text: &str, pattern: &str) -> String {
+    let opts = ExtractOptions {
+        must_contain: Some(pattern.into()),
+        ..Default::default()
+    };
+    let out = probe_render(text, opts.probe_pattern(), opts.probe_is_regex());
+    assert!(out.starts_with("probe: MATCH"), "{out}");
+    out.lines()
+        .find(|l| l.starts_with("[1]"))
+        .unwrap_or_else(|| panic!("no excerpt line:\n{out}"))
+        .to_string()
+}
+
+#[test]
+fn probe_excerpt_points_at_the_hit_on_non_ascii_pages() {
+    let prefix = "Асинхронная среда выполнения для языка Rust. ".repeat(6);
+    let text = format!("{prefix}The tokio runtime schedules tasks. {prefix}");
+    let sub = probe_excerpt(&text, "tokio runtime");
+    assert!(sub.contains("tokio runtime"), "substring excerpt: {sub}");
+    let re = probe_excerpt(&text, "/tokio\\s+runtime/");
+    assert!(re.contains("tokio runtime"), "regex excerpt: {re}");
+}
+
+#[test]
+fn probe_excerpt_survives_case_folding_that_changes_byte_length() {
+    // 'İ' (2 bytes) lowercases to "i̇" (3 bytes): the old lowercased
+    // haystack drifted further from the real text with every one.
+    let prefix = "İSTANBUL İZMİR İÇEL ".repeat(40);
+    let text = format!("{prefix}Needle here. {prefix}");
+    let sub = probe_excerpt(&text, "needle");
+    assert!(sub.contains("Needle"), "excerpt: {sub}");
+}
+
+// A multi-KB substring pattern expands past the regex size limit
+// under (?i); it must still be searched as a literal, not reported
+// as an "invalid regex".
+#[test]
+fn probe_substring_longer_than_the_regex_size_limit_still_matches() {
+    let needle = "проверка ".repeat(800); // ~14 KB, Cyrillic
+    let text = format!("intro {needle} outro");
+    let out = probe_render(&text, needle.trim_end(), false);
+    assert!(
+        out.starts_with("probe: MATCH : 1 hit"),
+        "{}",
+        &out[..out.len().min(120)]
+    );
+    let miss = probe_render("nothing here", needle.trim_end(), false);
+    assert!(miss.starts_with("probe: NO MATCH"), "{miss}");
+}
+
 /// Issue #49: links and formatting nested inside em/strong were
 /// flattened away by `plain()`. Nested inline markup must survive:
 /// `<em>A <strong><a>B</a></strong> C</em>` → `*A **[B](url)** C*`.
