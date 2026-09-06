@@ -82,12 +82,29 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let mut body = String::new();
     let block_sel = Selector::parse("h1, h2, h3, h4, p, ul, ol, pre, table, blockquote").unwrap();
     for el in root.select(&block_sel) {
+        // Descendant select: a <p> inside a <li> or <blockquote>,
+        // a nested <ul>, would be emitted as part of its parent
+        // AND again on its own. Outermost matches only.
+        let nested = el
+            .ancestors()
+            .take_while(|a| a.id() != root.id())
+            .filter_map(ElementRef::wrap)
+            .any(|a| block_sel.matches(&a));
+        if nested {
+            continue;
+        }
         match el.value().name() {
             "h1" | "h2" | "h3" | "h4" => {
                 let t = text_of(el);
                 if !t.is_empty() {
                     let level = el.value().name().as_bytes()[1] - b'0';
                     body.push_str(&format!("{} {}\n\n", "#".repeat(level as usize), t));
+                }
+            }
+            "ul" | "ol" => {
+                let (items, _) = crate::extract::blocks::list_items(el, url, &body_opts, 0);
+                if !items.is_empty() {
+                    crate::extract::render::push_list(&mut body, &items, el.value().name() == "ol");
                 }
             }
             _ => {
@@ -262,5 +279,27 @@ mod tests {
           <body><nav><a class="md-nav__link" href="/a/">A</a><a class="md-nav__link" href="/b/">B</a></nav>
           <main><p>hi</p></main></body></html>"#;
         assert!(extract(thin, "https://docs.example.com/", &opts()).is_none());
+    }
+
+    // The block selector matched descendants, so a <p> inside a
+    // <li> or <blockquote>, and a nested <ul>, were emitted once
+    // as part of their parent and again on their own.
+    #[test]
+    fn nested_blocks_are_emitted_once() {
+        let html = MKDOCS.replace(
+            "<pre>code sample</pre>",
+            "<ul><li><p>Step one</p><ul><li>Detail a</li></ul></li><li>Step two</li></ul>\
+             <blockquote><p>Quoted note</p></blockquote>\
+             <pre>code sample</pre>",
+        );
+        let ex = extract(&html, "https://docs.example.com/guide/", &opts()).unwrap();
+        let md = &ex.markdown;
+        assert_eq!(md.matches("Step one").count(), 1, "{md}");
+        assert_eq!(md.matches("Detail a").count(), 1, "{md}");
+        assert_eq!(md.matches("Quoted note").count(), 1, "{md}");
+        assert!(
+            md.contains("- Step one\n  - Detail a\n- Step two\n"),
+            "{md}"
+        );
     }
 }

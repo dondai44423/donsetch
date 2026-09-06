@@ -8,10 +8,34 @@ const MAX_DEPTH: usize = 100;
 /// Render an element's inline content as markdown.
 /// Returns (markdown, link_density 0..1).
 pub fn markdown(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (String, f32) {
+    markdown_impl(el, base, opts, false)
+}
+
+/// `markdown` for a list item: its own content only. Nested
+/// `<ul>`/`<ol>` children are the caller's (rendered as indented
+/// items), not flattened into this item's line -- which had every
+/// nested item appearing twice, fused into its parent and again
+/// on its own line.
+pub fn item_markdown(
+    li: ElementRef<'_>,
+    base: &str,
+    opts: &super::ExtractOptions,
+) -> (String, f32) {
+    markdown_impl(li, base, opts, true)
+}
+
+fn markdown_impl(
+    el: ElementRef<'_>,
+    base: &str,
+    opts: &super::ExtractOptions,
+    skip_lists: bool,
+) -> (String, f32) {
     let mut buf = String::new();
     let mut total = 0usize;
     let mut link = 0usize;
-    render(el, base, opts, &mut buf, &mut total, &mut link, 0);
+    render(
+        el, base, opts, &mut buf, &mut total, &mut link, 0, skip_lists,
+    );
     let collapsed = collapse(&buf);
     // Restore <br> sentinels as newlines after whitespace collapse.
     let collapsed = collapsed.replace('\u{0}', "\n");
@@ -35,6 +59,7 @@ pub fn plain(el: ElementRef<'_>) -> String {
     collapse(&buf)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     el: ElementRef<'_>,
     base: &str,
@@ -43,6 +68,7 @@ fn render(
     total: &mut usize,
     link: &mut usize,
     depth: usize,
+    skip_lists: bool,
 ) {
     if depth > MAX_DEPTH {
         return;
@@ -61,6 +87,14 @@ fn render(
                     continue;
                 };
                 let name = c.value().name();
+                if skip_lists && matches!(name, "ul" | "ol") {
+                    // Block boundary: text before and after the
+                    // nested list must not fuse ("BeforeAfter").
+                    if !buf.is_empty() && !buf.ends_with(' ') {
+                        buf.push(' ');
+                    }
+                    continue;
+                }
                 match name {
                     "a" => {
                         // Render children recursively so nested
@@ -148,13 +182,13 @@ fn render(
                         if !buf.is_empty() && !buf.ends_with(' ') {
                             buf.push(' ');
                         }
-                        render(c, base, opts, buf, total, link, depth + 1);
+                        render(c, base, opts, buf, total, link, depth + 1, false);
                     }
                     _ => {
                         if crate::extract::junk::skip(c) {
                             continue;
                         }
-                        render(c, base, opts, buf, total, link, depth + 1);
+                        render(c, base, opts, buf, total, link, depth + 1, false);
                     }
                 }
             }
@@ -175,7 +209,16 @@ impl RenderInner {
         let mut t = String::new();
         let mut total = 0usize;
         let mut link = 0usize;
-        render(c, base, opts, &mut t, &mut total, &mut link, depth + 1);
+        render(
+            c,
+            base,
+            opts,
+            &mut t,
+            &mut total,
+            &mut link,
+            depth + 1,
+            false,
+        );
         t
     }
 }

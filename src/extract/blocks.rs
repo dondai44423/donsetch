@@ -428,7 +428,11 @@ fn contains_block(el: ElementRef<'_>) -> bool {
     false
 }
 
-fn list_items(
+/// Items of a `<ul>`/`<ol>`, nested lists flattened to indented
+/// entries ("  " per level, up to 4 deep). Shared with the docs
+/// and Wikipedia adapters so nested lists render the same way
+/// everywhere.
+pub(crate) fn list_items(
     list: ElementRef<'_>,
     base: &str,
     opts: &super::ExtractOptions,
@@ -444,7 +448,15 @@ fn list_items(
         if li.value().name() != "li" || crate::extract::junk::skip(li) {
             continue;
         }
-        let (md, ld) = inline::markdown(li, base, opts);
+        // Below the cap the nested lists are rendered as indented
+        // items (so the item's own line must not include them); at
+        // the cap they are flattened into the line instead, never
+        // dropped.
+        let (md, ld) = if depth < 4 {
+            inline::item_markdown(li, base, opts)
+        } else {
+            inline::markdown(li, base, opts)
+        };
         let md = md.trim().to_string();
         if !md.is_empty() {
             items.push(format!("{}{}", "  ".repeat(depth as usize), md));
