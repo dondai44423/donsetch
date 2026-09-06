@@ -5,10 +5,16 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.6.4] - 2026-09-05
 
 ### Fixed
 
+- **News freshness treated future-dated items as stale:** a negative
+  days-since count fell through every freshness arm to the stale 0.85
+  weight, and the freshness test used hardcoded dates that would rot.
+  A future date is a skewed clock and deserves the freshest weight;
+  the test now walks the tier boundaries relative to today.
+  Credit: mnaza (#143).
 - **Char-boundary slice panics (panic=abort means daemon death):** the JSON-LD metadata search, the `\u` escape decoder, PDF date parsing, `doctor`'s key masking, and the Xvfb stderr-diagnostic path all sliced/truncated at raw byte positions, which panics inside a multibyte character on any non-ASCII input. All cuts now pull back onto `floor_char_boundary` or go char-based. Credit: mnaza (#133, #141).
 - **BYOK transport errors leaked the request URL, SerpApi keys included:** a failed DNS/refused/TLS call rendered the full `reqwest` error, which for SerpApi embeds the key in the query string, into the model-visible `last_error`, CLI stderr and debug log. All ten providers now go through one `from_transport` mapping that uses `without_url()`, with a test proving the key is gone. Credit: mnaza (#134).
 - **`keys export`/`proxy export` wrote credentials world-readable:** files were created at the umask default (0644) and tightened only afterwards, with the chmod failure silently ignored. New `write_private` opens owner-only (0600) from the moment the file exists and re-tightens an existing file. Credit: mnaza (#139).
