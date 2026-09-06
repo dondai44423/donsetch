@@ -271,6 +271,24 @@ impl ResumeFile {
     }
 }
 
+/// Tier-2 (real browser) escalations allowed per crawl: each one is
+/// a 20-40s headless-browser cycle, so the cap is the crawl's cost
+/// ceiling, not a tuning knob.
+const GHOST_BUDGET: usize = 3;
+
+/// Claim one ghost escalation from the shared budget. Atomic
+/// check-and-decrement: workers used to `load() > 0` then
+/// `fetch_sub(1)` as two steps, so two workers seeing budget == 1
+/// both passed the check, the second `fetch_sub` wrapped the counter
+/// to `usize::MAX`, and every later check passed for the rest of the
+/// crawl -- the cost cap gone. Only reachable with `concurrency > 1`
+/// (the default is 1), but that is a public `CrawlOptions` field.
+fn claim_ghost_slot(budget: &AtomicUsize) -> bool {
+    budget
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
 pub struct Crawler {
     fetch: PageFetcher,
     governor: Arc<Governor>,
@@ -534,7 +552,7 @@ impl Crawler {
         let focus = Arc::new(opts.focus.clone());
 
         let workers = opts.concurrency.max(1);
-        let ghost_budget = Arc::new(AtomicUsize::new(3));
+        let ghost_budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
         let mut handles = Vec::new();
         for wid in 0..workers {
             let queue = Arc::clone(&sh_queue);
@@ -826,10 +844,7 @@ impl Crawler {
                         && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25)
-                            && ghost_budget.load(Ordering::SeqCst) > 0
-                        {
-                            ghost_budget.fetch_sub(1, Ordering::SeqCst);
+                        if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
                             match ghost_hook(item.url.clone()).await {
                                 Ok(gp) => ghost_html = Some(gp.html),
                                 Err(why) => {
@@ -992,10 +1007,7 @@ impl Crawler {
                         && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25)
-                            && ghost_budget.load(Ordering::SeqCst) > 0
-                        {
-                            ghost_budget.fetch_sub(1, Ordering::SeqCst);
+                        if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
                             match ghost_hook(item.url.clone()).await {
                                 Ok(gp) => {
                                     if let Ok(r2) = extract::extract(
