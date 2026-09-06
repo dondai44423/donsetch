@@ -45,13 +45,7 @@ pub async fn search(
         .timeout(TIMEOUT)
         .send()
         .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                KeyError::NetworkError
-            } else {
-                KeyError::UnknownError(format!("network: {e}"))
-            }
-        })?;
+        .map_err(KeyError::from_transport)?;
 
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();

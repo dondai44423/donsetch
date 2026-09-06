@@ -89,6 +89,24 @@ impl KeyError {
             Self::ServerError(_) | Self::NetworkError | Self::UnknownError(_) => None,
         }
     }
+
+    /// The one place a transport failure becomes a KeyError.
+    ///
+    /// `reqwest::Error`'s Display includes the full request URL,
+    /// query string and all. SerpApi's API takes the key as
+    /// `?api_key=`, so rendering that error verbatim put the whole
+    /// key into `last_error`, and from there into the MCP search
+    /// error the model sees, the CLI's stderr and the DONSEEK_DEBUG
+    /// log on any non-timeout transport failure (DNS, refused, TLS).
+    /// The URL adds nothing here anyway: the provider name is
+    /// prepended by the caller and the endpoint is a constant.
+    pub(crate) fn from_transport(e: reqwest::Error) -> Self {
+        if e.is_timeout() {
+            Self::NetworkError
+        } else {
+            Self::UnknownError(format!("network: {}", e.without_url()))
+        }
+    }
 }
 
 impl std::fmt::Display for KeyError {
@@ -377,6 +395,37 @@ mod tests {
         assert_eq!(KeyError::ServerError("500".into()).to_key_state(), None);
         assert_eq!(KeyError::NetworkError.to_key_state(), None);
         assert_eq!(KeyError::UnknownError("x".into()).to_key_state(), None);
+    }
+
+    // A real transport error from a refused loopback connect, with the
+    // key where SerpApi's API puts it (the query string). The raw
+    // reqwest error renders the full URL, so this is exactly the path
+    // that used to put the key into the model-visible search error.
+    #[tokio::test]
+    async fn transport_errors_never_carry_the_request_url() {
+        const KEY: &str = "SUPERSECRETKEY123";
+        // no_proxy: a reachable HTTP_PROXY in the environment would
+        // turn the refused connect into a 502 *response*.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let err = client
+            .get("http://127.0.0.1:1/search")
+            .query(&[("q", "hello"), ("api_key", KEY)])
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(!err.is_timeout(), "connection refused, not a timeout");
+        // Sanity: the unredacted error really does carry the key,
+        // otherwise this test proves nothing.
+        assert!(err.to_string().contains(KEY));
+        let mapped = KeyError::from_transport(err);
+        assert!(
+            !mapped.to_string().contains(KEY),
+            "key leaked into KeyError: {mapped}"
+        );
+        assert!(matches!(mapped, KeyError::UnknownError(_)));
     }
 
     #[test]
