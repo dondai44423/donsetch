@@ -13,6 +13,13 @@
 #   just bin      build target/ci/donsetch (for live smokes)
 #   just smoke    bin + doctor + fetch/search/bypass smoke
 #   just fuzz extract    30s fuzz burst on one target
+#   just clean-bloat     drop profiles the loop never uses + fuzz cache
+
+# Cargo never GCs stale artifacts: debug/release/fuzz caches grow
+# without bound across dep bumps (110G caught; ~99G was bloat). This
+# clears everything except the warm `ci` loop profile.
+clean-bloat:
+	rm -rf target/debug target/release fuzz/target
 
 # Pre-push gate: everything CI will flag.
 all: fmt-check lint test

@@ -5,6 +5,20 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Char-boundary slice panics (panic=abort means daemon death):** the JSON-LD metadata search, the `\u` escape decoder, PDF date parsing, `doctor`'s key masking, and the Xvfb stderr-diagnostic path all sliced/truncated at raw byte positions, which panics inside a multibyte character on any non-ASCII input. All cuts now pull back onto `floor_char_boundary` or go char-based. Credit: mnaza (#133, #141).
+- **BYOK transport errors leaked the request URL, SerpApi keys included:** a failed DNS/refused/TLS call rendered the full `reqwest` error, which for SerpApi embeds the key in the query string, into the model-visible `last_error`, CLI stderr and debug log. All ten providers now go through one `from_transport` mapping that uses `without_url()`, with a test proving the key is gone. Credit: mnaza (#134).
+- **`keys export`/`proxy export` wrote credentials world-readable:** files were created at the umask default (0644) and tightened only afterwards, with the chmod failure silently ignored. New `write_private` opens owner-only (0600) from the moment the file exists and re-tightens an existing file. Credit: mnaza (#139).
+- **Self-update left a stale `libonnxruntime.so` beside new binaries:** `-u` swapped only the binary, so Linux self-updaters kept the old runtime (e.g. one needing GLIBC_2.38) and OCR/rerank stayed dead while `doctor`'s presence check said fine. The update now stages, backs up and atomically swaps sibling runtime libs, and `--rollback` pairs the previous binary with its previous lib. Credit: mnaza (#136).
+- **`--rollback` could destroy the previous version:** the current binary was copied over `.bak` before the final atomic rename, so a rename failure (sticky-bit dir, immutable file) discarded the only copy of the version being rolled back to; the Windows path also returned exit 0 when its copy failed. The swap now stages everything first and keeps `.bak` untouched until the rename has succeeded. Credit: mnaza (#137).
+- **`must_contain`/regex probe excerpts missed the match on non-ASCII pages:** the substring path searched a separately lowercased copy (offsets drift when case folding changes byte lengths) and both paths fed byte offsets into a char-indexed window, so on any page with non-ASCII text before the hit the excerpt landed past it. Everything now goes through one case-insensitive regex with a byte-window literal fallback. Credit: mnaza (#140).
+- **Data tables lost their row labels:** `<th scope="row">` cells were collected per-row from a `<td>`-only select, so every label vanished and the remaining cells shifted one column left. One select over `th, td` in document order keeps the column alignment. Credit: mnaza (#135).
+- **Proxy passwords containing `@` broke parsing:** auth split at the first `@`, so `p@ss` became user `alice`, host `p`. The address cannot contain `@`, so splitting at the last one is the only correct point. Credit: mnaza (#138).
+- **Ghost escalation budget could wrap to `usize::MAX` under concurrent workers:** a load-then-decrement race let two workers both pass the budget check, wrapping the counter and deleting the crawl's cost ceiling. `fetch_update` makes the decrement atomic. Credit: mnaza (#142).
+
 ## [3.6.3] - 2026-09-05
 
 ### Added
