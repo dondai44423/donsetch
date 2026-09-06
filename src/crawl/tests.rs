@@ -1112,3 +1112,51 @@ async fn seed_always_in_scope_with_include() {
         "seed should not be marked out of scope"
     );
 }
+
+// ────────────────────────────────────────────────────────────────
+// Lowercase-drift proofs: offset slices on non-ASCII pages
+// ────────────────────────────────────────────────────────────────
+// The link extractors lowercase the WHOLE document to case-fold the
+// tag names, then slice the ORIGINAL at offsets found in the copy.
+// Case folding changes byte lengths ('İ' U+0130 = 2 bytes -> "i̇"
+// = 3 bytes), so every offset after a folding char drifts. These
+// tests prove the failure; the fix searches the original with an
+// ASCII case-insensitive byte scan (ASCII folding is length-stable).
+
+#[test]
+fn link_rel_panics_on_folding_char_before_the_tag_scan() {
+    // 'İ' (2 bytes) lowercases to "i̇" (3 bytes). With İ INSIDE the
+    // tag and a multibyte char right after '>', the old code's
+    // lowered-copy offsets slice one byte into that char: a
+    // str-slice panic, abort in release. Pre-fix: this panicked.
+    let html = "<html><head><link rel=\"alternate\" title=\"İstanbul\" \
+                type=\"application/rss+xml\" href=\"/feed.xml\">內容</head></html>";
+    let got = std::panic::catch_unwind(|| super::extract_feed_links(html));
+    let links = got.expect("extract_feed_links panicked on a folding char");
+    assert_eq!(links, vec!["/feed.xml"]);
+}
+
+#[test]
+fn feed_xml_folding_char_dropped_links_old_math() {
+    // RSS with a folding char in the channel title before each item
+    // and inside one URL: the old offset math shifted every slice
+    // by one byte, so the URLs read as "ttps://..." and were
+    // silently dropped (both), instead of returned. Pre-fix: the
+    // assertion on the URL list failed.
+    let xml = "<rss><channel><title>İstanbul</title>\
+               <item><link>https://example.com/f/1</link></item>\
+               <item><link>https://example.com/f/İtem</link></item>\
+               </channel></rss>";
+    let got = std::panic::catch_unwind(|| super::parse_feed_urls(xml, 10));
+    let urls = got.expect("parse_feed_urls panicked");
+    assert_eq!(
+        urls,
+        vec!["https://example.com/f/1", "https://example.com/f/İtem"]
+    );
+    // Atom shape too: 'İ' inside the entry title before <link href>.
+    let atom = "<feed><entry><title>İstanbul</title>\
+                <link href=\"https://example.com/a/İtem\" rel=\"alternate\"/></entry></feed>";
+    let got = std::panic::catch_unwind(|| super::parse_feed_urls(atom, 10));
+    let urls = got.expect("atom parse panicked");
+    assert_eq!(urls, vec!["https://example.com/a/İtem"]);
+}

@@ -1545,6 +1545,27 @@ impl Crawler {
     }
 }
 
+/// Case-insensitive ASCII byte search. Every pattern this file
+/// scans for is ASCII (<tag, rel="...", href...), and ASCII case
+/// folding never changes byte lengths, so a match start is always
+/// a char boundary of the ORIGINAL string (ASCII bytes cannot
+/// occur inside a multi-byte UTF-8 sequence). This replaces the
+/// old whole-document `to_lowercase()` scan: Unicode folding is
+/// NOT length-stable ('İ' == 2 bytes lowercases to "i̇" == 3), so
+/// offsets measured on the lowered copy drifted when applied to
+/// the original and sliced mid-character or past the end.
+fn find_ascii_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || from >= h.len() || n.len() > h.len().saturating_sub(from) {
+        return None;
+    }
+    h[from..]
+        .windows(n.len())
+        .position(|w| w.eq_ignore_ascii_case(n))
+        .map(|p| from + p)
+}
+
 /// Extract `<link rel="canonical" href="...">` from HTML.
 /// Byte-scan, no DOM parse. Handles both attribute orders
 /// (`rel` before `href` and `href` before `rel`).
@@ -1555,25 +1576,25 @@ fn extract_canonical(html: &str) -> Option<String> {
 /// Extract all href values from `<link>` tags with a given `rel`
 /// attribute value. Byte-scan, no DOM parse.
 fn extract_link_rel(html: &str, rel: &str) -> Vec<String> {
-    let lower = html.to_lowercase();
-    let rel_pat = format!("rel=\"{rel}\"");
+    let rel_pat1 = format!("rel=\"{rel}\"");
     let rel_pat2 = format!("rel='{rel}'");
     let rel_pat3 = format!("rel={rel}");
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while let Some(link_start) = lower[pos..].find("<link") {
-        let abs = pos + link_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<link", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !(tag.contains(&rel_pat) || tag.contains(&rel_pat2) || tag.contains(&rel_pat3)) {
+        if !(find_ascii_ci(tag, &rel_pat1, 0).is_some()
+            || find_ascii_ci(tag, &rel_pat2, 0).is_some()
+            || find_ascii_ci(tag, &rel_pat3, 0).is_some())
+        {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        if let Some(href) = extract_href(orig_tag) {
+        if let Some(href) = extract_href(tag) {
             out.push(href);
         }
     }
@@ -1582,21 +1603,18 @@ fn extract_link_rel(html: &str, rel: &str) -> Vec<String> {
 
 /// Extract `<base href="...">` from HTML. First one wins.
 fn extract_base_href(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
     let mut pos = 0usize;
-    while let Some(base_start) = lower[pos..].find("<base") {
-        let abs = pos + base_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<base", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !tag.contains("href") {
+        if find_ascii_ci(tag, "href", 0).is_none() {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        return extract_href(orig_tag);
+        return extract_href(tag);
     }
     None
 }
@@ -1605,28 +1623,27 @@ fn extract_base_href(html: &str) -> Option<String> {
 /// `<link rel="alternate" type="application/rss+xml" href="...">`
 /// or `type="application/atom+xml"`.
 fn extract_feed_links(html: &str) -> Vec<String> {
-    let lower = html.to_lowercase();
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while let Some(link_start) = lower[pos..].find("<link") {
-        let abs = pos + link_start;
-        let Some(tag_end) = lower[abs..].find('>') else {
+    while let Some(abs) = find_ascii_ci(html, "<link", pos) {
+        let Some(tag_end) = html[abs..].find('>') else {
             break;
         };
         let tag_end_abs = abs + tag_end + 1;
-        let tag = &lower[abs..tag_end_abs];
+        let tag = &html[abs..tag_end_abs];
         pos = tag_end_abs;
-        if !tag.contains("rel=\"alternate\"")
-            && !tag.contains("rel='alternate'")
-            && !tag.contains("rel=alternate")
+        if !(find_ascii_ci(tag, "rel=\"alternate\"", 0).is_some()
+            || find_ascii_ci(tag, "rel='alternate'", 0).is_some()
+            || find_ascii_ci(tag, "rel=alternate", 0).is_some())
         {
             continue;
         }
-        if !tag.contains("application/rss+xml") && !tag.contains("application/atom+xml") {
+        if find_ascii_ci(tag, "application/rss+xml", 0).is_none()
+            && find_ascii_ci(tag, "application/atom+xml", 0).is_none()
+        {
             continue;
         }
-        let orig_tag = &html[abs..tag_end_abs];
-        if let Some(href) = extract_href(orig_tag) {
+        if let Some(href) = extract_href(tag) {
             out.push(href);
         }
     }
@@ -1639,16 +1656,14 @@ fn extract_feed_links(html: &str) -> Vec<String> {
 /// Skips `rel="self"` and `rel="enclosure"` (feed metadata).
 fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
     let mut urls = Vec::new();
-    let lower = xml.to_lowercase();
     // RSS: <link>URL</link>
     let mut pos = 0usize;
     while urls.len() < cap {
-        let Some(open) = lower[pos..].find("<link>") else {
+        let Some(open) = find_ascii_ci(xml, "<link>", pos) else {
             break;
         };
-        let abs = pos + open;
-        let after = abs + 6;
-        let Some(close_rel) = lower[after..].find("</link>") else {
+        let after = open + 6;
+        let Some(close_rel) = xml[after..].find("</link>") else {
             break;
         };
         let text = xml[after..after + close_rel].trim();
@@ -1661,26 +1676,24 @@ fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
     if urls.len() < cap {
         pos = 0;
         while urls.len() < cap {
-            let Some(link_start) = lower[pos..].find("<link ") else {
+            let Some(abs) = find_ascii_ci(xml, "<link ", pos) else {
                 break;
             };
-            let abs = pos + link_start;
-            let Some(tag_end) = lower[abs..].find('>') else {
+            let Some(tag_end) = xml[abs..].find('>') else {
                 break;
             };
             let tag_end_abs = abs + tag_end + 1;
-            let tag = &lower[abs..tag_end_abs];
+            let tag = &xml[abs..tag_end_abs];
             pos = tag_end_abs;
             // Skip non-content links.
-            if tag.contains("rel=\"self\"")
-                || tag.contains("rel='self'")
-                || tag.contains("rel=\"enclosure\"")
-                || tag.contains("rel='enclosure'")
+            if find_ascii_ci(tag, "rel=\"self\"", 0).is_some()
+                || find_ascii_ci(tag, "rel='self'", 0).is_some()
+                || find_ascii_ci(tag, "rel=\"enclosure\"", 0).is_some()
+                || find_ascii_ci(tag, "rel='enclosure'", 0).is_some()
             {
                 continue;
             }
-            let orig_tag = &html_orig(xml, abs, tag_end_abs);
-            if let Some(href) = extract_href(orig_tag)
+            if let Some(href) = extract_href(tag)
                 && href.starts_with("http")
             {
                 urls.push(href);
@@ -1690,15 +1703,9 @@ fn parse_feed_urls(xml: &str, cap: usize) -> Vec<String> {
     urls
 }
 
-/// Safe slice of the original XML (not lowered) for href extraction.
-fn html_orig(xml: &str, from: usize, to: usize) -> &str {
-    &xml[from..to.min(xml.len())]
-}
-
 /// Extract the `href` attribute value from an HTML tag string.
 fn extract_href(tag: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let href_pos = lower.find("href")?;
+    let href_pos = find_ascii_ci(tag, "href", 0)?;
     let after = &tag[href_pos + 4..];
     // Skip whitespace and =.
     let after = after.trim_start();

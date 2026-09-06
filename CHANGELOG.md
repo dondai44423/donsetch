@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Crawl link/feed extraction could panic or drop URLs on pages
+  with case-folding characters:** the extractors lowercase the whole
+  document to fold tag names, then index the ORIGINAL at offsets
+  measured on the copy. Unicode folding is not length-stable ('İ' U+0130
+  = 2 bytes but lowercases to "i̇" = 3), so links after the first
+  folding char were sliced mid-character (a str-slice panic: daemon
+  abort in release) or one byte late (wrong span: RSS/Atom feed URLs
+  silently dropped). Canonical/base/feed extraction now scans the
+  original bytes with ASCII case-insensitive matching (tag and
+  attribute names are ASCII, and ASCII folding is length-stable),
+  which also removes the per-page whole-document lowercase
+  allocation. Two discriminating tests: pre-fix one panicked and
+  one dropped both feed URLs; post-fix both correct.
+
 - **h1 chunked reader no longer allocates unboundedly:** a server
   that never sends the chunk terminator (or keeps the size line
   growing) drove an unbounded buffer in the response path. Chunk
