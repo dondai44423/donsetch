@@ -193,7 +193,9 @@ jobs:
 
       - name: Test (nextest)
         run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }}
-        timeout-minutes: 15
+        # 15m was exhausted on macos-arm64 cold builds (nextest spawns
+        # one process per test; ~950 tests on the slowest runner).
+        timeout-minutes: 30
 
       # Windows: compile-check the release feature set without the
       # 305MB MSVC static link. Catches feature-gating typos and
