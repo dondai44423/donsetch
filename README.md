@@ -60,6 +60,40 @@ and as a standalone CLI.
 | 🧬 **Built from scratch** | Own HTTP/2 (HPACK, flow control), own extraction engine, own PDF parser, own search aggregator, own crawl engine. |
 | 🪶 **~2k tokens** | Three tools, ~2.0k tokens of total schema (tools/list, measured). Every token earns its place. |
 
+## 🧭 Pick the right tool for the job
+
+DonSeTch is a **rapid-fire research tool**: search, read, verify. A
+search, a fetch or two, a docs page, one PDF. Its speed is the point,
+and that speed is its stealth for one-shot reads.
+
+It is NOT built for tasks where an agent "works through" a defended
+site the way a person would. That class includes:
+
+- **Bulk document harvesting**: discovering and downloading many PDFs
+  or files from one repository in a single run.
+- **Long sessions against one site**: page after page, click by click,
+  at machine speed, same IP, no human pauses.
+- **Mass extraction**: mirroring a file library, dataset collection,
+  systematic downloads.
+
+DonSeTch will *probably work* on those too, and nothing stops it.
+But every request fires hundreds of times faster than a human, and
+defended sites read that pattern itself as a bot, not just the
+fingerprint. The realistic risk is an IP-level block: restricted
+access, a captcha wall, or a ban on your whole network mid-run. When
+that happens, it is the task shape, not a fetch-layer failure. The
+same page fetched once, as a research read, is fine.
+
+For those workflows, use
+**[Bladebro](https://github.com/dondai44423/bladebro)**. It is the
+next step up, built exactly for that shape of work: a real browser
+doing what a human does, page by page, download by download, at a
+human's pace. Slower than DonSeTch by design, because over a long
+session against a defended site, looking human beats being fast.
+
+**Rule of thumb: one-shot research = DonSeTch. Working a defended
+site like a person to collect things = Bladebro.**
+
 ## 🆕 v3, the agent-first upgrade
 
 Context is the agent's budget. v3 saves it aggressively:
@@ -829,7 +863,7 @@ search speed, mainstream source authority, no-sitemap discovery.
 | Search rate-limits without a proxy | Keyless search hits engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
 | Rerank in a CPU-limited container | Auto-clamped to cgroup parallelism on Linux. `DONSEEK_RERANK_THREADS` to override. |
 | Windows needs DirectML.dll | In-box since Windows 10 1903. Only trimmed Server Core/Nano images need the NuGet copy beside the binary. |
-| Not built for mass scraping | Agentic research, not bulk extraction. |
+| Not built for mass scraping | Agentic research, not bulk extraction. See "Pick the right tool" above. |
 
 ## 🧱 Honest limits
 
