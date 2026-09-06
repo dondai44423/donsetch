@@ -1661,6 +1661,57 @@ fn table_without_th_promotes_first_row() {
 }
 
 // ════════════════════════════════════════════════════════════
+// 24b. TABLE ROW HEADERS (<th scope="row">) ARE KEPT
+// ════════════════════════════════════════════════════════════
+
+// The standard accessible markup for a data table labels each row
+// with a <th scope="row">. table_block collected <th> and <td> with
+// two separate selects and only ever used <th> cells for the single
+// header row, so every later row silently lost its label and its
+// remaining cells shifted one column left.
+#[test]
+fn table_row_header_cells_are_kept_in_data_rows() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th></th><th>2022</th><th>2023</th></tr>
+<tr><th scope="row">Revenue</th><td>10</td><td>20</td></tr>
+<tr><th scope="row">Costs</th><td>7</td><td>9</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(
+        r.markdown.contains("| Revenue | 10 | 20 |"),
+        "row label dropped:\n{}",
+        r.markdown
+    );
+    assert!(r.markdown.contains("| Costs | 7 | 9 |"));
+}
+
+// A first row that mixes <th> and <td> is a data row, not a header
+// row; its <td> cells must not be thrown away.
+#[test]
+fn table_mixed_first_row_keeps_td_cells() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Language</th><td>Rust</td></tr>
+<tr><th>License</th><td>MIT</td></tr>
+<tr><th>Since</th><td>2015</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(
+        r.markdown.contains("Rust") && r.markdown.contains("MIT") && r.markdown.contains("2015"),
+        "td cells dropped:\n{}",
+        r.markdown
+    );
+    assert!(
+        r.markdown.contains("| License | MIT |"),
+        "label/value pairing lost:\n{}",
+        r.markdown
+    );
+}
+
+// ════════════════════════════════════════════════════════════
 // 25. TABLE CELL TRUNCATION : CHAR-BASED (CJK)
 // ════════════════════════════════════════════════════════════
 
