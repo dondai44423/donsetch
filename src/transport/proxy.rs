@@ -90,8 +90,10 @@ impl Proxy {
             (ProxyScheme::Http, s)
         };
 
-        // Split auth@addr : auth is optional.
-        let (user, pass, addr) = match rest.split_once('@') {
+        // Split auth@addr : auth is optional. The address (host:port)
+        // can never contain '@', so split at the LAST one: user and
+        // password both may.
+        let (user, pass, addr) = match rest.rsplit_once('@') {
             Some((auth, addr)) => {
                 let (u, p) = auth
                     .split_once(':')
@@ -685,6 +687,37 @@ mod tests {
         assert!(Proxy::parse("garbage").is_err());
         assert!(Proxy::parse("u:p@bad").is_err());
         assert!(Proxy::parse("u:p@host:99999").is_err());
+    }
+
+    // Auth was split from the address at the FIRST '@', so a
+    // password containing one ("p@ss") ended up as pass="p" and
+    // host="ss@1.2.3.4": accepted by `proxy add`, stored, and then
+    // unreachable. The address can never contain '@' (host:port),
+    // so the LAST '@' is the only correct split point.
+    #[test]
+    fn parse_password_containing_at() {
+        let p = Proxy::parse("socks5://alice:p@ss@1.2.3.4:1080").unwrap();
+        assert_eq!(p.user, "alice");
+        assert_eq!(p.pass, "p@ss");
+        assert_eq!(p.host, "1.2.3.4");
+        assert_eq!(p.port, 1080);
+        // Round trip through to_url keeps the password whole.
+        let p2 = Proxy::parse(&p.to_url()).unwrap();
+        assert_eq!(p2.pass, "p@ss");
+        assert_eq!(p2.host, "1.2.3.4");
+    }
+
+    #[test]
+    fn parse_user_and_password_containing_at_with_ipv6() {
+        let p = Proxy::parse("http://me@corp:p@ss:w0rd@[::1]:3128").unwrap();
+        assert_eq!(p.user, "me@corp");
+        assert_eq!(p.pass, "p@ss:w0rd");
+        assert_eq!(p.host, "::1");
+        assert_eq!(p.port, 3128);
+        let p2 = Proxy::parse(&p.to_url()).unwrap();
+        assert_eq!(p2.user, "me@corp");
+        assert_eq!(p2.pass, "p@ss:w0rd");
+        assert_eq!(p2.host, "::1");
     }
 
     #[test]
