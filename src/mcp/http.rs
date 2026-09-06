@@ -55,7 +55,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::mcp::server::{CancelMap, Daemon, handle};
+use crate::mcp::server::{CancelMap, Daemon, cancel_key, handle};
 
 /// Idle sessions are dropped after this long, so cancelled-tool
 /// registries cannot leak forever for clients that vanish mid-call.
@@ -437,7 +437,7 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
     // Mirrors the stdio transport's inline handling.
     if is_notification && method == "notifications/cancelled" {
         let cancels = resolve_cancels(&state, sid_header.as_deref());
-        if let Some(rid) = req.pointer("/params/requestId").and_then(Value::as_i64)
+        if let Some(rid) = req.pointer("/params/requestId").and_then(cancel_key)
             && let Some(sender) = cancels
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -473,7 +473,7 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
     // Writer sink for in-flight progress notifications. Each request
     // gets a fresh channel; nothing else consumes it.
     let (progress_tx, mut progress_rx) = mpsc::channel::<String>(256);
-    let request_id = req.get("id").and_then(Value::as_i64);
+    let request_id = req.get("id").and_then(cancel_key);
 
     let outcome = tokio::time::timeout(
         state.timeout,

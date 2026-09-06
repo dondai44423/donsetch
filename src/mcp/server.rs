@@ -254,8 +254,20 @@ where
     }
 }
 
+/// Cancellation registry: request-id key → cancel sender.
 pub type CancelMap =
-    Arc<std::sync::Mutex<std::collections::HashMap<i64, tokio::sync::watch::Sender<bool>>>>;
+    Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>>;
+
+/// Registry key for a JSON-RPC request id. Ids are numbers OR
+/// strings (uuids, "req-7"); keying on i64 meant a string-id client
+/// could never cancel anything. The JSON encoding keeps `7` and
+/// `"7"` distinct, as the spec requires.
+pub fn cancel_key(id: &Value) -> Option<String> {
+    match id {
+        Value::Number(_) | Value::String(_) => Some(id.to_string()),
+        _ => None,
+    }
+}
 
 /// Handle one line. Returns Some(response) for requests,
 /// None for notifications and cancelled requests (per MCP spec,
@@ -289,9 +301,9 @@ pub async fn handle(
 
     // tools/call gets the full context: cancel + progress.
     if method == "tools/call" {
-        let rid = id.as_i64();
+        let rid = cancel_key(&id);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        if let Some(r) = rid {
+        if let Some(r) = rid.clone() {
             cancels
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4756,5 +4768,26 @@ mod initialize_tests {
                 json!(v)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cancel_key_tests {
+    use super::cancel_key;
+    use serde_json::json;
+
+    // JSON-RPC ids are numbers OR strings. The registry was keyed
+    // on i64, so a client using string ids ("req-7", uuids) could
+    // never cancel anything: its notifications/cancelled found no
+    // entry and the crawl ran to completion.
+    #[test]
+    fn string_and_number_ids_both_get_a_key() {
+        assert!(cancel_key(&json!("req-7")).is_some());
+        assert!(cancel_key(&json!(7)).is_some());
+        assert!(cancel_key(&json!(-1)).is_some());
+        assert_ne!(cancel_key(&json!("7")), cancel_key(&json!(7)));
+        assert_eq!(cancel_key(&json!("req-7")), cancel_key(&json!("req-7")));
+        assert!(cancel_key(&json!(null)).is_none());
+        assert!(cancel_key(&json!({"a": 1})).is_none());
     }
 }
