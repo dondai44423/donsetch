@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use serde_json::Value;
 
-use crate::mcp::server::{CancelMap, Daemon, handle};
+use crate::mcp::server::{CancelMap, Daemon, cancel_key, handle};
 
 /// One stdin line, classified.
 enum Incoming {
@@ -107,7 +107,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(v) = serde_json::from_str::<Value>(&line)
             && v.get("id").is_none()
             && v.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
-            && let Some(rid) = v.pointer("/params/requestId").and_then(Value::as_i64)
+            && let Some(rid) = v.pointer("/params/requestId").and_then(cancel_key)
             && let Some(sender) = cancels
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
