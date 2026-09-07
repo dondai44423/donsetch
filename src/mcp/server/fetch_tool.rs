@@ -610,6 +610,11 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             .unwrap_or(if scheme == "http" { 80 } else { 443 });
         let mut state = daemon.state.lock().await;
         state.note_origin(&host, scheme, port);
+        // Longitudinal identity (v4 phase 0.3): mint or validate
+        // the domain persona. Coherence drift or quarantine here
+        // re-mints automatically.
+        let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
+        state.ensure_persona(&host, &caps);
     }
     let route = if tier == "2" && !is_pdf_url && !adapter_host {
         RouteDecision::SkipToSolve

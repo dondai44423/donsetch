@@ -36,6 +36,7 @@ pub mod onnx;
 pub mod pages;
 pub mod paths;
 pub mod pdf;
+pub mod persona;
 pub mod profile;
 pub mod search;
 pub mod spec;

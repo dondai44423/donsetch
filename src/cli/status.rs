@@ -182,6 +182,9 @@ pub async fn run() {
             format!("learning (no hosts yet){ro}")
         } else {
             let mut line = format!("{hosts} hosts · {walled} walled · {warm} warm");
+            if !state.personas.is_empty() {
+                line.push_str(&format!(" · {} personas", state.personas.len()));
+            }
             if state.probes_total > 0 {
                 line.push_str(&format!(" · {} probes", state.probes_total));
             }

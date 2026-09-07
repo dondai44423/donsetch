@@ -241,6 +241,10 @@ pub struct GhostState {
     /// observable, never magic.
     #[serde(default)]
     pub probes_total: u64,
+    /// Per-domain stable identities (v4 phase 0.3): same key space
+    /// as profiles, evicted together.
+    #[serde(default)]
+    pub personas: HashMap<String, crate::persona::Persona>,
     #[serde(default)]
     pub profiles: HashMap<String, DomainProfile>,
     #[serde(default)]
@@ -861,6 +865,56 @@ impl GhostState {
         self.save();
     }
 
+    /// The persona for a host, minting or re-minting as needed
+    /// (v4 phase 0.3). Longitudinal rule: an existing coherent
+    /// persona is returned unchanged for weeks; a burned
+    /// (quarantined) or drifted one is replaced with generation+1,
+    /// never resurrected.
+    pub fn ensure_persona(
+        &mut self,
+        host: &str,
+        caps: &crate::persona::PersonaCaps,
+    ) -> Option<&crate::persona::Persona> {
+        if !route_memory_enabled() {
+            return self.personas.get(host);
+        }
+        if route_memory_readonly() {
+            return self.personas.get(host);
+        }
+        let n = now();
+        let needs_mint = match self.personas.get(host) {
+            None => true,
+            Some(p) => !p.coherent(caps),
+        };
+        if needs_mint {
+            let generation = self
+                .personas
+                .get(host)
+                .map(|p| p.generation.saturating_add(1))
+                .unwrap_or(1);
+            self.personas.insert(
+                host.to_string(),
+                crate::persona::Persona::mint(host, caps, generation, n),
+            );
+            self.save();
+        }
+        self.personas.get(host)
+    }
+
+    /// Burn a persona (detection event, operator request). The next
+    /// ensure_persona mints a fresh identity with a bumped
+    /// generation; the burned one is never reused.
+    pub fn quarantine_persona(&mut self, host: &str, reason: &str) {
+        if !route_memory_enabled() || route_memory_readonly() {
+            return;
+        }
+        if let Some(p) = self.personas.get_mut(host) {
+            p.quarantined_at = Some(now());
+            p.quarantine_reason = Some(reason.to_string());
+            self.save();
+        }
+    }
+
     /// Aggregate route-memory stats for `donsetch status`
     /// (v4 phase 0: self-improvement must be observable).
     pub fn route_stats(&self) -> (usize, usize, usize, usize, usize) {
@@ -911,6 +965,7 @@ impl GhostState {
             let evict = self.profiles.len() - PROFILE_CAP;
             for (host, _) in by_activity.into_iter().take(evict) {
                 self.profiles.remove(&host);
+                self.personas.remove(&host);
             }
         }
         #[cfg(not(test))]
@@ -1579,6 +1634,98 @@ mod tests {
         state.note_probe();
         assert_eq!(state.probes_total, 2);
         unsafe { std::env::remove_var("DONSETCH_ROUTE_MEMORY_READONLY") };
+    }
+
+    // == v4 phase 0.3: personas ==
+
+    fn test_caps() -> crate::persona::PersonaCaps {
+        crate::persona::PersonaCaps {
+            chrome_major: 150,
+            platform: crate::profile::Platform::Linux,
+            branded: true,
+        }
+    }
+
+    #[test]
+    fn persona_mints_once_and_stays_stable() {
+        let mut state = GhostState::default();
+        let caps = test_caps();
+        let first = state.ensure_persona("example.com", &caps).unwrap().clone();
+        let second = state.ensure_persona("example.com", &caps).unwrap().clone();
+        // Longitudinal rule: same persona, unchanged, forever.
+        assert_eq!(first, second);
+        assert_eq!(first.generation, 1);
+        assert!(first.quarantined_at.is_none());
+    }
+
+    #[test]
+    fn quarantined_persona_is_replaced_never_resurrected() {
+        let mut state = GhostState::default();
+        let caps = test_caps();
+        let burned = state.ensure_persona("example.com", &caps).unwrap().clone();
+        state.quarantine_persona("example.com", "detected by scorecard");
+        let fresh = state.ensure_persona("example.com", &caps).unwrap().clone();
+        assert_eq!(fresh.generation, burned.generation + 1);
+        assert_ne!(fresh.entropy_seed, burned.entropy_seed);
+        assert!(fresh.quarantined_at.is_none());
+        assert!(fresh.coherent(&caps));
+    }
+
+    #[test]
+    fn drifted_persona_remints_on_ensure() {
+        // The wire profile bumped (Chrome 150 -> 151): the old
+        // persona would claim a build the TLS layer no longer
+        // emits. ensure_persona must re-mint, not ship the tell.
+        let mut state = GhostState::default();
+        let old_caps = test_caps();
+        state.ensure_persona("example.com", &old_caps).unwrap();
+        let new_caps = crate::persona::PersonaCaps {
+            chrome_major: 151,
+            ..test_caps()
+        };
+        let p = state.ensure_persona("example.com", &new_caps).unwrap();
+        assert_eq!(p.chrome_major, 151);
+        assert_eq!(p.generation, 2);
+    }
+
+    #[test]
+    fn personas_respect_route_memory_switches() {
+        let mut state = GhostState::default();
+        let caps = test_caps();
+        unsafe { std::env::set_var("DONSETCH_NO_ROUTE_MEMORY", "1") };
+        assert!(state.ensure_persona("x.example", &caps).is_none());
+        assert!(state.personas.is_empty());
+        state.quarantine_persona("x.example", "should be a no-op");
+        unsafe { std::env::remove_var("DONSETCH_NO_ROUTE_MEMORY") };
+    }
+
+    #[test]
+    fn personas_survive_serde_roundtrip_and_evict_with_profiles() {
+        let mut state = GhostState::default();
+        let caps = test_caps();
+        state.ensure_persona("a.example", &caps).unwrap();
+        let json = serde_json::to_string(&state).unwrap();
+        let back: GhostState = serde_json::from_str(&json).unwrap();
+        assert!(back.personas.contains_key("a.example"));
+        // LRU eviction removes the persona alongside the profile.
+        let mut state = GhostState::default();
+        state.personas.insert(
+            "ancient.example".into(),
+            crate::persona::Persona::mint("ancient.example", &caps, 1, 1),
+        );
+        state
+            .profiles
+            .insert("ancient.example".into(), DomainProfile::default());
+        for i in 0..PROFILE_CAP {
+            let p = DomainProfile {
+                last_cold_check: 1_700_000_000 + i as u64,
+                ..Default::default()
+            };
+            state.profiles.insert(format!("h{i}.example"), p);
+        }
+        state.save();
+        assert_eq!(state.profiles.len(), PROFILE_CAP);
+        assert!(!state.personas.contains_key("ancient.example"));
     }
 
     #[test]
