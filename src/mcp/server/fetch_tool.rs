@@ -751,6 +751,13 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         let o = out.as_ref().unwrap();
         {
             let mut state = daemon.state.lock().await;
+            // Tier-1 jar flush (v4 phase 1.4): persist the whole
+            // cookie store on every completed navigation, inside
+            // the same record_* save (one state write per fetch,
+            // today's cost class). Browser-true: cookies survive
+            // process restarts, so remote sessions see a RETURNING
+            // visitor, not a fresh jar every run.
+            state.sync_tier1_cookies(&daemon.fetcher.jar_all_snapshot().await);
             match o.verdict {
                 Verdict::Challenge(_) => {
                     state.record_failure(&host, crate::ghost::cache::FailClass::Block);

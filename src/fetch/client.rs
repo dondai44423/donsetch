@@ -113,6 +113,14 @@ impl Fetcher {
         jar.reset(cookies);
     }
 
+    /// Whole-jar export for the tier-1 cookie vault (v4 phase 1.4):
+    /// the browser cookie store view that makes a returning agent
+    /// replay like a returning device across process restarts.
+    pub async fn jar_all_snapshot(&self) -> Vec<CookieRecord> {
+        let jar = self.jar.lock().unwrap_or_else(|e| e.into_inner());
+        jar.snapshot_all()
+    }
+
     /// Export all cookies for a host with their expiry, for
     /// write-back to the persistent domain profile after a
     /// successful warm fetch.

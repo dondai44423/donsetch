@@ -188,6 +188,9 @@ pub async fn run() {
             if state.probes_total > 0 {
                 line.push_str(&format!(" · {} probes", state.probes_total));
             }
+            if state.tier1_cookie_count() > 0 {
+                line.push_str(&format!(" · {} vaulted", state.tier1_cookie_count()));
+            }
             if state.shadowed_assets_total > 0 {
                 line.push_str(&format!(" · {} shadowed", state.shadowed_assets_total));
             }

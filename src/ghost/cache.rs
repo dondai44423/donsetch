@@ -229,6 +229,15 @@ pub enum RouteDecision {
     SolveCooldown(u64),
 }
 
+/// Whole-jar bucket cap (v4 phase 1.4): 500 distinct (name,
+/// domain, path) triples. Browsers hold far more (Chrome keeps
+/// ~180/domain, thousands per store); 500 covers any real agent
+/// working set and bounds the state file.
+const TIER1_COOKIE_MAX: usize = 500;
+/// Refuse to vault pathological cookie values: an oversized value
+/// is either junk or an attack surface on state writes.
+const TIER1_COOKIE_VALUE_MAX: usize = 4096;
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct GhostState {
     /// State format version. 1 = pre-v4 (runs the one-time
@@ -245,6 +254,15 @@ pub struct GhostState {
     /// page-load realism at work, surfaced in donsetch status.
     #[serde(default)]
     pub shadowed_assets_total: u64,
+    /// Tier-1 whole-jar persistence (v4 phase 1.4): the browser
+    /// cookie-store view, so a returning agent replays device /
+    /// analytics / cf_bm cookies like a returning browser instead
+    /// of showing up fresh on every process. Login-worthy cookies
+    /// ride their own vault; this bucket holds the plain
+    /// navigation set (one store, like a browser: clearance
+    /// duplicates at boot merge to the same key harmlessly).
+    #[serde(default)]
+    pub tier1_cookies: Vec<CookieRecord>,
     /// Per-domain stable identities (v4 phase 0.3): same key space
     /// as profiles, evicted together.
     #[serde(default)]
@@ -958,6 +976,46 @@ impl GhostState {
             })
             .count();
         (hosts, walled, warm, cooldowns, flaky)
+    }
+
+    /// Tier-1 jar flush (v4 phase 1.4): merge the whole jar into
+    /// the persisted snapshot. Browser-true mechanics: dedupe
+    /// (name, domain, path), refresh in place at the front (cap
+    /// evicts the coldest tail), drop expired and pathological
+    /// values. Does NOT save: the caller is already inside the
+    /// state lock and the outcome record after it saves once.
+    pub fn sync_tier1_cookies(&mut self, all: &[CookieRecord]) {
+        if crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT")
+            || crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY")
+        {
+            return;
+        }
+        let now = now();
+        for c in all {
+            if c.domain.is_empty()
+                || c.value.is_empty()
+                || c.value.len() > TIER1_COOKIE_VALUE_MAX
+                || c.expires_at.is_some_and(|e| e <= now)
+            {
+                continue;
+            }
+            let key = (c.name.clone(), c.domain.clone(), c.path.clone());
+            if let Some(pos) = self
+                .tier1_cookies
+                .iter()
+                .position(|x| (x.name.clone(), x.domain.clone(), x.path.clone()) == key)
+            {
+                self.tier1_cookies.remove(pos);
+            }
+            self.tier1_cookies.insert(0, c.clone());
+        }
+        self.tier1_cookies.truncate(TIER1_COOKIE_MAX);
+    }
+
+    /// Cookie count for `donsetch status`: the vault must be
+    /// observable, never magic.
+    pub fn tier1_cookie_count(&self) -> usize {
+        !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") as usize * self.tier1_cookies.len()
     }
 
     pub fn save(&mut self) {
@@ -2397,6 +2455,58 @@ mod tests {
         s.record_solved("a.com", &cookies, Some("cloudflare"), true);
         let p = &s.profiles["a.com"];
         assert_eq!(p.cookies.len(), 2); // cf_clearance + datadome only
+    }
+
+    #[test]
+    fn tier1_jar_sync_dedupes_refreshes_and_caps() {
+        let mut st = GhostState::default();
+        let rec = |n: &str, v: &str, d: &str, exp: Option<u64>| CookieRecord {
+            name: n.into(),
+            value: v.into(),
+            domain: d.into(),
+            path: "/".into(),
+            expires_at: exp,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".into(),
+        };
+        st.sync_tier1_cookies(&[rec("uid", "a", ".x.com", Some(now() + 999))]);
+        assert_eq!(st.tier1_cookies.len(), 1);
+        // Same key, new value: refresh in place, never duplicated.
+        st.sync_tier1_cookies(&[rec("uid", "b", ".x.com", Some(now() + 999))]);
+        assert_eq!(st.tier1_cookies.len(), 1);
+        assert_eq!(st.tier1_cookies[0].value, "b");
+        // Expired + empty-value + giant-value refused.
+        st.sync_tier1_cookies(&[
+            rec("dead", "v", ".x.com", Some(now().saturating_sub(10))),
+            rec("none", "", ".x.com", None),
+            rec(
+                "big",
+                ("x".repeat(TIER1_COOKIE_VALUE_MAX + 1)).as_str(),
+                ".x.com",
+                None,
+            ),
+        ]);
+        assert_eq!(st.tier1_cookies.len(), 1);
+        // Cap: flood past 500 distinct, cap holds, refreshed survives.
+        for i in 0..600 {
+            st.sync_tier1_cookies(&[rec(&format!("k{i}"), "v", ".x.com", None)]);
+        }
+        assert_eq!(st.tier1_cookies.len(), TIER1_COOKIE_MAX);
+        // Honest cap semantics: the freshest flood entries survived,
+        // the oldest (never-refreshed) tail left. uid was last
+        // touched before the flood: it is the first evicted.
+        assert!(st.tier1_cookies.iter().any(|c| c.name == "k599"));
+        assert!(st.tier1_cookies.iter().all(|c| c.name != "k0"));
+        // Kill switch blocks the sync.
+        unsafe { std::env::set_var("DONSETCH_NO_COOKIE_VAULT", "1") };
+        st.sync_tier1_cookies(&[rec("post", "v", ".x.com", None)]);
+        assert!(st.tier1_cookies.iter().all(|c| c.name != "post"));
+        unsafe { std::env::remove_var("DONSETCH_NO_COOKIE_VAULT") };
+        // Roundtrip through serde (persistence shape).
+        let json = serde_json::to_string(&st).unwrap();
+        let back: GhostState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tier1_cookies.len(), TIER1_COOKIE_MAX);
     }
 
     #[test]
