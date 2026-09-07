@@ -733,6 +733,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             let mut state = daemon.state.lock().await;
             match o.verdict {
                 Verdict::Challenge(_) => {
+                    state.record_failure(&host, crate::ghost::cache::FailClass::Block);
                     if is_warm {
                         // Warm cookies went stale : learn the real lifetime.
                         state.record_warm_stale(&host);
