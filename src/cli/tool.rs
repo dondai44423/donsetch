@@ -68,6 +68,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             .unwrap_or_default();
         if urls.len() > 1 {
             let code = run_bulk_fetch(&daemon, tool, &base_args, &urls, json_mode, quiet).await;
+            crate::fetch::shadow::drain_pending().await;
             daemon.shutdown().await;
             return code;
         }
@@ -84,6 +85,9 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
         }
     };
     let code = render_result(&result, json_mode, quiet, cmd);
+    // Let page-load realism finish (v4 phase 1.3): the shadow burst
+    // runs in the background; a one-shot CLI would kill it on exit.
+    crate::fetch::shadow::drain_pending().await;
     daemon.shutdown().await;
     code
 }

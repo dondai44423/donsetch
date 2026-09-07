@@ -791,7 +791,11 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // path : the adapter is an optimization, never a dependency.
     if let Some(o) = &out {
         match o.verdict {
-            Verdict::ContentOk => {}
+            Verdict::ContentOk => {
+                // Page-load realism (v4 phase 1.3): background
+                // subresource burst for stealth-relevant hosts.
+                crate::fetch::shadow::maybe_shadow(&daemon.fetcher, &daemon.state, &o.url, o).await;
+            }
             Verdict::Challenge(_) if tier != "1" => {}
             v => {
                 if adapter_host && !no_adapter {

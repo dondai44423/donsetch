@@ -188,6 +188,9 @@ pub async fn run() {
             if state.probes_total > 0 {
                 line.push_str(&format!(" · {} probes", state.probes_total));
             }
+            if state.shadowed_assets_total > 0 {
+                line.push_str(&format!(" · {} shadowed", state.shadowed_assets_total));
+            }
             if cooldowns > 0 {
                 line.push_str(&format!(" · {cooldowns} in cooldown"));
             }

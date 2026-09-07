@@ -241,6 +241,10 @@ pub struct GhostState {
     /// observable, never magic.
     #[serde(default)]
     pub probes_total: u64,
+    /// Lifetime shadow-fetched subresource count (v4 phase 1.3):
+    /// page-load realism at work, surfaced in donsetch status.
+    #[serde(default)]
+    pub shadowed_assets_total: u64,
     /// Per-domain stable identities (v4 phase 0.3): same key space
     /// as profiles, evicted together.
     #[serde(default)]
@@ -840,6 +844,15 @@ impl GhostState {
             .take(limit)
             .map(|(h, _)| h.clone())
             .collect()
+    }
+
+    /// A shadow burst fetched N subresources (v4 phase 1.3).
+    pub fn note_shadow(&mut self, assets: usize) {
+        if !route_memory_enabled() || route_memory_readonly() {
+            return;
+        }
+        self.shadowed_assets_total = self.shadowed_assets_total.saturating_add(assets as u64);
+        self.save();
     }
 
     /// One background probe was attempted (any outcome).
