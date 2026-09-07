@@ -4,6 +4,18 @@ use donsetch::mcp;
 
 #[tokio::main]
 async fn main() {
+    // CLI convention (rg, curl): a closed stdout pipe is normal,
+    // not an error. Rust masks SIGPIPE by default, so every pipe-
+    // tiled run (donsetch --help | head) turned the write into an
+    // EPIPE panic with a full backtrace after head quit. Restoring
+    // the default disposition makes the kill silent with exit 141,
+    // exactly what the shell expects. The MCP daemon inherits it
+    // too: when the transport pipe breaks, the client is gone and
+    // an instant exit beats a panic dump.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 

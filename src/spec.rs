@@ -642,9 +642,38 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
 /// `--quiet` are CLI-adapter flags (not MCP params), appended
 /// to every tool command.
 pub fn cli_command(tool: &ToolSpec) -> clap::Command {
+    // CLI --help speaks to a human in a terminal; the full agent
+    // contract stays in the MCP description field. Same facts,
+    // different voice.
+    let cli_long = match tool.cli_cmd {
+        "fetch" => "Fetch one URL (or several) as clean markdown. \
+Redirects, bot walls and JS-shells escalate automatically through two \
+tiers; the output tells you what happened at every step. \
+Use --focus to narrow the content, --must-contain for a cheap \
+probe, and a result handle from a search result (donsetch fetch \
+@10hd73d) to fetch a result directly. \
+--browser-actions sends clicks/typing to a headless browser for \
+sites that need interaction. \
+--archive serves a Wayback snapshot when the live page is dead.",
+        "search" => "Search the web across 5 keyless engines, merged with \
+consensus ranking (no API keys needed). \
+Every result carries a short handle: donsetch fetch @<handle> \
+fetches it directly. \
+Use --max-results to cap the list and --intent to pick a vertical \
+(web|news|code|docs|pdf|paper|hashun); the default auto-detects. \
+--json gives the full result envelope (titles, snippets, scores, \
+engine health).",
+        "crawl" => "Crawl a site: sitemap-aware, budgeted, focused. \
+The default --mode content walks the same domain from the seed with \
+a best-first frontier, scoring pages for the --topic you give. \
+--mode map is a cheap sitemap-shape inventory. \
+Returns pages with per-page notes; long crawls emit a resume token \
+you can pass with --resume to continue later.",
+        _ => tool.summary,
+    };
     let mut cmd = clap::Command::new(tool.cli_cmd)
         .about(tool.summary)
-        .long_about(tool.description)
+        .long_about(cli_long)
         .after_help(format!(
             "EXAMPLES:\n{}",
             tool.examples
