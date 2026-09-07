@@ -953,6 +953,24 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Run
 `cargo test --features ocr,rerank` before submitting. AGPL v3: all
 contributions under the same license.
 
+## 💛 Sponsors
+
+DonSeTch is open source and free to use. If you want to support development, consider sponsoring.
+
+| Tier | Price | What you get |
+|---|---|---|
+| 🥉 Bronze | $10/mo | Name + link in Sponsors section |
+| 🥈 Silver | $25/mo | Small logo + link in Sponsors section |
+| 🥇 Gold | $49/mo | Large logo + link, pinned at top of Sponsors section |
+
+One-time sponsorships are also welcome at any amount.
+
+Pricing will increase as the project grows. Right now DonSeTch is early (small but growing), so sponsorship is cheap. A Gold tier at $49/mo is high reward, near zero investment for any company that relies on web research for AI agents. Lock in the current rate before it goes up.
+
+If your product is part of this space (proxy platforms, search infrastructure, BYO providers, anything a DonSeTch user would plug in), Gold goes one step further: if your tool fits natively within DonSeTch, you get the banners and the link plus an official native integration shipped in the binary itself.
+
+Email bhandaribishesh879@gmail.com to become a sponsor.
+
 ## 📄 License
 
 Copyright (c) 2026 Bishesh Bhandari. AGPL-3.0, see [LICENSE](LICENSE).
