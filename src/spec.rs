@@ -646,7 +646,8 @@ pub fn cli_command(tool: &ToolSpec) -> clap::Command {
     // contract stays in the MCP description field. Same facts,
     // different voice.
     let cli_long = match tool.cli_cmd {
-        "fetch" => "Fetch one URL (or several) as clean markdown. \
+        "fetch" => {
+            "Fetch one URL (or several) as clean markdown. \
 Redirects, bot walls and JS-shells escalate automatically through two \
 tiers; the output tells you what happened at every step. \
 Use --focus to narrow the content, --must-contain for a cheap \
@@ -654,21 +655,26 @@ probe, and a result handle from a search result (donsetch fetch \
 @10hd73d) to fetch a result directly. \
 --browser-actions sends clicks/typing to a headless browser for \
 sites that need interaction. \
---archive serves a Wayback snapshot when the live page is dead.",
-        "search" => "Search the web across 5 keyless engines, merged with \
+--archive serves a Wayback snapshot when the live page is dead."
+        }
+        "search" => {
+            "Search the web across 5 keyless engines, merged with \
 consensus ranking (no API keys needed). \
 Every result carries a short handle: donsetch fetch @<handle> \
 fetches it directly. \
 Use --max-results to cap the list and --intent to pick a vertical \
 (web|news|code|docs|pdf|paper|hashun); the default auto-detects. \
 --json gives the full result envelope (titles, snippets, scores, \
-engine health).",
-        "crawl" => "Crawl a site: sitemap-aware, budgeted, focused. \
+engine health)."
+        }
+        "crawl" => {
+            "Crawl a site: sitemap-aware, budgeted, focused. \
 The default --mode content walks the same domain from the seed with \
 a best-first frontier, scoring pages for the --topic you give. \
 --mode map is a cheap sitemap-shape inventory. \
 Returns pages with per-page notes; long crawls emit a resume token \
-you can pass with --resume to continue later.",
+you can pass with --resume to continue later."
+        }
         _ => tool.summary,
     };
     let mut cmd = clap::Command::new(tool.cli_cmd)
@@ -816,6 +822,13 @@ mod tests {
             .expect("web_search spec")
     }
 
+    fn crawl_tool() -> &'static ToolSpec {
+        TOOLS
+            .iter()
+            .find(|tool| tool.name == "web_crawl")
+            .expect("web_crawl spec")
+    }
+
     #[test]
     fn search_variants_use_a_strict_array_schema() {
         let schema = mcp_schema(search_tool());
@@ -853,21 +866,28 @@ mod tests {
     }
 
     #[test]
-    fn mcp_contract_is_compact_without_reducing_cli_help() {
+    fn mcp_contract_is_compact_and_cli_help_stays_usable() {
         for tool in TOOLS {
             let schema = mcp_schema(tool);
             assert_eq!(schema["description"], tool.mcp_description);
             assert!(
                 tool.mcp_description.len() < tool.description.len(),
-                "{} model description should be shorter than CLI long help",
+                "{} model description should be shorter than the agent contract",
                 tool.name
             );
         }
 
-        let mut command = cli_command(fetch_tool());
-        let long_help = command.render_long_help().to_string();
-        assert!(long_help.contains("Domain intelligence"));
-        assert!(long_help.contains("cross-encoder pass"));
+        // The CLI long-help is written for a human in a terminal: it
+        // must stay discoverable (the main knobs named) without
+        // borrowing the agent-facing contract text.
+        let long_help = cli_command(fetch_tool()).render_long_help().to_string();
+        assert!(long_help.contains("--focus"), "{long_help}");
+        assert!(long_help.contains("handle"), "{long_help}");
+        let long_search = cli_command(search_tool()).render_long_help().to_string();
+        assert!(long_search.contains("--intent"), "{long_search}");
+        assert!(long_search.contains("handle"), "{long_search}");
+        let long_crawl = cli_command(crawl_tool()).render_long_help().to_string();
+        assert!(long_crawl.contains("--resume"), "{long_crawl}");
     }
 
     #[test]
