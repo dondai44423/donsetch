@@ -153,6 +153,15 @@ impl Fetcher {
         self.fetch_via_jar_ref(url_str, proxy, use_jar, None).await
     }
 
+    /// Evidence-grade cold probe (v4 phase 0.2): no shared cookie
+    /// jar (a true cold client) and the revalidation cache bypassed
+    /// (a cached page is not evidence about the wall RIGHT NOW).
+    /// Used only by the background route-memory prober.
+    pub async fn fetch_cold_probe(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
+        self.fetch_via_jar_opts(url_str, None, false, None, true)
+            .await
+    }
+
     /// Same as `fetch_via_jar` but with a referer header. The
     /// referer is sent on the initial request only (not redirect
     /// hops), matching browser behavior. `sec-fetch-site` is
@@ -166,6 +175,20 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_via_jar_opts(url_str, proxy, use_jar, referer, false)
+            .await
+    }
+
+    /// Full-knobs variant: `skip_cache` bypasses the revalidation
+    /// cache entirely (probe path only; everything else keeps it).
+    pub async fn fetch_via_jar_opts(
+        &self,
+        url_str: &str,
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        skip_cache: bool,
+    ) -> Result<FetchOutcome, FetchError> {
         // Centralized URL safety gate (fetch tier). The synchronous
         // literal checks run here (scheme, credentials, localhost and
         // private literals: no dial can follow a cached return). The
@@ -176,12 +199,18 @@ impl Fetcher {
         let started = Instant::now();
 
         // Fresh-window cache hit: no request at all (browser-true).
+        // Probes (v4 phase 0.2) skip this: a cached page is not
+        // evidence about the wall RIGHT NOW.
         let check = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.check(url_str)
+            if skip_cache {
+                CacheCheck::None
+            } else {
+                cache.check(url_str)
+            }
         };
         let conditional = match check {
             CacheCheck::Fresh(body, status, headers) => {
@@ -326,7 +355,7 @@ impl Fetcher {
                     // otherwise be re-served fresh as "content" on
                     // every later fetch (hardcoded ContentOk made it
                     // worse). Walls are never cacheable.
-                    if matches!(out.verdict, Verdict::ContentOk) {
+                    if !skip_cache && matches!(out.verdict, Verdict::ContentOk) {
                         let mut cache = self
                             .cache
                             .lock()

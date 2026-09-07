@@ -596,6 +596,21 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // need a browser. Force Cold even if a stale profile says
     // SkipToSolve (from a previous Xvfb failure that poisoned
     // the domain).
+    // Remember the real origin scheme (v4 phase 0.2: the prober
+    // probes the origin, not a guessed https upgrade).
+    {
+        let scheme = if url.starts_with("http://") {
+            "http"
+        } else {
+            "https"
+        };
+        let port = url::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.port_or_known_default())
+            .unwrap_or(if scheme == "http" { 80 } else { 443 });
+        let mut state = daemon.state.lock().await;
+        state.note_origin(&host, scheme, port);
+    }
     let route = if tier == "2" && !is_pdf_url && !adapter_host {
         RouteDecision::SkipToSolve
     } else if tier == "1" || is_pdf_url || adapter_host {

@@ -56,6 +56,9 @@ pub struct Daemon {
     /// domain trigger a solve while the agent is still reading
     /// results. Cheap spinlock: a lost race just skips the win.
     pre_solve_busy: std::sync::atomic::AtomicBool,
+    /// Background route-memory prober handle (v4 phase 0.2);
+    /// aborted on shutdown.
+    probe_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -120,7 +123,21 @@ impl Daemon {
             )),
             vault_seen: tokio::sync::Mutex::new(None),
             pre_solve_busy: std::sync::atomic::AtomicBool::new(false),
+            probe_task: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Spawn the background route-memory prober (v4 phase 0.2).
+    /// Called once the daemon is inside its runtime; one-shot CLI
+    /// paths never call it, so short-lived processes stay clean.
+    pub fn start_prober(self: &Arc<Self>) {
+        if crate::config::env_flag("DONSETCH_NO_ROUTE_PROBES") {
+            return;
+        }
+        let handle = crate::ghost::probe::spawn(Arc::clone(&self.fetcher), Arc::clone(&self.state));
+        if let Ok(mut slot) = self.probe_task.lock() {
+            *slot = Some(handle);
+        }
     }
 
     /// Shutdown: kill ghost browser + Xvfb (if owned).

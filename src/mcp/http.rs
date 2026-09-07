@@ -98,6 +98,7 @@ struct HttpState {
 /// Run the HTTP MCP server until SIGTERM/SIGINT.
 pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let daemon = Arc::new(Daemon::new().await.map_err(|e| e.to_string())?);
+    daemon.start_prober();
     let auth_token = std::env::var("DONSETCH_HTTP_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());

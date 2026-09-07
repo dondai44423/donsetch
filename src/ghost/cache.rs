@@ -143,6 +143,22 @@ pub struct DomainProfile {
     /// flaky network can never poison a route decision.
     #[serde(default)]
     pub failures: VecDeque<(u64, FailClass)>,
+    /// The scheme this host was actually fetched over ("https" or
+    /// "http"). The background prober (v4 phase 0.2) probes the real
+    /// origin, not a guessed https upgrade.
+    #[serde(default = "default_scheme")]
+    pub origin_scheme: String,
+    /// The port the origin was actually fetched on (0 = the
+    /// scheme's default). Host keys strip ports; without this the
+    /// prober would hit :443/:80 on dev servers and internal tools
+    /// and learn nothing (live-caught on the wall rig: probes died
+    /// on connection-refused against port 80).
+    #[serde(default)]
+    pub origin_port: u16,
+}
+
+fn default_scheme() -> String {
+    "https".to_string()
 }
 
 fn default_ewma() -> f32 {
@@ -220,6 +236,11 @@ pub struct GhostState {
     /// Persisted on every save; old files deserialize as 1.
     #[serde(default = "state_version_v1")]
     pub version: u32,
+    /// Lifetime background-probe attempts (v4 phase 0.2), surfaced
+    /// in `donsetch status`: the self-improvement loop must be
+    /// observable, never magic.
+    #[serde(default)]
+    pub probes_total: u64,
     #[serde(default)]
     pub profiles: HashMap<String, DomainProfile>,
     #[serde(default)]
@@ -763,6 +784,83 @@ impl GhostState {
     /// and freshness logic without disk side effects.
     /// No-op when DONSEEK_NO_DISK_STATE is set : keeps in-memory
     /// state for the session but doesn't persist to disk.
+    /// The recorded origin for a host: scheme and port, defaults
+    /// https:443. The prober builds probe URLs from this.
+    pub fn profile_origin(&self, host: &str) -> (String, u16) {
+        self.profiles
+            .get(host)
+            .map(|p| {
+                let port = if p.origin_port != 0 {
+                    p.origin_port
+                } else if p.origin_scheme == "http" {
+                    80
+                } else {
+                    443
+                };
+                (p.origin_scheme.clone(), port)
+            })
+            .unwrap_or_else(|| ("https".to_string(), 443))
+    }
+
+    /// Remember the scheme a host is fetched over (v4 phase 0.2:
+    /// the prober probes the real origin). Idempotent, cheap.
+    pub fn note_origin(&mut self, host: &str, scheme: &str, port: u16) {
+        if !route_memory_enabled() || route_memory_readonly() {
+            return;
+        }
+        if scheme != "http" && scheme != "https" {
+            return;
+        }
+        let p = self.profiles.entry(host.to_string()).or_default();
+        if p.origin_scheme != scheme || p.origin_port != port {
+            p.origin_scheme = scheme.to_string();
+            p.origin_port = port;
+            self.save();
+        }
+    }
+
+    /// Stale-walled hosts due for a background probe (v4 phase
+    /// 0.2), stalest first. Only hosts with tier-2 memory AND cold
+    /// evidence older than `stale_secs` qualify.
+    pub fn probe_candidates(&self, stale_secs: u64, limit: usize) -> Vec<String> {
+        let n = now();
+        let mut stale: Vec<(&String, u64)> = self
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.needs_tier2 && n.saturating_sub(p.last_cold_check) > stale_secs)
+            .map(|(h, p)| (h, p.last_cold_check))
+            .collect();
+        stale.sort_by_key(|(_, t)| *t);
+        stale
+            .into_iter()
+            .take(limit)
+            .map(|(h, _)| h.clone())
+            .collect()
+    }
+
+    /// One background probe was attempted (any outcome).
+    pub fn note_probe(&mut self) {
+        if !route_memory_enabled() || route_memory_readonly() {
+            return;
+        }
+        self.probes_total = self.probes_total.saturating_add(1);
+    }
+
+    /// A probe that says nothing about the wall (transport error,
+    /// non-wall verdict on the front page). Re-arms the probe
+    /// cadence so the host is not hammered, WITHOUT touching wall
+    /// flags, EWMAs, or fetch counters: inconclusive is not
+    /// evidence in either direction.
+    pub fn record_probe_inconclusive(&mut self, host: &str) {
+        if !route_memory_enabled() || route_memory_readonly() {
+            return;
+        }
+        let n = now();
+        let p = self.profiles.entry(host.to_string()).or_default();
+        p.last_cold_check = n;
+        self.save();
+    }
+
     /// Aggregate route-memory stats for `donsetch status`
     /// (v4 phase 0: self-improvement must be observable).
     pub fn route_stats(&self) -> (usize, usize, usize, usize, usize) {
@@ -1393,6 +1491,94 @@ mod tests {
             panic!("v2 file must never enter the migration");
         }
         assert!(state2.profiles["walled.example"].needs_tier2);
+    }
+
+    #[test]
+    fn probe_candidates_stalest_first_and_filtered() {
+        let mut state = GhostState::default();
+        let n = now();
+        // Stale walled host: candidate.
+        state.profiles.insert(
+            "stale.example".into(),
+            DomainProfile {
+                needs_tier2: true,
+                last_cold_check: n - 30_000,
+                ..Default::default()
+            },
+        );
+        // Staler walled host: candidate, first.
+        state.profiles.insert(
+            "staler.example".into(),
+            DomainProfile {
+                needs_tier2: true,
+                last_cold_check: n - 40_000,
+                ..Default::default()
+            },
+        );
+        // Fresh walled host: not yet.
+        state.profiles.insert(
+            "fresh.example".into(),
+            DomainProfile {
+                needs_tier2: true,
+                last_cold_check: n - 10,
+                ..Default::default()
+            },
+        );
+        // Stale but NOT walled: never probed (nothing to heal).
+        state.profiles.insert(
+            "easy.example".into(),
+            DomainProfile {
+                last_cold_check: n - 99_999,
+                ..Default::default()
+            },
+        );
+        let c = state.probe_candidates(6 * 3600, 3);
+        assert_eq!(c, vec!["staler.example", "stale.example"]);
+        let one = state.probe_candidates(6 * 3600, 1);
+        assert_eq!(one, vec!["staler.example"]);
+    }
+
+    #[test]
+    fn probe_inconclusive_rearms_without_touching_evidence() {
+        // Discriminating: inconclusive must change ONLY the probe
+        // cadence field. Wall flags, EWMAs, fetch counters stay put;
+        // an inconclusive probe is not evidence in either direction.
+        let mut state = GhostState::default();
+        let host = "walled.example";
+        state.profiles.insert(
+            host.into(),
+            DomainProfile {
+                needs_tier2: true,
+                fetch_count: 5,
+                last_cold_check: 1,
+                ..Default::default()
+            },
+        );
+        state.record_cold_walled(host, Some("cloudflare"));
+        // Simulate staleness (record_cold_walled stamps now(); the
+        // probe must re-arm from an OLD value to be observable).
+        state.profiles.get_mut(host).unwrap().last_cold_check = 1;
+        let before = state.profiles.get(host).unwrap().clone();
+        state.record_probe_inconclusive(host);
+        let after = state.profiles.get(host).unwrap();
+        assert!(after.last_cold_check > before.last_cold_check);
+        assert_eq!(after.needs_tier2, before.needs_tier2);
+        assert_eq!(after.fetch_count, before.fetch_count);
+        assert_eq!(after.t1_ewma, before.t1_ewma);
+        assert_eq!(after.t1_samples, before.t1_samples);
+        assert_eq!(after.walled_count, before.walled_count);
+    }
+
+    #[test]
+    fn note_probe_counts_and_respects_switches() {
+        let mut state = GhostState::default();
+        state.note_probe();
+        state.note_probe();
+        assert_eq!(state.probes_total, 2);
+        unsafe { std::env::set_var("DONSETCH_ROUTE_MEMORY_READONLY", "1") };
+        state.note_probe();
+        assert_eq!(state.probes_total, 2);
+        unsafe { std::env::remove_var("DONSETCH_ROUTE_MEMORY_READONLY") };
     }
 
     #[test]

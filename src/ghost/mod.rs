@@ -19,6 +19,7 @@ pub mod cdp;
 pub mod cloak;
 pub mod manager;
 pub mod ops;
+pub mod probe;
 pub mod proc;
 pub mod xvfb;
 
