@@ -31,12 +31,19 @@ use crate::fetch::client::Fetcher;
 pub const ECHO_ENDPOINT: &str = "https://tls.peet.ws/api/all";
 
 /// The fingerprint layers we track, one snapshot.
+use std::time::Duration;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FingerprintSnapshot {
     /// Free-text provenance: what produced this snapshot
     /// ("tier1 fetcher, profile chrome-151, linux", or the ghost
     /// chrome version). For human review of the fixture.
+    /// Defaulted: raw echo endpoints do not carry it; capture()
+    /// stamps it. Ghost-parsed snapshots carry it too.
+    #[serde(default)]
     pub source: String,
+    /// Defaulted like source
+    #[serde(default)]
     pub captured_at: String,
     pub user_agent: String,
     pub ja3: String,
@@ -63,6 +70,12 @@ pub async fn capture(fetcher: &Fetcher) -> Result<FingerprintSnapshot, String> {
         .fetch(ECHO_ENDPOINT)
         .await
         .map_err(|e| format!("echo endpoint fetch failed: {e}"))?;
+    // Operator debug: when DONSETCH_DEBUG_ECHO=1 the RAW echo lands
+    // in /tmp/ for offline diffing against the evergreen ghost
+    // capture (/tmp/ghost-echo-blob.json). Off by default.
+    if crate::config::env_flag("DONSETCH_DEBUG_ECHO") {
+        let _ = std::fs::write("/tmp/tier1-echo-raw.json", &out.body);
+    }
     parse_echo(&out.body, fetcher.profile().name)
 }
 
@@ -175,6 +188,49 @@ pub fn baseline_fixture() -> Result<FingerprintSnapshot, String> {
 
 pub fn parse_fixture_str(s: &str) -> Result<FingerprintSnapshot, String> {
     serde_json::from_str(s).map_err(|e| format!("stealth baseline fixture unreadable: {e}"))
+}
+
+/// Echo capture through the REAL local browser (ghost): the
+/// always-current reference for `doctor --stealth --parity`. No
+/// fixture involved: the comparison is tier-1 vs the browser on
+/// the floor, and it cannot go stale. The echo JSON arrives
+/// rendered in a <pre> block; carve the first JSON object out and
+/// parse. `None` when no usable local Chrome exists (doctor says
+/// so instead of pretending).
+pub async fn capture_via_ghost(
+    mgr: &std::sync::Arc<crate::ghost::manager::GhostManager>,
+) -> Result<FingerprintSnapshot, String> {
+    let profile = crate::profile::BrowserProfile::host_default();
+    let mut g = mgr
+        .acquire(&profile)
+        .await
+        .map_err(|e| format!("ghost acquire: {e}"))?;
+    let page = crate::ghost::ops::ghost_fetch(&mut g, ECHO_ENDPOINT, Duration::from_secs(35))
+        .await
+        .map_err(|e| format!("ghost render of the echo: {e}"))?;
+    let html = page.html;
+    let start = html
+        .find('{')
+        .ok_or("no echo JSON found in the browser page")?;
+    let end = html
+        .rfind('}')
+        .take_if(|e| *e > start)
+        .ok_or("no echo JSON end in the browser page")?
+        + 1;
+    let blob = &html[start..end];
+    let parse = parse_echo(blob.as_bytes(), "ghost real Chrome");
+    if parse.is_err()
+        && let Err(write_err) = std::fs::write("/tmp/ghost-echo-blob.json", blob.as_bytes())
+    {
+        eprintln!("ghost echo debug dump failed: {write_err}");
+    }
+    let mut snap = parse?;
+    snap.source = "ghost (real local Chrome)".to_string();
+    snap.captured_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    Ok(snap)
 }
 
 #[cfg(test)]

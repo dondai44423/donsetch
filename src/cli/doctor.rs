@@ -41,11 +41,14 @@ pub async fn run() {
     let only_mcp = args.iter().any(|a| a == "--mcp");
     let stealth = args.iter().any(|a| a == "--stealth");
     let stealth_record = args.iter().any(|a| a == "--stealth-record");
+    let parity = args.iter().any(|a| a == "--parity");
 
     // --stealth / --stealth-record: the drift scorecard (v4 phase
     // 0.4). Standalone mode: skips the general check battery.
+    // --parity (with --stealth, v4 phase 1.1): diff tier-1 against
+    // the REAL local browser instead of the fixture.
     if stealth || stealth_record {
-        let code = stealth_scorecard(stealth_record, json).await;
+        let code = stealth_scorecard(stealth_record, json, parity).await;
         std::process::exit(code);
     }
 
@@ -1306,7 +1309,11 @@ async fn apply_fixes(collected: &mut [(String, String, String, String)]) -> Resu
 /// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
 /// layers match the baseline, 1 drift or capture failure
 /// (--stealth-record writes the fixture and exits 0 on success).
-async fn stealth_scorecard(record: bool, json: bool) -> i32 {
+/// --parity (v4 phase 1.1) instead diffs the live tier-1 capture
+/// against the REAL local browser (ghost): the evergreen check,
+/// no fixture involved. It cannot go stale; it fails when the
+/// profile and the floor diverge.
+async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
     use crate::profile::scorecard;
 
     cli::print_title(&format!("{DISPLAY_NAME} Stealth Scorecard"));
@@ -1327,6 +1334,40 @@ async fn stealth_scorecard(record: bool, json: bool) -> i32 {
             return 1;
         }
     };
+
+    if parity {
+        let mgr = crate::ghost::manager::GhostManager::new().await;
+        return match scorecard::capture_via_ghost(&mgr).await {
+            Ok(ghost) => {
+                let report = scorecard::diff(&ghost, &live);
+                let bad = report.iter().filter(|v| !v.same).count();
+                println!("  parity scope: tier-1 vs LOCAL BROWSER (fixtureless, evergreen)");
+                println!();
+                for v in &report {
+                    let mark = if v.same { "ok  " } else { "DIFF" };
+                    println!("  [{mark}] {:<8}", v.layer);
+                    if !v.same {
+                        println!("       tier1:   {}", v.live);
+                        println!("       browser: {}", v.baseline);
+                    }
+                }
+                println!();
+                if bad == 0 {
+                    println!("  parity: tier 1 matches the local browser. Evergreen.");
+                    0
+                } else {
+                    eprintln!("  {bad} layer(s) diverged from the local browser.");
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("  ghost parity unavailable: {e}");
+                eprintln!("  (need a local Chrome: ghost must render the echo once)");
+                // Parity is best-effort evergreen, not the fixture gate.
+                1
+            }
+        };
+    }
 
     if record {
         let mut fixture = live.clone();

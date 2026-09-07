@@ -110,6 +110,18 @@ impl BrowserProfile {
                              ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:\
                              AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA",
                 groups: "X25519MLKEM768:X25519:P-256:P-384",
+                // NOTE (v4 parity finding, 2026-09-08): the floor's
+                // real Chromium 151 also pads sig-algs with three
+                // GREASE codes (0x0904/05/06) at the front. boring's
+                // public set_sigalgs_list validates against known
+                // algorithms and refuses them ([INVALID_SIGNATURE_
+                // ALGORITHM], live-proven), and upstream boringssl
+                // has NO sig-alg grease hook (its grease indexes:
+                // cipher/group/ext1/ext2/version/ticket/ech). Raw
+                // ClientHello extension injection would be needed:
+                // documented as the L1 evergreen work item in
+                // design/v4.md, doctor --stealth --parity surfaces
+                // the exact delta meanwhile.
                 sigalgs: "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
                           ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
                           rsa_pss_rsae_sha512:rsa_pkcs1_sha512",
