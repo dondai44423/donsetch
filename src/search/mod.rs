@@ -22,7 +22,7 @@ mod tasks;
 pub use render::{render_compact_markdown, render_markdown, render_meta};
 
 use enrich::PrewarmCache;
-use persist::{load_cache_disk, load_health_disk, save_cache_disk, save_health_disk};
+use persist::{load_cache_disk, load_health_disk, save_cache_disk, save_health_disk_if_dirty};
 use tasks::{EngineResult, TaskFut, engine_task, ghost_engine_task, vertical_task};
 
 use std::collections::HashMap;
@@ -63,13 +63,9 @@ fn cache_ttl(intent: Intent, query: &str) -> Duration {
         "deadline",
         "release date",
         "news",
-        "2024",
-        "2025",
-        "2026",
-        "2027",
     ];
     let q = query.to_lowercase();
-    if RECENCY.iter().any(|s| q.contains(s)) {
+    if RECENCY.iter().any(|s| q.contains(s)) || recency_year_in(&q) {
         return Duration::from_secs(300);
     }
     match intent {
@@ -77,6 +73,30 @@ fn cache_ttl(intent: Intent, query: &str) -> Duration {
         Intent::Code => Duration::from_secs(900),
         _ => Duration::from_secs(1800),
     }
+}
+
+/// Year mentions inside the [current-2, current+1] window are
+/// time-sensitive ("inflation 2026"); outside years ("cars 1998",
+/// "medieval 1400") cache normally. Generated from the clock so the
+/// window rolls forward automatically (was a hardcoded list that
+/// would rot in 2028).
+fn recency_year_in(q: &str) -> bool {
+    let y = current_year();
+    ((y - 2)..=(y + 1)).any(|yy| q.contains(&yy.to_string()))
+}
+
+/// UTC calendar year without a date dependency: days since epoch ->
+/// civil year (Howard Hinnant's algorithm).
+fn current_year() -> i64 {
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    era * 400 + yoe + 1
 }
 
 /// Normalize a query for cache keys: casing, punctuation
@@ -113,6 +133,10 @@ pub struct Searcher {
     /// keeps that memory across daemon restarts instead of
     /// re-paying the same failure every boot.
     trust: Mutex<HashMap<String, f64>>,
+    /// Set on any health-map mutation; the disk save swaps it off
+    /// and skips the write entirely when nothing changed (was: a
+    /// clone + serialize + write on every uncached search).
+    health_dirty: std::sync::atomic::AtomicBool,
     /// normalized-query cache: zero egress cost on repeats.
     /// Stores up to 12 results; reads truncate to the
     /// requested max so max_results variants share entries.
@@ -195,6 +219,7 @@ impl Searcher {
             fetcher,
             pool,
             trust: Mutex::new(trust),
+            health_dirty: std::sync::atomic::AtomicBool::new(false),
             cache: Mutex::new(load_cache_disk()),
             failures: Mutex::new(failures),
             inflight: Mutex::new(std::collections::HashSet::new()),
@@ -275,6 +300,8 @@ impl Searcher {
             e.0 += 1;
             e.1 = Instant::now();
         }
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn search(
@@ -292,7 +319,7 @@ impl Searcher {
         // max_results: the leader publishes the full top-12 into
         // the cache, so a query run once at max=2 and again at
         // max=10 shares one fan-out instead of paying two.
-        let sf_key = format!("{}|{intent_probe:?}", norm_query(query));
+        let sf_key = format!("{}|{}", norm_query(query), intent_probe.code());
         let leader = {
             let mut m = self
                 .inflight
@@ -309,8 +336,8 @@ impl Searcher {
                 let hit = self
                     .cache
                     .lock()
-                    .unwrap()
-                    .get(&format!("{}|{intent_probe:?}", norm_query(query)))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&format!("{}|{}", norm_query(query), intent_probe.code()))
                     .cloned();
                 if let Some((at, cached, total)) = hit
                     && at.elapsed() < cache_ttl(intent_probe, query)
@@ -351,7 +378,7 @@ impl Searcher {
         // re-lists the same tail.
         let max_results = max_results.clamp(1, 12);
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
-        let cache_key = format!("{}|{intent:?}", norm_query(query));
+        let cache_key = format!("{}|{}", norm_query(query), intent.code());
 
         if let Some((at, cached, total)) = self
             .cache
@@ -645,7 +672,7 @@ impl Searcher {
                     .failures
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                save_health_disk(&t, &f);
+                save_health_disk_if_dirty(self, &t, &f);
             }
             return Err(FetchError::Http(format!(
                 "search: all engines failed : {}",
@@ -747,7 +774,7 @@ impl Searcher {
                 .failures
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            save_health_disk(&t, &f);
+            save_health_disk_if_dirty(self, &t, &f);
         }
 
         Ok(SearchOutcome {
@@ -770,6 +797,8 @@ impl Searcher {
         let t = trust.entry(base_engine.to_string()).or_insert(1.0);
         let target = if ok { 1.2 } else { 0.3 };
         *t = (*t * 0.7 + target * 0.3).clamp(0.2, 2.0);
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -951,7 +980,7 @@ mod tests {
         trust.insert("bing".to_string(), 0.42);
         let mut failures = HashMap::new();
         failures.insert("google".to_string(), (3, Instant::now()));
-        save_health_disk(&trust, &failures);
+        crate::search::persist::save_health_disk(&trust, &failures);
 
         let (t, f) = load_health_disk();
         assert_eq!(t["brave"], 1.8, "high trust survives");

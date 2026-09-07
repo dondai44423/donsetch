@@ -85,16 +85,33 @@ pub async fn run() {
 
     // ── Proxies ──────────────────────────────────────────────
 
-    let proxies = proxy::load_config();
+    let (proxies, skipped_proxy_lines) = proxy::load_config_verbose();
     if proxies.is_empty() {
-        cli::print_kv(
-            "proxies",
-            &format!("{} (direct connection)", cli::dim("none")),
-        );
+        if skipped_proxy_lines > 0 {
+            cli::print_kv(
+                "proxies",
+                &format!(
+                    "{} ({} invalid line(s) ignored in {})",
+                    cli::yellow("warn"),
+                    skipped_proxy_lines,
+                    cli::dim("proxies.txt")
+                ),
+            );
+        } else {
+            cli::print_kv(
+                "proxies",
+                &format!("{} (direct connection)", cli::dim("none")),
+            );
+        }
     } else {
         let n = proxies.len();
         let word = if n == 1 { "proxy" } else { "proxies" };
-        cli::print_kv("proxies", &format!("{} {} configured", n, word));
+        let skipped = if skipped_proxy_lines > 0 {
+            format!(", {} invalid line(s) ignored", skipped_proxy_lines)
+        } else {
+            String::new()
+        };
+        cli::print_kv("proxies", &format!("{} {} configured{}", n, word, skipped));
     }
 
     // ── Cache ────────────────────────────────────────────────

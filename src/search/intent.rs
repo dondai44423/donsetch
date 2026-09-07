@@ -10,6 +10,34 @@ pub enum Intent {
     Entity,
 }
 
+impl Intent {
+    /// Stable u8 code for disk-backed keys (query cache). Debug strings
+    /// coupled the disk format to variant names: renaming a variant
+    /// silently remapped or orphaned old entries.
+    pub fn code(self) -> u8 {
+        match self {
+            Intent::Web => 0,
+            Intent::Code => 1,
+            Intent::Paper => 2,
+            Intent::News => 3,
+            Intent::Entity => 4,
+        }
+    }
+
+    /// Inverse of `code`; unknown values fall back to Web. Legacy
+    /// Debug-string entries (one TTL generation) are remapped by
+    /// `from_legacy_debug` at load time.
+    pub fn from_code(c: u8) -> Self {
+        match c {
+            1 => Intent::Code,
+            2 => Intent::Paper,
+            3 => Intent::News,
+            4 => Intent::Entity,
+            _ => Intent::Web,
+        }
+    }
+}
+
 /// Intent is ADVISORY, never a gate: it selects bonus
 /// priors and which verticals join the fan-out. Wrong
 /// intent must never ruin a query : so signals split

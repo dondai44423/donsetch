@@ -61,14 +61,20 @@ pub(crate) fn load_cache_disk() -> CacheMap {
     };
     for (key, age, results, total) in entries {
         // TTL is intent + recency keyed (the query text
-        // is the key's first segment).
+        // is the key's first segment). Keys carry a stable u8
+        // intent code; pre-code entries carry the Debug string and
+        // remap by name for one TTL generation.
         let (qpart, ipart) = key.rsplit_once('|').unwrap_or((key.as_str(), ""));
-        let intent = match ipart {
-            "News" => Intent::News,
-            "Code" => Intent::Code,
-            "Paper" => Intent::Paper,
-            "Entity" => Intent::Entity,
-            _ => Intent::Web,
+        let intent = if let Ok(code) = ipart.parse::<u8>() {
+            Intent::from_code(code)
+        } else {
+            match ipart {
+                "News" => Intent::News,
+                "Code" => Intent::Code,
+                "Paper" => Intent::Paper,
+                "Entity" => Intent::Entity,
+                _ => Intent::Web,
+            }
         };
         let ttl = cache_ttl(intent, qpart);
         if Duration::from_secs(age) < ttl {
@@ -147,4 +153,21 @@ pub(crate) fn save_health_disk(
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(tmp, path);
     }
+}
+
+/// Dirty-flag wrapper: skips the disk write entirely when no health
+/// mutation happened since the last save (was: clone + serialize +
+/// write on every uncached search, a few KB per query).
+pub(crate) fn save_health_disk_if_dirty(
+    searcher: &super::Searcher,
+    trust: &HashMap<String, f64>,
+    failures: &HashMap<String, (u32, Instant)>,
+) {
+    if !searcher
+        .health_dirty
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    save_health_disk(trust, failures);
 }

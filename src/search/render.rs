@@ -281,6 +281,15 @@ pub fn render_compact_markdown(
 }
 
 /// structuredContent metadata.
+/// The egress label for the machine meta: the known trio pass
+/// through, anything else is a proxy chain.
+fn egress_label(raw: &str) -> String {
+    match raw {
+        "direct" | "byok" | "ghost" => raw.to_string(),
+        _ => "proxy".to_string(),
+    }
+}
+
 pub fn render_meta(out: &SearchOutcome) -> Value {
     json!({
         "intent": format!("{:?}", out.intent),
@@ -310,7 +319,7 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
         }).collect::<Vec<_>>(),
         "engines": out.report.iter().map(|r| json!({
             "engine": r.engine, "status": r.status, "hits": r.hits, "ms": r.ms,
-            "egress": if r.egress == "direct" { "direct".to_string() } else if r.egress == "byok" { "byok".to_string() } else if r.egress == "ghost" { "ghost".to_string() } else { "proxy".to_string() },
+            "egress": egress_label(&r.egress),
         })).collect::<Vec<_>>(),
     })
 }

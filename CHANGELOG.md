@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+**Audit wave (2026-09-07): every finding from the post-3.6.6 refactor
+audit, verified live before fixing, discriminating tests on the fixes.**
+
+- **S1 (security):** the certificate-decompression callback reserved
+  the SERVER-declared uncompressed length upfront; a hostile origin
+  could declare 4 GiB and trigger the reservation before any byte
+  arrived. Refused above 16 MiB (far past any real chain),
+  discriminator-tested with the callback directly.
+- **B2:** conditional revalidation headers (If-None-Match/If-Modified-
+  Since) minted for the original URL rode every redirect hop; a
+  colliding ETag on the target produced a false 304. Fixed + proven
+  with an E2E rig: pre-fix the second hop carries the stale validator
+  and the caller merges the wrong cached body; post-fix the redirect
+  target answers a real 200. Reverting the fix fails the test.
+- **B6:** the cookie export (`snapshot_for`) hard-coded `path: "/"`,
+  widening path-scoped cookies on the export/import cycle. The real
+  path is carried now (regression test).
+- **B1:** the search single-flight follower read the cache mutex with
+  a poison-panic; one transient panic mid-lock would outage every
+  search in the daemon. Poison-safe like every other access.
+- **E15 (curl parity):** the env proxy is re-evaluated per redirect
+  hop against NO_PROXY; a redirect to a NO_PROXY-covered host dials
+  direct instead of riding the proxy for the rest of the chain.
+  Discriminator test: post-fix the second hop arrives origin-form at
+  the direct server, pre-fix it arrives absolute-form at the proxy.
+- **E4 (RFC 9112 6.3):** differing Content-Length values on one
+  response are rejected as invalid (request-smuggling class); the
+  same value repeated stays tolerated (HTTP/1.0 proxy reality).
+- **E14:** the cookie `Expires=` date form is parsed now (IMF-fixdate
+  + RFC 850 + asctime, RFC 6265 5.1.1 tolerance); date-expired
+  cookies no longer live as session cookies or leak into the vault
+  export. Max-Age keeps precedence. Canonical-vector tested.
+- **E13:** an unparseable cookie Max-Age is IGNORED (RFC 6265 5.2.2:
+  session cookie), not turned into a 1-second cookie.
+- **E12:** `Vary: *` responses are never stored in the revalidation
+  cache (Chrome parity; a stored variant would serve stale forever).
+- **E11:** revalidation-cache eviction is FIFO by insert order, not
+  an arbitrary HashMap victim.
+- **E10:** layered `Content-Encoding` (`gzip, br`) peels both layers
+  instead of a hard fetch error.
+- **E1 (curl 7.86 parity):** NO_PROXY understands bracketed IPv6 and
+  bare IPv6 literals, CIDR networks (`192.168.0.0/16`) and
+  `host:port` entries.
+- **E5:** unsupported proxy schemes (`socks4://`, `https://` upstream
+  proxies...) are rejected at parse with a clear message instead of
+  parsing as HTTP and dying at dial time with a confusing error.
+- **E9:** the query-cache recency window for year mentions is
+  generated from the clock ([current-2, current+1]); the hardcoded
+  2024-2027 list would have made every 2028 query cache as evergreen.
+- **E7:** the query-cache key embeds a stable u8 intent code instead
+  of the Intent Debug string (renaming a variant used to remap or
+  orphan old cache entries).
+- **E16:** the BMP magic check now requires the declared file-size
+  field to be plausible against the body length; a plain-text
+  document starting with "BM" no longer classifies as binary.
+- **E19:** the raw-text fallback thresholds are named shared consts.
+- **L1:** the SSL_CERT_FILE/SSL_CERT_DIR bundle is cached keyed on
+  (path, size, mtime); was re-read and re-parsed on every connector
+  build (every fetch) in interception networks.
+- **L7:** the async DNS-aware SSRF gate runs exactly once per
+  request (inside the request path); the outer gate kept only the
+  synchronous literal checks for cache-fresh returns, and the
+  redirect hop's duplicate pre-gate is gone. Was 2x resolver RTT
+  per fetch and per hop.
+- **L2:** h1's naive `windows().position()` scans replaced by
+  memmem (sublinear); the old loop was quadratic on slow-drip
+  header responses.
+- **L4:** the engine-health disk save is debounced by a dirty flag;
+  was a clone + serialize + write on every uncached search.
+- **L9:** the SPA-shape detector counts `aria-busy` markers with an
+  ASCII-case-insensitive scan instead of lowercasing the whole
+  document.
+- **Q1:** unparseable proxy lines are counted and surfaced in
+  `donsetch status` ("N invalid line(s) ignored") instead of being
+  dropped silently.
+- **Q3/Q4:** the wall-classification verdict is scored inside the
+  response-finalizer (one site of truth instead of every caller
+  re-detecting), and the egress label chain is a mapping function.
+
 ### Added
 
 - **Structured-content compat for Claude Code / VS Code (issue #27,

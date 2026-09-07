@@ -18,6 +18,15 @@ use super::{ExtractOptions, Extracted};
 ///
 /// Returns None when there's < 200 chars of visible text : the
 /// page is genuinely empty (JS shell or block page).
+// Shared fallback thresholds (E19: duplicated between extract() and
+// text_fallback, guaranteed to drift).
+/// A page below this much extracted text (and no focus query) triggers
+/// the raw-text fallback pass.
+pub const FALLBACK_MIN_TEXT: usize = 200;
+/// A fallback page below this much real text is classified thin
+/// (agent signal: this looks like a JS shell).
+pub const FALLBACK_THIN_TEXT: usize = 800;
+
 pub fn text_fallback(
     html_text: &str,
     meta: &metadata::Meta,
@@ -75,7 +84,7 @@ pub fn text_fallback(
         blocks_total,
         blocks_shown: blocks_total,
         tokens_est,
-        thin: total_text < 800,
+        thin: total_text < FALLBACK_THIN_TEXT,
         content_kind: ContentKind::Page,
         lang: "unknown".to_string(),
         quality: 0.3, // lower quality than block-based extraction

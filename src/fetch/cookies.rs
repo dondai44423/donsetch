@@ -201,18 +201,44 @@ impl CookieJar {
                             }
                         }
                         "path" => path = val.trim().to_string(),
+                        "expires" => {
+                            // RFC 6265 5.2.1: a non-parseable Expires is
+                            // IGNORED; a past date expires the cookie.
+                            // Max-Age takes precedence (5.4): only fill
+                            // in from Expires when Max-Age said nothing.
+                            if !expired
+                                && expires_at.is_none()
+                                && let Some(unix) = parse_http_date(val.trim())
+                            {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                if unix <= now {
+                                    expired = true;
+                                } else {
+                                    expires_at = Some(unix);
+                                }
+                            }
+                        }
                         "max-age" => {
-                            let secs: i64 = val.trim().parse().unwrap_or(1);
-                            if secs <= 0 {
-                                expired = true;
-                            } else {
-                                expires_at = Some(
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs())
-                                        .unwrap_or(0)
-                                        + secs as u64,
-                                );
+                            // RFC 6265 5.2.2: an unparseable Max-Age is
+                            // IGNORED (the cookie stays a session
+                            // cookie); only a parsed value <= 0 expires.
+                            // Was: unwrap_or(1) turned any parse miss
+                            // into a 1-second cookie.
+                            match val.trim().parse::<i64>() {
+                                Ok(secs) if secs <= 0 => expired = true,
+                                Ok(secs) => {
+                                    expires_at = Some(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0)
+                                            + secs as u64,
+                                    );
+                                }
+                                Err(_) => {}
                             }
                         }
                         "samesite" => {
@@ -352,7 +378,11 @@ impl CookieJar {
                 name: c.name.clone(),
                 value: c.value.clone(),
                 domain: c.domain.clone(),
-                path: "/".to_string(),
+                // Carry the real path: a hard-coded "/" widens
+                // path-scoped cookies on the export/import cycle
+                // (snapshot -> vault replant -> store_raw), letting a
+                // cookie scoped to /secret leak onto the whole domain.
+                path: c.path.clone(),
                 expires_at: c.expires_at,
                 secure: c.secure,
                 http_only: c.http_only,
@@ -420,6 +450,100 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// RFC 7231 IMF-fixdate, plus the two obsolete forms the RFC tells
+/// recipients to accept (RFC 850, asctime). Returns unix seconds.
+/// Used for the cookie `Expires=` attribute (E14: the date form was
+/// previously not parsed at all, so date-expired cookies lived as
+/// session cookies and got exported to the vault).
+fn parse_http_date(s: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let month_of = |m: &str| {
+        MONTHS
+            .iter()
+            .position(|x| m.len() >= 3 && m[..3].eq_ignore_ascii_case(x))
+    };
+    let secs_of = |y: i64, mo: usize, d: i64, hh: i64, mm: i64, ss: i64| {
+        if !(1..=12).contains(&(mo as i64 + 1)) || !(1..=31).contains(&d) {
+            return None;
+        }
+        // Howard Hinnant's days_from_civil.
+        let mp: i64 = (mo as i64 + 10) % 12;
+        let y = if mo >= 2 { y } else { y - 1 };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(((days * 86_400) + hh * 3600 + mm * 60 + ss).max(0) as u64)
+    };
+    let s = s.trim();
+    // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
+    if let Some(rest) = s.split_once(", ") {
+        let parts: Vec<&str> = rest.1.split_ascii_whitespace().collect();
+        if parts.len() >= 4 {
+            let day: i64 = parts[0].parse().ok()?;
+            let mon = month_of(parts[1])?;
+            let year: i64 = parts[2].parse().ok()?;
+            let t: Vec<&str> = parts[3].split(':').collect();
+            if t.len() == 3
+                && let (Ok(hh), Ok(mm), Ok(ss)) = (
+                    t[0].parse::<i64>(),
+                    t[1].parse::<i64>(),
+                    t[2].parse::<i64>(),
+                )
+            {
+                return secs_of(year, mon, day, hh, mm, ss);
+            }
+        }
+        // RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
+        let dmy: Vec<&str> = rest.1.split_ascii_whitespace().collect();
+        if !dmy.is_empty() {
+            let seg: Vec<&str> = dmy[0].split('-').collect();
+            if seg.len() == 3 {
+                let day: i64 = seg[0].parse().ok()?;
+                let mon = month_of(seg[1])?;
+                let yy: i64 = seg[2].parse().ok()?;
+                let year = if yy < 100 {
+                    if yy < 70 { 2000 + yy } else { 1900 + yy }
+                } else {
+                    yy
+                };
+                let t: Vec<&str> = dmy.get(1)?.split(':').collect();
+                if t.len() == 3
+                    && let (Ok(hh), Ok(mm), Ok(ss)) = (
+                        t[0].parse::<i64>(),
+                        t[1].parse::<i64>(),
+                        t[2].parse::<i64>(),
+                    )
+                {
+                    return secs_of(year, mon, day, hh, mm, ss);
+                }
+            }
+        }
+        return None;
+    }
+    // asctime: Sun Nov  6 08:49:37 1994
+    let parts: Vec<&str> = s.split_ascii_whitespace().collect();
+    if parts.len() == 5 {
+        let mon = month_of(parts[1])?;
+        let day: i64 = parts[2].parse().ok()?;
+        let t: Vec<&str> = parts[3].split(':').collect();
+        if t.len() == 3
+            && let (Ok(hh), Ok(mm), Ok(ss)) = (
+                t[0].parse::<i64>(),
+                t[1].parse::<i64>(),
+                t[2].parse::<i64>(),
+            )
+        {
+            let year: i64 = parts[4].parse().ok()?;
+            return secs_of(year, mon, day, hh, mm, ss);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -992,5 +1116,139 @@ mod tests {
         let snap = jar.snapshot_for("example.com");
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].same_site, "none");
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn parse_http_date_imf_fixdate() {
+        let secs = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        assert_eq!(secs, 784111777, "canonical RFC 7231 example");
+        let leap = parse_http_date("Wed, 29 Feb 2023 00:00:00 GMT");
+        assert!(
+            leap.is_some(),
+            "non-leap Feb 29 still parses (validates range)"
+        );
+    }
+
+    #[test]
+    fn parse_http_date_rfc850_and_asctime() {
+        // Sunday, 06-Nov-94 08:49:37 GMT == the same instant.
+        assert_eq!(
+            parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"),
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+        // asctime: Sun Nov  6 08:49:37 1994
+        assert_eq!(
+            parse_http_date("Sun Nov  6 08:49:37 1994"),
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+    }
+
+    #[test]
+    fn parse_http_date_rejects_garbage() {
+        assert!(parse_http_date("not a date").is_none());
+        assert!(parse_http_date("").is_none());
+        assert!(parse_http_date("Sun, 99 Xxx 1994 08:49:37 GMT").is_none());
+    }
+
+    #[test]
+    fn store_from_headers_expires_date_form_is_honored() {
+        let mut jar = CookieJar::new();
+        let host = "example.org";
+        let future = "Wed, 01 Jan 2031 00:00:00 GMT";
+        jar.store_from_headers(
+            host,
+            &[(
+                "set-cookie".to_string(),
+                format!("sid=1; Path=/p; Expires={future}"),
+            )],
+            true,
+        );
+        let snap = jar.snapshot_for("example.org");
+        assert!(
+            snap.iter()
+                .any(|c| c.name == "sid" && c.path == "/p" && c.expires_at.is_some()),
+            "date-form expiry parsed and carried: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn store_from_headers_max_age_wins_over_expires() {
+        let mut jar = CookieJar::new();
+        let host = "example.org";
+        jar.store_from_headers(
+            host,
+            &[(
+                "set-cookie".to_string(),
+                "sid=2; Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+            )],
+            true,
+        );
+        let snap = jar.snapshot_for("example.org");
+        let c = snap
+            .iter()
+            .find(|c| c.name == "sid")
+            .expect("cookie stored");
+        assert!(c.expires_at.is_some(), "Max-Age kept the cookie alive");
+        assert!(
+            c.expires_at.unwrap() > now_secs(),
+            "Expires in 1970 must not win"
+        );
+    }
+
+    #[test]
+    fn store_from_headers_unparseable_max_age_stays_session_cookie() {
+        let mut jar = CookieJar::new();
+        let host = "example.org";
+        jar.store_from_headers(
+            host,
+            &[("set-cookie".to_string(), "sid=3; Max-Age=abc".to_string())],
+            true,
+        );
+        let snap = jar.snapshot_for("example.org");
+        let c = snap
+            .iter()
+            .find(|c| c.name == "sid")
+            .expect("cookie stored");
+        assert!(
+            c.expires_at.is_none(),
+            "unparseable Max-Age = session cookie (RFC 6265)"
+        );
+    }
+
+    #[test]
+    fn store_from_headers_past_expires_expires_immediately() {
+        let mut jar = CookieJar::new();
+        let host = "example.org";
+        jar.store_from_headers(
+            host,
+            &[(
+                "set-cookie".to_string(),
+                "sid=4; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+            )],
+            true,
+        );
+        let snap = jar.snapshot_for("example.org");
+        assert!(
+            !snap.iter().any(|c| c.name == "sid"),
+            "past-dated Expires must not leave a live cookie"
+        );
+    }
+
+    #[test]
+    fn snapshot_for_carries_real_paths() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.org",
+            &[("set-cookie".to_string(), "k=v; Path=/secret".to_string())],
+            true,
+        );
+        let snap = jar.snapshot_for("example.org");
+        let c = snap.iter().find(|c| c.name == "k").expect("cookie");
+        assert_eq!(c.path, "/secret", "export must keep the real path (B6)");
     }
 }

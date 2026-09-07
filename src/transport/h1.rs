@@ -124,10 +124,27 @@ where
     let is_chunked = headers_out
         .iter()
         .any(|(n, v)| n == "transfer-encoding" && v.contains("chunked"));
-    let content_len: Option<usize> = headers_out
+    // RFC 9112 6.3: a message with multiple, different Content-Length
+    // values is invalid (request-smuggling class); browsers reject it.
+    // Same value repeated is tolerated. Parse failure on ANY of them is
+    // also invalid per RFC; stay lenient there (treat as absent) but
+    // reject the conflicting-values case outright.
+    let mut content_lens: Vec<usize> = headers_out
         .iter()
-        .find(|(n, _)| n == "content-length")
-        .and_then(|(_, v)| v.parse().ok());
+        .filter(|(n, _)| n == "content-length")
+        .filter_map(|(_, v)| v.trim().parse().ok())
+        .collect();
+    content_lens.sort_unstable();
+    content_lens.dedup();
+    let content_len = match content_lens.as_slice() {
+        [] => None,
+        [one] => Some(*one),
+        conflicting => {
+            return Err(FetchError::Http(format!(
+                "h1: conflicting content-length headers: {conflicting:?}"
+            )));
+        }
+    };
 
     if is_chunked {
         body = read_chunked(stream, body).await?;
@@ -168,7 +185,10 @@ where
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+    // memmem is sublinear (two-way search); the naive windows scan was
+    // O(n*m) and re-scanned from byte 0 after every 16 KiB trickle
+    // (quadratic on slow-drip responses).
+    memchr::memmem::find(hay, needle)
 }
 
 /// Decode chunked transfer coding from `prefix` (already-read bytes) + stream.
@@ -246,6 +266,26 @@ where
 
 #[cfg(test)]
 mod tests {
+    // RFC 9112 6.3: differing Content-Length values = invalid message
+    // (request-smuggling class). Browsers reject; we do too.
+    #[tokio::test]
+    async fn conflicting_content_length_is_rejected() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\ncontent-length: 9\r\n\r\nhello";
+        let mut s = RO(&wire[..]);
+        match get(&mut s, "/", &[]).await {
+            Ok(r) => panic!("must reject conflicting lengths, got status {}", r.status),
+            Err(e) => assert!(e.to_string().contains("content-length"), "{e}"),
+        }
+    }
+
+    // The same value repeated is tolerated (HTTP/1.0 proxies do this).
+    #[tokio::test]
+    async fn repeated_identical_content_length_is_tolerated() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\ncontent-length: 5\r\n\r\nhello";
+        let mut s = RO(&wire[..]);
+        let resp = get(&mut s, "/", &[]).await.expect("valid message");
+        assert_eq!(resp.body, b"hello");
+    }
     use super::*;
     use std::pin::Pin;
     use std::sync::Arc;

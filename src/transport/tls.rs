@@ -36,6 +36,13 @@ unsafe extern "C" fn cert_decompress_brotli(
     in_len: usize,
 ) -> std::os::raw::c_int {
     unsafe {
+        // The length is server-declared: a hostile origin can ask for
+        // gigabytes and this callback would reserve them upfront. Real
+        // chains never come close to 16 MiB (Chrome bounds the same
+        // way); refuse anything larger.
+        if uncompressed_len > 16 << 20 {
+            return 0;
+        }
         let compressed = std::slice::from_raw_parts(input, in_len);
         let mut decompressed = Vec::with_capacity(uncompressed_len);
         if std::io::Read::read_to_end(
@@ -184,11 +191,64 @@ fn build_connector_with(
 /// verifiable, so it is appended to the platform store on every
 /// connector build.
 fn load_env_roots() -> Vec<X509> {
-    let mut out = Vec::new();
-    for path in std::env::vars_os()
+    // The bundle is re-read on every connector build (every fetch);
+    // cache it keyed on the observed path identity (size + mtime for
+    // files, mtime for dirs). A changed or removed bundle invalidates
+    // the cache; a fresh process sees env changes immediately.
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<EnvRootsCache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(EnvRootsCache::default()));
+    let Ok(mut cache) = cache.lock() else {
+        return Vec::new();
+    };
+    let key = env_roots_fingerprint();
+    if cache.key == Some(key.clone()) {
+        return cache.roots.clone();
+    }
+    let roots = read_env_roots();
+    cache.key = Some(key);
+    cache.roots = roots.clone();
+    roots
+}
+
+#[derive(Default)]
+struct EnvRootsCache {
+    key: Option<Vec<(std::path::PathBuf, u64, u64)>>,
+    roots: Vec<X509>,
+}
+
+/// Identity of the env bundle: (path, len, mtime) per entry; dirs are
+/// keyed by (path, 0, mtime-of-dir). Parse errors keep the old parse:
+/// content changes that keep identity are not worth rescanning for.
+fn env_roots_fingerprint() -> Vec<(std::path::PathBuf, u64, u64)> {
+    let mut fp = Vec::new();
+    for path in env_root_paths() {
+        match std::fs::metadata(&path) {
+            Ok(md) => {
+                let len = if path.is_dir() { 0 } else { md.len() };
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                fp.push((path, len, mtime));
+            }
+            Err(_) => fp.push((path, u64::MAX, u64::MAX)),
+        }
+    }
+    fp
+}
+
+fn env_root_paths() -> Vec<std::path::PathBuf> {
+    std::env::vars_os()
         .filter_map(|(k, v)| (k == "SSL_CERT_FILE" || k == "SSL_CERT_DIR").then_some(v))
         .map(std::path::PathBuf::from)
-    {
+        .collect()
+}
+
+fn read_env_roots() -> Vec<X509> {
+    let mut out = Vec::new();
+    for path in env_root_paths() {
         let entries: Vec<std::path::PathBuf> = if path.is_dir() {
             let Ok(rd) = std::fs::read_dir(&path) else {
                 continue;
@@ -480,6 +540,86 @@ mod tests {
         // assertion: the file is read, blocks are split.
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(pem_certs(&bytes).len(), 2);
-        let _ = load_env_roots(); // exercises the full env path
+        let roots = load_env_roots(); // exercises the full env path
+        // S1 companion (L1): the bundle parse is cached on (path,
+        // len, mtime). A second call hits the cache and returns the
+        // same roots without re-reading.
+        let roots2 = load_env_roots();
+        assert_eq!(roots.len(), roots2.len());
+    }
+
+    #[test]
+    fn env_roots_cache_key_tracks_path_identity() {
+        let dir = std::env::temp_dir().join(format!("dscache{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binding = rcgen::generate_simple_self_signed(vec!["example.org".to_string()]).unwrap();
+        let ca = binding.cert.der();
+        let path = dir.join("ca.der");
+        std::fs::write(&path, ca).unwrap();
+        // SAFETY: nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", &path);
+            std::env::remove_var("SSL_CERT_DIR");
+        }
+        let first = load_env_roots();
+        assert_eq!(first.len(), 1, "der bundle parses to one cert");
+        // Same identity -> cache hit, same result.
+        assert_eq!(load_env_roots().len(), 1);
+        // New path with different content -> new identity, re-read.
+        let path2 = dir.join("ca2.der");
+        std::fs::write(&path2, [0u8; 64]).unwrap();
+        unsafe { std::env::set_var("SSL_CERT_FILE", &path2) };
+        assert!(load_env_roots().is_empty(), "garbage file parses to zero");
+    }
+
+    #[test]
+    fn decompress_rejects_hostile_declared_size() {
+        // S1: the server-declared uncompressed length used to reserve
+        // memory upfront. A hostile 4 GiB declaration must bail with
+        // 0 BEFORE any allocation (pre-fix: with_capacity(4 GiB) ->
+        // abort/OOM right here).
+        let mut out: *mut boring_sys::CRYPTO_BUFFER = std::ptr::null_mut();
+        let rc = unsafe {
+            cert_decompress_brotli(
+                std::ptr::null_mut(),
+                &mut out,
+                u32::MAX as usize,
+                [].as_ptr(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "oversized declaration refused, nothing allocated");
+    }
+
+    #[test]
+    fn decompress_roundtrip_small_payload() {
+        // Positive path still works: a real brotli blob decompresses
+        // into a CRYPTO_BUFFER of the declared length.
+        let payload = b"MIIB2 certification payload for the roundtrip";
+        let mut compressed = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+            enc.write_all(payload).unwrap();
+        }
+        let mut out: *mut boring_sys::CRYPTO_BUFFER = std::ptr::null_mut();
+        let rc = unsafe {
+            cert_decompress_brotli(
+                std::ptr::null_mut(),
+                &mut out,
+                payload.len(),
+                compressed.as_ptr(),
+                compressed.len(),
+            )
+        };
+        assert_eq!(rc, 1, "decompressed into the allocated buffer");
+        assert!(!out.is_null());
+        unsafe {
+            let len = boring_sys::CRYPTO_BUFFER_len(out);
+            assert_eq!(len, payload.len());
+            let data = std::slice::from_raw_parts(boring_sys::CRYPTO_BUFFER_data(out), len);
+            assert_eq!(data, payload);
+            boring_sys::CRYPTO_BUFFER_free(out);
+        }
     }
 }

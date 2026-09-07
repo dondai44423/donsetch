@@ -311,7 +311,6 @@ pub fn is_binary_body(body: &[u8]) -> bool {
         b"\x89PNG",
         b"\xff\xd8\xff",
         b"GIF8",
-        b"BM",
         b"\x1f\x8b",
         b"PK\x03\x04",
         b"\x7fELF",
@@ -324,6 +323,16 @@ pub fn is_binary_body(body: &[u8]) -> bool {
         if body.starts_with(m) {
             return true;
         }
+    }
+    // BMP is a bare 2-byte "BM" + a 4-byte LE file size. A text/plain
+    // document can also start with "BM" ("BMW..."), so require the
+    // declared size field to be plausible against the body length
+    // (E16); anything else falls through to the byte statistics below.
+    if body.len() >= 6
+        && body.starts_with(b"BM")
+        && u32::from_le_bytes([body[2], body[3], body[4], body[5]]) as usize <= body.len()
+    {
+        return true;
     }
     let scan = &body[..body.len().min(1024)];
     let nulls = scan.iter().filter(|&&b| b == 0).count();
@@ -339,6 +348,19 @@ pub fn is_binary(body: &[u8], content_type: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bm_text_prefix_is_not_binary_but_real_bmp_is() {
+        // A plain-text article starting with "BM": declared size field
+        // is nonsense against the body length -> text.
+        let text = b"BMW just unveiled the 2027 iX5 with 800km range";
+        assert!(!is_binary_body(text), "E16: BM text false positive");
+        // A real BMP: header size field = plausible file length.
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&100u32.to_le_bytes());
+        bmp.extend_from_slice(&[0u8; 96]);
+        assert!(is_binary_body(&bmp), "real BMP still binary");
+    }
     use super::*;
 
     #[test]

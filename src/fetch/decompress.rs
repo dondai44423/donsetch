@@ -45,8 +45,48 @@ pub fn decompress(encoding: &str, body: &[u8]) -> Result<Vec<u8>, FetchError> {
                 .map_err(|e| FetchError::Http(format!("zstd: {e}")))?;
             read_capped(dec)
         }
-        other => Err(FetchError::Http(format!(
-            "unknown content-encoding: {other}"
-        ))),
+        other => {
+            // Layered encodings ("gzip, br", rare but real): peel one
+            // layer per pass, innermost last. The cap applies to the
+            // final size.
+            if let Some((outer, inner)) = other.split_once(", ").or_else(|| other.split_once(",")) {
+                let middle = decompress(inner.trim(), body)?;
+                return decompress(outer.trim(), &middle);
+            }
+            Err(FetchError::Http(format!(
+                "unknown content-encoding: {other}"
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn layered_encoding_peels_all_layers() {
+        // "gzip, br" = gzip applied first (innermost), br on top
+        // (outermost); decoding peels outermost first. Both decoders run.
+        let payload = b"layered payload for the peeling test";
+        let gzipped = {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(payload).unwrap();
+            enc.finish().unwrap()
+        };
+        let mut br = Vec::new();
+        {
+            let mut enc = brotli::CompressorWriter::new(&mut br, 4096, 5, 22);
+            enc.write_all(&gzipped).unwrap();
+        }
+        let plain = decompress("gzip, br", &br).expect("peels br then gzip");
+        assert_eq!(plain, payload);
+    }
+
+    #[test]
+    fn unknown_single_encoding_still_errors() {
+        let e = decompress("xz", b"payload").unwrap_err();
+        assert!(format!("{e}").contains("xz"), "honest error preserved");
     }
 }

@@ -166,12 +166,13 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
-        // Centralized URL safety gate (fetch tier). Every fetch target,
-        // including explicit proxy lanes, env proxies, and every
-        // redirect hop, is validated via the async DNS-aware gate.
-        // Rejects non-http(s), credentials, localhost/private literals
-        // and DNS-resolved private addresses before any network.
-        crate::fetch::guards::ensure_url_safe(url_str).await?;
+        // Centralized URL safety gate (fetch tier). The synchronous
+        // literal checks run here (scheme, credentials, localhost and
+        // private literals: no dial can follow a cached return). The
+        // async DNS-aware tier runs exactly once per request, inside
+        // fetch_once_via; this outer gate used to resolve DNS too,
+        // doubling resolver RTT and load on every fetch (L7).
+        crate::fetch::guards::validate_url_basic(url_str)?;
         let started = Instant::now();
 
         // Fresh-window cache hit: no request at all (browser-true).
@@ -213,28 +214,39 @@ impl Fetcher {
         // Resolve env-var proxy (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
         // when no explicit proxy lane is passed. This follows the
         // curl/wget convention so users can route all DonSeTch
-        // traffic through a proxy with a single env var. Resolved
-        // once here and reused across redirect hops for consistency.
+        // traffic through a proxy with a single env var. Re-resolved
+        // for the CURRENT url at every hop (curl parity, E15: a
+        // redirect to a NO_PROXY-covered host dials direct instead of
+        // riding the env proxy for the rest of the chain). Explicit
+        // proxy lanes stay pinned for the whole chain by design.
         // Proxies are NOT used for single-URL fetch by default:
         // one request to one URL does not rate-limit, and routing
         // through a proxy wastes bandwidth and hurts the TLS
         // fingerprint (residential proxies don't use our Chrome-true
         // BoringSSL stack). Proxies belong on search (many engines)
         // and crawl (many pages, same host) where rate limits bite.
-        let env_proxy = if proxy.is_none() && !crate::config::env_flag("DONSETCH_NO_ENV_PROXY") {
-            crate::transport::proxy::from_env_for(url_str)
-        } else {
-            None
-        };
-        let effective_proxy = proxy.or(env_proxy.as_ref());
 
         loop {
             let host = host_of(&current)?;
+            let env_proxy = if proxy.is_none() && !crate::config::env_flag("DONSETCH_NO_ENV_PROXY")
+            {
+                crate::transport::proxy::from_env_for(&current)
+            } else {
+                None
+            };
+            let effective_proxy = proxy.or(env_proxy.as_ref());
             // Referer applies to the initial request only.
             // Redirects get no referer (avoids cross-origin leak).
             let ref_arg = if first_request { referer } else { None };
+            // Revalidation conditionals were minted for the ORIGINAL
+            // url's cache entry. Carrying them onto redirect hops lets
+            // a colliding ETag on the target produce a false 304 and
+            // merge the wrong cached body (B2). Only the first hop
+            // sends them.
+            let hop_conditional: &[(String, String)] =
+                if first_request { &conditional } else { &[] };
             let mut out = self
-                .fetch_once_via(&current, &conditional, effective_proxy, use_jar, ref_arg)
+                .fetch_once_via(&current, hop_conditional, effective_proxy, use_jar, ref_arg)
                 .await?;
             {
                 let mut jar = self
@@ -287,8 +299,10 @@ impl Fetcher {
                     // Centralized redirect SSRF guard : validates scheme,
                     // credentials and host, and rejects private literals.
                     // Non-http(s) redirects are returned honestly, not followed.
-                    // Every redirect hop also passes through the async DNS-aware
-                    // gate so private DNS results fail closed even on redirects.
+                    // The async DNS-aware gate for the new target runs once,
+                    // inside fetch_once_via (it re-gates every URL it is
+                    // handed); a second call here would resolve DNS twice
+                    // per hop for the same verdict.
                     let next = match crate::fetch::guards::validate_redirect_url(&base, &loc) {
                         Ok(u) => u,
                         Err(e) => {
@@ -302,8 +316,6 @@ impl Fetcher {
                             return Err(e);
                         }
                     };
-                    // DNS-aware validation for the redirect target (fail-closed).
-                    crate::fetch::guards::ensure_url_safe(next.as_str()).await?;
                     current = next.to_string();
                 }
                 _ => {
@@ -486,8 +498,8 @@ impl Fetcher {
                 .h2_request(&mut conn, &authority, &path, &req_headers, true)
                 .await
             {
-                Ok(mut out) => {
-                    out.verdict = walls::detect(out.status, &out.headers, &out.body);
+                Ok(out) => {
+                    // verdict already scored by finish()
                     self.pool
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -514,8 +526,8 @@ impl Fetcher {
                 )
                 .await
             {
-                Ok(mut out) => {
-                    out.verdict = walls::detect(out.status, &out.headers, &out.body);
+                Ok(out) => {
+                    // verdict already scored by finish()
                     return Ok(out);
                 }
                 Err(e) => {
@@ -711,6 +723,10 @@ fn finish(
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     let body = decompress::decompress(&encoding, &body)?;
+    // Wall classification lives here: every caller used to score the
+    // finished outcome with walls::detect right after the call; one
+    // site of truth instead of N re-detections (Q4).
+    let verdict = walls::detect(status, &headers, &body);
     Ok(FetchOutcome {
         url,
         status,
@@ -720,7 +736,7 @@ fn finish(
         redirects: 0,
         cache: CacheState::None,
         used_pool,
-        verdict: Verdict::ContentOk,
+        verdict,
         elapsed: Duration::ZERO,
     })
 }

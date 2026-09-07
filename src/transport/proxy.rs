@@ -29,13 +29,52 @@ fn no_proxy_match(host: &str) -> bool {
     if no_proxy.is_empty() {
         return false;
     }
+    // The host as delivered is bare ("::1", "example.com"); entries
+    // may be bracketed IPv6 ("[::1]"), CIDR ("192.168.0.0/16") or
+    // "host:port" (curl 7.86+ supports all of these; E1).
+    let host_unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let host_ip: Option<std::net::IpAddr> = host_unbracketed.parse().ok();
     for entry in no_proxy.split(',') {
         let entry = entry.trim();
         if entry == "*" {
             return true;
         }
+        // host:port: the port is scoped extra detail; the host part is
+        // what matters for matching.
+        let entry_no_port = entry
+            .rsplit_once(':')
+            .filter(|(h, p)| !p.is_empty() && p.parse::<u16>().is_ok() && !h.contains(':'))
+            .map(|(h, _)| h)
+            .unwrap_or(entry);
+        let entry = entry_no_port
+            .strip_prefix('[')
+            .and_then(|e| e.strip_suffix(']'))
+            .unwrap_or(entry_no_port);
+        // CIDR: an entry with a prefix length matches hosts whose
+        // address falls inside the network.
+        if let Some((net, bits)) = entry.split_once('/') {
+            if let (Ok(net_ip), Ok(prefix)) = (net.parse::<std::net::IpAddr>(), bits.parse::<u8>())
+                && let Some(host_ip) = host_ip
+                && cidr_match(host_ip, net_ip, prefix)
+            {
+                return true;
+            }
+            continue;
+        }
+        // Literal IP entry matches a literal IP host exactly (after
+        // bracket stripping); a bare IPv6 entry like "::1" also lands
+        // on this arm via host_unbracketed == entry.
+        if entry.parse::<std::net::IpAddr>().is_ok() && host_ip.is_some() {
+            if host_unbracketed == entry {
+                return true;
+            }
+            continue;
+        }
         let entry = entry.strip_prefix('.').unwrap_or(entry);
-        if host == entry {
+        if host == entry || host_unbracketed == entry {
             return true;
         }
         // host.ends_with(&format!(".{entry}")) without the per-entry
@@ -49,6 +88,41 @@ fn no_proxy_match(host: &str) -> bool {
         }
     }
     false
+}
+
+/// Prefix-compare two addresses of the same family (v4 over v6 is
+/// never a match).
+fn cidr_match(host: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
+    match (host, net) {
+        (std::net::IpAddr::V4(h), std::net::IpAddr::V4(n)) => {
+            if bits > 32 {
+                return false;
+            }
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            (u32::from(h) & mask) == (u32::from(n) & mask)
+        }
+        (std::net::IpAddr::V6(h), std::net::IpAddr::V6(n)) => {
+            if bits > 128 {
+                return false;
+            }
+            let (hb, nb) = (h.octets(), n.octets());
+            let full = bits as usize / 8;
+            if hb[..full] != nb[..full] {
+                return false;
+            }
+            let rem = bits % 8;
+            if rem == 0 {
+                return true;
+            }
+            let mask = u8::MAX << (8 - rem);
+            (hb[full] & mask) == (nb[full] & mask)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +163,23 @@ impl Proxy {
     ///   "user:pass@host:port"  (bare = HTTP CONNECT, backward compat)
     ///   "host:port"            (no auth, HTTP CONNECT)
     pub fn parse(s: &str) -> Result<Self, FetchError> {
+        // E5: an unsupported scheme ("socks4://host:1080") used to
+        // parse as HTTP with the scheme text inside the host, then
+        // fail at dial time with a confusing "bad addr" error. Reject
+        // any scheme:// line we don't serve, right here, where the
+        // user is looking.
+        if s.contains("://")
+            && let Some(scheme) = s.split("://").next()
+            && !scheme.is_empty()
+            && !matches!(
+                scheme.to_ascii_lowercase().as_str(),
+                "http" | "socks5" | "socks5h"
+            )
+        {
+            return Err(FetchError::Http(format!(
+                "proxy: unsupported scheme '{scheme}://' (supported: http://, socks5://, socks5h://)"
+            )));
+        }
         let (scheme, rest) = if let Some(r) = s.strip_prefix("socks5://") {
             (ProxyScheme::Socks5, r)
         } else if let Some(r) = s.strip_prefix("socks5h://") {
@@ -486,11 +577,18 @@ pub fn config_path() -> PathBuf {
 /// Load proxies from the config file. Returns empty vec if the
 /// file doesn't exist (not an error : first run).
 pub fn load_config() -> Vec<Proxy> {
+    load_config_verbose().0
+}
+
+/// Same as `load_config` but reports how many non-comment lines were
+/// dropped as unparseable (Q1: a typo in proxies.txt used to mean a
+/// silently absent proxy). `(proxies, skipped)`.
+pub fn load_config_verbose() -> (Vec<Proxy>, usize) {
     let path = config_path();
     let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    parse_lines(&content)
+    parse_lines_verbose(&content)
 }
 
 /// Load proxies from `DONSEEK_PROXIES` env var (comma-separated).
@@ -536,6 +634,10 @@ pub fn from_env_for(url: &str) -> Option<Proxy> {
 
     // Scheme-specific env var, then ALL_PROXY as fallback.
     // Check uppercase first, then lowercase (curl convention).
+    // Note (Q2): non-http(s) schemes fall into the HTTP_PROXY arm. DonSeTch
+    // never dials non-http(s) URLs (the URL gate rejects them first), so
+    // curl's "ALL_PROXY covers unknown schemes" rule is dormant here; the
+    // ALL_PROXY fallback below already covers both http and https.
     let env_name = if scheme == "https" {
         "HTTPS_PROXY"
     } else {
@@ -576,13 +678,20 @@ pub fn save_config(proxies: &[Proxy]) -> std::io::Result<()> {
 
 /// Parse proxy URLs from text: one per line, # comments and
 /// blank lines ignored.
-fn parse_lines(content: &str) -> Vec<Proxy> {
-    content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| Proxy::parse(line).ok())
-        .collect()
+fn parse_lines_verbose(content: &str) -> (Vec<Proxy>, usize) {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match Proxy::parse(line) {
+            Ok(p) => out.push(p),
+            Err(_) => skipped += 1,
+        }
+    }
+    (out, skipped)
 }
 
 pub(crate) fn base64(input: &str) -> String {
@@ -592,6 +701,64 @@ pub(crate) fn base64(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // E1: IPv6 literals (bracketed and bare), CIDR networks and
+    // host:port entries in NO_PROXY.
+    #[test]
+    fn no_proxy_matches_ipv6_cidr_and_port_entries() {
+        unsafe {
+            std::env::set_var(
+                "NO_PROXY",
+                "[::1],192.168.0.0/16,example.com:8443,.internal.local",
+            )
+        };
+        assert!(no_proxy_match("::1"), "bare IPv6 host vs bracketed entry");
+        assert!(no_proxy_match("192.168.5.5"), "CIDR /16");
+        assert!(!no_proxy_match("192.169.0.1"), "outside the CIDR");
+        assert!(
+            no_proxy_match("example.com"),
+            "host:port entry matches the host"
+        );
+        assert!(!no_proxy_match("example.org"), "other hosts unaffected");
+        assert!(
+            no_proxy_match("api.internal.local"),
+            "dot-prefixed entry still matches"
+        );
+        unsafe { std::env::remove_var("NO_PROXY") };
+    }
+
+    #[test]
+    fn no_proxy_cidr_v6() {
+        unsafe { std::env::set_var("NO_PROXY", "fc00::/7") };
+        assert!(no_proxy_match("fc00:1::2"), "inside fc00::/7");
+        assert!(!no_proxy_match("fe80::1"), "outside");
+        unsafe { std::env::remove_var("NO_PROXY") };
+    }
+
+    // E5: an unsupported scheme line is a loud parse error, not a
+    // proxy that pretends to be HTTP and dies at dial time.
+    #[test]
+    fn proxy_parse_rejects_unsupported_schemes() {
+        assert!(Proxy::parse("socks4://127.0.0.1:1080").is_err());
+        assert!(Proxy::parse("https://127.0.0.1:3128").is_err());
+        assert!(Proxy::parse("ftp://127.0.0.1:21").is_err());
+        // supported schemes still parse
+        assert!(Proxy::parse("http://127.0.0.1:3128").is_ok());
+        assert!(Proxy::parse("socks5://127.0.0.1:1080").is_ok());
+        assert!(Proxy::parse("socks5h://127.0.0.1:1080").is_ok());
+        // scheme-less lines keep their legacy meaning (http by default)
+        assert!(Proxy::parse("127.0.0.1:3128").is_ok());
+    }
+
+    // Q1: unparseable proxy lines are counted, not silently dropped.
+    #[test]
+    fn parse_lines_verbose_counts_skipped() {
+        let (proxies, skipped) = parse_lines_verbose(
+            "http://127.0.0.1:3128\n\n# comment\nsocks4://127.0.0.1:1080\ngarbage-no-colon\n",
+        );
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(skipped, 2, "socks4 line + garbage line counted");
+    }
     use super::*;
 
     #[test]
@@ -781,7 +948,7 @@ http://host:8080
 
 # Empty line above
 ";
-        let proxies = parse_lines(content);
+        let proxies = parse_lines_verbose(content).0;
         assert_eq!(proxies.len(), 2);
         assert_eq!(proxies[0].id(), "host:1080");
         assert_eq!(proxies[1].id(), "host:8080");
@@ -795,15 +962,19 @@ garbage_line
 u:p@also_valid:8080
 :99999
 ";
-        let proxies = parse_lines(content);
+        let proxies = parse_lines_verbose(content).0;
         assert_eq!(proxies.len(), 2);
     }
 
     #[test]
     fn parse_lines_empty() {
-        assert!(parse_lines("").is_empty());
-        assert!(parse_lines("# only comments\n# more comments").is_empty());
-        assert!(parse_lines("\n\n\n").is_empty());
+        assert!(parse_lines_verbose("").0.is_empty());
+        assert!(
+            parse_lines_verbose("# only comments\n# more comments")
+                .0
+                .is_empty()
+        );
+        assert!(parse_lines_verbose("\n\n\n").0.is_empty());
     }
 
     // ── from_env_for tests ──

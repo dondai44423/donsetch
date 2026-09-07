@@ -480,8 +480,9 @@ pub fn extract(
     // fully-hydrated pages (Amazon, React apps), making it
     // a false-positive. aria-busy is a reliable loading
     // signal set by the browser, not CSS.
-    let lower_html = html_text.to_lowercase();
-    let has_skeletons = lower_html.matches("aria-busy=\"true\"").take(3).count() >= 3;
+    // ASCII-case-insensitive scan (L9): was a whole-document
+    // to_lowercase() allocation just to count three markers.
+    let has_skeletons = count_ascii_ci(&html_text, "aria-busy=\"true\"", 3) >= 3;
 
     // Scope: explicit selector or scored main-content detection.
     let roots: Vec<scraper::ElementRef<'_>> = if let Some(sel) = &opts.selector {
@@ -549,7 +550,8 @@ pub fn extract(
     // structure (h1-h6 → markdown headings) and paragraph breaks.
     // When focus is active, short content is intentional (the agent
     // asked for a filtered slice), not a sign of extraction failure.
-    let needs_fallback = extracted.thin || (extracted.total_chars < 200 && opts.focus.is_none());
+    let needs_fallback = extracted.thin
+        || (extracted.total_chars < fallback::FALLBACK_MIN_TEXT && opts.focus.is_none());
     if needs_fallback
         && let Some(mut fb) = fallback::text_fallback(&html_text, &meta, url, opts, max_chars)
     {
@@ -1160,4 +1162,29 @@ fn ceil_char_boundary(text: &str, mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Count case-insensitive ASCII occurrences of `needle` in `hay`,
+/// stopping at `max` (the detectors only compare against a small
+/// threshold). No allocation: was a whole-document to_lowercase() just
+/// to count three `aria-busy` markers (L9).
+fn count_ascii_ci(hay: &str, needle: &str, max: usize) -> usize {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || n.len() > h.len() {
+        return 0;
+    }
+    let first_low = n[0].to_ascii_lowercase();
+    let first_high = n[0].to_ascii_uppercase();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + n.len() <= h.len() && count < max {
+        if (h[i] == first_low || h[i] == first_high) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            count += 1;
+            i += n.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
 }

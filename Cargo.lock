@@ -1040,6 +1040,7 @@ dependencies = [
  "futures-util",
  "image",
  "libc",
+ "memchr",
  "ndarray",
  "num_cpus",
  "oar-ocr",
