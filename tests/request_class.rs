@@ -2,7 +2,7 @@
 //! carries the subresource header set on the actual socket, not
 //! the navigation set. The rig records the raw headers it receives.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 
