@@ -69,6 +69,18 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
+    // main() restores SIGPIPE's default disposition so piped CLI
+    // output dies quietly : this process must not. The crash
+    // contract below depends on a write to a dead child's stdin
+    // coming back as an EPIPE error (hold the bytes, restart,
+    // replay) rather than a signal that kills the supervisor; and
+    // a broken output pipe just means the client left (handled at
+    // the write). The child daemon is unaffected : it makes its
+    // own choice in its own main().
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     let mut restarts: u32 = 0;
     let mut pending: Vec<u8> = Vec::new();
     let output = Arc::new(Mutex::new(output));
@@ -267,6 +279,67 @@ mod tests {
         .unwrap();
         let got = sink.0.lock().unwrap().clone();
         assert_eq!(String::from_utf8_lossy(&got), "hello\n");
+    }
+
+    /// A client that sends one request after a delay long enough
+    /// for the first child to have died, then EOF.
+    #[cfg(unix)]
+    struct DelayedOnce(&'static [u8], bool);
+
+    #[cfg(unix)]
+    impl Read for DelayedOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.1 {
+                return Ok(0);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            self.1 = true;
+            buf[..self.0.len()].copy_from_slice(self.0);
+            Ok(self.0.len())
+        }
+    }
+
+    // main() restores SIGPIPE's default disposition for the CLI
+    // (quiet `donsetch --help | head` exits). The supervisor's
+    // whole crash contract, though, is built on the write to a
+    // dead child's stdin coming back as an EPIPE *error* (hold
+    // the bytes, restart, replay): under SIG_DFL that write is a
+    // SIGPIPE that kills the supervisor itself before write_all
+    // returns. run_with must pin SIG_IGN for its own process no
+    // matter what main() set. Without the fix this test does not
+    // fail an assert : the test process dies by signal 13.
+    #[cfg(unix)]
+    #[test]
+    fn crash_mid_write_restarts_even_with_cli_sigpipe_disposition() {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+        let sink = Sink::default();
+        let spawns = Arc::new(Mutex::new(0u32));
+        let spawns2 = Arc::clone(&spawns);
+        run_with(
+            move || {
+                let mut n = spawns2.lock().unwrap();
+                *n += 1;
+                let mut c = Command::new("sh");
+                // First child dies instantly; its replacement serves.
+                c.args(["-c", if *n == 1 { "exit 0" } else { "cat" }]);
+                c
+            },
+            DelayedOnce(b"ping\n", false),
+            sink.clone(),
+        )
+        .unwrap();
+        assert!(
+            *spawns.lock().unwrap() >= 2,
+            "the dead child must have been replaced"
+        );
+        let got = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "ping\n",
+            "the held request must replay to the restarted child"
+        );
     }
 
     #[test]
