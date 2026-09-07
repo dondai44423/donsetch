@@ -5,6 +5,7 @@
 //!
 //! HTTP mode: SSE streaming for responses and progress notifications.
 
+pub mod compat;
 pub mod server;
 pub mod stdio;
 pub mod supervisor;

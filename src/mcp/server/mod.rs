@@ -288,6 +288,7 @@ pub async fn handle(
     line: &str,
     cancels: &CancelMap,
     writer_tx: &mpsc::Sender<String>,
+    mode: &crate::mcp::compat::ModeCell,
 ) -> Option<String> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -354,6 +355,23 @@ pub async fn handle(
         if *cancel_probe.borrow() || cancel_probe.has_changed().unwrap_or(false) {
             return None;
         }
+        let result = match result {
+            Ok(r) => {
+                // Client-compat shaping (issue #27): harnesses that
+                // show the model only `structuredContent` get the
+                // surfaces merged into the one they render.
+                let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
+                let r = if crate::mcp::compat::effective(mode)
+                    == crate::mcp::compat::ClientMode::TextOnly
+                {
+                    crate::mcp::compat::shape_result(tool, r)
+                } else {
+                    r
+                };
+                Ok(r)
+            }
+            Err((code, message)) => Err((code, message)),
+        };
         let resp = match result {
             Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
             Err((code, message)) => json!({
@@ -365,7 +383,14 @@ pub async fn handle(
     }
 
     let result: Result<Value, (i64, String)> = match method {
-        "initialize" => Ok(initialize(&params)),
+        "initialize" => {
+            // Issue #27: remember what kind of client this session
+            // speaks for. Lenient by design: the pointer read
+            // tolerates a missing clientInfo and Claude Code's
+            // object-shaped version.
+            mode.set(crate::mcp::compat::mode_from_params(&params));
+            Ok(initialize(&params))
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools::list()),
         "notifications/initialized" | "notifications/cancelled" => {

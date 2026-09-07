@@ -296,6 +296,15 @@ connect to `http://localhost:8765/mcp`. Sessions, cancellation,
 `/health`, token auth via `DONSETCH_HTTP_TOKEN`, per-request timeout,
 all documented in `donsetch mcp --help`.
 
+**Structured-content compat (Claude Code / VS Code):** those harnesses
+show the model only `structuredContent` and drop the `content` array,
+which hides the page markdown behind tool metadata. DonSeTch detects
+them at the handshake (`clientInfo.name`) and merges the surfaces:
+a compact `[meta]` text block carries the structured state, the
+markdown stays a clean text block, and `structuredContent` is omitted.
+Any other client keeps the default token-optimal shape. To force the
+compat shape for an unrecognized client, set `DONSETCH_MCP_TEXT_ONLY=1`.
+
 **2. CLI (for humans and scripts).** Same engine as MCP, thin adapter:
 
 ```bash

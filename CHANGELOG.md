@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Structured-content compat for Claude Code / VS Code (issue #27,
+  thanks Mart-Bogdan + maykura):** those harnesses show the model only
+  `structuredContent` and drop the `content` array, so agents saw
+  fetch/crawl metadata but never the page markdown. DonSeTch now
+  detects them at the MCP handshake (`clientInfo.name`, matched
+  case-insensitively against a known list; Claude Code's object-shaped
+  `version` is tolerated) and, for those sessions, merges the two
+  surfaces: the full structured state folds into a compact leading
+  `[meta]` text block, the document stays a clean markdown text block,
+  and `structuredContent` is omitted. web_search is exempt (its
+  structuredContent is the richer surface). Every other client keeps
+  the unchanged token-optimal split. Manual override:
+  `DONSETCH_MCP_TEXT_ONLY=1` forces the compat shape for any client,
+  which is also the escape hatch for newly discovered broken hosts.
+  Compat mode is per-session on the HTTP transport; error results
+  carry their stable code + escalation trace through the same
+  `[meta]` fold. Verified end to end over both stdio and streamable
+  HTTP against the real binary (default shape, compat shape, error
+  path, search exemption, per-session isolation, env override).
+
+
+
 ### Fixed
 
 - **The supervisor crash-recovery outlived the 3.6.6 SIGPIPE

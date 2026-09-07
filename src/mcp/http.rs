@@ -72,6 +72,9 @@ const SSE_MAX_LIFETIME: Duration = Duration::from_secs(25 * 60);
 
 struct Session {
     cancels: CancelMap,
+    /// Issue #27 compat mode for this session: set by the session's
+    /// `initialize` handshake, read by every tool call it makes.
+    mode: Arc<crate::mcp::compat::ModeCell>,
     last_seen: Instant,
 }
 
@@ -331,6 +334,11 @@ fn new_session_id() -> String {
 impl SessionTable {
     /// Registry for an existing session id, or None if unknown.
     fn registry(&self, id: &str) -> Option<CancelMap> {
+        self.session_handles(id).map(|(c, _)| c)
+    }
+
+    /// Cancels + mode cell for an existing session, refreshing idle.
+    fn session_handles(&self, id: &str) -> Option<(CancelMap, Arc<crate::mcp::compat::ModeCell>)> {
         let mut sessions = self
             .sessions
             .lock()
@@ -338,13 +346,13 @@ impl SessionTable {
         self.gc_locked(&mut sessions);
         let s = sessions.get_mut(id)?;
         s.last_seen = Instant::now();
-        Some(Arc::clone(&s.cancels))
+        Some((Arc::clone(&s.cancels), Arc::clone(&s.mode)))
     }
 
-    /// Registry for `id`, creating it on first use. The empty id is
-    /// the shared default registry for session-less clients; it is
-    /// never a candidate for MAX_SESSIONS eviction.
-    fn registry_or_create(&self, id: &str) -> CancelMap {
+    /// Registry + mode cell for `id`, creating it on first use. The
+    /// empty id is the shared default registry for session-less
+    /// clients; it is never a candidate for MAX_SESSIONS eviction.
+    fn registry_or_create(&self, id: &str) -> (CancelMap, Arc<crate::mcp::compat::ModeCell>) {
         let mut sessions = self
             .sessions
             .lock()
@@ -352,7 +360,7 @@ impl SessionTable {
         self.gc_locked(&mut sessions);
         if let Some(s) = sessions.get_mut(id) {
             s.last_seen = Instant::now();
-            return Arc::clone(&s.cancels);
+            return (Arc::clone(&s.cancels), Arc::clone(&s.mode));
         }
         if sessions.len() >= MAX_SESSIONS && !id.is_empty() {
             // Evict the oldest session to bound memory.
@@ -366,14 +374,16 @@ impl SessionTable {
             }
         }
         let cancels: CancelMap = Arc::new(Mutex::new(HashMap::new()));
+        let mode = Arc::new(crate::mcp::compat::ModeCell::new());
         sessions.insert(
             id.to_string(),
             Session {
                 cancels: Arc::clone(&cancels),
+                mode: Arc::clone(&mode),
                 last_seen: Instant::now(),
             },
         );
-        cancels
+        (cancels, mode)
     }
 
     /// Remove a session; true if it existed.
@@ -399,8 +409,8 @@ impl SessionTable {
 }
 
 impl HttpState {
-    /// Registry for session-less clients; created on first use.
-    fn default_cancels(&self) -> CancelMap {
+    /// Registry + mode for session-less clients; created on first use.
+    fn default_handles(&self) -> (CancelMap, Arc<crate::mcp::compat::ModeCell>) {
         self.sessions.registry_or_create("")
     }
 }
@@ -452,11 +462,13 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
 
     // Session resolution: header wins; unknown ids are expired per
     // streamable-HTTP convention. initialize without a header mints a
-    // new session echoed back on the response.
+    // new session echoed back on the response. Each session carries
+    // its own issue-#27 compat mode; session-less clients share the
+    // default (env override still applies per call).
     let mut new_session: Option<String> = None;
-    let cancels = match sid_header.as_deref() {
-        Some(sid) if !sid.is_empty() => match state.sessions.registry(sid) {
-            Some(c) => c,
+    let (cancels, mode_cell) = match sid_header.as_deref() {
+        Some(sid) if !sid.is_empty() => match state.sessions.session_handles(sid) {
+            Some(h) => h,
             None => return rpc_error(StatusCode::NOT_FOUND, -32001, "session expired or unknown"),
         },
         _ => {
@@ -465,7 +477,7 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
                 new_session = Some(sid.clone());
                 state.sessions.registry_or_create(&sid)
             } else {
-                state.default_cancels()
+                state.default_handles()
             }
         }
     };
@@ -477,7 +489,7 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
 
     let outcome = tokio::time::timeout(
         state.timeout,
-        handle(&state.daemon, &line, &cancels, &progress_tx),
+        handle(&state.daemon, &line, &cancels, &progress_tx, &mode_cell),
     )
     .await;
 
@@ -540,8 +552,8 @@ fn resolve_cancels(state: &HttpState, sid: Option<&str>) -> CancelMap {
         Some(s) if !s.is_empty() => state
             .sessions
             .registry(s)
-            .unwrap_or_else(|| state.default_cancels()),
-        _ => state.default_cancels(),
+            .unwrap_or_else(|| state.default_handles().0),
+        _ => state.default_handles().0,
     }
 }
 

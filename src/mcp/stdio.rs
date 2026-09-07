@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use serde_json::Value;
 
+use crate::mcp::compat::ModeCell;
 use crate::mcp::server::{CancelMap, Daemon, cancel_key, handle};
 
 /// One stdin line, classified.
@@ -87,6 +88,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // crawl stops its workers gracefully and persists its resume
     // token before returning).
     let cancels: CancelMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // Issue #27 compat mode: one session per process; the initialize
+    // handshake records what the client renders.
+    let mode = Arc::new(ModeCell::new());
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
@@ -119,8 +123,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let daemon = Arc::clone(&daemon);
         let tx = tx.clone();
         let cancels = Arc::clone(&cancels);
+        let mode = Arc::clone(&mode);
         tokio::spawn(async move {
-            if let Some(resp) = handle(&daemon, &line, &cancels, &tx).await {
+            if let Some(resp) = handle(&daemon, &line, &cancels, &tx, &mode).await {
                 let _ = tx.send(resp).await;
             }
         });
