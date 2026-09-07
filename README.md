@@ -47,6 +47,8 @@ reqwest; the core paths that run on every fetch do not.)
 Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes)
 and as a standalone CLI.
 
+> **V4 is coming. And it's not just any upgrade.**
+
 ## ✨ What makes it different
 
 | | What it does |
