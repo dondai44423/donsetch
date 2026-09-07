@@ -10,7 +10,7 @@ use url::Url;
 use crate::detect::walls::{self, Verdict};
 use crate::error::FetchError;
 use crate::ghost::cache::CookieRecord;
-use crate::profile::BrowserProfile;
+use crate::profile::{BrowserProfile, RequestClass};
 use crate::transport::pool::Pool;
 use crate::transport::{h1, h2::conn::H2Conn, proxy, tcp, tls};
 
@@ -413,6 +413,28 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_once_via_class(
+            url_str,
+            conditional,
+            proxy,
+            use_jar,
+            referer,
+            RequestClass::Navigation,
+        )
+        .await
+    }
+
+    /// Class-aware variant (v4 phase 1.2): subresource fetches
+    /// carry the per-class header set, not the navigation set.
+    pub async fn fetch_once_via_class(
+        &self,
+        url_str: &str,
+        conditional: &[(String, String)],
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        class: RequestClass,
+    ) -> Result<FetchOutcome, FetchError> {
         // Centralized gate ensures credentials/host checks even for
         // direct fetch_once calls (e.g. tests, internal callers).
         // Includes DNS resolution : every target, including proxy
@@ -447,7 +469,7 @@ impl Fetcher {
         };
 
         // Header set from profile (Chrome order, coherence) + cookie + conditionals.
-        let mut req_headers = self.profile.h1_headers(&authority, &path);
+        let mut req_headers = self.profile.h1_headers_for_class(&authority, &path, class);
         if use_jar {
             let jar = self
                 .jar
