@@ -38,6 +38,30 @@ pub struct CookieJar {
     vault_domains: std::collections::HashSet<String>,
 }
 
+/// Shared RFC 1035 label validation for hosts and domains:
+/// non-empty overall (<=253 bytes), labels 1-63 bytes, no
+/// leading/trailing hyphen, lower-case alnum + hyphen only.
+fn valid_host_labels(s: &str) -> Option<()> {
+    if s.is_empty() || s.len() > 253 {
+        return None;
+    }
+    for label in s.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return None;
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
 fn normalize_domain(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -59,34 +83,7 @@ fn normalize_domain(raw: &str) -> Option<String> {
     if s.ends_with('.') {
         s.pop();
     }
-    if s.is_empty() {
-        return None;
-    }
-    if s.bytes()
-        .any(|b| b == b'\r' || b == b'\n' || b == b'\0' || b < 0x20 || b == 0x7F)
-    {
-        return None;
-    }
-    if s.len() > 253 {
-        return None;
-    }
-    for label in s.split('.') {
-        if label.is_empty() {
-            return None;
-        }
-        if label.len() > 63 {
-            return None;
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return None;
-        }
-        if !label
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return None;
-        }
-    }
+    valid_host_labels(&s)?;
     Some(s)
 }
 
@@ -106,29 +103,7 @@ fn normalize_host(raw: &str) -> Option<String> {
     if s.ends_with('.') {
         s.pop();
     }
-    if s.is_empty() {
-        return None;
-    }
-    if s.len() > 253 {
-        return None;
-    }
-    for label in s.split('.') {
-        if label.is_empty() {
-            return None;
-        }
-        if label.len() > 63 {
-            return None;
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return None;
-        }
-        if !label
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return None;
-        }
-    }
+    valid_host_labels(&s)?;
     Some(s)
 }
 
