@@ -1,875 +1,16 @@
-//! The stdio server: read loop, dispatch, writer task,
-//! and the fetch tool handler with full escalation.
-
-use std::sync::Arc;
+//! The fetch tool handler: dispatch, URL/handle resolution,
+//! multi-fetch batching, single fetch + the full escalation ladder
+//! (bypass, ghost, actions, OCR, anticloak, resurrection), page
+//! history + link handles, and the result envelope assembly.
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc};
 
-use futures_util::FutureExt;
-
-use crate::crawl::real as crawl_real;
-use crate::crawl::{CrawlMode, CrawlOptions, Crawler};
-use crate::detect::walls::{Vendor, Verdict};
-use crate::error::FetchError;
-use crate::extract::{self, ExtractOptions};
-use crate::fetch::client::Fetcher;
-use crate::ghost::cache::{CookieRecord, GhostState, RouteDecision};
-use crate::ghost::manager::GhostManager;
-use crate::ghost::ops;
-use crate::profile::BrowserProfile;
-use crate::search::byok::ByokSearcher;
-use crate::search::egress::EgressPool;
-use crate::search::intent::Intent;
-use crate::search::{self, Searcher};
-
-use super::tools;
-
-/// Shared daemon state, built once, lives forever.
-pub struct Daemon {
-    fetcher: Arc<Fetcher>,
-    profile: BrowserProfile,
-    ghost_mgr: Arc<GhostManager>,
-    state: Arc<Mutex<GhostState>>,
-    searcher: Arc<Searcher>,
-    byok: ByokSearcher,
-    crawler: Crawler,
-    handles: Arc<Mutex<crate::handles::HandleTable>>,
-    history: Arc<std::sync::Mutex<crate::pages::history::PageHistory>>,
-    /// (modified, len) of ghost-state.json at the last vault refresh:
-    /// a login or logout CLI write flips this and the next tool call
-    /// resyncs the cookie jar. mtime-only would miss same-second
-    /// login+logout pairs, hence the length pair.
-    vault_seen: tokio::sync::Mutex<Option<(u64, u64)>>,
-    /// One background pre-solve at a time: search hints for a walled
-    /// domain trigger a solve while the agent is still reading
-    /// results. Cheap spinlock: a lost race just skips the win.
-    pre_solve_busy: std::sync::atomic::AtomicBool,
-}
-
-impl Daemon {
-    pub async fn new() -> Result<Self, crate::error::FetchError> {
-        let profile = BrowserProfile::host_default();
-        let fetcher = Arc::new(Fetcher::new(profile.clone())?);
-        let proxies = crate::transport::proxy::load_all();
-        let ghost_mgr = GhostManager::new().await;
-        let state = Arc::new(Mutex::new(GhostState::load()));
-
-        // Tier 1 starts the session with the vault too: a domain
-        // that serves without JS gets an authenticated plain-HTTP
-        // fetch on the very first request after a restart, not
-        // only after the browser has visited it once.
-        {
-            let sessions = crate::ghost::cache::load_session_cookies();
-            fetcher.import_cookies(&sessions).await;
-        }
-
-        // Build ghost escalation hook for the crawl: renders
-        // JS-only pages in the headless browser so SPA sites
-        // yield real content instead of empty shells. Capped at
-        // 3 per crawl by the orchestrator. The search clone runs
-        // the SAME machinery but never serves from the render
-        // cache: a cached walled SERP would replay as "no
-        // results" forever inside one TTL window.
-        let ghost_hook = make_ghost_hook(
-            Arc::clone(&ghost_mgr),
-            profile.clone(),
-            Arc::clone(&fetcher),
-            Arc::clone(&state),
-            false,
-        );
-        let search_ghost = make_ghost_hook(
-            Arc::clone(&ghost_mgr),
-            profile.clone(),
-            Arc::clone(&fetcher),
-            Arc::clone(&state),
-            true,
-        );
-
-        let (crawler, _gov) = crawl_real::build(Arc::clone(&fetcher), proxies);
-        let crawler = crawler.with_ghost(ghost_hook);
-
-        let searcher = Arc::new(
-            Searcher::new(Fetcher::new(profile.clone())?, EgressPool::from_env())
-                .with_ghost(search_ghost),
-        );
-        searcher.preflight();
-
-        Ok(Self {
-            fetcher,
-            profile,
-            ghost_mgr,
-            state,
-            searcher,
-            byok: ByokSearcher::new(),
-            crawler,
-            handles: Arc::new(Mutex::new(crate::handles::HandleTable::load())),
-            history: Arc::new(std::sync::Mutex::new(
-                crate::pages::history::PageHistory::load(),
-            )),
-            vault_seen: tokio::sync::Mutex::new(None),
-            pre_solve_busy: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    /// Shutdown: kill ghost browser + Xvfb (if owned).
-    /// Called by the CLI before exit; by the MCP daemon on close.
-    pub async fn shutdown(&self) {
-        self.ghost_mgr.shutdown().await;
-    }
-
-    /// Resync the tier-1 cookie jar from the session vault when the
-    /// on-disk file moved (login/logout/rotation). Stat-only in the
-    /// hot path; parse only after a real change.
-    pub async fn refresh_vault(&self) {
-        let meta = std::fs::metadata(crate::paths::cache_dir().join("ghost-state.json"))
-            .ok()
-            .map(|m| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    (m.mtime() as u64, m.len())
-                }
-                #[cfg(not(unix))]
-                {
-                    (0u64, m.len())
-                }
-            });
-        let Some(sig) = meta else { return };
-        let changed = {
-            let mut seen = self.vault_seen.lock().await;
-            let changed = *seen != Some(sig);
-            if changed {
-                *seen = Some(sig);
-            }
-            changed
-        };
-        if changed {
-            let cookies = crate::ghost::cache::load_session_cookies();
-            self.fetcher.reset_to(&cookies).await;
-        }
-    }
-}
-
-/// Note: The stdio transport implementation has been moved to `stdio.rs`.
-/// This function is kept for backward compatibility but delegates to the stdio module.
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    crate::mcp::stdio::run().await
-}
-
-/// Per-request tool context (v3): cancellation signal + progress
-/// emitter. `None` = CLI invocation (no client to cancel us).
-#[derive(Clone)]
-pub(crate) struct ToolCtx {
-    cancel: tokio::sync::watch::Receiver<bool>,
-    /// The raw _meta.progressToken from the request, if the client
-    /// asked for progress notifications.
-    progress_token: Option<Value>,
-    progress_tx: Option<mpsc::UnboundedSender<String>>,
-}
-
-/// Standalone progress emission for spawned subtasks (batch fetch
-/// workers) that own cloned parts instead of the whole ctx.
-pub(crate) fn emit_progress(
-    parts: &(Option<Value>, Option<mpsc::UnboundedSender<String>>),
-    done: u64,
-    total: Option<u64>,
-    message: &str,
-) {
-    let (Some(token), Some(tx)) = (&parts.0, &parts.1) else {
-        return;
-    };
-    let mut params = json!({ "progressToken": token, "progress": done });
-    if let Some(t) = total {
-        params["total"] = json!(t);
-    }
-    if !message.is_empty() {
-        params["message"] = json!(message);
-    }
-    let line = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/progress",
-        "params": params,
-    })
-    .to_string();
-    let _ = tx.send(line);
-}
-
-impl ToolCtx {
-    pub fn cancelled(&self) -> bool {
-        *self.cancel.borrow() || self.cancel.has_changed().unwrap_or(false)
-    }
-
-    /// Resolves when the client cancels this request.
-    pub async fn cancelled_async(&mut self) -> bool {
-        if self.cancelled() {
-            return true;
-        }
-        self.cancel.changed().await.is_err() || *self.cancel.borrow()
-    }
-
-    /// Emit an MCP progress notification if the client asked for
-    /// progress. Never blocks, never panics : progress is a
-    /// courtesy, not a contract.
-    /// Cloneable progress parts for subtasks and closures.
-    pub fn progress_parts(&self) -> (Option<Value>, Option<mpsc::UnboundedSender<String>>) {
-        (self.progress_token.clone(), self.progress_tx.clone())
-    }
-
-    /// Clone the cancel receiver (e.g. for the crawl's graceful
-    /// stop flag).
-    pub fn cancel_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.cancel.clone()
-    }
-}
-
-/// Run a tool future under an optional deadline and cancellation,
-/// collapsing the 2×2 combination into one place. Cancelled
-/// results are discarded by the caller (handle suppresses the
-/// response); the sentinel just keeps types simple.
-pub(crate) async fn run_with_budget<F>(
-    fut: F,
-    deadline: Option<std::time::Duration>,
-    ctx: Option<&mut ToolCtx>,
-    on_deadline: impl FnOnce() -> Value,
-) -> Value
-where
-    F: std::future::Future<Output = Value>,
-{
-    match (deadline, ctx) {
-        (Some(d), Some(c)) => tokio::select! {
-            r = fut => r,
-            _ = tokio::time::sleep(d) => on_deadline(),
-            _ = c.cancelled_async() => tool_error("cancelled"),
-        },
-        (Some(d), None) => tokio::select! {
-            r = fut => r,
-            _ = tokio::time::sleep(d) => on_deadline(),
-        },
-        (None, Some(c)) => tokio::select! {
-            r = fut => r,
-            _ = c.cancelled_async() => tool_error("cancelled"),
-        },
-        (None, None) => fut.await,
-    }
-}
-
-/// Cancellation registry: request-id key → cancel sender.
-pub type CancelMap =
-    Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>>;
-
-/// Registry key for a JSON-RPC request id. Ids are numbers OR
-/// strings (uuids, "req-7"); keying on i64 meant a string-id client
-/// could never cancel anything. The JSON encoding keeps `7` and
-/// `"7"` distinct, as the spec requires.
-pub fn cancel_key(id: &Value) -> Option<String> {
-    match id {
-        Value::Number(_) | Value::String(_) => Some(id.to_string()),
-        _ => None,
-    }
-}
-
-/// Handle one line. Returns Some(response) for requests,
-/// None for notifications and cancelled requests (per MCP spec,
-/// a cancelled request gets no response).
-pub async fn handle(
+use super::*;
+pub(super) async fn fetch_tool(
     daemon: &Arc<Daemon>,
-    line: &str,
-    cancels: &CancelMap,
-    writer_tx: &mpsc::Sender<String>,
-) -> Option<String> {
-    let msg: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => {
-            return Some(
-                json!({
-                    "jsonrpc": "2.0", "id": null,
-                    "error": { "code": -32700, "message": "parse error" }
-                })
-                .to_string(),
-            );
-        }
-    };
-    let id = msg.get("id").cloned();
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-
-    // Notifications (no id) that we recognize: stay silent.
-    // (cancelled is intercepted in run() before this point.)
-    id.as_ref()?;
-    let id = id.unwrap();
-
-    // tools/call gets the full context: cancel + progress.
-    if method == "tools/call" {
-        let rid = cancel_key(&id);
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        if let Some(r) = rid.clone() {
-            cancels
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(r, cancel_tx);
-        }
-        // Probe kept outside the ctx so the final suppression check
-        // still works after the ctx is consumed.
-        let cancel_probe = cancel_rx.clone();
-        // Progress plumbing: if the request carried a progressToken,
-        // give the tool a channel straight to the writer.
-        let progress_token = params.pointer("/_meta/progressToken").cloned();
-        let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
-        let progress_tx = progress_token.as_ref().map(|_| ptx);
-        let writer_tx = writer_tx.clone();
-        let forwarder = tokio::spawn(async move {
-            while let Some(line) = prx.recv().await {
-                let _ = writer_tx.send(line).await;
-            }
-        });
-        let ctx = ToolCtx {
-            cancel: cancel_rx,
-            progress_token,
-            progress_tx,
-        };
-        let result = call_tool_ctx(daemon, &params, Some(ctx)).await;
-        // Deregister + stop forwarding progress. The forwarder ends
-        // when ptx drops : it moved into ctx, dropped at await end.
-        if let Some(r) = rid {
-            cancels
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&r);
-        }
-        let _ = forwarder.await;
-        // A cancelled request never gets a response, even if the
-        // tool managed to finish before observing the cancel.
-        if *cancel_probe.borrow() || cancel_probe.has_changed().unwrap_or(false) {
-            return None;
-        }
-        let resp = match result {
-            Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-            Err((code, message)) => json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": { "code": code, "message": message }
-            }),
-        };
-        return Some(resp.to_string());
-    }
-
-    let result: Result<Value, (i64, String)> = match method {
-        "initialize" => Ok(initialize(&params)),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(tools::list()),
-        "notifications/initialized" | "notifications/cancelled" => {
-            return None;
-        }
-        _ => Err((-32601, format!("method not found: {method}"))),
-    };
-
-    let resp = match result {
-        Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-        Err((code, message)) => json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": { "code": code, "message": message }
-        }),
-    };
-    Some(resp.to_string())
-}
-
-fn initialize(params: &Value) -> Value {
-    let asked = params
-        .get("protocolVersion")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    // Echo theirs if we speak it, else our max.
-    let version = if tools::PROTOCOL_VERSIONS.contains(&asked) {
-        asked
-    } else {
-        tools::PROTOCOL_VERSIONS[0]
-    };
-    json!({
-        "protocolVersion": version,
-        "capabilities": { "tools": {} },
-        "instructions": tools::instructions(),
-        "serverInfo": {
-            "name": tools::SERVER_NAME,
-            "title": tools::SERVER_TITLE,
-            "version": tools::SERVER_VERSION
-        }
-    })
-}
-
-pub(crate) async fn call_tool(
-    daemon: &Arc<Daemon>,
-    params: &Value,
-) -> Result<Value, (i64, String)> {
-    call_tool_ctx(daemon, params, None).await
-}
-
-pub(crate) async fn call_tool_ctx(
-    daemon: &Arc<Daemon>,
-    params: &Value,
-    ctx: Option<ToolCtx>,
-) -> Result<Value, (i64, String)> {
-    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    match name {
-        "web_fetch" => Ok(fetch_tool(daemon, &args, ctx).await),
-        "web_search" => Ok(search_tool(daemon, &args, ctx).await),
-        "web_crawl" => Ok(crawl_tool(daemon, &args, ctx).await),
-        _ => Err((-32602, format!("unknown tool: {name}"))),
-    }
-}
-
-/// The crawl tool: two-phase site walk. Phase 1 = sitemap
-/// discovery (a map costs ~2 requests instead of N fetches);
-/// Phase 2 = Governor-paced frontier walk riding DonShadow +
-/// DonSift. Resume tokens make huge sites paginable.
-#[allow(clippy::field_reassign_with_default)]
-async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<ToolCtx>) -> Value {
-    daemon.refresh_vault().await;
-    // Resume can work without a url (the seed is stored in the
-    // resume state). If url is missing AND no resume token, error.
-    let url = match args.get("url").and_then(Value::as_str) {
-        Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
-        // Empty string (the CLI's explicit resume-only positional) and
-        // a missing key are the same case: the seed is loaded from
-        // the resume state.
-        None | Some("") => {
-            if args.get("resume").and_then(Value::as_str).is_none() {
-                return tool_error("crawl: url required (or provide resume token to continue)");
-            }
-            String::new()
-        }
-        Some(u) => return tool_error(format!("crawl: url must be http(s), got: {u}")),
-    };
-    let mut opts = CrawlOptions::default();
-    opts.focus = args.get("focus").and_then(Value::as_str).map(String::from);
-    opts.mode = match args.get("mode").and_then(Value::as_str).unwrap_or("full") {
-        "map" => CrawlMode::Map,
-        "content" => CrawlMode::Content,
-        _ => CrawlMode::Full,
-    };
-    if let Some(n) = args.get("max_pages").and_then(Value::as_u64) {
-        opts.max_pages = n.clamp(1, 200) as usize;
-    }
-    if let Some(n) = args.get("max_depth").and_then(Value::as_u64) {
-        opts.max_depth = n.clamp(0, 8) as u32;
-    }
-    if let Some(n) = args.get("max_total_chars").and_then(Value::as_u64) {
-        opts.max_total_chars = (n as usize).clamp(4_000, 500_000);
-    }
-    if let Some(n) = args.get("per_page_max").and_then(Value::as_u64) {
-        opts.per_page_max = (n as usize).clamp(400, 40_000);
-    }
-    if let Some(a) = args.get("include_paths").and_then(Value::as_array) {
-        opts.include_paths = a
-            .iter()
-            .filter_map(Value::as_str)
-            .map(String::from)
-            .collect();
-    }
-    if let Some(a) = args.get("exclude_paths").and_then(Value::as_array) {
-        opts.exclude_paths = a
-            .iter()
-            .filter_map(Value::as_str)
-            .map(String::from)
-            .collect();
-    }
-    if let Some(b) = args.get("same_host").and_then(Value::as_bool) {
-        opts.same_host = b;
-    }
-    if let Some(b) = args.get("respect_robots").and_then(Value::as_bool) {
-        opts.respect_robots = b;
-    }
-    if let Some(n) = args.get("deadline_s").and_then(Value::as_u64) {
-        opts.deadline = std::time::Duration::from_secs(n.clamp(5, 600));
-    }
-    if let Some(q) = args.get("min_quality").and_then(Value::as_f64) {
-        opts.min_quality = q.clamp(0.0, 1.0) as f32;
-    }
-    let resume = args.get("resume").and_then(Value::as_str).map(String::from);
-
-    // v3 delta crawl: skip pages whose fingerprints are on file,
-    // and record the fingerprints of everything actually fetched :
-    // crawls feed the same memory fetches do.
-    if args
-        .get("since_last")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let hist = Arc::clone(&daemon.history);
-        opts.skip_unchanged = Some(Arc::new(move |url: &str| {
-            hist.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .has_recent(url)
-        }));
-    }
-    {
-        let hist = Arc::clone(&daemon.history);
-        opts.on_page = Some(Arc::new(
-            move |url: &str, fp: Option<&str>, md: &str, title: Option<&str>| {
-                if let Some(fp) = fp {
-                    let mut h = hist
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    h.record(url, fp, md.len(), title, md);
-                }
-            },
-        ));
-    }
-
-    // v3: cancellation + progress. The crawl stops its workers
-    // gracefully on cancel (the stop-flag mechanism) and persists
-    // its resume token : partial progress is never lost.
-    if let Some(c) = &ctx {
-        opts.cancel = Some(c.cancel_receiver());
-        let parts = c.progress_parts();
-        let last_emit = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        opts.progress = Some(Arc::new(move |done, queued| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            // Throttle: first pages + one beat every 2s.
-            if done <= 2
-                || now.saturating_sub(last_emit.load(std::sync::atomic::Ordering::Relaxed)) > 2_000
-            {
-                last_emit.store(now, std::sync::atomic::Ordering::Relaxed);
-                emit_progress(
-                    &parts,
-                    done as u64,
-                    None,
-                    &format!("{done} pages, {queued} queued"),
-                );
-            }
-        }));
-    }
-
-    // Centralized SSRF guard on the seed.
-    if !url.is_empty()
-        && let Err(e) = crate::fetch::guards::validate_url_basic(&url)
-    {
-        return tool_error(format!("{e}"));
-    }
-
-    // Ghost-warm: if this host was tier-2 solved recently, the
-    // clearance cookies ride tier 1 from page one.
-    if let Some(host) = url::Url::parse(&url)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from))
-    {
-        let route = daemon.state.lock().await.route_for(&host);
-        if let RouteDecision::Warm(cookies) = route {
-            daemon.fetcher.import_cookies(&cookies).await;
-        }
-    }
-
-    let requested_mode = opts.mode;
-    let crawl_t0 = std::time::Instant::now();
-    let result = match daemon.crawler.crawl(&url, opts, resume.as_deref()).await {
-        Ok(r) => {
-            // Batch-flush the fingerprints the crawl just recorded.
-            daemon
-                .history
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .flush();
-            r
-        }
-        Err(e) => {
-            // Crawl failures are input errors (bad seed / expired
-            // resume token) : permanent, not worth a blind retry.
-            // Classify honestly so the agent doesn't burn calls.
-            let msg = e.to_ascii_lowercase();
-            let (kind, hint) = if msg.contains("resume token") {
-                (
-                    "permanent",
-                    "the resume token is expired or unknown : start a fresh crawl (omit resume)",
-                )
-            } else if msg.contains("bad seed") || msg.contains("must have a host") {
-                (
-                    "permanent",
-                    "check the seed URL format (full scheme + host, e.g. https://example.com/docs/)",
-                )
-            } else {
-                (
-                    "transient",
-                    "safe to retry immediately; if repeated, lower max_pages or widen deadline_s",
-                )
-            };
-            let mut trace = Trace::default();
-            trace.step("crawl", "crawl", "error", crawl_t0.elapsed().as_millis());
-            return tool_error_structured(
-                format!("crawl: {e}"),
-                kind,
-                Some(json!({
-                    "url": url,
-                    "escalation": trace.value(),
-                    "next_action": hint,
-                })),
-            );
-        }
-    };
-
-    render_crawl_result(&result, requested_mode)
-}
-
-fn render_crawl_result(result: &crate::crawl::CrawlResult, requested_mode: CrawlMode) -> Value {
-    // One linear evidence document: page identity and body appear exactly once.
-    let mut text = String::new();
-    text.push_str(&format!("# Crawl\n{}\n\n", result.seed));
-    if requested_mode == CrawlMode::Map {
-        text.push_str("## Discovered URLs\n");
-        for u in &result.map {
-            text.push_str(&format!("- {u}\n"));
-        }
-        text.push('\n');
-    }
-    if requested_mode != CrawlMode::Map {
-        for (index, page) in result
-            .pages
-            .iter()
-            .filter(|page| !page.duplicate)
-            .enumerate()
-        {
-            text.push_str(&format!("## [{}]", index + 1));
-            if !page.title.is_empty() {
-                text.push_str(&format!(" {}", page.title));
-            }
-            text.push('\n');
-            text.push_str(&page.url);
-            let body = strip_source_frontmatter(
-                &page.markdown,
-                &page.url,
-                (!page.title.is_empty()).then_some(page.title.as_str()),
-            );
-            if !body.is_empty() {
-                text.push_str("\n\n");
-                text.push_str(&body);
-            }
-            text.push_str("\n\n---\n\n");
-        }
-        if requested_mode == CrawlMode::Full {
-            let rendered = result
-                .pages
-                .iter()
-                .filter(|page| !page.duplicate)
-                .map(|page| page.url.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            let remaining = result
-                .map
-                .iter()
-                .filter(|url| !rendered.contains(url.as_str()))
-                .collect::<Vec<_>>();
-            if !remaining.is_empty() {
-                text.push_str("## Discovered URLs not fetched\n");
-                for url in remaining {
-                    text.push_str(&format!("- {url}\n"));
-                }
-            }
-        }
-    }
-
-    let next_action = compute_crawl_next_action(result);
-    let mut structured = json!({
-        "seed": result.seed,
-        "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
-        "pages": result.pages.iter().filter(|p| !p.duplicate).map(|p| json!({
-            "url": p.url,
-            "lastmod": p.lastmod,
-        })).collect::<Vec<_>>(),
-        "stop": format!("{:?}", result.stop),
-    });
-    if let Some(resume) = &result.resume {
-        structured["resume"] = json!(resume);
-    }
-    if !next_action.is_empty() {
-        structured["next_action"] = json!(next_action);
-    }
-    let debug = json!({
-        "mode": format!("{:?}", requested_mode),
-        "map": result.map,
-        "queued": result.queued,
-        "filtered_out": result.filtered_out,
-        "skipped": result.skipped.iter().map(|(u, w)| json!({"url": u, "reason": w})).collect::<Vec<_>>(),
-        "pages": result.pages.iter().map(|p| json!({
-            "url": p.url,
-            "title": p.title,
-            "kind": format!("{:?}", p.kind),
-            "chars": p.chars,
-            "quality": p.quality,
-            "duplicate": p.duplicate,
-            "parent": p.parent,
-            "score": (p.score * 100.0).round() / 100.0,
-            "lastmod": p.lastmod,
-        })).collect::<Vec<_>>(),
-        "crawl_delay": result.crawl_delay,
-        "elapsed_s": result.elapsed.as_secs_f64(),
-    });
-    json!({
-        "content": [{"type": "text", "text": text.trim_end()}],
-        "structuredContent": structured,
-        "_meta": {"com.donsetch/crawl-debug": debug},
-    })
-}
-
-/// Compute actionable guidance for the agent based on crawl
-/// results. Returns an empty string when the crawl succeeded
-/// normally (no guidance needed).
-fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> String {
-    use crate::crawl::StopReason;
-
-    // Resume available : always suggest it first.
-    if let Some(tok) = &result.resume {
-        return format!(
-            "resume={tok} to continue crawling (stopped: {:?}).",
-            result.stop
-        );
-    }
-
-    // 0 pages : diagnose why.
-    if result.pages.is_empty() {
-        let skip_reasons: Vec<&str> = result.skipped.iter().map(|(_, w)| w.as_str()).collect();
-        let all_scope = skip_reasons
-            .iter()
-            .all(|r| r.contains("out of scope") || r.contains("filtered"));
-        let all_blocked = skip_reasons
-            .iter()
-            .all(|r| r.contains("Challenge") || r.contains("Blocked") || r.contains("wall"));
-        let all_404 = skip_reasons
-            .iter()
-            .all(|r| r.contains("404") || r.contains("NotFound"));
-        let has_sitemap = !result.map.is_empty();
-
-        if all_404 {
-            return "seed URL returned 404 : check the URL is correct.".into();
-        }
-        if all_blocked {
-            return "the site blocked the crawler. Try respect_robots=false, or fetch the seed URL directly first to check access.".into();
-        }
-        if all_scope && result.filtered_out > 0 {
-            return "all discovered URLs were outside the seed's path scope. Try broader include_paths, or same_host=false to crawl the whole host.".into();
-        }
-        if !has_sitemap && result.map.is_empty() && result.filtered_out == 0 {
-            return "no sitemap found and no links discovered. Try mode=content to BFS from the seed, or check the seed URL is accessible.".into();
-        }
-        return "crawl returned 0 pages. Try mode=content, broader include_paths, or a different seed URL.".into();
-    }
-
-    // Pages found but stopped early.
-    match result.stop {
-        StopReason::MaxPages => {
-            "crawl hit the page budget. Increase max_pages or use resume to continue.".into()
-        }
-        StopReason::CharBudget => {
-            "crawl hit the character budget. Increase max_total_chars or use resume to continue."
-                .into()
-        }
-        StopReason::Deadline => {
-            "crawl hit the time deadline. Increase deadline_s or use resume to continue.".into()
-        }
-        StopReason::Cancelled => {
-            "crawl cancelled : resume with the token above to continue where it stopped.".into()
-        }
-        StopReason::ThrottledOut => {
-            "the host throttled the crawler. Wait a few minutes and resume.".into()
-        }
-        StopReason::DepthLimit => {
-            "crawl hit the depth limit. Increase max_depth to discover more pages.".into()
-        }
-        StopReason::FrontierEmpty => String::new(), // normal completion
-    }
-}
-
-/// Map a raw FetchError to a user-friendly diagnostic.
-/// No Rust internals, no TLS jargon : clean, actionable.
-fn friendly_fetch_error(e: &FetchError) -> String {
-    match e {
-        FetchError::Timeout => "request timed out (the server took too long to respond)".into(),
-        FetchError::TooManyRedirects => "too many redirects (the URL loops)".into(),
-        FetchError::InvalidUrl(u) => format!("invalid URL: {u}"),
-        FetchError::Tls(msg) => {
-            // Classified errors (egress interception, cert trust) carry
-            // the actionable hint the user needs to fix their network;
-            // pass those through verbatim. Raw SSL/BoringSSL internals
-            // get flattened into short honest messages.
-            if msg.contains("egress path")
-                || msg.contains("certificate verification failed")
-                || msg.contains("TLS handshake aborted")
-                || msg.contains("TLS handshake cut short")
-            {
-                format!("TLS error: {msg}")
-            } else {
-                let msg = msg.to_lowercase();
-                if msg.contains("certificate") || msg.contains("handshake") {
-                    "TLS error: the server's certificate or handshake failed".into()
-                } else if msg.contains("reset") || msg.contains("eof") {
-                    "connection reset by server".into()
-                } else {
-                    "TLS connection failed".into()
-                }
-            }
-        }
-        FetchError::Io(e) => {
-            let msg = e.to_string();
-            if msg.contains("refused") {
-                "connection refused (the server is not accepting connections)".into()
-            } else if msg.contains("timed out") {
-                "connection timed out".into()
-            } else if msg.contains("not found") || msg.contains("no address") {
-                "host not found (DNS lookup failed)".into()
-            } else if msg.contains("reset") {
-                "connection reset by server".into()
-            } else {
-                format!("network error: {e}")
-            }
-        }
-        FetchError::Http(msg) => {
-            // h1/h2 protocol errors: strip raw parser messages.
-            let msg = msg.to_lowercase();
-            if msg.contains("eof before headers") {
-                "server closed the connection before sending a response".into()
-            } else if msg.contains("read_server_hello") {
-                "TLS handshake failed (server rejected the connection)".into()
-            } else {
-                format!("HTTP protocol error: {e}")
-            }
-        }
-        FetchError::Ghost(msg) => format!("browser automation error: {msg}"),
-    }
-}
-
-/// Map a Verdict + status code to a clean, specific error message.
-/// Distinguishes genuine blocks from upstream errors from SPAs.
-fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String {
-    match verdict {
-        Verdict::AuthWall => {
-            format!("HTTP 401 at {url} : the server requires authentication")
-        }
-        Verdict::Paywall => format!("paywall: {url} requires payment to view content"),
-        Verdict::SoftNotFound => format!("not found: {url} returned HTTP {status}"),
-        Verdict::Blocked => {
-            // 403/429 without challenge markers = upstream block, not a bot wall.
-            match status {
-                403 => format!("forbidden: {url} returned HTTP 403 (access denied)"),
-                429 => format!("rate limited: {url} returned HTTP 429 (too many requests)"),
-                503 => format!(
-                    "service unavailable: {url} returned HTTP 503 (server overloaded or down)"
-                ),
-                _ => format!("blocked: {url} returned HTTP {status}"),
-            }
-        }
-        Verdict::Challenge(v) => format!(
-            "bot wall: {url} is protected by {:?} (try fetch with tier=2 for headless browser)",
-            v
-        ),
-        Verdict::ContentOk => format!("unexpected error: {url} (status {status})"),
-    }
-}
-
-/// The fetch tool: tier 1 → verdict → ghost solve/render
-/// → DonSift. Ports the CLI escalation into the daemon,
-/// with warm-start and render cache.
-#[allow(clippy::field_reassign_with_default)]
-async fn fetch_tool(daemon: &Arc<Daemon>, args: &Value, mut ctx: Option<ToolCtx>) -> Value {
+    args: &Value,
+    mut ctx: Option<ToolCtx>,
+) -> Value {
     daemon.refresh_vault().await;
     let deadline = args
         .get("deadline_ms")
@@ -928,23 +69,7 @@ async fn fetch_tool(daemon: &Arc<Daemon>, args: &Value, mut ctx: Option<ToolCtx>
 
 /// Honest deadline error (v3 D1): the tool respects the agent's
 /// clock. What was fetched so far is described; nothing pretends.
-fn deadline_error(url: &str) -> Value {
-    let mut trace = Trace::default();
-    trace.step("clock", "deadline", "hit", 0);
-    tool_error_structured(
-        format!("fetch: deadline_ms exceeded at {url}"),
-        "transient",
-        Some(json!({
-            "url": url,
-            "escalation": trace.value(),
-            "next_action": "retry with a higher deadline_ms, or tier=1 (skips browser escalation : the usual deadline eater on walled sites)",
-        })),
-    )
-}
-
-/// Resolve a raw url-or-handle argument to a fetchable http(s)
-/// URL. Ok(URL) or Err(error Value).
-async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result<String, Value> {
+pub(super) async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result<String, Value> {
     if raw.starts_with("http://") || raw.starts_with("https://") {
         return Ok(raw.to_string());
     }
@@ -980,7 +105,7 @@ async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result<String, Va
 /// whole; the budget slices proportional to size, never below a
 /// floor. All-failed = honest error; partial = composed result
 /// with per-URL status.
-async fn fetch_multi(
+pub(super) async fn fetch_multi(
     daemon: &Arc<Daemon>,
     args: &Value,
     urls: Vec<String>,
@@ -1102,7 +227,7 @@ async fn fetch_multi(
 /// Compose a batch without repeating page evidence or transport telemetry on
 /// model-visible surfaces. Kept pure so partial and all-failed contracts are
 /// deterministic unit-test inputs.
-fn render_fetch_batch(
+pub(super) fn render_fetch_batch(
     urls: &[String],
     results: &[Value],
     markdowns: &[Option<String>],
@@ -1251,7 +376,7 @@ fn render_fetch_batch(
 
 /// Single-URL fetch with resurrection (v3): dead URLs get one
 /// honest attempt at the Wayback Machine before the error stands.
-async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
+pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
     let archive = match args.get("archive").and_then(Value::as_str) {
         Some("off") => "off",
         Some("only") => "only",
@@ -1297,7 +422,7 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
 
 /// v3 F3: find the rel=next pagination link (rel may carry other
 /// tokens, e.g. rel="next chapter"); resolved against `base`.
-fn find_rel_next(html: &str, base: &str) -> Option<String> {
+pub(super) fn find_rel_next(html: &str, base: &str) -> Option<String> {
     let doc = scraper::Html::parse_document(html);
     let sel = scraper::Selector::parse("link[rel], a[rel]").ok()?;
     let base = url::Url::parse(base).ok()?;
@@ -1321,7 +446,7 @@ fn find_rel_next(html: &str, base: &str) -> Option<String> {
 /// Strip a part's frontmatter (title line, URL line, description
 /// line) : stitched parts share the article's chrome, and the
 /// `*(part N)*` marker already carries the context.
-fn strip_part_frontmatter(md: &str) -> String {
+pub(super) fn strip_part_frontmatter(md: &str) -> String {
     let lines: Vec<&str> = md.lines().collect();
     let mut start = 0;
     if lines.first().is_some_and(|l| l.starts_with("# ")) {
@@ -1337,7 +462,7 @@ fn strip_part_frontmatter(md: &str) -> String {
 }
 
 #[allow(clippy::field_reassign_with_default)]
-async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
+pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
     let t0 = std::time::Instant::now();
     // Full parse up front: an unparseable URL would otherwise flow
     // through the whole pipeline with host="" : poisoning domain
@@ -2157,7 +1282,7 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
 /// `donsetch keys add unlocker <key>`. No key = inert, returns None.
 /// Only fires on wall verdicts (Challenge/Blocked) and ghost "walled"
 /// failures. Respects tier=1 (explicit no-escalation).
-async fn try_bypass(
+pub(super) async fn try_bypass(
     daemon: &Arc<Daemon>,
     url: &str,
     opts: &ExtractOptions,
@@ -2243,7 +1368,7 @@ async fn try_bypass(
 /// ride warm tier 1 : with `replay_ok` set from the tier-1 retry's
 /// actual outcome. A pure SPA render (thin content, no wall) never
 /// touches the domain profile: the site isn't walled, it's JS-only.
-async fn ghost_escalate(
+pub(super) async fn ghost_escalate(
     daemon: &Arc<Daemon>,
     url: &str,
     host: &str,
@@ -2600,7 +1725,8 @@ async fn ghost_escalate(
         let doc = scraper::Html::parse_document(&page.html);
         let meta = crate::extract::metadata::metadata(&doc);
         let max_chars = opts.max_chars.unwrap_or(16_000).max(200);
-        if let Some(fb) = crate::extract::text_fallback(&page.html, &meta, url, opts, max_chars)
+        if let Some(fb) =
+            crate::extract::fallback::text_fallback(&page.html, &meta, url, opts, max_chars)
             && !fb.thin
         {
             return Ok((fb, "ghost-text", 200, url.to_string()));
@@ -2646,7 +1772,7 @@ async fn ghost_escalate(
 /// flow computes its own is_pdf_url). Covers both the .pdf
 /// suffix convention and the /pdf/ path convention (arXiv:
 /// arxiv.org/pdf/1706.03762 serves a PDF with no extension).
-fn is_pdf_url_like(url: &str) -> bool {
+pub(super) fn is_pdf_url_like(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url).to_lowercase();
     if path.ends_with(".pdf") {
         return true;
@@ -2667,7 +1793,7 @@ fn is_pdf_url_like(url: &str) -> bool {
 /// extraction over the final DOM. focus/section/toc all work
 /// on the interacted-with page. One call replaces hound's
 /// navigate→act→act→read round-trips.
-async fn fetch_with_actions(
+pub(super) async fn fetch_with_actions(
     daemon: &Arc<Daemon>,
     url: &str,
     host: &str,
@@ -2914,7 +2040,11 @@ async fn fetch_with_actions(
 /// 5MB each, SSRF-guarded) and append an `## image text` section
 /// to the result. On-demand only : OCR models are heavy and most
 /// pages never need it.
-async fn apply_image_ocr(daemon: &Arc<Daemon>, res: &mut Value, images: &[(String, String)]) {
+pub(super) async fn apply_image_ocr(
+    daemon: &Arc<Daemon>,
+    res: &mut Value,
+    images: &[(String, String)],
+) {
     #[cfg(not(feature = "ocr"))]
     {
         let _ = (daemon, images);
@@ -3012,7 +2142,7 @@ async fn apply_image_ocr(daemon: &Arc<Daemon>, res: &mut Value, images: &[(Strin
 /// bots. Render the same URL in the real browser and compare word
 /// sets. Material divergence → `cloak_suspected` with a trust
 /// recommendation. Cost: one browser render, only on suspicion.
-async fn anticloak_check(
+pub(super) async fn anticloak_check(
     daemon: &Arc<Daemon>,
     url: &str,
     tier1_markdown: &str,
@@ -3034,7 +2164,7 @@ async fn anticloak_check(
         &ExtractOptions::default(),
     )
     .ok()?;
-    fn words(s: &str) -> std::collections::HashSet<&str> {
+    pub(super) fn words(s: &str) -> std::collections::HashSet<&str> {
         s.split_whitespace().collect()
     }
     let a = words(tier1_markdown);
@@ -3066,7 +2196,11 @@ async fn anticloak_check(
 /// the nearest snapshot : labeled ruthlessly so archived content
 /// can never masquerade as live. `archive: auto` (default) only on
 /// dead-end failures; `only` skips the live attempt; `off` never.
-async fn try_resurrect(daemon: &Arc<Daemon>, url: &str, live_error: &Value) -> Option<Value> {
+pub(super) async fn try_resurrect(
+    daemon: &Arc<Daemon>,
+    url: &str,
+    live_error: &Value,
+) -> Option<Value> {
     // 1. Availability lookup (keyless, public API).
     let avail_url = format!(
         "https://archive.org/wayback/available?url={}",
@@ -3181,7 +2315,7 @@ async fn try_resurrect(daemon: &Arc<Daemon>, url: &str, live_error: &Value) -> O
 
 /// Percent-encode a value for a query string: everything outside
 /// the unreserved set (plus ':', '/' which wayback tolerates raw).
-fn encode_query_value(s: &str) -> String {
+pub(super) fn encode_query_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -3195,7 +2329,7 @@ fn encode_query_value(s: &str) -> String {
 }
 
 /// Wayback timestamp (YYYYMMDDhhmmss) → "YYYY-MM-DD".
-fn wayback_date(ts: &str) -> String {
+pub(super) fn wayback_date(ts: &str) -> String {
     if ts.len() >= 8 && ts[..8].chars().all(|c| c.is_ascii_digit()) {
         format!("{}-{}-{}", &ts[0..4], &ts[4..6], &ts[6..8])
     } else {
@@ -3203,7 +2337,7 @@ fn wayback_date(ts: &str) -> String {
     }
 }
 
-fn wayback_age_days(ts: &str) -> u64 {
+pub(super) fn wayback_age_days(ts: &str) -> u64 {
     let y: u64 = ts.get(0..4).and_then(|s| s.parse().ok()).unwrap_or(2015);
     let m: u64 = ts.get(4..6).and_then(|s| s.parse().ok()).unwrap_or(1);
     let d: u64 = ts.get(6..8).and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -3220,7 +2354,7 @@ fn wayback_age_days(ts: &str) -> u64 {
 /// unchanged verdict) instead of the full content.
 /// What the extractor learned about one fetched page : the
 /// page-history record input.
-struct PageFacts<'a> {
+pub(super) struct PageFacts<'a> {
     fingerprint: Option<&'a str>,
     markdown: &'a str,
     title: Option<&'a str>,
@@ -3228,7 +2362,7 @@ struct PageFacts<'a> {
     complete: bool,
 }
 
-fn apply_page_history(
+pub(super) fn apply_page_history(
     daemon: &Arc<Daemon>,
     res: &mut Value,
     url: &str,
@@ -3322,7 +2456,7 @@ fn apply_page_history(
     }
 }
 
-fn now_unix() -> u64 {
+pub(super) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3332,7 +2466,7 @@ fn now_unix() -> u64 {
 /// v3 reference handles: rewrite markdown links in a fetch result
 /// to `L{n}` handles and expose the count as compact machine state.
 /// Mutates `res` in place; no-op when links aren't in the output.
-async fn apply_link_handles(daemon: &Arc<Daemon>, res: &mut Value) {
+pub(super) async fn apply_link_handles(daemon: &Arc<Daemon>, res: &mut Value) {
     // When handles are disabled, links keep their hrefs.
     if !crate::handles::handles_enabled() {
         return;
@@ -3360,7 +2494,7 @@ async fn apply_link_handles(daemon: &Arc<Daemon>, res: &mut Value) {
 
 /// Remove only frontmatter represented by the wrapper's canonical source
 /// header. Byline, publication date and summaries remain evidence.
-fn strip_source_frontmatter(markdown: &str, url: &str, title: Option<&str>) -> String {
+pub(super) fn strip_source_frontmatter(markdown: &str, url: &str, title: Option<&str>) -> String {
     const FRONTMATTER_LINES: usize = 8;
     let mut dropped_title = false;
     let mut dropped_url = false;
@@ -3383,7 +2517,7 @@ fn strip_source_frontmatter(markdown: &str, url: &str, title: Option<&str>) -> S
     lines.join("\n").trim().to_string()
 }
 
-fn same_fetch_url(candidate: &str, expected: &str) -> bool {
+pub(super) fn same_fetch_url(candidate: &str, expected: &str) -> bool {
     match (url::Url::parse(candidate), url::Url::parse(expected)) {
         (Ok(candidate), Ok(expected)) => candidate == expected,
         _ => candidate == expected,
@@ -3391,7 +2525,11 @@ fn same_fetch_url(candidate: &str, expected: &str) -> bool {
 }
 
 /// Present one canonical title and source URL followed by the evidence body.
-fn format_fetch_markdown(ex: &extract::Extracted, source_url: &str, display_url: &str) -> String {
+pub(super) fn format_fetch_markdown(
+    ex: &extract::Extracted,
+    source_url: &str,
+    display_url: &str,
+) -> String {
     let body = strip_source_frontmatter(&ex.markdown, source_url, ex.title.as_deref());
     let mut markdown = String::new();
     if let Some(title) = &ex.title {
@@ -3405,7 +2543,7 @@ fn format_fetch_markdown(ex: &extract::Extracted, source_url: &str, display_url:
     markdown
 }
 
-fn finish_result(
+pub(super) fn finish_result(
     ex: &extract::Extracted,
     tier: &str,
     status: u16,
@@ -3488,7 +2626,7 @@ fn finish_result(
 /// v3 F2: per-result route hints from the self-improving store :
 /// domains that consistently need the browser carry the cost in
 /// the open so the agent can budget or pick a faster source.
-async fn route_hints(
+pub(super) async fn route_hints(
     daemon: &Arc<Daemon>,
     out: &crate::search::SearchOutcome,
 ) -> Vec<Option<String>> {
@@ -3504,7 +2642,7 @@ async fn route_hints(
         .collect()
 }
 
-async fn bind_search_handles(
+pub(super) async fn bind_search_handles(
     daemon: &Arc<Daemon>,
     out: &crate::search::SearchOutcome,
 ) -> Vec<String> {
@@ -3512,7 +2650,7 @@ async fn bind_search_handles(
     bind_search_urls(daemon, &urls).await
 }
 
-async fn bind_search_urls(daemon: &Arc<Daemon>, urls: &[String]) -> Vec<String> {
+pub(super) async fn bind_search_urls(daemon: &Arc<Daemon>, urls: &[String]) -> Vec<String> {
     // When handles are disabled (DONSETCH_URL_HANDLES=off), return
     // empty vec : search results show raw URLs instead.
     if !crate::handles::handles_enabled() {
@@ -3522,1015 +2660,6 @@ async fn bind_search_urls(daemon: &Arc<Daemon>, urls: &[String]) -> Vec<String> 
     let hs = ht.set_search_results(urls);
     // Search handles are in-memory only : no flush.
     hs
-}
-
-async fn search_tool(daemon: &Arc<Daemon>, args: &Value, mut ctx: Option<ToolCtx>) -> Value {
-    daemon.refresh_vault().await;
-    let deadline = args
-        .get("deadline_ms")
-        .and_then(Value::as_u64)
-        .map(|ms| std::time::Duration::from_millis(ms.clamp(500, 600_000)));
-    let queries = match parse_search_queries(args) {
-        Ok(queries) => queries,
-        Err(message) => return tool_error(message),
-    };
-    let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(7) as usize;
-    let intent = match args.get("intent").and_then(Value::as_str) {
-        Some("web") => Some(Intent::Web),
-        Some("code") => Some(Intent::Code),
-        Some("paper") => Some(Intent::Paper),
-        Some("news") => Some(Intent::News),
-        Some("entity") => Some(Intent::Entity),
-        _ => None,
-    };
-
-    if queries.len() == 1 {
-        let query = &queries[0];
-        run_with_budget(
-            search_inner(daemon, query, max, intent),
-            deadline,
-            ctx.as_mut(),
-            || search_deadline_error(query),
-        )
-        .await
-    } else {
-        let deadline_queries = queries.clone();
-        run_with_budget(
-            search_batch_inner(daemon, &queries, max, intent),
-            deadline,
-            ctx.as_mut(),
-            move || search_batch_deadline_error(&deadline_queries),
-        )
-        .await
-    }
-}
-
-/// Parse the required base query and at most two explicit alternate
-/// formulations. DonSeTch never invents variants: the calling agent has the
-/// task context and can express ambiguity without a local language model.
-fn parse_search_queries(args: &Value) -> Result<Vec<String>, String> {
-    let base = args
-        .get("query")
-        .and_then(Value::as_str)
-        .filter(|query| !query.trim().is_empty())
-        .ok_or_else(|| "search: query required".to_string())?;
-    // Preserve the original base query exactly. This keeps the established
-    // single-query path and cache key behavior unchanged.
-    let mut queries = vec![base.to_string()];
-
-    let Some(variants) = args.get("query_variants") else {
-        return Ok(queries);
-    };
-    let variants = variants
-        .as_array()
-        .ok_or_else(|| "search: query_variants must be an array of strings".to_string())?;
-    if variants.len() > 2 {
-        return Err("search: query_variants accepts at most 2 entries".to_string());
-    }
-    for variant in variants {
-        let variant = variant
-            .as_str()
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-            .ok_or_else(|| {
-                "search: every query_variants entry must be a non-empty string".to_string()
-            })?;
-        if !queries
-            .iter()
-            .any(|existing| existing.trim().eq_ignore_ascii_case(variant))
-        {
-            queries.push(variant.to_string());
-        }
-    }
-    Ok(queries)
-}
-
-/// Honest deadline error for search (v3 D1).
-fn search_deadline_error(query: &str) -> Value {
-    let mut trace = Trace::default();
-    trace.step("search", "engines", "deadline", 0);
-    tool_error_structured(
-        format!("search: deadline_ms exceeded for \"{query}\""),
-        "transient",
-        Some(json!({
-            "query": query,
-            "escalation": trace.value(),
-            "next_action": "retry with a higher deadline_ms, or without one (engines have their own timeouts)",
-        })),
-    )
-}
-
-fn search_batch_deadline_error(queries: &[String]) -> Value {
-    let mut trace = Trace::default();
-    trace.step("search", "query-variants", "deadline", 0);
-    tool_error_structured(
-        format!(
-            "search: deadline_ms exceeded while running {} query variants",
-            queries.len()
-        ),
-        "transient",
-        Some(json!({
-            "queries": queries,
-            "escalation": trace.value(),
-            "next_action": "retry with a higher deadline_ms, fewer query_variants, or a single query",
-        })),
-    )
-}
-
-/// Ghost render capability shared by the crawl and the search
-/// SERP cascade lane. `skip_cache_read` = never serve a previous
-/// render from the cache (the search lane uses this: a cached
-/// walled SERP would replay "no results" for the whole TTL).
-/// Writes are always kept: the cache still serves normal fetches
-/// of the same URL.
-fn make_ghost_hook(
-    ghost_mgr: std::sync::Arc<GhostManager>,
-    profile: BrowserProfile,
-    fetcher: std::sync::Arc<Fetcher>,
-    state: Arc<tokio::sync::Mutex<GhostState>>,
-    skip_cache_read: bool,
-) -> crate::crawl::GhostHook {
-    std::sync::Arc::new(move |url: String| {
-        let ghost_mgr = std::sync::Arc::clone(&ghost_mgr);
-        let profile = profile.clone();
-        let fetcher = std::sync::Arc::clone(&fetcher);
-        let state = Arc::clone(&state);
-        async move {
-            // Render cache shortcut (crawl only).
-            if !skip_cache_read {
-                let s = state.lock().await;
-                if let Some(rc) = s.render_for(&url) {
-                    return Ok(crate::crawl::GhostRender {
-                        html: rc.html.clone(),
-                    });
-                }
-            }
-            let mut g = match ghost_mgr.acquire(&profile).await {
-                Ok(g) => g,
-                Err(e) => return Err(format!("browser launch: {e}")),
-            };
-            let page = match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20))
-                .await
-            {
-                Ok(p) => p,
-                Err(first) => {
-                    // Retry once on transient timeout.
-                    match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20)).await {
-                        Ok(p) => p,
-                        Err(second) => {
-                            return Err(format!("render: {first}; retry: {second}"));
-                        }
-                    }
-                }
-            };
-            if page.captcha {
-                return Err("interactive captcha (unsolvable by design)".to_string());
-            }
-            if !page.cookies.is_empty() {
-                fetcher.import_cookies(&page.cookies).await;
-                crate::ghost::cache::store_session_cookies(&page.cookies);
-            }
-            {
-                let mut s = state.lock().await;
-                s.record_render(&url, &page.html);
-            }
-            Ok(crate::crawl::GhostRender { html: page.html })
-        }
-        .boxed()
-    })
-}
-
-#[derive(Debug)]
-struct SearchFailure {
-    cause: String,
-    byok_tried: bool,
-    /// "permanent" for bad input that no retry or fallback fixes
-    /// (validate_query rejected it before any engine was contacted);
-    /// "transient" for exhausted engines/providers.
-    kind: &'static str,
-}
-
-/// The search pipeline: BYOK providers (if configured) with
-/// local-engine fallback, or local-first when keys say so.
-/// No deadline/cancel logic here : the wrapper owns the clock.
-async fn search_inner(
-    daemon: &Arc<Daemon>,
-    query: &str,
-    max: usize,
-    intent: Option<Intent>,
-) -> Value {
-    match search_outcome(daemon, query, max, intent).await {
-        Ok(out) => {
-            let top = out.results.first().map(|r| r.url.as_str());
-            maybe_pre_solve(daemon, top);
-            render_search_outcome(daemon, &out).await
-        }
-        Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
-    }
-}
-
-async fn render_search_outcome(daemon: &Arc<Daemon>, out: &crate::search::SearchOutcome) -> Value {
-    let hs = bind_search_handles(daemon, out).await;
-    let hints = route_hints(daemon, out).await;
-    let md = search::render_compact_markdown(out, "# Search results", Some(&hs), &hints);
-    let model = search_model_meta(out, &hs);
-    let debug = search_debug_meta(out);
-    json!({
-        "content": [{ "type": "text", "text": md }],
-        "structuredContent": model,
-        "_meta": {"com.donsetch/search-debug": debug},
-    })
-}
-
-/// Machine state needed to route a subsequent fetch. Titles and snippets are
-/// already present on the linear evidence surface; ranking and engine
-/// telemetry remain in client-only metadata.
-fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[String]) -> Value {
-    let results = out
-        .results
-        .iter()
-        .enumerate()
-        .map(|(index, result)| {
-            let mut item = json!({
-                "rank": index + 1,
-                "url": result.url,
-            });
-            if let Some(handle) = handles.get(index) {
-                item["handle"] = json!(handle);
-            }
-            item
-        })
-        .collect::<Vec<_>>();
-    json!({"weak": out.weak, "results": results})
-}
-
-fn search_debug_meta(out: &crate::search::SearchOutcome) -> Value {
-    // Full machine view: per-result title/url/snippet/score plus
-    // the engines report. This is the client-only namespace (the
-    // model never sees _meta), so the detail costs CLI/pipeline
-    // consumers nothing and no model tokens. The compact-contract
-    // PR pruned search-debug down to telemetry only, which broke
-    // every machine consumer reading meta.results[].snippet (the
-    // in-repo bench went 0/30 silently; live-found, restored).
-    search::render_meta(out)
-}
-
-/// Retrying a fully-failed batch only makes sense if at least one
-/// variant failed for a transient (engine/provider) reason; if every
-/// variant was rejected by validate_query ("permanent"), no engine
-/// was ever contacted and retrying the same queries won't help.
-/// Pulled out as a pure function so this logic is testable without a
-/// live `Daemon`.
-fn batch_failure_kind<'a>(kinds: impl Iterator<Item = &'a str>) -> &'static str {
-    if kinds.into_iter().all(|k| k == "permanent") {
-        "permanent"
-    } else {
-        "transient"
-    }
-}
-
-/// Execute explicit query variants concurrently and keep every result set
-/// separate. Grouped evidence lets the calling model compare formulations
-/// while each query retains DonSeTch's established ranking semantics.
-async fn search_batch_inner(
-    daemon: &Arc<Daemon>,
-    queries: &[String],
-    max: usize,
-    intent: Option<Intent>,
-) -> Value {
-    let started = std::time::Instant::now();
-    let futures = queries
-        .iter()
-        .map(|query| search_outcome(daemon, query, max, intent));
-    let outcomes = futures_util::future::join_all(futures).await;
-    if let Some(Ok(first)) = outcomes.first() {
-        let top = first.results.first().map(|r| r.url.as_str());
-        maybe_pre_solve(daemon, top);
-    }
-    let ok = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
-    if ok == 0 {
-        let errors = queries
-            .iter()
-            .zip(outcomes.iter())
-            .filter_map(|(query, outcome)| match outcome {
-                Ok(_) => None,
-                Err(failure) => Some(json!({"query": query, "error": failure.cause})),
-            })
-            .collect::<Vec<_>>();
-        let kind = batch_failure_kind(outcomes.iter().filter_map(|outcome| match outcome {
-            Ok(_) => None,
-            Err(f) => Some(f.kind),
-        }));
-        let next_action = if kind == "permanent" {
-            "fix the queries and search again"
-        } else {
-            "retry once, then reduce to the strongest single query"
-        };
-        return tool_error_structured(
-            format!("search: all {} query variants failed", queries.len()),
-            kind,
-            Some(json!({
-                "queries": queries,
-                "errors": errors,
-                "next_action": next_action,
-            })),
-        );
-    }
-
-    // Mint one global set of handles so every S-handle in every section keeps
-    // resolving after the batch completes. Binding each sub-search separately
-    // would leave clients with ambiguous per-section numbering/state.
-    let urls = outcomes
-        .iter()
-        .filter_map(|outcome| outcome.as_ref().ok())
-        .flat_map(|out| out.results.iter().map(|result| result.url.clone()))
-        .collect::<Vec<_>>();
-    let handles = bind_search_urls(daemon, &urls).await;
-    let mut handle_offset = 0usize;
-    let mut markdown = format!("# Search results : {} formulations", queries.len());
-    let mut searches = Vec::with_capacity(queries.len());
-    let mut diagnostics = Vec::with_capacity(queries.len());
-
-    for (query, outcome) in queries.iter().zip(outcomes.iter()) {
-        markdown.push_str("\n\n");
-        let role = if searches.is_empty() {
-            "primary"
-        } else {
-            "variant"
-        };
-        let heading = format!("## q{} {role} : {query}", searches.len());
-        match outcome {
-            Ok(out) => {
-                let count = out.results.len();
-                let query_handles = if handles.is_empty() {
-                    None
-                } else {
-                    Some(&handles[handle_offset..handle_offset + count])
-                };
-                handle_offset += count;
-                let hints = route_hints(daemon, out).await;
-                markdown.push_str(&search::render_compact_markdown(
-                    out,
-                    &heading,
-                    query_handles,
-                    &hints,
-                ));
-                let mut model = search_model_meta(out, query_handles.unwrap_or(&[]));
-                model["query"] = json!(query);
-                searches.push(model);
-                let mut debug = search_debug_meta(out);
-                debug["query"] = json!(query);
-                diagnostics.push(debug);
-            }
-            Err(failure) => {
-                markdown.push_str(&format!("{heading}\nFailed : {}", failure.cause));
-                searches.push(json!({
-                    "query": query,
-                    "error": failure.cause,
-                    "results": [],
-                }));
-                diagnostics.push(json!({"query": query, "error": failure.cause}));
-            }
-        }
-    }
-
-    json!({
-        "content": [{ "type": "text", "text": markdown }],
-        "structuredContent": {
-            "query_count": queries.len(),
-            "ok": ok,
-            "errors": queries.len() - ok,
-            "searches": searches,
-        },
-        "_meta": {"com.donsetch/search-debug": {
-            "elapsed_ms": started.elapsed().as_millis() as u64,
-            "searches": diagnostics,
-        }},
-    })
-}
-
-/// The search pipeline without presentation. Keeping acquisition separate lets
-/// multi-query mode share one deadline and one final handle table while the
-/// single-query response stays byte-for-byte compatible.
-async fn search_outcome(
-    daemon: &Arc<Daemon>,
-    query: &str,
-    max: usize,
-    intent: Option<Intent>,
-) -> Result<crate::search::SearchOutcome, SearchFailure> {
-    // Input hygiene first: a bad query is a permanent-shaped failure
-    // whether the fanout would have been BYOK or local.
-    if let Some(problem) = search::validate_query(query) {
-        return Err(SearchFailure {
-            cause: problem,
-            byok_tried: false,
-            kind: "permanent",
-        });
-    }
-    // Reload from disk first : picks up keys added/removed
-    // via CLI while the daemon was running.
-    daemon.byok.reload();
-    let byok_configured = daemon.byok.is_configured();
-    let local_first = daemon.byok.is_local_default();
-
-    // BYOK-first mode: try providers, fall back to local.
-    if byok_configured && !local_first {
-        match daemon.byok.search(query, max, intent).await {
-            Ok(out) => return Ok(out),
-            Err(e) => {
-                if std::env::var_os("DONSEEK_DEBUG").is_some() {
-                    eprintln!("[byok] all providers exhausted, falling back to local: {e}");
-                }
-                // Fall through to local search.
-            }
-        }
-    }
-
-    // Local search (primary in local-first mode, fallback in BYOK-first).
-    match daemon.searcher.search(query, max, intent).await {
-        Ok(out) => Ok(out),
-        Err(e) => {
-            // Local failed : if BYOK is configured and we're in
-            // local-first mode, try BYOK as a last resort.
-            if byok_configured && local_first {
-                if std::env::var_os("DONSEEK_DEBUG").is_some() {
-                    eprintln!("[byok] local search failed, trying BYOK fallback: {e}");
-                }
-                match daemon.byok.search(query, max, intent).await {
-                    Ok(out) => Ok(out),
-                    Err(e2) => Err(SearchFailure {
-                        cause: format!("local ({e}); byok ({e2})"),
-                        byok_tried: true,
-                        kind: "transient",
-                    }),
-                }
-            } else {
-                Err(SearchFailure {
-                    cause: e.to_string(),
-                    byok_tried: false,
-                    kind: "transient",
-                })
-            }
-        }
-    }
-}
-
-/// Search failure → structured error: every engine (and BYOK if
-/// tried) failed. The agent needs to know retrying is safe and
-/// what the levers are (BYOK keys, intent, simpler query).
-/// Predict-prefetch the walledest top result while the agent reads
-/// results: when the top URL's domain is known-walled (skip-to-solve
-/// route), start ONE background solve NOW. The agent's fetch a few
-/// seconds later rides warm. Bounded: one in flight daemon-wide, top
-/// result only, no extraction, and every failure feeds the same
-/// cooldown memory the fetch path uses.
-pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
-    let Some(url) = top_url else { return };
-    if !url.starts_with("http") {
-        return;
-    }
-    let Some(host) = url
-        .split_once("://")
-        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
-        .filter(|h| !h.is_empty() && h.contains('.'))
-    else {
-        return;
-    };
-    let d = daemon.clone();
-    let host_str = host.to_string();
-    let url_str = url.to_string();
-    tokio::spawn(async move {
-        use std::sync::atomic::Ordering;
-        if d.pre_solve_busy.swap(true, Ordering::SeqCst) {
-            return; // one pre-solve at a time
-        }
-        let _guard = PreSolveGuard(&d);
-        {
-            let state = d.state.lock().await;
-            if !matches!(
-                state.route_for(&host_str),
-                RouteDecision::SkipToSolve | RouteDecision::RecheckCold
-            ) {
-                return; // not a known wall: the search prewarm covers it
-            }
-        }
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
-            eprintln!(
-                "[pre-solve] kicking background solve for {} ({})",
-                host_str, url_str
-            );
-        }
-        let t0 = std::time::Instant::now();
-        let Ok(mut g) = d.ghost_mgr.acquire(&d.profile).await else {
-            return;
-        };
-        let page =
-            match ops::ghost_fetch(&mut g, &url_str, std::time::Duration::from_secs(20)).await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-        if page.captcha
-            || matches!(
-                crate::detect::walls::detect_dom_smart(page.html.as_bytes()),
-                crate::detect::walls::Verdict::Challenge(_)
-                    | crate::detect::walls::Verdict::Blocked
-            )
-        {
-            d.state.lock().await.record_wall_failed(&host_str);
-            return;
-        }
-        if !page.cookies.is_empty() {
-            d.fetcher.import_cookies(&page.cookies).await;
-            crate::ghost::cache::store_session_cookies(&page.cookies);
-            // Honest replay_ok: only verified tier-1 replay earns
-            // warm routing.
-            let replay_ok = matches!(
-                d.fetcher.fetch(&url_str).await,
-                Ok(o) if o.verdict == crate::detect::walls::Verdict::ContentOk
-            );
-            d.state.lock().await.record_solved(
-                &host_str,
-                &page.cookies,
-                page.vendor.as_deref(),
-                replay_ok,
-            );
-        }
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
-            eprintln!(
-                "[pre-solve] done for {} in {}ms",
-                host_str,
-                t0.elapsed().as_millis()
-            );
-        }
-    });
-}
-
-/// RAII reset: the pre-solve flag clears when the task ends no
-/// matter how it exits.
-struct PreSolveGuard<'a>(&'a Daemon);
-impl Drop for PreSolveGuard<'_> {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        self.0.pre_solve_busy.store(false, Ordering::SeqCst);
-    }
-}
-
-fn search_error(query: &str, cause: &str, byok_tried: bool, kind: &str) -> Value {
-    if kind == "permanent" {
-        // validate_query rejected the query before any engine or
-        // provider was ever contacted : no escalation trace to show,
-        // and retrying the same query (or adding an API key) won't
-        // help, unlike the exhausted-engines case below.
-        return tool_error_structured(
-            format!("search: {cause}"),
-            "permanent",
-            Some(json!({
-                "query": query,
-                "next_action": "fix the query and search again",
-            })),
-        );
-    }
-    let mut trace = Trace::default();
-    trace.step("search", "engines", "error", 0);
-    if byok_tried {
-        trace.step("byok", "providers", "error", 0);
-    }
-    let mut hint = String::from(
-        "all engines failed : transient in most cases: retry once, then simplify the query",
-    );
-    if !byok_tried {
-        hint.push_str(
-            "; if repeated, add an API key provider (donsetch keys add) for a fallback path",
-        );
-    }
-    tool_error_structured(
-        format!("search: {cause}"),
-        "transient",
-        Some(json!({
-            "query": query,
-            "escalation": trace.value(),
-            "next_action": hint,
-        })),
-    )
-}
-
-fn tool_error(message: impl Into<String>) -> Value {
-    tool_error_kind(message, "permanent")
-}
-
-/// Like `tool_error` but with an explicit `errorKind` for CLI
-/// exit-code mapping. `kind` is one of: "permanent", "transient",
-/// "walled". MCP clients ignore the extra field; the CLI uses it
-/// to choose exit 1 / 2 / 3.
-fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
-    tool_error_structured(message, kind, None)
-}
-
-/// Error with structure: the 50-case report asked for honest
-/// machine-readable failure state : status, verdict, url,
-/// next_action, and the escalation trace : so an agent can
-/// decide its fallback without parsing prose. Human message
-/// stays in content[0].text exactly as before.
-/// v3 error taxonomy: stable machine-readable codes so agents
-/// branch on `code`, not prose. One classifier, every tool.
-///
-/// | code | meaning |
-/// |---|---|
-/// | network.dns / network.timeout / network.ratelimit | transport |
-/// | wall.challenge / wall.captcha / wall.paywall / wall.auth | blocked |
-/// | cloak.suspected | tier-1 content is likely decoy |
-/// | content.notfound / content.binary / content.oversize / content.extract | body |
-/// | guard.ssrf | blocked by design |
-/// | parse.encoding | charset-level failure |
-/// | archive.stale | served an old snapshot |
-/// | deadline.hit | time budget exhausted |
-/// | crawl.seed / crawl.resume / fetch.invalid | input errors |
-fn error_code(msg: &str, structured: Option<&Value>) -> &'static str {
-    let m = msg.to_ascii_lowercase();
-    let v = structured
-        .and_then(|s| s.get("verdict"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    match () {
-        _ if m.contains("ssrf") || m.contains("private/loopback") => "guard.ssrf",
-        _ if m.contains("deadline") => "deadline.hit",
-        _ if m.contains("dns") => "network.dns",
-        _ if m.contains("timeout") || m.contains("timed out") => "network.timeout",
-        _ if m.contains("rate limit") || m.contains("429") => "network.ratelimit",
-        _ if m.contains("binary content") => "content.binary",
-        _ if m.contains("too large") || m.contains("oversize") => "content.oversize",
-        _ if m.contains("invalid url") => "fetch.invalid",
-        _ if m.contains("bad seed") => "crawl.seed",
-        _ if m.contains("resume token") => "crawl.resume",
-        _ if m.contains("charset") || m.contains("decode") => "parse.encoding",
-        _ if m.contains("captcha") => "wall.captcha",
-        _ if m.contains("archived copy") || m.contains("snapshot") => "archive.stale",
-        _ if v == "Challenge" => "wall.challenge",
-        _ if v == "Paywall" => "wall.paywall",
-        _ if v == "AuthWall" => "wall.auth",
-        _ if v == "SoftNotFound" => "content.notfound",
-        _ if m.contains("tls error") && m.contains("certificate verification failed") => {
-            "tls.verify"
-        }
-        _ if m.contains("tls handshake aborted") || m.contains("tls handshake cut short") => {
-            "tls.egress"
-        }
-        _ if m.contains("extraction failed") || m.contains("no content") => "content.extract",
-        _ if m.contains("cloak") => "cloak.suspected",
-        _ => "content.extract",
-    }
-}
-
-fn tool_error_structured(
-    message: impl Into<String>,
-    kind: &str,
-    structured: Option<Value>,
-) -> Value {
-    let mut text = message.into();
-    // Fold next_action from structured into the text for clients
-    // (Claude Code, VSCode) that drop text when structuredContent
-    // is present. next_action is critical for agent recovery.
-    if let Some(ref s) = structured
-        && let Some(action) = s.get("next_action").and_then(Value::as_str)
-        && !action.is_empty()
-    {
-        text.push_str(&format!("\n\nNext action: {action}"));
-    }
-    let code = error_code(&text, structured.as_ref());
-    let mut v = json!({
-        "content": [{ "type": "text", "text": text }],
-        "isError": true,
-        "errorKind": kind,
-        "code": code
-    });
-    if let Some(mut s) = structured {
-        // The stable code lives where agents read it.
-        s["code"] = json!(code);
-        v["structuredContent"] = s;
-    }
-    v
-}
-
-/// What should the agent DO next, given this failure? One line,
-/// actionable, derived from verdict + kind. The report's core
-/// ask: "make failures unambiguous."
-fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str) -> String {
-    match verdict {
-        Some(Verdict::AuthWall) => {
-            "requires login credentials : no keyless automated path; use an interactive browser with your session".into()
-        }
-        Some(Verdict::Paywall) => {
-            "paid content : no automated path; look for an open preprint/copy via web_search".into()
-        }
-        Some(Verdict::SoftNotFound) => {
-            "verify the URL (typo? deleted page?) : or web_search the page title to find the moved copy".into()
-        }
-        Some(Verdict::Challenge(_)) if kind == "walled" => {
-            "tier 2 browser could not solve it : interactive verification needed; no automated path (by design DonSeTch does not solve captchas)".into()
-        }
-        Some(Verdict::Challenge(_)) => {
-            "retry with tier=2 (or tier=auto) : the headless browser solves most JS/cookie challenges".into()
-        }
-        Some(Verdict::Blocked) => match status {
-            429 => "rate limited : wait 30-60s and retry".into(),
-            403 => "access denied : retry later or from a different network; this server refuses bots".into(),
-            _ => "server rejected the request : retrying later sometimes works".into(),
-        },
-        _ if kind == "transient" => {
-            "transient network failure : safe to retry immediately".into()
-        }
-        _ if kind == "walled" => {
-            "no extractable content behind the wall : use an interactive agent browser for this site".into()
-        }
-        _ if kind == "tls.verify" => {
-            "the interception CA is not trusted: export SSL_CERT_FILE pointing at the network's CA bundle and retry (donsetch doctor reports both trust stores)".into()
-        }
-        _ if kind == "tls.egress" => {
-            "the egress path is intercepting HTTPS: export HTTPS_PROXY/HTTP_PROXY to route fetches through the network proxy (env-proxy convention, DONSETCH_NO_ENV_PROXY to disable) and retry".into()
-        }
-        _ => "check the URL and retry; if repeated, the site may be down or blocking".into(),
-    }
-}
-
-/// Escalation trace: the ordered record of what DonSeTch tried :
-/// HTTP → browser → OCR-style fallbacks : with tier, action,
-/// outcome and per-step latency. Successes expose it through client-only
-/// `_meta`; errors retain actionable state on the model surface.
-#[derive(Default)]
-struct Trace {
-    steps: Vec<Value>,
-}
-
-impl Trace {
-    fn step(&mut self, tier: &str, action: &str, outcome: &str, ms: u128) {
-        self.steps.push(json!({
-            "tier": tier,
-            "action": action,
-            "outcome": outcome,
-            "ms": ms,
-        }));
-    }
-
-    fn value(&self) -> Value {
-        Value::Array(self.steps.clone())
-    }
-}
-
-/// Classify a wall verdict into an errorKind for CLI exit codes.
-fn verdict_kind(v: Verdict, status: u16) -> &'static str {
-    match v {
-        Verdict::Challenge(_) | Verdict::AuthWall | Verdict::Paywall => "walled",
-        Verdict::Blocked if status == 429 || status == 503 => "transient",
-        _ => "permanent",
-    }
-}
-
-/// Classify a network/fetch error into an errorKind.
-fn fetch_error_kind(e: &FetchError) -> &'static str {
-    match e {
-        FetchError::Timeout | FetchError::Io(_) => "transient",
-        // Match on the classifier's own leading sentences, never on
-        // hint text : "SSL_CERT_FILE" appears in BOTH hints, and
-        // with it in the verify arm (checked first) every egress
-        // failure classified as tls.verify; the egress arm was dead.
-        FetchError::Tls(msg)
-            if msg.starts_with("TLS handshake aborted")
-                || msg.starts_with("TLS handshake cut short") =>
-        {
-            "tls.egress"
-        }
-        FetchError::Tls(msg)
-            if msg.starts_with("TLS certificate verification failed")
-                || msg.contains("trusted root") =>
-        {
-            "tls.verify"
-        }
-        _ => "permanent",
-    }
-}
-
-#[cfg(test)]
-mod stitch_tests {
-    use super::*;
-
-    // fetch_error_kind's tls.verify arm matched on "SSL_CERT_FILE" :
-    // text that also appears in the egress hint appended to every
-    // aborted/cut-short handshake message, so ALL egress failures
-    // classified as tls.verify and the tls.egress arm was dead code
-    // (wrong next_action: "export SSL_CERT_FILE" instead of the
-    // proxy-routing hint the interception fix exists to give).
-    // Classify against the REAL classifier output, not hand-written
-    // strings, so the two files cannot drift apart again.
-    #[test]
-    fn tls_error_kinds_match_the_real_classifier_output() {
-        #[derive(Debug)]
-        struct E(&'static str);
-        impl std::fmt::Display for E {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.0)
-            }
-        }
-        impl std::error::Error for E {}
-        let classified = |raw: &'static str| {
-            FetchError::Tls(crate::transport::tls::classify_handshake_error(&E(raw)))
-        };
-        // Middlebox kills the handshake: reset / early EOF.
-        assert_eq!(
-            fetch_error_kind(&classified("connection reset by peer")),
-            "tls.egress"
-        );
-        assert_eq!(
-            fetch_error_kind(&classified("unexpected EOF during handshake")),
-            "tls.egress"
-        );
-        // Re-signed cert from an untrusted interception CA.
-        assert_eq!(
-            fetch_error_kind(&classified("certificate verify failed: unknown ca")),
-            "tls.verify"
-        );
-        // Unclassified boring text stays permanent.
-        assert_eq!(
-            fetch_error_kind(&classified("some exotic library error")),
-            "permanent"
-        );
-    }
-
-    // search_error used to hardcode errorKind: "transient" for every
-    // failure, including validate_query rejections (empty/oversized
-    // query) that never contact an engine -- contradicting its own
-    // caller's comment ("a bad query is a permanent-shaped failure")
-    // and, via exit_code_of in cli/tool.rs, handing scripts the wrong
-    // exit code for a non-retryable input error.
-    #[test]
-    fn search_error_permanent_has_no_false_escalation_trace() {
-        let v = search_error(
-            "",
-            "empty query : pass a non-empty query string",
-            false,
-            "permanent",
-        );
-        assert_eq!(v["errorKind"], "permanent");
-        assert!(
-            v["structuredContent"].get("escalation").is_none(),
-            "a validation failure never contacted an engine: no escalation trace to show"
-        );
-    }
-
-    #[test]
-    fn search_error_transient_keeps_engine_escalation_trace() {
-        let v = search_error("q", "all engines timed out", false, "transient");
-        assert_eq!(v["errorKind"], "transient");
-        assert!(v["structuredContent"].get("escalation").is_some());
-    }
-
-    #[test]
-    fn batch_failure_kind_permanent_only_when_every_variant_is() {
-        assert_eq!(
-            batch_failure_kind(["permanent", "permanent"].into_iter()),
-            "permanent"
-        );
-        assert_eq!(batch_failure_kind(["permanent"].into_iter()), "permanent");
-    }
-
-    #[test]
-    fn batch_failure_kind_transient_if_any_variant_is() {
-        // One transient variant means a retry could still succeed :
-        // the batch as a whole should be reported retryable.
-        assert_eq!(
-            batch_failure_kind(["permanent", "transient"].into_iter()),
-            "transient"
-        );
-        assert_eq!(
-            batch_failure_kind(["transient", "transient"].into_iter()),
-            "transient"
-        );
-    }
-
-    #[test]
-    fn rel_next_found_and_resolved() {
-        let html = r#"<html><head>
-            <link rel="prev" href="/p1">
-            <link rel="next chapter" href="/p3?page=2">
-        </head><body></body></html>"#;
-        // "/p3" is root-absolute: joins against the origin.
-        assert_eq!(
-            find_rel_next(html, "https://example.com/story/p2"),
-            Some("https://example.com/p3?page=2".to_string())
-        );
-    }
-
-    #[test]
-    fn anchor_rel_next_works() {
-        let html = r#"<a rel="next" href="page-3.html">Next</a>"#;
-        assert_eq!(
-            find_rel_next(html, "https://example.com/book/page-2.html"),
-            Some("https://example.com/book/page-3.html".to_string())
-        );
-    }
-
-    #[test]
-    fn no_next_is_none() {
-        assert!(find_rel_next("<html></html>", "https://example.com/").is_none());
-    }
-
-    #[test]
-    fn part_frontmatter_stripped() {
-        let part =
-            "# My Story\nhttps://example.com/p2\n> Same description\n\nPart two content here.";
-        assert_eq!(strip_part_frontmatter(part), "Part two content here.");
-        assert_eq!(strip_part_frontmatter("Just content"), "Just content");
-    }
-}
-
-#[cfg(test)]
-mod search_variant_tests {
-    use super::parse_search_queries;
-    use serde_json::json;
-
-    #[test]
-    fn single_query_contract_is_unchanged() {
-        assert_eq!(
-            parse_search_queries(&json!({"query": "  rust ownership  "})).unwrap(),
-            vec!["  rust ownership  "]
-        );
-    }
-
-    #[test]
-    fn variants_are_trimmed_and_case_insensitive_duplicates_are_removed() {
-        assert_eq!(
-            parse_search_queries(&json!({
-                "query": "  rust async trait patterns  ",
-                "query_variants": [
-                    "async fn in trait rust",
-                    "RUST ASYNC TRAIT PATTERNS"
-                ]
-            }))
-            .unwrap(),
-            vec!["  rust async trait patterns  ", "async fn in trait rust"]
-        );
-    }
-
-    #[test]
-    fn variants_are_bounded_and_strictly_typed() {
-        assert!(
-            parse_search_queries(&json!({
-                "query": "base",
-                "query_variants": ["one", "two", "three"]
-            }))
-            .unwrap_err()
-            .contains("at most 2")
-        );
-        assert!(
-            parse_search_queries(&json!({"query": "base", "query_variants": "one"}))
-                .unwrap_err()
-                .contains("array of strings")
-        );
-        assert!(
-            parse_search_queries(&json!({"query": "base", "query_variants": [""]}))
-                .unwrap_err()
-                .contains("non-empty string")
-        );
-    }
-}
-
-#[cfg(test)]
-mod error_code_tests {
-    use super::error_code;
-    use serde_json::json;
-
-    #[test]
-    fn codes_are_stable() {
-        assert_eq!(
-            error_code(
-                "blocked: 10.0.0.1 is a private/loopback address : SSRF guard",
-                None
-            ),
-            "guard.ssrf"
-        );
-        assert_eq!(
-            error_code("deadline: exceeded 2000ms", None),
-            "deadline.hit"
-        );
-        assert_eq!(error_code("dns: resolve failed", None), "network.dns");
-        assert_eq!(
-            error_code("walled", Some(&json!({"verdict": "Challenge"}))),
-            "wall.challenge"
-        );
-        assert_eq!(
-            error_code("walled", Some(&json!({"verdict": "Paywall"}))),
-            "wall.paywall"
-        );
-        assert_eq!(
-            error_code("binary content: image/png", None),
-            "content.binary"
-        );
-        assert_eq!(error_code("crawl: bad seed URL", None), "crawl.seed");
-        assert_eq!(
-            error_code("crawl: resume token expired", None),
-            "crawl.resume"
-        );
-        assert_eq!(error_code("fetch: invalid URL", None), "fetch.invalid");
-    }
 }
 
 #[cfg(test)]
@@ -4562,7 +2691,7 @@ mod fetch_output_contract_tests {
     }
 
     #[test]
-    fn fetch_renders_identity_once_and_hides_diagnostics_from_model_state() {
+    pub(super) fn fetch_renders_identity_once_and_hides_diagnostics_from_model_state() {
         let mut trace = Trace::default();
         trace.step("1", "http-fetch", "ok", 12);
         let output = finish_result(
@@ -4610,57 +2739,13 @@ mod fetch_output_contract_tests {
 }
 
 #[cfg(test)]
-mod search_output_contract_tests {
-    use super::{search_debug_meta, search_model_meta};
-    use crate::search::SearchOutcome;
-    use crate::search::intent::Intent;
-    use crate::search::rank::Merged;
-    use std::time::Duration;
-
-    #[test]
-    fn search_structure_routes_without_repeating_ranked_evidence() {
-        let output = SearchOutcome {
-            results: vec![Merged {
-                title: "Visible in markdown".into(),
-                url: "https://example.com/answer".into(),
-                snippet: "Evidence belongs to text".into(),
-                sources: vec![("bing".into(), 0)],
-                score: 0.9,
-                published: None,
-            }],
-            weak: false,
-            intent: Intent::Web,
-            report: Vec::new(),
-            cached: false,
-            elapsed: Duration::from_millis(10),
-            provider: None,
-            reranked: true,
-        };
-        let state = search_model_meta(&output, &["S1".into()]);
-        assert_eq!(state["results"][0]["rank"], 1);
-        assert_eq!(state["results"][0]["handle"], "S1");
-        for absent in ["title", "snippet", "score", "engines"] {
-            assert!(state["results"][0].get(absent).is_none());
-        }
-        let debug = search_debug_meta(&output);
-        assert_eq!(debug["results"][0]["score"], 0.9);
-        // The machine channel (client-only _meta) carries the full
-        // per-result view: scripts, the bench, and pipelines read
-        // meta.results[].snippet through the CLI --json re-materializer.
-        assert_eq!(debug["results"][0]["title"], "Visible in markdown");
-        assert_eq!(debug["results"][0]["url"], "https://example.com/answer");
-        assert_eq!(debug["results"][0]["snippet"], "Evidence belongs to text");
-    }
-}
-
-#[cfg(test)]
 mod batch_output_contract_tests {
     use super::fetch_output_contract_tests::extracted;
     use super::{Trace, finish_result, render_fetch_batch};
     use serde_json::json;
 
     #[test]
-    fn batch_keeps_evidence_order_and_per_url_failure_codes() {
+    pub(super) fn batch_keeps_evidence_order_and_per_url_failure_codes() {
         let urls: Vec<String> = vec![
             "https://example.com/a".into(),
             "https://example.com/b".into(),
@@ -4736,139 +2821,5 @@ mod batch_output_contract_tests {
         assert_eq!(flagged_state["next_offset"], 16000);
         assert_eq!(flagged_state["cloak_suspected"], true);
         assert_eq!(flagged_state["archived"]["age_days"], 3);
-    }
-}
-
-#[cfg(test)]
-mod crawl_output_contract_tests {
-    use super::render_crawl_result;
-    use crate::crawl::{CrawlMode, CrawlPage, CrawlResult, StopReason};
-    use crate::extract::ContentKind;
-    use serde_json::json;
-    use std::time::Duration;
-
-    #[test]
-    fn crawl_renders_page_identity_once_and_keeps_resume_as_state() {
-        let page = CrawlPage {
-            url: "https://example.com/docs/page".into(),
-            title: "Evidence page".into(),
-            kind: ContentKind::Article,
-            markdown: "# Evidence page\nhttps://example.com/docs/page\n\nUseful evidence.".into(),
-            chars: 16,
-            quality: 0.93,
-            duplicate: false,
-            parent: Some("https://example.com/docs/".into()),
-            score: 0.88,
-            lastmod: Some("2026-09-04".into()),
-        };
-        let result = CrawlResult {
-            seed: "https://example.com/docs/".into(),
-            pages: vec![page],
-            queued: vec![],
-            filtered_out: 0,
-            skipped: vec![],
-            stop: StopReason::MaxPages,
-            elapsed: Duration::from_millis(42),
-            map: vec![],
-            crawl_delay: None,
-            resume: Some("opaque-resume".into()),
-        };
-        let output = render_crawl_result(&result, CrawlMode::Full);
-        let text = output["content"][0]["text"].as_str().unwrap();
-        assert_eq!(text.matches("Evidence page").count(), 1);
-        assert_eq!(text.matches("https://example.com/docs/page").count(), 1);
-        assert!(!text.contains("quality="));
-        assert!(!text.contains("opaque-resume"));
-        assert_eq!(output["structuredContent"]["resume"], "opaque-resume");
-        assert!(
-            output["structuredContent"]["pages"][0]
-                .get("quality")
-                .is_none()
-        );
-        assert_eq!(
-            output["_meta"]["com.donsetch/crawl-debug"]["pages"][0]["quality"],
-            json!(0.93_f32)
-        );
-    }
-}
-
-#[cfg(test)]
-mod initialize_tests {
-    use super::{initialize, tools};
-    use serde_json::{Value, json};
-
-    /// The package version moves every release; the fixture holds a
-    /// sentinel there so a version bump never touches it.
-    const VERSION_SENTINEL: &str = "<CARGO_PKG_VERSION>";
-
-    fn fixture() -> Value {
-        let raw = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/initialize.json"
-        ))
-        .expect("read fixture");
-        let mut v: Value = serde_json::from_str(&raw).expect("parse fixture");
-        // Patch the one moving field on the parsed value, never on
-        // the text: a textual substitution would also hit the
-        // version wherever else it appeared.
-        let slot = &mut v["serverInfo"]["version"];
-        assert_eq!(slot, VERSION_SENTINEL, "fixture lost its version sentinel");
-        *slot = json!(tools::SERVER_VERSION);
-        v
-    }
-
-    /// Golden fixture: the whole initialize result : capabilities,
-    /// serverInfo, and the `instructions` blurb the client injects
-    /// into every session's context. If this fails, the handshake
-    /// an agent sees changed; bless the fixture deliberately.
-    #[test]
-    fn initialize_matches_fixture() {
-        // Unknown protocol version → we answer with our newest.
-        let got = initialize(&json!({ "protocolVersion": "1999-01-01" }));
-        assert_eq!(got, fixture(), "initialize result drifted from fixture");
-    }
-
-    /// Generated from the spec table, so a new tool must announce
-    /// itself with no prose edit : and announce itself once: zero
-    /// means an agent never learns the tool exists (deferred-loading
-    /// clients see only names up front), twice is paid-for noise.
-    #[test]
-    fn instructions_list_every_tool_once() {
-        let text = tools::instructions();
-        for t in crate::spec::TOOLS {
-            let hits = text.matches(t.name).count();
-            assert_eq!(hits, 1, "{} announced {hits}x, expected once", t.name);
-        }
-    }
-
-    #[test]
-    fn known_protocol_version_is_echoed() {
-        for v in tools::PROTOCOL_VERSIONS {
-            assert_eq!(
-                initialize(&json!({ "protocolVersion": v }))["protocolVersion"],
-                json!(v)
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod cancel_key_tests {
-    use super::cancel_key;
-    use serde_json::json;
-
-    // JSON-RPC ids are numbers OR strings. The registry was keyed
-    // on i64, so a client using string ids ("req-7", uuids) could
-    // never cancel anything: its notifications/cancelled found no
-    // entry and the crawl ran to completion.
-    #[test]
-    fn string_and_number_ids_both_get_a_key() {
-        assert!(cancel_key(&json!("req-7")).is_some());
-        assert!(cancel_key(&json!(7)).is_some());
-        assert!(cancel_key(&json!(-1)).is_some());
-        assert_ne!(cancel_key(&json!("7")), cancel_key(&json!(7)));
-        assert_eq!(cancel_key(&json!("req-7")), cancel_key(&json!("req-7")));
-        assert!(cancel_key(&json!(null)).is_none());
-        assert!(cancel_key(&json!({"a": 1})).is_none());
     }
 }
