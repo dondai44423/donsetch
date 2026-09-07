@@ -360,11 +360,10 @@ pub async fn handle(
                 // Client-compat shaping (issue #27): harnesses that
                 // show the model only `structuredContent` get the
                 // surfaces merged into the one they render.
-                let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let r = if crate::mcp::compat::effective(mode)
                     == crate::mcp::compat::ClientMode::TextOnly
                 {
-                    crate::mcp::compat::shape_result(tool, r)
+                    crate::mcp::compat::shape_result(r)
                 } else {
                     r
                 };
