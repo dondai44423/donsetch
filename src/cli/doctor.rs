@@ -39,6 +39,15 @@ pub async fn run() {
     let deep = args.iter().any(|a| a == "--deep");
     let fix = args.iter().any(|a| a == "--fix");
     let only_mcp = args.iter().any(|a| a == "--mcp");
+    let stealth = args.iter().any(|a| a == "--stealth");
+    let stealth_record = args.iter().any(|a| a == "--stealth-record");
+
+    // --stealth / --stealth-record: the drift scorecard (v4 phase
+    // 0.4). Standalone mode: skips the general check battery.
+    if stealth || stealth_record {
+        let code = stealth_scorecard(stealth_record, json).await;
+        std::process::exit(code);
+    }
 
     cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
     println!();
@@ -1292,6 +1301,113 @@ async fn apply_fixes(collected: &mut [(String, String, String, String)]) -> Resu
         cli::bold("done")
     );
     Ok(())
+}
+
+/// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
+/// layers match the baseline, 1 drift or capture failure
+/// (--stealth-record writes the fixture and exits 0 on success).
+async fn stealth_scorecard(record: bool, json: bool) -> i32 {
+    use crate::profile::scorecard;
+
+    cli::print_title(&format!("{DISPLAY_NAME} Stealth Scorecard"));
+    println!();
+
+    let fetcher = match Fetcher::new(crate::profile::BrowserProfile::host_default()) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("  fetcher init failed: {e}");
+            return 1;
+        }
+    };
+    let live = match scorecard::capture(&fetcher).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("  capture failed: {e}");
+            eprintln!("  (the echo endpoint is unreachable; retry or check egress)");
+            return 1;
+        }
+    };
+
+    if record {
+        let mut fixture = live.clone();
+        fixture.source = format!(
+            "tier1 fetcher, profile {}, recorded via --stealth-record",
+            fetcher.profile().name
+        );
+        fixture.captured_at = "operator-recorded".to_string();
+        let path = "tests/fixtures/stealth-baseline.json";
+        match serde_json::to_string_pretty(&fixture) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(path, format!("{text}\n")) {
+                    eprintln!("  could not write {path}: {e}");
+                    return 1;
+                }
+                println!("  baseline recorded to {path}");
+                println!("  review the diff, then rebuild: the fixture is embedded at build time");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("  could not serialize fixture: {e}");
+                return 1;
+            }
+        }
+    }
+
+    let baseline = match scorecard::baseline_fixture() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("  {e}");
+            return 1;
+        }
+    };
+    let verdicts = scorecard::diff(&baseline, &live);
+    let mut drifted = 0;
+    if json {
+        let layers: Vec<serde_json::Value> = verdicts
+            .iter()
+            .map(|v| {
+                serde_json::json!({
+                    "layer": v.layer,
+                    "same": v.same,
+                    "baseline": v.baseline,
+                    "live": v.live,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "endpoint": scorecard::ECHO_ENDPOINT,
+                "profile": live.profile,
+                "drifted": verdicts.iter().filter(|v| !v.same).count(),
+                "layers": layers,
+            }))
+            .unwrap()
+        );
+    } else {
+        for v in &verdicts {
+            if v.same {
+                cli::check_pass(v.layer, "matches baseline");
+            } else {
+                drifted += 1;
+                cli::check_fail(
+                    v.layer,
+                    "DRIFTED",
+                    "re-capture the profile and re-record the baseline deliberately",
+                );
+                println!("      baseline: {}", v.baseline);
+                println!("      live:     {}", v.live);
+            }
+        }
+        println!();
+        if drifted == 0 {
+            println!("  all layers match the baseline; no drift");
+        } else {
+            println!("  {drifted} layer(s) drifted. If Chrome bumped, re-capture the profile");
+            println!("  and re-record the baseline deliberately: donsetch doctor --stealth-record");
+        }
+    }
+    if drifted == 0 { 0 } else { 1 }
 }
 
 #[cfg(test)]

@@ -123,7 +123,7 @@ impl BrowserProfile {
                 conn_window_update: 15663105,
             },
             user_agent: format!(
-                "Mozilla/5. ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
+                "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
                 platform.ua_token()
             ),
             sec_ch_ua,
@@ -638,5 +638,26 @@ mod probe_tests {
         // Plausibility band: 20..=400 : rejects years, build ids, ports.
         assert_eq!(parse_version_major("Chrome 1985.1"), None);
         assert_eq!(parse_version_major("Chrome 100000"), None);
+    }
+}
+
+pub mod scorecard;
+
+#[cfg(test)]
+mod ua_tests {
+    #[test]
+    fn user_agent_carries_real_mozilla_token() {
+        for platform in [
+            super::Platform::Linux,
+            super::Platform::Windows,
+            super::Platform::MacOs,
+        ] {
+            let p = super::BrowserProfile::chrome(151, platform, true);
+            assert!(
+                p.user_agent.starts_with("Mozilla/5.0 ("),
+                "UA must carry the real Mozilla/5.0 token: {}",
+                p.user_agent
+            );
+        }
     }
 }
