@@ -71,8 +71,8 @@ impl Fetcher {
 
     pub fn new(profile: BrowserProfile) -> Result<Self, FetchError> {
         let sessions = tls::new_session_store();
-        let connector = tls::build_connector(&profile, sessions.clone())?;
-        let connector_compat = tls::build_connector_compat(&profile, sessions.clone())?;
+        let connector = tls::build_connector(&profile)?;
+        let connector_compat = tls::build_connector_compat(&profile)?;
         Ok(Self {
             profile,
             connector,

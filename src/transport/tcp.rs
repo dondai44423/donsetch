@@ -92,7 +92,7 @@ pub async fn happy_connect_with(
 async fn connect_all(addrs: Vec<SocketAddr>, warm: bool) -> Result<TcpStream, FetchError> {
     let mut last_err = FetchError::Http("no addresses".into());
     for addr in addrs {
-        match tokio::time::timeout(CONNECT_TIMEOUT, connect_one(addr, warm)).await {
+        match tokio::time::timeout(CONNECT_TIMEOUT, tcp_connect(addr, warm)).await {
             Ok(Ok(s)) => {
                 s.set_nodelay(true).ok();
                 return Ok(s);
@@ -102,10 +102,6 @@ async fn connect_all(addrs: Vec<SocketAddr>, warm: bool) -> Result<TcpStream, Fe
         }
     }
     Err(last_err)
-}
-
-async fn connect_one(addr: SocketAddr, warm: bool) -> Result<TcpStream, FetchError> {
-    tcp_connect(addr, warm).await
 }
 
 /// Linux TFO-capable connect for warm hosts. Everything else runs

@@ -48,7 +48,10 @@ where
     }
     let mut req = format!("GET {path} HTTP/1.1\r\n");
     for (n, v) in headers {
-        req.push_str(&format!("{n}: {v}\r\n"));
+        req.push_str(n);
+        req.push_str(": ");
+        req.push_str(v);
+        req.push_str("\r\n");
     }
     req.push_str("\r\n");
     stream.write_all(req.as_bytes()).await?;
@@ -157,22 +160,15 @@ where
         }
     }
 
-    Ok(H2Placeholder::into_h1(status, headers_out, body))
+    Ok(H1Response {
+        status,
+        headers: headers_out,
+        body,
+    })
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
-}
-
-struct H2Placeholder;
-impl H2Placeholder {
-    fn into_h1(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> H1Response {
-        H1Response {
-            status,
-            headers,
-            body,
-        }
-    }
 }
 
 /// Decode chunked transfer coding from `prefix` (already-read bytes) + stream.

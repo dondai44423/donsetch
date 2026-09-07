@@ -35,7 +35,16 @@ fn no_proxy_match(host: &str) -> bool {
             return true;
         }
         let entry = entry.strip_prefix('.').unwrap_or(entry);
-        if host == entry || host.ends_with(&format!(".{entry}")) {
+        if host == entry {
+            return true;
+        }
+        // host.ends_with(&format!(".{entry}")) without the per-entry
+        // allocation: the char before a matching suffix must be '.'.
+        // (Byte-identical semantics, including the empty-entry edge.)
+        if host.len() > entry.len()
+            && host.ends_with(entry)
+            && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
+        {
             return true;
         }
     }
@@ -156,12 +165,7 @@ impl Proxy {
         target_host: &str,
         target_port: u16,
     ) -> Result<TcpStream, FetchError> {
-        let mut stream = tokio::time::timeout(
-            PROXY_TIMEOUT,
-            TcpStream::connect((self.host.as_str(), self.port)),
-        )
-        .await
-        .map_err(|_| FetchError::Timeout)??;
+        let mut stream = self.connect_tcp().await?;
         stream.set_nodelay(true).ok();
 
         match self.scheme {
@@ -426,15 +430,8 @@ impl Proxy {
     /// Reconstruct the proxy URL string from parsed fields.
     /// Handles IPv6 bracketing. Used for config-file round-trip.
     pub fn to_url(&self) -> String {
-        let scheme = match self.scheme {
-            ProxyScheme::Http => "http",
-            ProxyScheme::Socks5 => "socks5",
-        };
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
+        let scheme = scheme_str(self.scheme);
+        let host = bracketed_host(&self.host);
         if self.user.is_empty() {
             format!("{scheme}://{host}:{}", self.port)
         } else {
@@ -449,16 +446,27 @@ impl Proxy {
     /// credentials : Chrome handles proxy auth via its own dialog or
     /// `--proxy-auth` extension). Used for the Ghost browser tier.
     pub fn chrome_proxy_arg(&self) -> String {
-        let scheme = match self.scheme {
-            ProxyScheme::Http => "http",
-            ProxyScheme::Socks5 => "socks5",
-        };
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        format!("{scheme}://{host}:{}", self.port)
+        format!(
+            "{}://{}:{}",
+            scheme_str(self.scheme),
+            bracketed_host(&self.host),
+            self.port
+        )
+    }
+}
+
+fn scheme_str(scheme: ProxyScheme) -> &'static str {
+    match scheme {
+        ProxyScheme::Http => "http",
+        ProxyScheme::Socks5 => "socks5",
+    }
+}
+
+fn bracketed_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
 }
 
@@ -578,29 +586,8 @@ fn parse_lines(content: &str) -> Vec<Proxy> {
 }
 
 pub(crate) fn base64(input: &str) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let b = input.as_bytes();
-    let mut out = String::with_capacity(b.len() * 4 / 3 + 4);
-    for chunk in b.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, &c)| acc | ((c as u32) << (16 - 8 * i)));
-        for i in 0..4 {
-            let shift = 18 - 6 * i;
-            // Padding goes at the END: output char `i` covers bits
-            // [i*6, i*6+6). It is padding only when the chunk has no
-            // bits that far in. Testing `shift` instead gets this
-            // backwards, since shift counts down as i counts up.
-            let pad = i * 6 >= chunk.len() * 8;
-            out.push(if pad {
-                '='
-            } else {
-                T[((n >> shift) & 63) as usize] as char
-            });
-        }
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(input.as_bytes())
 }
 
 #[cfg(test)]

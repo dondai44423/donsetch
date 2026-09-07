@@ -92,18 +92,12 @@ pub enum HandshakeProfile {
     InterceptionSafe,
 }
 
-pub fn build_connector(
-    profile: &BrowserProfile,
-    _sessions: SessionStore,
-) -> Result<SslConnector, FetchError> {
+pub fn build_connector(profile: &BrowserProfile) -> Result<SslConnector, FetchError> {
     build_connector_with(profile, HandshakeProfile::ChromeTrue)
 }
 
 /// Same as `build_connector` but with the interception-safe wire profile.
-pub fn build_connector_compat(
-    profile: &BrowserProfile,
-    _sessions: SessionStore,
-) -> Result<SslConnector, FetchError> {
+pub fn build_connector_compat(profile: &BrowserProfile) -> Result<SslConnector, FetchError> {
     build_connector_with(profile, HandshakeProfile::InterceptionSafe)
 }
 
