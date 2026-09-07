@@ -5,6 +5,56 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Crawl robots.txt `Crawl-delay: inf` aborted the crawl worker:**
+  `Duration::from_secs_f64` panics on infinite or overflowing values,
+  so a host declaring an absurd delay killed the lane. Delay is now
+  clamped (finite + capped 60s) at every setter and re-clamped in the
+  pacing math. Credit: mnaza (#155).
+- **Sitemap `<loc>` URLs were used with XML entities intact:**
+  `&`, numeric/char codes (`&#x27;`, `&#39;`) and CDATA wrappers
+  stayed raw in every fetched URL, breaking query-string pages. Own
+  minimal entity decoder with bounds; CDATA stripped inside `<loc>`.
+  Credit: mnaza (#156).
+- **MathML table-of-parts shapes were invisible in extraction:**
+  layout tags (mtable/mtd/msup etc.) were absent from the recursion
+  guard's tag list. Credit: mnaza (#157).
+- **HTTP/1.1 1xx interim responses returned as the final response:**
+  100 Continue/103 Early Hints from CDNs got mistaken for the real
+  status, handing callers a hint block with an unframed body. Interim
+  blocks skipped (a 1xx-class counter caps the stream; unexpected
+  101 upgrades refused). Credit: mnaza (#158).
+- **RSS/Atom close tags were matched case-sensitively** while the
+  open already wasn't: `<LINK>` left a row half-parsed. Close scans
+  are case-insensitive ASCII now (the open already were). Credit:
+  mnaza (#159).
+- **`tls.egress` was dead code:** the TLS classifier's two hints share
+  the substring `SSL_CERT_FILE`, and the egress arm ran behind the
+  cert-trust arm, so every intercepted-transport error landed on the
+  cert guidance. The classifier's own opening sentences now drive the
+  split, and the test composes both through the real function so the
+  pair can't drift. Credit: mnaza (#160).
+- **Plaintext HTTP via an authenticating proxy sent no
+  Proxy-Authorization, and SOCKS5 tunnels carried absolute-form
+  request lines to the target server** instead of origin-form. Both
+  fixed with one shared `proxy_authorization()` builder + correct
+  in-tunnel form. Credit: mnaza (#161).
+- **One non-UTF-8 line in Chrome's stderr failed the whole ghost
+  launch.** stderr is scanned lossy now (byte-level scan for wall
+  markers), only the real failure paths depend on exact text.
+  Credit: mnaza (#162).
+- **`donsetch --help | head` printed a panic backtrace after head
+  closed the pipe** (Rust masks SIGPIPE; the write's EPIPE panics).
+  The default disposition is restored at start: silent exit 141 like
+  rg/curl. The MCP daemon inherits it: a broken transport pipe means
+  the client is gone, so an instant exit beats a stack dump.
+- **The 3 tool subcommands leaked the agent-facing MCP description
+  into `--help`** (LLM-voice paragraphs). Each now carries a short
+  human description of its own: same facts, terminal voice.
+
 ## [3.6.5] - 2026-09-06
 
 ### Added
