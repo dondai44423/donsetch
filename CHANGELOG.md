@@ -5,6 +5,20 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The supervisor crash-recovery outlived the 3.6.6 SIGPIPE
+  restoration** (mnaza, #163): pinning SIG_DFL process-wide killed the
+  `mcp --supervised` parent exactly when a crashed child's stdin write
+  returned EPIPE (the signal it exists to survive), and bypassed the
+  stdio transport's graceful broken-pipe shutdown and the BYOK
+  plugin's tolerant child-write path. CLI commands keep the quiet
+  exit-141 pipe convention; `mcp` and the supervisor pin SIG_IGN for
+  themselves. Discriminating test: on 3.6.6 the test process dies by
+  signal 13, with the fix it passes.
+
 ## [3.6.6] - 2026-09-06
 
 ### Fixed
