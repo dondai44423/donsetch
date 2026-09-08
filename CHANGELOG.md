@@ -7,11 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+V4 work in progress on `master`. Nothing below ships through a release
+channel until the v4.0.0 release train.
+
+### Added
+
+- Route memory: fetches learn route health per tier (EWMA latency by
+  route, failure classes, LRU-bounded store). Tier 1 rides healthy
+  routes only; persistent failures quarantine and a background probe
+  re-heals them when the block lifts; a replaced route never re-enters
+  while still marked failed. Kill switches + `donsetch status` line.
+- Persona store: long-lived per-domain identity records (fingerprint
+  class, headers, session state) ride inside ghost pages across runs,
+  with a coherence checker and a `donsetch status` line.
+- Stealth scorecard: `doctor --stealth` grades the tier-1 battery
+  (TLS/H2/header classes) with conflict codes; `--parity` diffs the
+  live fingerprint against real local Chromium (JA4/JA3/H2/vector
+  agreement). Weekly `stealth.yml` CI alarm on profile drift.
+- Tier-1 request realism: navigation-class header sets per request
+  class (document/rpc/embed), subresource shadow-fetching that
+  reproduces real page-load traffic (assets behind the primary fetch),
+  and tier-1 cookie persistence replaying returning-device sessions
+  across runs. Each subsystem carries a kill switch.
+- Prewarm: search hands a warm tier-1 pipe to the first-result fetch
+  that follows it (hot-path time drops from roughly 550 ms wire
+  build-up to about 25 ms served from RAM). Served/wire split is
+  visible in `donsetch status`.
+- `web_answer`: evidence-pack answer tool for chat-first MCP clients
+  (query + token budget, up to a handful of pages, ranked citation
+  graph, one-line answer). Kill switch `DONSETCH_NO_ANSWER_TOOL`.
+- Crawl dataset mode: `--json` renders one JSON object per page
+  (url/title/kind/markdown/chars/fetched_at/lastmod/parent), sorted by
+  URL, deduped; skipped pages carry reasons. Best for machine-ready
+  exports; plain text stays the default.
+- Crawl delta recrawl: `--since-last` re-fetches pages and compares
+  content fingerprints against crawl history; unchanged pages refresh
+  history but drop out of results and budgets with skip reason
+  "unchanged since last crawl". Replaces the old fixed 24 h window
+  that silently missed quiet mutations.
+- Crawl-shape: seeded reader-like frontier ordering (head-window
+  jitter over the top ranks, topology preserved), so repeated crawls
+  of one site stop replaying an identical mechanical order to access
+  logs. Kill switch `DONSETCH_NO_CRAWL_SHAPE`.
+- Adapters reach the crawl fetch path: the same rewrite pass
+  `web_fetch` uses rides inside crawl fetches; the canonical URL stays
+  the dedup/history key.
+- MCP compat folding applies to `web_search` too: structured-content-
+  only clients receive raw result URLs through the folded metadata
+  block instead of losing them; the model-facing contract text now
+  states it. (#165)
+- Clarify compact search labels: counts describe search-index families
+  that returned a URL, not independent sources corroborating its
+  claims. The weak results message now refers to cross-index
+  agreement. Ranking is unchanged. (#166)
+
 ### Changed
 
-- Clarify compact search labels: counts describe search-index families that
-  returned a URL, not independent sources corroborating its claims. The weak
-  results message now refers to cross-index agreement. Ranking is unchanged.
+- Crawl pacing cleanup: the vestigial 0-100 ms skim dwell is deleted;
+  self-inferred waits cap at 7 s while host-declared waits (Retry-
+  After) stay uncapped and honored. All pacing lives in the crawl
+  governor, pressure-adaptive.
+
+### Fixed
+
+- **#164 audit wave (S1-S6 in the search/fetch stack):**
+  S1: version matching is boundary-aware; "5.2" no longer matches
+  "15.2" or "5.20" but still matches "5.2.1" and "v5.2".
+  S2: empty vertical results report no-results instead of success;
+  engine OK counts and retry/cache gates were inflated.
+  S3: plugin-hit truncation before URL dedup dropped, so oversize
+  plugin output can no longer shrink the final unique count.
+  S4: cache entries keep engine reports; cache hits return real
+  engine evidence (old 4-tuple caches still load).
+  S5: single-URL fetch with `budget_tokens` runs under
+  `run_with_budget`: `deadline_ms` and MCP cancellation apply, and
+  the budget bounds the page like batch mode.
+  S6: BYOK plugin error envelopes cap at 600 chars, matching the
+  stderr trim.
+- Storage guard: bounded target-dir growth and pinned the cargo
+  profile on every nextest run.
 
 ## [3.6.7] - 2026-09-07
 
