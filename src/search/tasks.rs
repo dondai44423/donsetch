@@ -140,9 +140,70 @@ pub(super) async fn vertical_task(
     {
         Err(_) => (vertical, Err(("timeout".into(), "direct".into(), false))),
         Ok(Err(e)) => (vertical, Err((format!("{e}"), "direct".into(), false))),
-        Ok(Ok(hits)) => {
-            let ms = started.elapsed().as_millis() as u64;
-            (vertical, Ok((hits, ms, "direct".into(), false)))
+        Ok(Ok(hits)) => vertical_success(vertical, hits, started.elapsed().as_millis() as u64),
+    }
+}
+
+/// Pure outcome mapping for a vertical fetch (#164 S2).
+///
+/// An empty vertical is a "no results" outcome, not a healthy engine:
+/// counting it as Ok would inflate ok_engines and relax the
+/// retry/cache gates, labeling degraded searches healthy exactly when
+/// retrieval is worst. "no-results" is excluded from retries, trust
+/// penalties, and egress fault reporting (is_engine_fault), so this
+/// stays an honest, penalty-free report.
+fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (String, EngineResult) {
+    if hits.is_empty() {
+        return (vertical, Err(("no-results".into(), "direct".into(), false)));
+    }
+    (vertical, Ok((hits, ms, "direct".into(), false)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(title: &str, url: &str) -> engines::Hit {
+        engines::Hit {
+            title: title.into(),
+            url: url.into(),
+            snippet: String::new(),
+            rank: 1,
+            published: None,
         }
+    }
+
+    #[test]
+    fn vertical_empty_hits_is_no_results_not_success() {
+        // #164: an empty vertical used to count as a healthy engine,
+        // inflating ok_engines and relaxing retry/cache gates exactly
+        // when retrieval was worst. It must report no-results instead.
+        let (name, result) = vertical_success("github".into(), Vec::new(), 12);
+        assert_eq!(name, "github");
+        let (status, egress, was_engine) = result.expect_err("empty vertical must not be Ok");
+        assert_eq!(status, "no-results");
+        assert_eq!(egress, "direct");
+        assert!(!was_engine, "vertical outcomes are not engine faults");
+    }
+
+    #[test]
+    fn vertical_no_results_is_neither_retried_nor_a_fault() {
+        let (_, result) = vertical_success("wikipedia".into(), Vec::new(), 5);
+        let (status, _, _) = result.expect_err("empty vertical must be Err");
+        assert!(
+            !crate::search::is_engine_fault(&status),
+            "no-results must stay out of trust/quarantine penalties"
+        );
+    }
+
+    #[test]
+    fn vertical_with_hits_is_success() {
+        let (name, result) = vertical_success("github".into(), vec![hit("A", "https://a.com")], 42);
+        assert_eq!(name, "github");
+        let (hits, ms, egress, was_engine) = result.expect("hits => success");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(ms, 42);
+        assert_eq!(egress, "direct");
+        assert!(!was_engine);
     }
 }

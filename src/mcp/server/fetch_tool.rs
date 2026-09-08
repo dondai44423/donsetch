@@ -61,8 +61,31 @@ pub(super) async fn fetch_tool(
             Err(e) => return e,
         }
     }
+    // Single resolved URL: keep the single-page response shape, but
+    // always run under the deadline + MCP-cancellation wrapper (#164).
+    // Previously this branch (reached whenever budget_tokens was set,
+    // since the fast path above demands budget_tokens.is_none())
+    // called fetch_single bare: an uncancellable, deadline-free fetch
+    // on a path that can still spawn a ghost render. budget_tokens
+    // also bounds the page now, exactly like the batch path.
     if resolved.len() == 1 {
-        return fetch_single(daemon, args, &resolved[0]).await;
+        let owned_args;
+        let effective_args = if let Some(b) = budget_tokens {
+            let budget_chars = b.saturating_mul(4).max(800);
+            let mut a = args.clone();
+            a["max_chars"] = json!(budget_chars);
+            owned_args = a;
+            &owned_args
+        } else {
+            args
+        };
+        return run_with_budget(
+            fetch_single(daemon, effective_args, &resolved[0]),
+            deadline,
+            ctx.as_mut(),
+            || deadline_error(&resolved[0]),
+        )
+        .await;
     }
     fetch_multi(daemon, args, resolved, budget_tokens, deadline, ctx).await
 }

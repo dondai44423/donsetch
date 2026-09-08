@@ -141,7 +141,7 @@ pub struct Searcher {
     /// Stores up to 12 results; reads truncate to the
     /// requested max so max_results variants share entries.
     #[allow(clippy::type_complexity)]
-    cache: Mutex<HashMap<String, (Instant, Vec<Merged>, usize)>>,
+    cache: Mutex<HashMap<String, (Instant, Vec<Merged>, usize, Vec<EngineReport>)>>,
     /// Chronic-failure quarantine: engine -> (consecutive
     /// failures, last failure). 3 strikes across any
     /// egresses = benched for QUARANTINE_TTL so a walled
@@ -187,7 +187,7 @@ where
 // `search::enrich`.
 
 /// Per-engine outcome for honest reporting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineReport {
     pub engine: String,
     pub status: String,
@@ -339,7 +339,7 @@ impl Searcher {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&format!("{}|{}", norm_query(query), intent_probe.code()))
                     .cloned();
-                if let Some((at, cached, total)) = hit
+                if let Some((at, cached, total, reports)) = hit
                     && at.elapsed() < cache_ttl(intent_probe, query)
                 {
                     let weak = rank::is_weak(&cached, total);
@@ -349,7 +349,7 @@ impl Searcher {
                         results,
                         weak,
                         intent: intent_probe,
-                        report: Vec::new(),
+                        report: reports,
                         cached: true,
                         elapsed: started.elapsed(),
                         provider: None,
@@ -380,7 +380,7 @@ impl Searcher {
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
         let cache_key = format!("{}|{}", norm_query(query), intent.code());
 
-        if let Some((at, cached, total)) = self
+        if let Some((at, cached, total, reports)) = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -394,7 +394,7 @@ impl Searcher {
                 results,
                 weak,
                 intent,
-                report: Vec::new(),
+                report: reports.clone(),
                 cached: true,
                 elapsed: started.elapsed(),
                 provider: None,
@@ -746,7 +746,7 @@ impl Searcher {
             if cache.len() >= 500
                 && let Some(oldest) = cache
                     .iter()
-                    .max_by_key(|(_, (at, _, _))| at.elapsed())
+                    .max_by_key(|(_, (at, _, _, _))| at.elapsed())
                     .map(|(k, _)| k.clone())
             {
                 cache.remove(&oldest);
@@ -757,6 +757,7 @@ impl Searcher {
                     Instant::now(),
                     results.iter().take(12).cloned().collect(),
                     total,
+                    report.clone(),
                 ),
             );
             save_cache_disk(&cache);

@@ -147,6 +147,29 @@ fn entity_covered(entity: &Entity, text_lower: &str) -> bool {
 
 /// Find all version numbers (d{1,3}.d{1,3}) in text.
 /// Used to detect version mismatches.
+/// Boundary-aware version match (#164): `5.2` matches `5.2`, `5.2.1`
+/// and `v5.2`, but not `15.2` (longer major continuing from the
+/// left) or `5.20` (longer minor continuing to the right). A trailing
+/// dot starts a patch segment of the same minor line and still counts.
+/// Plain substring matching let wrong-version docs skip the
+/// specifier-mismatch penalty entirely.
+fn version_at_boundary(text: &str, version: &str) -> bool {
+    text.match_indices(version).any(|(start, matched)| {
+        let left_ok = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_ascii_digit() && c != '.');
+        let end = start + matched.len();
+        let right_ok = end >= text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_ascii_digit());
+        left_ok && right_ok
+    })
+}
+
 fn find_versions(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut versions = Vec::new();
@@ -242,7 +265,9 @@ pub fn penalize(query: &str, results: &mut [Merged]) {
         // Version specifier: only penalize if NO query version
         // appears in the result. Handles "python 3.12 vs 3.11"
         // : a result mentioning 3.11 matches one query version.
-        let any_version_matches = query_versions.iter().any(|v| text_lower.contains(v));
+        let any_version_matches = query_versions
+            .iter()
+            .any(|v| version_at_boundary(&text_lower, v));
         if !any_version_matches {
             for qv in &query_versions {
                 let query_major = qv.split('.').next().unwrap_or("");
@@ -664,6 +689,72 @@ mod tests {
         assert!(
             (results[0].score - 1.0).abs() < 1e-9,
             "case-insensitive match in snippet"
+        );
+    }
+
+    #[test]
+    fn version_match_is_boundary_anchored() {
+        // #164: "5.2" inside "5.20" is NOT a version match: a 5.20
+        // page must take the same-major mismatch penalty, not a free
+        // pass from substring containment.
+        let mut results = vec![
+            merged(
+                "glorax 5.20 release notes",
+                "what changed in 5.20",
+                "https://ex.com/520",
+                1.0,
+            ),
+            merged(
+                "glorax 5.2 release notes",
+                "what changed in 5.2",
+                "https://ex.com/52",
+                1.0,
+            ),
+        ];
+        penalize("glorax 5.2", &mut results);
+        assert!(
+            results[0].score < results[1].score,
+            "5.20 docs must rank below an exact 5.2 match"
+        );
+        assert!(
+            results[0].score < 1.0,
+            "5.20 page must take the mismatch penalty"
+        );
+    }
+
+    #[test]
+    fn version_boundary_allows_patch_and_prefix_forms() {
+        // "5.2.1" and "v5.2" both satisfy a "5.2" request: no
+        // penalty, no mismatch flag.
+        let mut results = vec![
+            merged(
+                "glorax 5.2.1 changelog",
+                "patch notes",
+                "https://ex.com/a",
+                1.0,
+            ),
+            merged("glorax v5.2 guide", "docs", "https://ex.com/b", 1.0),
+        ];
+        penalize("glorax 5.2", &mut results);
+        assert!((results[0].score - 1.0).abs() < 1e-9, "5.2.1 satisfies 5.2");
+        assert!((results[1].score - 1.0).abs() < 1e-9, "v5.2 satisfies 5.2");
+    }
+
+    #[test]
+    fn version_boundary_longer_major_stays_neutral() {
+        // "15.2" against a "5.2" request: no longer a false match,
+        // but a different major is not a same-line mismatch either:
+        // neutral, per the same-major-only penalty policy.
+        let mut results = vec![merged(
+            "glorax 15.2 release notes",
+            "what changed in 15.2",
+            "https://ex.com/152",
+            1.0,
+        )];
+        penalize("glorax 5.2", &mut results);
+        assert!(
+            (results[0].score - 1.0).abs() < 1e-9,
+            "different major: no penalty"
         );
     }
 }
