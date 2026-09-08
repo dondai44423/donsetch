@@ -21,10 +21,13 @@
 //! stdio proxy): the full `structuredContent` is folded into a compact
 //! leading `[meta]` text block (lossless by construction, ~10% of the
 //! document), `structuredContent` is dropped, and the document stays a
-//! clean markdown text block. web_search is left alone: its
-//! structuredContent IS the richer surface (per-result consensus,
-//! engine health, full snippets), so a structured-first client gets
-//! the better copy unchanged.
+//! clean markdown text block. Every tool folds the same way,
+//! web_search included: its model-facing `structuredContent` is the
+//! lean `{weak, results:[{rank,url,handle}]}` routing state built by
+//! `search_model_meta`, while the titles and snippets live in the
+//! markdown block. The per-result title/snippet/score/engines view
+//! is `search_debug_meta`, which rides in `_meta` and never reaches
+//! the model in either mode.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -115,13 +118,11 @@ pub fn effective(cell: &ModeCell) -> ClientMode {
     env_override().unwrap_or_else(|| cell.get())
 }
 
-/// Merge the split surfaces for a text-only client. web_search is
-/// exempt: its structuredContent is the richer surface, so it is
-/// handed over untouched in both modes.
-pub fn shape_result(tool: &str, mut result: Value) -> Value {
-    if tool == "web_search" {
-        return result;
-    }
+/// Merge the split surfaces for a text-only client. Applies to every
+/// tool: whatever `structuredContent` a result carries is state the
+/// model needs, and a client in this mode drops the `content` array
+/// that holds the document.
+pub fn shape_result(mut result: Value) -> Value {
     let Some(sc) = result.get("structuredContent") else {
         return result;
     };
@@ -174,7 +175,7 @@ mod tests {
 
     #[test]
     fn fetch_result_folds_state_into_leading_meta_block() {
-        let shaped = shape_result("web_fetch", fetch_result());
+        let shaped = shape_result(fetch_result());
         assert!(shaped.get("structuredContent").is_none());
         let content = shaped["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -193,7 +194,7 @@ mod tests {
             "content": [{ "type": "text", "text": "/a\n/b\n" }],
             "structuredContent": { "map": ["/a", "/b"], "stop": "FrontierEmpty" }
         });
-        let shaped = shape_result("web_crawl", crawl);
+        let shaped = shape_result(crawl);
         assert!(shaped.get("structuredContent").is_none());
         let meta = shaped["content"][0]["text"].as_str().unwrap();
         assert!(!meta.contains("\"map\""));
@@ -204,7 +205,7 @@ mod tests {
             "content": [{ "type": "text", "text": "page" }],
             "structuredContent": { "resume": "tok-1", "stop": "MaxPages", "map": [] }
         });
-        let shaped = shape_result("web_crawl", with_resume);
+        let shaped = shape_result(with_resume);
         assert!(
             shaped["content"][0]["text"]
                 .as_str()
@@ -222,7 +223,7 @@ mod tests {
             "code": "network.timeout",
             "structuredContent": { "code": "network.timeout", "escalation": [1, 2] }
         });
-        let shaped = shape_result("web_fetch", err);
+        let shaped = shape_result(err);
         assert!(shaped.get("structuredContent").is_none());
         let meta = shaped["content"][0]["text"].as_str().unwrap();
         assert!(meta.contains("network.timeout"));
@@ -236,32 +237,22 @@ mod tests {
     }
 
     #[test]
-    fn web_search_is_left_alone_in_both_modes() {
-        let search = json!({
-            "content": [{ "type": "text", "text": "1. result" }],
-            "structuredContent": { "results": [1, 2, 3], "engines": [] }
-        });
-        let shaped = shape_result("web_search", search.clone());
-        assert_eq!(shaped, search);
-    }
-
-    #[test]
     fn results_without_structured_content_pass_through() {
         let bare = json!({ "content": [{ "type": "text", "text": "x" }] });
-        assert_eq!(shape_result("web_fetch", bare.clone()), bare);
+        assert_eq!(shape_result(bare.clone()), bare);
         // structuredContent present but empty after the map drop:
         // nothing to fold, shape unchanged.
         let empty = json!({
             "content": [{ "type": "text", "text": "x" }],
             "structuredContent": { "map": ["/a"] }
         });
-        assert_eq!(shape_result("web_crawl", empty.clone()), empty);
+        assert_eq!(shape_result(empty.clone()), empty);
     }
 
     #[test]
     fn result_without_content_array_gets_meta_only_content() {
         let odd = json!({ "structuredContent": { "stop": "Deadline" } });
-        let shaped = shape_result("web_crawl", odd);
+        let shaped = shape_result(odd);
         assert!(shaped.get("structuredContent").is_none());
         assert_eq!(shaped["content"][0]["type"], "text");
         assert!(

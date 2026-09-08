@@ -204,7 +204,7 @@ or add an API-key provider (`donsetch keys add`)*\n",
         ));
     }
     if handles.is_some() && !out.results.is_empty() {
-        md.push_str("*fetch results by their S-handle (raw urls in structuredContent)*\n");
+        md.push_str("*fetch results by their S-handle (raw urls in the result metadata)*\n");
     }
     md
 }

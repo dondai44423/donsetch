@@ -611,6 +611,10 @@ mod search_output_contract_tests {
         let state = search_model_meta(&output, &["S1".into()]);
         assert_eq!(state["results"][0]["rank"], 1);
         assert_eq!(state["results"][0]["handle"], "S1");
+        // The markdown shows title, host and the S-handle : never the
+        // raw URL. This field is the model's only source of citable
+        // URLs once the compat fold merges the surfaces (issue #27).
+        assert_eq!(state["results"][0]["url"], "https://example.com/answer");
         for absent in ["title", "snippet", "score", "engines"] {
             assert!(state["results"][0].get(absent).is_none());
         }
