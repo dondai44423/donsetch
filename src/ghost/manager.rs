@@ -1,40 +1,106 @@
 //! GhostManager : the daemon's browser lifecycle brain.
 //!
-//! One browser, one tab, one job at a time. Frozen
-//! between jobs (0 CPU), reaped after 10 min frozen,
-//! crash-transparent on acquire.
+//! A pool of warm browsers, one tab per slot, one job per slot at
+//! a time. Frozen between jobs (0 CPU), reaped after 10 min frozen,
+//! crash-transparent on acquire. Slots are keyed by persona identity
+//! (the profile value) with a host-affinity hint on acquire: a repeat
+//! visit to the same host reuses the same-profile browser that
+//! already has that site's session state warm. Default pool: 3 slots.
+//! `DONSETCH_GHOST_POOL_SLOTS` sizes it (1-16); `DONSETCH_NO_GHOST_POOL`
+//! forces the legacy single-slot behavior.
 //!
-//! On Linux, an Xvfb virtual display is started at init
-//! and kept warm. Ghost launches headful Chrome on this
-//! display : the stealth path that passes Cloudflare/DataDome.
+//! Concurrency: each slot carries its own lock; a held browser job
+//! pins exactly its slot, other slots stay free. Selection reads a
+//! lightweight metadata snapshot under its own short lock, then
+//! locks the chosen slot only.
+//!
+//! On Linux, an Xvfb virtual display is started at init and kept warm
+//! for the whole pool. Ghost launches headful Chrome on this display :
+//! the stealth path that passes Cloudflare/DataDome.
 
+use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{FREEZE_AFTER, Ghost, REAP_AFTER};
 use crate::error::FetchError;
 use crate::profile::BrowserProfile;
 
+/// Pool size: default 3 warm slots. Env override
+/// `DONSETCH_GHOST_POOL_SLOTS` clamps to 1..=16; 0 falls back to the
+/// default (a zero-slot pool would disable the warm path entirely,
+/// which the kill switch owns); `DONSETCH_NO_GHOST_POOL` forces the
+/// legacy single-slot path.
+/// Pool size: default 3 warm slots. Env override
+/// `DONSETCH_GHOST_POOL_SLOTS` clamps to 1..=16; 0 falls back to the
+/// default (a zero-slot pool would disable the warm path entirely,
+/// which the kill switch owns); `DONSETCH_NO_GHOST_POOL` forces the
+/// legacy single-slot path.
+fn pool_slots(default: usize) -> usize {
+    pool_size(
+        std::env::var_os("DONSETCH_NO_GHOST_POOL").is_some(),
+        std::env::var("DONSETCH_GHOST_POOL_SLOTS").ok().as_deref(),
+        default,
+    )
+}
+
+/// Sizing rule: kill switch > explicit > default; explicit clamps
+/// 1..=16; zero falls back to default (pools bounded to a real slot).
+fn pool_size(no_pool: bool, slots_env: Option<&str>, default: usize) -> usize {
+    if no_pool {
+        return 1;
+    }
+    match slots_env.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => default,
+        Some(n) => n.clamp(1, 16),
+        None => default,
+    }
+}
+
+/// Metadata snapshot of one slot for the selector. Written at the
+/// state-change points (launch, guard drop, reap, persona kill);
+/// read once per acquire. Cheap Copy snapshot.
+#[derive(Clone)]
+struct Snap {
+    live: bool,
+    key: Option<u64>,
+    host: Option<String>,
+    used: Instant,
+}
+
 struct Slot {
     ghost: Option<Ghost>,
-    xvfb: Option<super::xvfb::Xvfb>,
-    last_used: Instant,
+    /// Persona identity this slot was launched under (hash of the
+    /// profile fields). Cleared on reap/kill; a fresh persona claims
+    /// the slot by relaunching, never by inheriting a stranger's
+    /// browser.
+    key: Option<u64>,
+    /// Host affinity hint: the host of the last acquire this slot
+    /// served. A repeat hit on that host reuses the session state.
+    host: Option<String>,
 }
 
 pub struct GhostManager {
-    slot: Arc<Mutex<Slot>>,
-    /// Xvfb display string (":99") on Linux, None elsewhere.
+    meta: Arc<Mutex<Vec<Snap>>>,
+    slots: Vec<Arc<AsyncMutex<Slot>>>,
+    /// Xvfb display string (":99") on Linux, None elsewhere. The
+    /// display is pool-wide: every slot's Chrome attaches to it.
     display: Option<String>,
+    /// The pool-wide Xvfb handle; killed once at daemon shutdown
+    /// (previously one per manager; the pool shares one).
+    xvfb: AsyncMutex<Option<super::xvfb::Xvfb>>,
 }
 
-/// RAII handle: derefs straight to the live Ghost, so
-/// async ops hold the lock across awaits. Drop stamps
-/// last_used for the reaper.
+/// RAII handle: derefs straight to the live Ghost of ONE slot, so
+/// async ops hold only that slot's lock across awaits. The others
+/// stay free. Drop stamps the slot's last_used in the meta snapshot.
 pub struct GhostGuard {
+    meta: Arc<Mutex<Vec<Snap>>>,
     guard: OwnedMutexGuard<Slot>,
+    idx: usize,
 }
 
 impl Deref for GhostGuard {
@@ -52,7 +118,14 @@ impl DerefMut for GhostGuard {
 
 impl Drop for GhostGuard {
     fn drop(&mut self) {
-        self.guard.last_used = Instant::now();
+        // Stamp the slot we held. tokio's blocking_lock is safe in a
+        // drop path (contended only across job lifetimes, the meta
+        // critical section is microseconds).
+        if let Ok(mut snaps) = self.meta.lock()
+            && let Some(snap) = snaps.get_mut(self.idx)
+        {
+            snap.used = Instant::now();
+        }
         // On Windows and macOS, a frozen browser window stays visible
         // (Windows: taskbar, macOS: desktop). On Linux with Xvfb the
         // window is on a virtual display (invisible), so the warm-browser
@@ -64,7 +137,14 @@ impl Drop for GhostGuard {
         // Drop closes the handle and the browser tree is reaped.
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            let _ = self.guard.ghost.take();
+            self.guard.ghost = None;
+            if let Ok(mut snaps) = self.meta.lock() {
+                if let Some(snap) = snaps.get_mut(self.idx) {
+                    snap.live = false;
+                    snap.key = None;
+                    snap.host = None;
+                }
+            }
         }
     }
 }
@@ -84,8 +164,29 @@ fn xvfb_missing_hint() -> Option<&'static str> {
     }
 }
 
+/// Persona identity of a browser profile: the fields that decide
+/// what the wire sees. Same hash = same identity = same warm slot
+/// reuse; a profile change must never silently inherit another
+/// persona's browser (the single-slot era reused whatever was warm,
+/// which let scorecard probes run under the fetch profile's browser).
+fn persona_key(profile: &BrowserProfile) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    profile.name.hash(&mut h);
+    format!("{:?}", profile.tls).hash(&mut h);
+    format!("{:?}", profile.h2).hash(&mut h);
+    profile.user_agent.hash(&mut h);
+    format!("{:?}", profile.platform).hash(&mut h);
+    h.finish()
+}
+
 impl GhostManager {
     pub async fn new() -> Arc<Self> {
+        Self::with_slot_default(3).await
+    }
+
+    /// Test seam: same init path, arbitrary default (clamped by the
+    /// same rules as the env).
+    async fn with_slot_default(default: usize) -> Arc<Self> {
         // Termux (Android) has no X11 by default. Skip Xvfb entirely;
         // Ghost will use --headless=new mode. Detecting Termux early
         // avoids a confusing error message about Xvfb installation.
@@ -95,11 +196,11 @@ impl GhostManager {
 
         // A forced headless backend does not need a virtual display. Avoid
         // starting Xvfb so the selection is explicit in both process and args.
-        let xvfb = if super::cloak::headless_mode_requested() {
+        let (display, xvfb) = if super::cloak::headless_mode_requested() {
             if std::env::var_os("DONGHOST_DEBUG").is_some() {
                 eprintln!("[ghost] headless backend selected, skipping Xvfb");
             }
-            None
+            (None, None)
         } else if !is_termux && super::xvfb::is_available() {
             match super::xvfb::Xvfb::start().await {
                 Ok(xvfb) => {
@@ -107,13 +208,13 @@ impl GhostManager {
                     if std::env::var_os("DONGHOST_DEBUG").is_some() {
                         eprintln!("[ghost] Xvfb started on {disp}");
                     }
-                    Some(xvfb)
+                    (Some(disp), Some(xvfb))
                 }
                 Err(e) => {
                     eprintln!(
                         "[ghost] Xvfb start failed: {e}, falling back to headful off-screen mode"
                     );
-                    None
+                    (None, None)
                 }
             }
         } else if is_termux {
@@ -121,7 +222,7 @@ impl GhostManager {
             if std::env::var_os("DONGHOST_DEBUG").is_some() {
                 eprintln!("[ghost] Termux detected, using headless mode (no Xvfb)");
             }
-            None
+            (None, None)
         } else if let Some(hint) = xvfb_missing_hint() {
             // Xvfb not installed on a Linux-family system: warn the
             // user. Chrome will run headful off-screen
@@ -132,73 +233,175 @@ impl GhostManager {
             // hint: headful off-screen is their native mode and the
             // apt/pacman advice does not apply (issue #81).
             eprintln!("{hint}");
-            None
+            (None, None)
         } else {
             // macOS/Windows/other: no Xvfb concept at all.
-            None
+            (None, None)
         };
 
-        let display = xvfb.as_ref().map(|x| x.display_env());
-
-        let mgr = Arc::new(Self {
-            slot: Arc::new(Mutex::new(Slot {
+        let seed = pool_slots(default);
+        let slots: Vec<Slot> = (0..seed)
+            .map(|_| Slot {
                 ghost: None,
-                xvfb,
-                last_used: Instant::now(),
-            })),
+                key: None,
+                host: None,
+            })
+            .collect();
+        let meta: Vec<Snap> = slots
+            .iter()
+            .map(|_| Snap {
+                live: false,
+                key: None,
+                host: None,
+                used: Instant::now(),
+            })
+            .collect();
+        let mgr = Arc::new(Self {
+            meta: Arc::new(Mutex::new(meta)),
+            slots: slots
+                .into_iter()
+                .map(|s| Arc::new(AsyncMutex::new(s)))
+                .collect(),
             display,
+            xvfb: AsyncMutex::new(xvfb),
         });
         let reaper = Arc::clone(&mgr);
         tokio::spawn(async move { reaper.reap_loop().await });
         mgr
     }
 
-    /// Acquire the ghost: launch if absent, thaw if
-    /// frozen, relaunch if the thaw finds a corpse.
+    /// Acquire the ghost: launch if absent, thaw if frozen,
+    /// relaunch if the thaw finds a corpse.
     pub async fn acquire(&self, profile: &BrowserProfile) -> Result<GhostGuard, FetchError> {
-        let mut slot = self.slot.clone().lock_owned().await;
-        let need_launch = match slot.ghost.as_mut() {
+        self.acquire_for(profile, None).await
+    }
+
+    /// Host-affinity acquire: a repeat hit on the same host reuses
+    /// the browser that already touched that site (session warmth),
+    /// when that browser matches the persona. Different profiles or
+    /// hosts spill into other slots or evict the coldest.
+    pub async fn acquire_for(
+        &self,
+        profile: &BrowserProfile,
+        host: Option<&str>,
+    ) -> Result<GhostGuard, FetchError> {
+        let key = persona_key(profile);
+        let idx = {
+            let snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+            pick_slot(&snaps, key, host)
+        };
+        // Lock only the chosen slot. Other slots stay free for
+        // concurrent acquires.
+        let mut guard = Arc::clone(&self.slots[idx]).lock_owned().await;
+        if guard.key != Some(key) {
+            // Persona switch on a still-live browser: the slot's
+            // browser belongs to another identity. Kill it instead
+            // of mutating another persona's fingerprint state.
+            if let Some(mut old) = guard.ghost.take() {
+                old.kill().await;
+                guard.key = None;
+                guard.host = None;
+            }
+        }
+        guard.key = Some(key);
+        guard.host = host.map(|h| h.to_string());
+        let need_launch = match guard.ghost.as_mut() {
             None => true,
             Some(g) => !g.thaw(),
         };
         if need_launch {
-            if let Some(mut old) = slot.ghost.take() {
+            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                eprintln!("[pool] launch slot {} (thaw fail or empty)", idx);
+            }
+            if let Some(mut old) = guard.ghost.take() {
                 old.kill().await;
             }
-            slot.ghost = Some(Ghost::launch(profile, self.display.as_deref()).await?);
+            guard.ghost = Some(Ghost::launch(profile, self.display.as_deref()).await?);
+        } else {
+            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                eprintln!("[pool] warm serve slot {}", idx);
+            }
+            // Warm slot served the job: pool receipt. The kill switch
+            // does not silence the counter: a single slot may warm-reuse.
+            let mut st = crate::ghost::cache::GhostState::load();
+            st.note_pool_served();
         }
-        Ok(GhostGuard { guard: slot })
+        {
+            let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(snap) = snaps.get_mut(idx) {
+                snap.live = guard.ghost.is_some();
+                snap.key = guard.key;
+                snap.host = guard.host.clone();
+                snap.used = Instant::now();
+            }
+        }
+        Ok(GhostGuard {
+            meta: Arc::clone(&self.meta),
+            guard,
+            idx,
+        })
     }
 
-    /// Freeze after FREEZE_AFTER idle; reap after
-    /// REAP_AFTER frozen. 5s tick.
+    /// Freeze every slot idle past FREEZE_AFTER; reap those past
+    /// REAP_AFTER frozen. 5s tick. A busy slot (job in flight) is
+    /// locked; defer its reap to the next tick.
     async fn reap_loop(&self) {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
-            let mut slot = self.slot.lock().await;
-            let idle = slot.last_used.elapsed();
-            let Some(g) = slot.ghost.as_mut() else {
-                continue;
-            };
-            if g.is_frozen() {
-                if idle > REAP_AFTER {
-                    let mut g = slot.ghost.take().expect("ghost");
-                    g.kill().await;
+            for (idx, slot) in self.slots.iter().enumerate() {
+                let idle = {
+                    let snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+                    snaps.get(idx).map(|s| s.used.elapsed()).unwrap_or_default()
+                };
+                let Ok(mut guard) = slot.try_lock() else {
+                    continue; // job in flight; defer to the next tick
+                };
+                let Some(g) = guard.ghost.as_mut() else {
+                    if let Ok(mut snaps) = self.meta.lock()
+                        && let Some(snap) = snaps.get_mut(idx)
+                    {
+                        snap.live = false;
+                        snap.key = None;
+                        snap.host = None;
+                    }
+                    continue;
+                };
+                if g.is_frozen() {
+                    if idle > REAP_AFTER {
+                        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                            eprintln!("[pool] reap slot {}", idx);
+                        }
+                        if let Some(mut dead) = guard.ghost.take() {
+                            dead.kill().await;
+                        }
+                        guard.key = None;
+                        guard.host = None;
+                        if let Ok(mut snaps) = self.meta.lock()
+                            && let Some(snap) = snaps.get_mut(idx)
+                        {
+                            snap.live = false;
+                            snap.key = None;
+                            snap.host = None;
+                        }
+                    }
+                } else if idle > FREEZE_AFTER {
+                    g.freeze();
                 }
-            } else if idle > FREEZE_AFTER {
-                g.freeze();
             }
         }
     }
 
-    /// Daemon shutdown: kill browser + Xvfb (if owned).
+    /// Daemon shutdown: kill every slot's browser, then the pool Xvfb.
     pub async fn shutdown(&self) {
-        let mut slot = self.slot.lock().await;
-        if let Some(mut g) = slot.ghost.take() {
-            g.kill().await;
+        for slot in &self.slots {
+            let mut guard = slot.lock().await;
+            if let Some(mut g) = guard.ghost.take() {
+                g.kill().await;
+            }
         }
-        if let Some(xvfb) = slot.xvfb.take() {
+        let xvfb = self.xvfb.lock().await.take();
+        if let Some(xvfb) = xvfb {
             xvfb.kill().await;
         }
     }
@@ -207,6 +410,123 @@ impl GhostManager {
     #[allow(dead_code)]
     pub fn is_headful(&self) -> bool {
         self.display.is_some()
+    }
+}
+
+/// Slot selection, pure so it stays testable without a browser:
+/// same persona + same host (session-warm reuse) > same persona,
+/// any warm slot > empty slot > coldest eviction. DECISION ONLY:
+/// killing a stranger persona's browser before relaunching lives
+/// in acquire_for.
+fn pick_slot(snaps: &[Snap], key: u64, host: Option<&str>) -> usize {
+    if let Some(host) = host
+        && let Some(i) = snaps
+            .iter()
+            .position(|v| v.live && v.key == Some(key) && v.host.as_deref() == Some(host))
+    {
+        return i;
+    }
+    if let Some(i) = snaps.iter().position(|v| v.live && v.key == Some(key)) {
+        return i;
+    }
+    // Held-empty same-persona slot (browser reaped under this
+    // persona): reuse before opening another slot.
+    if let Some(i) = snaps.iter().position(|v| !v.live && v.key == Some(key)) {
+        return i;
+    }
+    if let Some(i) = snaps.iter().position(|v| !v.live) {
+        return i;
+    }
+    snaps
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.used.cmp(&b.1.used))
+        .map(|(i, _)| i)
+        // usize::MAX only fires with a zero-slot pool, a construction
+        // bug; acquire_for would index-panic instead of spawning. The
+        // pool build clamps to >=1 so this is unreachable.
+        .unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn v(live: bool, key: Option<u64>, host: Option<&str>, idle_s: u64) -> Snap {
+        Snap {
+            live,
+            key,
+            host: host.map(|h| h.to_string()),
+            used: Instant::now() - Duration::from_secs(idle_s),
+        }
+    }
+
+    #[test]
+    fn same_persona_host_wins_over_warm_other() {
+        let k = 11;
+        let views = vec![
+            v(true, Some(k), Some("a.test"), 30),
+            v(true, Some(k), Some("b.test"), 1),
+            v(true, Some(22), None, 1),
+        ];
+        assert_eq!(pick_slot(&views, k, Some("a.test")), 0);
+    }
+
+    #[test]
+    fn same_persona_any_slot_beats_spare_launch() {
+        let k = 11;
+        let views = vec![v(false, None, None, 0), v(true, Some(k), None, 60)];
+        assert_eq!(
+            pick_slot(&views, k, None),
+            1,
+            "warm same-persona browser beats a launch"
+        );
+    }
+
+    #[test]
+    fn persona_switch_pickthen_kill_semantics() {
+        // Slot belongs to persona A. Persona B picks the same slot,
+        // and acquire_for must kill instead of inheriting.
+        let views = vec![v(true, Some(11), Some("a.test"), 10)];
+        assert_eq!(pick_slot(&views, 22, None), 0);
+        assert_ne!(11, 22);
+    }
+
+    #[test]
+    fn spare_slot_beats_eviction() {
+        let k = 11;
+        let views = vec![v(true, Some(9), None, 1), v(false, None, None, 0)];
+        assert_eq!(
+            pick_slot(&views, k, None),
+            1,
+            "empty slot beats evicting a warm browser"
+        );
+    }
+
+    #[test]
+    fn coldest_evicted_when_no_capacity() {
+        let k = 11;
+        let views = vec![v(true, Some(9), None, 3), v(true, Some(8), None, 60)];
+        assert_eq!(pick_slot(&views, k, None), 1);
+    }
+
+    #[test]
+    fn pool_size_kill_switch_and_clamps() {
+        assert_eq!(
+            pool_size(true, Some("44"), 3),
+            1,
+            "kill switch forces single-slot legacy"
+        );
+        assert_eq!(pool_size(false, Some("44"), 3), 16, "above 16 clamps to 16");
+        assert_eq!(pool_size(false, Some("0"), 5), 5, "0 falls back to default");
+        assert_eq!(pool_size(false, Some("7"), 3), 7);
+        assert_eq!(
+            pool_size(false, Some("junk"), 3),
+            3,
+            "unparseable falls back"
+        );
+        assert_eq!(pool_size(false, None, 3), 3);
+        assert_eq!(pool_size(true, None, 3), 1);
     }
 }
 

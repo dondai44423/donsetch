@@ -116,7 +116,8 @@ pub(super) fn make_ghost_hook(
                     });
                 }
             }
-            let mut g = match ghost_mgr.acquire(&profile).await {
+            let g_host = crate::search::rank::host_of(&url);
+            let mut g = match ghost_mgr.acquire_for(&profile, Some(g_host.as_str())).await {
                 Ok(g) => g,
                 Err(e) => return Err(format!("browser launch: {e}")),
             };
@@ -476,7 +477,11 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             );
         }
         let t0 = std::time::Instant::now();
-        let Ok(mut g) = d.ghost_mgr.acquire(&d.profile).await else {
+        let Ok(mut g) = d
+            .ghost_mgr
+            .acquire_for(&d.profile, Some(host_str.as_str()))
+            .await
+        else {
             return;
         };
         let page =

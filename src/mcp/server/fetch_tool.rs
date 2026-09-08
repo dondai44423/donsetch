@@ -1443,7 +1443,7 @@ pub(super) async fn ghost_escalate(
     let t0 = std::time::Instant::now();
     let mut g = daemon
         .ghost_mgr
-        .acquire(&daemon.profile)
+        .acquire_for(&daemon.profile, Some(host))
         .await
         .map_err(|e| (format!("browser launch failed: {e}"), "permanent"))?;
     trace.step("2", "browser-launch", "ok", t0.elapsed().as_millis());
@@ -1869,7 +1869,11 @@ pub(super) async fn fetch_with_actions(
     trace.step("route", "actions", "browser-script", 0);
 
     let t0 = std::time::Instant::now();
-    let mut g = match daemon.ghost_mgr.acquire(&daemon.profile).await {
+    let mut g = match daemon
+        .ghost_mgr
+        .acquire_for(&daemon.profile, Some(host))
+        .await
+    {
         Ok(g) => g,
         Err(e) => {
             return tool_error_structured(
@@ -2210,7 +2214,12 @@ pub(super) async fn anticloak_check(
     url: &str,
     tier1_markdown: &str,
 ) -> Option<(f64, String)> {
-    let mut g = daemon.ghost_mgr.acquire(&daemon.profile).await.ok()?;
+    let host = crate::search::rank::host_of(url);
+    let mut g = daemon
+        .ghost_mgr
+        .acquire_for(&daemon.profile, Some(host.as_str()))
+        .await
+        .ok()?;
     let page = ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
         .await
         .ok()?;

@@ -86,6 +86,9 @@ channel until the v4.0.0 release train.
   stderr trim.
 - Storage guard: bounded target-dir growth and pinned the cargo
   profile on every nextest run.
+- Ghost-state counters now merge against the state on disk at every
+  save, so a late save with a stale in-memory snapshot can no longer
+  rewind lifetime counters (caught live: the pool warm-serve receipt).
 
 ## [3.6.7] - 2026-09-07
 

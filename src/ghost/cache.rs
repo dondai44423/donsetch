@@ -267,6 +267,13 @@ pub struct GhostState {
     /// counted: a served pack means real evidence reached the agent.
     #[serde(default)]
     pub answered_packs_total: u64,
+    /// v4 phase 3 ghost pool visibility: how many ghost acquires were
+    /// served by an already-live pooled browser (thaw-and-go), as
+    /// opposed to paying a browser launch. Sums across the daemon's
+    /// lifetime; zero cold-starts are not counted. Surfaced in
+    /// donsetch status as the pool's warm-reuse receipt.
+    #[serde(default)]
+    pub pool_served_total: u64,
     /// Tier-1 whole-jar persistence (v4 phase 1.4): the browser
     /// cookie-store view, so a returning agent replays device /
     /// analytics / cf_bm cookies like a returning browser instead
@@ -902,6 +909,16 @@ impl GhostState {
         self.save();
     }
 
+    /// v4 phase 3 visibility: count a fetch served from an
+    /// already-warm pool browser (no launch, no thaw failure). With
+    /// DONSETCH_NO_GHOST_POOL set, the pool is one slot but warm
+    /// reuse inside that slot still counts: the receipt lives with
+    /// the behavior.
+    pub fn note_pool_served(&mut self) {
+        self.pool_served_total = self.pool_served_total.saturating_add(1);
+        self.save();
+    }
+
     /// One background probe was attempted (any outcome).
     pub fn note_probe(&mut self) {
         if !route_memory_enabled() || route_memory_readonly() {
@@ -1078,6 +1095,23 @@ impl GhostState {
             let p = path();
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
+            }
+            // Merge monotonic counters against the disk state as it
+            // exists RIGHT NOW: independent load() snapshots race
+            // (a stale in-memory copy saving later would otherwise
+            // rewind lifetimes). Max-merge is correct for counters:
+            // they only grow. Real case: the pool-warm receipt.
+            if let Ok(bytes) = std::fs::read(&p)
+                && let Ok(disk) = serde_json::from_slice::<GhostState>(&bytes)
+            {
+                self.probes_total = self.probes_total.max(disk.probes_total);
+                self.shadowed_assets_total =
+                    self.shadowed_assets_total.max(disk.shadowed_assets_total);
+                self.prewarmed_served_total =
+                    self.prewarmed_served_total.max(disk.prewarmed_served_total);
+                self.answered_packs_total =
+                    self.answered_packs_total.max(disk.answered_packs_total);
+                self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
             }
             if let Ok(s) = serde_json::to_string(self) {
                 let tmp = p.with_extension("json.tmp");
