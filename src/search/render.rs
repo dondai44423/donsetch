@@ -235,20 +235,18 @@ pub fn render_compact_markdown(
             index + 1,
             result.title
         ));
-        // Corroboration on the model surface: how many independent
-        // index families agree determines how much a result can be
-        // trusted sight-unseen. Counting families (not engines) is
-        // the same math the ranking uses, so the number stays
-        // honest across correlated engines.
+        // Report how many search-index families returned this URL,
+        // using the same count as ranking. This is retrieval agreement,
+        // not independent corroboration of the page's claims.
         let families = rank::family_count(result);
         if let Some(hint) = hints.get(index).and_then(|hint| hint.as_deref()) {
             markdown.push(' ');
             markdown.push_str(hint);
         }
         markdown.push_str(&format!(
-            " · {} {}",
+            " · {} index {}",
             families,
-            if families == 1 { "source" } else { "sources" }
+            if families == 1 { "family" } else { "families" }
         ));
         markdown.push('\n');
         if !result.snippet.is_empty() {
@@ -261,7 +259,7 @@ pub fn render_compact_markdown(
     if out.results.is_empty() {
         markdown.push_str("No results. Retry once with a materially different formulation.\n");
     } else if out.weak {
-        markdown.push_str("Weak results : low cross-source agreement.\n");
+        markdown.push_str("Weak results : low cross-index agreement.\n");
     }
 
     let unavailable = out
