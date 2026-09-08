@@ -21,8 +21,22 @@
 clean-bloat:
 	rm -rf target/debug target/release fuzz/target
 
+# Hard storage guard: the target dir never gets to blow past 25G.
+# One du + compare (~2s), prune-through only when bloat exists. The
+# second GIB recheck uses 30G so the gate pays no extra rebuild.
+guard:
+	@if [ -d target ] && [ "$$(du -sm target | cut -f1)" -gt 25000 ]; then \
+		echo "guard: pruning bloat profiles (target > 25G)"; \
+		rm -rf target/debug target/release fuzz/target; \
+	fi
+
+# Instant size report: what each shell of target/ costs.
+space:
+	@du -shx target 2>/dev/null
+	@du -shx target/*/ 2>/dev/null | sort -rh | head -8
+
 # Pre-push gate: everything CI will flag.
-all: fmt-check lint test
+all: guard fmt-check lint test
 
 # Pre-tag gate: `all` + the Cargo.lock gate (catches a version bump
 # with a stale lock in seconds, the failure that used to cost a full
@@ -64,10 +78,15 @@ lint:
     cargo clippy --profile ci --all-targets --features ocr,rerank,http -- -Dwarnings
 
 # Full suite, full feature set, fail-fast. The cargo profile is
-# pinned via CLI (older nextest ignores the config-level
-# cargo-profile key).
+# pinned via CLI: nextest 0.9.x ignores the config-level key, and an
+# unpinned run compiles the debug graph (the 110G/21G recidivism).
 test:
     cargo nextest run --cargo-profile ci --features ocr,rerank,http
+
+# Scoped test run with the SAME pin: `just t crawl::frontier`
+# is the only local way to run a subset without growing debug.
+t expression:
+    cargo nextest run --cargo-profile ci --features ocr,rerank,http -E 'test({{expression}})' 
 
 # The binary for live smoke runs (fast profile, real behavior).
 bin:
