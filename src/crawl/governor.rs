@@ -22,23 +22,27 @@ use std::time::{Duration, Instant};
 
 /// Base inter-request delay per lane when healthy.
 ///
-/// v2 elastic pacing: 300ms+jitter (~225-375ms gaps) is the
-/// pace of a human skimming docs : clicking through interesting
-/// links fast. A normal browser page load fires 20-80 requests
-/// to one host in parallel, so single-document fetches at this
-/// pace sit far below any per-IP threshold that allows normal
-/// browsing. The governor's job is the ESCALATION ladder, not
-/// presumptive slowness: any throttle signal (429/503), latency
-/// stress (EWMA > 3× baseline), or robots crawl-delay raises
-/// the pace reactively : we discover the host's real limit from
-/// its own signals instead of taxing every crawl with a 700ms+
-/// theater of politeness. Measured effect: small-crawl median
-/// 6.29s → ~2.5s with zero observed throttling on test hosts.
+/// Elastic pacing: 200ms+jitter (~150-250ms gaps). A normal
+/// browser page load fires 20-80 requests to one host in
+/// parallel, so single-document fetches at this pace sit far
+/// below any per-IP threshold that allows normal browsing. The
+/// governor's job is the ESCALATION ladder, not presumptive
+/// slowness: any throttle signal (429/503), latency stress
+/// (EWMA > 3× baseline), or robots crawl-delay raises the pace
+/// reactively : we discover the host's real limit from its own
+/// signals instead of taxing every crawl with a theater of
+/// politeness. Measured effect: small-crawl median 6.29s →
+/// ~2.5s with zero observed throttling on test hosts.
 const BASE_DELAY: Duration = Duration::from_millis(200);
 
 /// Hard ceiling on adaptive delay growth (rung = BASE * 2^k,
-/// capped at 6 rungs ≈ 45s).
+/// capped at 6 rungs). Every ladder delay is additionally capped
+/// at MAX_LADDER_WAIT: self-inferred waits never exceed ~7s
+/// (v4 law 11: stealth through truth, never time). Host-declared
+/// waits (the 429/503 penalty box, robots crawl-delay) bypass the
+/// cap and are honored in full.
 const MAX_BACKOFF_RUNG: u32 = 6;
+const MAX_LADDER_WAIT: Duration = Duration::from_secs(7);
 
 /// Latency EWMA window: new samples weigh 25%.
 const EWMA_ALPHA: f64 = 0.25;
@@ -199,9 +203,12 @@ impl Governor {
             return wait;
         }
 
-        // Compute the new next_allowed: base * 2^rung, jittered.
+        // Compute the new next_allowed: base * 2^rung, jittered,
+        // capped at MAX_LADDER_WAIT (law 11).
         let rung_mult = (1u64 << hl.rung.min(MAX_BACKOFF_RUNG)) as f64;
-        let delay = base.mul_f64(rung_mult * self.jitter(seq));
+        let delay = base
+            .mul_f64(rung_mult * self.jitter(seq))
+            .min(MAX_LADDER_WAIT);
         hl.next_allowed = now + delay;
         Duration::ZERO
     }
@@ -211,7 +218,7 @@ impl Governor {
     /// the pending next_allowed FORWARD when the rung decays :
     /// a host answering fine again shouldn't serve an old
     /// penalty window computed while it was upset.
-    pub fn on_success(&self, host: &str, lane: &str, latency: Duration, dwell_ms: u64) {
+    pub fn on_success(&self, host: &str, lane: &str, latency: Duration) {
         let ms = latency.as_secs_f64() * 1000.0;
         let mut lanes = self
             .lanes
@@ -245,17 +252,6 @@ impl Governor {
                     .min(hl.next_allowed.saturating_duration_since(Instant::now()))
                     .mul_f64(new_mult);
         }
-        // Dwell time: a human reads the page before navigating
-        // to the next one. Proportional to page size (bytes/4),
-        // capped at 2s. Added AFTER rung adjustments so it
-        // extends : not replaces : the paced window. This breaks
-        // the metronome fingerprint: a 50KB page gets a longer
-        // gap than a 2KB page, just like real reading.
-        if dwell_ms > 0 {
-            let dwell = Duration::from_millis(dwell_ms);
-            let now = Instant::now();
-            hl.next_allowed = hl.next_allowed.max(now) + dwell;
-        }
         drop(lanes);
 
         // Success decays the shared host penalty too.
@@ -284,7 +280,11 @@ impl Governor {
             let hl = lanes.entry(key).or_default();
             hl.rung = (hl.rung + 2).min(MAX_BACKOFF_RUNG);
             let rung_mult = (1u64 << hl.rung) as f64;
-            hl.next_allowed = Instant::now() + self.base().mul_f64(rung_mult * self.jitter(0xbeef));
+            hl.next_allowed = Instant::now()
+                + self
+                    .base()
+                    .mul_f64(rung_mult * self.jitter(0xbeef))
+                    .min(MAX_LADDER_WAIT);
         }
         // Shared host penalty box: everyone backs off together.
         let mut hosts = self
@@ -312,7 +312,8 @@ impl Governor {
         hl.next_allowed = Instant::now()
             + self
                 .base()
-                .mul_f64((1u64 << hl.rung) as f64 * self.jitter(7));
+                .mul_f64((1u64 << hl.rung) as f64 * self.jitter(7))
+                .min(MAX_LADDER_WAIT);
     }
 
     /// Pick the least-blocked lane for the host, respecting the
@@ -456,9 +457,9 @@ mod tests {
                 Some(Instant::now() - Duration::from_secs(1));
             hosts.get_mut("ex.com").unwrap().rung = 2;
         }
-        g.on_success("ex.com", "lane0", Duration::from_millis(50), 0);
-        g.on_success("ex.com", "lane0", Duration::from_millis(50), 0);
-        g.on_success("ex.com", "lane0", Duration::from_millis(50), 0);
+        g.on_success("ex.com", "lane0", Duration::from_millis(50));
+        g.on_success("ex.com", "lane0", Duration::from_millis(50));
+        g.on_success("ex.com", "lane0", Duration::from_millis(50));
         let after = g.wait_for("ex.com", "lane0", 2);
         let _ = before;
         assert!(after < Duration::from_secs(2));
@@ -467,10 +468,10 @@ mod tests {
     #[test]
     fn rising_latency_adds_rung() {
         let g = gov(&[LaneKind::Direct]);
-        g.on_success("ex.com", "lane0", Duration::from_millis(100), 0);
+        g.on_success("ex.com", "lane0", Duration::from_millis(100));
         // Feed rising latencies.
         for _ in 0..6 {
-            g.on_success("ex.com", "lane0", Duration::from_millis(500), 0);
+            g.on_success("ex.com", "lane0", Duration::from_millis(500));
         }
         {
             let lanes = g
@@ -479,6 +480,31 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let hl = lanes.get(&("ex.com".into(), "lane0".into())).unwrap();
             assert!(hl.rung >= 1);
+        }
+    }
+
+    // v4 phase 3 (law 11): the adaptive ladder is capped. At the
+    // top rung the wait must never exceed MAX_LADDER_WAIT, whatever
+    // the jitter draws. Pre-cap, rung 6 reached ~16s.
+    #[test]
+    fn ladder_capped_at_seven_seconds() {
+        for seed in 0..32u64 {
+            let g = gov(&[LaneKind::Direct]);
+            {
+                let mut lanes = g
+                    .lanes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                lanes
+                    .entry(("ex.com".into(), "lane0".into()))
+                    .or_default()
+                    .rung = MAX_BACKOFF_RUNG;
+            }
+            let w = g.wait_for("ex.com", "lane0", seed);
+            assert!(
+                w <= MAX_LADDER_WAIT,
+                "seed {seed}: wait {w:?} exceeds the 7s cap"
+            );
         }
     }
 

@@ -110,6 +110,18 @@ impl BrowserProfile {
                              ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:\
                              AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA",
                 groups: "X25519MLKEM768:X25519:P-256:P-384",
+                // NOTE (v4 parity finding, 2026-09-08): the floor's
+                // real Chromium 151 also pads sig-algs with three
+                // GREASE codes (0x0904/05/06) at the front. boring's
+                // public set_sigalgs_list validates against known
+                // algorithms and refuses them ([INVALID_SIGNATURE_
+                // ALGORITHM], live-proven), and upstream boringssl
+                // has NO sig-alg grease hook (its grease indexes:
+                // cipher/group/ext1/ext2/version/ticket/ech). Raw
+                // ClientHello extension injection would be needed:
+                // documented as the L1 evergreen work item in
+                // design/v4.md, doctor --stealth --parity surfaces
+                // the exact delta meanwhile.
                 sigalgs: "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
                           ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:\
                           rsa_pss_rsae_sha512:rsa_pkcs1_sha512",
@@ -123,7 +135,7 @@ impl BrowserProfile {
                 conn_window_update: 15663105,
             },
             user_agent: format!(
-                "Mozilla/5. ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
+                "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
                 platform.ua_token()
             ),
             sec_ch_ua,
@@ -149,6 +161,25 @@ impl BrowserProfile {
     /// Ordered header template for a document GET, Chrome order.
     /// (name, value-or-placeholder). Placeholders filled by caller.
     pub fn h1_headers(&self, host: &str, path: &str) -> Vec<(String, String)> {
+        self.h1_headers_for_class(host, path, RequestClass::Navigation)
+    }
+
+    /// Class-aware header sets (v4 phase 1.2). A real browser does
+    /// not send one header set for everything: navigations carry
+    /// upgrade-insecure-requests + sec-fetch-user + the document
+    /// Accept; subresources carry per-type Accept, no-cors mode,
+    /// and their own sec-fetch-dest. JA4H fingerprints the header
+    /// set and order per request; one set for every request class
+    /// is itself a tell.
+    pub fn h1_headers_for_class(
+        &self,
+        host: &str,
+        path: &str,
+        class: RequestClass,
+    ) -> Vec<(String, String)> {
+        if class != RequestClass::Navigation {
+            return self.h1_subresource_headers(host, path, class);
+        }
         vec![
             ("host".into(), host.into()),
             ("connection".into(), "keep-alive".into()),
@@ -166,6 +197,44 @@ impl BrowserProfile {
             ("accept-language".into(), accept_language_for(host, path).to_string()),
         ]
     }
+
+    /// Subresource header set in Chrome's subresource order:
+    /// host, connection, the sec-ch-ua cluster, user-agent, the
+    /// per-type Accept, the sec-fetch trio (site/mode/dest), then
+    /// accept-encoding and accept-language. No
+    /// upgrade-insecure-requests and no sec-fetch-user: Chrome does
+    /// not send those on subresources. Referer is added by the
+    /// caller (the page URL); sec-fetch-site is recomputed against
+    /// the page origin by the client like any other hop.
+    fn h1_subresource_headers(
+        &self,
+        host: &str,
+        path: &str,
+        class: RequestClass,
+    ) -> Vec<(String, String)> {
+        let (accept, dest) = class.accept_and_dest();
+        let _ = path;
+        vec![
+            ("host".into(), host.into()),
+            ("connection".into(), "keep-alive".into()),
+            ("sec-ch-ua".into(), self.sec_ch_ua.clone()),
+            ("sec-ch-ua-mobile".into(), "?0".into()),
+            (
+                "sec-ch-ua-platform".into(),
+                format!("\"{}\"", self.platform.ch_platform()),
+            ),
+            ("user-agent".into(), self.user_agent.clone()),
+            ("accept".into(), accept),
+            ("sec-fetch-site".into(), "same-origin".into()),
+            ("sec-fetch-mode".into(), "no-cors".into()),
+            ("sec-fetch-dest".into(), dest),
+            ("accept-encoding".into(), "gzip, deflate, br, zstd".into()),
+            (
+                "accept-language".into(),
+                accept_language_for(host, path).to_string(),
+            ),
+        ]
+    }
 }
 
 /// v3 F5: Accept-Language coherent with the target's locale.
@@ -173,6 +242,45 @@ impl BrowserProfile {
 /// header on a .ru page is served the English stub (and is a mild
 /// incoherence signal). Derived from the host TLD and non-Latin
 /// script in the path; everything else stays Chrome-default en-US.
+/// What kind of request this is (v4 phase 1.2): header sets and
+/// JA4H profiles differ per class, so the wire must too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestClass {
+    /// Top-level document load.
+    Navigation,
+    /// Stylesheet subresource.
+    Style,
+    /// Script subresource.
+    Script,
+    /// Font subresource.
+    Font,
+    /// Image subresource.
+    Image,
+    /// favicon.ico (image class, dest image).
+    Favicon,
+}
+
+impl RequestClass {
+    /// The per-class Accept value and sec-fetch-dest, matching what
+    /// Chrome sends for the same subresource type.
+    fn accept_and_dest(self) -> (String, String) {
+        match self {
+            RequestClass::Navigation => (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+                    .to_string(),
+                "document".to_string(),
+            ),
+            RequestClass::Style => ("text/css,*/*;q=0.1".to_string(), "style".to_string()),
+            RequestClass::Script => ("*/*".to_string(), "script".to_string()),
+            RequestClass::Font => ("*/*".to_string(), "font".to_string()),
+            RequestClass::Image | RequestClass::Favicon => (
+                "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8".to_string(),
+                "image".to_string(),
+            ),
+        }
+    }
+}
+
 pub fn accept_language_for(host: &str, path: &str) -> &'static str {
     let tld = host.rsplit('.').next().unwrap_or("");
     let lang = match tld {
@@ -638,5 +746,97 @@ mod probe_tests {
         // Plausibility band: 20..=400 : rejects years, build ids, ports.
         assert_eq!(parse_version_major("Chrome 1985.1"), None);
         assert_eq!(parse_version_major("Chrome 100000"), None);
+    }
+}
+
+pub mod scorecard;
+
+#[cfg(test)]
+mod class_tests {
+    use super::*;
+
+    fn profile() -> BrowserProfile {
+        BrowserProfile::chrome(151, Platform::Linux, true)
+    }
+
+    #[test]
+    fn navigation_class_is_the_exact_historical_set() {
+        // Byte-compat guard: phase 1.2 must not perturb the
+        // navigation emission at all.
+        let p = profile();
+        let h = p.h1_headers_for_class("example.com", "/", RequestClass::Navigation);
+        let names: Vec<&str> = h.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "host",
+                "connection",
+                "sec-ch-ua",
+                "sec-ch-ua-mobile",
+                "sec-ch-ua-platform",
+                "upgrade-insecure-requests",
+                "user-agent",
+                "accept",
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-user",
+                "sec-fetch-dest",
+                "accept-encoding",
+                "accept-language"
+            ]
+        );
+        let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("sec-fetch-dest"), Some("document"));
+        assert_eq!(get("sec-fetch-mode"), Some("navigate"));
+        assert_eq!(get("sec-fetch-user"), Some("?1"));
+        assert_eq!(get("upgrade-insecure-requests"), Some("1"));
+    }
+
+    #[test]
+    fn subresource_classes_carry_their_own_sets() {
+        let p = profile();
+        for (class, dest, accept_prefix) in [
+            (RequestClass::Style, "style", "text/css"),
+            (RequestClass::Script, "script", "*/*"),
+            (RequestClass::Font, "font", "*/*"),
+            (RequestClass::Image, "image", "image/avif"),
+            (RequestClass::Favicon, "image", "image/avif"),
+        ] {
+            let h = p.h1_headers_for_class("example.com", "/a", class);
+            let names: Vec<&str> = h.iter().map(|(n, _)| n.as_str()).collect();
+            let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+            assert_eq!(get("sec-fetch-dest"), Some(dest), "{class:?}");
+            assert_eq!(get("sec-fetch-mode"), Some("no-cors"), "{class:?}");
+            assert!(
+                get("accept").unwrap().starts_with(accept_prefix),
+                "{class:?} accept {:?}",
+                get("accept")
+            );
+            // Subresources never carry navigation-only headers.
+            assert!(!names.contains(&"upgrade-insecure-requests"), "{class:?}");
+            assert!(!names.contains(&"sec-fetch-user"), "{class:?}");
+            // The identity layers stay identical to navigation.
+            assert_eq!(get("user-agent"), Some(p.user_agent.as_str()), "{class:?}");
+            assert_eq!(get("sec-ch-ua"), Some(p.sec_ch_ua.as_str()), "{class:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ua_tests {
+    #[test]
+    fn user_agent_carries_real_mozilla_token() {
+        for platform in [
+            super::Platform::Linux,
+            super::Platform::Windows,
+            super::Platform::MacOs,
+        ] {
+            let p = super::BrowserProfile::chrome(151, platform, true);
+            assert!(
+                p.user_agent.starts_with("Mozilla/5.0 ("),
+                "UA must carry the real Mozilla/5.0 token: {}",
+                p.user_agent
+            );
+        }
     }
 }

@@ -6,13 +6,23 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use super::EngineReport;
 use super::Intent;
 use super::cache_ttl;
 use super::rank::Merged;
 
 /// Query-cache map shape: key -> (written-at, up-to-12 results,
-/// merge total at write time).
-pub(crate) type CacheMap = HashMap<String, (Instant, Vec<Merged>, usize)>;
+/// merge total at write time, engine reports). The reports are
+/// cached with the results so a cache hit still carries engine
+/// evidence (#164: cache hits used to return an empty report,
+/// hiding whether the answer was fresh consensus or stale cache).
+pub(crate) type CacheMap = HashMap<String, (Instant, Vec<Merged>, usize, Vec<EngineReport>)>;
+
+/// On-disk cache entry: (key, age_secs, results, merge total,
+/// engine reports). Owned form for load, borrowed form for save.
+type DiskEntry = (String, u64, Vec<Merged>, usize, Vec<EngineReport>);
+type DiskEntryRef<'a> = (String, u64, Vec<Merged>, usize, &'a [EngineReport]);
+type DiskEntryLegacy = (String, u64, Vec<Merged>, usize);
 
 /// Disk cache path (ghost-state pattern).
 fn cache_path() -> Option<std::path::PathBuf> {
@@ -26,19 +36,22 @@ fn dirs_cache() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// On disk: (key, age_secs, results, total) : age lets us
-/// re-base Instant across process restarts.
+/// On disk: (key, age_secs, results, total, reports) : age lets us
+/// re-base Instant across process restarts. Reports were added for
+/// #164; entries written before that carry a 4-tuple and load with
+/// an empty report list rather than being discarded.
 pub(crate) fn save_cache_disk(cache: &CacheMap) {
     let Some(path) = cache_path() else { return };
     let now = Instant::now();
-    let entries: Vec<(String, u64, Vec<Merged>, usize)> = cache
+    let entries: Vec<DiskEntryRef> = cache
         .iter()
-        .map(|(k, (at, r, t))| {
+        .map(|(k, (at, r, t, rep))| {
             (
                 k.clone(),
                 now.saturating_duration_since(*at).as_secs(),
                 r.clone(),
                 *t,
+                rep.as_slice(),
             )
         })
         .collect();
@@ -56,10 +69,19 @@ pub(crate) fn load_cache_disk() -> CacheMap {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return map;
     };
-    let Ok(entries) = serde_json::from_str::<Vec<(String, u64, Vec<Merged>, usize)>>(&raw) else {
-        return map;
+    // Current 5-tuple format first; fall back to the pre-#164
+    // 4-tuple format so an existing cache survives an upgrade.
+    let entries: Vec<DiskEntry> = match serde_json::from_str(&raw) {
+        Ok(e) => e,
+        Err(_) => match serde_json::from_str::<Vec<DiskEntryLegacy>>(&raw) {
+            Ok(old) => old
+                .into_iter()
+                .map(|(k, age, results, total)| (k, age, results, total, Vec::new()))
+                .collect(),
+            Err(_) => return map,
+        },
     };
-    for (key, age, results, total) in entries {
+    for (key, age, results, total, reports) in entries {
         // TTL is intent + recency keyed (the query text
         // is the key's first segment). Keys carry a stable u8
         // intent code; pre-code entries carry the Debug string and
@@ -80,7 +102,12 @@ pub(crate) fn load_cache_disk() -> CacheMap {
         if Duration::from_secs(age) < ttl {
             map.insert(
                 key,
-                (Instant::now() - Duration::from_secs(age), results, total),
+                (
+                    Instant::now() - Duration::from_secs(age),
+                    results,
+                    total,
+                    reports,
+                ),
             );
         }
     }

@@ -391,6 +391,28 @@ impl CookieJar {
             .collect()
     }
 
+    /// Whole-jar export (browser cookie-store view), expired
+    /// cookies dropped. The tier-1 vault flush (v4 phase 1.4)
+    /// persists this so a returning agent replays like a returning
+    /// browser device instead of a fresh jar on every process.
+    pub fn snapshot_all(&self) -> Vec<CookieRecord> {
+        let now = now_secs();
+        self.cookies
+            .iter()
+            .filter(|c| c.expires_at.is_none_or(|e| e > now))
+            .map(|c| CookieRecord {
+                name: c.name.clone(),
+                value: c.value.clone(),
+                domain: c.domain.clone(),
+                path: c.path.clone(),
+                expires_at: c.expires_at,
+                secure: c.secure,
+                http_only: c.http_only,
+                same_site: c.same_site.clone(),
+            })
+            .collect()
+    }
+
     /// Cookie header value for a request to `host` + `path` over
     /// a channel of the given scheme, if any match. `is_https`
     /// gates the Secure set: a Secure cookie is attached only on

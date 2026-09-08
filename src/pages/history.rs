@@ -144,6 +144,16 @@ impl PageHistory {
         }
     }
 
+    /// True when the URL is on file with the same content
+    /// fingerprint. Powers delta crawl: only pages whose content
+    /// changed since the last crawl are returned. No TTL here: an
+    /// identical hash means identical content, however old it is.
+    pub fn matches_fingerprint(&self, url: &str, fingerprint: &str) -> bool {
+        self.entries
+            .get(url)
+            .is_some_and(|r| r.fingerprint == fingerprint)
+    }
+
     /// Was this URL fetched (and recorded) recently? Powers delta
     /// crawls: `since_last` skips pages whose fingerprint is on
     /// file from the last 24h.

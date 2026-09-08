@@ -339,10 +339,15 @@ fn build_request(query: &str, max: usize, intent: &Intent, timeout_ms: u64) -> S
 /// Parse + validate a stdout envelope into hits. Invalid entries
 /// are dropped (bad title/url), other problems are errors naming
 /// the exact cause. Returns (hits, degraded, dropped_count).
+///
+/// No per-query cap here (#164): the parse-side bound is
+/// MAX_RESULTS; the final cap to the requested max happens in
+/// `to_merged` AFTER URL dedup. Truncating before dedup let
+/// duplicate-heavy plugin output silently deliver fewer unique
+/// results than the agent asked for.
 fn parse_envelope(
     bytes: &[u8],
     plugin_name: &str,
-    max: usize,
 ) -> Result<(Vec<SearchHit>, bool, usize), String> {
     let v: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("plugin {plugin_name}: stdout is not valid JSON: {e}"))?;
@@ -364,6 +369,10 @@ fn parse_envelope(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unspecified plugin error".to_string());
+        // #164: cap like the sibling stderr trim (600 chars). An
+        // envelope error must not ride the full 8 MiB stdout budget
+        // onto the model surface.
+        let msg: String = msg.chars().take(600).collect();
         return Err(format!("plugin {plugin_name}: {msg}"));
     }
 
@@ -442,7 +451,6 @@ fn parse_envelope(
             results.len()
         ));
     }
-    hits.truncate(max.max(1));
     Ok((hits, degraded, dropped))
 }
 
@@ -531,7 +539,7 @@ pub(crate) async fn run_plugin(
         .to_string();
 
     match status {
-        Ok(code) if code.success() => match parse_envelope(&body, name, max) {
+        Ok(code) if code.success() => match parse_envelope(&body, name) {
             Ok((hits, degraded, dropped)) => {
                 if dropped > 0 && std::env::var_os("DONSEEK_DEBUG").is_some() {
                     eprintln!("[plugin] {name}: dropped {dropped} invalid result entries");
@@ -574,7 +582,11 @@ fn extract_error_envelope(bytes: &[u8]) -> Result<(String, bool), ()> {
     if err.trim().is_empty() {
         return Err(());
     }
-    Ok((err.trim().to_owned(), retryable))
+    // #164: cap like the sibling stderr trim (600 chars): an error
+    // envelope must not ride the full 8 MiB stdout budget onto the
+    // model surface.
+    let msg: String = err.trim().chars().take(600).collect();
+    Ok((msg, retryable))
 }
 
 fn spawn_plugin(name: &str, def: &PluginDef) -> Result<tokio::process::Child, String> {
@@ -805,7 +817,7 @@ mod tests {
             {"title":"A","url":"https://a.com","snippet":"s","score":0.9},
             {"title":"B","url":"https://b.com"}
         ]}"#;
-        let (hits, degraded, dropped) = parse_envelope(env.as_bytes(), "t", 10).unwrap();
+        let (hits, degraded, dropped) = parse_envelope(env.as_bytes(), "t").unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "A");
         assert!((hits[0].score - 0.9).abs() < 0.001);
@@ -817,7 +829,7 @@ mod tests {
     #[test]
     fn parse_envelope_empty_results_ok() {
         let env = r#"{"format":1,"results":[]}"#;
-        let (hits, degraded, _) = parse_envelope(env.as_bytes(), "t", 10).unwrap();
+        let (hits, degraded, _) = parse_envelope(env.as_bytes(), "t").unwrap();
         assert!(hits.is_empty());
         assert!(!degraded);
     }
@@ -832,7 +844,7 @@ mod tests {
             {"title":"NoUrl"},
             "not-an-object"
         ]}"#;
-        let (hits, _, dropped) = parse_envelope(env.as_bytes(), "t", 10).unwrap();
+        let (hits, _, dropped) = parse_envelope(env.as_bytes(), "t").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "OK");
         assert_eq!(dropped, 5);
@@ -841,14 +853,14 @@ mod tests {
     #[test]
     fn parse_envelope_all_dropped_is_error() {
         let env = r#"{"format":1,"results":[{"title":"","url":"https://x.com"}]}"#;
-        let e = parse_envelope(env.as_bytes(), "t", 10).unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
         assert!(e.contains("failed validation"), "{e}");
     }
 
     #[test]
     fn parse_envelope_score_clamped_and_capped() {
         let env = r#"{"format":1,"results":[{"title":"A","url":"https://a.com","score":9.5}]}"#;
-        let (hits, _, _) = parse_envelope(env.as_bytes(), "t", 10).unwrap();
+        let (hits, _, _) = parse_envelope(env.as_bytes(), "t").unwrap();
         assert_eq!(hits[0].score, 1.0);
     }
 
@@ -858,52 +870,69 @@ mod tests {
         let env = format!(
             r#"{{"format":1,"results":[{{"title":"A","url":"https://a.com","snippet":"{big}"}}]}}"#
         );
-        let (hits, _, _) = parse_envelope(env.as_bytes(), "t", 10).unwrap();
+        let (hits, _, _) = parse_envelope(env.as_bytes(), "t").unwrap();
         assert_eq!(hits[0].snippet.chars().count(), MAX_SNIPPET_CHARS);
     }
 
     #[test]
-    fn parse_envelope_results_truncated_to_max() {
+    fn parse_envelope_keeps_hits_past_max_for_downstream_dedup() {
+        // #164: capping to max at parse time (BEFORE URL dedup in
+        // to_merged) made duplicate-heavy plugin output deliver fewer
+        // unique results than requested. Parse keeps every valid hit
+        // (bounded only by MAX_RESULTS); the max cap is applied after
+        // dedup in to_merged.
         let mut items = Vec::new();
         for i in 0..10 {
             items.push(format!(r#"{{"title":"T{i}","url":"https://t{i}.com"}}"#));
         }
         let env = format!(r#"{{"format":1,"results":[{}]}}"#, items.join(","));
-        let (hits, _, _) = parse_envelope(env.as_bytes(), "t", 3).unwrap();
-        assert_eq!(hits.len(), 3);
+        let (hits, _, _) = parse_envelope(env.as_bytes(), "t").unwrap();
+        assert_eq!(hits.len(), 10, "parse must not pre-truncate to max");
     }
 
     #[test]
     fn parse_envelope_format_mismatch() {
         let env = r#"{"format":7,"results":[]}"#;
-        let e = parse_envelope(env.as_bytes(), "t", 10).unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
         assert!(e.contains("unsupported format 7"), "{e}");
     }
 
     #[test]
     fn parse_envelope_missing_results() {
         let env = r#"{"format":1,"foo":1}"#;
-        let e = parse_envelope(env.as_bytes(), "t", 10).unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
         assert!(e.contains("results"), "{e}");
     }
 
     #[test]
     fn parse_envelope_error_envelope() {
         let env = r#"{"format":1,"error":"rate limit hit","retryable":true}"#;
-        let e = parse_envelope(env.as_bytes(), "t", 10).unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
         assert!(e.contains("rate limit hit"), "{e}");
     }
 
     #[test]
+    fn parse_envelope_error_is_capped_before_model_surface() {
+        // #164: an oversized error string must not reach the model
+        // surface whole; it is trimmed to the same 600-char budget as
+        // sibling stderr.
+        let big = "x".repeat(5000);
+        let env = format!(r#"{{"format":1,"error":"{big}"}}"#);
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
+        let payload = e.strip_prefix("plugin t: ").unwrap();
+        assert_eq!(payload.chars().count(), 600, "error text must be capped");
+    }
+
+    #[test]
     fn parse_envelope_not_json() {
-        let e = parse_envelope(b"<html>oops</html>", "t", 10).unwrap_err();
+        let e = parse_envelope(b"<html>oops</html>", "t").unwrap_err();
         assert!(e.contains("not valid JSON"), "{e}");
     }
 
     #[test]
     fn parse_envelope_degraded_flag() {
         let env = r#"{"format":1,"results":[{"title":"A","url":"https://a.com"}],"degraded":true}"#;
-        let (_, degraded, _) = parse_envelope(env.as_bytes(), "t", 10).unwrap();
+        let (_, degraded, _) = parse_envelope(env.as_bytes(), "t").unwrap();
         assert!(degraded);
     }
 
@@ -915,6 +944,17 @@ mod tests {
         assert!(retryable);
         assert!(extract_error_envelope(b"{}").is_err());
         assert!(extract_error_envelope(b"<html>").is_err());
+    }
+
+    #[test]
+    fn extract_error_envelope_caps_long_message() {
+        // #164: mirror the stderr trim; a huge error envelope must not
+        // surface unbounded.
+        let big = "y".repeat(8000);
+        let env = format!(r#"{{"error":"{big}"}}"#);
+        let (msg, retryable) = extract_error_envelope(env.as_bytes()).unwrap();
+        assert_eq!(msg.chars().count(), 600, "envelope error must be capped");
+        assert!(!retryable);
     }
 
     #[test]

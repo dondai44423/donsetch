@@ -95,6 +95,9 @@ pub struct CrawlPage {
     pub score: f64,
     /// Sitemap `<lastmod>` if available (ISO 8601 date string).
     pub lastmod: Option<String>,
+    /// Unix epoch seconds when this page was fetched (dataset
+    /// mode: per-row freshness that survives crawl resumes).
+    pub fetched_at: u64,
 }
 
 /// Why the crawl stopped. Agents MUST see this to decide
@@ -136,8 +139,9 @@ pub struct CrawlResult {
 
 /// v3: (done, queued) : fired per completed page, throttled by the caller.
 pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>;
-/// v3: true = skip the URL entirely (recorded fingerprint still fresh).
-pub type SkipFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// v4 phase 3 delta crawl: (url, new_fingerprint) -> true when the
+/// page is unchanged since the last crawl (fingerprint on file matches).
+pub type UnchangedFn = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// v3: (url, fingerprint, markdown, title) : the delta-crawl memory feed.
 pub type OnPageFn = std::sync::Arc<dyn Fn(&str, Option<&str>, &str, Option<&str>) + Send + Sync>;
 
@@ -170,12 +174,29 @@ pub struct CrawlOptions {
     /// v3: progress callback (done, queued) : fired per completed
     /// page, throttled by the caller.
     pub progress: Option<ProgressFn>,
-    /// v3: delta crawl : URLs for which this returns true are
-    /// skipped entirely (recorded fingerprint still fresh).
-    pub skip_unchanged: Option<SkipFn>,
+    /// v4 phase 3 delta crawl: called after extraction with the
+    /// page's fresh fingerprint; true = unchanged since the last
+    /// crawl. Unchanged pages are re-verified (history refreshed),
+    /// their outlinks still harvested, but they are excluded from
+    /// results and consume no page/char budgets. Replaces the old
+    /// presence-only pre-fetch skip, which could never see changes.
+    pub delta_unchanged: Option<UnchangedFn>,
     /// v3: record a fetched page's fingerprint (url, fingerprint,
     /// markdown, title) : the delta-crawl memory feed.
     pub on_page: Option<OnPageFn>,
+    /// v4 phase 3 dataset mode: render one JSON object per page
+    /// (JSON Lines) instead of a markdown document. Output-format
+    /// only; traversal, budgets, and pacing are unchanged.
+    pub dataset: bool,
+    /// v4 phase 3 crawl-shape: reader-like pop jitter in the frontier
+    /// (default true). False restores exact score-order traversal.
+    /// Zero latency cost; DONSETCH_NO_CRAWL_SHAPE flips it at runtime
+    /// without any rebuild (belt for operators, env wins over the
+    /// option).
+    pub shape: bool,
+    /// Overrides the automatic shape seed (tests pin ordering; prod
+    /// derives it from the seed URL + clock). None = auto.
+    pub shape_seed: Option<u64>,
     /// Map hard cap.
     pub map_cap: usize,
     /// Minimum content quality (0.0-1.0). Pages below this
@@ -198,9 +219,12 @@ impl Default for CrawlOptions {
             deadline: Duration::from_secs(120),
             concurrency: 1,
             respect_robots: true,
+            dataset: false,
+            shape: true,
+            shape_seed: None,
             cancel: None,
             progress: None,
-            skip_unchanged: None,
+            delta_unchanged: None,
             on_page: None,
             map_cap: 120,
             min_quality: 0.05,
@@ -443,7 +467,20 @@ impl Crawler {
         }
 
         // ── Frontier seeding ───────────────────────────────
-        let mut queue = FrontierQueue::new();
+        let mut queue = FrontierQueue::with_shaper(
+            opts.shape && !crate::config::env_flag("DONSETCH_NO_CRAWL_SHAPE"),
+            opts.shape_seed.unwrap_or_else(|| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seed.as_str().hash(&mut h);
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    .hash(&mut h);
+                h.finish()
+            }),
+        );
         // Budgets are PER-CALL: a resume continues from the saved
         // position but the caller's page/char budgets apply to
         // the NEW work. (Run 2 must not instantly exhaust itself
@@ -578,7 +615,6 @@ impl Crawler {
             let max_pages = opts.max_pages;
             // Sitemap found ⇒ link discovery does not depend on the
             // seed fetch ⇒ even the seed is skippable in delta mode.
-            let sitemap_found = !sitemap_entries.is_empty();
             let max_total = opts.max_total_chars;
             let max_depth = opts.max_depth;
 
@@ -699,18 +735,6 @@ impl Crawler {
                     // The seed is always fetched (entry point for
                     // link discovery) but its content is scope-gated
                     // post-extraction. Non-seed URLs are filtered here.
-                    // v3 delta crawl: skip pages with a fresh recorded
-                    // fingerprint. Counted as skipped, not fetched.
-                    if let Some(should_skip) = &opts_worker.skip_unchanged
-                        && (item.url != seed_norm_w || sitemap_found)
-                        && should_skip(&item.url)
-                    {
-                        skipped
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((item.url.clone(), "unchanged (since_last)".into()));
-                        continue 'work;
-                    }
                     let is_seed = item.url == seed_norm_w;
                     if !is_seed
                         && !scope_allowed(
@@ -795,19 +819,13 @@ impl Crawler {
                     } else {
                         match (page.status, &page.verdict) {
                             (200, Verdict::ContentOk) => {
-                                // Skim dwell: proportional to page size,
-                                // capped at 300ms. v1 used up to 2s/page
-                                // ("a human reads a 50KB article") : but
-                                // an agent skims for extraction, not
-                                // reading, and the dwell's real job is
-                                // anti-metronome entropy, which jitter +
-                                // this small size-proportional term
-                                // already provide. 2s/page of pure sleep
-                                // was the single biggest crawl latency
-                                // cost (6.29s median in the 50-case
-                                // benchmark).
-                                let dwell = (page.body.len() / 64).min(100) as u64;
-                                governor.on_success(host, &lane.id, page.latency, dwell)
+                                // No dwell: pacing is the governor's
+                                // rung/jitter ladder alone (law 11, v4
+                                // phase 3). The old size-proportional
+                                // skim dwell was a vestigial
+                                // human-reading simulation that only
+                                // bought latency.
+                                governor.on_success(host, &lane.id, page.latency)
                             }
                             (429, _) | (503, _) => {
                                 governor.on_throttled(host, &lane.id);
@@ -1098,6 +1116,17 @@ impl Crawler {
 
                     let chars = md.chars().count();
 
+                    // v4 phase 3 delta recrawl: compare the freshly
+                    // extracted fingerprint with page history. An
+                    // unchanged page is re-verified (history timestamp
+                    // refreshed) and its outlinks are still harvested
+                    // below, so changed descendants remain reachable;
+                    // it just never enters the result set or the
+                    // page/char budgets.
+                    let unchanged = opts_worker.delta_unchanged.as_ref().is_some_and(|f| {
+                        r.fingerprint.as_deref().is_some_and(|fp| f(&page.url, fp))
+                    });
+
                     if !in_scope {
                         // Navigation-only: don't add to results,
                         // don't count against page budget. Still
@@ -1106,6 +1135,14 @@ impl Crawler {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "out of scope (navigation-only)".into()));
+                    } else if unchanged {
+                        if let Some(rec) = &opts_worker.on_page {
+                            rec(&page.url, r.fingerprint.as_deref(), &md, r.title.as_deref());
+                        }
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((page.url.clone(), "unchanged since last crawl".into()));
                     } else {
                         let done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
                         if let Some(cb) = &opts_worker.progress {
@@ -1137,6 +1174,10 @@ impl Crawler {
                                 parent: item.parent.clone(),
                                 score: item.score,
                                 lastmod: None, // filled after worker loop from sitemap
+                                fetched_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
                             });
                         if duplicate {
                             skipped

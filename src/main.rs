@@ -32,7 +32,7 @@ async fn main() {
 
     match cmd {
         // ── Agent tools (spec-driven, shared core, clap-parsed) ──
-        "fetch" | "search" | "crawl" => {
+        "fetch" | "search" | "answer" | "crawl" => {
             let code = cli::tool::run(cmd, &args[2..]).await;
             std::process::exit(code as i32);
         }
@@ -138,7 +138,7 @@ async fn main() {
 /// Falls back to top-level help for unknown commands.
 async fn route_help(cmd: &str) {
     match cmd {
-        "fetch" | "search" | "crawl" => {
+        "fetch" | "search" | "answer" | "crawl" => {
             // Re-invoke with --help (clap handles the output).
             let help_args = vec!["--help".to_string()];
             let _ = cli::tool::run(cmd, &help_args).await;

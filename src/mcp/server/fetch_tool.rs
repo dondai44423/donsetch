@@ -61,8 +61,31 @@ pub(super) async fn fetch_tool(
             Err(e) => return e,
         }
     }
+    // Single resolved URL: keep the single-page response shape, but
+    // always run under the deadline + MCP-cancellation wrapper (#164).
+    // Previously this branch (reached whenever budget_tokens was set,
+    // since the fast path above demands budget_tokens.is_none())
+    // called fetch_single bare: an uncancellable, deadline-free fetch
+    // on a path that can still spawn a ghost render. budget_tokens
+    // also bounds the page now, exactly like the batch path.
     if resolved.len() == 1 {
-        return fetch_single(daemon, args, &resolved[0]).await;
+        let owned_args;
+        let effective_args = if let Some(b) = budget_tokens {
+            let budget_chars = b.saturating_mul(4).max(800);
+            let mut a = args.clone();
+            a["max_chars"] = json!(budget_chars);
+            owned_args = a;
+            &owned_args
+        } else {
+            args
+        };
+        return run_with_budget(
+            fetch_single(daemon, effective_args, &resolved[0]),
+            deadline,
+            ctx.as_mut(),
+            || deadline_error(&resolved[0]),
+        )
+        .await;
     }
     fetch_multi(daemon, args, resolved, budget_tokens, deadline, ctx).await
 }
@@ -596,6 +619,26 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // need a browser. Force Cold even if a stale profile says
     // SkipToSolve (from a previous Xvfb failure that poisoned
     // the domain).
+    // Remember the real origin scheme (v4 phase 0.2: the prober
+    // probes the origin, not a guessed https upgrade).
+    {
+        let scheme = if url.starts_with("http://") {
+            "http"
+        } else {
+            "https"
+        };
+        let port = url::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.port_or_known_default())
+            .unwrap_or(if scheme == "http" { 80 } else { 443 });
+        let mut state = daemon.state.lock().await;
+        state.note_origin(&host, scheme, port);
+        // Longitudinal identity (v4 phase 0.3): mint or validate
+        // the domain persona. Coherence drift or quarantine here
+        // re-mints automatically.
+        let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
+        state.ensure_persona(&host, &caps);
+    }
     let route = if tier == "2" && !is_pdf_url && !adapter_host {
         RouteDecision::SkipToSolve
     } else if tier == "1" || is_pdf_url || adapter_host {
@@ -662,17 +705,25 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // freshness); the rest of the pipeline (extraction,
     // thin→ghost, history) runs unchanged on the cached body.
     let mut prewarmed = false;
-    if !is_pdf_url
-        && let Some(entry) = daemon
+    // Bind the take() result first: a lock guard in the if-let
+    // scrutinee would live across the .await below and make the
+    // future !Send.
+    let prewarm_entry = if !is_pdf_url {
+        daemon
             .searcher
             .prewarms()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(&orig_url)
-    {
+    } else {
+        None
+    };
+    if let Some(entry) = prewarm_entry {
         tier_used = "prewarmed";
         prewarmed = true;
         trace.step("prewarm", "search-handoff", "hit", 0);
+        // law 6: make the warm handoff observable in `donsetch status`.
+        daemon.state.lock().await.note_prewarm_served();
         out = Some(crate::fetch::client::FetchOutcome {
             url: orig_url.clone(),
             status: 200,
@@ -731,8 +782,16 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         let o = out.as_ref().unwrap();
         {
             let mut state = daemon.state.lock().await;
+            // Tier-1 jar flush (v4 phase 1.4): persist the whole
+            // cookie store on every completed navigation, inside
+            // the same record_* save (one state write per fetch,
+            // today's cost class). Browser-true: cookies survive
+            // process restarts, so remote sessions see a RETURNING
+            // visitor, not a fresh jar every run.
+            state.sync_tier1_cookies(&daemon.fetcher.jar_all_snapshot().await);
             match o.verdict {
                 Verdict::Challenge(_) => {
+                    state.record_failure(&host, crate::ghost::cache::FailClass::Block);
                     if is_warm {
                         // Warm cookies went stale : learn the real lifetime.
                         state.record_warm_stale(&host);
@@ -770,7 +829,11 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // path : the adapter is an optimization, never a dependency.
     if let Some(o) = &out {
         match o.verdict {
-            Verdict::ContentOk => {}
+            Verdict::ContentOk => {
+                // Page-load realism (v4 phase 1.3): background
+                // subresource burst for stealth-relevant hosts.
+                crate::fetch::shadow::maybe_shadow(&daemon.fetcher, &daemon.state, &o.url, o).await;
+            }
             Verdict::Challenge(_) if tier != "1" => {}
             v => {
                 if adapter_host && !no_adapter {

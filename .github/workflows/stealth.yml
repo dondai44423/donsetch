@@ -1,0 +1,59 @@
+# Stealth scorecard (v4 phase 0.4): the drift alarm.
+#
+# Chrome bumps stable every ~4 weeks; fingerprint mimicry pinned to
+# an old build rots quietly. This weekly job captures the live
+# fingerprint the fetcher emits (JA3 normalized, JA4, peetprint,
+# Akamai h2, UA) and diffs every layer against the committed
+# baseline. Any drift reds the run before JA4 databases catch up.
+#
+# When this goes red the response is deliberate, never automatic:
+# re-capture the profile for the new Chrome build, verify parity,
+# then `donsetch doctor --stealth-record` and commit the fixture.
+
+name: stealth-scorecard
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # weekly, Monday 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scorecard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the binary
+        run: cargo build --profile ci --bin donsetch
+
+      - name: Stealth scorecard
+        run: ./target/ci/donsetch doctor --stealth
+
+  chrome-bump:
+    needs: scorecard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe the current Chromium stable (keyless) and alarm on gap
+        run: |
+          FEED=$(curl -fsSL "https://chromiumdash.appspot.com/fetch_milestones?num=6")
+          LATEST=$(echo "$FEED" | python3 -c "import sys,json; rows=[r for r in json.load(sys.stdin) if r.get('schedule_phase')=='stable']; print(rows[0]['milestone'] if rows else 0)")
+          PINNED=$(grep -oP 'chrome-\\K[0-9]+' src/profile/mod.rs | head -1)
+          echo "pinned profile chrome-$PINNED, current Chromium stable $LATEST"
+          GAP=$((LATEST - PINNED))
+          if [ "$GAP" -eq 0 ]; then
+            echo "  profile is current."
+          elif [ "$GAP" -eq 1 ]; then
+            echo "::warning title=Chromium fingerprint fresh window::pinned=$PINNED stable=$LATEST: one Chrome minor behind; capture window is open (doctor --stealth --parity locally), refresh fixtures soon"
+          else
+            echo "::warning title=Chromium fingerprint drift::pinned=$PINNED stable=$LATEST: capture window STALE: run the evergreen capture and refresh fixtures/stealth-baseline.json; alert, never auto-merge"
+            exit 1
+          fi

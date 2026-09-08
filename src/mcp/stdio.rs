@@ -57,6 +57,7 @@ fn parse_error(reason: &str) -> String {
 /// Never returns Err on client garbage : only on fatal IO.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let daemon = Arc::new(Daemon::new().await?);
+    daemon.start_prober();
     let (tx, mut rx) = mpsc::channel::<String>(256);
 
     // Single writer: response lines can never interleave.

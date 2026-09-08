@@ -521,4 +521,40 @@ mod tests {
         let merged = to_merged(hits, "exa", 3);
         assert_eq!(merged.len(), 3);
     }
+
+    #[test]
+    fn to_merged_caps_after_dedup() {
+        // #164: duplicate-heavy provider output must still deliver the
+        // requested number of unique results: dedup runs BEFORE the
+        // cap, so duplicates cannot eat the max budget. (The old
+        // parse-time truncate let plugins return fewer unique hits
+        // than requested.)
+        let hits = vec![
+            SearchHit {
+                title: "a".into(),
+                url: "https://a.com".into(),
+                snippet: "s".into(),
+                score: 1.0,
+            },
+            SearchHit {
+                title: "dup of a".into(),
+                url: "https://a.com/".into(), // trailing slash = same norm_key
+                snippet: "s".into(),
+                score: 0.9,
+            },
+            SearchHit {
+                title: "b".into(),
+                url: "https://b.com".into(),
+                snippet: "s".into(),
+                score: 0.8,
+            },
+        ];
+        let merged = to_merged(hits, "exa", 2);
+        assert_eq!(merged.len(), 2, "dedup must not shrink the max budget");
+        assert_eq!(merged[0].title, "a");
+        assert_eq!(
+            merged[1].title, "b",
+            "second slot goes to the next unique hit"
+        );
+    }
 }

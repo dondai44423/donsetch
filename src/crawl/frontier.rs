@@ -249,6 +249,13 @@ fn glob_at(pat: &[u8], s: &[u8]) -> bool {
 pub struct FrontierQueue {
     heap: BinaryHeap<Frontier>,
     seen: HashSet<String>,
+    /// v4 phase 3 crawl-shape: pop a reader-like jitter inside the
+    /// head window instead of always the exact top, so repeated
+    /// crawls of the same site do not replay an identical,
+    /// score-eager fetch order to server logs. Ordering only.
+    shaper: bool,
+    /// xorshift64 state for the hop; a deliberate non-zero seed.
+    rng: u64,
 }
 
 impl Default for FrontierQueue {
@@ -256,12 +263,26 @@ impl Default for FrontierQueue {
         Self::new()
     }
 }
-
 impl FrontierQueue {
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
             seen: HashSet::new(),
+            shaper: false,
+            rng: 0x9e3779b97f4a7c15,
+        }
+    }
+
+    /// Construct a shaped frontier (reader-like pop jitter, default) or an unshaped one. The
+    /// unshaped (classic) heap behavior comes back when callers pass false - which is what
+    /// DONSETCH_NO_CRAWL_SHAPE does - and for tests that need deterministic score ordering.
+    /// The seed may be zero: xorshift non-zeroes it before use.
+    pub fn with_shaper(shaper_enabled: bool, seed: u64) -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            seen: HashSet::new(),
+            shaper: shaper_enabled,
+            rng: seed,
         }
     }
 
@@ -330,7 +351,43 @@ impl FrontierQueue {
     }
 
     pub fn pop(&mut self) -> Option<Frontier> {
-        self.heap.pop()
+        if !self.shaper || self.heap.len() < 2 {
+            return self.heap.pop();
+        }
+        // Take a small head window, pick with weights decaying head-first
+        // (top twice more likely than second, halving down), put the
+        // un-picked back. Every promised item still gets fetched; only
+        // the order changes.
+        const WINDOW: usize = 4;
+        const WEIGHTS: [u32; WINDOW] = [8, 4, 2, 1];
+        let take = WINDOW.min(self.heap.len());
+        let mut head: Vec<Frontier> = (0..take).filter_map(|_| self.heap.pop()).collect();
+        let pick = {
+            let mut x = self.rng;
+            if x == 0 {
+                x = 0x9e3779b97f4a7c15;
+            }
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.rng = x;
+            let total: u32 = WEIGHTS[..take].iter().sum();
+            let mut r = (x % (total as u64)) as u32;
+            let mut idx = take - 1;
+            for (i, w) in WEIGHTS[..take].iter().enumerate() {
+                if r < *w {
+                    idx = i;
+                    break;
+                }
+                r -= *w;
+            }
+            idx
+        };
+        let chosen = head.swap_remove(pick);
+        for f in head {
+            self.heap.push(f);
+        }
+        Some(chosen)
     }
 
     /// Snapshot all queued entries (url, score, depth, retries,
@@ -520,6 +577,91 @@ mod tests {
         q.push(u1, 1.0, 0);
         q.push(u2, 5.0, 0);
         assert!(q.pop().unwrap().url.ends_with("/b"));
+    }
+
+    fn seed_urls(n: usize) -> Vec<(Url, f64)> {
+        (0..n)
+            .map(|i| {
+                (
+                    Url::parse(&format!("https://ex.com/p{i}")).unwrap(),
+                    10.0 - i as f64,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shaper_is_deterministic_per_seed() {
+        // Same pushed list + same seed = same traversal order.
+        let urls = seed_urls(6);
+        let mut qa = FrontierQueue::with_shaper(true, 0x5eed);
+        let mut qb = FrontierQueue::with_shaper(true, 0x5eed);
+        for (u, s) in &urls {
+            qa.push(u.clone(), *s, 0);
+            qb.push(u.clone(), *s, 0);
+        }
+        for _ in 0..6 {
+            assert_eq!(qa.pop().unwrap().url, qb.pop().unwrap().url);
+        }
+        assert!(qa.pop().is_none());
+    }
+
+    #[test]
+    fn shape_kill_switch_path_matches_score_order() {
+        // Explicit kill switch == shaper off == classic heap order.
+        let urls = seed_urls(6);
+        let mut q = FrontierQueue::with_shaper(false, 0x5eed);
+        for (u, s) in &urls {
+            q.push(u.clone(), *s, 0);
+        }
+        for i in 0..6 {
+            assert!(
+                q.pop().unwrap().url.ends_with(&format!("/p{i}")),
+                "unshaped pop {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn shaper_is_reader_biased_not_uniform() {
+        // The head window reordering is not a lottery: the exact top
+        // element is still picked a majority of the time across seeds.
+        // (Weights: 8/4/2/1 over the window.)
+        let urls = seed_urls(4);
+        let mut top = 0;
+        let mut second = 0;
+        for b in 1u64..41 {
+            let mut q = FrontierQueue::with_shaper(true, b * 0x9e37);
+            for (u, s) in &urls {
+                q.push(u.clone(), *s, 0);
+            }
+            let got = q.pop().unwrap().url.to_string();
+            if got.ends_with("/p0") {
+                top += 1;
+            } else if got.ends_with("/p1") {
+                second += 1;
+            }
+        }
+        assert!(top > second + 4, "top {top} vs second {second}");
+    }
+
+    #[test]
+    fn shaper_never_loses_items() {
+        // Requeue mechanics: every pushed URL still comes out exactly once.
+        let urls = seed_urls(9);
+        let mut q = FrontierQueue::with_shaper(true, 0x123456789);
+        for (u, s) in &urls {
+            q.push(u.clone(), *s, 0);
+        }
+        let mut got = Vec::new();
+        while let Some(f) = q.pop() {
+            got.push(f.url.to_string());
+        }
+        assert_eq!(got.len(), 9);
+        let mut sorted = got.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 9);
     }
 
     #[test]

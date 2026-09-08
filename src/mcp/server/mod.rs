@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use futures_util::FutureExt;
 
+mod answer_tool;
 mod crawl_tool;
 mod errors;
 mod fetch_tool;
@@ -56,6 +57,9 @@ pub struct Daemon {
     /// domain trigger a solve while the agent is still reading
     /// results. Cheap spinlock: a lost race just skips the win.
     pre_solve_busy: std::sync::atomic::AtomicBool,
+    /// Background route-memory prober handle (v4 phase 0.2);
+    /// aborted on shutdown.
+    probe_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -73,6 +77,11 @@ impl Daemon {
         {
             let sessions = crate::ghost::cache::load_session_cookies();
             fetcher.import_cookies(&sessions).await;
+            // Tier-1 jar persistence (v4 phase 1.4), kill-switched.
+            if !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") {
+                let jar = state.lock().await.tier1_cookies.clone();
+                fetcher.import_cookies(&jar).await;
+            }
         }
 
         // Build ghost escalation hook for the crawl: renders
@@ -120,7 +129,21 @@ impl Daemon {
             )),
             vault_seen: tokio::sync::Mutex::new(None),
             pre_solve_busy: std::sync::atomic::AtomicBool::new(false),
+            probe_task: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Spawn the background route-memory prober (v4 phase 0.2).
+    /// Called once the daemon is inside its runtime; one-shot CLI
+    /// paths never call it, so short-lived processes stay clean.
+    pub fn start_prober(self: &Arc<Self>) {
+        if crate::config::env_flag("DONSETCH_NO_ROUTE_PROBES") {
+            return;
+        }
+        let handle = crate::ghost::probe::spawn(Arc::clone(&self.fetcher), Arc::clone(&self.state));
+        if let Ok(mut slot) = self.probe_task.lock() {
+            *slot = Some(handle);
+        }
     }
 
     /// Shutdown: kill ghost browser + Xvfb (if owned).
@@ -156,7 +179,13 @@ impl Daemon {
             changed
         };
         if changed {
-            let cookies = crate::ghost::cache::load_session_cookies();
+            let mut cookies = crate::ghost::cache::load_session_cookies();
+            // Reset is wholesale: keep the tier-1 jar (device /
+            // analytics cookies the browser-real daemon already
+            // holds) so a login resync does not erase the session.
+            if !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") {
+                cookies.extend(self.state.lock().await.tier1_cookies.clone());
+            }
             self.fetcher.reset_to(&cookies).await;
         }
     }
@@ -448,6 +477,7 @@ pub(crate) async fn call_tool_ctx(
     match name {
         "web_fetch" => Ok(fetch_tool::fetch_tool(daemon, &args, ctx).await),
         "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
+        "web_answer" => Ok(answer_tool::answer_tool(daemon, &args, ctx).await),
         "web_crawl" => Ok(crawl_tool::crawl_tool(daemon, &args, ctx).await),
         _ => Err((-32602, format!("unknown tool: {name}"))),
     }

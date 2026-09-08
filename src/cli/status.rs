@@ -165,6 +165,52 @@ pub async fn run() {
         )
     };
     cli::print_kv("health", &health);
+
+    // v4 phase 0: route-memory visibility (the self-improvement
+    // loop must be observable, never magic).
+    let route_line = if crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY") {
+        "off (DONSETCH_NO_ROUTE_MEMORY)".to_string()
+    } else {
+        let state = crate::ghost::cache::GhostState::load();
+        let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
+        let ro = if crate::config::env_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
+            " · read-only"
+        } else {
+            ""
+        };
+        if hosts == 0 {
+            format!("learning (no hosts yet){ro}")
+        } else {
+            let mut line = format!("{hosts} hosts · {walled} walled · {warm} warm");
+            if !state.personas.is_empty() {
+                line.push_str(&format!(" · {} personas", state.personas.len()));
+            }
+            if state.probes_total > 0 {
+                line.push_str(&format!(" · {} probes", state.probes_total));
+            }
+            if state.tier1_cookie_count() > 0 {
+                line.push_str(&format!(" · {} vaulted", state.tier1_cookie_count()));
+            }
+            if state.shadowed_assets_total > 0 {
+                line.push_str(&format!(" · {} shadowed", state.shadowed_assets_total));
+            }
+            if state.prewarmed_served_total > 0 {
+                line.push_str(&format!(" · {} prewarmed", state.prewarmed_served_total));
+            }
+            if state.answered_packs_total > 0 {
+                line.push_str(&format!(" · {} answered", state.answered_packs_total));
+            }
+            if cooldowns > 0 {
+                line.push_str(&format!(" · {cooldowns} in cooldown"));
+            }
+            if flaky > 0 {
+                line.push_str(&format!(" · {flaky} flaky-wall"));
+            }
+            line.push_str(ro);
+            line
+        }
+    };
+    cli::print_kv("route memory", &route_line);
     cli::print_kv(
         "deep fingerprint",
         "not probed (run `donsetch doctor --deep`)",

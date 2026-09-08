@@ -47,6 +47,8 @@ reqwest; the core paths that run on every fetch do not.)
 Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes)
 and as a standalone CLI.
 
+> **V4 is coming. And it's not just any upgrade.**
+
 ## ✨ What makes it different
 
 | | What it does |
@@ -734,8 +736,14 @@ inventory), then Governor-paced frontier walk with extraction per page.
 - **Focus-ranked frontier**: `focus="query"` ranks pages by BM25
   relevance, crawls only matches.
 - **Adaptive pacing**: the Governor paces per (host, lane).
-  429/503 → exponential backoff. Dwell-time variance proportional to
-  page size breaks metronome fingerprints.
+  429/503 → backoff on host signals; host-declared waits
+  (`Retry-After`, robots `Crawl-delay`) honored in full; everything
+  self-inferred caps at ~7s. Zero artificial dwell on the fetch path
+  (stealth through truth, never time).
+- **Crawl-shape**: frontier pops get a seeded reader-like jitter, so
+  repeated crawls never replay one identical, score-eager fetch
+  order to server logs. Ordering only (every page still fetched,
+  payloads untouched). Kill switch: `DONSETCH_NO_CRAWL_SHAPE=1`.
 - **Resume tokens**: stopped crawls resume with one call; valid 30
   min, survive restarts.
 - **Near-dup detection**: title + first 200 chars hashed.
@@ -950,6 +958,24 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Run
 `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` and
 `cargo test --features ocr,rerank` before submitting. AGPL v3: all
 contributions under the same license.
+
+## 💛 Sponsors
+
+DonSeTch is open source and free to use. If you want to support development, consider sponsoring.
+
+| Tier | Price | What you get |
+|---|---|---|
+| 🥉 Bronze | $10/mo | Name + link in Sponsors section |
+| 🥈 Silver | $25/mo | Small logo + link in Sponsors section |
+| 🥇 Gold | $49/mo | Large logo + link, pinned at top of Sponsors section |
+
+One-time sponsorships are also welcome at any amount.
+
+Pricing will increase as the project grows. Right now DonSeTch is early (small but growing), so sponsorship is cheap. A Gold tier at $49/mo is high reward, near zero investment for any company that relies on web research for AI agents. Lock in the current rate before it goes up.
+
+If your product is part of this space (proxy platforms, search infrastructure, BYO providers, anything a DonSeTch user would plug in), Gold goes one step further: if your tool fits natively within DonSeTch, you get the banners and the link plus an official native integration shipped in the binary itself.
+
+Email bhandaribishesh879@gmail.com to become a sponsor.
 
 ## 📄 License
 

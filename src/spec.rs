@@ -358,6 +358,46 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
 
 // ── web_crawl ────────────────────────────────────────────────
 
+/// `web_answer` params.
+const ANSWER_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "query",
+        flag: "",
+        kind: ParamKind::Str,
+        cli: CliKind::PositionalJoined,
+        required: true,
+        help: "Factual question to collect cited evidence for.",
+        mcp_help: None,
+    },
+    ParamSpec {
+        name: "budget_tokens",
+        flag: "budget-tokens",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Token budget for the whole evidence pack (200-8000, default 2000).",
+        mcp_help: Some("Token budget for the whole evidence pack (200-8000, default 2000)."),
+    },
+    ParamSpec {
+        name: "max_pages",
+        flag: "max-pages",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Max pages to read evidence from (1-5, default 3).",
+        mcp_help: Some("Max pages to read evidence from (1-5, default 3)."),
+    },
+    ParamSpec {
+        name: "deadline_ms",
+        flag: "deadline-ms",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang.",
+        mcp_help: None,
+    },
+];
+
 const CRAWL_PARAMS: &[ParamSpec] = &[
     ParamSpec {
         name: "url",
@@ -477,9 +517,20 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "Delta crawl: skip pages you already fetched in the last 24h (fingerprint on file) : only new/changed pages are fetched and counted. Monitoring and re-crawls at a fraction of the cost.",
+        help: "Delta crawl: pages are re-checked against fingerprint memory; only new/changed pages are returned. Monitoring and re-crawls at a fraction of the cost.",
         mcp_help: Some(
             "Return only pages new or changed since the last crawl of this site. Use for monitoring or a repeated crawl, not a first visit.",
+        ),
+    },
+    ParamSpec {
+        name: "dataset",
+        flag: "dataset",
+        kind: ParamKind::SetTrue,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Dataset mode: output one JSON object per page (JSON Lines) instead of markdown.",
+        mcp_help: Some(
+            "Dataset mode: return JSON Lines (one JSON object per page) instead of markdown.",
         ),
     },
     ParamSpec {
@@ -528,16 +579,30 @@ pub static TOOLS: &[ToolSpec] = &[
         ],
     },
     ToolSpec {
+        name: "web_answer",
+        cli_cmd: "answer",
+        summary: "Evidence pack for a factual question : search + read top pages, passages with sources",
+        description: "One-call research for a factual question : DonSeTch searches the web, reads the top pages, and returns a compact pack of relevant passages, each tied to its source URL with a freshness stamp.\n\nNo prose answer is invented: you get verbatim cited evidence to reason over. Dead or walled pages are skipped and reported, never silently dropped. Duplicate mirrors are collapsed.\n\nbudget_tokens caps the whole pack; max_pages caps how many sources are read; deadline_ms caps the wall clock (honest deadline error, never a hang).\n\nResponse: content[0].text is the markdown evidence pack. structuredContent contains query, empty, truncated, tokens_est, per-source citations and skipped pages with reasons. Search and per-page timing diagnostics live in _meta.",
+        mcp_description: "Factual question -> cited evidence in one call: searches the web, reads top pages, returns verbatim passages tied to source URLs with freshness stamps. No prose answer invented; you synthesize. Dead/walled pages are skipped and reported.",
+        params: ANSWER_PARAMS,
+        examples: &[
+            "donsetch answer \"when did Rust 1.0 release\"",
+            "donsetch answer \"capital of Bhutan\" --budget-tokens 1000",
+            "donsetch answer \"tokio select macro\" --max-pages 4",
+        ],
+    },
+    ToolSpec {
         name: "web_crawl",
         cli_cmd: "crawl",
         summary: "Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)",
-        description: "Crawl a site from a seed : for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap : see what a site has before committing · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped.\n\nBudgets: focus (topic) ranks the frontier by BM25-lite link-text/URL-path keyword scoring and crawls only matches : set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory : returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: content[0].text is one linear site-evidence document. structuredContent contains seed, completion, page URLs, stop reason and any resume/next action. Map, queue, skip, score, quality, crawl-delay and timing diagnostics live in _meta. FrontierEmpty is complete; MaxPages, CharBudget, DepthLimit, Deadline, ThrottledOut and Cancelled are incomplete.",
-        mcp_description: "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs.",
+        description: "Crawl a site from a seed : for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap : see what a site has before committing · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped. dataset=true emits JSON Lines (one object per page).\n\nBudgets: focus (topic) ranks the frontier by BM25-lite link-text/URL-path keyword scoring and crawls only matches : set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory : returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: content[0].text is one linear site-evidence document. structuredContent contains seed, completion, page URLs, stop reason and any resume/next action. Map, queue, skip, score, quality, crawl-delay and timing diagnostics live in _meta. FrontierEmpty is complete; MaxPages, CharBudget, DepthLimit, Deadline, ThrottledOut and Cancelled are incomplete.",
+        mcp_description: "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs. dataset=true returns JSONL (one object per page).",
         params: CRAWL_PARAMS,
         examples: &[
             "donsetch crawl https://docs.site.com --topic \"authentication\"",
             "donsetch crawl https://docs.site.com --mode map",
             "donsetch crawl https://docs.site.com --max-pages 25 --deadline 300",
+            "donsetch crawl https://docs.site.com --dataset > site.jsonl",
         ],
     },
 ];

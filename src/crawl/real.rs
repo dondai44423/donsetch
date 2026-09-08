@@ -38,6 +38,18 @@ pub fn build(fetcher: Arc<Fetcher>, proxies: Vec<Proxy>) -> (Crawler, Arc<Govern
         Arc::new(move |url: String, lane: String, referer: Option<String>| {
             let fetcher = Arc::clone(&fetcher);
             let proxies = Arc::clone(&proxies);
+            // v4 phase 3: the same adapter registry web_fetch uses
+            // shapes crawl fetches, so a reddit/npm class URL rides
+            // the cheap .json/registry path instead of the HTML app.
+            // The candidate URL stays canonical: dedup, history and
+            // output rows key on it, the wire just asks for the
+            // rewritten endpoint. DONSETCH_NO_ADAPTERS silences this
+            // exactly as it does in web_fetch (handled inside
+            // adapters::rewrite).
+            let fetch_url = url::Url::parse(&url)
+                .ok()
+                .and_then(|u| crate::adapters::rewrite(&u).map(|(alt, _via)| alt))
+                .unwrap_or_else(|| url.clone());
             async move {
                 let started = Instant::now();
                 let proxy = if lane == "direct" {
@@ -49,7 +61,7 @@ pub fn build(fetcher: Arc<Fetcher>, proxies: Vec<Proxy>) -> (Crawler, Arc<Govern
                 // lane B's identity would link the two egress IPs.
                 let use_jar = proxy.is_none();
                 match fetcher
-                    .fetch_via_jar_ref(&url, proxy, use_jar, referer.as_deref())
+                    .fetch_via_jar_ref(&fetch_url, proxy, use_jar, referer.as_deref())
                     .await
                 {
                     Ok(out) => {
