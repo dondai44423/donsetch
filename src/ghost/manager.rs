@@ -138,12 +138,12 @@ impl Drop for GhostGuard {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             self.guard.ghost = None;
-            if let Ok(mut snaps) = self.meta.lock() {
-                if let Some(snap) = snaps.get_mut(self.idx) {
-                    snap.live = false;
-                    snap.key = None;
-                    snap.host = None;
-                }
+            if let Ok(mut snaps) = self.meta.lock()
+                && let Some(snap) = snaps.get_mut(self.idx)
+            {
+                snap.live = false;
+                snap.key = None;
+                snap.host = None;
             }
         }
     }
