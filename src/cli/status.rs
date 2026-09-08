@@ -197,6 +197,9 @@ pub async fn run() {
             if state.prewarmed_served_total > 0 {
                 line.push_str(&format!(" · {} prewarmed", state.prewarmed_served_total));
             }
+            if state.answered_packs_total > 0 {
+                line.push_str(&format!(" · {} answered", state.answered_packs_total));
+            }
             if cooldowns > 0 {
                 line.push_str(&format!(" · {cooldowns} in cooldown"));
             }

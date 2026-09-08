@@ -261,6 +261,12 @@ pub struct GhostState {
     /// network fetch.
     #[serde(default)]
     pub prewarmed_served_total: u64,
+    /// Lifetime count of web_answer evidence packs served with at
+    /// least one usable source (v4 phase 2.2), surfaced in
+    /// donsetch status. Empty packs (nothing usable found) are not
+    /// counted: a served pack means real evidence reached the agent.
+    #[serde(default)]
+    pub answered_packs_total: u64,
     /// Tier-1 whole-jar persistence (v4 phase 1.4): the browser
     /// cookie-store view, so a returning agent replays device /
     /// analytics / cf_bm cookies like a returning browser instead
@@ -886,6 +892,13 @@ impl GhostState {
     /// prewarm is on; no extra gate here.
     pub fn note_prewarm_served(&mut self) {
         self.prewarmed_served_total = self.prewarmed_served_total.saturating_add(1);
+        self.save();
+    }
+
+    /// v4 phase 2.2 visibility: count an evidence pack served with
+    /// at least one usable source.
+    pub fn note_answer_served(&mut self) {
+        self.answered_packs_total = self.answered_packs_total.saturating_add(1);
         self.save();
     }
 

@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use futures_util::FutureExt;
 
+mod answer_tool;
 mod crawl_tool;
 mod errors;
 mod fetch_tool;
@@ -477,6 +478,7 @@ pub(crate) async fn call_tool_ctx(
     match name {
         "web_fetch" => Ok(fetch_tool::fetch_tool(daemon, &args, ctx).await),
         "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
+        "web_answer" => Ok(answer_tool::answer_tool(daemon, &args, ctx).await),
         "web_crawl" => Ok(crawl_tool::crawl_tool(daemon, &args, ctx).await),
         _ => Err((-32602, format!("unknown tool: {name}"))),
     }

@@ -2,7 +2,7 @@
   "capabilities": {
     "tools": {}
   },
-  "instructions": "Web access: fetch, search, crawl : one URL, many URLs, or a whole site.\n\n- web_fetch: Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)\n- web_search: Web search : 5 keyless engines merged + reranked, or your API keys\n- web_crawl: Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)\n\nOutput is the page's own markdown : full wording, code blocks and tables preserved.",
+  "instructions": "Web access: fetch, search, answer, crawl : pages, questions, or whole sites.\n\n- web_fetch: Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)\n- web_search: Web search : 5 keyless engines merged + reranked, or your API keys\n- web_answer: Evidence pack for a factual question : search + read top pages, passages with sources\n- web_crawl: Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)\n\nOutput is the page's own markdown : full wording, code blocks and tables preserved.",
   "protocolVersion": "2026-07-28",
   "serverInfo": {
     "name": "donsetch",

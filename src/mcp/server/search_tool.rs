@@ -153,12 +153,12 @@ pub(super) fn make_ghost_hook(
 
 #[derive(Debug)]
 pub(super) struct SearchFailure {
-    cause: String,
-    byok_tried: bool,
+    pub(super) cause: String,
+    pub(super) byok_tried: bool,
     /// "permanent" for bad input that no retry or fallback fixes
     /// (validate_query rejected it before any engine was contacted);
     /// "transient" for exhausted engines/providers.
-    kind: &'static str,
+    pub(super) kind: &'static str,
 }
 
 /// The search pipeline: BYOK providers (if configured) with

@@ -358,6 +358,48 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
 
 // ── web_crawl ────────────────────────────────────────────────
 
+/// `web_answer` params.
+const ANSWER_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "query",
+        flag: "",
+        kind: ParamKind::Str,
+        cli: CliKind::PositionalJoined,
+        required: true,
+        help: "Factual question to collect cited evidence for.",
+        mcp_help: None,
+    },
+    ParamSpec {
+        name: "budget_tokens",
+        flag: "budget-tokens",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Token budget for the whole evidence pack (200-8000, default 2000). Sources are read in rank order until the budget is spent.",
+        mcp_help: Some(
+            "Token budget for the whole evidence pack (200-8000, default 2000). Sources are read in rank order until the budget is spent.",
+        ),
+    },
+    ParamSpec {
+        name: "max_pages",
+        flag: "max-pages",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Max pages to read evidence from (1-5, default 3).",
+        mcp_help: Some("Max pages to read evidence from (1-5, default 3)."),
+    },
+    ParamSpec {
+        name: "deadline_ms",
+        flag: "deadline-ms",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang.",
+        mcp_help: None,
+    },
+];
+
 const CRAWL_PARAMS: &[ParamSpec] = &[
     ParamSpec {
         name: "url",
@@ -525,6 +567,19 @@ pub static TOOLS: &[ToolSpec] = &[
             "donsetch search \"exact phrase\" --intent code",
             "donsetch search site:github.com tokio --max-results 10",
             "donsetch search \"rust async trait patterns\" --query-variant \"async fn in trait rust\"",
+        ],
+    },
+    ToolSpec {
+        name: "web_answer",
+        cli_cmd: "answer",
+        summary: "Evidence pack for a factual question : search + read top pages, passages with sources",
+        description: "One-call research for a factual question : DonSeTch searches the web, reads the top pages, and returns a compact pack of relevant passages, each tied to its source URL with a freshness stamp.\n\nNo prose answer is invented: you get verbatim cited evidence to reason over. Dead or walled pages are skipped and reported, never silently dropped. Duplicate mirrors are collapsed.\n\nbudget_tokens caps the whole pack; max_pages caps how many sources are read; deadline_ms caps the wall clock (honest deadline error, never a hang).\n\nResponse: content[0].text is the markdown evidence pack. structuredContent contains query, empty, truncated, tokens_est, per-source citations and skipped pages with reasons. Search and per-page timing diagnostics live in _meta.",
+        mcp_description: "Ask a factual question and get cited evidence in one call. Searches the web, reads the top pages, returns verbatim passages each tied to a source URL and freshness stamp. Does not invent a prose answer; you synthesize from the evidence. Use web_search+web_fetch instead when you need full pages or must choose sources yourself. Dead/walled pages are skipped and reported.",
+        params: ANSWER_PARAMS,
+        examples: &[
+            "donsetch answer \"when did Rust 1.0 release\"",
+            "donsetch answer \"capital of Bhutan\" --budget-tokens 1000",
+            "donsetch answer \"tokio select macro\" --max-pages 4",
         ],
     },
     ToolSpec {

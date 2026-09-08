@@ -204,6 +204,34 @@
       "name": "web_search"
     },
     {
+      "description": "Ask a factual question and get cited evidence in one call. Searches the web, reads the top pages, returns verbatim passages each tied to a source URL and freshness stamp. Does not invent a prose answer; you synthesize from the evidence. Use web_search+web_fetch instead when you need full pages or must choose sources yourself. Dead/walled pages are skipped and reported.",
+      "inputSchema": {
+        "properties": {
+          "budget_tokens": {
+            "description": "Token budget for the whole evidence pack (200-8000, default 2000). Sources are read in rank order until the budget is spent.",
+            "type": "integer"
+          },
+          "deadline_ms": {
+            "description": "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang.",
+            "type": "integer"
+          },
+          "max_pages": {
+            "description": "Max pages to read evidence from (1-5, default 3).",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Factual question to collect cited evidence for.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "web_answer"
+    },
+    {
       "description": "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs.",
       "inputSchema": {
         "properties": {
