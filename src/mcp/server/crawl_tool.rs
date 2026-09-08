@@ -67,21 +67,30 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
     if let Some(q) = args.get("min_quality").and_then(Value::as_f64) {
         opts.min_quality = q.clamp(0.0, 1.0) as f32;
     }
+    // v4 phase 3: dataset mode is output-format only.
+    if args
+        .get("dataset")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        opts.dataset = true;
+    }
     let resume = args.get("resume").and_then(Value::as_str).map(String::from);
 
-    // v3 delta crawl: skip pages whose fingerprints are on file,
-    // and record the fingerprints of everything actually fetched :
-    // crawls feed the same memory fetches do.
+    // v4 phase 3 delta crawl: pages are re-checked and their fresh
+    // fingerprint compared with page history; only changed or new
+    // pages land in the results. Recording happens for every fetched
+    // page below, so crawls keep feeding the same memory fetches do.
     if args
         .get("since_last")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         let hist = Arc::clone(&daemon.history);
-        opts.skip_unchanged = Some(Arc::new(move |url: &str| {
+        opts.delta_unchanged = Some(Arc::new(move |url: &str, fp: &str| {
             hist.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .has_recent(url)
+                .matches_fingerprint(url, fp)
         }));
     }
     {
@@ -145,6 +154,7 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
     }
 
     let requested_mode = opts.mode;
+    let dataset = opts.dataset;
     let crawl_t0 = std::time::Instant::now();
     let result = match daemon.crawler.crawl(&url, opts, resume.as_deref()).await {
         Ok(r) => {
@@ -191,13 +201,17 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         }
     };
 
-    render_crawl_result(&result, requested_mode)
+    render_crawl_result(&result, requested_mode, dataset)
 }
 
 pub(super) fn render_crawl_result(
     result: &crate::crawl::CrawlResult,
     requested_mode: CrawlMode,
+    dataset: bool,
 ) -> Value {
+    if dataset {
+        return render_crawl_dataset(result, requested_mode);
+    }
     // One linear evidence document: page identity and body appear exactly once.
     let mut text = String::new();
     text.push_str(&format!("# Crawl\n{}\n\n", result.seed));
@@ -296,6 +310,82 @@ pub(super) fn render_crawl_result(
     })
 }
 
+/// Dataset mode (v4 phase 3): one JSON object per fetched page,
+/// JSON Lines. Rows are sorted by URL for deterministic output
+/// (delta-friendly diffs across recrawls). Duplicate content pages
+/// are dropped: a dataset wants one row per page. serde_json does
+/// the escaping, so every row is valid JSON by construction.
+pub(super) fn render_crawl_dataset(
+    result: &crate::crawl::CrawlResult,
+    requested_mode: CrawlMode,
+) -> Value {
+    let mut rows: Vec<Value> = result
+        .pages
+        .iter()
+        .filter(|p| !p.duplicate)
+        .map(|p| {
+            json!({
+                "url": p.url,
+                "title": p.title,
+                "kind": format!("{:?}", p.kind),
+                "markdown": p.markdown,
+                "chars": p.chars,
+                "fetched_at": p.fetched_at,
+                "lastmod": p.lastmod,
+                "parent": p.parent,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a["url"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["url"].as_str().unwrap_or(""))
+    });
+
+    let mut text = String::new();
+    for row in &rows {
+        text.push_str(&serde_json::to_string(row).unwrap_or_default());
+        text.push('\n');
+    }
+
+    let next_action = compute_crawl_next_action(result);
+    let mut structured = json!({
+        "seed": result.seed,
+        "dataset": true,
+        "rows": rows.len(),
+        "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
+        "stop": format!("{:?}", result.stop),
+    });
+    if requested_mode == CrawlMode::Map {
+        structured["map"] = json!(result.map);
+    }
+    if let Some(resume) = &result.resume {
+        structured["resume"] = json!(resume);
+    }
+    if !next_action.is_empty() {
+        structured["next_action"] = json!(next_action);
+    }
+    let debug = json!({
+        "mode": format!("{:?}", requested_mode),
+        "rows": rows.len(),
+        "queued": result.queued,
+        "filtered_out": result.filtered_out,
+        "skipped": result
+            .skipped
+            .iter()
+            .map(|(u, w)| json!({ "url": u, "reason": w }))
+            .collect::<Vec<_>>(),
+        "crawl_delay": result.crawl_delay,
+        "elapsed_s": result.elapsed.as_secs_f64(),
+    });
+    json!({
+        "content": [{ "type": "text", "text": text.trim_end() }],
+        "structuredContent": structured,
+        "_meta": { "com.donsetch/crawl-debug": debug },
+    })
+}
+
 /// Compute actionable guidance for the agent based on crawl
 /// results. Returns an empty string when the crawl succeeded
 /// normally (no guidance needed).
@@ -385,6 +475,7 @@ mod crawl_output_contract_tests {
             parent: Some("https://example.com/docs/".into()),
             score: 0.88,
             lastmod: Some("2026-09-04".into()),
+            fetched_at: 1_770_000_000,
         };
         let result = CrawlResult {
             seed: "https://example.com/docs/".into(),
@@ -398,7 +489,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: Some("opaque-resume".into()),
         };
-        let output = render_crawl_result(&result, CrawlMode::Full);
+        let output = render_crawl_result(&result, CrawlMode::Full, false);
         let text = output["content"][0]["text"].as_str().unwrap();
         assert_eq!(text.matches("Evidence page").count(), 1);
         assert_eq!(text.matches("https://example.com/docs/page").count(), 1);
@@ -414,5 +505,97 @@ mod crawl_output_contract_tests {
             output["_meta"]["com.donsetch/crawl-debug"]["pages"][0]["quality"],
             json!(0.93_f32)
         );
+    }
+
+    fn dataset_fixture() -> crate::crawl::CrawlResult {
+        let page = |url: &str, title: &str, md: &str, dup: bool| CrawlPage {
+            url: url.into(),
+            title: title.into(),
+            kind: crate::extract::ContentKind::Article,
+            markdown: md.into(),
+            chars: md.len(),
+            quality: 0.9,
+            duplicate: dup,
+            parent: None,
+            score: 1.0,
+            lastmod: None,
+            fetched_at: 1_770_000_000,
+        };
+        crate::crawl::CrawlResult {
+            seed: "https://example.com/docs/".into(),
+            pages: vec![
+                page(
+                    "https://example.com/docs/b",
+                    "B",
+                    "line with \"quotes\" and\nnewlines",
+                    false,
+                ),
+                page("https://example.com/docs/a", "A", "alpha body", false),
+                page(
+                    "https://example.com/docs/b?x=1",
+                    "B dup",
+                    "alpha body",
+                    true,
+                ),
+            ],
+            queued: vec![],
+            filtered_out: 0,
+            skipped: vec![(
+                "https://example.com/docs/walled".into(),
+                "wall.challenge".into(),
+            )],
+            stop: crate::crawl::StopReason::FrontierEmpty,
+            elapsed: std::time::Duration::from_millis(7),
+            map: vec![],
+            crawl_delay: None,
+            resume: None,
+        }
+    }
+
+    // Dataset mode must emit one VALID JSON object per non-duplicate
+    // page, sorted by URL, with the page's own markdown verbatim
+    // (escaping included). A markdown document or unsorted/duplicate
+    // rows fail this test.
+    #[test]
+    fn dataset_mode_emits_valid_sorted_jsonl() {
+        let out = render_crawl_result(&dataset_fixture(), crate::crawl::CrawlMode::Full, true);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "duplicates dropped, one row per page");
+        let row0: serde_json::Value = serde_json::from_str(lines[0]).expect("row 0 valid JSON");
+        let row1: serde_json::Value = serde_json::from_str(lines[1]).expect("row 1 valid JSON");
+        assert_eq!(row0["url"], "https://example.com/docs/a");
+        assert_eq!(row1["url"], "https://example.com/docs/b");
+        // Verbatim markdown with hostile characters survives the round trip.
+        assert_eq!(row1["markdown"], "line with \"quotes\" and\nnewlines");
+        assert_eq!(row0["fetched_at"], 1_770_000_000u64);
+        assert_eq!(out["structuredContent"]["rows"], 2);
+        assert_eq!(out["structuredContent"]["dataset"], true);
+        assert_eq!(out["structuredContent"]["complete"], true);
+        // Skipped pages surface in debug, never as rows.
+        assert_eq!(
+            out["_meta"]["com.donsetch/crawl-debug"]["skipped"][0]["reason"],
+            "wall.challenge"
+        );
+    }
+
+    #[test]
+    fn dataset_mode_still_reports_resume_and_budget_stops() {
+        let mut r = dataset_fixture();
+        r.stop = crate::crawl::StopReason::MaxPages;
+        r.resume = Some("tok-1".into());
+        let out = render_crawl_result(&r, crate::crawl::CrawlMode::Full, true);
+        assert_eq!(out["structuredContent"]["resume"], "tok-1");
+        assert_eq!(out["structuredContent"]["complete"], false);
+        let hint = out["structuredContent"]["next_action"].as_str().unwrap();
+        assert!(hint.contains("resume"), "resume guidance preserved");
+    }
+
+    #[test]
+    fn markdown_mode_unchanged_by_dataset_flag_absence() {
+        let out = render_crawl_result(&dataset_fixture(), crate::crawl::CrawlMode::Full, false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("# Crawl"));
+        assert!(text.contains("## [1]"));
     }
 }

@@ -204,11 +204,11 @@
       "name": "web_search"
     },
     {
-      "description": "Ask a factual question and get cited evidence in one call. Searches the web, reads the top pages, returns verbatim passages each tied to a source URL and freshness stamp. Does not invent a prose answer; you synthesize from the evidence. Use web_search+web_fetch instead when you need full pages or must choose sources yourself. Dead/walled pages are skipped and reported.",
+      "description": "Factual question -> cited evidence in one call: searches the web, reads top pages, returns verbatim passages tied to source URLs with freshness stamps. No prose answer invented; you synthesize. Dead/walled pages are skipped and reported.",
       "inputSchema": {
         "properties": {
           "budget_tokens": {
-            "description": "Token budget for the whole evidence pack (200-8000, default 2000). Sources are read in rank order until the budget is spent.",
+            "description": "Token budget for the whole evidence pack (200-8000, default 2000).",
             "type": "integer"
           },
           "deadline_ms": {
@@ -232,9 +232,13 @@
       "name": "web_answer"
     },
     {
-      "description": "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs.",
+      "description": "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs. dataset=true returns JSONL (one object per page).",
       "inputSchema": {
         "properties": {
+          "dataset": {
+            "description": "Dataset mode: return JSON Lines (one JSON object per page) instead of markdown.",
+            "type": "boolean"
+          },
           "deadline_s": {
             "description": "Hard crawl deadline in seconds (default 120, range 5-600). Partial results return after.",
             "type": "integer"
