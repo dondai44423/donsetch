@@ -938,6 +938,8 @@ async fn v2_sitemap_priority_seeds_frontier() {
     let crawler = Crawler::new(fetch, gov());
     let mut o = opts();
     o.mode = CrawlMode::Full;
+    o.shape = false; // priority semantics are exact-order; shaping is
+    // tested separately (frontier tests pin the jitter contract).
     o.max_pages = 2; // seed + 1 : priority decides which
     let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
     // The high-priority page should be fetched before the low one.

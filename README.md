@@ -736,8 +736,14 @@ inventory), then Governor-paced frontier walk with extraction per page.
 - **Focus-ranked frontier**: `focus="query"` ranks pages by BM25
   relevance, crawls only matches.
 - **Adaptive pacing**: the Governor paces per (host, lane).
-  429/503 → exponential backoff. Dwell-time variance proportional to
-  page size breaks metronome fingerprints.
+  429/503 → backoff on host signals; host-declared waits
+  (`Retry-After`, robots `Crawl-delay`) honored in full; everything
+  self-inferred caps at ~7s. Zero artificial dwell on the fetch path
+  (stealth through truth, never time).
+- **Crawl-shape**: frontier pops get a seeded reader-like jitter, so
+  repeated crawls never replay one identical, score-eager fetch
+  order to server logs. Ordering only (every page still fetched,
+  payloads untouched). Kill switch: `DONSETCH_NO_CRAWL_SHAPE=1`.
 - **Resume tokens**: stopped crawls resume with one call; valid 30
   min, survive restarts.
 - **Near-dup detection**: title + first 200 chars hashed.

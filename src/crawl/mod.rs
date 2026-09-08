@@ -188,6 +188,15 @@ pub struct CrawlOptions {
     /// (JSON Lines) instead of a markdown document. Output-format
     /// only; traversal, budgets, and pacing are unchanged.
     pub dataset: bool,
+    /// v4 phase 3 crawl-shape: reader-like pop jitter in the frontier
+    /// (default true). False restores exact score-order traversal.
+    /// Zero latency cost; DONSETCH_NO_CRAWL_SHAPE flips it at runtime
+    /// without any rebuild (belt for operators, env wins over the
+    /// option).
+    pub shape: bool,
+    /// Overrides the automatic shape seed (tests pin ordering; prod
+    /// derives it from the seed URL + clock). None = auto.
+    pub shape_seed: Option<u64>,
     /// Map hard cap.
     pub map_cap: usize,
     /// Minimum content quality (0.0-1.0). Pages below this
@@ -211,6 +220,8 @@ impl Default for CrawlOptions {
             concurrency: 1,
             respect_robots: true,
             dataset: false,
+            shape: true,
+            shape_seed: None,
             cancel: None,
             progress: None,
             delta_unchanged: None,
@@ -456,7 +467,20 @@ impl Crawler {
         }
 
         // ── Frontier seeding ───────────────────────────────
-        let mut queue = FrontierQueue::new();
+        let mut queue = FrontierQueue::with_shaper(
+            opts.shape && !crate::config::env_flag("DONSETCH_NO_CRAWL_SHAPE"),
+            opts.shape_seed.unwrap_or_else(|| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seed.as_str().hash(&mut h);
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    .hash(&mut h);
+                h.finish()
+            }),
+        );
         // Budgets are PER-CALL: a resume continues from the saved
         // position but the caller's page/char budgets apply to
         // the NEW work. (Run 2 must not instantly exhaust itself
