@@ -52,6 +52,14 @@ channel until the v4.0.0 release train.
 - Adapters reach the crawl fetch path: the same rewrite pass
   `web_fetch` uses rides inside crawl fetches; the canonical URL stays
   the dedup/history key.
+- Ghost browser pool: up to 16 warm browser slots keyed by persona
+  identity and host affinity; a repeat hit on the same host lands on
+  the browser that already carries that site's session state, and a
+  persona switch inside a slot relaunches instead of inheriting
+  another identity's fingerprint state. `donsetch status` shows the
+  warm-serve receipt; `DONSETCH_GHOST_POOL_SLOTS` sizes the pool
+  (default 3), `DONSETCH_NO_GHOST_POOL` reverts to the old
+  single-slot path.
 - MCP compat folding applies to `web_search` too: structured-content-
   only clients receive raw result URLs through the folded metadata
   block instead of losing them; the model-facing contract text now
