@@ -950,6 +950,8 @@ mod tests {
         ];
         // 5 engines, 3 families (bing family dedups to one opinion).
         assert_eq!(rank::family_count(&r), 3);
+        let markdown = render_compact_markdown(&outcome(vec![r]), "", None, &[]);
+        assert!(markdown.contains("3 index families"), "{markdown}");
     }
 
     #[test]
@@ -1253,12 +1255,13 @@ mod tests {
             &[Some("· ⚠ needs browser".into())],
         );
         assert!(
-            markdown
-                .contains("1. S1 · Tokio runtime guide : tokio.rs · ⚠ needs browser · 1 source"),
-            "corroboration rides the same line, after the route hint: {markdown}"
+            markdown.contains(
+                "1. S1 · Tokio runtime guide : tokio.rs · ⚠ needs browser · 1 index family"
+            ),
+            "index-family count follows the route hint: {markdown}"
         );
         assert!(markdown.contains("A focused explanation"));
-        assert!(markdown.contains("Weak results : low cross-source agreement."));
+        assert!(markdown.contains("Weak results : low cross-index agreement."));
         assert!(markdown.contains("Degraded retrieval : 1/2 backends available."));
         for diagnostic in [
             "engines:",
