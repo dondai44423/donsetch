@@ -972,41 +972,6 @@ async fn v2_referer_passed_to_fetcher() {
     // PageFetcher signature accepts referer.
 }
 
-#[test]
-fn v2_governor_dwell_extends_wait() {
-    // Gap: fixed-interval traffic is a bot fingerprint.
-    // Dwell time proportional to page size breaks the metronome.
-    let g = Governor::new(vec![Lane {
-        id: "d".into(),
-        kind: LaneKind::Direct,
-    }]);
-    // First request: no wait.
-    assert_eq!(g.wait_for("ex.com", "d", 0), Duration::ZERO);
-    // Simulate a large-page success with 2000ms dwell.
-    g.on_success("ex.com", "d", Duration::from_millis(50), 2000);
-    // Next request must wait at least the dwell time.
-    let w = g.wait_for("ex.com", "d", 1);
-    assert!(
-        w > Duration::ZERO,
-        "dwell time must extend the wait beyond zero"
-    );
-}
-
-#[test]
-fn v2_governor_zero_dwell_no_extra_wait() {
-    // Zero dwell = no extra wait. Small pages (cache hits) should
-    // not inflate the pacing.
-    let g = Governor::new(vec![Lane {
-        id: "d".into(),
-        kind: LaneKind::Direct,
-    }]);
-    g.wait_for("ex.com", "d", 0);
-    g.on_success("ex.com", "d", Duration::from_millis(50), 0);
-    let w = g.wait_for("ex.com", "d", 1);
-    // Without dwell, the wait is just the base pacing delay.
-    assert!(w < Duration::from_secs(3));
-}
-
 // ── Hardening tests (PDF, sitemap, www normalization) ────────
 
 #[test]

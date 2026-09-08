@@ -795,19 +795,13 @@ impl Crawler {
                     } else {
                         match (page.status, &page.verdict) {
                             (200, Verdict::ContentOk) => {
-                                // Skim dwell: proportional to page size,
-                                // capped at 300ms. v1 used up to 2s/page
-                                // ("a human reads a 50KB article") : but
-                                // an agent skims for extraction, not
-                                // reading, and the dwell's real job is
-                                // anti-metronome entropy, which jitter +
-                                // this small size-proportional term
-                                // already provide. 2s/page of pure sleep
-                                // was the single biggest crawl latency
-                                // cost (6.29s median in the 50-case
-                                // benchmark).
-                                let dwell = (page.body.len() / 64).min(100) as u64;
-                                governor.on_success(host, &lane.id, page.latency, dwell)
+                                // No dwell: pacing is the governor's
+                                // rung/jitter ladder alone (law 11, v4
+                                // phase 3). The old size-proportional
+                                // skim dwell was a vestigial
+                                // human-reading simulation that only
+                                // bought latency.
+                                governor.on_success(host, &lane.id, page.latency)
                             }
                             (429, _) | (503, _) => {
                                 governor.on_throttled(host, &lane.id);
