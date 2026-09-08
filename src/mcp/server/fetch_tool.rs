@@ -705,17 +705,25 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // freshness); the rest of the pipeline (extraction,
     // thin→ghost, history) runs unchanged on the cached body.
     let mut prewarmed = false;
-    if !is_pdf_url
-        && let Some(entry) = daemon
+    // Bind the take() result first: a lock guard in the if-let
+    // scrutinee would live across the .await below and make the
+    // future !Send.
+    let prewarm_entry = if !is_pdf_url {
+        daemon
             .searcher
             .prewarms()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(&orig_url)
-    {
+    } else {
+        None
+    };
+    if let Some(entry) = prewarm_entry {
         tier_used = "prewarmed";
         prewarmed = true;
         trace.step("prewarm", "search-handoff", "hit", 0);
+        // law 6: make the warm handoff observable in `donsetch status`.
+        daemon.state.lock().await.note_prewarm_served();
         out = Some(crate::fetch::client::FetchOutcome {
             url: orig_url.clone(),
             status: 200,

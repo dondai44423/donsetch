@@ -5,8 +5,6 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use url::Url;
-
 use crate::detect::walls::{self, Verdict};
 use crate::error::FetchError;
 use crate::ghost::cache::CookieRecord;
@@ -264,7 +262,6 @@ impl Fetcher {
         // and crawl (many pages, same host) where rate limits bite.
 
         loop {
-            let host = host_of(&current)?;
             let env_proxy = if proxy.is_none() && !crate::config::env_flag("DONSETCH_NO_ENV_PROXY")
             {
                 crate::transport::proxy::from_env_for(&current)
@@ -285,15 +282,10 @@ impl Fetcher {
             let mut out = self
                 .fetch_once_via(&current, hop_conditional, effective_proxy, use_jar, ref_arg)
                 .await?;
-            {
-                let mut jar = self
-                    .jar
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let current_is_https =
-                    Url::parse(&current).is_ok_and(|u| u.scheme().eq_ignore_ascii_case("https"));
-                jar.store_from_headers(&host, &out.headers, current_is_https);
-            }
+            // Cookie store for this hop lives in fetch_once_via_class
+            // (v4 phase 2.1): the primitive owns the jar-write, so the
+            // cookie-warm retry below can already ride cookies this
+            // hop just set.
 
             // 304: merge body from cache.
             if out.status == 304
@@ -380,15 +372,8 @@ impl Fetcher {
                             .fetch_once_via(&current, &[], effective_proxy, use_jar, ref_arg)
                             .await
                     {
-                        {
-                            let mut jar = self
-                                .jar
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let current_is_https = Url::parse(&current)
-                                .is_ok_and(|u| u.scheme().eq_ignore_ascii_case("https"));
-                            jar.store_from_headers(&host, &retry.headers, current_is_https);
-                        }
+                        // The retry's Set-Cookie was stored by the
+                        // one-hop primitive itself.
                         retry.verdict = walls::detect(retry.status, &retry.headers, &retry.body);
                         if matches!(retry.verdict, Verdict::ContentOk) {
                             let mut cache = self
@@ -559,6 +544,7 @@ impl Fetcher {
             {
                 Ok(out) => {
                     // verdict already scored by finish()
+                    self.store_hop_cookies(use_jar, host, is_https, &out.headers);
                     self.pool
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -587,6 +573,7 @@ impl Fetcher {
             {
                 Ok(out) => {
                     // verdict already scored by finish()
+                    self.store_hop_cookies(use_jar, host, is_https, &out.headers);
                     return Ok(out);
                 }
                 Err(e) => {
@@ -598,6 +585,34 @@ impl Fetcher {
             }
         }
         Err(last_err)
+    }
+
+    /// One jar-write owner (v4 phase 2.1): every use_jar hop both
+    /// ATTACHES stored cookies (above, before dialing) and STORES the
+    /// response's Set-Cookie (here, on success). Before this, only the
+    /// redirect-loop wrapper in fetch_via_jar_opts stored, so one-hop
+    /// jar riders (search prewarm, shadow subresources) read like a
+    /// browser but learned nothing back: the jar stayed empty and the
+    /// next request went out cookie-less. Real browsers store
+    /// subresource Set-Cookie too, so the store lives in the shared
+    /// primitive, not the callers. The primitive is strictly one-hop,
+    /// so keying on the request host/scheme is per-hop correct for
+    /// redirect chains.
+    fn store_hop_cookies(
+        &self,
+        use_jar: bool,
+        host: &str,
+        is_https: bool,
+        headers: &[(String, String)],
+    ) {
+        if !use_jar {
+            return;
+        }
+        let mut jar = self
+            .jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        jar.store_from_headers(host, headers, is_https);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -798,13 +813,6 @@ fn finish(
         verdict,
         elapsed: Duration::ZERO,
     })
-}
-
-fn host_of(url_str: &str) -> Result<String, FetchError> {
-    let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
-    url.host_str()
-        .map(|h| h.to_string())
-        .ok_or_else(|| FetchError::InvalidUrl(url_str.into()))
 }
 
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {

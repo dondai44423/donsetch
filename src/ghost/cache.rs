@@ -254,6 +254,13 @@ pub struct GhostState {
     /// page-load realism at work, surfaced in donsetch status.
     #[serde(default)]
     pub shadowed_assets_total: u64,
+    /// Lifetime count of fetches served from the search->fetch
+    /// prewarm cache (v4 phase 2.1 warm handoff), surfaced in
+    /// donsetch status. Counter, not inventory: the RAM cache is
+    /// one-shot and capped, so "served" proves the handoff saved a
+    /// network fetch.
+    #[serde(default)]
+    pub prewarmed_served_total: u64,
     /// Tier-1 whole-jar persistence (v4 phase 1.4): the browser
     /// cookie-store view, so a returning agent replays device /
     /// analytics / cf_bm cookies like a returning browser instead
@@ -870,6 +877,15 @@ impl GhostState {
             return;
         }
         self.shadowed_assets_total = self.shadowed_assets_total.saturating_add(assets as u64);
+        self.save();
+    }
+
+    /// v4 phase 2.1 visibility: count a fetch served from the
+    /// search prewarm cache. DONSETCH_NO_PREWARM stops entries
+    /// being parked in the first place, so this only grows while
+    /// prewarm is on; no extra gate here.
+    pub fn note_prewarm_served(&mut self) {
+        self.prewarmed_served_total = self.prewarmed_served_total.saturating_add(1);
         self.save();
     }
 

@@ -379,7 +379,15 @@ pub(super) async fn search_outcome(
     // BYOK-first mode: try providers, fall back to local.
     if byok_configured && !local_first {
         match daemon.byok.search(query, max, intent).await {
-            Ok(out) => return Ok(out),
+            Ok(out) => {
+                // v4 phase 2.1: the warm handoff is not a local-search
+                // privilege. Provider results carry their own titles
+                // and snippets, so the reply does not wait: prewarm
+                // fires detached and parks bodies while the model
+                // reads the results (law 5: zero added latency).
+                daemon.searcher.spawn_prewarm(&out.results);
+                return Ok(out);
+            }
             Err(e) => {
                 if std::env::var_os("DONSEEK_DEBUG").is_some() {
                     eprintln!("[byok] all providers exhausted, falling back to local: {e}");
@@ -400,7 +408,11 @@ pub(super) async fn search_outcome(
                     eprintln!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
                 match daemon.byok.search(query, max, intent).await {
-                    Ok(out) => Ok(out),
+                    Ok(out) => {
+                        // Same detached prewarm as the BYOK-first path.
+                        daemon.searcher.spawn_prewarm(&out.results);
+                        Ok(out)
+                    }
                     Err(e2) => Err(SearchFailure {
                         cause: format!("local ({e}); byok ({e2})"),
                         byok_tried: true,

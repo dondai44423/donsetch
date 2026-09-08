@@ -194,6 +194,9 @@ pub async fn run() {
             if state.shadowed_assets_total > 0 {
                 line.push_str(&format!(" · {} shadowed", state.shadowed_assets_total));
             }
+            if state.prewarmed_served_total > 0 {
+                line.push_str(&format!(" · {} prewarmed", state.prewarmed_served_total));
+            }
             if cooldowns > 0 {
                 line.push_str(&format!(" · {cooldowns} in cooldown"));
             }
