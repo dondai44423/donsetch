@@ -218,16 +218,16 @@ pub fn detect(query: &str) -> Intent {
 
 /// Engines to fan out per intent. Order = trust prior.
 /// Bing family (bing/ddg/yahoo) + independent indexes
-/// (mojeek/brave) for consensus diversity.
+/// (mojeek/brave/google) for consensus diversity.
 /// DDG and Brave are PROXY_AVERSE : they prefer the direct
 /// lane because proxy IPs get CAPTCHA'd/429'd.
 pub fn engines_for(intent: Intent) -> &'static [&'static str] {
     match intent {
-        // 5 engines, 3 index families (bing, mojeek, brave).
+        // 6 engines, 4 index families (bing, mojeek, brave, google).
         Intent::Web | Intent::Code | Intent::News | Intent::Entity => {
-            &["bing", "ddg", "mojeek", "yahoo", "brave"]
+            &["bing", "ddg", "mojeek", "yahoo", "brave", "google"]
         }
-        Intent::Paper => &["bing", "ddg", "mojeek"],
+        Intent::Paper => &["bing", "ddg", "mojeek", "google"],
     }
 }
 

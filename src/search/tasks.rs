@@ -19,24 +19,82 @@ pub(super) type EngineResult =
 pub(super) type TaskFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = (String, EngineResult)> + Send + 'a>>;
 
+#[derive(Clone, Copy)]
+pub(super) struct EngineContext<'a> {
+    pub fetcher: &'a Fetcher,
+    pub pool: &'a EgressPool,
+    pub google: &'a engines::google_wml::ProfileSelector,
+}
+
 pub(super) async fn engine_task(
     engine: String,
     query: String,
     egress_id: String,
     proxy: Option<crate::transport::proxy::Proxy>,
-    fetcher: &Fetcher,
-    pool: &EgressPool,
+    context: EngineContext<'_>,
 ) -> (String, EngineResult) {
-    let label = engine.clone();
-    pool.pace(&engine, &egress_id).await;
+    engine_task_with_budget(
+        engine,
+        query,
+        egress_id,
+        proxy,
+        context,
+        ENGINE_TIMEOUT,
+        None,
+    )
+    .await
+}
+
+/// One admission and HTTP attempt under a single deadline, including pacing.
+pub(super) async fn engine_task_with_budget(
+    engine: String,
+    query: String,
+    egress_id: String,
+    proxy: Option<crate::transport::proxy::Proxy>,
+    context: EngineContext<'_>,
+    budget: std::time::Duration,
+    previous: Option<(&str, &str)>,
+) -> (String, EngineResult) {
+    let EngineContext {
+        fetcher,
+        pool,
+        google,
+    } = context;
+    let mut label = engine.clone();
+    let deadline = tokio::time::Instant::now() + budget;
     let started = Instant::now();
+    if tokio::time::timeout_at(deadline, pool.pace(&engine, &egress_id))
+        .await
+        .is_err()
+    {
+        return (label, Err(("pacing-timeout".into(), egress_id, true)));
+    }
+    let lease = if engine == "google" {
+        match google.select(&egress_id, previous) {
+            Ok(lease) => {
+                label = lease.label();
+                Some(lease)
+            }
+            Err(status) => return (label, Err((status.into(), egress_id, true))),
+        }
+    } else {
+        None
+    };
+    let google_ua = lease.as_ref().map(|lease| lease.user_agent());
     let Some(url) = engines::serp_url(&engine, &query) else {
         return (label, Err(("no-url".into(), egress_id, true)));
     };
-    let out = match tokio::time::timeout(
-        ENGINE_TIMEOUT,
-        fetcher.fetch_once_via(&url, &[], proxy.as_ref(), false, None),
-    )
+    let out = match tokio::time::timeout_at(deadline, async {
+        if let Some(ua) = google_ua {
+            fetcher
+                .fetch_once_via_user_agent(&url, proxy.as_ref(), ua)
+                .await
+        } else {
+            fetcher
+                .fetch_once_via(&url, &[], proxy.as_ref(), false, None)
+                .await
+        }
+    })
     .await
     {
         Err(_) => return (label, Err(("timeout".into(), egress_id, true))),
@@ -52,12 +110,6 @@ pub(super) async fn engine_task(
         Ok(Ok(o)) => o,
     };
     let ms = started.elapsed().as_millis() as u64;
-    if out.status == 429 || !matches!(out.verdict, Verdict::ContentOk) {
-        return (
-            label,
-            Err((format!("blocked:{}", out.status), egress_id, true)),
-        );
-    }
     let html = crate::extract::charset::decode(
         &out.body,
         out.headers
@@ -66,6 +118,20 @@ pub(super) async fn engine_task(
             .map(|(_, v)| v.as_str())
             .unwrap_or(""),
     );
+    if engine == "google"
+        && let Some(status) = engines::google_wml::response_error(out.status, &out.headers, &html)
+    {
+        if let Some(lease) = &lease {
+            google.finish(lease, status);
+        }
+        return (label, Err((status.into(), egress_id, true)));
+    }
+    if out.status == 429 || !matches!(out.verdict, Verdict::ContentOk) {
+        return (
+            label,
+            Err((format!("blocked:{}", out.status), egress_id, true)),
+        );
+    }
     let hits = engines::parse(&engine, &html);
     if hits.len() < 3 {
         // Honest "no results" is NOT an engine failure :
@@ -78,22 +144,25 @@ pub(super) async fn engine_task(
         let status = if dry { "no-results" } else { "empty-parse" };
         return (label, Err((status.into(), egress_id, true)));
     }
+    if let Some(lease) = &lease {
+        google.finish(lease, "ok");
+    }
     (label, Ok((hits, ms, egress_id, true)))
 }
 
 /// The browser-render SERP lane. Runs the SERP URL through the
 /// shared ghost hook (render cache shortcut included), parses
-/// with the same layered parser as the plain-HTTP engine, and
+/// with the desktop parser (separate from the WML HTTP layout), and
 /// reports honestly: "google_ghost" on the engine list, egress
-/// "ghost". Engine id shares the "google" base for trust +
-/// quarantine so repeated cascades learn.
+/// "ghost". Health is transport-specific; ranking still counts only
+/// one Google index family across HTTP and browser results.
 pub(super) async fn ghost_engine_task(
     engine: String,
     query: String,
     hook: crate::crawl::GhostHook,
 ) -> (String, EngineResult) {
     let started = Instant::now();
-    let Some(url) = engines::serp_url("google", &query) else {
+    let Some(url) = engines::serp_url("google_ghost", &query) else {
         return (engine, Err(("no-url".into(), "ghost".into(), true)));
     };
     // The hook runs acquire + render + one retry internally,
@@ -112,7 +181,7 @@ pub(super) async fn ghost_engine_task(
         }
         Ok(Ok(r)) => r.html,
     };
-    let hits = engines::parse("google", &rendered);
+    let hits = engines::parse("google_ghost", &rendered);
     let ms = started.elapsed().as_millis() as u64;
     if hits.len() < 3 {
         // 200-but-no-results 2026 Google = bot wall or an AI-mode
@@ -162,6 +231,78 @@ fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn engine_budget_includes_pacing_without_starting_network() {
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let pool = EgressPool::new(Vec::new());
+        let google = engines::google_wml::ProfileSelector::from_env();
+        let context = EngineContext {
+            fetcher: &fetcher,
+            pool: &pool,
+            google: &google,
+        };
+        pool.pace("bing", "direct").await;
+        let (_, outcome) = engine_task_with_budget(
+            "bing".into(),
+            "unused".into(),
+            "direct".into(),
+            None,
+            context,
+            std::time::Duration::from_millis(1),
+            None,
+        )
+        .await;
+        let (status, _, _) = outcome.unwrap_err();
+        assert_eq!(status, "pacing-timeout");
+        assert!(!super::super::is_engine_fault(&status));
+    }
+
+    /// Explicit live test of the actual fan-out task, not a second HTTP client.
+    /// Never runs in the ordinary offline test suite.
+    #[tokio::test]
+    #[ignore = "makes three paced, direct requests to Google; no browser or paid API"]
+    async fn google_wml_live() {
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let pool = EgressPool::new(Vec::new());
+        let google = engines::google_wml::ProfileSelector::from_env();
+        let context = EngineContext {
+            fetcher: &fetcher,
+            pool: &pool,
+            google: &google,
+        };
+        for query in [
+            "rust programming language",
+            "PostgreSQL documentation",
+            "musei di Roma",
+        ] {
+            let (engine, outcome) = engine_task(
+                "google".into(),
+                query.into(),
+                "direct".into(),
+                None,
+                context,
+            )
+            .await;
+            let (hits, ms, egress, was_engine) =
+                outcome.expect("Google HTTP lane must return usable results");
+            assert!(engine.starts_with("google@"));
+            assert_eq!(egress, "direct");
+            assert!(was_engine);
+            assert!(hits.len() >= 3);
+            assert!(
+                hits.iter()
+                    .all(|h| !h.title.is_empty() && url::Url::parse(&h.url).is_ok())
+            );
+            assert!(hits.iter().any(|h| !h.snippet.is_empty()));
+            eprintln!(
+                "{query:?}: {} hits, {ms} ms, first={}",
+                hits.len(),
+                hits[0].url
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
 
     fn hit(title: &str, url: &str) -> engines::Hit {
         engines::Hit {

@@ -44,6 +44,61 @@ fn header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
 }
 
 #[tokio::test]
+async fn legacy_user_agent_is_single_and_request_local() {
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let fetcher =
+        donsetch::fetch::client::Fetcher::new(donsetch::profile::BrowserProfile::host_default())
+            .unwrap();
+    let ua = donsetch::search::engines::google_wml::USER_AGENT;
+    let (legacy_port, legacy_rx) = serve_once();
+    let (normal_port, normal_rx) = serve_once();
+    let legacy_url = format!("http://127.0.0.1:{legacy_port}/search");
+    let normal_url = format!("http://127.0.0.1:{normal_port}/page");
+    let (legacy, normal) = tokio::join!(
+        fetcher.fetch_once_via_user_agent(&legacy_url, None, ua),
+        fetcher.fetch_once_via(&normal_url, &[], None, false, None),
+    );
+    assert_eq!(legacy.unwrap().status, 200);
+    assert_eq!(normal.unwrap().status, 200);
+    let raw = legacy_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(header(&raw, "user-agent"), Some(ua));
+    assert_eq!(
+        raw.lines()
+            .filter(|l| l.to_lowercase().starts_with("user-agent:"))
+            .count(),
+        1
+    );
+    assert!(!raw.to_lowercase().contains("sec-ch-ua"));
+    assert!(!raw.to_lowercase().contains("sec-fetch-"));
+    assert!(header(&raw, "cookie").is_none());
+    let raw = normal_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        header(&raw, "user-agent"),
+        Some(fetcher.profile().user_agent.as_str())
+    );
+    assert!(header(&raw, "sec-ch-ua").is_some());
+}
+
+#[tokio::test]
+async fn legacy_user_agent_rejects_header_injection_before_network() {
+    let fetcher =
+        donsetch::fetch::client::Fetcher::new(donsetch::profile::BrowserProfile::host_default())
+            .unwrap();
+    for ua in ["", "Nokia\r\nCookie: injected", "Nokia\0", "Nokià"] {
+        let error = fetcher
+            .fetch_once_via_user_agent("not-a-url", None, ua)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("invalid User-Agent"));
+    }
+}
+
+#[tokio::test]
 async fn subresource_class_goes_out_on_the_wire() {
     unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
     let (port, rx) = serve_once();

@@ -12,6 +12,16 @@ channel until the v4.0.0 release train.
 
 ### Added
 
+- Native keyless Google search via the legacy mobile endpoint, using
+  DonShadow without a browser or paid API. Seven selectable Nokia
+  profiles (`DONSETCH_GOOGLE_PROFILE`, default `6230-03.15`), observed
+  working in local tests; availability is not guaranteed. An explicit
+  CAPTCHA permits one next-profile attempt in the existing thin-merge
+  retry wave; successful profiles remain preferred per egress in
+  memory, with circular advancement on CAPTCHA and no profile cooldowns.
+  Profile selection resets on restart. HTTP 429 and other walls do
+  not rotate. Native and
+  browser Google share one ranking family but keep separate health.
 - Route memory: fetches learn route health per tier (EWMA latency by
   route, failure classes, LRU-bounded store). Tier 1 rides healthy
   routes only; persistent failures quarantine and a background probe
@@ -78,6 +88,14 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Search pacing uses cancellation-safe per-engine/egress admission;
+  waiting is included in attempt deadlines and cancelled waiters
+  leave no future-slot debt. Google HTTP health is isolated from
+  legacy browser health; Google follows common failure and quarantine rules.
+- Search retries retain completed peers when another retry times out
+  and report retry timeouts explicitly, with the attempted Google
+  profile when available. At most one retry per engine per search. Ordinary
+  retries, including Google, keep a three-second budget including pacing.
 - **#164 audit wave (S1-S6 in the search/fetch stack):**
   S1: version matching is boundary-aware; "5.2" no longer matches
   "15.2" or "5.20" but still matches "5.2.1" and "v5.2".

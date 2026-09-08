@@ -4,6 +4,8 @@
 
 use scraper::{Html, Selector};
 
+pub mod google_wml;
+
 /// One raw hit from one engine.
 #[derive(Debug, Clone)]
 pub struct Hit {
@@ -149,7 +151,8 @@ pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
     let doc = Html::parse_document(html);
     let mut hits = match engine {
         "brave" => parse_brave(&doc),
-        "google" => parse_google(&doc),
+        "google" => google_wml::parse(&doc),
+        "google_ghost" => parse_google(&doc),
         "bing" => parse_bing(&doc),
         // DDG primary is now lite : the html endpoint serves a
         // CAPTCHA challenge to proxy IPs.  parse_ddg (html parser)
@@ -569,7 +572,8 @@ fn parse_yahoo(doc: &Html) -> Vec<Hit> {
 pub fn serp_url(engine: &str, query: &str) -> Option<String> {
     let q = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
     match engine {
-        "google" => Some(format!(
+        "google" => Some(google_wml::url(query)),
+        "google_ghost" => Some(format!(
             "https://www.google.com/search?q={q}&hl=en&gl=us&num=15&ie=utf-8&oe=utf-8"
         )),
         "brave" => Some(format!("https://search.brave.com/search?q={q}")),
@@ -587,6 +591,20 @@ pub fn serp_url(engine: &str, query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_http_and_browser_keep_distinct_endpoints_and_parsers() {
+        assert!(serp_url("google", "rust").unwrap().contains("/wml/search?"));
+        assert!(
+            serp_url("google_ghost", "rust")
+                .unwrap()
+                .contains("/search?")
+        );
+        assert!(!serp_url("google_ghost", "rust").unwrap().contains("/wml/"));
+        let desktop = r#"<div class="g"><a href="https://example.org/"><h3>Title</h3></a><div class="VwiEFb">Snippet</div></div>"#;
+        assert_eq!(parse("google_ghost", desktop).len(), 1);
+        assert!(parse("google", desktop).is_empty());
+    }
 
     #[test]
     fn serp_url_detection() {
