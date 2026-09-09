@@ -378,7 +378,67 @@ mod linux {
         }
         // Socket exists: is anyone listening? Try connecting. If it
         // fails, the socket is stale.
-        std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+            return false;
+        }
+        // A tombstone socket left behind by a zombie'd Xvfb (kill
+        // -9 mid-session) can still answer a bare connect, and a
+        // Chromium client handed that socket will never open CDP
+        // (devtools ws timeout on every tier-2 escalation). A
+        // bounded real-protocol probe settles it: only a server
+        // that answers xdpyinfo within 2 seconds is healthy.
+        if !xdpyinfo_probe().await {
+            return false;
+        }
+        true
+    }
+
+    /// Real X-protocol probe. False when xdpyinfo is missing (the
+    /// cheaper connect-only semantics still apply) or the display
+    /// does not answer within the budget.
+    async fn xdpyinfo_probe() -> bool {
+        static PROBE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        const PRESENT: u8 = 1;
+        const MISSING: u8 = 2;
+        let state = PROBE_STATE.load(std::sync::atomic::Ordering::Relaxed);
+        let present = if state == PRESENT {
+            true
+        } else if state == MISSING {
+            false
+        } else {
+            let ok = tokio::process::Command::new("which")
+                .arg("xdpyinfo")
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            PROBE_STATE.store(
+                if ok { PRESENT } else { MISSING },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            ok
+        };
+        if !present {
+            return true; // xdpyinfo absent: trust the connect check
+        }
+        let display = format!(":{}", display_num());
+        let child = tokio::process::Command::new("xdpyinfo")
+            .arg("-display")
+            .arg(&display)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(_) => return true, // spawn failed: do not veto on tooling
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(status)) => status.success(),
+            _ => {
+                let _ = child.kill().await;
+                false
+            }
+        }
     }
 }
 
