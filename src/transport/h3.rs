@@ -46,6 +46,7 @@ pub struct QuicStats {
     pub resumed: bool,
     pub pkts_in: u64,
     pub pkts_out: u64,
+    pub total_ms: u128,
 }
 
 pub struct H3Out {
@@ -56,7 +57,6 @@ pub struct H3Out {
 }
 
 pub struct H3Request<'a> {
-    pub origin: &'a str,
     pub egress: &'a str,
     pub host: &'a str,
     pub port: u16,
@@ -111,7 +111,6 @@ pub async fn h3_fetch_heat(
     profile: &crate::profile::BrowserProfile,
 ) -> Result<(H3Out, QuicStats), FetchError> {
     h3_fetch_inner(
-        req.origin,
         req.egress,
         req.host,
         req.port,
@@ -128,7 +127,6 @@ pub async fn h3_fetch_heat(
 
 #[allow(clippy::too_many_arguments)]
 async fn h3_fetch_inner(
-    origin: &str,
     egress: &str,
     host: &str,
     port: u16,
@@ -153,8 +151,11 @@ async fn h3_fetch_inner(
     // Ticket load: when there is one, arm 0-RTT (a ticket must exist
     // for the early-data to fire) and stamp it before quiche's first
     // packet leaves.
-    let resumed = crate::transport::routes::load_h3_session(origin, egress);
-    if resumed.is_some() {
+    let resumed = crate::transport::routes::load_h3_session(authority, egress);
+    if let Some(bytes) = &resumed {
+        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            eprintln!("[h3] session resume armed ({} bytes)", bytes.len());
+        }
         cfg.enable_early_data();
     }
 
@@ -281,6 +282,27 @@ async fn h3_fetch_inner(
                 };
                 match event {
                     h3::Event::Headers { list, .. } => {
+                        // Early-hints (1xx) over h3 are informational:
+                        // the final status and body follow on the same
+                        // stream. Record alt-svc hints, keep polling. A
+                        // 1xx is only treated as final if it is also
+                        // the last... never: non-1xx always wins.
+                        let is_informational = list.iter().any(|h| {
+                            h.name() == b":status"
+                                && std::str::from_utf8(h.value())
+                                    .ok()
+                                    .and_then(|x| x.trim().parse::<u16>().ok())
+                                    .is_some_and(|s| s < 200)
+                        });
+                        if is_informational {
+                            for hdr in &list {
+                                if hdr.name() == b"alt-svc" {
+                                    altsvc =
+                                        Some(String::from_utf8_lossy(hdr.value()).into_owned());
+                                }
+                            }
+                            continue;
+                        }
                         for hdr in &list {
                             if hdr.name() == b":status" && status == 0 {
                                 status = std::str::from_utf8(hdr.value())
@@ -369,7 +391,7 @@ async fn h3_fetch_inner(
                 if std::env::var_os("DONGHOST_DEBUG").is_some() {
                     eprintln!("[h3] session saved {} bytes", sess.len());
                 }
-                crate::transport::routes::save_h3_session(origin, egress, sess);
+                crate::transport::routes::save_h3_session(authority, egress, sess);
             } else if std::env::var_os("DONGHOST_DEBUG").is_some() {
                 eprintln!("[h3] no session ticket before close");
             }
@@ -387,6 +409,7 @@ async fn h3_fetch_inner(
                     resumed: conn.is_resumed(),
                     pkts_in,
                     pkts_out,
+                    total_ms: started.elapsed().as_millis(),
                 },
             ));
         }
@@ -408,6 +431,7 @@ async fn h3_fetch_inner(
                         resumed: conn.is_resumed(),
                         pkts_in,
                         pkts_out,
+                        total_ms: started.elapsed().as_millis(),
                     },
                 ));
             }
@@ -463,9 +487,7 @@ pub async fn h3_fetch_direct(
         .find(|(n, _)| n == "user-agent")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
-    let origin = format!("https://{authority}");
     let req = H3Request {
-        origin: &origin,
         egress: "direct",
         host,
         port,
@@ -483,12 +505,13 @@ pub async fn h3_fetch_direct(
     let (out, stats) = h3_fetch_heat(&req, &profile).await?;
     if std::env::var_os("DONGHOST_DEBUG").is_some() {
         eprintln!(
-            "[h3] stats {}:{} early={} resumed={} hs_ms={} pkts_in={} pkts_out={}",
+            "[h3] stats {}:{} early={} resumed={} hs_ms={} total_ms={} pkts_in={} pkts_out={}",
             host,
             port,
             stats.early_data,
             stats.resumed,
             stats.handshake_ms,
+            stats.total_ms,
             stats.pkts_in,
             stats.pkts_out
         );

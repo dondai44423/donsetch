@@ -213,6 +213,16 @@ pub fn drop_h3(origin: &str) {
 
 pub fn save_h3_session(origin: &str, egress: &str, session: &[u8]) {
     with(|mem| {
+        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            eprintln!(
+                "[routes] save_h3_session key={origin} eg={egress} n={} match={}",
+                mem.routes.len(),
+                mem.routes
+                    .get(origin)
+                    .map(|s| s.egress.clone())
+                    .unwrap_or_default()
+            );
+        }
         if let Some(st) = mem.routes.get_mut(origin)
             && st.egress == egress
         {
