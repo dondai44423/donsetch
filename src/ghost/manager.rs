@@ -382,6 +382,14 @@ impl GhostManager {
                     }
                 } else if idle > FREEZE_AFTER {
                     g.freeze();
+                    if let Ok(mut snaps) = self.meta.lock()
+                        && let Some(snap) = snaps.get_mut(idx)
+                    {
+                        // Freeze is the start of the reap countdown: the
+                        // reaper must not age a fresh freeze with the
+                        // pre-freeze idle clock.
+                        snap.used = Instant::now();
+                    }
                 }
             }
         }
