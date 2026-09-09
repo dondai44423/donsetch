@@ -88,6 +88,13 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Xvfb reuse gate now demands a bounded real-protocol answer
+  (xdpyinfo within 2s) before handing a display to the pool, so a
+  SIGKILLed Xvfb's tombstone socket can no longer wedge every
+  tier-2 escalation behind an honest "devtools ws timeout".
+- The ghost-pool selector tracks the slot's in-flight lock as a
+  busy flag: a concurrent same-persona hit spawns on a free slot
+  instead of serializing behind a warm one.
 - Search pacing uses cancellation-safe per-engine/egress admission;
   waiting is included in attempt deadlines and cancelled waiters
   leave no future-slot debt. Google HTTP health is isolated from
