@@ -547,16 +547,24 @@ Disable with `DONSEEK_NO_DISK_STATE=1`.
 
 ## 🔎 Keyless search
 
-No API key, no account. 5 keyless engines across 4 independent index
+No API key, no account. 6 keyless engines across 4 independent index
 families + 8 official verticals run in parallel on your machine, merged,
 deduped, ranked.
 
-- **Backends:** Bing-family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek
+- **Backends:** Bing-family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek, Google
   + keyless verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv,
   StackExchange, MDN, Google News).
+- **Native Google:** browser-free HTTP via the legacy mobile endpoint, using
+  the existing Rust transport. Seven selectable, experimentally verified Nokia
+  profiles; the default is `6230-03.15`. No paid API or CAPTCHA solver.
+  Successful profiles remain preferred per egress in memory; CAPTCHA advances
+  circularly through the profiles. Retry, pacing and quarantine use the same
+  policy as other engines, with no per-profile cooldowns. Selection resets on
+  restart. Rate limits do not advance the profile cursor.
+  Availability depends on Google and the network; see [configuration and limits](docs/google-wml.md).
 - **Ghost SERP cascade lane:** if the plain fan-out and its retry wave
-  leave the merge thin (<3 lanes or <15 hits), one headless render
-  unlocks Google's 2026 JS-shell SERP as a 4th consensus family. Costs
+  leave the merge thin (<3 lanes or <15 hits) and native Google failed,
+  one headless render can recover Google's desktop SERP. Costs
   nothing when healthy (only fires under underdelivery); reports itself
   honestly as `google_ghost`.
 - **Semantic reranking**: local ONNX cross-encoder

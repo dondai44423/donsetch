@@ -37,6 +37,7 @@ use intent::Intent;
 use rank::Merged;
 
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
+const RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Chronic-failure bench time. A walled engine stops wasting a
 /// fan-out slot for this long after 3 consecutive strikes.
@@ -122,12 +123,17 @@ fn norm_query(q: &str) -> String {
 /// A single predicate so quarantine and trust tracking can't drift
 /// out of sync with each other again.
 fn is_engine_fault(status: &str) -> bool {
-    !status.starts_with("dead") && status != "auth-fail" && status != "no-results"
+    !status.starts_with("dead")
+        && status != "auth-fail"
+        && status != "no-results"
+        && status != "invalid-config"
+        && status != "pacing-timeout"
 }
 
 pub struct Searcher {
     fetcher: Fetcher,
     pool: EgressPool,
+    google: engines::google_wml::ProfileSelector,
     /// engine -> trust EWMA (1.0 seed; 0.2..2.0 clamp).
     /// Persisted to disk: an engine that learned "this walled me"
     /// keeps that memory across daemon restarts instead of
@@ -190,6 +196,8 @@ where
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineReport {
     pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub status: String,
     pub hits: usize,
     pub ms: u64,
@@ -218,6 +226,7 @@ impl Searcher {
         Self {
             fetcher,
             pool,
+            google: engines::google_wml::ProfileSelector::from_env(),
             trust: Mutex::new(trust),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
             cache: Mutex::new(load_cache_disk()),
@@ -417,7 +426,7 @@ impl Searcher {
         // goes only to the first two engines (top trust).
         let mut live: Vec<&str> = engines
             .iter()
-            .filter(|e| !self.quarantined(e))
+            .filter(|e| !self.quarantined(engine_health_key(e)))
             .copied()
             .collect();
         // Rank engines by learned trust so width cuts drop
@@ -429,10 +438,10 @@ impl Searcher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             live.sort_by(|a, b| {
                 trust
-                    .get(*b)
+                    .get(engine_health_key(b))
                     .copied()
                     .unwrap_or(1.0)
-                    .total_cmp(&trust.get(*a).copied().unwrap_or(1.0))
+                    .total_cmp(&trust.get(engine_health_key(a)).copied().unwrap_or(1.0))
             });
         }
         // ── Adaptive fan-out width: the governor. Under
@@ -462,25 +471,13 @@ impl Searcher {
         //
         // We only exclude proxy egresses from reuse : direct
         // is shared, not exclusive.
-        let has_proxies = self.pool.has_proxies();
-        for (engine, q) in assignments {
-            let Some(eg) = self.pool.pick(&engine, &used_egresses, true) else {
-                break;
-            };
-            // Exclude proxy egresses (spread across proxies)
-            // but NOT direct (multiple PROXY_AVERSE engines
-            // share the direct lane with pacing).
-            if has_proxies && eg.proxy.is_some() {
-                used_egresses.push(eg.id.clone());
-            }
-            futures.push(Box::pin(engine_task(
-                engine,
-                q,
-                eg.id,
-                eg.proxy,
-                &self.fetcher,
-                &self.pool,
-            )));
+        let context = tasks::EngineContext {
+            fetcher: &self.fetcher,
+            pool: &self.pool,
+            google: &self.google,
+        };
+        for (engine, q, eg) in assign_egresses(&self.pool, assignments, &mut used_egresses) {
+            futures.push(Box::pin(engine_task(engine, q, eg.id, eg.proxy, context)));
         }
         // Verticals: direct, friendly APIs.
         let verticals: Vec<&&str> = verticals.iter().filter(|v| !self.quarantined(v)).collect();
@@ -509,14 +506,24 @@ impl Searcher {
         let failed: Vec<String> = if merge_thin {
             outcomes
                 .iter()
-                .filter(|(_, r)| matches!(r, Err((s, _, _)) if s != "no-results"))
+                .filter(|(_, r)| matches!(r, Err((s, _, _)) if retry_engine_failure(s)))
                 .map(|(e, _)| e.split('@').next().unwrap_or(e).to_string())
                 .collect()
         } else {
             Vec::new()
         };
         let mut retry_futures: Vec<TaskFut> = Vec::new();
+        let mut retried = std::collections::HashSet::new();
         for engine in &failed {
+            if !retried.insert(engine) {
+                continue;
+            }
+            if outcomes
+                .iter()
+                .any(|(label, outcome)| engine_name(label) == engine && outcome.is_ok())
+            {
+                continue;
+            }
             let is_vertical = matches!(
                 engine.as_str(),
                 "github"
@@ -534,11 +541,18 @@ impl Searcher {
                 let Some(eg) = self.pool.pick("github", &[], false) else {
                     continue;
                 };
-                retry_futures.push(Box::pin(vertical_task(
+                let task = Box::pin(vertical_task(
                     engine.clone(),
                     query.to_string(),
                     &self.fetcher,
                     eg.proxy,
+                ));
+                retry_futures.push(Box::pin(bounded_retry(
+                    task,
+                    engine.clone(),
+                    eg.id,
+                    false,
+                    RETRY_TIMEOUT,
                 )));
                 continue;
             }
@@ -547,30 +561,30 @@ impl Searcher {
             let Some(eg) = self.pool.pick(engine, &used_egresses, true) else {
                 continue;
             };
-            retry_futures.push(Box::pin(engine_task(
+            let previous = outcomes.iter().find_map(|(label, result)| {
+                if engine_name(label) == engine
+                    && let Err((status, _, _)) = result
+                {
+                    Some((label.as_str(), status.as_str()))
+                } else {
+                    None
+                }
+            });
+            retry_futures.push(Box::pin(tasks::engine_task_with_budget(
                 retry_engine.to_string(),
                 query.to_string(),
                 eg.id,
                 eg.proxy,
-                &self.fetcher,
-                &self.pool,
+                context,
+                RETRY_TIMEOUT,
+                previous,
             )));
         }
-        let retry_outcomes = if retry_futures.is_empty() {
-            Vec::new()
-        } else {
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                futures_util::future::join_all(retry_futures),
-            )
-            .await
-            .unwrap_or_default()
-        };
+        let retry_outcomes = futures_util::future::join_all(retry_futures).await;
 
         // ── Ghost SERP cascade lane ──
-        // 2026 Google serves a JS shell to plain HTTP (live-proven:
-        // 0 result anchors in 92KB), but it renders fine in our own
-        // headless browser (also live-proven: parse-ready div.g blocks).
+        // Google's desktop endpoint may serve a JS shell to plain HTTP.
+        // The WML HTTP lane uses a separate layout and legacy User-Agent.
         // When the plain fan-out AND its retry wave still left the
         // merge thin, one browser render buys a genuinely independent
         // index family instead of shipping weak results.
@@ -582,23 +596,28 @@ impl Searcher {
                 .map(|(h, _, _, _)| h.len())
                 .sum::<usize>();
         let force_lane = std::env::var_os("DONSEEK_FORCE_GHOST_LANE").is_some();
+        let google_http_ok = outcomes
+            .iter()
+            .chain(&retry_outcomes)
+            .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
         let lane_permitted = self.ghost.is_some()
             && std::env::var_os("DONSEEK_NO_GHOST_LANES").is_none()
-            && !self.quarantined("google");
-        let lane_outcomes: Vec<(String, EngineResult)> =
-            if lane_permitted && (force_lane || ghost_lane_wanted(retry_ok, retry_hits)) {
-                let hook = self.ghost.as_ref().unwrap().clone();
-                let task = ghost_engine_task("google_ghost".to_string(), query.to_string(), hook);
-                match tokio::time::timeout(Duration::from_secs(30), task).await {
-                    Ok(outcome) => vec![outcome],
-                    Err(_) => vec![(
-                        "google_ghost".to_string(),
-                        Err(("ghost-timeout".into(), "ghost".into(), true)),
-                    )],
-                }
-            } else {
-                Vec::new()
-            };
+            && !self.quarantined("google_ghost");
+        let lane_outcomes: Vec<(String, EngineResult)> = if lane_permitted
+            && google_ghost_wanted(force_lane, google_http_ok, retry_ok, retry_hits)
+        {
+            let hook = self.ghost.as_ref().unwrap().clone();
+            let task = ghost_engine_task("google_ghost".to_string(), query.to_string(), hook);
+            match tokio::time::timeout(Duration::from_secs(30), task).await {
+                Ok(outcome) => vec![outcome],
+                Err(_) => vec![(
+                    "google_ghost".to_string(),
+                    Err(("ghost-timeout".into(), "ghost".into(), true)),
+                )],
+            }
+        } else {
+            Vec::new()
+        };
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
@@ -607,23 +626,26 @@ impl Searcher {
             .chain(retry_outcomes)
             .chain(lane_outcomes)
             .collect();
-        for (engine, outcome) in all {
+        for (label, outcome) in all {
+            let profile = label.split_once('@').map(|(_, p)| p.to_string());
+            let engine = engine_name(&label).to_string();
             let ghost_lane = engine == "google_ghost";
             match outcome {
                 Ok((hits, ms, egress_id, was_engine)) => {
-                    let base = engine.split('_').next().unwrap_or(&engine);
+                    let base = engine_health_key(&engine);
                     self.record_outcome(base, true);
                     if was_engine && !ghost_lane {
                         // "ghost" is not an egress id: pool
                         // bookkeeping must not record lanes that
                         // the pool never assigned.
-                        self.pool.report_ok(base, &egress_id);
+                        self.pool.report_ok(&engine, &egress_id);
                     }
                     if was_engine || ghost_lane {
                         self.bump_trust(base, true);
                     }
                     report.push(EngineReport {
                         engine: engine.clone(),
+                        profile: profile.clone(),
                         status: "ok".into(),
                         hits: hits.len(),
                         ms,
@@ -632,7 +654,7 @@ impl Searcher {
                     per_engine.push((engine, hits));
                 }
                 Err((status, egress_id, was_engine)) => {
-                    let base = engine.split('_').next().unwrap_or(&engine);
+                    let base = engine_health_key(&engine);
                     // Dead proxies and auth failures are egress/BYOK
                     // problems, not engine failures : don't quarantine
                     // or distrust the engine over them.
@@ -644,8 +666,8 @@ impl Searcher {
                             self.pool.report_dead(&egress_id);
                         } else if status == "auth-fail" {
                             self.pool.report_auth_fail(&egress_id);
-                        } else if status != "no-results" {
-                            self.pool.report_blocked(base, &egress_id);
+                        } else if is_engine_fault(&status) {
+                            self.pool.report_blocked(&engine, &egress_id);
                         }
                     }
                     if (was_engine || ghost_lane) && is_engine_fault(&status) {
@@ -653,6 +675,7 @@ impl Searcher {
                     }
                     report.push(EngineReport {
                         engine,
+                        profile,
                         status,
                         hits: 0,
                         ms: 0,
@@ -684,11 +707,18 @@ impl Searcher {
             )));
         }
 
-        let trust = self
+        let mut trust = self
             .trust
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // Public result names stay stable; ranking must use the new HTTP
+        // health namespace, never legacy browser health stored as `google`.
+        let google_trust = trust
+            .get(engine_health_key("google"))
+            .copied()
+            .unwrap_or(1.0);
+        trust.insert("google".into(), google_trust);
         let total = rank::merged_total(&per_engine);
         // Always merge 12 results for the cache, then trim to
         // max_results for the response. Without this, a first
@@ -803,10 +833,71 @@ impl Searcher {
     }
 }
 
-/// Thinness gate for the ghost cascade lane, kept pure for
-/// tests. Same thresholds as the plain retry wave: a merge
-/// with <3 working lanes or <15 hits is not a healthy merge,
-/// and one browser render is cheaper than weak results.
+/// Assignment only: eligibility remains owned by EgressPool::pick.
+/// Keep this pass shared by the real fan-out and its offline regression tests.
+fn assign_egresses(
+    pool: &EgressPool,
+    assignments: Vec<(String, String)>,
+    used: &mut Vec<String>,
+) -> Vec<(String, String, egress::Egress)> {
+    let mut selected = Vec::new();
+    let has_proxies = pool.has_proxies();
+    for (engine, query) in assignments {
+        let Some(egress) = pool.pick(&engine, used, true) else {
+            // Unavailable for this engine does not mean unavailable for peers.
+            continue;
+        };
+        // Spread configured proxies; direct remains shared with pacing.
+        if has_proxies && egress.proxy.is_some() {
+            used.push(egress.id.clone());
+        }
+        selected.push((engine, query, egress));
+    }
+    selected
+}
+
+fn engine_name(label: &str) -> &str {
+    label.split('@').next().unwrap_or(label)
+}
+
+fn engine_health_key(engine: &str) -> &str {
+    let engine = engine_name(engine);
+    if engine == "google" {
+        return "google_http_v1";
+    }
+    // Different Google transports can fail independently; only ranking groups
+    // them into one index family. A WML block must not quarantine the browser.
+    if engine == "google_ghost" {
+        engine
+    } else {
+        egress::health_key(engine)
+    }
+}
+
+fn retry_engine_failure(status: &str) -> bool {
+    !matches!(status, "no-results" | "pacing-timeout" | "invalid-config")
+}
+
+/// Vertical retries retain explicit timeout outcomes; engine tasks own their
+/// deadline internally so diagnostics include the identity actually attempted.
+async fn bounded_retry(
+    task: TaskFut<'_>,
+    engine: String,
+    egress: String,
+    was_engine: bool,
+    budget: Duration,
+) -> (String, EngineResult) {
+    tokio::time::timeout(budget, task)
+        .await
+        .unwrap_or_else(|_| (engine, Err(("retry-timeout".into(), egress, was_engine))))
+}
+
+fn google_ghost_wanted(force: bool, http_ok: bool, engines_ok: usize, hits_ok: usize) -> bool {
+    force || (!http_ok && ghost_lane_wanted(engines_ok, hits_ok))
+}
+
+/// Thinness gate for the ghost cascade lane. A successful HTTP Google
+/// response already supplies that index; the caller skips the browser then.
 fn ghost_lane_wanted(engines_ok: usize, hits_ok: usize) -> bool {
     engines_ok < 3 || hits_ok < 15
 }
@@ -903,6 +994,156 @@ mod tests {
     use super::render::clip_snippet;
     use super::*;
 
+    #[test]
+    fn regression_unavailable_google_does_not_stop_other_assignments() {
+        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:12345").unwrap();
+        let id = proxy.id();
+        let pool = EgressPool::new(vec![proxy]);
+        pool.report_blocked("google", &id);
+        let assignments = ["google", "bing"]
+            .map(|e| (e.into(), "query".into()))
+            .to_vec();
+        // Explicitly unavailable direct lane; the proxy is still viable for Bing.
+        let selected = assign_egresses(&pool, assignments, &mut vec!["direct".into()]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(engine, _, _)| engine.as_str())
+                .collect::<Vec<_>>(),
+            ["bing"]
+        );
+    }
+
+    #[test]
+    fn assignments_preserve_proxy_spreading_and_shared_direct_lane() {
+        let proxies = ["http://127.0.0.1:12345", "http://127.0.0.1:12346"]
+            .map(|url| crate::transport::proxy::Proxy::parse(url).unwrap())
+            .to_vec();
+        let pool = EgressPool::new(proxies);
+        let assignments = ["bing", "yahoo", "brave", "ddg"]
+            .map(|e| (e.into(), "query".into()))
+            .to_vec();
+        let mut used = Vec::new();
+        let selected = assign_egresses(&pool, assignments, &mut used);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(used, ["127.0.0.1:12345", "127.0.0.1:12346"]);
+        assert_eq!(selected[2].2.id, "direct");
+        assert_eq!(selected[3].2.id, "direct");
+    }
+
+    #[test]
+    fn google_transport_health_is_separate_but_index_family_is_shared() {
+        assert_eq!(engine_health_key("google@6230-05.50"), "google_http_v1");
+        assert_ne!(engine_health_key("google"), "google");
+        assert_ne!(
+            engine_health_key("google"),
+            engine_health_key("google_ghost")
+        );
+        assert_eq!(engine_health_key("ddg_html"), "ddg");
+        assert_eq!(
+            rank::engine_family("google"),
+            rank::engine_family("google_ghost")
+        );
+    }
+
+    #[test]
+    fn engine_reports_load_legacy_cache_and_preserve_new_profile() {
+        let mut report: EngineReport = serde_json::from_str(
+            r#"{"engine":"google","status":"ok","hits":10,"ms":700,"egress":"direct"}"#,
+        )
+        .unwrap();
+        assert!(report.profile.is_none());
+        report.profile = Some("6230-04.44".into());
+        let reloaded: EngineReport =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(reloaded.profile.as_deref(), Some("6230-04.44"));
+    }
+
+    #[test]
+    fn successful_google_http_skips_browser_unless_explicitly_forced() {
+        assert!(!google_ghost_wanted(false, true, 1, 3));
+        assert!(google_ghost_wanted(false, false, 1, 3));
+        assert!(!google_ghost_wanted(false, false, 4, 20));
+        assert!(google_ghost_wanted(true, true, 4, 20));
+    }
+
+    #[test]
+    fn all_engines_share_retry_eligibility() {
+        for status in [
+            "blocked:captcha",
+            "blocked:429",
+            "blocked:consent",
+            "blocked:http-status",
+            "empty-parse",
+            "net",
+            "timeout",
+            "dead-proxy",
+            "auth-fail",
+        ] {
+            assert!(retry_engine_failure(status));
+            if !matches!(status, "dead-proxy" | "auth-fail") {
+                assert!(is_engine_fault(status));
+            }
+        }
+        for status in ["invalid-config", "no-results", "pacing-timeout"] {
+            assert!(!retry_engine_failure(status));
+            assert!(!is_engine_fault(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_retry_does_not_discard_completed_peer() {
+        let fast: TaskFut = Box::pin(async {
+            (
+                "google".into(),
+                Err(("blocked:captcha".into(), "direct".into(), true)),
+            )
+        });
+        let slow: TaskFut = Box::pin(std::future::pending());
+        let outcomes = futures_util::future::join_all(vec![
+            bounded_retry(
+                fast,
+                "google".into(),
+                "direct".into(),
+                true,
+                Duration::from_millis(20),
+            ),
+            bounded_retry(
+                slow,
+                "bing".into(),
+                "direct".into(),
+                true,
+                Duration::from_millis(10),
+            ),
+        ])
+        .await;
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(&outcomes[1].1, Err((s, _, _)) if s == "retry-timeout"));
+        assert_eq!(outcomes[0].0, "google");
+        // A second CAPTCHA is reported, not recursively scheduled.
+        assert!(matches!(&outcomes[0].1, Err((s, _, _)) if s == "blocked:captcha"));
+    }
+
+    #[test]
+    fn native_google_is_available_once_in_every_intent_roster() {
+        for intent in [
+            intent::Intent::Web,
+            intent::Intent::Code,
+            intent::Intent::News,
+            intent::Intent::Entity,
+            intent::Intent::Paper,
+        ] {
+            assert_eq!(
+                intent::engines_for(intent)
+                    .iter()
+                    .filter(|e| **e == "google")
+                    .count(),
+                1
+            );
+            assert!(!intent::engines_for(intent).contains(&"google_ghost"));
+        }
+    }
+
     // Egress/BYOK-auth noise must never look like the engine
     // misbehaving: record_outcome (quarantine) and bump_trust (the
     // ranking-weight EWMA) both gate on this predicate, and had
@@ -914,6 +1155,7 @@ mod tests {
         assert!(!is_engine_fault("dead-proxy"));
         assert!(!is_engine_fault("auth-fail"));
         assert!(!is_engine_fault("no-results"));
+        assert!(!is_engine_fault("invalid-config"));
         assert!(is_engine_fault("blocked:403"));
         assert!(is_engine_fault("blocked:captcha"));
         assert!(is_engine_fault("empty-parse"));
@@ -1234,6 +1476,7 @@ mod tests {
         search.report = vec![
             EngineReport {
                 engine: "bing".into(),
+                profile: None,
                 status: "ok".into(),
                 hits: 10,
                 ms: 12,
@@ -1241,6 +1484,7 @@ mod tests {
             },
             EngineReport {
                 engine: "ddg".into(),
+                profile: None,
                 status: "blocked:403".into(),
                 hits: 0,
                 ms: 20,

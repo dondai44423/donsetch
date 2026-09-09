@@ -248,6 +248,7 @@ impl ByokSearcher {
                     let results = to_merged(outcome.hits, &provider, max);
                     let report = vec![EngineReport {
                         engine: provider.clone(),
+                        profile: None,
                         status: if outcome.degraded {
                             "degraded".into()
                         } else {

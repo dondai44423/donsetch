@@ -315,9 +315,13 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
                 "engines": seen_engines,
             })
         }).collect::<Vec<_>>(),
-        "engines": out.report.iter().map(|r| json!({
-            "engine": r.engine, "status": r.status, "hits": r.hits, "ms": r.ms,
-            "egress": egress_label(&r.egress),
-        })).collect::<Vec<_>>(),
+        "engines": out.report.iter().map(|r| {
+            let mut report = json!({
+                "engine": r.engine, "status": r.status, "hits": r.hits, "ms": r.ms,
+                "egress": egress_label(&r.egress),
+            });
+            if let Some(profile) = &r.profile { report["profile"] = json!(profile); }
+            report
+        }).collect::<Vec<_>>(),
     })
 }

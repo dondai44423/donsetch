@@ -43,6 +43,11 @@ pub struct FetchOutcome {
     pub elapsed: Duration,
 }
 
+struct RequestIdentity<'a> {
+    class: RequestClass,
+    legacy_user_agent: Option<&'a str>,
+}
+
 pub struct Fetcher {
     profile: BrowserProfile,
     connector: boring::ssl::SslConnector,
@@ -428,6 +433,62 @@ impl Fetcher {
         referer: Option<&str>,
         class: RequestClass,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_once_via_identity(
+            url_str,
+            conditional,
+            proxy,
+            use_jar,
+            referer,
+            RequestIdentity {
+                class,
+                legacy_user_agent: None,
+            },
+        )
+        .await
+    }
+
+    /// One cookie-less hop with a request-local legacy User-Agent.
+    /// Reuses TLS, connection pooling and URL guards; does not mutate the
+    /// shared browser profile or follow redirects with this identity.
+    pub async fn fetch_once_via_user_agent(
+        &self,
+        url_str: &str,
+        proxy: Option<&proxy::Proxy>,
+        user_agent: &str,
+    ) -> Result<FetchOutcome, FetchError> {
+        if user_agent.is_empty()
+            || !user_agent.is_ascii()
+            || user_agent.bytes().any(|b| b.is_ascii_control())
+        {
+            return Err(FetchError::Http("invalid User-Agent".into()));
+        }
+        self.fetch_once_via_identity(
+            url_str,
+            &[],
+            proxy,
+            false,
+            None,
+            RequestIdentity {
+                class: RequestClass::Navigation,
+                legacy_user_agent: Some(user_agent),
+            },
+        )
+        .await
+    }
+
+    async fn fetch_once_via_identity(
+        &self,
+        url_str: &str,
+        conditional: &[(String, String)],
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        identity: RequestIdentity<'_>,
+    ) -> Result<FetchOutcome, FetchError> {
+        let RequestIdentity {
+            class,
+            legacy_user_agent: user_agent,
+        } = identity;
         // Centralized gate ensures credentials/host checks even for
         // direct fetch_once calls (e.g. tests, internal callers).
         // Includes DNS resolution : every target, including proxy
@@ -463,6 +524,19 @@ impl Fetcher {
 
         // Header set from profile (Chrome order, coherence) + cookie + conditionals.
         let mut req_headers = self.profile.h1_headers_for_class(&authority, &path, class);
+        if let Some(ua) = user_agent {
+            // These browser metadata headers do not describe a legacy client.
+            req_headers.retain(|(n, _)| {
+                !n.starts_with("sec-ch-ua")
+                    && !n.starts_with("sec-fetch-")
+                    && n != "upgrade-insecure-requests"
+            });
+            for (name, value) in &mut req_headers {
+                if name == "user-agent" {
+                    *value = ua.to_owned();
+                }
+            }
+        }
         if use_jar {
             let jar = self
                 .jar

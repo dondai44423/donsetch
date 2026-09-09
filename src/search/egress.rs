@@ -17,7 +17,8 @@
 //!   startup and never assigned mid-query.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+type PaceGate = Arc<tokio::sync::Mutex<Option<Instant>>>;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,15 @@ const DIRECT_JITTER_MS: u64 = 2000;
 /// because our residential IP isn't on blocklists.
 const PROXY_AVERSE: &[&str] = &["brave", "ddg"];
 
+/// Health is shared by DDG's primary and alternate endpoints. This is not
+/// ranking's index-family map: Bing and Yahoo keep their own egress health.
+pub(super) fn health_key(engine: &str) -> &str {
+    match engine {
+        "ddg_lite" | "ddg_html" => "ddg",
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
     Healthy,
@@ -54,11 +64,11 @@ pub struct Egress {
 struct PairState {
     health: Health,
     burned_until: Option<Instant>,
-    last_used: Option<Instant>,
 }
 
 pub struct EgressPool {
     egresses: Vec<Egress>,
+    pacing: Mutex<HashMap<(String, String), PaceGate>>,
     /// (engine, egress_id) -> state
     pairs: Mutex<HashMap<(String, String), PairState>>,
     /// Global proxy liveness (connect failures burn a proxy
@@ -94,6 +104,7 @@ impl EgressPool {
         }
         Self {
             egresses,
+            pacing: Mutex::new(HashMap::new()),
             pairs: Mutex::new(HashMap::new()),
             dead: Mutex::new(HashMap::new()),
             stress_ok: AtomicU32::new(2000), // seed optimistic
@@ -152,6 +163,7 @@ impl EgressPool {
     /// - everyone else rides proxies first; direct only as
     ///   last resort (protect the home IP)
     pub fn pick(&self, engine: &str, exclude: &[String], direct_available: bool) -> Option<Egress> {
+        let engine = health_key(engine);
         let pairs = self
             .pairs
             .lock()
@@ -226,6 +238,7 @@ impl EgressPool {
 
     /// Record a successful engine call through this egress.
     pub fn report_ok(&self, engine: &str, egress_id: &str) {
+        let engine = health_key(engine);
         self.stress_record(true);
         let mut pairs = self
             .pairs
@@ -236,16 +249,15 @@ impl EgressPool {
             .or_insert(PairState {
                 health: Health::Suspect,
                 burned_until: None,
-                last_used: None,
             });
         s.health = Health::Healthy;
         s.burned_until = None;
-        s.last_used = Some(Instant::now());
     }
 
     /// Engine rejected us (429 / challenge / empty parse):
     /// burn the pair, not the engine.
     pub fn report_blocked(&self, engine: &str, egress_id: &str) {
+        let engine = health_key(engine);
         self.stress_record(false);
         let mut pairs = self
             .pairs
@@ -256,7 +268,6 @@ impl EgressPool {
             .or_insert(PairState {
                 health: Health::Suspect,
                 burned_until: None,
-                last_used: None,
             });
         s.health = match s.health {
             Health::Healthy => Health::Suspect,
@@ -265,7 +276,6 @@ impl EgressPool {
                 Health::Burned
             }
         };
-        s.last_used = Some(Instant::now());
     }
 
     /// The egress line itself is dead (connect failure).
@@ -316,19 +326,79 @@ impl EgressPool {
             (MIN_INTERVAL, JITTER_MS)
         };
         let interval = base + Duration::from_millis(jitter(jit));
-        let wait = {
-            let pairs = self
-                .pairs
+        let gate = {
+            let mut gates = self
+                .pacing
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pairs
-                .get(&(engine.to_string(), egress_id.to_string()))
-                .and_then(|s| s.last_used)
-                .map(|t| interval.saturating_sub(t.elapsed()))
-                .unwrap_or(Duration::ZERO)
+            gates
+                .entry((engine.into(), egress_id.into()))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+                .clone()
         };
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+        // FIFO, cancellation-safe admission. Waiters reserve no future slots.
+        // Cancellation drops the guard without changing the last admission.
+        let mut last = gate.lock().await;
+        if let Some(at) = *last {
+            tokio::time::sleep(interval.saturating_sub(at.elapsed())).await;
+        }
+        *last = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    #[test]
+    fn regression_ddg_fallback_updates_the_selected_egress_health() {
+        let proxy = Proxy::parse("http://127.0.0.1:12345").unwrap();
+        let id = proxy.id();
+        let pool = EgressPool::new(vec![proxy]);
+        pool.report_blocked("ddg", &id);
+        pool.report_ok("ddg_html", &id);
+        assert_eq!(pool.pick("ddg", &[], false).map(|e| e.id), Some(id.clone()));
+        pool.report_blocked("ddg_html", &id);
+        pool.report_blocked("ddg_html", &id);
+        pool.report_ok("yahoo", &id);
+        assert!(pool.pick("ddg", &[], false).is_none());
+        assert!(pool.pick("ddg_html", &[], false).is_none());
+        assert!(pool.pick("yahoo", &[], false).is_some());
+        pool.report_ok("ddg_lite", &id);
+        assert!(pool.pick("ddg_html", &[], false).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiters_do_not_reserve_future_slots() {
+        let pool = EgressPool::new(Vec::new());
+        pool.pace("google", "direct").await;
+        let key = ("google".to_string(), "direct".to_string());
+        let gate = pool.pacing.lock().unwrap()[&key].clone();
+        let first = *gate.lock().await;
+        for _ in 0..20 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), pool.pace("google", "direct"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(*gate.lock().await, first);
+        pool.report_ok("google", "direct");
+        pool.report_blocked("google", "direct");
+        assert_eq!(*gate.lock().await, first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pool.pace("bing", "direct"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn direct_last_resort_is_the_same_for_all_engines() {
+        let pool = EgressPool::new(Vec::new());
+        for engine in ["google", "bing", "ddg", "brave"] {
+            pool.report_blocked(engine, "direct");
+            assert_eq!(pool.pick(engine, &[], true).unwrap().id, "direct");
         }
     }
 }
