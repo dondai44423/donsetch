@@ -11,6 +11,15 @@ V4 work in progress on `master`. Nothing below ships through a release
 channel until the v4.0.0 release train.
 
 ### Added
+- Experimental HTTP/3 lane (opt-in via `DONSETCH_H3=1`) on a quiche
+  0.29.3 fork that shares one BoringSSL build with tier-1. An h3
+  route is learned from `alt-svc` response headers (same-origin
+  only, proxies exempt) and persisted in the cache dir under
+  `routes.json` together with the serialized QUIC TLS session. The
+  lane stays off by default: on repeat visits the v1 one-shot
+  connection shape measures slower than our reused h2 pool, and
+  `DONSETCH_NO_H3` kills the whole path regardless. The h3 Client
+  Hello reuses the same Chrome-true TLS builder as h1/h2.
 
 - Native keyless Google search via the legacy mobile endpoint, using
   DonShadow without a browser or paid API. Seven selectable Nokia
@@ -92,9 +101,16 @@ channel until the v4.0.0 release train.
   (xdpyinfo within 2s) before handing a display to the pool, so a
   SIGKILLed Xvfb's tombstone socket can no longer wedge every
   tier-2 escalation behind an honest "devtools ws timeout".
-- The ghost-pool selector tracks the slot's in-flight lock as a
-  busy flag: a concurrent same-persona hit spawns on a free slot
-  instead of serializing behind a warm one.
+- Ghost pool spill fix (mnaza): a same-persona pool previously
+  funneled every distinct host into slot 0, since "any warm
+  same-persona slot" outranked free slots and the daemon always runs
+  one persona. Slot claims (persona key + host) are now stamped and
+  visible to concurrent selectors at pick time under the meta lock,
+  before the seconds-long browser launch, so a second in-flight host
+  claims a free slot and a same-host job joins the in-flight claim
+  and warm-serves it. An exhausted pool reuses our coldest own
+  browser before evicting a stranger's. Their contribution lives as
+  its own rebased commit on master (af13034).
 - Search pacing uses cancellation-safe per-engine/egress admission;
   waiting is included in attempt deadlines and cancelled waiters
   leave no future-slot debt. Google HTTP health is isolated from

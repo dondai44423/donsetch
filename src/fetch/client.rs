@@ -605,6 +605,59 @@ impl Fetcher {
             ));
         }
 
+        // 0) h3 lane (v4 phase 5.1). Direct egress only (UDP does not
+        // tunnel through CONNECT): the h1/h2 path stays the fallback
+        // there. Route memory + kill switch gate it. The attempt's
+        // transport failure drops the route (Chrome semantics: a served
+        // alt-svc that fails vanishes until a header re-vouches).
+        if is_https
+            && proxy.is_none()
+            && !crate::config::env_flag("DONSETCH_NO_H3")
+            && crate::config::env_flag("DONSETCH_H3")
+            && let Some(h3port) = crate::transport::routes::h3_route(&origin, "direct")
+        {
+            match crate::transport::h3::h3_fetch_direct(
+                host,
+                h3port,
+                &path,
+                &authority,
+                req_headers.clone(),
+                None,
+            )
+            .await
+            {
+                Ok((h3out, _stats)) => {
+                    if let Some(alt) = h3out.altsvc.as_ref()
+                        && let Some((port, _)) = crate::transport::routes::parse_h3_candidate(alt)
+                    {
+                        crate::transport::routes::record_h3(&origin, port, 86400, "direct");
+                    }
+                    if h3out.status == 0 || h3out.status < 200 {
+                        crate::transport::routes::drop_h3(&origin);
+                        // fall through to h1/h2
+                    } else {
+                        self.store_hop_cookies(use_jar, host, is_https, &h3out.headers);
+                        return Ok(FetchOutcome {
+                            url: url_str.to_string(),
+                            status: h3out.status,
+                            alpn: "h3".into(),
+                            headers: h3out.headers,
+                            body: h3out.body,
+                            redirects: 0,
+                            cache: CacheState::None,
+                            used_pool: false,
+                            verdict: Verdict::ContentOk,
+                            elapsed: std::time::Duration::from_millis(0),
+                        });
+                    }
+                }
+                Err(_) => {
+                    crate::transport::routes::drop_h3(&origin);
+                    // fall through to h1/h2 below
+                }
+            }
+        }
+
         // 1) Try a pooled h2 connection for this origin.
         let pooled = self
             .pool
@@ -619,6 +672,17 @@ impl Fetcher {
                 Ok(out) => {
                     // verdict already scored by finish()
                     self.store_hop_cookies(use_jar, host, is_https, &out.headers);
+                    // Alt-svc absorb (v4 phase 5.1): only on a direct
+                    // https lane; proxies naturally exempt. It lets a
+                    // later connection on the same origin take h3.
+                    if is_https
+                        && proxy.is_none()
+                        && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
+                        && let Some((raw_port, _)) =
+                            crate::transport::routes::parse_h3_candidate(hdr_alt)
+                    {
+                        crate::transport::routes::record_h3(&origin, raw_port, 86400, "direct");
+                    }
                     self.pool
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -648,6 +712,18 @@ impl Fetcher {
                 Ok(out) => {
                     // verdict already scored by finish()
                     self.store_hop_cookies(use_jar, host, is_https, &out.headers);
+                    // Alt-svc absorb (v4 phase 5.1): only on a direct https
+                    // lane; refreshed per response so the ma= lifetime stays
+                    // current. h3 only when the server announced it for the
+                    // same origin.
+                    if is_https
+                        && proxy.is_none()
+                        && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
+                        && let Some((alt_port, _)) =
+                            crate::transport::routes::parse_h3_candidate(hdr_alt)
+                    {
+                        crate::transport::routes::record_h3(&origin, alt_port, 86400, "direct");
+                    }
                     return Ok(out);
                 }
                 Err(e) => {

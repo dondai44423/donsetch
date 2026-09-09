@@ -10,6 +10,11 @@ boring = { version = "5", features = ["mlkem"] }
 boring-sys = "5"
 foreign-types = "0.5"
 tokio-boring = "5"
+# QUIC + HTTP/3 (phase 5.1). Donsetch fork of quiche 0.29.3 with the boring
+# dep raised to ^5 so the QUIC handshake forges share one boringssl build
+# (boring/boring-sys 5.2) with tier-1 h1/h2. Upstream tag: 0.29.3; fork tag
+# donsetch-v0.29.3-1 = "quiche + boring 5" only.
+quiche = { git = "https://github.com/dondai44423/quiche", tag = "donsetch-v0.29.3-1", default-features = false, features = ["boringssl-boring-crate"] }
 tokio = { version = "1", features = ["full"] }
 url = "2"
 brotli = "8"

@@ -184,6 +184,71 @@ fn build_connector_with(
     Ok(b.build())
 }
 
+/// Same wire behaviors as `build_connector_with(ChromeTrue)` but surfaced as
+/// a raw `SslContextBuilder` for transports that own their own handshake glue
+/// (the h3 stack runs quiche over this Chrome-true builder). Differences:
+/// TLS 1.3 only (the QUIC spec allows only TLS 1.3), ALPN `h3` only, and no
+/// in-boring session callbacks: the QUIC session store is persistence-managed
+/// at the h3 layer via quiche's serialized SSL_SESSION bytes.
+pub fn build_quic_ctx_builder(
+    profile: &BrowserProfile,
+) -> Result<boring::ssl::SslContextBuilder, FetchError> {
+    use boring::ssl::SslContext;
+    let mut b = SslContext::builder(SslMethod::tls()).map_err(tls_err)?;
+    b.set_min_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(tls_err)?;
+    b.set_max_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(tls_err)?;
+    // TLS 1.2 cipher list is inert on a 1.3-only handshake but as long as
+    // the profile stays the single source of truth it remains harmless.
+    b.set_cipher_list(profile.tls.ciphers_12).map_err(tls_err)?;
+    b.set_curves_list(profile.tls.groups).map_err(tls_err)?;
+    b.set_sigalgs_list(profile.tls.sigalgs).map_err(tls_err)?;
+    // The ClientHello with one QUIC protocol carries exactly one ALPN: h3.
+    b.set_alpn_protos(b"\x02h3").map_err(tls_err)?;
+    b.set_grease_enabled(true);
+    b.set_permute_extensions(true);
+
+    // OCSP stapling + SCT + brotli cert compression: Chrome sends all of
+    // these extensions on QUIC too, so the QUIC ClientHello uses the same
+    // request set as our h2 handshake.
+    unsafe { boring_sys::SSL_CTX_enable_ocsp_stapling(b.as_ptr()) };
+    unsafe { boring_sys::SSL_CTX_enable_signed_cert_timestamps(b.as_ptr()) };
+    let rc = unsafe {
+        boring_sys::SSL_CTX_add_cert_compression_alg(
+            b.as_ptr(),
+            2,
+            None,
+            Some(cert_decompress_brotli),
+        )
+    };
+    if rc != 1 {
+        return Err(FetchError::Tls(
+            "cert compression registration failed".into(),
+        ));
+    }
+
+    // Platform-native root store (same trust semantics as h1/h2).
+    let roots = rustls_native_certs::load_native_certs();
+    let mut loaded = 0usize;
+    for cert in roots.certs {
+        if let Ok(x) = X509::from_der(cert.as_ref())
+            && b.cert_store_mut().add_cert(x).is_ok()
+        {
+            loaded += 1;
+        }
+    }
+    for cert in load_env_roots() {
+        if b.cert_store_mut().add_cert(cert).is_ok() {
+            loaded += 1;
+        }
+    }
+    if loaded == 0 {
+        return Err(FetchError::Tls("no root certs loaded".into()));
+    }
+    Ok(b)
+}
+
 /// Roots loaded from the SSL_CERT_FILE / SSL_CERT_DIR environment.
 /// Read in DER or PEM (single cert or bundle); unreadable entries
 /// are skipped silently, matching libcurl. In a TLS-intercepting
