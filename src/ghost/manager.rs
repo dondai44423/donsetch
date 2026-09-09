@@ -34,11 +34,6 @@ use crate::profile::BrowserProfile;
 /// default (a zero-slot pool would disable the warm path entirely,
 /// which the kill switch owns); `DONSETCH_NO_GHOST_POOL` forces the
 /// legacy single-slot path.
-/// Pool size: default 3 warm slots. Env override
-/// `DONSETCH_GHOST_POOL_SLOTS` clamps to 1..=16; 0 falls back to the
-/// default (a zero-slot pool would disable the warm path entirely,
-/// which the kill switch owns); `DONSETCH_NO_GHOST_POOL` forces the
-/// legacy single-slot path.
 fn pool_slots(default: usize) -> usize {
     pool_size(
         std::env::var_os("DONSETCH_NO_GHOST_POOL").is_some(),
@@ -69,10 +64,6 @@ struct Snap {
     key: Option<u64>,
     host: Option<String>,
     used: Instant,
-    /// Job in flight holds this slot's lock. The selector skips
-    /// busy slots so a concurrent same-persona hit spawns on a
-    /// free slot instead of serializing behind a warm one.
-    busy: bool,
 }
 
 struct Slot {
@@ -129,10 +120,6 @@ impl Drop for GhostGuard {
             && let Some(snap) = snaps.get_mut(self.idx)
         {
             snap.used = Instant::now();
-            snap.busy = false;
-            snap.live = self.guard.ghost.is_some();
-            snap.key = self.guard.key;
-            snap.host = self.guard.host.clone();
         }
         // On Windows and macOS, a frozen browser window stays visible
         // (Windows: taskbar, macOS: desktop). On Linux with Xvfb the
@@ -262,7 +249,6 @@ impl GhostManager {
                 key: None,
                 host: None,
                 used: Instant::now(),
-                busy: false,
             })
             .collect();
         let mgr = Arc::new(Self {
@@ -296,8 +282,8 @@ impl GhostManager {
     ) -> Result<GhostGuard, FetchError> {
         let key = persona_key(profile);
         let idx = {
-            let snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
-            pick_slot(&snaps, key, host)
+            let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+            claim_slot(&mut snaps, key, host)
         };
         // Lock only the chosen slot. Other slots stay free for
         // concurrent acquires.
@@ -314,12 +300,6 @@ impl GhostManager {
         }
         guard.key = Some(key);
         guard.host = host.map(|h| h.to_string());
-        {
-            let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(snap) = snaps.get_mut(idx) {
-                snap.busy = true;
-            }
-        }
         let need_launch = match guard.ghost.as_mut() {
             None => true,
             Some(g) => !g.thaw(),
@@ -402,11 +382,6 @@ impl GhostManager {
                     }
                 } else if idle > FREEZE_AFTER {
                     g.freeze();
-                    if let Ok(mut snaps) = self.meta.lock()
-                        && let Some(snap) = snaps.get_mut(idx)
-                    {
-                        snap.used = Instant::now();
-                    }
                 }
             }
         }
@@ -433,45 +408,91 @@ impl GhostManager {
     }
 }
 
-/// Slot selection, pure so it stays testable without a browser:
-/// same persona + same host (session-warm reuse) > same persona,
-/// any warm slot > empty slot > coldest eviction. DECISION ONLY:
-/// killing a stranger persona's browser before relaunching lives
-/// in acquire_for.
+/// Slot selection, pure so it stays testable without a browser.
+/// Ranked: same persona + same host (session-warm reuse), then
+/// same persona with no competing host affinity, then held-empty
+/// same persona (no competing affinity), then a free slot (a NEW
+/// host spills here : the daemon runs one profile, so ranking
+/// "any warm same-persona slot" above free slots would funnel
+/// every host into slot 0 forever), then coldest same-persona
+/// reuse (a thaw beats a relaunch), then coldest eviction.
+/// DECISION ONLY: killing a stranger persona's browser before
+/// relaunching lives in acquire_for.
 fn pick_slot(snaps: &[Snap], key: u64, host: Option<&str>) -> usize {
+    let mine = |v: &Snap| v.key == Some(key);
+    // Affinities compete only when the job and the slot both name
+    // a host and the hosts differ; a hostless job or slot rides
+    // along with anything.
+    let compatible = |v: &Snap| match (host, v.host.as_deref()) {
+        (Some(job), Some(slot)) => job == slot,
+        _ => true,
+    };
     if let Some(host) = host
-        && let Some(i) = snaps.iter().position(|v| {
-            v.live && !v.busy && v.key == Some(key) && v.host.as_deref() == Some(host)
-        })
+        && let Some(i) = snaps
+            .iter()
+            .position(|v| v.live && mine(v) && v.host.as_deref() == Some(host))
     {
         return i;
     }
     if let Some(i) = snaps
         .iter()
-        .position(|v| v.live && !v.busy && v.key == Some(key))
+        .position(|v| v.live && mine(v) && compatible(v))
     {
         return i;
     }
-    // Idle empty slot: reuse before opening another slot. A busy
-    // empty slot (a launch in flight) is not idle.
+    // Held-empty same-persona slot (browser reaped under this
+    // persona, or a same-host launch already in flight): reuse
+    // before opening another slot.
     if let Some(i) = snaps
         .iter()
-        .position(|v| !v.live && !v.busy && v.key == Some(key))
+        .position(|v| !v.live && mine(v) && compatible(v))
     {
         return i;
     }
-    if let Some(i) = snaps.iter().position(|v| !v.live && !v.busy) {
+    // Spill: unclaimed slots first, then any browserless slot
+    // (a stranger's reaped slot costs nothing to take over).
+    if let Some(i) = snaps.iter().position(|v| !v.live && v.key.is_none()) {
         return i;
     }
+    if let Some(i) = snaps.iter().position(|v| !v.live) {
+        return i;
+    }
+    // Every slot is warm and affined elsewhere. Reusing our own
+    // coldest browser costs a thaw; evicting a stranger's costs a
+    // kill AND a launch : prefer our own.
+    if let Some(i) = coldest(snaps, |v| v.live && mine(v)) {
+        return i;
+    }
+    coldest(snaps, |_| true)
+        // Only reachable with a zero-slot pool, a construction
+        // bug; acquire_for would index-panic instead of spawning.
+        // The pool build clamps to >=1 so this is unreachable.
+        .unwrap_or(usize::MAX)
+}
+
+fn coldest(snaps: &[Snap], eligible: impl Fn(&Snap) -> bool) -> Option<usize> {
     snaps
         .iter()
         .enumerate()
+        .filter(|(_, v)| eligible(v))
         .min_by(|a, b| a.1.used.cmp(&b.1.used))
         .map(|(i, _)| i)
-        // usize::MAX only fires with a zero-slot pool, a construction
-        // bug; acquire_for would index-panic instead of spawning. The
-        // pool build clamps to >=1 so this is unreachable.
-        .unwrap_or(usize::MAX)
+}
+
+/// Pick and stamp the claim (key, host, used) in one step, under
+/// the caller's meta lock. The claim is visible to concurrent
+/// pickers BEFORE the seconds-long browser launch, so parallel
+/// jobs to different hosts spread across slots instead of all
+/// stacking behind one slot's launch. The launch outcome (live)
+/// lands in the snapshot after acquire finishes, as before.
+fn claim_slot(snaps: &mut [Snap], key: u64, host: Option<&str>) -> usize {
+    let idx = pick_slot(snaps, key, host);
+    if let Some(snap) = snaps.get_mut(idx) {
+        snap.key = Some(key);
+        snap.host = host.map(|h| h.to_string());
+        snap.used = Instant::now();
+    }
+    idx
 }
 
 #[cfg(test)]
@@ -484,40 +505,69 @@ mod pool_tests {
             key,
             host: host.map(|h| h.to_string()),
             used: Instant::now() - Duration::from_secs(idle_s),
-            busy: false,
         }
     }
 
-    fn busy_snap(live: bool, key: Option<u64>, host: Option<&str>, idle_s: u64) -> Snap {
-        Snap {
-            busy: true,
-            ..v(live, key, host, idle_s)
-        }
-    }
-
+    // The daemon runs ONE profile, so every acquire shares one
+    // persona key. If "any warm same-persona slot" outranks empty
+    // slots, that one persona never opens a second slot: every job
+    // to every host funnels into slot 0 and the pool never pools.
     #[test]
-    fn concurrent_same_persona_spawns_on_a_free_slot() {
+    fn different_hosts_spill_into_free_slots() {
         let k = 11;
-        // Slot 0 is the same persona, warm and busy (a job in flight);
-        // slot 1 idle. The pick must NOT serialize on slot 0.
         let views = vec![
-            busy_snap(true, Some(k), Some("a.test"), 5),
+            v(true, Some(k), Some("a.test"), 1),
+            v(false, None, None, 0),
             v(false, None, None, 0),
         ];
-        assert_eq!(pick_slot(&views, k, None), 1);
-        // And when the only live candidate is busy, the pick falls
-        // through to eviction of the coldest rather than dead-waiting
-        // on the busy slot (the coldest IS the busy warm one here).
-        let views2 = vec![busy_snap(true, Some(k), Some("a.test"), 60)];
-        assert_eq!(pick_slot(&views2, k, None), 0);
+        assert_eq!(
+            pick_slot(&views, k, Some("b.test")),
+            1,
+            "a new host must open a free slot, not steal a.test's warm session"
+        );
+        // The reverse direction holds too: a.test keeps its slot.
+        assert_eq!(pick_slot(&views, k, Some("a.test")), 0);
     }
 
     #[test]
-    fn warm_idle_same_persona_beats_spare_launch() {
+    fn exhausted_pool_reuses_coldest_own_slot_before_evicting_strangers() {
         let k = 11;
-        // Same-Persona idle beats a spare launch.
-        let views = vec![v(true, Some(k), None, 30), v(false, None, None, 0)];
-        assert_eq!(pick_slot(&views, k, None), 0);
+        let views = vec![
+            v(true, Some(k), Some("a.test"), 1),
+            v(true, Some(k), Some("b.test"), 60),
+            v(true, Some(22), Some("c.test"), 600),
+        ];
+        assert_eq!(
+            pick_slot(&views, k, Some("d.test")),
+            1,
+            "warm same-persona reuse (no relaunch) beats killing a stranger's browser"
+        );
+    }
+
+    // Selection alone is not enough: the launch takes seconds, and
+    // the slot's claim used to reach the meta snapshot only after
+    // it. Concurrent acquires all saw the same pre-launch snapshot
+    // and stacked on one slot. claim_slot stamps the claim under
+    // the caller's meta lock, before anyone launches.
+    #[test]
+    fn concurrent_claims_spread_hosts_instead_of_stacking() {
+        let mut views = vec![
+            v(false, None, None, 0),
+            v(false, None, None, 0),
+            v(false, None, None, 0),
+        ];
+        let k = 11;
+        assert_eq!(claim_slot(&mut views, k, Some("a.test")), 0);
+        assert_eq!(
+            claim_slot(&mut views, k, Some("b.test")),
+            1,
+            "a second in-flight host must not stack behind a.test's launch"
+        );
+        assert_eq!(
+            claim_slot(&mut views, k, Some("a.test")),
+            0,
+            "the same host joins the in-flight claim and warm-serves after it"
+        );
     }
 
     #[test]
