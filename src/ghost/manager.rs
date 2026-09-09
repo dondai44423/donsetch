@@ -69,6 +69,10 @@ struct Snap {
     key: Option<u64>,
     host: Option<String>,
     used: Instant,
+    /// Job in flight holds this slot's lock. The selector skips
+    /// busy slots so a concurrent same-persona hit spawns on a
+    /// free slot instead of serializing behind a warm one.
+    busy: bool,
 }
 
 struct Slot {
@@ -125,6 +129,10 @@ impl Drop for GhostGuard {
             && let Some(snap) = snaps.get_mut(self.idx)
         {
             snap.used = Instant::now();
+            snap.busy = false;
+            snap.live = self.guard.ghost.is_some();
+            snap.key = self.guard.key;
+            snap.host = self.guard.host.clone();
         }
         // On Windows and macOS, a frozen browser window stays visible
         // (Windows: taskbar, macOS: desktop). On Linux with Xvfb the
@@ -254,6 +262,7 @@ impl GhostManager {
                 key: None,
                 host: None,
                 used: Instant::now(),
+                busy: false,
             })
             .collect();
         let mgr = Arc::new(Self {
@@ -305,6 +314,12 @@ impl GhostManager {
         }
         guard.key = Some(key);
         guard.host = host.map(|h| h.to_string());
+        {
+            let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(snap) = snaps.get_mut(idx) {
+                snap.busy = true;
+            }
+        }
         let need_launch = match guard.ghost.as_mut() {
             None => true,
             Some(g) => !g.thaw(),
@@ -387,6 +402,11 @@ impl GhostManager {
                     }
                 } else if idle > FREEZE_AFTER {
                     g.freeze();
+                    if let Ok(mut snaps) = self.meta.lock()
+                        && let Some(snap) = snaps.get_mut(idx)
+                    {
+                        snap.used = Instant::now();
+                    }
                 }
             }
         }
@@ -420,21 +440,27 @@ impl GhostManager {
 /// in acquire_for.
 fn pick_slot(snaps: &[Snap], key: u64, host: Option<&str>) -> usize {
     if let Some(host) = host
-        && let Some(i) = snaps
-            .iter()
-            .position(|v| v.live && v.key == Some(key) && v.host.as_deref() == Some(host))
+        && let Some(i) = snaps.iter().position(|v| {
+            v.live && !v.busy && v.key == Some(key) && v.host.as_deref() == Some(host)
+        })
     {
         return i;
     }
-    if let Some(i) = snaps.iter().position(|v| v.live && v.key == Some(key)) {
+    if let Some(i) = snaps
+        .iter()
+        .position(|v| v.live && !v.busy && v.key == Some(key))
+    {
         return i;
     }
-    // Held-empty same-persona slot (browser reaped under this
-    // persona): reuse before opening another slot.
-    if let Some(i) = snaps.iter().position(|v| !v.live && v.key == Some(key)) {
+    // Idle empty slot: reuse before opening another slot. A busy
+    // empty slot (a launch in flight) is not idle.
+    if let Some(i) = snaps
+        .iter()
+        .position(|v| !v.live && !v.busy && v.key == Some(key))
+    {
         return i;
     }
-    if let Some(i) = snaps.iter().position(|v| !v.live) {
+    if let Some(i) = snaps.iter().position(|v| !v.live && !v.busy) {
         return i;
     }
     snaps
@@ -458,7 +484,40 @@ mod pool_tests {
             key,
             host: host.map(|h| h.to_string()),
             used: Instant::now() - Duration::from_secs(idle_s),
+            busy: false,
         }
+    }
+
+    fn busy_snap(live: bool, key: Option<u64>, host: Option<&str>, idle_s: u64) -> Snap {
+        Snap {
+            busy: true,
+            ..v(live, key, host, idle_s)
+        }
+    }
+
+    #[test]
+    fn concurrent_same_persona_spawns_on_a_free_slot() {
+        let k = 11;
+        // Slot 0 is the same persona, warm and busy (a job in flight);
+        // slot 1 idle. The pick must NOT serialize on slot 0.
+        let views = vec![
+            busy_snap(true, Some(k), Some("a.test"), 5),
+            v(false, None, None, 0),
+        ];
+        assert_eq!(pick_slot(&views, k, None), 1);
+        // And when the only live candidate is busy, the pick falls
+        // through to eviction of the coldest rather than dead-waiting
+        // on the busy slot (the coldest IS the busy warm one here).
+        let views2 = vec![busy_snap(true, Some(k), Some("a.test"), 60)];
+        assert_eq!(pick_slot(&views2, k, None), 0);
+    }
+
+    #[test]
+    fn warm_idle_same_persona_beats_spare_launch() {
+        let k = 11;
+        // Same-Persona idle beats a spare launch.
+        let views = vec![v(true, Some(k), None, 30), v(false, None, None, 0)];
+        assert_eq!(pick_slot(&views, k, None), 0);
     }
 
     #[test]
