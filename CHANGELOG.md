@@ -12,6 +12,7 @@ channel until the v4.0.0 release train.
 
 ### Added
 - Experimental HTTP/3 lane (opt-in via `DONSETCH_H3=1`) on a quiche
+
   0.29.3 fork that shares one BoringSSL build with tier-1. An h3
   route is learned from `alt-svc` response headers (same-origin
   only, proxies exempt) and persisted in the cache dir under
@@ -20,6 +21,10 @@ channel until the v4.0.0 release train.
   connection shape measures slower than our reused h2 pool, and
   `DONSETCH_NO_H3` kills the whole path regardless. The h3 Client
   Hello reuses the same Chrome-true TLS builder as h1/h2.
+  Transport parity verified live against curl --http3 on a
+  1.4 MB page (852 ms vs 825 ms) and 0-RTT resumption arms and
+  is accepted on repeat visits; the default stays on our reused
+  h2 pool, which still measurably wins the same-or-faster gate.
 
 - Native keyless Google search via the legacy mobile endpoint, using
   DonShadow without a browser or paid API. Seven selectable Nokia
