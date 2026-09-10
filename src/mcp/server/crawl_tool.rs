@@ -103,6 +103,13 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     h.record(url, fp, md.len(), title, md);
                 }
+                // The crawl's page lands in the local web memory too.
+                #[cfg(feature = "rerank")]
+                if !crate::memory::kill_switch()
+                    && let Err(e) = crate::memory::ingest(url, title.unwrap_or(""), md)
+                {
+                    eprintln!("[crawl] memory ingest failed (honest): {e}");
+                }
             },
         ));
     }

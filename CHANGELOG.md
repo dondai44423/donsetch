@@ -26,6 +26,18 @@ channel until the v4.0.0 release train.
   is accepted on repeat visits; the default stays on our reused
   h2 pool, which still measurably wins the same-or-faster gate.
 
+- Local web memory for agents (`web_memory` tool + `donsetch memory`
+  query): a bounded on-device index of pages this machine fetched.
+  all-MiniLM-L6-v2 quantized runs locally on the same onnxruntime
+  the search reranker uses; the model + tokenizer download once,
+  sha256-pinned, into the cache dir and nothing ever leaves the box
+  after that. Fetches, crawl pages and search snippets ingest
+  automatically; `DONSETCH_NO_WEB_MEMORY` disables ingest and search;
+  `DONSETCH_WEB_MEMORY_CAP` bounds the index (default 4000 rows,
+  oldest-first eviction). Unavailable on builds without the rerank
+  feature: the release builds all carry it.
+
+
 - Native keyless Google search via the legacy mobile endpoint, using
   DonShadow without a browser or paid API. Seven selectable Nokia
   profiles (`DONSETCH_GOOGLE_PROFILE`, default `6230-03.15`), observed

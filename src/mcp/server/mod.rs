@@ -16,6 +16,8 @@ mod crawl_tool;
 mod errors;
 mod fetch_tool;
 mod search_tool;
+#[cfg(feature = "rerank")]
+mod web_memory_tool;
 
 use crate::crawl::real as crawl_real;
 use crate::crawl::{CrawlMode, CrawlOptions, Crawler};
@@ -479,6 +481,13 @@ pub(crate) async fn call_tool_ctx(
         "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
         "web_answer" => Ok(answer_tool::answer_tool(daemon, &args, ctx).await),
         "web_crawl" => Ok(crawl_tool::crawl_tool(daemon, &args, ctx).await),
+        #[cfg(feature = "rerank")]
+        "web_memory" => Ok(web_memory_tool::web_memory_tool(daemon, &args, ctx).await),
+        #[cfg(not(feature = "rerank"))]
+        "web_memory" => Err((
+            -32603,
+            "web_memory requires the rerank feature (a release build); this binary was built without it".to_string(),
+        )),
         _ => Err((-32602, format!("unknown tool: {name}"))),
     }
 }

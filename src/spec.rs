@@ -546,6 +546,31 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
     },
 ];
 
+/// Local web memory (v4 phase 5.2): semantic search over pages this
+/// machine already fetched, stored on-device only.
+const MEMORY_PARAMS: &[ParamSpec] = &[
+    ParamSpec {
+        name: "query",
+        flag: "query",
+        kind: ParamKind::Str,
+        cli: CliKind::PositionalJoined,
+        required: true,
+        help: "Semantic query over pages this machine already fetched.",
+        mcp_help: Some(
+            "Natural-language query over the local page memory. Describe what you are looking for; hits come from pages this machine fetched before.",
+        ),
+    },
+    ParamSpec {
+        name: "limit",
+        flag: "limit",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Max hits, default 6.",
+        mcp_help: Some("Maximum hits to return, 1..=50. Default 6."),
+    },
+];
+
 // ── The table ────────────────────────────────────────────────
 
 pub static TOOLS: &[ToolSpec] = &[
@@ -603,6 +628,18 @@ pub static TOOLS: &[ToolSpec] = &[
             "donsetch crawl https://docs.site.com --mode map",
             "donsetch crawl https://docs.site.com --max-pages 25 --deadline 300",
             "donsetch crawl https://docs.site.com --dataset > site.jsonl",
+        ],
+    },
+    ToolSpec {
+        name: "web_memory",
+        cli_cmd: "memory",
+        summary: "Search pages this machine already fetched (local, on-device)",
+        description: "One-call semantic search over your local page history. DonSeTch keeps a bounded on-device index of pages it fetched (URL, title, markdown digest) with all-MiniLM-L6-v2 embeddings computed locally by the vendored onnxruntime. Nothing leaves the box: the model runs here, the index lives under the cache dir, no cloud call.\n\nHits are ranked by cosine similarity (score 0..1). Kill switch: DONSETCH_NO_WEB_MEMORY (when set, web_memory returns nothing and ingest is disabled). The index is capped at 4000 rows (DONSETCH_WEB_MEMORY_CAP) with oldest-first eviction.",
+        mcp_description: "Search pages this machine fetched before with a natural-language query. Results come from a bounded local index that DonSeTch maintains itself; the model runs on-device. Ranked hits (url, title, snippet, score). To read beyond the snippet fetch the URL with web_fetch.",
+        params: MEMORY_PARAMS,
+        examples: &[
+            "donsetch memory \"quic congestion control\"",
+            "donsetch memory \"the alt-svc cache\" --limit 10",
         ],
     },
 ];

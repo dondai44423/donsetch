@@ -126,14 +126,16 @@ fn mcp_instructions_stay_cheap() {
 }
 
 #[test]
-fn split_mcp_contract_stays_under_2500_estimated_tokens() {
+fn split_mcp_contract_stays_under_3000_estimated_tokens() {
     // chars/4 is the repository-wide offline estimator. Exact tokenizer
-    // measurements belong in the external evaluation report.
+    // measurements belong in the external evaluation report. The
+    // web_memory addition (v4 phase 5.2) spent part of the old
+    // 2500 headroom; the ceiling tracks the 5-tool contract.
     let bytes = donsetch::mcp::tools::list().to_string().len();
     let estimated_tokens = bytes.div_ceil(4);
     assert!(
-        estimated_tokens <= 2_500,
-        "split MCP schema costs ~{estimated_tokens} tokens (>2500)"
+        estimated_tokens <= 3_000,
+        "split MCP schema costs ~{estimated_tokens} tokens (>3000)"
     );
 }
 

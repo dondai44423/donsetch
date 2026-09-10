@@ -1,46 +1,77 @@
-//! Per-domain memory: what happened on this origin before.
-//! Powers verdicts now; tier-2 routing later.
+//! Local web memory (v4 phase 5.2): semantic search over pages this
+//! machine already fetched, kept entirely on this box. Embeddings
+//! come from a locally-run all-MiniLM-L6-v2 onnxruntime session; the
+//! store is a bounded, atomic JSON index under the cache dir.
 //!
-//! Superseded by the persistent DomainProfile in ghost::cache
-//! for the self-improving fetch loop. Retained for reference.
+//! The whole module is compiled only with the rerank feature (the
+//! same feature that ships the search reranker; every release build
+//! carries it). Ingest hooks live at the tool surfaces
+//! (fetch/search/crawl), not inside the fetcher internals. The kill
+//! switch (`DONSETCH_NO_WEB_MEMORY`) turns the module off at both the
+//! ingest and the search layers; nothing writes or reads while it is
+//! set.
 
-#![allow(dead_code)]
+#[cfg(feature = "rerank")]
+pub mod model;
+#[cfg(feature = "rerank")]
+pub mod store;
 
-use std::collections::HashMap;
+#[cfg(feature = "rerank")]
+pub use store::{MemoryHit, cap, clear, index_path, ingest, kill_switch, rows, search};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DomainMemory {
-    /// A wall challenged us here at least once.
-    pub challenged: bool,
-    /// A cookie-warm retry succeeded here (JS-less cookie wall).
-    pub warm_retry_worked: bool,
-    /// Wall needs tier 2 (JS challenge seen).
-    pub needs_tier2: bool,
-}
+/// Maximum `limit` accepted by web_memory (schema clamp).
+pub const LIMIT_MAX: usize = 50;
 
-pub struct DomainMap {
-    map: HashMap<String, DomainMemory>,
-}
-
-impl DomainMap {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
+/// The implicit title of a markdown page = the first `# ` heading.
+#[cfg(feature = "rerank")]
+pub fn title_of(md: &str) -> String {
+    for line in md.lines() {
+        if let Some(t) = line.strip_prefix("# ") {
+            return t.trim().to_string();
         }
     }
+    String::new()
+}
 
-    #[allow(dead_code)] // used by MCP/verdict surface
-    pub fn get(&self, domain: &str) -> DomainMemory {
-        self.map.get(domain).copied().unwrap_or_default()
-    }
-
-    pub fn update(&mut self, domain: &str, f: impl FnOnce(&mut DomainMemory)) {
-        f(self.map.entry(domain.to_string()).or_default());
+#[cfg(feature = "rerank")]
+/// Argument guard shared by the CLI parser and the MCP tool:
+/// returns None when the arguments are valid, Some(message) with an
+/// honest operator-level reason otherwise. `limit` is optional and
+/// clamped to 1..=LIMIT_MAX; the query's presence is checked by the
+/// caller so the error can be tool-specific.
+pub fn guard(limit: Option<u64>) -> Option<String> {
+    match limit {
+        None => None,
+        Some(n) if (1..=LIMIT_MAX as u64).contains(&n) => None,
+        Some(n) => Some(format!("limit {n} out of range (1..={LIMIT_MAX})")),
     }
 }
 
-impl Default for DomainMap {
-    fn default() -> Self {
-        Self::new()
+#[cfg(feature = "rerank")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// title_of returns the first `# ` heading, else an empty string
+    /// (the search snippet path also feeds title-less rows).
+    #[test]
+    fn title_of_first_heading() {
+        assert_eq!(title_of("# Hello\nbody"), "Hello");
+        assert_eq!(title_of("## Only h2"), "");
+        assert_eq!(title_of("text\n# Later\nmore"), "Later");
+        assert_eq!(title_of(""), "");
+    }
+
+    /// Guard: the limit bounds the wire contract on both the CLI and
+    /// the MCP surface, so junk limit values fail before any embed.
+    #[test]
+    fn guard_imit_bounds() {
+        assert!(guard(None).is_none());
+        assert!(guard(Some(1)).is_none());
+        assert!(guard(Some(50)).is_none());
+        assert!(guard(Some(0)).is_some());
+        assert!(guard(Some(51)).is_some());
+        assert!(guard(Some(60)).is_some());
+        assert!(guard(Some(u64::MAX)).is_some());
     }
 }

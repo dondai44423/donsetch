@@ -313,6 +313,26 @@
         "type": "object"
       },
       "name": "web_crawl"
+    },
+    {
+      "description": "Search pages this machine fetched before with a natural-language query. Results come from a bounded local index that DonSeTch maintains itself; the model runs on-device. Ranked hits (url, title, snippet, score). To read beyond the snippet fetch the URL with web_fetch.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "description": "Maximum hits to return, 1..=50. Default 6.",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Natural-language query over the local page memory. Describe what you are looking for; hits come from pages this machine fetched before.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "web_memory"
     }
   ]
 }

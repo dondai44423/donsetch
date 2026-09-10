@@ -67,7 +67,14 @@ pub fn list() -> Value {
 
 /// Kill-switch visibility: a disabled tool is not advertised at all.
 fn tool_visible(name: &str) -> bool {
-    !(name == "web_answer" && crate::config::env_flag("DONSETCH_NO_ANSWER_TOOL"))
+    if name == "web_answer" && crate::config::env_flag("DONSETCH_NO_ANSWER_TOOL") {
+        return false;
+    }
+    #[cfg(feature = "rerank")]
+    if name == "web_memory" && crate::memory::kill_switch() {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
