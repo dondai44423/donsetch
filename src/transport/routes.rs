@@ -233,16 +233,37 @@ pub fn save_h3_session(origin: &str, egress: &str, session: &[u8]) {
 }
 
 pub fn load_h3_session(origin: &str, egress: &str) -> Option<Vec<u8>> {
-    with(|mem| {
-        let st = mem.routes.get(origin)?;
+    let dbg = std::env::var_os("DONGHOST_DEBUG").is_some();
+    let result: Result<Vec<u8>, &str> = with(|mem| {
+        let st = match mem.routes.get(origin) {
+            Some(s) => s,
+            None => return Err("origin miss"),
+        };
         if st.egress != egress {
-            return None;
+            return Err("egress mismatch");
         }
         if st.session_b64.is_empty() {
-            return None;
+            return Err("no session");
         }
-        B64.decode(&st.session_b64).ok()
-    })
+        B64.decode(&st.session_b64).map_err(|_| "decode fail")
+    });
+    match result {
+        Ok(b) => {
+            if dbg {
+                eprintln!(
+                    "[routes] load_h3_session {origin} eg={egress} hit ({}b)",
+                    b.len()
+                );
+            }
+            Some(b)
+        }
+        Err(why) => {
+            if dbg {
+                eprintln!("[routes] load_h3_session {origin} eg={egress} miss ({why})");
+            }
+            None
+        }
+    }
 }
 
 fn with<T>(f: impl FnOnce(&mut RouteMemory) -> T) -> T {
