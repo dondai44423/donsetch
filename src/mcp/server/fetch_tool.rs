@@ -97,6 +97,7 @@ pub(super) async fn fetch_tool(
 /// Store a successful fetch result page into the local web memory.
 /// Additive (v4 law 5): ingest failure never touches the fetch result;
 /// its only surface is a stderr receipt.
+#[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
 fn memory_ingest_result(url: &str, result: &Value) {
     #[cfg(feature = "rerank")]
     if !crate::memory::kill_switch() && result.get("isError").and_then(Value::as_bool) != Some(true)
