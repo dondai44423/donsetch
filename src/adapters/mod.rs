@@ -19,6 +19,7 @@
 pub mod docs_outline;
 pub mod github;
 pub mod packages;
+pub mod plugins;
 pub mod reddit_json;
 pub mod stackexchange;
 pub mod wiki_infobox;
@@ -44,120 +45,224 @@ fn debug_dump(html: &str, url: &str) {
     let _ = std::fs::write(p, format!("<!-- {url} -->\n{html}"));
 }
 
-/// Fetch-level URL rewrite. Returns `(new_url, adapter_name)`
-/// where adapter_name is the honest `via=` label.
+/// One bundled rewrite adapter.
+#[derive(Clone, Copy)]
+pub struct BuiltinRewrite {
+    /// The honest via label ("adapter:<suffix>").
+    pub via: &'static str,
+    /// One-line description for `donsetch adapters`.
+    pub description: &'static str,
+    /// Match + rewrite, returns the new URL string.
+    pub apply: fn(&url::Url) -> Option<String>,
+}
+
+/// The bundled rewrite set, in dispatch order.
+const BUILTIN_REWRITES: [BuiltinRewrite; 7] = [
+    BuiltinRewrite {
+        via: "adapter:reddit-json",
+        description: "reddit thread and listing pages -> old.reddit .json endpoints",
+        apply: reddit_json_rw,
+    },
+    BuiltinRewrite {
+        via: "adapter:reddit-old",
+        description: "other reddit pages -> the legacy SSR host old.reddit.com",
+        apply: reddit_old_rw,
+    },
+    BuiltinRewrite {
+        via: "adapter:npm-registry",
+        description: "npmjs.com/package/<pkg> -> registry.npmjs.org packument or version",
+        apply: npm_registry_rw,
+    },
+    BuiltinRewrite {
+        via: "adapter:pypi-json",
+        description: "pypi.org/project/<pkg> -> pypi.org/pypi/<pkg>/json",
+        apply: pypi_json_rw,
+    },
+    BuiltinRewrite {
+        via: "adapter:crates-api",
+        description: "crates.io/crates/<crate> -> crates.io/api/v1/crates/<crate>",
+        apply: crates_api_rw,
+    },
+    BuiltinRewrite {
+        via: "adapter:go-proxy",
+        description: "pkg.go.dev module pages -> proxy.golang.org @latest",
+        apply: go_proxy_rw,
+    },
+    BuiltinRewrite {
+        via: "adapter:rubygems-api",
+        description: "rubygems.org/gems/<gem> -> rubygems.org/api/v1/gems/<gem>.json",
+        apply: rubygems_api_rw,
+    },
+];
+
+/// Bundled adapter list for `donsetch adapters` and the loader's
+/// name-collision check (the via suffix after "adapter:").
+pub fn builtins() -> &'static [BuiltinRewrite] {
+    &BUILTIN_REWRITES
+}
+
+/// The bundled adapters' suffixes ("reddit-json", ...) for the
+/// user-loader collision gate.
+pub(crate) fn builtin_via_suffixes() -> Vec<&'static str> {
+    BUILTIN_REWRITES
+        .iter()
+        .map(|b| b.via.strip_prefix("adapter:").unwrap_or(b.via))
+        .collect()
+}
+
+/// Fetch-level URL rewrite: the registry.
+///
+/// Order: bundled entries first (the historical order), then the
+/// user plugin catalog, first match wins, and every result carries
+/// the honest via label.
 ///
 /// `None` = no adapter (fetch the URL as given).
 pub fn rewrite(u: &url::Url) -> Option<(String, &'static str)> {
     if !enabled() {
         return None;
     }
-    let host = u.host_str()?;
-    let path = u.path().to_string();
+    for b in &BUILTIN_REWRITES {
+        if let Some(new_url) = (b.apply)(u) {
+            return Some((new_url, b.via));
+        }
+    }
+    for row in plugins::catalog() {
+        if let Some(new_url) = plugins::apply(&row.plugin, u) {
+            return Some((new_url, row.via));
+        }
+    }
+    None
+}
 
-    // ── Reddit: the .json endpoints on old.reddit. ──────────
-    // Threads and subreddit listings become structured JSON in
-    // one plain-HTTP GET : no JS shell, no login overlay. Other
-    // reddit paths (user pages, search) still get the legacy-SSR
-    // domain; the HTML extractor or generic path handles those.
-    if host == "www.reddit.com" || host == "reddit.com" || host == "old.reddit.com" {
-        let trimmed = path.trim_end_matches('/');
-        let path_part = if trimmed.is_empty() { "/" } else { trimmed };
-        let is_thread = path.contains("/comments/");
-        let is_listing = path == "/" || path.starts_with("/r/") || path.starts_with("/comments");
-        if (is_thread || is_listing) && !path_part.ends_with(".json") {
-            // Keep query (?t=top sorts) : drop fragments only.
-            let mut u2 = u.clone();
-            let _ = u2.set_host(Some("old.reddit.com"));
-            u2.set_path(&format!("{path_part}.json"));
-            u2.set_fragment(None);
-            return Some((u2.to_string(), "adapter:reddit-json"));
-        }
-        if host != "old.reddit.com" {
-            let mut u2 = u.clone();
-            let _ = u2.set_host(Some("old.reddit.com"));
-            return Some((u2.to_string(), "adapter:reddit-old"));
-        }
+// -- Bundled adapters: matchers + rewrites. -------------------------
+// Each returns the rewritten URL name; `rewrite` attaches the via.
+
+fn reddit_json_rw(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if !matches!(host, "www.reddit.com" | "reddit.com" | "old.reddit.com") {
         return None;
     }
+    let path = u.path().to_string();
+    let trimmed = path.trim_end_matches('/');
+    let path_part = if trimmed.is_empty() { "/" } else { trimmed };
+    let is_thread = path.contains("/comments/");
+    let is_listing = path == "/" || path.starts_with("/r/") || path.starts_with("/comments");
+    if !(is_thread || is_listing) || path_part.ends_with(".json") {
+        return None;
+    }
+    // Keep query (?t=top sorts) : drop fragments only.
+    let mut u2 = u.clone();
+    let _ = u2.set_host(Some("old.reddit.com"));
+    u2.set_path(&format!("{path_part}.json"));
+    u2.set_fragment(None);
+    Some(u2.to_string())
+}
 
-    // ── Package registries: page URL → JSON API. ────────────
-    // Agents look up packages constantly; the HTML pages are JS
-    // shells, the APIs are keyless CDNs.
-    if host == "www.npmjs.com" || host == "npmjs.com" {
-        // /package/<pkg> or /package/<pkg>/v/<ver>
-        let rest = path.strip_prefix("/package/")?;
-        let rest = rest.trim_matches('/');
-        if rest.is_empty() {
-            return None;
-        }
-        // /v/<ver> suffix → version manifest; else full packument.
-        let (pkg, ver): (&str, Option<&str>) = match rest.split_once("/v/") {
-            Some((p, v)) => (p, Some(v)),
-            None => (rest, None),
-        };
-        let api_path = ver.map_or_else(|| pkg.to_string(), |v| format!("{pkg}/{v}"));
-        let u2 = url::Url::parse(&format!("https://registry.npmjs.org/{api_path}")).ok()?;
-        return Some((u2.to_string(), "adapter:npm-registry"));
+fn reddit_old_rw(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if !matches!(host, "www.reddit.com" | "reddit.com") {
+        return None;
     }
-    if host == "pypi.org" || host == "pypi.python.org" {
-        // /project/<pkg>(/<ver>)
-        let rest = path.strip_prefix("/project/")?;
-        let rest = rest.trim_matches('/');
-        let mut parts = rest.split('/');
-        let pkg = parts.next()?;
-        if pkg.is_empty() {
-            return None;
-        }
-        let ver = parts.next().filter(|v| !v.is_empty());
-        // PEP 503 name normalization: case + -_. runs → -
-        let norm = pkg.to_lowercase().replace(['_', '.'], "-");
-        let api_path = ver.map_or_else(|| format!("{norm}/json"), |v| format!("{norm}/{v}/json"));
-        let u2 = url::Url::parse(&format!("https://pypi.org/pypi/{api_path}")).ok()?;
-        return Some((u2.to_string(), "adapter:pypi-json"));
-    }
-    if host == "crates.io" || host == "www.crates.io" {
-        // /crates/<name>(/<ver>)
-        let rest = path.strip_prefix("/crates/")?;
-        let rest = rest.trim_matches('/');
-        let mut parts = rest.split('/');
-        let name = parts.next()?;
-        if name.is_empty() {
-            return None;
-        }
-        let ver = parts.next().filter(|v| !v.is_empty());
-        // Version-specific: the version endpoint carries deps.
-        let api_path = ver.map_or_else(|| name.to_string(), |v| format!("{name}/{v}"));
-        let u2 = url::Url::parse(&format!("https://crates.io/api/v1/crates/{api_path}")).ok()?;
-        return Some((u2.to_string(), "adapter:crates-api"));
-    }
-    if host == "pkg.go.dev" {
-        // /<module path> → Go module proxy. Uppercase paths need
-        // !escaping on the proxy (rare) : skip those, generic
-        // handles them. Stdlib paths (no dot in the first
-        // element: /fmt, /net/http) have no proxy module : skip.
-        let rest = path.strip_prefix('/')?;
-        if rest.is_empty() || rest.starts_with("std") {
-            return None;
-        }
-        let first = rest.split('/').next().unwrap_or("");
-        if !first.contains('.') || rest.chars().any(|c| c.is_uppercase()) {
-            return None;
-        }
-        let u2 = url::Url::parse(&format!("https://proxy.golang.org/{rest}/@latest")).ok()?;
-        return Some((u2.to_string(), "adapter:go-proxy"));
-    }
-    if host == "rubygems.org" || host == "www.rubygems.org" {
-        let rest = path.strip_prefix("/gems/")?;
-        let gem = rest.trim_matches('/');
-        if gem.is_empty() || gem.contains('/') {
-            return None;
-        }
-        let u2 = url::Url::parse(&format!("https://rubygems.org/api/v1/gems/{gem}.json")).ok()?;
-        return Some((u2.to_string(), "adapter:rubygems-api"));
-    }
+    let mut u2 = u.clone();
+    let _ = u2.set_host(Some("old.reddit.com"));
+    Some(u2.to_string())
+}
 
-    None
+fn npm_registry_rw(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if host != "www.npmjs.com" && host != "npmjs.com" {
+        return None;
+    }
+    // /package/<pkg> or /package/<pkg>/v/<ver>
+    let rest = u.path().strip_prefix("/package/")?;
+    let rest = rest.trim_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    // /v/<ver> suffix = version manifest; else full packument.
+    let (pkg, ver): (&str, Option<&str>) = match rest.split_once("/v/") {
+        Some((p, v)) => (p, Some(v)),
+        None => (rest, None),
+    };
+    let api_path = ver.map_or_else(|| pkg.to_string(), |v| format!("{pkg}/{v}"));
+    let u2 = url::Url::parse(&format!("https://registry.npmjs.org/{api_path}")).ok()?;
+    Some(u2.to_string())
+}
+
+fn pypi_json_rw(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if host != "pypi.org" && host != "pypi.python.org" {
+        return None;
+    }
+    // /project/<pkg>(/<ver>)
+    let rest = u.path().strip_prefix("/project/")?;
+    let rest = rest.trim_matches('/');
+    let mut parts = rest.split('/');
+    let pkg = parts.next()?;
+    if pkg.is_empty() {
+        return None;
+    }
+    let ver = parts.next().filter(|v| !v.is_empty());
+    // PEP 503 name normalization: case + -_. runs = -
+    let norm = pkg.to_lowercase().replace(['_', '.'], "-");
+    let api_path = ver.map_or_else(|| format!("{norm}/json"), |v| format!("{norm}/{v}/json"));
+    let u2 = url::Url::parse(&format!("https://pypi.org/pypi/{api_path}")).ok()?;
+    Some(u2.to_string())
+}
+
+fn crates_api_rw(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if host != "crates.io" && host != "www.crates.io" {
+        return None;
+    }
+    // /crates/<name>(/<ver>)
+    let rest = u.path().strip_prefix("/crates/")?;
+    let rest = rest.trim_matches('/');
+    let mut parts = rest.split('/');
+    let name = parts.next()?;
+    if name.is_empty() {
+        return None;
+    }
+    let ver = parts.next().filter(|v| !v.is_empty());
+    // Version-specific: the version endpoint carries deps.
+    let api_path = ver.map_or_else(|| name.to_string(), |v| format!("{name}/{v}"));
+    let u2 = url::Url::parse(&format!("https://crates.io/api/v1/crates/{api_path}")).ok()?;
+    Some(u2.to_string())
+}
+
+fn go_proxy_rw(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if host != "pkg.go.dev" {
+        return None;
+    }
+    // /<module path> -> Go module proxy. Uppercase paths need
+    // !escaping on the proxy (rare) : skip those, generic
+    // handles them. Stdlib paths (no dot in the first
+    // element: /fmt, /net/http) have no proxy module : skip.
+    let rest = u.path().strip_prefix('/')?;
+    if rest.is_empty() || rest.starts_with("std") {
+        return None;
+    }
+    let first = rest.split('/').next().unwrap_or("");
+    if !first.contains('.') || rest.chars().any(|c| c.is_uppercase()) {
+        return None;
+    }
+    let u2 = url::Url::parse(&format!("https://proxy.golang.org/{rest}/@latest")).ok()?;
+    Some(u2.to_string())
+}
+
+fn rubygems_api_rw(u: &url::Url) -> Option<String> {
+    let host = u.host_str()?;
+    if host != "rubygems.org" && host != "www.rubygems.org" {
+        return None;
+    }
+    let rest = u.path().strip_prefix("/gems/")?;
+    let gem = rest.trim_matches('/');
+    if gem.is_empty() || gem.contains('/') {
+        return None;
+    }
+    let u2 = url::Url::parse(&format!("https://rubygems.org/api/v1/gems/{gem}.json")).ok()?;
+    Some(u2.to_string())
 }
 
 /// Extract-level dispatch for JSON bodies (post-rewrite).

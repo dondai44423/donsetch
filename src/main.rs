@@ -103,6 +103,10 @@ async fn main() {
         "login" => cli::login::run(&args).await,
         "proxy" => cli::proxy::run(&args).await,
         "status" => cli::status::run().await,
+        "adapters" => match args.get(2).map(String::as_str) {
+            Some("--help" | "-h") => cli::adapters::help(),
+            _ => cli::adapters::run(),
+        },
         "stop" => cli::stop::run(),
         "doctor" | "--doctor" => cli::doctor::run().await,
         "update" | "-u" | "--update" => cli::update::run().await,
@@ -146,6 +150,7 @@ async fn route_help(cmd: &str) {
         "keys" => {
             cli::keys::run(&["donsetch".into(), "keys".into(), "help".into()]).await;
         }
+        "adapters" => cli::adapters::help(),
         "proxy" => {
             // proxy::run is async, but print_help is sync.
             // Just call the help directly.

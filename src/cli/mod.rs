@@ -4,6 +4,7 @@
 //! spinner. Cross-platform: Linux, macOS, Windows (virtual
 //! terminal processing enabled on Windows 10+).
 
+pub mod adapters;
 pub mod doctor;
 pub mod keys;
 pub mod login;

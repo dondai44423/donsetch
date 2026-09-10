@@ -37,6 +37,15 @@ channel until the v4.0.0 release train.
   oldest-first eviction). Unavailable on builds without the rerank
   feature: the release builds all carry it.
 
+- Adapter registry v1 (`donsetch adapters`): the named rewrite and
+  extract adapters are now a registry, and operators can add more
+  fetch-level rewrites as pure-data JSON plugins in
+  `cache_dir()/adapters/` (one file per rule: hosts, optional path
+  prefix, an https target template with one `{path}` placeholder;
+  no executables or scripts, the fetcher's egress guards still
+  apply). Bad files are skipped with a receipt and never break
+  fetching; `DONSETCH_NO_ADAPTERS=1` stays the master kill switch.
+
 
 - Native keyless Google search via the legacy mobile endpoint, using
   DonShadow without a browser or paid API. Seven selectable Nokia

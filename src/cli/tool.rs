@@ -511,6 +511,10 @@ pub fn print_top_help() {
     println!("  {:8} Manage proxy configuration", "proxy");
     println!("  {:8} Quick status overview", "status");
     println!(
+        "  {:8} Show the adapter registry + user plugins",
+        "adapters"
+    );
+    println!(
         "  {:8} Kill orphaned Chrome instances + clean stale locks",
         "stop"
     );
