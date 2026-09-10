@@ -68,6 +68,16 @@ pub struct H3Request<'a> {
     pub timeout: Duration,
 }
 
+/// Same bomb rule as the h1 reader: a body must fail the shared
+/// transport cap BEFORE it allocates past it, not after.
+fn accept_body_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), FetchError> {
+    if body.len().saturating_add(chunk.len()) > super::MAX_BODY {
+        return Err(FetchError::Http("h3: body exceeds cap".into()));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, FetchError> {
     (host, port)
         .to_socket_addrs()
@@ -325,7 +335,7 @@ async fn h3_fetch_inner(
                         let mut chunk = [0u8; 65_536];
                         loop {
                             match hc.recv_body(&mut conn, sid, &mut chunk) {
-                                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                                Ok(n) => accept_body_chunk(&mut body, &chunk[..n])?,
                                 Err(h3::Error::Done) => break,
                                 Err(e) => {
                                     return Err(FetchError::Http(format!("h3 body err {e}")));
@@ -517,4 +527,28 @@ pub async fn h3_fetch_direct(
         );
     }
     Ok((out, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The h1 reader learned this the hard way (#144): a hostile
+    // origin streaming an unbounded body must hit the shared cap,
+    // not the allocator. The h3 lane reads the same kind of wire.
+    #[test]
+    fn body_chunks_stop_at_the_shared_transport_cap() {
+        let mut body = Vec::new();
+        assert!(accept_body_chunk(&mut body, &[0u8; 65_536]).is_ok());
+        assert_eq!(body.len(), 65_536);
+        // Jump to just under the cap, then cross it.
+        let mut near = vec![0u8; super::super::MAX_BODY - 10];
+        assert!(accept_body_chunk(&mut near, &[0u8; 10]).is_ok());
+        let before = near.len();
+        assert!(
+            accept_body_chunk(&mut near, &[0u8; 1]).is_err(),
+            "the crossing chunk must fail"
+        );
+        assert_eq!(near.len(), before, "a refused chunk must not allocate");
+    }
 }

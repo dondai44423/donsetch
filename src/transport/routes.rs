@@ -99,8 +99,11 @@ fn save_file(path: &PathBuf, routes: &HashMap<String, RouteState>) {
         Ok(v) => v,
         Err(_) => return,
     };
+    // Owner-only from the first byte (the vault rule): the file
+    // carries serialized TLS sessions, 0-RTT material. Rename keeps
+    // the swap atomic and preserves the 0600 the tmp was born with.
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
+    if crate::config::write_private(&tmp, &bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
@@ -203,6 +206,16 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
     });
 }
 
+/// One absorb for every alt-svc sighting: parse the header value and
+/// record the route with the SERVER'S ma= lifetime (Chrome's 1h
+/// default when absent) — never a made-up constant. Returns what was
+/// recorded; None when no QUIC-v1 h3 candidate parses.
+pub fn absorb_alt_svc(origin: &str, value: &str, egress: &str) -> Option<(u16, u64)> {
+    let (port, ma) = parse_h3_candidate(value)?;
+    record_h3(origin, port, ma, egress);
+    Some((port, ma))
+}
+
 pub fn drop_h3(origin: &str) {
     with(|mem| {
         if mem.routes.remove(origin).is_some() {
@@ -259,6 +272,65 @@ fn with<T>(f: impl FnOnce(&mut RouteMemory) -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The parser extracts ma= carefully (tests below), but every
+    // absorb call site used to throw it away and record a hardcoded
+    // 86400: a server vouching for 60 seconds was cached for a day.
+    // The lifetime the server names must be the lifetime we honor.
+    #[test]
+    fn absorb_records_the_servers_own_ma_lifetime() {
+        let dir = std::env::temp_dir().join(format!("donsetch-routes-ma-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        assert_eq!(
+            absorb_alt_svc("ma0.test", "h3=\":443\"; ma=0", "direct"),
+            Some((443, 0))
+        );
+        assert_eq!(
+            h3_route("ma0.test", "direct"),
+            None,
+            "an expired vouch must not route"
+        );
+        assert_eq!(
+            absorb_alt_svc("ma600.test", "h3=\":443\"; ma=600", "direct"),
+            Some((443, 600))
+        );
+        assert_eq!(h3_route("ma600.test", "direct"), Some(443));
+        assert_eq!(absorb_alt_svc("none.test", "h2=\":443\"", "direct"), None);
+        assert_eq!(h3_route("none.test", "direct"), None);
+        // Shrink the plain-`cargo test` window where a same-process
+        // test could see this tempdir as its cache root (nextest
+        // isolates processes; this is belt for the local runner).
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The module doc promises "same trust shape as the cookie vault":
+    // routes.json carries serialized TLS sessions (0-RTT material),
+    // and the vault rule is owner-only from the first byte.
+    #[cfg(unix)]
+    #[test]
+    fn routes_file_lands_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-routes-prv-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("routes.json");
+        let mut routes = HashMap::new();
+        routes.insert(
+            "example.test".to_string(),
+            RouteState {
+                use_h3: true,
+                h3_port: 443,
+                valid_until_ms: now_ms() + 1000,
+                egress: "direct".into(),
+                session_b64: "c2VjcmV0".into(),
+            },
+        );
+        save_file(&path, &routes);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "session-bearing routes.json must be 0600");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn alt_svc_h3_plain_port() {
