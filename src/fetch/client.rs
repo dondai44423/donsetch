@@ -627,28 +627,31 @@ impl Fetcher {
             .await
             {
                 Ok((h3out, _stats)) => {
-                    if let Some(alt) = h3out.altsvc.as_ref()
-                        && let Some((port, _)) = crate::transport::routes::parse_h3_candidate(alt)
-                    {
-                        crate::transport::routes::record_h3(&origin, port, 86400, "direct");
+                    if let Some(alt) = h3out.altsvc.as_ref() {
+                        crate::transport::routes::absorb_alt_svc(&origin, alt, "direct");
                     }
                     if h3out.status == 0 || h3out.status < 200 {
                         crate::transport::routes::drop_h3(&origin);
                         // fall through to h1/h2
                     } else {
                         self.store_hop_cookies(use_jar, host, is_https, &h3out.headers);
-                        return Ok(FetchOutcome {
-                            url: url_str.to_string(),
-                            status: h3out.status,
-                            alpn: "h3".into(),
-                            headers: h3out.headers,
-                            body: h3out.body,
-                            redirects: 0,
-                            cache: CacheState::None,
-                            used_pool: false,
-                            verdict: Verdict::ContentOk,
-                            elapsed: std::time::Duration::from_millis(0),
-                        });
+                        // Same exit as every other transport: finish()
+                        // decompresses and scores walls::detect, so a
+                        // challenge served over h3 escalates instead of
+                        // masquerading as ContentOk. An undecodable h3
+                        // payload is a transport failure: drop the
+                        // vouch, let h1/h2 answer.
+                        match finish(
+                            url_str.to_string(),
+                            "h3",
+                            h3out.status,
+                            h3out.headers,
+                            h3out.body,
+                            false,
+                        ) {
+                            Ok(out) => return Ok(out),
+                            Err(_) => crate::transport::routes::drop_h3(&origin),
+                        }
                     }
                 }
                 Err(_) => {
@@ -674,14 +677,13 @@ impl Fetcher {
                     self.store_hop_cookies(use_jar, host, is_https, &out.headers);
                     // Alt-svc absorb (v4 phase 5.1): only on a direct
                     // https lane; proxies naturally exempt. It lets a
-                    // later connection on the same origin take h3.
+                    // later connection on the same origin take h3, for
+                    // exactly the ma= lifetime the server vouched.
                     if is_https
                         && proxy.is_none()
                         && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
-                        && let Some((raw_port, _)) =
-                            crate::transport::routes::parse_h3_candidate(hdr_alt)
                     {
-                        crate::transport::routes::record_h3(&origin, raw_port, 86400, "direct");
+                        crate::transport::routes::absorb_alt_svc(&origin, hdr_alt, "direct");
                     }
                     self.pool
                         .lock()
@@ -714,15 +716,13 @@ impl Fetcher {
                     self.store_hop_cookies(use_jar, host, is_https, &out.headers);
                     // Alt-svc absorb (v4 phase 5.1): only on a direct https
                     // lane; refreshed per response so the ma= lifetime stays
-                    // current. h3 only when the server announced it for the
-                    // same origin.
+                    // current (the server's own ma=, never a constant). h3
+                    // only when the server announced it for the same origin.
                     if is_https
                         && proxy.is_none()
                         && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
-                        && let Some((alt_port, _)) =
-                            crate::transport::routes::parse_h3_candidate(hdr_alt)
                     {
-                        crate::transport::routes::record_h3(&origin, alt_port, 86400, "direct");
+                        crate::transport::routes::absorb_alt_svc(&origin, hdr_alt, "direct");
                     }
                     return Ok(out);
                 }
@@ -1018,5 +1018,64 @@ fn referer_value(referer: &str, target: &str) -> String {
         format!("{}://{host}{port}/", r.scheme())
     } else {
         referer.to_string()
+    }
+}
+
+#[cfg(test)]
+mod transport_exit_tests {
+    use super::*;
+
+    // The h3 lane used to hand back a literal Verdict::ContentOk for
+    // any status >= 200: a Cloudflare challenge served over h3 (403 +
+    // cf-mitigated) looked like clean content — no tier-2 escalation,
+    // and compressed bodies skipped decompression entirely. Every
+    // transport must leave through finish(), the one site of truth
+    // for decompress + walls::detect. This pins the contract the h3
+    // exit now rides.
+    #[test]
+    fn finish_scores_walls_and_decompresses_for_the_h3_exit() {
+        let headers = vec![
+            ("server".to_string(), "cloudflare".to_string()),
+            ("cf-mitigated".to_string(), "challenge".to_string()),
+        ];
+        let out = finish(
+            "https://walled.test/".into(),
+            "h3",
+            403,
+            headers,
+            b"<html><head><title>Just a moment...</title></head></html>".to_vec(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(out.verdict, Verdict::Challenge(_)),
+            "a cf-mitigated 403 must classify as a challenge on every transport, got {:?}",
+            out.verdict
+        );
+        assert_eq!(out.alpn, "h3");
+
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(b"<html><body>real content</body></html>")
+                .unwrap();
+            enc.finish().unwrap();
+        }
+        let out = finish(
+            "https://ok.test/".into(),
+            "h3",
+            200,
+            vec![("content-encoding".to_string(), "gzip".to_string())],
+            gz,
+            false,
+        )
+        .unwrap();
+        assert!(
+            out.body
+                .windows(b"real content".len())
+                .any(|w| w == b"real content"),
+            "the h3 exit must decompress like every other transport"
+        );
     }
 }

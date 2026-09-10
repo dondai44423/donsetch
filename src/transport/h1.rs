@@ -11,9 +11,8 @@ pub struct H1Response {
     pub body: Vec<u8>,
 }
 
-/// Hard cap on an HTTP/1.1 response body (matches the
-/// decompression cap : bombs must fail before they allocate).
-const MAX_BODY: usize = 64 << 20;
+use super::MAX_BODY;
+
 /// Cap on any framing line the client accumulates while looking
 /// for its terminator: the header block, a chunk-size line, the
 /// trailer section. A server that never sends the CRLF must run
