@@ -247,7 +247,13 @@ pub fn extract_assets(page_url: &str, html: &[u8]) -> Vec<(String, RequestClass)
 /// Byte-scan over the tag soup: no DOM, no allocation beyond the
 /// candidates. Looks at <link>, <script>, <img> only.
 fn scan_candidates(html: &str) -> Vec<(String, RequestClass)> {
-    let lower = html.to_lowercase();
+    // Offsets found here index back into `html`, and only
+    // to_ascii_lowercase preserves byte length and char boundaries.
+    // It is also the folding HTML specifies: tag and attribute names
+    // match ASCII-case-insensitively. A slice that lands mid-codepoint
+    // panics, and the release profile aborts rather than unwinding, so
+    // the cost of breaking this is the whole daemon, not one fetch.
+    let lower = html.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -342,7 +348,9 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// Pull an attribute value out of a single tag's text. Handles
 /// double quotes, single quotes, and unquoted values.
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
+    // ASCII-only folding, same reason as scan_candidates: `at` indexes
+    // back into `tag`.
+    let lower = tag.to_ascii_lowercase();
     let needle = format!("{name}=");
     let at = lower.find(&needle)? + needle.len();
     let rest = &tag[at..];
@@ -375,6 +383,35 @@ mod tests {
         <video src="/video/intro.mp4"></video>
         <a href="/about">about</a>
         </body></html>"#;
+
+    /// Fails if the folding in `scan_candidates` or `attr` returns to
+    /// `to_lowercase`. The markers are picked for their byte-length
+    /// deltas: `Ω` (3->2) shifts the offsets onto ASCII and the assets
+    /// vanish, `K` (3->1) shifts onto a continuation byte and the
+    /// slice panics. `İ` (2->3) still parses either way, kept so the
+    /// growth direction is covered too.
+    #[test]
+    fn non_ascii_before_a_tag_does_not_shift_offsets() {
+        for marker in ["\u{130}", "\u{212A}", "\u{2126}"] {
+            let html = format!(
+                "<html><head><p>{marker}{marker}{marker}</p>\
+                 <link rel=\"stylesheet\" href=\"/css/App.css\">\
+                 <script src=\"/js/App.js\"></script></head></html>"
+            );
+            let assets = extract_assets("https://example.com/p", html.as_bytes());
+            let urls: Vec<&str> = assets.iter().map(|(u, _)| u.as_str()).collect();
+            assert!(
+                urls.contains(&"https://example.com/css/App.css"),
+                "stylesheet lost after {marker:?}: {urls:?}"
+            );
+            // Fails if a fix slices `lower` instead of `tag`: URL
+            // paths are case-sensitive.
+            assert!(
+                urls.contains(&"https://example.com/js/App.js"),
+                "script lost or case-folded after {marker:?}: {urls:?}"
+            );
+        }
+    }
 
     #[test]
     fn extracts_browser_subresources_in_order() {
