@@ -28,6 +28,18 @@ on:
   pull_request:
     branches: [master]
 
+# One live run per pull request: a new push evicts that PR's own
+# still-running checks instead of queueing behind them. On a
+# pull_request event github.ref is refs/pull/<n>/merge, so the group
+# key carries the PR number and runs never cancel across PRs.
+#
+# Pushes to master keep the group key refs/heads/master and opt out of
+# cancellation: branch protection reads per-commit results, so a
+# cancelled master run would leave a gap rather than a verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
