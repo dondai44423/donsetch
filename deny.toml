@@ -60,8 +60,10 @@ skip-tree = []
 
 [sources]
 # Only crates.io + vendored paths (PDFium static libs are fetched
-# by build.rs, not a registry dep).
+# by build.rs, not a registry dep) + the donsetch quiche fork the
+# h3 lane pins by tag (3cf7a49; boring lifted to ^5 there so one
+# BoringSSL build serves h1/h2 and QUIC).
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/dondai44423/quiche"]
