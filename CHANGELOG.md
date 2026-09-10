@@ -11,6 +11,13 @@ V4 work in progress on `master`. Nothing below ships through a release
 channel until the v4.0.0 release train.
 
 ### Added
+- h3 lane hardening (mnaza, PR #169): every transport now exits
+  through one point, so decompression and wall detection also apply
+  to HTTP/3 responses (a challenge served over h3 no longer reports
+  as clean content); alt-svc routes honor the server's own `ma=`
+  lifetime instead of a constant; the HTTP/3 body reader stops at
+  the shared 64 MiB cap before allocating; `routes.json` carries
+  serialized TLS session material and lands owner-only (0600).
 - Experimental HTTP/3 lane (opt-in via `DONSETCH_H3=1`) on a quiche
 
   0.29.3 fork that shares one BoringSSL build with tier-1. An h3
