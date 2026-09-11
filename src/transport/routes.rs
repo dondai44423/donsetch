@@ -29,6 +29,9 @@ const MA_DEFAULT: u64 = 3600; // alt-svc without ma= gets Chrome's 1h default
 // routes.json row ceiling (issue #175): everything harder than this
 // is an attack shape or a misdirected campaign, not organic browsing.
 const ROWS_MAX: usize = 512;
+/// A re-vouch that extends the window by less than this never hits
+/// the disk: the extension is immaterial against the claimed ma.
+const PERSIST_GRACE_MS: u128 = 60_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RouteState {
@@ -236,13 +239,19 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
         // or a shorter window is worth nothing on disk, and the
         // in-memory entry keeps the current (already valid) lifetime.
         match mem.routes.get(origin) {
+            // Skip when the record on disk is not materially stale:
+            // the same route and egress with a validity that expires
+            // within PERSIST_GRACE_MS of the fresh vouch carries no
+            // information worth a disk write (issue #175).
             Some(cur)
                 if cur.h3_port == fresh.h3_port
                     && cur.egress == fresh.egress
-                    && cur.valid_until_ms >= fresh.valid_until_ms =>
+                    && cur.valid_until_ms + PERSIST_GRACE_MS >= fresh.valid_until_ms =>
             {
                 if std::env::var_os("DONGHOST_DEBUG").is_some() {
-                    eprintln!("[routes] absorb {origin} eg={egress} skip (no newer vouch)");
+                    eprintln!(
+                        "[routes] absorb {origin} eg={egress} skip (vouch not materially newer)"
+                    );
                 }
                 return;
             }
@@ -475,18 +484,33 @@ mod tests {
             "a no-newer re-vouch must not rewrite routes.json"
         );
 
-        // A longer ma extends the record: the write happens.
+        // Extends by less than the grace window: still not worth a
+        // disk write (issue #175).
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert_eq!(
             absorb_alt_svc("skip.test", "h3=\":443\"; ma=601", "direct"),
             Some((443, 601))
         );
+        let m_grace = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .expect("routes still present");
+        assert_eq!(
+            m_skip, m_grace,
+            "an extension inside the grace window must not rewrite the file"
+        );
+
+        // Materially farther out: the write happens.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            absorb_alt_svc("skip.test", "h3=\":443\"; ma=700", "direct"),
+            Some((443, 700))
+        );
         let m_extend = std::fs::metadata(&file)
             .and_then(|m| m.modified())
             .expect("routes still present");
         assert_ne!(
-            m_skip, m_extend,
-            "a fresher vouch must extend the record on disk"
+            m_grace, m_extend,
+            "a materially fresher vouch must extend the record on disk"
         );
 
         // The switch DONSETCH_NO_ALT_SVC shuts the bookkeeping up
