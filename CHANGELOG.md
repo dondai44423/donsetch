@@ -150,6 +150,10 @@ channel until the v4.0.0 release train.
   fetched behind the session was a fourth persisted copy of the
   session, served back with no network hop for up to five minutes
   after logout. Unrelated domains' renders stay.
+- Repeat BYOK searches now ride the same TTL'd disk cache as keyless
+  results instead of re-billing the provider (issue #195): same query
+  + intent replays from cache under a separate byok namespace, capped
+  at 500 entries like the local path (mnaza, #197).
 - The web-memory index persist stages to a PID+sequence-unique
   file per write (PR #191): overlapping persists (a crawl fires
   one per 256-row chunk and one on completion) can no longer tear
