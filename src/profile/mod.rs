@@ -555,6 +555,23 @@ fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
 fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Result<String, String> {
     use std::io::Read;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // Own process group: the timeout kill must reach the
+                // browser's descendants too, or they inherit the
+                // stdout pipe and hang the reader join forever (the
+                // itoqa-found doctor hang).
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn browser version probe: {e}"))?;
@@ -651,7 +668,14 @@ fn kill_probe_tree(pid: Option<u32>) {
     }
     #[cfg(not(windows))]
     unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+        // Kill the WHOLE group: the browser's descendants inherit the
+        // parent's stdout pipe, and only when every write end is dead
+        // does the reader thread see EOF and the join return. Killing
+        // just the parent left the pipe held open and doctor hung
+        // forever (itoqa 2026-09-11). The child runs in its own group
+        // via pre_exec setpgid, so the negative pid hits it and every
+        // descendant, not our own process group.
+        libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
@@ -698,7 +722,29 @@ mod locale_tests {
 
 #[cfg(test)]
 mod probe_tests {
-    use super::{BrowserProfile, Platform, parse_version_major, parse_version_string};
+    use super::{
+        BrowserProfile, Platform, parse_version_major, parse_version_string,
+        spawn_probe_with_timeout,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_timeout_kills_descendants_and_returns_bounded() {
+        // A wedged browser's descendant holds the stdout pipe. Pre-fix
+        // this hung FOREVER: the timeout killed only the parent, the
+        // grandchild kept the pipe open, and the stdout join never saw
+        // EOF. Post-fix the whole group dies and the probe fails in
+        // ~PROBE_SPAWN_TIMEOUT. A wild sleep 300 guards the fixture.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & wait; echo never")
+            .stdout(std::process::Stdio::piped());
+        let start = std::time::Instant::now();
+        let out = spawn_probe_with_timeout(cmd);
+        assert!(out.is_err(), "a wedged probe must fail, not hang");
+        let secs = start.elapsed().as_secs();
+        assert!(secs < 15, "probe must be bounded, took {secs}s");
+    }
 
     #[test]
     fn brand_lists_match_chrome_151_capture() {

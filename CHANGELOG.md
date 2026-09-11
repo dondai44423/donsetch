@@ -159,6 +159,11 @@ channel until the v4.0.0 release train.
   zstd 0.14.0, psl 2.1.231, actions/checkout 4 -> 7.
 
 ### Fixed
+- The browser probe timeout now kills the whole process group, not
+  just the parent: a wedged browser whose descendant held the stdout
+  pipe used to hang `donsetch doctor` forever. The probe now fails
+  at the timeout, bounded, on every platform.
+
 
 - The MCP supervisor no longer loses a request buffered into a
   child that dies before consuming it. The write succeeds while
