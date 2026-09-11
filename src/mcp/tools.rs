@@ -85,14 +85,19 @@ mod tests {
     /// drifted from the shipped MCP contract.
     #[test]
     fn generated_schema_matches_fixture() {
-        let fixture: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/tools_list.json"
-            ))
-            .expect("read fixture"),
-        )
-        .expect("parse fixture");
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tools_list.json"
+        );
+        // Blessing escape hatch: when a new tool lands, regenerate
+        // the golden write once and the test locks it in forever.
+        if std::env::var_os("BLESS_MCP_FIXTURES").is_some() {
+            let json = serde_json::to_string_pretty(&super::list()).expect("serialize tools");
+            std::fs::write(fixture_path, format!("{json}\n")).expect("bless fixture");
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture_path).expect("read fixture"))
+                .expect("parse fixture");
         assert_eq!(super::list(), fixture, "tools/list drifted from fixture");
     }
 }

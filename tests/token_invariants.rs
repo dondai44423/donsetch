@@ -120,9 +120,11 @@ fn mcp_instructions_stay_cheap() {
     // chars/4 : the estimator the rest of the codebase uses.
     let tokens = text.len() / 4;
     assert!(
-        tokens <= 150,
-        "instructions cost ~{tokens} tokens (>150) : resident in every session"
+        tokens <= 165,
+        "instructions cost ~{tokens} tokens (>165) : resident in every session"
     );
+    // The 150 cap covered the 5-tool contract; web_screenshot (issue
+    // #171) added the sixth tool line and the ceiling follows it.
 }
 
 #[test]

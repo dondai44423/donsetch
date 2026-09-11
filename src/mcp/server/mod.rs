@@ -18,6 +18,7 @@ mod fetch_tool;
 mod search_tool;
 #[cfg(feature = "rerank")]
 mod web_memory_tool;
+mod web_screenshot_tool;
 
 use crate::crawl::real as crawl_real;
 use crate::crawl::{CrawlMode, CrawlOptions, Crawler};
@@ -481,6 +482,7 @@ pub(crate) async fn call_tool_ctx(
         "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
         "web_answer" => Ok(answer_tool::answer_tool(daemon, &args, ctx).await),
         "web_crawl" => Ok(crawl_tool::crawl_tool(daemon, &args, ctx).await),
+        "web_screenshot" => Ok(web_screenshot_tool::web_screenshot_tool(daemon, &args, ctx).await),
         #[cfg(feature = "rerank")]
         "web_memory" => Ok(web_memory_tool::web_memory_tool(daemon, &args, ctx).await),
         #[cfg(not(feature = "rerank"))]

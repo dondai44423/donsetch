@@ -1299,6 +1299,25 @@ impl Ghost {
         std::fs::write(&dest, bytes).map_err(|e| FetchError::ghost(format!("screenshot: {e}")))
     }
 
+    /// PNG capture as in-memory bytes (web_screenshot tool, issue
+    /// #171). `full_page` asks CDP to capture beyond the viewport;
+    /// everything else is the same capture as [`Self::screenshot`].
+    pub async fn screenshot_bytes(&self, full_page: bool) -> Result<Vec<u8>, FetchError> {
+        let data = self
+            .cdp
+            .call(
+                Some(&self.session),
+                "Page.captureScreenshot",
+                json!({ "format": "png", "captureBeyondViewport": full_page }),
+            )
+            .await?
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FetchError::ghost("no screenshot data"))?
+            .to_string();
+        Ok(b64decode(data.as_bytes()))
+    }
+
     /// One trusted click with a human-ish pre-move path.
     /// CDP input events are isTrusted=true; detection is
     /// behavioral, so the path curves and overshoots.
@@ -1832,6 +1851,34 @@ fn b64decode(s: &[u8]) -> Vec<u8> {
         out.push((n >> 16) as u8);
         out.push((n >> 8) as u8);
         out.push(n as u8);
+    }
+    out
+}
+
+const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Minimal base64 encoder (the sibling of `b64decode`, same
+/// no-new-dependency rule). Input is raw PNG bytes, output feeds
+/// the MCP image content block (issue #171).
+pub fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHA[(n >> 18) as usize & 63] as char);
+        out.push(B64_ALPHA[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHA[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHA[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
