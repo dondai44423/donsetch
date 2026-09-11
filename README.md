@@ -18,7 +18,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
 
-[Install](#-install) · [Quickstart](#-quickstart) · [The 3 tools](#-the-3-tools) · [Chrome TLS](#-chrome-tls-not-chrome-like) · [Solve & Bounce](#-solve-and-bounce) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Benchmark](#-wrb-web-research-benchmark) · [Comparison](#-comparison) · [Gotchas](#-gotchas) · [Limits](#-honest-limits)
+[Install](#-install) · [Quickstart](#-quickstart) · [The 6 tools](#-the-6-tools) · [Chrome TLS](#-chrome-tls-not-chrome-like) · [Solve & Bounce](#-solve-and-bounce) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Benchmark](#-wrb-web-research-benchmark) · [Comparison](#-comparison) · [Gotchas](#-gotchas) · [Limits](#-honest-limits)
 
 </div>
 
@@ -157,7 +157,7 @@ brew tap dondai44423/donsetch && brew install donsetch
 pi install npm:donsetch
 ```
 
-Registers the 3 tools as native pi tools, spawns the binary at session
+Registers the agent tools as native pi tools, spawns the binary at session
 start, self-updates with `pi update --extensions`.
 
 **DeepSeek Harness (`dsh`, first-class plugin):**
@@ -382,13 +382,16 @@ The CLI is a thin adapter over the same engine the MCP server uses:
 | `donsetch update` / `rollback` | Self-update from GitHub Releases, revert |
 | `donsetch tools` | Tool schemas as JSON (same as MCP `tools/list`) |
 
-## 🎯 The 3 tools
+## 🎯 The 6 tools
 
 | Tool | What it does |
 |---|---|
 | 🌐 **`web_fetch`** | Any URL as clean markdown. HTTP first, escalates to headless browser on bot walls. PDFs with OCR + per-page confidence, `focus`/`toc`/`section`, pagination, `actions` for in-page control, `must_contain` probes, `archive` resurrection. |
 | 🔎 **`web_search`** | Keyless multi-engine search: 10+ backends, consensus + semantic reranking, query-aware official-source placement. Returns ranked URLs + snippets. |
 | 🕷️ **`web_crawl`** | Best-first same-domain crawl. Sitemap + frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
+| 💡 **`web_answer`** | Terminal synthesis over 2-9 fetched sources when enough authority exists; otherwise it answers with the exact gap and no fluff. |
+| 🧠 **`web_memory`** | Local-only vector memory the agent writes to as it works (performant: one batch = one embed pass + one disk write, async off the answer path). Search by semantic proximity, cap-bounded, on-device model. |
+| 📸 **`web_screenshot`** | Rendered PNG of any URL through the same tier-2 browser. URL goes through the usual safety guards; CLI twin: `donsetch screenshot URL [--out PATH]`. |
 
 Tool schemas: `donsetch tools`. Every tool returns structured errors
 with stable codes + `next_action`. v3.6 compact contracts: the model
@@ -809,7 +812,7 @@ Every layer in Rust. No dependency on existing OSS web tooling.
 | 🔎 **DonSeek** | Keyless multi-engine search, RRF + BM25 + consensus + semantic reranking | `src/search/` |
 | 🕷️ **DonTread** | Crawl engine, sitemap, focus frontier, Governor pacing, resume tokens | `src/crawl/` |
 | 📄 **DonSheet** | PDF extraction, PDFium FFI, pixel-truth fusion, OCR cascade, forms | `src/pdf/` |
-| 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, 3 tools, crash-only supervisor | `src/mcp/` |
+| 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, 6 tools, crash-only supervisor | `src/mcp/` |
 
  **727 tests. Zero clippy warnings.**
 `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` is the law.
