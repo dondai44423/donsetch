@@ -17,10 +17,10 @@ tokio-boring = "5"
 quiche = { git = "https://github.com/dondai44423/quiche", tag = "donsetch-v0.29.3-1", default-features = false, features = ["boringssl-boring-crate"] }
 tokio = { version = "1", features = ["full"] }
 url = "2"
-brotli = "8"
+brotli = "9"
 memchr = "2"
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 rustls-native-certs = "0.8"
 scraper = "0.27.0"
 encoding_rs = "0.8.35"
