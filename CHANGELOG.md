@@ -48,6 +48,21 @@ channel until the v4.0.0 release train.
   its value and origin (`--markdown` for the reference table,
   `--legacy` for the old-name map); `donsetch doctor` warns about
   deprecated env names active in the shell.
+- Resurrection reaches transport-dead URLs: a TLS handshake against
+  a parked domain, a dead DNS name and a refused port now gate
+  `archive=auto` resurrection the same way 404/410 do, while
+  timeouts, resets and protocol errors stay excluded (a snapshot
+  must never launder an unknown, and a reset can be an IP-level
+  block that an archived copy would paper over). The gate reads a
+  new `structuredContent.fetch_error` transport class recorded on
+  every status-0 fetch error.
+- Wayback snapshot serving survives wayback's own redirect
+  interstitials: a thin capture is re-checked against wayback stub
+  markers, and a stub chain-hops through up to 4 `<meta
+  http-equiv="refresh">` targets when (and only when) wayback
+  rewrote the target (`web.archive.org/web/<14-digit-ts>/...`); a
+  live-web refresh target is never followed, because the URL we
+  are resurrecting may still be dead, moved, or hostile.
 - `web_screenshot` MCP tool: a rendered PNG of a page through the
   existing tier-2 browser (url, full_page, wait_ms). The capture is
   in-process only; the MCP result carries an image content block and
@@ -219,6 +234,16 @@ channel until the v4.0.0 release train.
   found". That answer no longer reads as a failed check: the
   probe skips with an honest, zero-credit note instead (reported
   by tripflex on #200). A 401 always stays a failure.
+- Resurrection no longer claims "never archived" on shaky ground:
+  the availability API is lossy and scheme-strict (a capture
+  recorded under `http://` is invisible to an `https://` query), so
+  an empty answer now falls through to the complete CDX index
+  (scheme-canonical, `filter=statuscode:200`, last 5 captures)
+  before `archive=only` reports anything, an unreachable archive
+  answers `transient` with its own message instead of a false
+  `permanent`, and a found-but-unusable snapshot names itself and
+  its stage (`structuredContent.archive_stage`) instead of
+  collapsing into the live error.
 - `site:` queries no longer leak off-domain results through BYOK
   providers (issue #190): both BYOK exits (provider-first and the
   local-first fallback) sweep results through the same post-merge
