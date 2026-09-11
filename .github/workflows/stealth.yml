@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -41,7 +41,7 @@ jobs:
     needs: scorecard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Probe the current Chromium stable (keyless) and alarm on gap
         run: |
           FEED=$(curl -fsSL "https://chromiumdash.appspot.com/fetch_milestones?num=6")
