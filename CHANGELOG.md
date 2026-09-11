@@ -155,7 +155,7 @@ channel until the v4.0.0 release train.
   one per 256-row chunk and one on completion) can no longer tear
   `index.json` through a shared tmp inode and parse-fail the next
   recall to an empty index.
-- Xvfb reuse gate now demands a bounded real-protocol answer
+- Subresource shadow-fetching no longer aborts the daemon on a page
   containing `İ`, `K` or `Ω`. The scanner searched a `to_lowercase()`
   copy of the document for tag offsets and then sliced the original
   string at them, but `to_lowercase` is not byte-length preserving, so
