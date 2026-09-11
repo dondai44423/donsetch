@@ -722,14 +722,12 @@ mod locale_tests {
 
 #[cfg(test)]
 mod probe_tests {
-    use super::{
-        BrowserProfile, Platform, parse_version_major, parse_version_string,
-        spawn_probe_with_timeout,
-    };
+    use super::{BrowserProfile, Platform, parse_version_major, parse_version_string};
 
     #[cfg(unix)]
     #[test]
     fn probe_timeout_kills_descendants_and_returns_bounded() {
+        use super::spawn_probe_with_timeout;
         // A wedged browser's descendant holds the stdout pipe. Pre-fix
         // this hung FOREVER: the timeout killed only the parent, the
         // grandchild kept the pipe open, and the stdout join never saw
