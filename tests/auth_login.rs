@@ -9,7 +9,7 @@ use std::net::TcpListener;
 
 use donsetch::auth::{self, AuthRegistry};
 use donsetch::ghost::cache::{
-    CookieRecord, clear_session_cookies_for, is_session_worthy, load_session_cookies,
+    CookieRecord, GhostState, clear_session_cookies_for, is_session_worthy, load_session_cookies,
     store_session_cookies,
 };
 
@@ -400,4 +400,40 @@ async fn probe_domain_does_not_panic_inside_a_tokio_runtime() {
     // panic = "abort", never by aborting the process).
     let result = auth::probe_domain("127.0.0.1", &cookies, Some(1));
     assert!(result.is_err(), "expected a connection-refused Err, got Ok");
+}
+
+/// Tier-1 jar echo hygiene (v4 phase 1.4, issue #173): the logout
+/// sweep owns every persisted copy. Two records, one matches the
+/// domain, one stays for another host.
+#[test]
+fn logout_wipes_the_tier1_echo() {
+    isolate_state();
+    let mut reg = AuthRegistry::load();
+    let _ = reg.remove("alpha.test");
+    // Keep this hermetic: no tier-2 browser, just sync the jar
+    // records the same way sync_warm_cookies would.
+    {
+        let mut state = GhostState::load();
+        state.sync_tier1_cookies(&[
+            cookie(".alpha.test", "session_cookie", "a", None),
+            cookie("beta.test", "other_cookie", "b", None),
+        ]);
+        state.save();
+    }
+    assert!(clear_session_cookies_for("alpha.test"));
+    let _ = clear_session_cookies_for("alpha.test"); // idempotent revisit
+    let state = GhostState::load();
+    let tiers: Vec<&str> = state
+        .tier1_cookies
+        .iter()
+        .map(|c| c.domain.as_str())
+        .collect();
+    assert!(
+        !tiers.iter().any(|d| d.ends_with("alpha.test")),
+        "session-echo leak after logout"
+    );
+    assert!(
+        tiers.iter().any(|d| d.ends_with("beta.test")),
+        "background housekeeping must keep unrelated domains"
+    );
 }

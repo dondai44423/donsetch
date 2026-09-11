@@ -639,6 +639,16 @@ pub fn clear_session_cookies_for(domain: &str) -> bool {
     }
     let mut state = GhostState::load();
     let mut removed = false;
+    // Issue #173: the tier-1 echo of the vault (synced by sync_tier1_cookies)
+    // was a third copy of the session that logout missed. Same rule as
+    // the profile jar: cookies are removed only when they belong to the
+    // domain that is being logged out.
+    let before_t1 = state.tier1_cookies.len();
+    state.tier1_cookies.retain(|c| {
+        let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
+        !crate::auth::cookie_belongs_to(&key, &host)
+    });
+    removed |= state.tier1_cookies.len() != before_t1;
     for p in state.profiles.values_mut() {
         let before = p.session_cookies.len();
         p.session_cookies.retain(|c| {
