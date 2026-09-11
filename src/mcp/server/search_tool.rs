@@ -401,6 +401,10 @@ pub(super) async fn search_outcome(
     if byok_configured && !local_first {
         match daemon.byok.search(query, max, intent).await {
             Ok(out) => {
+                let mut out = out;
+                // Issue #190: site: queries dawn on BYOK results too,
+                // and prewarm only the rows that survive the filter.
+                crate::search::site_filter(query, &mut out.results);
                 // v4 phase 2.1: the warm handoff is not a local-search
                 // privilege. Provider results carry their own titles
                 // and snippets, so the reply does not wait: prewarm
@@ -430,6 +434,11 @@ pub(super) async fn search_outcome(
                 }
                 match daemon.byok.search(query, max, intent).await {
                     Ok(out) => {
+                        // Issue #190: the site: scan has to reach the
+                        // fallback path too, or the local-first mode
+                        // leaks rows off-domain.
+                        let mut out = out;
+                        crate::search::site_filter(query, &mut out.results);
                         // Same detached prewarm as the BYOK-first path.
                         daemon.searcher.spawn_prewarm(&out.results);
                         Ok(out)

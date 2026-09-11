@@ -7,6 +7,8 @@
 use crate::DISPLAY_NAME;
 use crate::mcp::server::{self, Daemon};
 use crate::spec;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use clap::error::ErrorKind as ClapErrorKind;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -30,9 +32,35 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     // Build clap command from the spec table and parse.
     // `try_get_matches_from` expects the first element to be
     // the binary name (like std::env::args).
+    // CLI-only extra for the screenshot command: `--out PATH` is
+    // not an MCP schema member, so clap must never see it. The
+    // pair is stripped before parsing and replayed as a file write
+    // after the capture on the caller's result.
+    let mut out_path: Option<String> = None;
+    let mut out_seen = false;
+    let args_ref: &[String] = if cmd == "screenshot" {
+        let mut clean: Vec<String> = Vec::with_capacity(args.len());
+        let mut skip = false;
+        for (i, a) in args.iter().enumerate() {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if a == "--out" {
+                skip = true;
+                out_seen = true;
+                out_path = args.get(i + 1).cloned();
+                continue;
+            }
+            clean.push(a.clone());
+        }
+        Box::leak(clean.into_boxed_slice())
+    } else {
+        args
+    };
     let cli = spec::cli_command(tool);
     let mut full_args = vec![cmd.to_string()];
-    full_args.extend_from_slice(args);
+    full_args.extend_from_slice(args_ref);
     let matches = match cli.try_get_matches_from(&full_args) {
         Ok(m) => m,
         Err(e) => match e.kind() {
@@ -85,6 +113,50 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
         }
     };
     let code = render_result(&result, json_mode, quiet, cmd);
+    // CLI-only: `screenshot --out PATH` writes the PNG alongside the
+    // receipt. Failures stay honest: stderr + a real exit code, never
+    // a silent no-save.
+    if cmd == "screenshot" && out_seen {
+        let Some(path) = out_path else {
+            eprintln!("[screenshot] error: --out given without a path; nothing saved");
+            return EXIT_PERMANENT;
+        };
+        let img = result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| {
+                        b.get("type").and_then(|t| t.as_str()) == Some("image")
+                            && b.get("data")
+                                .and_then(|d| d.as_str())
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                    })
+                    .and_then(|b| b.get("data").and_then(|d| d.as_str()))
+            });
+        let Some(data) = img else {
+            eprintln!("[screenshot] error: capture returned no image to save");
+            return EXIT_PERMANENT;
+        };
+        let Ok(bytes) = BASE64_STANDARD
+            .decode(data)
+            .map_err(|er| eprintln!("[screenshot] error: bad image payload: {er}"))
+        else {
+            return EXIT_PERMANENT;
+        };
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => eprintln!(
+                "[screenshot] saved {} bytes to {}",
+                bytes.len(), path
+            ),
+            Err(er) => {
+                eprintln!("[screenshot] error: could not write {path}: {er}");
+                return EXIT_PERMANENT;
+            }
+        }
+    }
     // Let page-load realism finish (v4 phase 1.3): the shadow burst
     // runs in the background; a one-shot CLI would kill it on exit.
     crate::fetch::shadow::drain_pending().await;

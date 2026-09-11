@@ -683,6 +683,7 @@ pub static TOOLS: &[ToolSpec] = &[
             "donsetch screenshot https://example.com",
             "donsetch screenshot https://example.com --full-page",
             "donsetch screenshot https://example.com --wait-ms 2500",
+            "donsetch screenshot https://example.com --out page.png",
         ],
     },
 ];

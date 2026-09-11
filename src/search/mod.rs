@@ -946,7 +946,11 @@ fn width_for_stress(stress: f64, available: usize) -> usize {
 ///
 /// Matches `domain.com` and any subdomain `*.domain.com`.
 /// Case-insensitive. Strips `www.` prefix before comparison.
-fn site_filter(query: &str, results: &mut Vec<Merged>) {
+/// (#190) site: filters BYOK results too: the same filtering and count
+/// semantics as the local engine sweeps. Redirect rows whose target
+/// host can not match the scanned domain (google goto proxies) drop;
+/// fail closed.
+pub(crate) fn site_filter(query: &str, results: &mut Vec<Merged>) {
     let q = query.to_lowercase();
     let mut site_domain: Option<String> = None;
     for token in q.split_whitespace() {
