@@ -18,6 +18,19 @@ use ort::value::TensorRef;
 use sha2::{Digest, Sha256};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 
+// `resolve/main` is a branch reference, not a revision: the host
+// serves whatever currently sits at that repo's head, so the hash and
+// byte count below are the only guard on what actually arrives. An
+// upstream re-push fails the pin on every install until both are
+// bumped — a visible outage of web memory rather than a silent model
+// swap, which is the trade being made. Pinning the URL to a commit
+// would remove the exposure; the sibling downloaders in
+// search/rerank.rs and pdf/ocr.rs float the same way.
+//
+// The file installs under a fixed name rather than one derived from
+// its hash, so two pins never coexist: bumping one deletes the other's
+// download. That is acceptable while the model is effectively static,
+// and content-addressed paths are out of scope here.
 pub const MODEL_URL: &str =
     "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx";
 pub const MODEL_SHA256: &str = "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1";
@@ -86,9 +99,30 @@ fn ensure_file(
         if verify_bytes(&bytes, sha, size) {
             return Ok(());
         }
-        // A wrong existing file = redownload; on failure leave it for
-        // a clean re-run, do not pretend it is good.
-        return ensure_file(url, sha, size, dest, what);
+        // Delete before redownloading. The rename below would replace
+        // it on success, so this is about the failure path: a
+        // surviving bad file is reported as present by
+        // has_model()/ready(), and every later call pays a full
+        // re-read and re-hash before rejecting it again.
+        //
+        // A concurrent remover reached the state we wanted. Any other
+        // error fails fast: a sharing violation here would fail the
+        // rename too, after a 23MB download.
+        match std::fs::remove_file(dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "[memory] corrupt {what} at {} already removed by another process",
+                    dest.display()
+                );
+            }
+            Err(e) => {
+                return Err(format!(
+                    "memory: remove corrupt {what} at {}: {e}",
+                    dest.display()
+                ));
+            }
+        }
     }
     std::fs::create_dir_all(dest.parent().unwrap_or_else(|| Path::new(".")))
         .map_err(|e| format!("memory: mkdir {}: {e}", dest.display()))?;
@@ -322,4 +356,38 @@ pub fn embed_batch(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     }
     let _ = d;
     Ok(vecs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fails if the failed-pin path returns to recursing into
+    /// `ensure_file` instead of deleting: every frame re-read the same
+    /// bytes, so the process dies on a stack overflow rather than the
+    /// assertion reporting.
+    #[test]
+    fn corrupt_existing_file_is_removed_and_does_not_recurse() {
+        let dir = std::env::temp_dir().join(format!("donsetch-model-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let dest = dir.join("model_quantized.onnx");
+        std::fs::write(&dest, b"not the model").expect("seed");
+
+        // Port 1 refuses instantly, so the redownload fails fast and
+        // the test never waits on the network.
+        let out = ensure_file(
+            "http://127.0.0.1:1/model.onnx",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            999_999,
+            &dest,
+            "test model",
+        );
+
+        assert!(out.is_err(), "a failed redownload must report, not pretend");
+        assert!(
+            !dest.exists(),
+            "the corrupt file must be removed, or the next call reads it again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

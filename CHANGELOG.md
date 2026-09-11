@@ -130,6 +130,25 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Subresource shadow-fetching no longer aborts the daemon on a page
+  containing `İ`, `K` or `Ω`. The scanner searched a `to_lowercase()`
+  copy of the document for tag offsets and then sliced the original
+  string at them, but `to_lowercase` is not byte-length preserving, so
+  one such character shifted every later offset: assets silently
+  dropped where the shift landed on ASCII, a mid-codepoint slice panic
+  where it did not : and the release profile's `panic = "abort"` turns
+  that into a daemon kill. Folding is `to_ascii_lowercase` now, which
+  is byte-length and char-boundary preserving, and is also what the
+  HTML standard specifies for tag and attribute names. `attr()` had
+  the same latent pattern and is fixed with it.
+- A corrupt local embedding model no longer wedges every subsequent
+  fetch. `ensure_file` recursed into itself with identical arguments
+  when the file on disk failed its SHA/size pin, never removing it, so
+  the same bad bytes were read forever : a stack overflow, or an
+  infinite loop if the recursion was optimized into a tail call. The
+  bad file is removed and the existing atomic download path takes
+  over; a concurrent remover is tolerated with a receipt, any other
+  removal failure is honest and immediate.
 - Default-feature builds compile again: the web-memory receipt in
   `donsetch status` tested the rerank feature with `cfg!` instead of
   `#[cfg]`. `cfg!` is a runtime boolean, so the rerank-only arms
