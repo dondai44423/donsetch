@@ -657,6 +657,18 @@ pub fn clear_session_cookies_for(domain: &str) -> bool {
         });
         removed |= p.session_cookies.len() != before;
     }
+    // Issue #173 (deeper pass): the rendered-DOM cache is a fourth copy
+    // of the session's fruit. A page fetched behind the session is
+    // stored whole in `renders` (RENDER_TTL = 5 min) and served by the
+    // tier-2 fetch shortcut, so a logged-out domain's dashboard would
+    // still hand back its authenticated DOM for up to five minutes.
+    // Drop every render whose host belongs to the logged-out domain.
+    let before_r = state.renders.len();
+    state.renders.retain(|url, _| {
+        let host = crate::search::rank::host_of(url);
+        !crate::auth::cookie_belongs_to(&key, &host)
+    });
+    removed |= state.renders.len() != before_r;
     if removed {
         state.save();
     }
