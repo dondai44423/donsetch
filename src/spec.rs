@@ -81,8 +81,13 @@ pub struct ParamSpec {
 pub struct ToolSpec {
     /// MCP tool name (`web_fetch`).
     pub name: &'static str,
-    /// CLI subcommand (`fetch`).
+    /// CLI subcommand (`fetch`). Ignored when `mcp_only` is set.
     pub cli_cmd: &'static str,
+    /// MCP-surface-only tool: announced in `tools/list` and the
+    /// initialize `instructions`, but with no CLI subcommand — not
+    /// dispatched from `main`, not resolved by `by_cli_cmd`, and not
+    /// listed in `donsetch --help`. `cli_cmd`/`examples` are inert.
+    pub mcp_only: bool,
     /// One-liner : `donsetch --help` listing AND the MCP
     /// `instructions` blurb sent at initialize.
     pub summary: &'static str,
@@ -607,6 +612,7 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_fetch",
         cli_cmd: "fetch",
+        mcp_only: false,
         summary: "Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)",
         description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : only relevant blocks, 50-80% cheaper.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). structuredContent.changed carries the verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true returns the whole article in one call (≤6 parts, *(part N)* markers).\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). JS-only pages need actions=[{click|type|press|scroll|wait,...}] : deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: structuredContent.next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: content[0].text is one canonical source document. structuredContent contains only actionable model state such as url, content_ok, content_kind, thin, changed, next_offset, PDF summary, stitch count, cloak warning and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
         mcp_description: "Read one URL or a deliberate URL batch as source markdown. Use search to discover URLs and crawl for multiple pages from one site. Prefer the smallest view that can supply the required evidence, and continue only from returned continuation state. Do not repeat a successful read unless it was thin, truncated, or failed. Automatic acquisition may use HTTP, a browser, an adapter, PDF extraction, or an archive. Treat content_ok=false, thin=true, or a stable error code as unresolved; follow next_action or choose another source. Cite the returned source URL.",
@@ -622,6 +628,7 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_search",
         cli_cmd: "search",
+        mcp_only: false,
         summary: "Web search : 5 keyless engines merged + reranked, or your API keys",
         description: "Web search : returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nEach result is one compact evidence row: fetch handle (or raw URL), title, host, focused snippet, and a browser-cost warning only when relevant. Rank already represents DonSeTch's scoring decision, so per-engine scores and timing are not repeated in model context. Weak or degraded retrieval remains explicitly labeled. Multi-query mode keeps one clearly labeled ranked section per formulation.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over automatically.\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nResponse: content[0].text is the ranked evidence list. structuredContent contains weak plus rank, URL and optional fetch handle for each result; multi-query mode keeps those lists separate. Engine health, score, cache, provider, reranker and timing diagnostics live in _meta.\n\nAfter search: fetch the best result via its S-handle : enrichment pre-fetches top results, so the next fetch is near-instant.",
         mcp_description: "Discover ranked candidate sources. Use this before fetch when you do not already have a URL; it returns titles and snippets, not page contents. A snippet supports only claims it states explicitly. Treat weak or degraded results as incomplete, and fetch a candidate when its full text is required. Search handles resolve directly in fetch; cite source URLs from the result metadata accompanying the ranked list.",
@@ -636,6 +643,7 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_answer",
         cli_cmd: "answer",
+        mcp_only: false,
         summary: "Evidence pack for a factual question : search + read top pages, passages with sources",
         description: "One-call research for a factual question : DonSeTch searches the web, reads the top pages, and returns a compact pack of relevant passages, each tied to its source URL with a freshness stamp.\n\nNo prose answer is invented: you get verbatim cited evidence to reason over. Dead or walled pages are skipped and reported, never silently dropped. Duplicate mirrors are collapsed.\n\nbudget_tokens caps the whole pack; max_pages caps how many sources are read; deadline_ms caps the wall clock (honest deadline error, never a hang).\n\nResponse: content[0].text is the markdown evidence pack. structuredContent contains query, empty, truncated, tokens_est, per-source citations and skipped pages with reasons. Search and per-page timing diagnostics live in _meta.",
         mcp_description: "Factual question -> cited evidence in one call: searches the web, reads top pages, returns verbatim passages tied to source URLs with freshness stamps. No prose answer invented; you synthesize. Dead/walled pages are skipped and reported.",
@@ -649,6 +657,7 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_crawl",
         cli_cmd: "crawl",
+        mcp_only: false,
         summary: "Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)",
         description: "Crawl a site from a seed : for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap : see what a site has before committing · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped. dataset=true emits JSON Lines (one object per page).\n\nBudgets: focus (topic) ranks the frontier by BM25-lite link-text/URL-path keyword scoring and crawls only matches : set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory : returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: content[0].text is one linear site-evidence document. structuredContent contains seed, completion, page URLs, stop reason and any resume/next action. Map, queue, skip, score, quality, crawl-delay and timing diagnostics live in _meta. FrontierEmpty is complete; MaxPages, CharBudget, DepthLimit, Deadline, ThrottledOut and Cancelled are incomplete.",
         mcp_description: "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs. dataset=true returns JSONL (one object per page).",
@@ -663,6 +672,7 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_memory",
         cli_cmd: "memory",
+        mcp_only: false,
         summary: "Search pages this machine already fetched (local, on-device)",
         description: "One-call semantic search over your local page history. DonSeTch keeps a bounded on-device index of pages it fetched (URL, title, markdown digest) with all-MiniLM-L6-v2 embeddings computed locally by the vendored onnxruntime. Nothing leaves the box: the model runs here, the index lives under the cache dir, no cloud call.\n\nHits are ranked by cosine similarity (score 0..1). Kill switch: DONSETCH_NO_WEB_MEMORY (when set, web_memory returns nothing and ingest is disabled). The index is capped at 4000 rows (DONSETCH_WEB_MEMORY_CAP) with oldest-first eviction.",
         mcp_description: "Search pages this machine fetched before with a natural-language query. Results come from a bounded local index that DonSeTch maintains itself; the model runs on-device. Ranked hits (url, title, snippet, score). To read beyond the snippet fetch the URL with web_fetch.",
@@ -675,21 +685,22 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_screenshot",
         cli_cmd: "screenshot",
+        mcp_only: true,
         summary: "Open a URL in a real browser, return the page as PNG",
         description: "A rendered PNG of a page: DonSeTch opens the URL in the same tier-2 browser it already keeps for challenge walls, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport.",
         mcp_description: "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height; wait_ms adds settle time after load (max 5000, default 600). Private/loopback URLs are blocked like web_fetch.",
         params: SCREENSHOT_PARAMS,
-        examples: &[
-            "donsetch screenshot https://example.com",
-            "donsetch screenshot https://example.com --full-page",
-            "donsetch screenshot https://example.com --wait-ms 2500",
-        ],
+        // MCP-only: no CLI subcommand, so no CLI examples. The capture
+        // returns an image content block that the CLI renderer has no
+        // way to deliver; it lives on the MCP surface only.
+        examples: &[],
     },
 ];
 
-/// Look up a tool spec by CLI subcommand name.
+/// Look up a tool spec by CLI subcommand name. MCP-only tools have no
+/// CLI subcommand and never resolve here.
 pub fn by_cli_cmd(cmd: &str) -> Option<&'static ToolSpec> {
-    TOOLS.iter().find(|t| t.cli_cmd == cmd)
+    TOOLS.iter().find(|t| !t.mcp_only && t.cli_cmd == cmd)
 }
 
 // ── MCP schema generation ────────────────────────────────────
@@ -1008,6 +1019,40 @@ mod tests {
             args["query_variants"],
             json!(["rust async trait objects", "async fn in trait rust"])
         );
+    }
+
+    // web_screenshot is an MCP-surface tool with no CLI: the spec
+    // used to declare cli_cmd "screenshot" + `donsetch screenshot`
+    // examples and list it in `donsetch --help`, but main never
+    // dispatched it, so the tool's own advertised example returned
+    // "unknown command 'screenshot'". An MCP-only tool must stay off
+    // every CLI path while remaining a first-class MCP tool.
+    #[test]
+    fn mcp_only_tools_have_no_cli_surface_but_stay_on_the_mcp_surface() {
+        let screenshot = TOOLS
+            .iter()
+            .find(|t| t.name == "web_screenshot")
+            .expect("web_screenshot present");
+        assert!(screenshot.mcp_only);
+        // No CLI subcommand resolves to it, and it advertises no
+        // CLI examples (they would all be dead `donsetch screenshot`).
+        assert!(by_cli_cmd("screenshot").is_none());
+        assert!(screenshot.examples.is_empty());
+        // Still a real MCP tool: present in tools/list by name.
+        let listed = crate::mcp::tools::list();
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"web_screenshot"), "{names:?}");
+        // Every non-mcp_only tool still resolves as a CLI subcommand.
+        for t in TOOLS {
+            if !t.mcp_only {
+                assert!(by_cli_cmd(t.cli_cmd).is_some(), "{} lost its CLI", t.name);
+            }
+        }
     }
 
     #[test]

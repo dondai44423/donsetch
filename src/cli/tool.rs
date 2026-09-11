@@ -492,6 +492,10 @@ pub fn print_top_help() {
     println!();
     println!("AGENT TOOLS:");
     for tool in spec::TOOLS {
+        // MCP-only tools have no CLI subcommand to advertise here.
+        if tool.mcp_only {
+            continue;
+        }
         println!("  {:8} {}", tool.cli_cmd, tool.summary);
     }
     println!();
