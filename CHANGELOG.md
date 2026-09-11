@@ -15,7 +15,10 @@ channel until the v4.0.0 release train.
   existing tier-2 browser (url, full_page, wait_ms). The capture is
   in-process only; the MCP result carries an image content block and
   a text note. Verified live against a real render (PNG header,
-  image/png).
+  image/png). The CLI ships the same render now that it was wired up:
+  `donsetch screenshot URL [--full-page|--wait-ms N]` prints the
+  receipt and, with the CLI-only `--out PATH`, writes the PNG with
+  honest failure paths (bad path or missing path = stderr + exit 1).
 - h3 lane hardening (mnaza, PR #169): every transport now exits
   through one point, so decompression and wall detection also apply
   to HTTP/3 responses (a challenge served over h3 no longer reports
@@ -137,7 +140,23 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
-- Subresource shadow-fetching no longer aborts the daemon on a page
+- `site:` queries no longer leak off-domain results through BYOK
+  providers (issue #190): both BYOK exits (provider-first and the
+  local-first fallback) sweep results through the same post-merge
+  domain filter the local engine uses; goto/redirect proxies drop
+  (fail closed), and the warm body prewarm runs on the rows that
+  survive the filter.
+- `donsetch login --logout DOMAIN` now also wipes the rendered-DOM
+  cache of the logged-out domain (Mart-Bogdan, PR #188): a page
+  fetched behind the session was a fourth persisted copy of the
+  session, served back with no network hop for up to five minutes
+  after logout. Unrelated domains' renders stay.
+- The web-memory index persist stages to a PID+sequence-unique
+  file per write (PR #191): overlapping persists (a crawl fires
+  one per 256-row chunk and one on completion) can no longer tear
+  `index.json` through a shared tmp inode and parse-fail the next
+  recall to an empty index.
+- Xvfb reuse gate now demands a bounded real-protocol answer
   containing `İ`, `K` or `Ω`. The scanner searched a `to_lowercase()`
   copy of the document for tag offsets and then sliced the original
   string at them, but `to_lowercase` is not byte-length preserving, so
@@ -176,6 +195,9 @@ channel until the v4.0.0 release train.
   never holds a response past its deadline (issue #178).
 - CI runs now concurrency-cancel per pull request only, never on
   master (Mart-Bogdan, PR #181).
+- The alt-svc kill-switch test no longer excludes Windows
+  (Mart-Bogdan, PR #189): the env-var mutations in it are not
+  Windows-specific, so the guard was dead weight.
 
 - Xvfb reuse gate now demands a bounded real-protocol answer
   (xdpyinfo within 2s) before handing a display to the pool, so a

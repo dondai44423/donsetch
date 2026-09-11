@@ -431,16 +431,14 @@ mod tests {
                 })
                 .collect()
         };
-            // Isolate the store dir under a temp DONSETCH_CACHE_DIR before
+        // Isolate the store dir under a temp DONSETCH_CACHE_DIR before
         // anything resolves cache_dir(); nextest runs one process per
         // test, so the env sticks for this test only. The naive read
         // of persist() (without this) fired 160 overwrite-renames into
         // the developer's real memory index on every test run: the
         // destructive pattern is explicitly forbidden.
-        let dir = std::env::temp_dir().join(format!(
-            "donsetch-test-persist-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-test-persist-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         unsafe {
             std::env::set_var("DONSETCH_CACHE_DIR", &dir);

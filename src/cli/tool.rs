@@ -7,8 +7,8 @@
 use crate::DISPLAY_NAME;
 use crate::mcp::server::{self, Daemon};
 use crate::spec;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::error::ErrorKind as ClapErrorKind;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -147,10 +147,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             return EXIT_PERMANENT;
         };
         match std::fs::write(&path, &bytes) {
-            Ok(()) => eprintln!(
-                "[screenshot] saved {} bytes to {}",
-                bytes.len(), path
-            ),
+            Ok(()) => eprintln!("[screenshot] saved {} bytes to {}", bytes.len(), path),
             Err(er) => {
                 eprintln!("[screenshot] error: could not write {path}: {er}");
                 return EXIT_PERMANENT;
