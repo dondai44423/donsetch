@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
 const MA_DEFAULT: u64 = 3600; // alt-svc without ma= gets Chrome's 1h default
+// routes.json row ceiling (issue #175): everything harder than this
+// is an attack shape or a misdirected campaign, not organic browsing.
+const ROWS_MAX: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RouteState {
@@ -53,10 +56,36 @@ struct RouteMemory {
 impl RouteMemory {
     fn fresh(&mut self) {
         let f = load_file(&self.path);
-        self.routes = f.routes;
+        // Routes only matter while they are alive: an expired record
+        // is a dead row that would otherwise ride along until the
+        // next successful absorb of that origin (issue #175). Same
+        // rule as the persist path, applied at load.
+        let now = now_ms();
+        self.routes = f
+            .routes
+            .into_iter()
+            .filter(|(_, st)| st.valid_until_ms > now)
+            .collect();
     }
     fn persist(&self) {
-        save_file(&self.path, &self.routes);
+        // Cap-first: one hostile redirect fanout used to be able to
+        // seed thousands of rows. Keep the freshest ROWS_MAX after
+        // dropping everything expired, then write.
+        let mut routes = self.routes.clone();
+        let now = now_ms();
+        routes.retain(|_, st| st.valid_until_ms > now);
+        if routes.len() > ROWS_MAX {
+            let mut by_expiry: Vec<(String, u128)> = routes
+                .iter()
+                .map(|(k, st)| (k.clone(), st.valid_until_ms))
+                .collect();
+            by_expiry.sort_by_key(|(_, v)| *v);
+            let drop = routes.len() - ROWS_MAX;
+            by_expiry.into_iter().take(drop).for_each(|(k, _)| {
+                routes.remove(&k);
+            });
+        }
+        save_file(&self.path, &routes);
     }
 }
 
@@ -191,17 +220,38 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
             .routes
             .get(origin)
             .filter(|st| st.egress == egress)
-            .map(|st| st.session_b64.clone());
-        mem.routes.insert(
-            origin.to_string(),
-            RouteState {
-                use_h3: true,
-                h3_port: port,
-                valid_until_ms: now_ms() + u128::from(ma_secs).saturating_mul(1000),
-                egress: egress.to_string(),
-                session_b64: session.unwrap_or_default(),
-            },
-        );
+            .map(|st| st.session_b64.clone())
+            .unwrap_or_default();
+        let fresh: RouteState = RouteState {
+            use_h3: true,
+            h3_port: port,
+            valid_until_ms: now_ms() + u128::from(ma_secs).saturating_mul(1000),
+            egress: egress.to_string(),
+            session_b64: session,
+        };
+        // Hot-path economics (issue #175): every alt-svc sighting used
+        // to rewrite the whole file even when it carried nothing new.
+        // Write only when the vouch extends the record's lifetime or
+        // changes the route; a re-vouch of the same route and the same
+        // or a shorter window is worth nothing on disk, and the
+        // in-memory entry keeps the current (already valid) lifetime.
+        match mem.routes.get(origin) {
+            Some(cur)
+                if cur.h3_port == fresh.h3_port
+                    && cur.egress == fresh.egress
+                    && cur.valid_until_ms >= fresh.valid_until_ms =>
+            {
+                if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                    eprintln!("[routes] absorb {origin} eg={egress} skip (no newer vouch)");
+                }
+                return;
+            }
+            _ => {}
+        }
+        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            eprintln!("[routes] absorb {origin} eg={egress} record (ma={ma_secs})");
+        }
+        mem.routes.insert(origin.to_string(), fresh);
         mem.persist();
     });
 }
@@ -209,8 +259,12 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
 /// One absorb for every alt-svc sighting: parse the header value and
 /// record the route with the SERVER'S ma= lifetime (Chrome's 1h
 /// default when absent) — never a made-up constant. Returns what was
-/// recorded; None when no QUIC-v1 h3 candidate parses.
+/// recorded; None when no QUIC-v1 h3 candidate parses or the
+/// bookkeeping is switched off (DONSETCH_NO_ALT_SVC).
 pub fn absorb_alt_svc(origin: &str, value: &str, egress: &str) -> Option<(u16, u64)> {
+    if crate::config::env_flag("DONSETCH_NO_ALT_SVC") {
+        return None;
+    }
     let (port, ma) = parse_h3_candidate(value)?;
     record_h3(origin, port, ma, egress);
     Some((port, ma))
@@ -385,5 +439,129 @@ mod tests {
             "h2.users, \"example.com:80\"; ma=1, h3=\":443\"; ma=600, h3-29=\":443\"",
         );
         assert_eq!(got, Some((443, 600)));
+    }
+
+    // Issue #175 part 1: the hot path must not rewrite the file on
+    // every alt-svc sighting. A re-vouch of the SAME route with a
+    // shorter or equal window adds nothing: no write. A fresher
+    // vouch extends the lifetime: a write.
+    #[test]
+    fn absorb_skips_the_file_rewrite_when_no_vouch_is_newer() {
+        let dir = std::env::temp_dir().join(format!("donsetch-routes-skip-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        let file = crate::paths::cache_dir().join("routes.json");
+
+        assert_eq!(
+            absorb_alt_svc("skip.test", "h3=\":443\"; ma=600", "direct"),
+            Some((443, 600))
+        );
+        let m_stable = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .expect("routes written on first absorb");
+
+        // Same route, a slightly shorter ma: the existing window is
+        // strictly fresher, nothing worth persisting.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            absorb_alt_svc("skip.test", "h3=\":443\"; ma=599", "direct"),
+            Some((443, 599))
+        );
+        let m_skip = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .expect("routes still present");
+        assert_eq!(
+            m_stable, m_skip,
+            "a no-newer re-vouch must not rewrite routes.json"
+        );
+
+        // A longer ma extends the record: the write happens.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            absorb_alt_svc("skip.test", "h3=\":443\"; ma=601", "direct"),
+            Some((443, 601))
+        );
+        let m_extend = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .expect("routes still present");
+        assert_ne!(
+            m_skip, m_extend,
+            "a fresher vouch must extend the record on disk"
+        );
+
+        // The switch DONSETCH_NO_ALT_SVC shuts the bookkeeping up
+        // entirely: absorbs still parse, they just do not record.
+        #[cfg(not(windows))]
+        unsafe {
+            std::env::set_var("DONSETCH_NO_ALT_SVC", "1")
+        };
+        #[cfg(not(windows))]
+        assert_eq!(
+            absorb_alt_svc("skip.test", "h3=\":443\"; ma=900", "direct"),
+            None
+        );
+        #[cfg(not(windows))]
+        unsafe {
+            std::env::remove_var("DONSETCH_NO_ALT_SVC")
+        };
+
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Issue #175 part 2: routes.json never grows past ROWS_MAX and
+    // expired rows never survive a persist.
+    #[test]
+    fn persist_caps_rows_and_drops_expired() {
+        let dir = std::env::temp_dir().join(format!("donsetch-routes-cap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        let file = crate::paths::cache_dir().join("routes.json");
+
+        {
+            let arc = shared();
+            let mut mem = arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            mem.routes.clear();
+            let now = now_ms();
+            for i in 0..600u32 {
+                mem.routes.insert(
+                    format!("h{i}.test"),
+                    RouteState {
+                        use_h3: true,
+                        h3_port: 443,
+                        valid_until_ms: now + 60_000,
+                        egress: "direct".to_string(),
+                        session_b64: String::new(),
+                    },
+                );
+            }
+            mem.routes.insert(
+                "dead.test".to_string(),
+                RouteState {
+                    use_h3: true,
+                    h3_port: 443,
+                    valid_until_ms: now - 1,
+                    egress: "direct".to_string(),
+                    session_b64: String::new(),
+                },
+            );
+            mem.persist();
+        }
+        let bytes = std::fs::read(&file).expect("routes.json exists");
+        let parsed: RoutesFile = serde_json::from_slice(&bytes).expect("routes parse");
+        assert_eq!(
+            parsed.routes.len(),
+            ROWS_MAX,
+            "persist must cap the file at ROWS_MAX"
+        );
+        assert!(
+            !parsed.routes.contains_key("dead.test"),
+            "an expired row must never survive a persist"
+        );
+
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
