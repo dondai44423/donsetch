@@ -11,6 +11,11 @@ V4 work in progress on `master`. Nothing below ships through a release
 channel until the v4.0.0 release train.
 
 ### Added
+- `web_screenshot` MCP tool: a rendered PNG of a page through the
+  existing tier-2 browser (url, full_page, wait_ms). The capture is
+  in-process only; the MCP result carries an image content block and
+  a text note. Verified live against a real render (PNG header,
+  image/png).
 - h3 lane hardening (mnaza, PR #169): every transport now exits
   through one point, so decompression and wall detection also apply
   to HTTP/3 responses (a challenge served over h3 no longer reports
@@ -149,20 +154,41 @@ channel until the v4.0.0 release train.
   bad file is removed and the existing atomic download path takes
   over; a concurrent remover is tolerated with a receipt, any other
   removal failure is honest and immediate.
-- Default-feature builds compile again: the web-memory receipt in
-  `donsetch status` tested the rerank feature with `cfg!` instead of
-  `#[cfg]`. `cfg!` is a runtime boolean, so the rerank-only arms
-  stayed in the token stream and still had to resolve
-  `crate::memory::{kill_switch, rows, cap}`, which the module gates
-  behind the feature. Every `cargo build` without `rerank` failed
-  with three E0425s; the printed status text is unchanged in both
-  configurations. The memory ingest wrappers in `mcp/server` needed
-  the same treatment from the other side: their bodies are entirely
-  rerank-gated, so without the feature their parameters are unused
-  and clippy `-Dwarnings` failed once the crate compiled far enough
-  to lint. Also restores the five fuzz targets (extract, charset,
-  feed, sitemap, paginate), which build default-featured and had
-  stopped running.
+- Default-feature builds compile again (Mart-Bogdan, PR #174): the
+  web-memory status receipt tested the rerank feature with a runtime
+  `cfg!` so no-rerank builds failed the compile on three symbols
+  behind the feature gate.
+
+### Fixed
+- Subresource shadow-fetching no longer aborts the daemon on pages
+  with `İ/K/Ω` (Mart-Bogdan, PR #179): the tag scanner folded with
+  `to_lowercase`, which is not byte-length preserving, then sliced
+  the original string at the shifted offsets (a mid-codepoint slice
+  panics, and release builds abort on panic).
+- A corrupt local embedding model no longer wedges every later fetch
+  (Mart-Bogdan, PR #179): the failed-pin path recursed into itself
+  with the identical arguments, re-reading the same bad bytes
+  forever; the bad file is removed and the honest redownload path
+  takes over.
+- `donsetch login --logout` now wipes the tier-1 echo of the vault
+  from ghost-state.json, not only the registries the sessions
+  replays through on the next start (issue #173).
+- `routes.json` was rewritten on every alt-svc sighting, could grow
+  without bound, and had no switch: re-vouches without a fresher
+  lifetime are skipped before the disk write, expired rows never
+  survive a persist, the row count caps at 512, and
+  `DONSETCH_NO_ALT_SVC` shuts the bookkeeping off (issue #175).
+- Web memory re-embedded and rewrote its whole index once per row,
+  putting up to one 20MB+ write on the answer path per hit: batch
+  ingest embeds in one pass and persists once, the crawl path chunks
+  at 256 rows, and ingestion runs on the blocking pool so a recall
+  never holds a response past its deadline (issue #178).
+- CI runs now concurrency-cancel per pull request only, never on
+  master (Mart-Bogdan, PR #181).
+
+### Changed
+- Dependencies: tokenizers 0.23.2, encoding_rs 0.8.40, brotli 9.0.0,
+  zstd 0.14.0, psl 2.1.231, actions/checkout 4 -> 7.
 - Xvfb reuse gate now demands a bounded real-protocol answer
   (xdpyinfo within 2s) before handing a display to the pool, so a
   SIGKILLed Xvfb's tombstone socket can no longer wedge every
