@@ -13,6 +13,7 @@
 //! the previous file intact.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -114,10 +115,27 @@ fn persist(entries: &[Entry]) -> Result<(), String> {
         entries: entries.to_vec(),
     };
     let body = serde_json::to_vec(&idx).map_err(|e| format!("memory: serialize: {e}"))?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let tmp = stage_path(&path);
     std::fs::write(&tmp, &body).map_err(|e| format!("memory: write: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("memory: rename: {e}"))?;
     Ok(())
+}
+
+/// A staging path unique to this write. The tmp was keyed on the PID
+/// alone, which was fine while ingest ran inline in the request task.
+/// ingest_async (issue #178) now hands every ingest to the blocking
+/// pool, and a single crawl fires it per 256-row chunk AND again on
+/// completion, so persists overlap: two writers opening one shared
+/// tmp with O_TRUNC truncate and interleave one inode, a rename moves
+/// the torn bytes into place, and the next load() parse-fails to an
+/// empty index (the whole recall cache silently wiped). A per-write
+/// suffix gives each persist its own inode; the rename is atomic, so
+/// index.json is always a complete file from some writer. PID stays
+/// in the name so a second process still never collides either.
+fn stage_path(path: &std::path::Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{}.{}.tmp", std::process::id(), n))
 }
 
 fn store() -> &'static Mutex<Vec<Entry>> {
@@ -369,6 +387,68 @@ mod tests {
         assert_eq!(snippetize(&long, usize::MAX).chars().count(), 300);
         let cjk = "東".repeat(10);
         assert!(!snippetize(&cjk, 8).is_empty());
+    }
+
+    // Two persists that overlap must not share one staging file.
+    // The old per-PID-only tmp meant every write in a process opened
+    // the SAME path with O_TRUNC; ingest_async (issue #178) made those
+    // writes concurrent (per-chunk + on-completion within one crawl),
+    // so a second writer could truncate the first mid-flight and the
+    // rename would move torn bytes into index.json -> next load()
+    // parse-fails to an empty index. Distinct staging paths per write
+    // are the invariant that keeps each rename a complete file.
+    #[test]
+    fn stage_paths_are_unique_per_write() {
+        let base = std::path::Path::new("/tmp/donsetch-idx/index.json");
+        let a = stage_path(base);
+        let b = stage_path(base);
+        assert_ne!(a, b, "each persist must stage to its own tmp file");
+        assert_ne!(a.file_name(), b.file_name());
+        // Both still land beside the target (same dir) and read as tmp.
+        assert_eq!(a.parent(), Some(std::path::Path::new("/tmp/donsetch-idx")));
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+    }
+
+    // A best-effort concurrency guard: many overlapping persists to
+    // one path must always leave a parseable, complete index (never a
+    // truncated/interleaved corpse). Deterministic reproduction of the
+    // race needs a slow filesystem; this at least exercises the path
+    // and locks the post-fix guarantee. SAFETY: nextest isolates the
+    // process; index_path() lives under model_dir() here.
+    #[test]
+    fn concurrent_persist_leaves_a_valid_index() {
+        let snap = |tag: usize| -> Vec<Entry> {
+            (0..64)
+                .map(|i| Entry {
+                    url: format!("https://ex{tag}.test/{i}"),
+                    title: format!("t{tag}-{i}"),
+                    body: "x".repeat(4096),
+                    ts: i as u64,
+                    vec: vec![0.1f32; 384],
+                })
+                .collect()
+        };
+        let handles: Vec<_> = (0..8)
+            .map(|tag| {
+                let s = snap(tag);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _ = persist(&s);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let raw = std::fs::read(index_path()).expect("index present after persists");
+        let parsed = serde_json::from_slice::<Index>(&raw);
+        assert!(parsed.is_ok(), "index.json must stay valid JSON");
+        assert_eq!(
+            parsed.unwrap().entries.len(),
+            64,
+            "a full snapshot survived"
+        );
     }
 
     /// The cap floor: junk or tiny values fall back to the default,
