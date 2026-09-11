@@ -27,7 +27,6 @@ channel until the v4.0.0 release train.
   the shared 64 MiB cap before allocating; `routes.json` carries
   serialized TLS session material and lands owner-only (0600).
 - Experimental HTTP/3 lane (opt-in via `DONSETCH_H3=1`) on a quiche
-
   0.29.3 fork that shares one BoringSSL build with tier-1. An h3
   route is learned from `alt-svc` response headers (same-origin
   only, proxies exempt) and persisted in the cache dir under
@@ -167,6 +166,13 @@ channel until the v4.0.0 release train.
   is byte-length and char-boundary preserving, and is also what the
   HTML standard specifies for tag and attribute names. `attr()` had
   the same latent pattern and is fixed with it.
+- MCP text-only fold now covers OpenCode v1 (tested on 1.18.3):\
+  unlike Claude Code / VS Code, OpenCode renders the `content` array
+  and drops `structuredContent` entirely, so agents previously lost
+  every compact state field (URL handles, `next_offset`, verdicts,
+  error codes). Handshake detection now matches `opencode` and folds
+  the state into the leading `[meta]` text block, same as the other
+  text-only clients.
 - A corrupt local embedding model no longer wedges every subsequent
   fetch. `ensure_file` recursed into itself with identical arguments
   when the file on disk failed its SHA/size pin, never removing it, so

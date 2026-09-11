@@ -1,6 +1,11 @@
 //! MCP client-compat layer for harnesses that show the model only
-//! `structuredContent` and discard the `content` array (Claude Code,
-//! VS Code: the model then sees tool metadata but never the document).
+//! one surface and discard the other.
+//!
+//! Two observed failure modes:
+//! - `structuredContent` only, `content` dropped (Claude Code, VS Code:
+//!   the model sees tool metadata but never the document).
+//! - `content` only, `structuredContent` dropped (OpenCode v1: the model
+//!   sees the document but never the compact state).
 //!
 //! DonSeTch's shape is deliberately split: `content` carries the
 //! document markdown, `structuredContent` carries compact actionable
@@ -71,17 +76,25 @@ impl Default for ModeCell {
     }
 }
 
-/// Clients observed showing the model only `structuredContent` while
-/// dropping every `content` block. Matched case-insensitively, exact.
+/// Clients observed showing the model only one surface and discarding
+/// the other. Matched case-insensitively, exact.
+///
+/// - Claude Code / VS Code: keep `structuredContent`, drop `content`.
+/// - OpenCode v1: keep `content`, drop `structuredContent`.
+///
 /// Wrappers reusing one of these names get one redundant surface at
 /// worst (a client that renders text AND matches here sees the meta
 /// block next to nothing else), so defaulting to a name match is the
 /// safe direction.
 ///
-/// EXIT PLAN: when a listed client starts rendering `content` blocks
-/// again, delete the entry and re-run a single `web_fetch` through it;
+/// EXIT PLAN: when a listed client starts rendering both surfaces,
+/// delete the entry and re-run a single `web_fetch` through it;
 /// if the document reaches the agent, the entry stays deleted.
-const TEXT_ONLY_CLIENTS: &[&str] = &["claude-code", "vscode"];
+const TEXT_ONLY_CLIENTS: &[&str] = &[
+    "claude-code", // renders structuredContent
+    "opencode",    // renders only content
+    "vscode",      // renders structuredContent
+];
 
 /// Handshake-detected mode from `clientInfo.name`. Lenient by
 /// construction: the caller hands over the raw JSON-RPC params, and
@@ -273,10 +286,15 @@ mod tests {
         // match: unknown clients keep the token-optimal default.
         let wrapper = json!({ "clientInfo": { "name": "claude-code-proxy" } });
         assert_eq!(mode_from_params(&wrapper), ClientMode::Default);
-        let other = json!({ "clientInfo": { "name": "opencode" } });
-        assert_eq!(mode_from_params(&other), ClientMode::Default);
+        // Listed for the OPPOSITE reason (renders content, drops
+        // structuredContent), and folded all the same.
+        let oc = json!({ "clientInfo": { "name": "opencode" } });
+        assert_eq!(mode_from_params(&oc), ClientMode::TextOnly);
         let vs = json!({ "clientInfo": { "name": "vscode" } });
         assert_eq!(mode_from_params(&vs), ClientMode::TextOnly);
+        // An unlisted client keeps the token-optimal split shape.
+        let other = json!({ "clientInfo": { "name": "cursor" } });
+        assert_eq!(mode_from_params(&other), ClientMode::Default);
     }
 
     #[test]

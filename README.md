@@ -298,14 +298,32 @@ connect to `http://localhost:8765/mcp`. Sessions, cancellation,
 `/health`, token auth via `DONSETCH_HTTP_TOKEN`, per-request timeout,
 all documented in `donsetch mcp --help`.
 
-**Structured-content compat (Claude Code / VS Code):** those harnesses
-show the model only `structuredContent` and drop the `content` array,
-which hides the page markdown behind tool metadata. DonSeTch detects
-them at the handshake (`clientInfo.name`) and merges the surfaces:
-a compact `[meta]` text block carries the structured state, the
-markdown stays a clean text block, and `structuredContent` is omitted.
-Any other client keeps the default token-optimal shape. To force the
-compat shape for an unrecognized client, set `DONSETCH_MCP_TEXT_ONLY=1`.
+**One-surface clients (the `[meta]` fold):** if your agent reports tool
+metadata but no page text, or gets the page text but can't cite a URL
+behind an `S3` handle, can't paginate, and never sees an error code,
+the client is rendering only one of the two MCP result surfaces and
+dropping the other. DonSeTch's default shape is split on purpose:
+`content` carries the document markdown, `structuredContent` carries
+compact actionable state (raw URLs behind the handles, `next_offset`,
+resume tokens, `content_ok`, `thin`, error codes, `next_action`). MCP
+never specified which surface a client shows, so both halves of that
+split get dropped in the wild — Claude Code and VS Code keep
+`structuredContent` and discard `content`; OpenCode v1 (tested on
+1.18.3) keeps `content` and discards `structuredContent`. Either way
+the fix is the same fold: a compact leading `[meta]` text block carries
+the state, the markdown stays a clean text block behind it, and
+`structuredContent` is omitted.
+
+Those three are detected at the handshake by `clientInfo.name`, matched
+exactly and case-insensitively against a hardcoded list, so a wrapper
+or fork under any other name — `claude-code-proxy`, say — is *not*
+detected and silently keeps the split shape. That is what
+`DONSETCH_MCP_TEXT_ONLY=1` is for: it forces the fold for every client
+regardless of the handshake, so an unlisted host is fixable today
+rather than at the next release. Fail-closed, like the other env flags
+— only an explicitly true value turns it on; `=false` leaves the
+handshake in charge. Every other client keeps the default token-optimal
+split shape.
 
 **2. CLI (for humans and scripts).** Same engine as MCP, thin adapter:
 
