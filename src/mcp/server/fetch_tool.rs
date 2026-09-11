@@ -53,7 +53,6 @@ pub(super) async fn fetch_tool(
             || deadline_error(&url),
         )
         .await;
-        memory_ingest_result(&url, &result);
         return result;
     }
     let mut resolved: Vec<String> = Vec::with_capacity(urls.len());
@@ -88,33 +87,9 @@ pub(super) async fn fetch_tool(
             || deadline_error(&resolved[0]),
         )
         .await;
-        memory_ingest_result(&resolved[0], &result);
         return result;
     }
     fetch_multi(daemon, args, resolved, budget_tokens, deadline, ctx).await
-}
-
-/// Store a successful fetch result page into the local web memory.
-/// Additive (v4 law 5): ingest failure never touches the fetch result;
-/// its only surface is a stderr receipt.
-#[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-fn memory_ingest_result(url: &str, result: &Value) {
-    #[cfg(feature = "rerank")]
-    if !crate::memory::kill_switch() && result.get("isError").and_then(Value::as_bool) != Some(true)
-    {
-        let md = result
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if md.is_empty() {
-            return;
-        }
-        crate::memory::ingest_async(vec![(
-            url.to_string(),
-            crate::memory::title_of(md),
-            md.to_string(),
-        )]);
-    }
 }
 
 /// Honest deadline error (v3 D1): the tool respects the agent's
@@ -212,23 +187,6 @@ pub(super) async fn fetch_multi(
         .iter()
         .map(|r| if is_err(r) { None } else { Some(md_of(r)) })
         .collect();
-    // Store the successful fetches into the local web memory. The
-    // hook gets the FULL body before any budget slicing: the memory
-    // keeps the page whole and truncates on its own. One batch =
-    // one embed pass + one disk write (issue #178), and it runs on
-    // the blocking pool so it cannot hold the response past the
-    // deadline.
-    #[cfg(feature = "rerank")]
-    if !crate::memory::kill_switch() {
-        let mut rows = Vec::with_capacity(urls.len());
-        for (idx, url) in urls.iter().enumerate() {
-            let Some(md) = markdowns[idx].as_deref() else {
-                continue;
-            };
-            rows.push((url.clone(), crate::memory::title_of(md), md.to_string()));
-        }
-        crate::memory::ingest_async(rows);
-    }
     let mut sliced_flags = vec![false; results.len()];
     if let Some(budget_tok) = budget_tokens {
         let budget_chars = budget_tok * 4;

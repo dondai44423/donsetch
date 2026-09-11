@@ -173,28 +173,11 @@ pub(super) async fn search_inner(
 ) -> Value {
     match search_outcome(daemon, query, max, intent).await {
         Ok(out) => {
-            memory_ingest_outcome(&out);
             let top = out.results.first().map(|r| r.url.as_str());
             maybe_pre_solve(daemon, top);
             render_search_outcome(daemon, &out).await
         }
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
-    }
-}
-
-/// Remember snippets of the top search hits before rendering. The
-/// memory's body cap truncates us so this stays small, and the
-/// kill switch short-circuits everything.
-#[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-fn memory_ingest_outcome(out: &crate::search::SearchOutcome) {
-    #[cfg(feature = "rerank")]
-    if !crate::memory::kill_switch() {
-        let rows: Vec<(String, String, String)> = out
-            .results
-            .iter()
-            .map(|r| (r.url.clone(), r.title.clone(), r.snippet.clone()))
-            .collect();
-        crate::memory::ingest_async(rows);
     }
 }
 
@@ -264,9 +247,6 @@ pub(super) async fn search_batch_inner(
         .iter()
         .map(|query| search_outcome(daemon, query, max, intent));
     let outcomes = futures_util::future::join_all(futures).await;
-    for out in outcomes.iter().flatten() {
-        memory_ingest_outcome(out);
-    }
     if let Some(Ok(first)) = outcomes.first() {
         let top = first.results.first().map(|r| r.url.as_str());
         maybe_pre_solve(daemon, top);

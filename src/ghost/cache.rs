@@ -261,12 +261,6 @@ pub struct GhostState {
     /// network fetch.
     #[serde(default)]
     pub prewarmed_served_total: u64,
-    /// Lifetime count of web_answer evidence packs served with at
-    /// least one usable source (v4 phase 2.2), surfaced in
-    /// donsetch status. Empty packs (nothing usable found) are not
-    /// counted: a served pack means real evidence reached the agent.
-    #[serde(default)]
-    pub answered_packs_total: u64,
     /// v4 phase 3 ghost pool visibility: how many ghost acquires were
     /// served by an already-live pooled browser (thaw-and-go), as
     /// opposed to paying a browser launch. Sums across the daemon's
@@ -924,13 +918,6 @@ impl GhostState {
         self.save();
     }
 
-    /// v4 phase 2.2 visibility: count an evidence pack served with
-    /// at least one usable source.
-    pub fn note_answer_served(&mut self) {
-        self.answered_packs_total = self.answered_packs_total.saturating_add(1);
-        self.save();
-    }
-
     /// v4 phase 3 visibility: count a fetch served from an
     /// already-warm pool browser (no launch, no thaw failure). With
     /// DONSETCH_NO_GHOST_POOL set, the pool is one slot but warm
@@ -1131,8 +1118,6 @@ impl GhostState {
                     self.shadowed_assets_total.max(disk.shadowed_assets_total);
                 self.prewarmed_served_total =
                     self.prewarmed_served_total.max(disk.prewarmed_served_total);
-                self.answered_packs_total =
-                    self.answered_packs_total.max(disk.answered_packs_total);
                 self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
             }
             if let Ok(s) = serde_json::to_string(self) {

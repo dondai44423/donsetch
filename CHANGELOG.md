@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 V4 work in progress on `master`. Nothing below ships through a release
 channel until the v4.0.0 release train.
 
+### Removed
+- `web_answer` (the evidence pack) and `web_memory` (the local vector
+  store), by my call. A fixed search-then-read pipeline and a
+  memory-of-everything store strip the agent's control over the loop
+  (which link, which budget) and spend tokens on pages the agent
+  would not have picked. The agent owns search + fetch; DonSeTch just
+  makes each of those calls god-tier. The search prefetch that the
+  pack spawned is kept (web_fetch consumes it: a speed win with zero
+  new surface).
+
 ### Changed
 - Every runtime env read now flows through the typed config. The old
   env names keep their exact historical trigger semantics and still

@@ -58,7 +58,6 @@ section!(TransportSection {
 
 section!(McpSection {
     text_only: bool = false,
-    answer_tool: bool = true,
     url_handles: bool = true,
 });
 
@@ -70,8 +69,6 @@ section!(StateSection {
     no_disk_state: bool = false,
     route_memory: RouteMemory = RouteMemory::ReadWrite,
     cookie_vault: bool = true,
-    web_memory: bool = true,
-    web_memory_cap: usize = 4000,
 });
 
 section!(ProxySection {
@@ -545,14 +542,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "DONSETCH_MCP_TEXT_ONLY",
         );
     }
-    if legacy_flag("DONSETCH_NO_ANSWER_TOOL") {
-        put(
-            &mut m,
-            "mcp.answer_tool",
-            false.into(),
-            "DONSETCH_NO_ANSWER_TOOL",
-        );
-    }
     if let Some(v) = std::env::var_os("DONSETCH_URL_HANDLES") {
         // Historical semantics: every value except the exact string "off"
         // keeps url handles enabled.
@@ -593,30 +582,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "DONSETCH_NO_COOKIE_VAULT",
         );
     }
-    if std::env::var_os("DONSETCH_NO_WEB_MEMORY").is_some() {
-        put(
-            &mut m,
-            "state.web_memory",
-            false.into(),
-            "DONSETCH_NO_WEB_MEMORY",
-        );
-    }
-    match int_env("DONSETCH_WEB_MEMORY_CAP") {
-        Some(n) => put_num(
-            &mut m,
-            &mut warnings,
-            "state.web_memory_cap",
-            "DONSETCH_WEB_MEMORY_CAP",
-            n,
-            256,
-            100000,
-        ),
-        None if std::env::var_os("DONSETCH_WEB_MEMORY_CAP").is_some() => {
-            warnings.push("ignoring DONSETCH_WEB_MEMORY_CAP: not a number".into())
-        }
-        None => {}
-    }
-
     // fetch
     if legacy_flag("DONSETCH_ALLOW_PRIVATE_EGRESS") {
         put(
@@ -1211,13 +1176,6 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "mcp",
-            "answer_tool",
-            FieldKind::Bool,
-            "true",
-            "expose web_answer",
-        ),
-        (
-            "mcp",
             "url_handles",
             FieldKind::Bool,
             "true",
@@ -1252,20 +1210,6 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             FieldKind::Bool,
             "true",
             "persist tier-1/tier-2 clearance cookies",
-        ),
-        (
-            "state",
-            "web_memory",
-            FieldKind::Bool,
-            "true",
-            "enable the local web-memory store",
-        ),
-        (
-            "state",
-            "web_memory_cap",
-            FieldKind::Int,
-            "4000",
-            "web-memory max entries (256..=100000)",
         ),
         // proxy
         (
@@ -1709,14 +1653,11 @@ const LEGACY_VARS: &[&str] = &[
     "DONSETCH_HTTP_TIMEOUT_SECS",
     "DONSETCH_HTTP_CORS",
     "DONSETCH_MCP_TEXT_ONLY",
-    "DONSETCH_NO_ANSWER_TOOL",
     "DONSETCH_URL_HANDLES",
     "DONSEEK_NO_DISK_STATE",
     "DONSETCH_NO_ROUTE_MEMORY",
     "DONSETCH_ROUTE_MEMORY_READONLY",
     "DONSETCH_NO_COOKIE_VAULT",
-    "DONSETCH_NO_WEB_MEMORY",
-    "DONSETCH_WEB_MEMORY_CAP",
     "DONSETCH_ALLOW_PRIVATE_EGRESS",
     "DONSETCH_H3",
     "DONSETCH_NO_H3",
@@ -1873,9 +1814,6 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if c.transport.timeout_secs == 0 || c.transport.timeout_secs > 3600 {
         return err("transport.timeout_secs must be 1..=3600".into());
-    }
-    if c.state.web_memory_cap < 256 || c.state.web_memory_cap > 100_000 {
-        return err("state.web_memory_cap must be 256..=100_000".into());
     }
     if c.bypass.max_daily == 0 || c.bypass.max_daily > 10_000 {
         return err("bypass.max_daily must be 1..=10_000".into());
@@ -2101,14 +2039,11 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSETCH_HTTP_TIMEOUT_SECS" => ("transport", "timeout_secs"),
         "DONSETCH_HTTP_CORS" => ("transport", "cors"),
         "DONSETCH_MCP_TEXT_ONLY" => ("mcp", "text_only"),
-        "DONSETCH_NO_ANSWER_TOOL" => ("mcp", "answer_tool"),
         "DONSETCH_URL_HANDLES" => ("mcp", "url_handles"),
         "DONSEEK_NO_DISK_STATE" => ("state", "no_disk_state"),
         "DONSETCH_NO_ROUTE_MEMORY" => ("state", "route_memory"),
         "DONSETCH_ROUTE_MEMORY_READONLY" => ("state", "route_memory"),
         "DONSETCH_NO_COOKIE_VAULT" => ("state", "cookie_vault"),
-        "DONSETCH_NO_WEB_MEMORY" => ("state", "web_memory"),
-        "DONSETCH_WEB_MEMORY_CAP" => ("state", "web_memory_cap"),
         "DONSETCH_ALLOW_PRIVATE_EGRESS" => ("fetch", "allow_private_egress"),
         "DONSETCH_H3" => ("fetch", "h3"),
         "DONSETCH_NO_H3" => ("fetch", "h3"),
@@ -2332,22 +2267,22 @@ mod tests {
     #[test]
     fn layer_fold_is_by_presence_not_value() {
         let guard = clean_env();
-        let path = write_cfg(&std::env::temp_dir(), "[mcp]\nanswer_tool = false\n");
+        let path = write_cfg(&std::env::temp_dir(), "[fetch]\nprewarm = false\n");
         set_env("DONSETCH_CONFIG", &path);
-        set_env("DONSETCH_MCP__ANSWER_TOOL", "true");
+        set_env("DONSETCH_FETCH__PREWARM", "true");
         let loaded = load().expect("load");
         assert!(
-            loaded.config.mcp.answer_tool,
+            loaded.config.fetch.prewarm,
             "env set it true explicitly; presence must beat default-equality"
         );
         let rows = origins(&loaded.merged, &loaded.config);
         let origin = rows
             .iter()
-            .find(|(s, k, _, _)| *s == "mcp" && *k == "answer_tool")
-            .expect("answer_tool row")
+            .find(|(s, k, _, _)| *s == "fetch" && *k == "prewarm")
+            .expect("prewarm row")
             .3
             .clone();
-        assert_eq!(origin, "DONSETCH_MCP__ANSWER_TOOL");
+        assert_eq!(origin, "DONSETCH_FETCH__PREWARM");
         drop(guard);
     }
 
@@ -2375,16 +2310,16 @@ mod tests {
     fn legacy_out_of_range_warns_and_keeps_the_default() {
         let guard = clean_env();
         set_env("DONSETCH_NO_CONFIG_FILE", "1");
-        set_env("DONSETCH_WEB_MEMORY_CAP", "100");
         set_env("DONSETCH_PDF_MAX_MB", "-1");
+        set_env("DONSETCH_HTTP_PORT", "99999");
         let loaded = load().expect("legacy values must never fail hard");
-        assert_eq!(loaded.config.state.web_memory_cap, 4000);
         assert_eq!(loaded.config.fetch.pdf_max_mb, 100);
+        assert_eq!(loaded.config.transport.port, 8765);
         assert!(
             loaded
                 .warnings
                 .iter()
-                .any(|w| w.contains("DONSETCH_WEB_MEMORY_CAP=100"))
+                .any(|w| w.contains("DONSETCH_HTTP_PORT=99999"))
         );
         assert!(
             loaded
