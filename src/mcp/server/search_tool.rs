@@ -399,20 +399,8 @@ pub(super) async fn search_outcome(
 
     // BYOK-first mode: try providers, fall back to local.
     if byok_configured && !local_first {
-        match daemon.byok.search(query, max, intent).await {
-            Ok(out) => {
-                let mut out = out;
-                // Issue #190: site: queries dawn on BYOK results too,
-                // and prewarm only the rows that survive the filter.
-                crate::search::site_filter(query, &mut out.results);
-                // v4 phase 2.1: the warm handoff is not a local-search
-                // privilege. Provider results carry their own titles
-                // and snippets, so the reply does not wait: prewarm
-                // fires detached and parks bodies while the model
-                // reads the results (law 5: zero added latency).
-                daemon.searcher.spawn_prewarm(&out.results);
-                return Ok(out);
-            }
+        match byok_search_cached(daemon, query, max, intent).await {
+            Ok(out) => return Ok(out),
             Err(e) => {
                 if std::env::var_os("DONSEEK_DEBUG").is_some() {
                     eprintln!("[byok] all providers exhausted, falling back to local: {e}");
@@ -432,17 +420,8 @@ pub(super) async fn search_outcome(
                 if std::env::var_os("DONSEEK_DEBUG").is_some() {
                     eprintln!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
-                match daemon.byok.search(query, max, intent).await {
-                    Ok(out) => {
-                        // Issue #190: the site: scan has to reach the
-                        // fallback path too, or the local-first mode
-                        // leaks rows off-domain.
-                        let mut out = out;
-                        crate::search::site_filter(query, &mut out.results);
-                        // Same detached prewarm as the BYOK-first path.
-                        daemon.searcher.spawn_prewarm(&out.results);
-                        Ok(out)
-                    }
+                match byok_search_cached(daemon, query, max, intent).await {
+                    Ok(out) => Ok(out),
                     Err(e2) => Err(SearchFailure {
                         cause: format!("local ({e}); byok ({e2})"),
                         byok_tried: true,
@@ -458,6 +437,34 @@ pub(super) async fn search_outcome(
             }
         }
     }
+}
+
+/// One BYOK acquisition with the shared search cache wrapped around
+/// it (issue #195). A repeat query inside the TTL is served from the
+/// cache with `cached: true` and never re-bills the provider; a fresh
+/// result is stored before it is filtered/prewarmed, so the cache
+/// holds the provider's full top slice exactly like the local path.
+/// Used by both BYOK entry points (BYOK-first and the local-first
+/// fallback) so caching cannot drift between them.
+async fn byok_search_cached(
+    daemon: &Arc<Daemon>,
+    query: &str,
+    max: usize,
+    intent: Option<Intent>,
+) -> Result<crate::search::SearchOutcome, String> {
+    let resolved = intent.unwrap_or_else(|| crate::search::intent::detect(query));
+    if let Some(hit) = daemon.searcher.byok_cache_get(query, resolved, max) {
+        return Ok(hit);
+    }
+    let mut out = daemon.byok.search(query, max, intent).await?;
+    // Store the provider's own top slice before site: filtering, so a
+    // later hit filters on serve exactly as the miss path does.
+    daemon.searcher.byok_cache_put(query, &out);
+    // Issue #190: site: queries reach BYOK results too, and prewarm
+    // only the rows that survive the filter (law 5: zero added latency).
+    crate::search::site_filter(query, &mut out.results);
+    daemon.searcher.spawn_prewarm(&out.results);
+    Ok(out)
 }
 
 /// Search failure → structured error: every engine (and BYOK if
