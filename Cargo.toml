@@ -51,7 +51,7 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.226" }
+psl = { version = "=2.1.231" }
 # OCR/rerank support deps. `ort` itself goes ONLY in the per-target sections
 # below, never here: Cargo unions features across matching target sections, so
 # a shared entry leaks `load-dynamic` onto Windows/macOS and silently strips
