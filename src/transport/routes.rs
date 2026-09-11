@@ -515,19 +515,12 @@ mod tests {
 
         // The switch DONSETCH_NO_ALT_SVC shuts the bookkeeping up
         // entirely: absorbs still parse, they just do not record.
-        #[cfg(not(windows))]
-        unsafe {
-            std::env::set_var("DONSETCH_NO_ALT_SVC", "1")
-        };
-        #[cfg(not(windows))]
+        unsafe { std::env::set_var("DONSETCH_NO_ALT_SVC", "1") };
         assert_eq!(
             absorb_alt_svc("skip.test", "h3=\":443\"; ma=900", "direct"),
             None
         );
-        #[cfg(not(windows))]
-        unsafe {
-            std::env::remove_var("DONSETCH_NO_ALT_SVC")
-        };
+        unsafe { std::env::remove_var("DONSETCH_NO_ALT_SVC") };
 
         unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
