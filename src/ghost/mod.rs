@@ -310,7 +310,12 @@ fn playwright_entry_suffixes() -> &'static [&'static str] {
 /// Linux (Playwright honors XDG_CACHE_HOME when set).
 fn playwright_registry_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(ov) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
+    // The config knob wins when set; otherwise the ambient standard
+    // var still applies (mirror-when-set semantics).
+    let cfg_root = &crate::config::cfg().browser.playwright_path;
+    if !cfg_root.is_empty() {
+        roots.push(PathBuf::from(cfg_root));
+    } else if let Some(ov) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
         roots.push(PathBuf::from(ov));
     }
     #[cfg(not(windows))]

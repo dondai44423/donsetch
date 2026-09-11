@@ -9,8 +9,8 @@ use crate::adapters;
 use crate::adapters::plugins;
 
 pub fn run() {
-    if std::env::var_os("DONSETCH_NO_ADAPTERS").is_some() {
-        println!("Adapter registry is OFF (DONSETCH_NO_ADAPTERS is set).");
+    if !crate::config::cfg().fetch.adapters {
+        println!("Adapter registry is OFF (fetch.adapters is false).");
         println!("Everything below stays loaded in memory but never fires.");
         println!();
     }

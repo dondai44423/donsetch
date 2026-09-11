@@ -663,11 +663,16 @@ pub fn from_env_for(url: &str) -> Option<Proxy> {
     };
     let env_val = match explicit {
         Some(v) => v.to_string(),
-        None => std::env::var(env_name)
+        // The ambient env layer is gated by proxy.from_environment:
+        // explicit [proxy] slots stay live even when the ambient
+        // convention is disabled (the gate must never starve a TOML
+        // proxy).
+        None if crate::config::cfg().proxy.from_environment => std::env::var(env_name)
             .or_else(|_| std::env::var(env_name.to_lowercase()))
             .or_else(|_| std::env::var("ALL_PROXY"))
             .or_else(|_| std::env::var("all_proxy"))
             .ok()?,
+        None => return None,
     };
     let env_val = env_val.trim();
     if env_val.is_empty() {

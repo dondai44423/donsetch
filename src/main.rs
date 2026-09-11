@@ -55,7 +55,7 @@ fn config_cli(args: &[String]) {
             if rest.iter().any(|a| a == "--markdown") {
                 println!("{}", config::show_markdown());
             } else {
-                print!("{}", config::show_text(&loaded.config));
+                print!("{}", config::show_text(&loaded));
             }
         }
         Err(e) => {
@@ -91,6 +91,18 @@ async fn main() {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
+    }
+
+    // Every command hard-fails on a broken config (the lazy fallback
+    // stays for library callers): a user must see the config error,
+    // never a silent run on defaults. `config show` loads itself so
+    // it can print the layers even when env values are bad; help and
+    // version read no config at all.
+    if !matches!(
+        cmd,
+        "config" | "help" | "--help" | "-h" | "version" | "-v" | "--version"
+    ) {
+        load_and_install_config(&args);
     }
 
     match cmd {

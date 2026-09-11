@@ -40,7 +40,7 @@ pub fn canonicalize(pc: &mut PageChars) -> Option<f32> {
         }
         mass[q as usize] += c.size.max(1.0);
     }
-    if std::env::var("DONSHEET_DEBUG_MATRIX").is_ok() {
+    if crate::config::cfg().debug.pdf_matrix {
         for (i, c) in pc.chars.iter().take(6).enumerate() {
             eprintln!(
                 "[rot_dbg] i={i} cp={:?} angle={:.2} size={:.2} rt={}",
@@ -52,7 +52,7 @@ pub fn canonicalize(pc: &mut PageChars) -> Option<f32> {
     if total <= 0.0 {
         return None;
     }
-    if std::env::var("DONSHEET_DEBUG").is_ok() {
+    if crate::config::cfg().debug.pdf {
         eprintln!(
             "[rotate] page {} mass: 0deg={:.0} 90deg={:.0} 180deg={:.0} 270deg={:.0} chars={} total={:.0}",
             pc.index,

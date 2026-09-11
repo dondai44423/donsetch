@@ -44,16 +44,6 @@ macro_rules! section {
                 Self { $($field: $default,)* }
             }
         }
-        impl $name {
-            /// Fold one layer into the accumulator: copy every field the
-            /// layer explicitly set (differing from the struct default).
-            pub(crate) fn fold_from(&mut self, other: &Self) {
-                let defaults = Self::default();
-                $( if other.$field != defaults.$field {
-                    self.$field = other.$field.clone();
-                } )*
-            }
-        }
     };
 }
 
@@ -278,6 +268,8 @@ pub struct Loaded {
     pub warnings: Vec<String>,
     /// The file the TOML layer came from, if any.
     pub file: Option<std::path::PathBuf>,
+    /// The fully layered tree, leaf origins intact (for `config show`).
+    pub merged: config::Map<String, config::Value>,
 }
 
 /// Load the layered config from defaults + env + TOML file and validate it.
@@ -286,7 +278,10 @@ pub fn load() -> Result<Loaded, ConfigError> {
 
     let mut file_layer: Option<config::Map<String, config::Value>> = None;
     let mut file_path: Option<std::path::PathBuf> = None;
-    let skip_file = std::env::var_os("DONSETCH_NO_CONFIG_FILE").is_some();
+    let skip_file = std::env::var("DONSETCH_NO_CONFIG_FILE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"));
     if !skip_file {
         match toml_path() {
             Some(path) => {
@@ -295,10 +290,14 @@ pub fn load() -> Result<Loaded, ConfigError> {
                     message: format!("unreadable ({e})"),
                 })?;
                 let source = config::File::from_str(&text, config::FileFormat::Toml);
-                file_layer = Some(source.collect().map_err(|e| ConfigError::File {
+                let mut map = source.collect().map_err(|e| ConfigError::File {
                     path: path.display().to_string(),
                     message: e.to_string(),
-                })?);
+                })?;
+                // from_str leaves origins unstamped: stamp every leaf
+                // with the file label so the display can name it.
+                restamp_origins(&mut map, &Some(format!("file:{}", path.display())));
+                file_layer = Some(map);
                 file_path = Some(path);
             }
             None => {
@@ -325,73 +324,87 @@ pub fn load() -> Result<Loaded, ConfigError> {
         return Err(ConfigError::Env(e.clone()));
     }
 
-    let mut raw = DonsetchConfig::default();
-    if let Some(file) = file_layer {
-        // Deserialize the file layer on its own so unknown keys fail loudly
-        // with the file path attached, then fold into the merged struct.
-        let file_cfg = deserialize_layer_table(&file).map_err(|m| ConfigError::File {
+    // Validate the file layer on its own so unknown keys and bad types
+    // fail loudly with the file path attached, exactly once.
+    if let Some(file) = &file_layer {
+        deserialize_layer_table(file).map_err(|m| ConfigError::File {
             path: file_path
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             message: m.to_string(),
         })?;
-        fold(&mut raw, &file_cfg);
     }
+
+    // The config crate's builder does the layering: sources are added
+    // bottom-up (defaults < legacy < file < new env) and each leaf of
+    // the merged tree carries the origin of the layer that won it.
+    // Presence is preserved by the builder, so a layer setting a field
+    // back to its default value still wins and still owns the origin.
+    let mut builder = config::Config::builder();
+    builder = builder.add_source(
+        config::Config::try_from(&DonsetchConfig::default())
+            .map_err(|e| ConfigError::Env(format!("serializing defaults: {e}")))?,
+    );
     if !legacy_map.is_empty() {
-        let legacy_cfg = deserialize_layer_table(&legacy_map)?;
-        fold(&mut raw, &legacy_cfg);
+        builder = builder.add_source(MapSource(legacy_map));
+    }
+    if let Some(file) = file_layer {
+        builder = builder.add_source(MapSource(file));
     }
     if !env_map.is_empty() {
-        let env_cfg = deserialize_layer_table(&env_map)?;
-        fold(&mut raw, &env_cfg);
+        builder = builder.add_source(MapSource(env_map));
     }
+    let merged = builder
+        .build()
+        .map_err(|e| ConfigError::Env(e.to_string()))?;
+    let raw: DonsetchConfig = merged
+        .clone()
+        .try_deserialize()
+        .map_err(|e| ConfigError::Env(e.to_string()))?;
 
     validate(&raw)?;
     Ok(Loaded {
         config: raw,
         warnings,
         file: file_path,
+        merged: merged
+            .collect()
+            .map_err(|e| ConfigError::Env(e.to_string()))?,
     })
+}
+
+/// Recursively restamp every leaf origin in a layer map: used for the
+/// TOML file (from_str leaves origins unstamped).
+fn restamp_origins(map: &mut config::Map<String, config::Value>, origin: &Option<String>) {
+    for value in map.values_mut() {
+        if let config::ValueKind::Table(inner) = &mut value.kind {
+            restamp_origins(inner, origin);
+        }
+        let kind = std::mem::replace(&mut value.kind, config::ValueKind::Nil);
+        *value = config::Value::new(origin.as_ref(), kind);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MapSource(config::Map<String, config::Value>);
+impl config::Source for MapSource {
+    fn collect(&self) -> Result<config::Map<String, config::Value>, config::ConfigError> {
+        Ok(self.0.clone())
+    }
+    fn clone_into_box(&self) -> Box<dyn config::Source + Send + Sync> {
+        Box::new(self.clone())
+    }
 }
 
 fn deserialize_layer_table(
     map: &config::Map<String, config::Value>,
 ) -> Result<DonsetchConfig, ConfigError> {
-    #[derive(Debug, Clone)]
-    struct MapSource(config::Map<String, config::Value>);
-    impl config::Source for MapSource {
-        fn collect(&self) -> Result<config::Map<String, config::Value>, config::ConfigError> {
-            Ok(self.0.clone())
-        }
-        fn clone_into_box(&self) -> Box<dyn config::Source + Send + Sync> {
-            Box::new(self.clone())
-        }
-    }
     let builder = config::Config::builder().add_source(MapSource(map.clone()));
     builder
         .build()
         .and_then(|c| c.try_deserialize::<DonsetchConfig>())
         .map_err(|e| ConfigError::Env(e.to_string()))
-}
-
-/// Fold a layer into the accumulator: every field the layer explicitly
-/// set (differing from the struct default) is copied over the current
-/// value. Later layers win.
-fn fold(dst: &mut DonsetchConfig, src: &DonsetchConfig) {
-    dst.transport.fold_from(&src.transport);
-    dst.mcp.fold_from(&src.mcp);
-    dst.paths.fold_from(&src.paths);
-    dst.state.fold_from(&src.state);
-    dst.proxy.fold_from(&src.proxy);
-    dst.tls.fold_from(&src.tls);
-    dst.persona.fold_from(&src.persona);
-    dst.cli.fold_from(&src.cli);
-    dst.fetch.fold_from(&src.fetch);
-    dst.bypass.fold_from(&src.bypass);
-    dst.search.fold_from(&src.search);
-    dst.browser.fold_from(&src.browser);
-    dst.debug.fold_from(&src.debug);
 }
 
 /// The file layer path: `DONSETCH_CONFIG` explicit, else the default
@@ -447,6 +460,22 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
     };
+    // Legacy numerics keep their historical soft semantics: a value
+    // outside the sane range is ignored with a warning, never a hard
+    // failure. (New-name env and TOML values stay strict.)
+    let put_num = |map: &mut VMap,
+                   warnings: &mut Vec<String>,
+                   path: &str,
+                   origin: &str,
+                   n: i64,
+                   lo: i64,
+                   hi: i64| {
+        if (lo..=hi).contains(&n) {
+            put(map, path, n.into(), origin);
+        } else {
+            warnings.push(format!("ignoring {origin}={n}: out of range {lo}..={hi}"));
+        }
+    };
 
     // transport
     if std::env::var("DONSETCH_TRANSPORT").as_deref() == Ok("http") {
@@ -466,7 +495,15 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_HTTP_PORT") {
-        Some(p) => put(&mut m, "transport.port", p.into(), "DONSETCH_HTTP_PORT"),
+        Some(n) => put_num(
+            &mut m,
+            &mut warnings,
+            "transport.port",
+            "DONSETCH_HTTP_PORT",
+            n,
+            1,
+            65535,
+        ),
         None if std::env::var_os("DONSETCH_HTTP_PORT").is_some() => {
             warnings.push("ignoring DONSETCH_HTTP_PORT: not a number".into())
         }
@@ -481,11 +518,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_HTTP_TIMEOUT_SECS") {
-        Some(s) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "transport.timeout_secs",
-            s.into(),
             "DONSETCH_HTTP_TIMEOUT_SECS",
+            n,
+            1,
+            3600,
         ),
         None if std::env::var_os("DONSETCH_HTTP_TIMEOUT_SECS").is_some() => {
             warnings.push("ignoring DONSETCH_HTTP_TIMEOUT_SECS: not a number".into())
@@ -562,11 +602,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_WEB_MEMORY_CAP") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "state.web_memory_cap",
-            n.into(),
             "DONSETCH_WEB_MEMORY_CAP",
+            n,
+            256,
+            100000,
         ),
         None if std::env::var_os("DONSETCH_WEB_MEMORY_CAP").is_some() => {
             warnings.push("ignoring DONSETCH_WEB_MEMORY_CAP: not a number".into())
@@ -609,11 +652,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_SHADOW_DEADLINE_MS") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "fetch.shadow_deadline_ms",
-            n.into(),
             "DONSETCH_SHADOW_DEADLINE_MS",
+            n,
+            1,
+            60000,
         ),
         None if std::env::var_os("DONSETCH_SHADOW_DEADLINE_MS").is_some() => {
             warnings.push("ignoring DONSETCH_SHADOW_DEADLINE_MS: not a number".into())
@@ -632,7 +678,15 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         put(&mut m, "fetch.prewarm", false.into(), "DONSETCH_NO_PREWARM");
     }
     match int_env("DONSETCH_PDF_MAX_MB") {
-        Some(n) => put(&mut m, "fetch.pdf_max_mb", n.into(), "DONSETCH_PDF_MAX_MB"),
+        Some(n) => put_num(
+            &mut m,
+            &mut warnings,
+            "fetch.pdf_max_mb",
+            "DONSETCH_PDF_MAX_MB",
+            n,
+            1,
+            4096,
+        ),
         None if std::env::var_os("DONSETCH_PDF_MAX_MB").is_some() => {
             warnings.push("ignoring DONSETCH_PDF_MAX_MB: not a number".into())
         }
@@ -645,11 +699,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         put(&mut m, "fetch.ocr", on.into(), "DONSHEET_OCR");
     }
     match int_env("DONSHEET_OCR_MAX_PAGES") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "fetch.ocr_max_pages",
-            n.into(),
             "DONSHEET_OCR_MAX_PAGES",
+            n,
+            1,
+            500,
         ),
         None if std::env::var_os("DONSHEET_OCR_MAX_PAGES").is_some() => {
             warnings.push("ignoring DONSHEET_OCR_MAX_PAGES: not a number".into())
@@ -694,11 +751,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_BYPASS_MAX_DAILY") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "bypass.max_daily",
-            n.into(),
             "DONSETCH_BYPASS_MAX_DAILY",
+            n,
+            1,
+            10000,
         ),
         None if std::env::var_os("DONSETCH_BYPASS_MAX_DAILY").is_some() => {
             warnings.push("ignoring DONSETCH_BYPASS_MAX_DAILY: not a number".into())
@@ -706,11 +766,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         None => {}
     }
     match int_env("DONSETCH_BYPASS_TIMEOUT_SECS") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "bypass.timeout_secs",
-            n.into(),
             "DONSETCH_BYPASS_TIMEOUT_SECS",
+            n,
+            1,
+            3600,
         ),
         None if std::env::var_os("DONSETCH_BYPASS_TIMEOUT_SECS").is_some() => {
             warnings.push("ignoring DONSETCH_BYPASS_TIMEOUT_SECS: not a number".into())
@@ -750,11 +813,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_BYPASS_CACHE_TTL_SECS") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "bypass.cache_ttl_secs",
-            n.into(),
             "DONSETCH_BYPASS_CACHE_TTL_SECS",
+            n,
+            1,
+            86400,
         ),
         None if std::env::var_os("DONSETCH_BYPASS_CACHE_TTL_SECS").is_some() => {
             warnings.push("ignoring DONSETCH_BYPASS_CACHE_TTL_SECS: not a number".into())
@@ -762,11 +828,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         None => {}
     }
     match int_env("DONSETCH_BYPASS_CACHE_MAX_ENTRIES") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "bypass.cache_max_entries",
-            n.into(),
             "DONSETCH_BYPASS_CACHE_MAX_ENTRIES",
+            n,
+            1,
+            100000,
         ),
         None if std::env::var_os("DONSETCH_BYPASS_CACHE_MAX_ENTRIES").is_some() => {
             warnings.push("ignoring DONSETCH_BYPASS_CACHE_MAX_ENTRIES: not a number".into())
@@ -808,11 +877,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSEEK_RERANK_THREADS") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "search.rerank_threads",
-            n.into(),
             "DONSEEK_RERANK_THREADS",
+            n,
+            0,
+            64,
         ),
         None if std::env::var_os("DONSEEK_RERANK_THREADS").is_some() => {
             warnings.push("ignoring DONSEEK_RERANK_THREADS: not a number".into())
@@ -836,10 +908,11 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         let backend = match v.as_str() {
             "auto" | "" => "auto",
             "chromium" | "chrome" | "original" => "chromium",
+            "headless" | "original-headless" => "headless",
             "cloak" | "cloakbrowser" => "cloak",
             _ => {
                 warnings.push(format!(
-                    "ignoring unknown browser backend {v:?} (auto | chromium | cloak)"
+                    "ignoring unknown browser backend {v:?} (auto | chromium | headless | cloak)"
                 ));
                 ""
             }
@@ -901,37 +974,45 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "CLOAKBROWSER_CACHE_DIR",
         );
     }
-    if std::env::var_os("DONSETCH_NO_GHOST_POOL").is_some() {
+    let no_pool = std::env::var_os("DONSETCH_NO_GHOST_POOL").is_some();
+    if no_pool {
         put(
             &mut m,
             "browser.pool_slots",
             1i64.into(),
             "DONSETCH_NO_GHOST_POOL",
         );
-    }
-    match int_env("DONSETCH_GHOST_POOL_SLOTS") {
-        Some(n) => put(
-            &mut m,
-            "browser.pool_slots",
-            n.into(),
-            "DONSETCH_GHOST_POOL_SLOTS",
-        ),
-        None if std::env::var_os("DONSETCH_GHOST_POOL_SLOTS").is_some() => {
-            warnings.push("ignoring DONSETCH_GHOST_POOL_SLOTS: not a number".into())
+    } else {
+        match int_env("DONSETCH_GHOST_POOL_SLOTS") {
+            Some(n) => put_num(
+                &mut m,
+                &mut warnings,
+                "browser.pool_slots",
+                "DONSETCH_GHOST_POOL_SLOTS",
+                n,
+                0,
+                16,
+            ),
+            None if std::env::var_os("DONSETCH_GHOST_POOL_SLOTS").is_some() => {
+                warnings.push("ignoring DONSETCH_GHOST_POOL_SLOTS: not a number".into())
+            }
+            None => {}
         }
-        None => {}
     }
     if let Some(v) = std::env::var_os("DONSETCH_XVFB_DISPLAY") {
         match v
             .to_str()
             .map(|s| s.trim().trim_start_matches(':').parse::<i64>())
         {
-            Some(Ok(n)) => put(
+            Some(Ok(n)) if (0..=254).contains(&n) => put(
                 &mut m,
                 "browser.xvfb_display",
                 n.into(),
                 "DONSETCH_XVFB_DISPLAY",
             ),
+            Some(Ok(n)) => warnings.push(format!(
+                "ignoring DONSETCH_XVFB_DISPLAY={n}: out of range 0..=254"
+            )),
             _ => warnings.push("ignoring DONSETCH_XVFB_DISPLAY: not a display number".into()),
         }
     }
@@ -944,11 +1025,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_PROBE_SCAN_SECS") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "browser.probe_scan_secs",
-            n.into(),
             "DONSETCH_PROBE_SCAN_SECS",
+            n,
+            1,
+            3600,
         ),
         None if std::env::var_os("DONSETCH_PROBE_SCAN_SECS").is_some() => {
             warnings.push("ignoring DONSETCH_PROBE_SCAN_SECS: not a number".into())
@@ -956,11 +1040,14 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         None => {}
     }
     match int_env("DONSETCH_PROBE_STALE_SECS") {
-        Some(n) => put(
+        Some(n) => put_num(
             &mut m,
+            &mut warnings,
             "browser.probe_stale_secs",
-            n.into(),
             "DONSETCH_PROBE_STALE_SECS",
+            n,
+            60,
+            604800,
         ),
         None if std::env::var_os("DONSETCH_PROBE_STALE_SECS").is_some() => {
             warnings.push("ignoring DONSETCH_PROBE_STALE_SECS: not a number".into())
@@ -1229,14 +1316,14 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "cert_file",
             FieldKind::Str,
             "(ambient)",
-            "extra CA cert file",
+            "extra CA cert file (additive on top of the ambient set)",
         ),
         (
             "tls",
             "cert_dir",
             FieldKind::Str,
             "(ambient)",
-            "extra CA cert directory",
+            "extra CA cert directory (additive on top of the ambient set)",
         ),
         // persona
         (
@@ -1610,6 +1697,7 @@ const RESERVED_VARS: &[&str] = &[
     "DONSETCH_CONFIG",
     "DONSETCH_NO_CONFIG_FILE",
     "DONSETCH_PLUGIN",
+    "DONSETCH_DEBUG",
     "BLESS_MCP_FIXTURES",
 ];
 
@@ -1852,44 +1940,35 @@ fn value_of(c: &DonsetchConfig, section: &str, key: &str) -> String {
     }
 }
 
-/// (section, key, current value, origin) for every documented knob.
-/// Origin = "default" | the env var that set it | "file:<path>".
-pub fn origins(c: &DonsetchConfig) -> Vec<(&'static str, &'static str, String, String)> {
+/// (section, key, current value, origin) for every documented knob:
+/// the origin comes straight off each leaf of the merged tree (the
+/// builder stamps which layer won), the value from the typed struct.
+pub fn origins(
+    merged: &config::Map<String, config::Value>,
+    c: &DonsetchConfig,
+) -> Vec<(&'static str, &'static str, String, String)> {
     let mut out = Vec::new();
-    let file = toml_path().map(|p| format!("file:{}", p.display()));
     for (section, key, _, _, _) in fieldbook() {
         let section = *section;
         let key = *key;
-        let mut origin = "default".to_string();
-        // Report the topmost setter: new env names beat legacy names,
-        // legacy names beat the file layer.
-        let s = section.to_uppercase();
-        let k = key.to_uppercase();
-        let env_name = format!("DONSETCH_{s}__{k}");
-        if std::env::var_os(&env_name).is_some() {
-            origin = env_name;
-        } else {
-            for var in LEGACY_VARS {
-                if legacy_target_of(var) == (section, key) && std::env::var_os(var).is_some() {
-                    origin = format!("legacy:{var}");
-                    break;
-                }
-            }
-            if origin == "default"
-                && let Some(file) = &file
-            {
-                origin = file.clone();
-            }
-        }
+        let origin = merged
+            .get(section)
+            .and_then(|v| match &v.kind {
+                config::ValueKind::Table(inner) => inner.get(key),
+                _ => None,
+            })
+            .and_then(config::Value::origin)
+            .map(str::to_string)
+            .unwrap_or_else(|| "default".to_string());
         out.push((section, key, value_of(c, section, key), origin));
     }
     out
 }
 
 /// Human-readable `config show` output: every knob, value, source.
-pub fn show_text(c: &DonsetchConfig) -> String {
+pub fn show_text(loaded: &Loaded) -> String {
     let mut out = String::new();
-    if let Some(path) = toml_path() {
+    if let Some(path) = &loaded.file {
         out.push_str(&format!("config file: {}\n", path.display()));
     } else {
         out.push_str("config file: (none, using env + defaults)\n");
@@ -1902,7 +1981,7 @@ pub fn show_text(c: &DonsetchConfig) -> String {
         ));
     }
     out.push('\n');
-    let rows = origins(c);
+    let rows = origins(&loaded.merged, &loaded.config);
     let mut last_section = "";
     for (section, key, value, origin) in rows {
         if section != last_section {
@@ -2041,10 +2120,13 @@ static CONFIG: OnceLock<DonsetchConfig> = OnceLock::new();
 
 /// Install a validated config (the CLI/MCP entry point does this after
 /// merging CLI flags). Errors are fatal and reported to the caller.
+/// Installing twice in one process is an error, not a silent no-op:
+/// the first install is the contract the whole daemon reads.
 pub fn install(cfg: DonsetchConfig) -> Result<(), ConfigError> {
     validate(&cfg)?;
-    let _ = CONFIG.set(cfg);
-    Ok(())
+    CONFIG
+        .set(cfg)
+        .map_err(|_| ConfigError::Env("config is already installed in this process".into()))
 }
 
 /// The process config, initializing lazily from defaults + env + file.
@@ -2119,6 +2201,243 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_env(name: &str, value: impl AsRef<std::ffi::OsStr>) {
+        unsafe { std::env::set_var(name, value) }
+    }
+
+    fn unset_env(name: &str) {
+        unsafe { std::env::remove_var(name) }
+    }
+
+    /// Snapshot-and-clear every donsetch env var (process-per-test makes
+    /// this safe; the guard restores the shell on drop so the dev's own
+    /// exports never leak into a sibling test process image).
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    fn clean_env() -> EnvGuard {
+        let mut saved = Vec::new();
+        let prefixes = [
+            "DONSETCH_",
+            "DONSEEK_",
+            "DONGHOST_",
+            "DONSHEET_",
+            "DONSIFT_",
+            "CLOAKBROWSER_",
+        ];
+        // Snapshot first: mutating the env while iterating vars_os
+        // deadlocks on the env lock.
+        let snapshot: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
+            .filter_map(|(k, v)| {
+                let name = k.to_str()?.to_string();
+                prefixes
+                    .iter()
+                    .any(|p| name.starts_with(p))
+                    .then_some((name, v))
+            })
+            .collect();
+        for (name, v) in snapshot {
+            unset_env(&name);
+            saved.push((name, Some(v)));
+        }
+        EnvGuard { saved }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(v) => set_env(name, v),
+                    None => unset_env(name),
+                }
+            }
+        }
+    }
+
+    fn write_cfg(tmp: &std::path::Path, text: &str) -> std::path::PathBuf {
+        let dir = tmp.join(format!("cfg-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("donsetch.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn rand_suffix() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string()
+    }
+
+    /// Presence beats default-equality: a top layer that sets a field to
+    /// its own default is still a setting and must win (the old value-
+    /// difference fold dropped it and lied about the origin).
+    #[test]
+    fn layer_fold_is_by_presence_not_value() {
+        let guard = clean_env();
+        let path = write_cfg(&std::env::temp_dir(), "[mcp]\nanswer_tool = false\n");
+        set_env("DONSETCH_CONFIG", &path);
+        set_env("DONSETCH_MCP__ANSWER_TOOL", "true");
+        let loaded = load().expect("load");
+        assert!(
+            loaded.config.mcp.answer_tool,
+            "env set it true explicitly; presence must beat default-equality"
+        );
+        let rows = origins(&loaded.merged, &loaded.config);
+        let origin = rows
+            .iter()
+            .find(|(s, k, _, _)| *s == "mcp" && *k == "answer_tool")
+            .expect("answer_tool row")
+            .3
+            .clone();
+        assert_eq!(origin, "DONSETCH_MCP__ANSWER_TOOL");
+        drop(guard);
+    }
+
+    /// The documented order is defaults < legacy < file < new env; the
+    /// implementation folded legacy AFTER the file, so a legacy value
+    /// beat the TOML. Pinned now.
+    #[test]
+    fn legacy_layer_loses_to_the_file() {
+        let guard = clean_env();
+        let path = write_cfg(&std::env::temp_dir(), "[fetch]\npdf_max_mb = 44\n");
+        set_env("DONSETCH_CONFIG", &path);
+        set_env("DONSETCH_PDF_MAX_MB", "7");
+        let loaded = load().expect("load");
+        assert_eq!(
+            loaded.config.fetch.pdf_max_mb, 44,
+            "the file layer must beat the legacy env name"
+        );
+        drop(guard);
+    }
+
+    /// Legacy names keep their historical soft semantics: a value
+    /// outside the sane range warns and keeps the default, never a hard
+    /// failure (review finding: both caps used to exit 1).
+    #[test]
+    fn legacy_out_of_range_warns_and_keeps_the_default() {
+        let guard = clean_env();
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        set_env("DONSETCH_WEB_MEMORY_CAP", "100");
+        set_env("DONSETCH_PDF_MAX_MB", "-1");
+        let loaded = load().expect("legacy values must never fail hard");
+        assert_eq!(loaded.config.state.web_memory_cap, 4000);
+        assert_eq!(loaded.config.fetch.pdf_max_mb, 100);
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("DONSETCH_WEB_MEMORY_CAP=100"))
+        );
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("DONSETCH_PDF_MAX_MB=-1"))
+        );
+        drop(guard);
+    }
+
+    /// proxy.from_environment gates the AMBIENT proxy convention, not
+    /// the config-file slots: an explicit TOML proxy must survive the
+    /// kill switch (the old caller-side gate starved it).
+    #[test]
+    fn from_environment_off_keeps_toml_proxy_slots_alive() {
+        let guard = clean_env();
+        let path = write_cfg(
+            &std::env::temp_dir(),
+            "[proxy]\nhttp = \"http://unlocker.local:3128\"\nfrom_environment = false\n",
+        );
+        set_env("DONSETCH_CONFIG", &path);
+        let loaded = load().expect("load");
+        assert!(!loaded.config.proxy.from_environment);
+        assert_eq!(loaded.config.proxy.http, "http://unlocker.local:3128");
+        // The resolver must see the slot even with the ambient gate off.
+        let picked = crate::transport::proxy::from_env_for("http://example.com");
+        assert!(
+            picked.is_some(),
+            "an explicit TOML proxy must survive from_environment=false"
+        );
+        drop(guard);
+    }
+
+    /// A file that merely exists is not a setter for every key: only the
+    /// keys present in it carry the file origin (the old code stamped
+    /// 72/74 rows as file:).
+    #[test]
+    fn file_origin_reports_only_present_keys() {
+        let guard = clean_env();
+        let path = write_cfg(&std::env::temp_dir(), "[fetch]\nh3 = true\n");
+        set_env("DONSETCH_CONFIG", &path);
+        let loaded = load().expect("load");
+        let rows = origins(&loaded.merged, &loaded.config);
+        let file_rows: Vec<&(_, _, _, _)> =
+            rows.iter().filter(|r| r.3.starts_with("file:")).collect();
+        assert_eq!(file_rows.len(), 1, "exactly one key came from the file");
+        assert_eq!(file_rows[0].0, "fetch");
+        assert_eq!(file_rows[0].1, "h3");
+        let defaulted = rows.iter().filter(|r| !r.3.starts_with("file:")).count();
+        assert!(defaulted >= 70, "everything else stays default-origin");
+        drop(guard);
+    }
+
+    /// The legacy backend mapper dropped the headless variant; it must
+    /// map to BrowserBackend::Headless like every historical spelling.
+    #[test]
+    fn legacy_headless_backend_still_maps() {
+        let guard = clean_env();
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        set_env("DONSETCH_BROWSER_BACKEND", "headless");
+        let loaded = load().expect("load");
+        assert_eq!(loaded.config.browser.backend, BrowserBackend::Headless);
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .all(|w| !w.contains("unknown browser backend")),
+            "headless is a known backend: {warnings:?}",
+            warnings = loaded.warnings
+        );
+        drop(guard);
+    }
+
+    /// Kill switch wins: DONSETCH_NO_GHOST_POOL must override a slot
+    /// count, exactly like the pre-config behavior.
+    #[test]
+    fn ghost_pool_kill_switch_wins_over_slot_count() {
+        let guard = clean_env();
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        set_env("DONSETCH_NO_GHOST_POOL", "1");
+        set_env("DONSETCH_GHOST_POOL_SLOTS", "4");
+        let loaded = load().expect("load");
+        assert_eq!(
+            loaded.config.browser.pool_slots, 1,
+            "the kill switch must beat the count"
+        );
+        drop(guard);
+    }
+
+    /// Falsy spellings of DONSETCH_NO_CONFIG_FILE mean "the file layer
+    /// is on": only truthy values disable it.
+    #[test]
+    fn no_config_file_falsy_words_still_load_the_file() {
+        for falsy in ["0", "false", "off", "no"] {
+            let guard = clean_env();
+            let path = write_cfg(&std::env::temp_dir(), "[fetch]\nh3 = true\n");
+            set_env("DONSETCH_CONFIG", &path);
+            set_env("DONSETCH_NO_CONFIG_FILE", falsy);
+            let loaded = load().expect("load");
+            assert!(
+                loaded.config.fetch.h3,
+                "DONSETCH_NO_CONFIG_FILE={falsy} must not disable the file layer"
+            );
+            drop(guard);
+        }
+    }
 
     /// Markdown tables must never split a row: raw pipes in defaults
     /// and descriptions are escaped ("\\|"), so a data row has the

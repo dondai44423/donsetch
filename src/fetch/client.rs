@@ -267,7 +267,7 @@ impl Fetcher {
         // and crawl (many pages, same host) where rate limits bite.
 
         loop {
-            let env_proxy = if proxy.is_none() && crate::config::cfg().proxy.from_environment {
+            let env_proxy = if proxy.is_none() {
                 crate::transport::proxy::from_env_for(&current)
             } else {
                 None

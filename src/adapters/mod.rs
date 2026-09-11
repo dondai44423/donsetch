@@ -26,17 +26,17 @@ pub mod wiki_infobox;
 
 /// Kill switch : checked once, then cached.
 fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("DONSETCH_NO_ADAPTERS").is_err())
+    crate::config::cfg().fetch.adapters
 }
 
 /// Debug capture: `DONSETCH_ADAPTER_DUMP=<dir>` writes every body
 /// an adapter inspects : fixture capture for adapter development.
 /// Best-effort, never a failure path.
 fn debug_dump(html: &str, url: &str) {
-    let Ok(dir) = std::env::var("DONSETCH_ADAPTER_DUMP") else {
+    let dir = crate::config::cfg().fetch.adapter_dump_dir.clone();
+    if dir.is_empty() {
         return;
-    };
+    }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut h);

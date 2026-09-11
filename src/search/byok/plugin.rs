@@ -406,7 +406,7 @@ fn parse_envelope(
             Some(u) if is_http_url(u) => u.to_string(),
             Some(u) => {
                 dropped += 1;
-                if std::env::var_os("DONSEEK_DEBUG").is_some() {
+                if crate::config::cfg().debug.search {
                     eprintln!("[plugin] {plugin_name}: dropped result with bad url: {u:?}");
                 }
                 continue;
@@ -439,7 +439,7 @@ fn parse_envelope(
             score,
         });
     }
-    if results.len() > MAX_RESULTS && std::env::var_os("DONSEEK_DEBUG").is_some() {
+    if results.len() > MAX_RESULTS && crate::config::cfg().debug.search {
         eprintln!(
             "[plugin] {plugin_name}: truncated {} results to {MAX_RESULTS}",
             results.len()
@@ -541,7 +541,7 @@ pub(crate) async fn run_plugin(
     match status {
         Ok(code) if code.success() => match parse_envelope(&body, name) {
             Ok((hits, degraded, dropped)) => {
-                if dropped > 0 && std::env::var_os("DONSEEK_DEBUG").is_some() {
+                if dropped > 0 && crate::config::cfg().debug.search {
                     eprintln!("[plugin] {name}: dropped {dropped} invalid result entries");
                 }
                 let ms = started.elapsed().as_millis() as u64;
@@ -595,8 +595,36 @@ fn spawn_plugin(name: &str, def: &PluginDef) -> Result<tokio::process::Child, St
     cmd.args(&def.cmd[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("DONSETCH_PLUGIN", "1")
+        .stderr(Stdio::piped());
+    // The child inherits the ambient env by default, which must not
+    // carry the proxy convention when the operator disabled it, and
+    // must carry the config-file proxy slots when they are set.
+    let cfg = crate::config::cfg();
+    if !cfg.proxy.from_environment {
+        for var in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            cmd.env_remove(var);
+        }
+    }
+    for (name, val) in [
+        ("HTTP_PROXY", &cfg.proxy.http),
+        ("HTTPS_PROXY", &cfg.proxy.https),
+        ("ALL_PROXY", &cfg.proxy.all),
+        ("NO_PROXY", &cfg.proxy.no_proxy),
+    ] {
+        if !val.is_empty() {
+            cmd.env(name, val);
+        }
+    }
+    cmd.env("DONSETCH_PLUGIN", "1")
         .env("DONSETCH_PLUGIN_NAME", name)
         .current_dir(std::env::temp_dir())
         .kill_on_drop(true);
