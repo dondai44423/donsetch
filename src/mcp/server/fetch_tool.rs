@@ -109,9 +109,11 @@ fn memory_ingest_result(url: &str, result: &Value) {
         if md.is_empty() {
             return;
         }
-        if let Err(e) = crate::memory::ingest(url, &crate::memory::title_of(md), md) {
-            eprintln!("[fetch-tool] memory ingest failed (honest): {e}");
-        }
+        crate::memory::ingest_async(vec![(
+            url.to_string(),
+            crate::memory::title_of(md),
+            md.to_string(),
+        )]);
     }
 }
 
@@ -212,17 +214,20 @@ pub(super) async fn fetch_multi(
         .collect();
     // Store the successful fetches into the local web memory. The
     // hook gets the FULL body before any budget slicing: the memory
-    // keeps the page whole and truncates on its own.
+    // keeps the page whole and truncates on its own. One batch =
+    // one embed pass + one disk write (issue #178), and it runs on
+    // the blocking pool so it cannot hold the response past the
+    // deadline.
     #[cfg(feature = "rerank")]
     if !crate::memory::kill_switch() {
+        let mut rows = Vec::with_capacity(urls.len());
         for (idx, url) in urls.iter().enumerate() {
             let Some(md) = markdowns[idx].as_deref() else {
                 continue;
             };
-            if let Err(e) = crate::memory::ingest(url, &crate::memory::title_of(md), md) {
-                eprintln!("[fetch-tool] memory ingest failed (honest): {e}");
-            }
+            rows.push((url.clone(), crate::memory::title_of(md), md.to_string()));
         }
+        crate::memory::ingest_async(rows);
     }
     let mut sliced_flags = vec![false; results.len()];
     if let Some(budget_tok) = budget_tokens {

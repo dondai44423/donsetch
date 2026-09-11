@@ -189,11 +189,12 @@ pub(super) async fn search_inner(
 fn memory_ingest_outcome(out: &crate::search::SearchOutcome) {
     #[cfg(feature = "rerank")]
     if !crate::memory::kill_switch() {
-        for r in out.results.iter() {
-            if let Err(e) = crate::memory::ingest(&r.url, &r.title, &r.snippet) {
-                eprintln!("[search-tool] memory ingest failed (honest): {e}");
-            }
-        }
+        let rows: Vec<(String, String, String)> = out
+            .results
+            .iter()
+            .map(|r| (r.url.clone(), r.title.clone(), r.snippet.clone()))
+            .collect();
+        crate::memory::ingest_async(rows);
     }
 }
 

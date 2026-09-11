@@ -17,7 +17,10 @@ pub mod model;
 pub mod store;
 
 #[cfg(feature = "rerank")]
-pub use store::{MemoryHit, cap, clear, index_path, ingest, kill_switch, rows, search};
+pub use store::{
+    MemoryHit, cap, clear, index_path, ingest, ingest_async, ingest_batch, kill_switch, rows,
+    search,
+};
 
 /// Maximum `limit` accepted by web_memory (schema clamp).
 pub const LIMIT_MAX: usize = 50;

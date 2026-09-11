@@ -189,6 +189,100 @@ pub fn ingest(url: &str, title: &str, body: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Batched ingest (issue #178): one lock acquisition, one eviction
+/// pass, one disk write for a whole page or search batch. Rows that
+/// fail the 80-char floor or the entry-key rules are dropped before
+/// the model is ever touched. Returns how many rows reached the
+/// index (including refreshes). Law 5 unchanged: an embed or
+/// persistence failure returns Err as a receipt and nothing is
+/// recorded.
+pub fn ingest_batch(rows: &[(String, String, String)]) -> Result<usize, String> {
+    if kill_switch() || rows.is_empty() {
+        return Ok(0);
+    }
+    let now = now_ms();
+    let mut prepped: Vec<(String, String, String)> = Vec::with_capacity(rows.len());
+    for (url, title, body) in rows {
+        let key = entry_key(url);
+        if key.is_empty() {
+            continue;
+        }
+        let body = snippetize(body, DOC_CHUNK);
+        if body.chars().count() < 80 {
+            continue;
+        }
+        prepped.push((key, title.clone(), body));
+    }
+    if prepped.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<String> = prepped
+        .iter()
+        .map(|(_, t, b)| format!("{t}\n{b}"))
+        .collect();
+    let vecs = model::embed_batch(&texts)?;
+    let lock = store();
+    let mut acc = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut changed = 0usize;
+    let mut added = 0usize;
+    for (row, vec) in prepped.iter().zip(vecs.iter()) {
+        let (key, title, body) = row;
+        if let Some(pos) = acc.iter().position(|e| e.url == *key) {
+            acc[pos].title = title.clone();
+            acc[pos].body = body.clone();
+            acc[pos].vec = vec.clone();
+            acc[pos].ts = now;
+        } else {
+            acc.push(Entry {
+                url: key.clone(),
+                title: title.clone(),
+                body: body.clone(),
+                ts: now,
+                vec: vec.clone(),
+            });
+            added += 1;
+        }
+        changed += 1;
+    }
+    if added > 0 {
+        while acc.len() > cap() {
+            let oldest = acc
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.ts)
+                .map(|(i, _)| i);
+            match oldest {
+                Some(i) => {
+                    acc.remove(i);
+                }
+                None => break,
+            }
+        }
+    }
+    let snapshot = acc.clone();
+    drop(acc);
+    persist(&snapshot)?;
+    Ok(changed)
+}
+
+/// Fire-and-forget bookkeeping (issue #178): the embed + write run
+/// on the blocking pool after the tool response is already on its
+/// way, so web memory never holds a response past deadline_ms.
+/// Law 5 unchanged: failures surface as a stderr receipt, never as
+/// a changed result.
+pub fn ingest_async(rows: Vec<(String, String, String)>) {
+    if rows.is_empty() {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = ingest_batch(&rows) {
+            eprintln!("[memory] ingest: {e}");
+        }
+    });
+}
+
 /// Semantic search over the local index: cosine similarity scan, top
 /// k hits above SIM_FLOOR. Returns empty for a missing model or an
 /// empty index (never an error unless the embed itself fails).
