@@ -371,6 +371,85 @@ mod tests {
         assert!(!snippetize(&cjk, 8).is_empty());
     }
 
+    // Two persists that overlap must not share one staging file.
+    // The old per-PID-only tmp meant every write in a process opened
+    // the SAME path with O_TRUNC; ingest_async (issue #178) made those
+    // writes concurrent (per-chunk + on-completion within one crawl),
+    // so a second writer could truncate the first mid-flight and the
+    // rename would move torn bytes into index.json -> next load()
+    // parse-fails to an empty index. Distinct staging paths per write
+    // are the invariant that keeps each rename a complete file.
+    #[test]
+    fn stage_paths_are_unique_per_write() {
+        let base = std::path::Path::new("/tmp/donsetch-idx/index.json");
+        let a = stage_path(base);
+        let b = stage_path(base);
+        assert_ne!(a, b, "each persist must stage to its own tmp file");
+        assert_ne!(a.file_name(), b.file_name());
+        // Both still land beside the target (same dir) and read as tmp.
+        assert_eq!(a.parent(), Some(std::path::Path::new("/tmp/donsetch-idx")));
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+    }
+
+    // A best-effort concurrency guard: many overlapping persists to
+    // one path must always leave a parseable, complete index (never a
+    // truncated/interleaved corpse). Deterministic reproduction of the
+    // race needs a slow filesystem; this at least exercises the path
+    // and locks the post-fix guarantee. SAFETY: an in-test
+    // DONSETCH_CACHE_DIR isolates index_path(); the naive read of
+    // persist() fires into the user's real dir and is forbidden.
+    #[test]
+    fn concurrent_persist_leaves_a_valid_index() {
+        let snap = |tag: usize| -> Vec<Entry> {
+            (0..64)
+                .map(|i| Entry {
+                    url: format!("https://ex{tag}.test/{i}"),
+                    title: format!("t{tag}-{i}"),
+                    body: "x".repeat(4096),
+                    ts: i as u64,
+                    vec: vec![0.1f32; 384],
+                })
+                .collect()
+        };
+            // Isolate the store dir under a temp DONSETCH_CACHE_DIR before
+        // anything resolves cache_dir(); nextest runs one process per
+        // test, so the env sticks for this test only. The naive read
+        // of persist() (without this) fired 160 overwrite-renames into
+        // the developer's real memory index on every test run: the
+        // destructive pattern is explicitly forbidden.
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-test-persist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe {
+            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
+        }
+
+        let handles: Vec<_> = (0..8)
+            .map(|tag| {
+                let s = snap(tag);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _ = persist(&s);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let raw = std::fs::read(index_path()).expect("index present after persists");
+        let parsed = serde_json::from_slice::<Index>(&raw);
+        assert!(parsed.is_ok(), "index.json must stay valid JSON");
+        assert_eq!(
+            parsed.unwrap().entries.len(),
+            64,
+            "a full snapshot survived"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The cap floor: junk or tiny values fall back to the default,
     /// sane values pass through. Mimics the real daemon env.
     /// SAFETY: nextest runs each test in its own process, so the
