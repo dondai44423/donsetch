@@ -115,6 +115,14 @@ fn norm_query(q: &str) -> String {
         .join(" ")
 }
 
+/// Cache key for BYOK provider results (issue #195). The `byok|`
+/// prefix keeps them out of the local path's `query|intent` slot, so
+/// switching the `default` between local and a provider can never
+/// serve one path's results under the other's name.
+fn byok_cache_key(query: &str, intent: Intent) -> String {
+    format!("byok|{}|{}", norm_query(query), intent.code())
+}
+
 /// Whether a failure `status` reflects the engine actually behaving
 /// badly (worth quarantining via `record_outcome` and eroding trust
 /// via `bump_trust`), as opposed to infra noise -- a dead egress
@@ -247,6 +255,78 @@ impl Searcher {
     /// by the fetch tool.
     pub fn prewarms(&self) -> &std::sync::Arc<std::sync::Mutex<PrewarmCache>> {
         &self.prewarms
+    }
+
+    /// Issue #195: serve a repeat BYOK query from the same TTL'd
+    /// cache the local path uses, so a metered provider is not
+    /// re-billed for an identical query inside the freshness window.
+    /// Returns a `cached: true` outcome (provider recovered from the
+    /// stored report) when a fresh entry exists. BYOK entries live in
+    /// their own key namespace so a `default` switch between local and
+    /// a provider never cross-serves one for the other.
+    pub fn byok_cache_get(
+        &self,
+        query: &str,
+        intent: Intent,
+        max_results: usize,
+    ) -> Option<SearchOutcome> {
+        let t0 = Instant::now();
+        let key = byok_cache_key(query, intent);
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (at, cached, _total, report) = cache.get(&key)?;
+        if at.elapsed() >= cache_ttl(intent, query) {
+            return None;
+        }
+        // The provider name is the engine label the BYOK path stored.
+        let provider = report.first().map(|r| r.engine.clone());
+        let mut results: Vec<Merged> = cached
+            .iter()
+            .take(max_results.clamp(1, 12))
+            .cloned()
+            .collect();
+        site_filter(query, &mut results);
+        Some(SearchOutcome {
+            results,
+            // BYOK results are provider-ranked and never flagged weak,
+            // matching the live BYOK path.
+            weak: false,
+            intent,
+            report: report.clone(),
+            cached: true,
+            elapsed: t0.elapsed(),
+            provider,
+            reranked: false,
+        })
+    }
+
+    /// Issue #195: persist a fresh BYOK outcome under the BYOK key
+    /// namespace, TTL'd like the local cache. Skips an empty result
+    /// set (the provider path errors on empty, so this is defensive).
+    pub fn byok_cache_put(&self, query: &str, out: &SearchOutcome) {
+        if out.results.is_empty() {
+            return;
+        }
+        let key = byok_cache_key(query, out.intent);
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // LRU-ish cap, same rule as the local write path.
+        if cache.len() >= 500
+            && let Some(oldest) = cache
+                .iter()
+                .max_by_key(|(_, (at, _, _, _))| at.elapsed())
+                .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+        let results: Vec<Merged> = out.results.iter().take(12).cloned().collect();
+        let total = results.len();
+        cache.insert(key, (Instant::now(), results, total, out.report.clone()));
+        save_cache_disk(&cache);
     }
 
     /// Proxy preflight: probe every proxy at startup so
@@ -997,6 +1077,109 @@ impl Drop for InflightGuard<'_> {
 mod tests {
     use super::render::clip_snippet;
     use super::*;
+
+    fn test_searcher() -> Searcher {
+        // Hermetic: point disk cache/health at a throwaway dir so the
+        // real user cache is neither read nor polluted, then clear the
+        // in-memory map so the entry set is exactly what the test puts
+        // (robust even if a sibling test changed the env first).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "donsetch-byok-cache-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let s = Searcher::new(fetcher, EgressPool::new(Vec::new()));
+        s.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        s
+    }
+
+    fn byok_outcome(provider: &str, urls: &[&str]) -> SearchOutcome {
+        let results = urls
+            .iter()
+            .enumerate()
+            .map(|(i, u)| Merged {
+                title: format!("t{i}"),
+                url: (*u).to_string(),
+                snippet: "s".into(),
+                sources: vec![(provider.to_string(), i)],
+                score: 1.0 - i as f64 * 0.1,
+                published: None,
+            })
+            .collect::<Vec<_>>();
+        let report = vec![EngineReport {
+            engine: provider.to_string(),
+            profile: None,
+            status: "ok".into(),
+            hits: results.len(),
+            ms: 12,
+            egress: "byok".into(),
+        }];
+        SearchOutcome {
+            results,
+            weak: false,
+            intent: Intent::Web,
+            report,
+            cached: false,
+            elapsed: Duration::ZERO,
+            provider: Some(provider.to_string()),
+            reranked: false,
+        }
+    }
+
+    // Issue #195: a repeat BYOK query must be served from the cache
+    // (cached: true, provider preserved), never re-billing the
+    // provider. The store/serve roundtrip is the mechanism the wiring
+    // in search_tool relies on.
+    #[test]
+    fn byok_results_roundtrip_the_cache_with_provider_and_cached_flag() {
+        let s = test_searcher();
+        // Cold: nothing cached, so a caller must go bill the provider.
+        assert!(s.byok_cache_get("quic test 42", Intent::Web, 3).is_none());
+
+        let out = byok_outcome("tinyfish", &["https://a.test/", "https://b.test/"]);
+        s.byok_cache_put("quic test 42", &out);
+
+        // Warm: served from cache, marked cached, provider intact.
+        let hit = s
+            .byok_cache_get("quic test 42", Intent::Web, 3)
+            .expect("a fresh BYOK entry must hit");
+        assert!(hit.cached, "a served BYOK cache entry must report cached");
+        assert_eq!(hit.provider.as_deref(), Some("tinyfish"));
+        assert!(!hit.weak);
+        assert_eq!(hit.results.len(), 2);
+        assert_eq!(hit.results[0].url, "https://a.test/");
+    }
+
+    // The BYOK namespace must not collide with the local path: a
+    // provider result must never be served for a local-default query
+    // of the same text/intent, nor vice versa.
+    #[test]
+    fn byok_cache_is_isolated_from_the_local_namespace() {
+        let s = test_searcher();
+        let out = byok_outcome("serper", &["https://only-byok.test/"]);
+        s.byok_cache_put("shared query", &out);
+        // The local cache key (query|intent) is a different slot, so a
+        // local read finds nothing the BYOK write left behind.
+        let local_key = format!("{}|{}", norm_query("shared query"), Intent::Web.code());
+        assert!(
+            !s.cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&local_key),
+            "a BYOK write must not populate the local cache slot"
+        );
+        // And the BYOK read still finds its own entry.
+        assert!(s.byok_cache_get("shared query", Intent::Web, 5).is_some());
+        // A different intent is a different entry (miss).
+        assert!(s.byok_cache_get("shared query", Intent::News, 5).is_none());
+    }
 
     #[test]
     fn regression_unavailable_google_does_not_stop_other_assignments() {
