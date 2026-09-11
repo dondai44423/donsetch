@@ -47,7 +47,7 @@ reqwest; the core paths that run on every fetch do not.)
 Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes)
 and as a standalone CLI.
 
-> **V4 is coming. And it's not just any upgrade.**
+> **V4 is coming soon.**
 
 ## ✨ What makes it different
 
@@ -273,6 +273,34 @@ donsetch doctor --fix    # repairs mechanical problems automatically
 `doctor --json` emits a machine-readable report; it also detects your
 MCP client and prints ready-to-paste registration blocks.
 
+## ⚙️ Configuration
+
+Every runtime knob lives in one typed config (`src/config.rs`). Four layers, later wins:
+
+1. Compiled defaults. A bare `donsetch mcp` stays the law: zero config needed.
+2. Legacy env vars (the pre-v4 names like `DONSETCH_NO_CRAWL_SHAPE`). Honored exactly as before, now reported as deprecated, cut at the v4 release.
+3. `donsetch.toml` at `<config-dir>/donsetch/donsetch.toml` (or anywhere via `DONSETCH_CONFIG=/path/file.toml`). Unknown keys and bad values are hard errors naming the file. `DONSETCH_NO_CONFIG_FILE=1` skips the file layer entirely (setting both is an error).
+4. New env names: `DONSETCH_<SECTION>__<KEY>`, for example `DONSETCH_FETCH__PDF_MAX_MB=25`. Section upper-case, double underscore, key upper-case.
+
+Knob sections: `transport`, `mcp`, `paths`, `state`, `proxy`, `tls`, `persona`, `cli`, `fetch`, `bypass`, `search`, `browser`, `debug`.
+
+- `donsetch config show` prints every knob with its value and its origin (default, legacy, file, env).
+- `donsetch config show --markdown` prints the full reference table, one row per knob.
+- `donsetch config show --legacy` maps every old env name to its config key.
+- `donsetch doctor` warns about the legacy vars active in your shell, mapped to their keys.
+
+```toml
+[fetch]
+h3 = true               # opt into the h3 lane
+shadow_fetch = "never"  # or "auto" / "always"
+pdf_max_mb = 100
+
+[state]
+web_memory_cap = 300
+```
+
+Booleans take `true` / `false`; enum knobs take their listed spellings. The exact TOML keys come from `donsetch config show`.
+
 ## Quickstart
 
 Two ways to use it:
@@ -331,6 +359,7 @@ split shape.
 donsetch fetch https://example.com --focus "pricing"
 donsetch search "rust async patterns" --intent code
 donsetch crawl https://docs.python.org --mode map --topic asyncio
+donsetch config show            # every knob with its origin (see Configuration)
 ```
 
 ## 🔀 HTTP Proxy

@@ -79,6 +79,9 @@ mod inner {
     enum ThreadOverride<'a> {
         Unset,
         Value(&'a str),
+        /// Unreachable through the config (validation rejects
+        /// non-numeric values at load); kept for the pure-machinery tests.
+        #[cfg_attr(not(test), allow(dead_code))]
         InvalidUnicode,
     }
 
@@ -136,11 +139,15 @@ mod inner {
     fn configured_intra_threads() -> ThreadSelection {
         let effective = std::thread::available_parallelism().ok().map(|n| n.get());
         let physical = num_cpus::get_physical();
-        let raw = std::env::var("DONSEEK_RERANK_THREADS");
-        let override_value = match raw.as_deref() {
-            Ok(raw) => ThreadOverride::Value(raw),
-            Err(std::env::VarError::NotPresent) => ThreadOverride::Unset,
-            Err(std::env::VarError::NotUnicode(_)) => ThreadOverride::InvalidUnicode,
+        // Source: [search] rerank_threads in the layered config
+        // (historically DONSEEK_RERANK_THREADS). 0 = auto; unparsable
+        // values are already rejected at config load, and legacy env
+        // values warn there.
+        let configured = crate::config::cfg().search.rerank_threads;
+        let override_value = if configured == 0 {
+            ThreadOverride::Unset
+        } else {
+            ThreadOverride::Value(Box::leak(configured.to_string().into_boxed_str()))
         };
         let (selection, warning) = select_intra_threads(override_value, effective, physical);
         if let Some(warning) = warning {

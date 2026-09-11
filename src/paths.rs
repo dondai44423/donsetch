@@ -16,8 +16,14 @@ use std::path::{Component, Path, PathBuf};
 pub fn cache_dir() -> PathBuf {
     // Test/container override: everything stateful hangs off this
     // one root, so redirecting it isolates a whole daemon cleanly.
+    // The env var is read per call on purpose: tests set it late.
     if let Some(d) = std::env::var_os("DONSETCH_CACHE_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(d);
+    }
+    // Layered config fallback ([paths] cache_dir in donsetch.toml).
+    let configured = crate::config::cfg().paths.cache_dir.trim();
+    if !configured.is_empty() {
+        return PathBuf::from(configured);
     }
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)

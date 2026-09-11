@@ -60,7 +60,7 @@ impl AuthRegistry {
     pub fn save(&self) {
         #[cfg(not(test))]
         {
-            if std::env::var_os("DONSEEK_NO_DISK_STATE").is_some() {
+            if crate::config::cfg().state.no_disk_state {
                 return;
             }
         }

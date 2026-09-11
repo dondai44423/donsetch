@@ -30,16 +30,14 @@ use crate::error::FetchError;
 use crate::profile::BrowserProfile;
 
 /// Pool size: default 3 warm slots. Env override
-/// `DONSETCH_GHOST_POOL_SLOTS` clamps to 1..=16; 0 falls back to the
+/// `browser.pool_slots` clamps to 1..=16; 0 falls back to the
 /// default (a zero-slot pool would disable the warm path entirely,
-/// which the kill switch owns); `DONSETCH_NO_GHOST_POOL` forces the
-/// legacy single-slot path.
+/// which the kill switch owns). The legacy `DONSETCH_NO_GHOST_POOL`
+/// kill switch maps to the same single-slot path through the config
+/// layer.
 fn pool_slots(default: usize) -> usize {
-    pool_size(
-        std::env::var_os("DONSETCH_NO_GHOST_POOL").is_some(),
-        std::env::var("DONSETCH_GHOST_POOL_SLOTS").ok().as_deref(),
-        default,
-    )
+    let n = crate::config::cfg().browser.pool_slots;
+    pool_size(n == 1, (n > 1).then(|| n.to_string()).as_deref(), default)
 }
 
 /// Sizing rule: kill switch > explicit > default; explicit clamps
@@ -192,7 +190,7 @@ impl GhostManager {
         // A forced headless backend does not need a virtual display. Avoid
         // starting Xvfb so the selection is explicit in both process and args.
         let (display, xvfb) = if super::cloak::headless_mode_requested() {
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!("[ghost] headless backend selected, skipping Xvfb");
             }
             (None, None)
@@ -200,7 +198,7 @@ impl GhostManager {
             match super::xvfb::Xvfb::start().await {
                 Ok(xvfb) => {
                     let disp = xvfb.display_env();
-                    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                    if crate::config::cfg().debug.ghost {
                         eprintln!("[ghost] Xvfb started on {disp}");
                     }
                     (Some(disp), Some(xvfb))
@@ -214,7 +212,7 @@ impl GhostManager {
             }
         } else if is_termux {
             // Termux: no Xvfb needed. Ghost uses --headless=new.
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!("[ghost] Termux detected, using headless mode (no Xvfb)");
             }
             (None, None)
@@ -305,7 +303,7 @@ impl GhostManager {
             Some(g) => !g.thaw(),
         };
         if need_launch {
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!("[pool] launch slot {} (thaw fail or empty)", idx);
             }
             if let Some(mut old) = guard.ghost.take() {
@@ -313,7 +311,7 @@ impl GhostManager {
             }
             guard.ghost = Some(Ghost::launch(profile, self.display.as_deref()).await?);
         } else {
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!("[pool] warm serve slot {}", idx);
             }
             // Warm slot served the job: pool receipt. The kill switch
@@ -364,7 +362,7 @@ impl GhostManager {
                 };
                 if g.is_frozen() {
                     if idle > REAP_AFTER {
-                        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                        if crate::config::cfg().debug.ghost {
                             eprintln!("[pool] reap slot {}", idx);
                         }
                         if let Some(mut dead) = guard.ghost.take() {

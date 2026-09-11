@@ -414,7 +414,7 @@ pub(super) async fn search_outcome(
                 return Ok(out);
             }
             Err(e) => {
-                if std::env::var_os("DONSEEK_DEBUG").is_some() {
+                if crate::config::cfg().debug.search {
                     eprintln!("[byok] all providers exhausted, falling back to local: {e}");
                 }
                 // Fall through to local search.
@@ -429,7 +429,7 @@ pub(super) async fn search_outcome(
             // Local failed : if BYOK is configured and we're in
             // local-first mode, try BYOK as a last resort.
             if byok_configured && local_first {
-                if std::env::var_os("DONSEEK_DEBUG").is_some() {
+                if crate::config::cfg().debug.search {
                     eprintln!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
                 match daemon.byok.search(query, max, intent).await {
@@ -499,7 +499,7 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
                 return; // not a known wall: the search prewarm covers it
             }
         }
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[pre-solve] kicking background solve for {} ({})",
                 host_str, url_str
@@ -544,7 +544,7 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
                 replay_ok,
             );
         }
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[pre-solve] done for {} in {}ms",
                 host_str,

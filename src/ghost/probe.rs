@@ -51,28 +51,27 @@ const PROBE_STALE_SECS: u64 = 6 * 3600;
 /// Test hooks for the live battery (seconds; the production
 /// defaults above apply when unset). Never documented for users.
 fn scan_interval() -> Duration {
-    std::env::var("DONSETCH_PROBE_SCAN_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(SCAN_INTERVAL_SECS_DUR)
+    let secs = crate::config::cfg().browser.probe_scan_secs;
+    if secs == 0 {
+        SCAN_INTERVAL_SECS_DUR
+    } else {
+        Duration::from_secs(secs)
+    }
 }
 
 fn probe_stale_secs() -> u64 {
-    std::env::var("DONSETCH_PROBE_STALE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(PROBE_STALE_SECS)
+    let secs = crate::config::cfg().browser.probe_stale_secs;
+    if secs == 0 { PROBE_STALE_SECS } else { secs }
 }
 
 /// Probing on/off, composed of the dedicated switch and the route
 /// memory switches (a read-only or disabled memory makes probing
 /// pointless).
 fn probes_enabled() -> bool {
-    !crate::config::env_flag("DONSETCH_NO_ROUTE_PROBES")
-        && !crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY")
-        && !crate::config::env_flag("DONSETCH_ROUTE_MEMORY_READONLY")
+    let c = crate::config::cfg();
+    c.browser.route_probes
+        && c.state.route_memory != crate::config::RouteMemory::Off
+        && c.state.route_memory != crate::config::RouteMemory::ReadOnly
 }
 
 /// Spawn the background prober. Daemon modes only: one-shot CLI

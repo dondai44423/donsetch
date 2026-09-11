@@ -80,17 +80,16 @@ pub fn ocr_cache_dir() -> PathBuf {
     crate::paths::cache_dir().join("ocr")
 }
 
-/// Master switch. Default ON (lazy); DONSHEET_OCR=off kills the tier.
+/// Master switch. Default ON (lazy); [fetch] ocr = false (legacy
+/// DONSHEET_OCR=off) kills the tier.
 pub fn enabled() -> bool {
-    !matches!(std::env::var("DONSHEET_OCR").as_deref(), Ok("off"))
+    crate::config::cfg().fetch.ocr
 }
 
 /// Max OCR pages per document (giant scans cost; the governor is budget).
 pub fn max_pages() -> usize {
-    std::env::var("DONSHEET_OCR_MAX_PAGES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(25)
+    let n = crate::config::cfg().fetch.ocr_max_pages;
+    if n == 0 { 25 } else { n as usize }
 }
 
 #[cfg(feature = "ocr")]

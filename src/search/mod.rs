@@ -595,13 +595,13 @@ impl Searcher {
                 .filter_map(|(_, r)| r.as_ref().ok())
                 .map(|(h, _, _, _)| h.len())
                 .sum::<usize>();
-        let force_lane = std::env::var_os("DONSEEK_FORCE_GHOST_LANE").is_some();
+        let force_lane = crate::config::cfg().search.ghost_lane == crate::config::GhostLane::Always;
         let google_http_ok = outcomes
             .iter()
             .chain(&retry_outcomes)
             .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
         let lane_permitted = self.ghost.is_some()
-            && std::env::var_os("DONSEEK_NO_GHOST_LANES").is_none()
+            && crate::config::cfg().search.ghost_lane != crate::config::GhostLane::Never
             && !self.quarantined("google_ghost");
         let lane_outcomes: Vec<(String, EngineResult)> = if lane_permitted
             && google_ghost_wanted(force_lane, google_http_ok, retry_ok, retry_hits)
@@ -754,7 +754,7 @@ impl Searcher {
         // SERP fragments. Bounded additive nudge, then re-sort.
         // DONSEEK_NO_TOPUP is the A/B kill switch for benching.
         #[cfg(feature = "rerank")]
-        if std::env::var_os("DONSEEK_NO_TOPUP").is_none() {
+        if crate::config::cfg().search.rerank_topup {
             let q = query.to_string();
             let mut owned = std::mem::take(&mut results);
             results = run_blocking_ranking(move || {

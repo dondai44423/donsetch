@@ -138,7 +138,7 @@ pub fn assemble(page: PageChars) -> PageLines {
     let mut cur_bl = f32::NAN;
     let mut cur_size = 0f32;
     // Tolerance: half the smaller font size, at least 1.5pt.
-    let peek = std::env::var("DONSHEET_DEBUG_CHARS").is_ok();
+    let peek = crate::config::cfg().debug.pdf_chars;
     for c in chars {
         if peek {
             eprintln!(
@@ -394,7 +394,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
 
     // Collapse runs of spaces and trim.
     let text = collapse_spaces(&text);
-    if std::env::var("DONSHEET_DEBUG_WORDS").is_ok() {
+    if crate::config::cfg().debug.pdf_words {
         eprintln!(
             "[words] {:?} -> {:?}",
             text,

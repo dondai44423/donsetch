@@ -65,6 +65,7 @@ impl Default for BypassConfig {
     }
 }
 
+#[allow(dead_code)]
 fn env_bool_off(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
@@ -76,45 +77,28 @@ fn env_bool_off(name: &str) -> bool {
 
 impl BypassConfig {
     pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-        if env_bool_off("DONSETCH_BYPASS") {
-            cfg.enabled = false;
+        // Historically this read nine env vars directly; the knobs now
+        // live in the layered config ([bypass] section). The clamps are
+        // defense-in-depth: config validation already fails loudly on
+        // out-of-range values.
+        let b = &crate::config::cfg().bypass;
+        Self {
+            enabled: b.enabled,
+            max_daily: b.max_daily.clamp(1, 10_000),
+            timeout: Duration::from_secs(b.timeout_secs.clamp(5, 600)),
+            render: b.render,
+            endpoint: if b.endpoint.trim().is_empty() {
+                PROD_ENDPOINT.to_string()
+            } else {
+                b.endpoint.trim().to_string()
+            },
+            cache_ttl: if !b.cache {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(b.cache_ttl_secs)
+            },
+            cache_max: b.cache_max_entries.clamp(1, 100_000),
         }
-        if let Ok(n) = std::env::var("DONSETCH_BYPASS_MAX_DAILY")
-            && let Ok(n) = n.trim().parse::<u32>()
-        {
-            cfg.max_daily = n.clamp(1, 10_000);
-        }
-        if let Ok(s) = std::env::var("DONSETCH_BYPASS_TIMEOUT_SECS")
-            && let Ok(s) = s.trim().parse::<u64>()
-        {
-            cfg.timeout = Duration::from_secs(s.clamp(5, 600));
-        }
-        if std::env::var("DONSETCH_BYPASS_RENDER").is_ok_and(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "on" | "yes")
-        }) {
-            cfg.render = true;
-        }
-        if let Ok(e) = std::env::var("DONSETCH_BYPASS_ENDPOINT")
-            && !e.trim().is_empty()
-        {
-            cfg.endpoint = e.trim().to_string();
-        }
-        if env_bool_off("DONSETCH_BYPASS_CACHE") {
-            cfg.cache_ttl = Duration::ZERO;
-        }
-        if let Ok(n) = std::env::var("DONSETCH_BYPASS_CACHE_TTL_SECS")
-            && let Ok(n) = n.trim().parse::<u64>()
-        {
-            cfg.cache_ttl = Duration::from_secs(n.clamp(0, 31_536_000));
-        }
-        if let Ok(n) = std::env::var("DONSETCH_BYPASS_CACHE_MAX_ENTRIES")
-            && let Ok(n) = n.trim().parse::<u32>()
-        {
-            cfg.cache_max = n.clamp(1, 100_000);
-        }
-        cfg
     }
 }
 
@@ -142,10 +126,14 @@ pub fn parse_key(raw: &str, default_zone: &str) -> Result<(String, String), Bypa
         }
         return Ok((token.to_string(), zone.to_string()));
     }
-    let zone = std::env::var("DONSETCH_UNLOCKER_ZONE")
-        .ok()
-        .filter(|z| !z.trim().is_empty())
-        .unwrap_or_else(|| default_zone.to_string());
+    let zone = {
+        let configured = crate::config::cfg().bypass.zone.trim().to_string();
+        if configured.is_empty() {
+            default_zone.to_string()
+        } else {
+            configured
+        }
+    };
     Ok((raw.trim().to_string(), zone))
 }
 

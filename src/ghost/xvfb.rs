@@ -28,10 +28,8 @@ mod linux {
     /// multi-daemon hosts (two sessions sharing :99 is supported,
     /// but separate displays are cheaper when both are hot).
     fn display_num() -> u8 {
-        std::env::var_os("DONSETCH_XVFB_DISPLAY")
-            .and_then(|v| v.to_string_lossy().parse::<u8>().ok())
-            .filter(|n| (1..=254).contains(n))
-            .unwrap_or(99)
+        let n = crate::config::cfg().browser.xvfb_display;
+        if (1..=254).contains(&n) { n as u8 } else { 99 }
     }
 
     /// Startup gate so two sessions racing for a shared display
@@ -221,7 +219,7 @@ mod linux {
                 )));
             }
 
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!("[ghost] Xvfb started on {display}");
             }
             Ok(Self {

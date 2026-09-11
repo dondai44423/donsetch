@@ -87,10 +87,11 @@ impl Searcher {
         const ENRICH_TOP: usize = 5;
         const ENRICH_TIMEOUT: Duration = Duration::from_secs(4);
 
-        // Kill switch (v4 phase 2.1): with DONSETCH_NO_PREWARM=1 no
-        // prewarm fetch ever goes on the wire, so servers see no
-        // burst at all. The honest-off state of the layer.
-        if crate::config::env_flag("DONSETCH_NO_PREWARM") {
+        // Kill switch (v4 phase 2.1): with prewarm disabled ([fetch]
+        // prewarm = false; historically DONSETCH_NO_PREWARM) no prewarm
+        // fetch ever goes on the wire, so servers see no burst at all.
+        // The honest-off state of the layer.
+        if !crate::config::cfg().fetch.prewarm {
             return;
         }
         let n = results.len().min(ENRICH_TOP);
@@ -229,7 +230,7 @@ impl Searcher {
     /// design (the provider's own ranking stands); parking is the
     /// point. Same kill switch as the inline pass.
     pub fn spawn_prewarm(self: &std::sync::Arc<Self>, results: &[Merged]) {
-        if results.is_empty() || crate::config::env_flag("DONSETCH_NO_PREWARM") {
+        if results.is_empty() || !crate::config::cfg().fetch.prewarm {
             return;
         }
         let mut owned = results.to_vec();

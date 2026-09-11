@@ -43,10 +43,16 @@ pub(crate) fn parse_key(key: &str) -> Result<(String, String), String> {
         }
         return Ok((token.to_string(), zone.to_string()));
     }
-    let zone = std::env::var("DONSETCH_BRIGHTDATA_ZONE")
-        .ok()
-        .filter(|z| !z.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_ZONE.to_string());
+    let configured = crate::config::cfg()
+        .search
+        .brightdata_zone
+        .trim()
+        .to_string();
+    let zone = if configured.is_empty() {
+        DEFAULT_ZONE.to_string()
+    } else {
+        configured
+    };
     Ok((key.trim().to_string(), zone))
 }
 

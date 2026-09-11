@@ -1498,7 +1498,7 @@ pub(super) async fn ghost_escalate(
             // CDP timeouts on first attempt are transient : the
             // browser was still warming up. Retry once before
             // conceding a permanent failure.
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!("[ghost_escalate] first attempt failed: {e}, retrying...");
             }
             ops::ghost_fetch(&mut g, url, std::time::Duration::from_secs(20))
@@ -1512,7 +1512,7 @@ pub(super) async fn ghost_escalate(
         &format!("captcha={} dom={}KB", page.captcha, page.html.len() / 1024),
         t1.elapsed().as_millis(),
     );
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         let safe: String = host
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '_' })

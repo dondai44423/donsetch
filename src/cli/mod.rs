@@ -41,10 +41,18 @@ pub fn init() {
 use std::io::IsTerminal;
 
 fn colours() -> bool {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
+    use crate::config::ColorMode;
+    match crate::config::cfg().cli.color {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        // Auto: honor NO_COLOR, then the tty check.
+        ColorMode::Auto => {
+            if std::env::var_os("NO_COLOR").is_some() {
+                return false;
+            }
+            std::io::stdout().is_terminal()
+        }
     }
-    std::io::stdout().is_terminal()
 }
 
 const GREEN: &str = "\x1b[32m";

@@ -810,7 +810,7 @@ where
                     } else {
                         m.b.atan2(m.a).to_degrees()
                     };
-                    if std::env::var("DONSHEET_DEBUG_MATRIX").is_ok() && i < 8 {
+                    if crate::config::cfg().debug.pdf_matrix && i < 8 {
                         eprintln!(
                             "[matrix] i={i} a={:.3} b={:.3} c={:.3} d={:.3} angle={angle:.1}",
                             m.a, m.b, m.c, m.d
@@ -911,7 +911,7 @@ where
                     None => Vec::new(),
                 },
             }));
-            if std::env::var("DONSHEET_DEBUG").is_ok() && pi % 50 == 0 {
+            if crate::config::cfg().debug.pdf && pi % 50 == 0 {
                 eprintln!("[engine] page {pi}/{page_count} done");
             }
         }

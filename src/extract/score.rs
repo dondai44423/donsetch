@@ -18,7 +18,7 @@ struct Stats {
 pub fn find_main<'a>(doc: &'a Html) -> Option<ElementRef<'a>> {
     let body = doc.select(&scraper::Selector::parse("body").ok()?).next()?;
     let (body_stats, best) = walk(body, 0);
-    if std::env::var_os("DONSIFT_DEBUG").is_some() {
+    if crate::config::cfg().debug.extract {
         eprintln!(
             "[donsift] body stats: text={} link={} punct={} paras={}",
             body_stats.text_len, body_stats.link_text_len, body_stats.punct, body_stats.paras

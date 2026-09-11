@@ -468,7 +468,7 @@ impl Crawler {
 
         // ── Frontier seeding ───────────────────────────────
         let mut queue = FrontierQueue::with_shaper(
-            opts.shape && !crate::config::env_flag("DONSETCH_NO_CRAWL_SHAPE"),
+            opts.shape && crate::config::cfg().fetch.crawl_shape,
             opts.shape_seed.unwrap_or_else(|| {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();

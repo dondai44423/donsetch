@@ -46,12 +46,12 @@ const BURST_CONCURRENCY: usize = 6;
 const MAX_FAILURES: usize = 3;
 
 fn deadline() -> std::time::Duration {
-    std::env::var("DONSETCH_SHADOW_DEADLINE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(BURST_DEADLINE)
+    let ms = crate::config::cfg().fetch.shadow_deadline_ms;
+    if ms == 0 {
+        BURST_DEADLINE
+    } else {
+        std::time::Duration::from_millis(ms)
+    }
 }
 
 /// Should this host get page-load realism? Route memory policy:
@@ -59,11 +59,10 @@ fn deadline() -> std::time::Duration {
 /// or mixed tier-1 history) marks the host defended enough to be
 /// worth the bytes. Open hosts stay fast and document-only.
 pub fn policy_shadows(state: &GhostState, host: &str) -> bool {
-    if crate::config::env_flag("DONSETCH_NO_SHADOW_FETCH") {
-        return false;
-    }
-    if crate::config::env_flag("DONSETCH_SHADOW_FETCH") {
-        return true;
+    match crate::config::cfg().fetch.shadow_fetch {
+        crate::config::ShadowFetch::Never => return false,
+        crate::config::ShadowFetch::Always => return true,
+        crate::config::ShadowFetch::Auto => {}
     }
     let Some(p) = state.profiles.get(host) else {
         return false;
