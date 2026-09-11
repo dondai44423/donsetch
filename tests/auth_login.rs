@@ -403,8 +403,17 @@ async fn probe_domain_does_not_panic_inside_a_tokio_runtime() {
 }
 
 /// Tier-1 jar echo hygiene (v4 phase 1.4, issue #173): the logout
-/// sweep owns every persisted copy. Two records, one matches the
-/// domain, one stays for another host.
+/// sweep owns every persisted copy. Two cookie records and two
+/// rendered pages, one of each matching the domain, one of each for
+/// another host. The rendered-DOM cache is a fourth copy of the
+/// session's fruit (a page fetched behind the session is stored
+/// whole in `renders`, RENDER_TTL = 5 min, and served by the tier-2
+/// fetch shortcut); a logout that leaves it hands back the logged-in
+/// DOM with no network hop for up to five minutes.
+///
+/// One test carries both echoes on purpose: the suite shares one
+/// on-disk state via the static cache dir, so a second concurrent
+/// writer would race the whole-file save under `cargo test`.
 #[test]
 fn logout_wipes_the_tier1_echo() {
     isolate_state();
@@ -418,6 +427,11 @@ fn logout_wipes_the_tier1_echo() {
             cookie(".alpha.test", "session_cookie", "a", None),
             cookie("beta.test", "other_cookie", "b", None),
         ]);
+        state.record_render(
+            "https://app.alpha.test/dashboard",
+            "<html><body>logged-in dashboard</body></html>",
+        );
+        state.record_render("https://beta.test/page", "<html>public</html>");
         state.save();
     }
     assert!(clear_session_cookies_for("alpha.test"));
@@ -435,5 +449,15 @@ fn logout_wipes_the_tier1_echo() {
     assert!(
         tiers.iter().any(|d| d.ends_with("beta.test")),
         "background housekeeping must keep unrelated domains"
+    );
+    assert!(
+        state
+            .render_for("https://app.alpha.test/dashboard")
+            .is_none(),
+        "the rendered DOM of a logged-out domain must not survive logout"
+    );
+    assert!(
+        state.render_for("https://beta.test/page").is_some(),
+        "logout must not evict renders of unrelated domains"
     );
 }
