@@ -52,10 +52,15 @@ pub fn profile_user_agent(id: Option<&str>) -> Option<&'static str> {
 }
 
 pub fn configured_user_agent() -> Option<&'static str> {
-    match std::env::var("DONSETCH_GOOGLE_PROFILE") {
-        Ok(id) => profile_user_agent(Some(&id)),
-        Err(std::env::VarError::NotPresent) => profile_user_agent(None),
-        Err(_) => None,
+    let id = crate::config::cfg()
+        .search
+        .google_profile
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        profile_user_agent(None)
+    } else {
+        profile_user_agent(Some(&id))
     }
 }
 

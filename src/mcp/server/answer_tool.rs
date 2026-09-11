@@ -51,7 +51,7 @@ pub(super) async fn answer_tool(
 ) -> Value {
     // Kill switch (law 6): honest-off state. tools/list hides the
     // tool too when this is set (see tools::list).
-    if crate::config::env_flag("DONSETCH_NO_ANSWER_TOOL") {
+    if !crate::config::cfg().mcp.answer_tool {
         return tool_error("answer: web_answer is disabled (DONSETCH_NO_ANSWER_TOOL)");
     }
     daemon.refresh_vault().await;

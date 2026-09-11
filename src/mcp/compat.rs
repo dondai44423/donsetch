@@ -118,7 +118,7 @@ pub fn mode_from_params(params: &Value) -> ClientMode {
 /// env flags): only an explicit true value turns it on; unset, empty,
 /// or any other value leaves the handshake in charge.
 pub fn env_override() -> Option<ClientMode> {
-    if crate::config::env_flag("DONSETCH_MCP_TEXT_ONLY") {
+    if crate::config::cfg().mcp.text_only {
         Some(ClientMode::TextOnly)
     } else {
         None
@@ -329,26 +329,30 @@ mod tests {
         assert_eq!(cell.get(), ClientMode::Default);
     }
 
-    // Env-var test: nextest isolates each test in its own process.
+    // Config is frozen at first touch (nextest runs one process per
+    // test), so each of these three arms is its own test with the env
+    // state in place BEFORE the first cfg() call.
     #[test]
-    fn env_override_forces_text_only_for_any_client() {
-        unsafe {
-            std::env::remove_var("DONSETCH_MCP_TEXT_ONLY");
-        }
+    fn text_only_override_off_by_default() {
         assert_eq!(env_override(), None);
+    }
+
+    #[test]
+    fn text_only_override_true_forces_the_fold() {
         unsafe {
             std::env::set_var("DONSETCH_MCP_TEXT_ONLY", "1");
         }
         assert_eq!(env_override(), Some(ClientMode::TextOnly));
         let cell = ModeCell::new();
         assert_eq!(effective(&cell), ClientMode::TextOnly);
+    }
+
+    #[test]
+    fn text_only_override_false_stays_off() {
         // =false must NOT enable it (fail-closed flag parse).
         unsafe {
             std::env::set_var("DONSETCH_MCP_TEXT_ONLY", "false");
         }
         assert_eq!(env_override(), None);
-        unsafe {
-            std::env::remove_var("DONSETCH_MCP_TEXT_ONLY");
-        }
     }
 }

@@ -56,7 +56,7 @@ pub fn classify(pages: &[PageLines], ordered_by_page: &[Vec<Line>], ctx: &FontCt
         }
         let fusion = pages[pi].fusion.as_ref();
         classify_page_fused(lines, ctx, n_pages > 1, &mut blocks, fusion);
-        if std::env::var("DONSHEET_DEBUG").is_ok() {
+        if crate::config::cfg().debug.pdf {
             eprintln!(
                 "[classify] page {pi}/{} done ({} blocks)",
                 n_pages,

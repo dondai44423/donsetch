@@ -71,7 +71,7 @@ pub fn has_model() -> bool {
 
 fn verify_bytes(body: &[u8], sha: &str, size: usize) -> bool {
     if body.len() != size {
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!("[memory] verify: len {} != {}", body.len(), size);
         }
         return false;
@@ -79,7 +79,7 @@ fn verify_bytes(body: &[u8], sha: &str, size: usize) -> bool {
     let mut h = Sha256::new();
     h.update(body);
     let hex: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         eprintln!("[memory] verify: got={} exp={}", hex, sha);
     }
     hex == sha
@@ -154,7 +154,7 @@ fn ensure_file(
         .recv()
         .map_err(|e| format!("memory: download recv for {what}: {e}"))??;
     #[cfg(feature = "rerank")]
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         let mut h = Sha256::new();
         h.update(&body);
         let debug_sha: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
@@ -226,7 +226,8 @@ pub fn ensure_loaded() -> Result<&'static Arc<Embedder>, String> {
 /// The kill switch: store ingest and store search are both disabled
 /// while the flag is present in the environment.
 pub fn kill_switch() -> bool {
-    std::env::var_os("DONSETCH_NO_WEB_MEMORY").is_some()
+    // True = memory DISABLED; the config field is enable-semantics.
+    !crate::config::cfg().state.web_memory
 }
 
 /// True when the model + tokenizer files are present AND the model

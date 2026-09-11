@@ -168,12 +168,13 @@ pub async fn run() {
 
     // v4 phase 0: route-memory visibility (the self-improvement
     // loop must be observable, never magic).
-    let route_line = if crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY") {
-        "off (DONSETCH_NO_ROUTE_MEMORY)".to_string()
+    let route_line = if crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off {
+        "off (state.route_memory = off)".to_string()
     } else {
         let state = crate::ghost::cache::GhostState::load();
         let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
-        let ro = if crate::config::env_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
+        let ro = if crate::config::cfg().state.route_memory == crate::config::RouteMemory::ReadOnly
+        {
             " · read-only"
         } else {
             ""

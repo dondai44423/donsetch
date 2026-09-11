@@ -68,7 +68,7 @@ pub fn is_ssrf_resolved_ip(ip: &IpAddr) -> bool {
 /// local services): DONSETCH_ALLOW_PRIVATE_EGRESS must be explicitly
 /// true to disable the SSRF guard chain end to end. Default off.
 pub(crate) fn private_egress_allowed() -> bool {
-    crate::config::env_flag("DONSETCH_ALLOW_PRIVATE_EGRESS")
+    crate::config::cfg().fetch.allow_private_egress
 }
 
 fn is_private_ip(ip: &IpAddr) -> bool {

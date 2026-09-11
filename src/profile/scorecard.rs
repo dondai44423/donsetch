@@ -73,7 +73,7 @@ pub async fn capture(fetcher: &Fetcher) -> Result<FingerprintSnapshot, String> {
     // Operator debug: when DONSETCH_DEBUG_ECHO=1 the RAW echo lands
     // in /tmp/ for offline diffing against the evergreen ghost
     // capture (/tmp/ghost-echo-blob.json). Off by default.
-    if crate::config::env_flag("DONSETCH_DEBUG_ECHO") {
+    if crate::config::cfg().debug.echo_scorecard {
         let _ = std::fs::write("/tmp/tier1-echo-raw.json", &out.body);
     }
     parse_echo(&out.body, fetcher.profile().name)

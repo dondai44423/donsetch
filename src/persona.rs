@@ -116,8 +116,13 @@ fn seed_for(host: &str, created_at: u64, generation: u32) -> u64 {
 /// Persona timezone: the operator's own TZ when sane, else UTC.
 /// (Phase 1 lets a declared proxy locale override per persona.)
 fn env_tz() -> String {
-    std::env::var("TZ")
-        .ok()
+    let configured = crate::config::cfg().persona.timezone.trim().to_string();
+    let candidate = if configured.is_empty() {
+        std::env::var("TZ").ok()
+    } else {
+        Some(configured)
+    };
+    candidate
         .map(|t| t.trim().to_string())
         .filter(|t| t.contains('/') && !t.contains(char::is_whitespace))
         .unwrap_or_else(|| "UTC".to_string())
@@ -125,17 +130,25 @@ fn env_tz() -> String {
 
 /// Persona locale: LANG/LC_ALL ("en_US.UTF-8" -> "en-US"), else en-US.
 fn env_locale() -> String {
+    let configured = crate::config::cfg().persona.locale.trim().to_string();
+    let mut sources = Vec::new();
+    if !configured.is_empty() {
+        sources.push(configured.clone());
+    }
     for var in ["LC_ALL", "LANG"] {
         if let Ok(v) = std::env::var(var) {
-            let base = v.split('.').next().unwrap_or("").replace('_', "-");
-            let mut parts = base.split('-');
-            let lang = parts.next().unwrap_or("");
-            if lang.len() >= 2 && lang.len() <= 3 && lang.chars().all(|c| c.is_ascii_lowercase()) {
-                return match parts.next() {
-                    Some(region) if !region.is_empty() => format!("{lang}-{region}"),
-                    _ => lang.to_string(),
-                };
-            }
+            sources.push(v);
+        }
+    }
+    for v in sources {
+        let base = v.split('.').next().unwrap_or("").replace('_', "-");
+        let mut parts = base.split('-');
+        let lang = parts.next().unwrap_or("");
+        if lang.len() >= 2 && lang.len() <= 3 && lang.chars().all(|c| c.is_ascii_lowercase()) {
+            return match parts.next() {
+                Some(region) if !region.is_empty() => format!("{lang}-{region}"),
+                _ => lang.to_string(),
+            };
         }
     }
     "en-US".to_string()

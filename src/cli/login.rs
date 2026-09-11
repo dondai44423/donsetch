@@ -156,7 +156,7 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
     let resolved = crate::ghost::resolve_browser_without_download()
         .map_err(|e| format!("no usable browser: {e} (run `donsetch doctor` for guidance)"))?;
     // A login needs a visible browser. Headless machines use --import.
-    if std::env::var_os("DONSETCH_LOGIN_FORCE").is_none() && !display_available() {
+    if !crate::config::cfg().browser.login_force && !display_available() {
         return Err(
             "no display available: interactive login needs a visible browser. \
              On servers use `donsetch login --import cookies.txt [domain]` instead."

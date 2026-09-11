@@ -378,6 +378,9 @@ fn probe_registry() -> Option<(u32, bool)> {
     ];
     // Sort DONGHOST_CHROME's family to the front if it doesn't already
     // lead : cheap, and makes the explicit choice authoritative.
+    if !crate::config::cfg().browser.chromium_path.is_empty() {
+        return Some(PathBuf::from(&crate::config::cfg().browser.chromium_path));
+    }
     if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
         let p = p.to_string_lossy().to_lowercase();
         for (family, key, branded) in [

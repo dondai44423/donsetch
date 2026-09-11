@@ -26,7 +26,6 @@ use crate::extract::metadata::Meta;
 pub use engine::{LoadError, OutlineItem};
 
 /// Hard input ceiling (server-side fetched PDFs can be huge).
-const DEFAULT_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum PdfFailure {
@@ -114,11 +113,9 @@ fn pdf_date(raw: &Option<String>) -> Option<String> {
 
 /// Parse `bytes` into DonSift blocks with full honesty flags.
 pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
-    let limit = std::env::var("DONSETCH_PDF_MAX_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(DEFAULT_MAX_BYTES);
+    // [fetch] pdf_max_mb (legacy DONSETCH_PDF_MAX_MB); validation
+    // enforces 1..=4096 at load, so this is always >= 1 MB.
+    let limit = crate::config::cfg().fetch.pdf_max_mb * 1024 * 1024;
     if bytes.len() > limit {
         return Err(PdfFailure::TooLarge(bytes.len()));
     }
@@ -292,7 +289,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
     let mut decided_hint: Option<&'static str> = None;
     // Per-page OCR confidence for PageMeta (final-text trust).
     let mut ocr_page_conf: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-    if std::env::var("DONSHEET_DEBUG").is_ok() {
+    if crate::config::cfg().debug.pdf {
         eprintln!(
             "[ocr] candidates: {:?} (enabled={})",
             needs_ocr,
@@ -314,11 +311,11 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                             // First page of a cascaded doc locks the winner.
                             if decided_hint.is_none() {
                                 decided_hint = Some(kind);
-                                if std::env::var("DONSHEET_DEBUG").is_ok() {
+                                if crate::config::cfg().debug.pdf {
                                     eprintln!("[ocr] recognizer locked: {kind}");
                                 }
                             }
-                            if std::env::var("DONSHEET_DEBUG").is_ok() {
+                            if crate::config::cfg().debug.pdf {
                                 eprintln!(
                                     "[ocr] page {pi}: {} lines in {:?}",
                                     olines.len(),
@@ -341,7 +338,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                             ocr_pages += 1;
                         }
                         Ok((_olines, _kind)) => {
-                            if std::env::var("DONSHEET_DEBUG").is_ok() {
+                            if crate::config::cfg().debug.pdf {
                                 eprintln!(
                                     "[ocr] page {pi}: zero usable lines in {:?}",
                                     t0.elapsed()
@@ -350,7 +347,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                         }
                         Err(e) => {
                             ocr_failed = true;
-                            if std::env::var("DONSHEET_DEBUG").is_ok() {
+                            if crate::config::cfg().debug.pdf {
                                 eprintln!("[ocr] page {pi} failed: {e}");
                             }
                             break;
@@ -359,7 +356,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
                 }
             }
             Err(e) => {
-                if std::env::var("DONSHEET_DEBUG").is_ok() {
+                if crate::config::cfg().debug.pdf {
                     eprintln!("[ocr] rasterize_pages failed: {e:?}");
                 }
             }
@@ -437,7 +434,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
 
     // Reading order per page. Vertical/rotated pages are an honest
     // flagged lane (best-effort; no column reconstruction in v1).
-    let dbg = std::env::var("DONSHEET_DEBUG").is_ok();
+    let dbg = crate::config::cfg().debug.pdf;
     if dbg {
         eprintln!("[parse] reading order start: {} pages", pages.len());
     }

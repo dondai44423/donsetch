@@ -67,7 +67,7 @@ pub fn list() -> Value {
 
 /// Kill-switch visibility: a disabled tool is not advertised at all.
 fn tool_visible(name: &str) -> bool {
-    if name == "web_answer" && crate::config::env_flag("DONSETCH_NO_ANSWER_TOOL") {
+    if name == "web_answer" && !crate::config::cfg().mcp.answer_tool {
         return false;
     }
     #[cfg(feature = "rerank")]

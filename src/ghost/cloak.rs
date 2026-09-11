@@ -20,7 +20,6 @@ use tar::Archive;
 const CLOAK_REPOSITORY: &str = "CloakHQ/CloakBrowser";
 const CLOAK_VERSION: &str = "146.0.7680.177.5";
 const CLOAK_SIGNING_KEY: &str = "MKFKwIhUcKWq5xTuNA0Ovg99njcDEcEJvmWYYhApvaU=";
-const CLOAK_DOWNLOAD_OPT_IN: &str = "DONSETCH_CLOAK_AUTO_DOWNLOAD";
 const DOWNLOAD_ATTEMPTS: u8 = 3;
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -44,6 +43,9 @@ impl BrowserBackend {
     }
 }
 
+// Production reads [browser] backend through config; this parser stays
+// for the backend-string tests and documentation.
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_backend(value: Option<&str>) -> Result<Option<BrowserBackend>, String> {
     match value {
         None | Some("") | Some("auto") => Ok(None),
@@ -60,10 +62,20 @@ fn parse_backend(value: Option<&str>) -> Result<Option<BrowserBackend>, String> 
 /// Invalid values return false here; `resolve_browser` reports the configuration
 /// error when the browser is actually acquired.
 pub fn headless_mode_requested() -> bool {
-    let requested = std::env::var_os("DONSETCH_BROWSER_BACKEND")
-        .or_else(|| std::env::var_os("DONGHOST_BROWSER_BACKEND"))
-        .map(|v| v.to_string_lossy().trim().to_ascii_lowercase());
-    parse_backend(requested.as_deref()).ok().flatten() == Some(BrowserBackend::HeadlessChromium)
+    config_backend() == Some(BrowserBackend::HeadlessChromium)
+}
+
+/// The configured backend ([browser] backend, historically
+/// DONSETCH_BROWSER_BACKEND / DONGHOST_BROWSER_BACKEND), mapped to the
+/// internal backend enum. Auto (and unknown values, which fail config
+/// validation) = no forcing.
+fn config_backend() -> Option<BrowserBackend> {
+    match crate::config::cfg().browser.backend {
+        crate::config::BrowserBackend::Auto => None,
+        crate::config::BrowserBackend::Chromium => Some(BrowserBackend::Chromium),
+        crate::config::BrowserBackend::Headless => Some(BrowserBackend::HeadlessChromium),
+        crate::config::BrowserBackend::Cloak => Some(BrowserBackend::CloakBrowser),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -104,10 +116,7 @@ pub fn resolve_browser_without_download() -> Result<BrowserResolution, String> {
 }
 
 fn resolve_browser_with_download(allow_download: bool) -> Result<BrowserResolution, String> {
-    let requested = std::env::var_os("DONSETCH_BROWSER_BACKEND")
-        .or_else(|| std::env::var_os("DONGHOST_BROWSER_BACKEND"))
-        .map(|v| v.to_string_lossy().trim().to_ascii_lowercase());
-    let backend = parse_backend(requested.as_deref())?;
+    let backend = config_backend();
 
     if backend == Some(BrowserBackend::CloakBrowser) {
         return resolve_cloak(allow_download);
@@ -135,7 +144,7 @@ fn resolve_browser_with_download(allow_download: bool) -> Result<BrowserResoluti
 fn resolve_chromium(backend: BrowserBackend) -> Result<BrowserResolution, String> {
     let path = super::chromium_binary()?;
     let version = crate::profile::probe_version_string_at_path(&path);
-    let source = if std::env::var_os("DONGHOST_CHROME").is_some() {
+    let source = if !crate::config::cfg().browser.chromium_path.is_empty() {
         "explicit"
     } else {
         "system"
@@ -149,20 +158,27 @@ fn resolve_chromium(backend: BrowserBackend) -> Result<BrowserResolution, String
 }
 
 fn resolve_cloak(allow_download: bool) -> Result<BrowserResolution, String> {
-    let (path, source) = if let Some(raw) = std::env::var_os("CLOAKBROWSER_BINARY_PATH") {
-        let path = PathBuf::from(raw);
-        validate_binary(&path)
-            .map_err(|e| format!("CLOAKBROWSER_BINARY_PATH `{}` invalid: {e}", path.display()))?;
+    let configured_cloak_path = crate::config::cfg().browser.cloak_path.trim().to_string();
+    let (path, source) = if !configured_cloak_path.is_empty() {
+        let path = PathBuf::from(&configured_cloak_path);
+        validate_binary(&path).map_err(|e| {
+            format!(
+                "[browser] cloak_path `{}` invalid (legacy env CLOAKBROWSER_BINARY_PATH): {e}",
+                path.display()
+            )
+        })?;
         (path, "explicit")
     } else {
         let requested = requested_version()?;
         if let Some(path) = cached_binary(&requested) {
             (path, "cache")
         } else if !allow_download || !auto_download_enabled() {
-            return Err(format!(
-                "CloakBrowser binary not found; set CLOAKBROWSER_BINARY_PATH or {}=1 to download the signed public binary",
-                CLOAK_DOWNLOAD_OPT_IN
-            ));
+            return Err(
+                "CloakBrowser binary not found; set browser.cloak_path (legacy env \
+                 CLOAKBROWSER_BINARY_PATH) or browser.cloak_auto_download (legacy \
+                 DONSETCH_CLOAK_AUTO_DOWNLOAD=1) to download the signed public binary"
+                    .into(),
+            );
         } else {
             (install_public_binary()?, "downloaded")
         }
@@ -177,7 +193,9 @@ fn resolve_cloak(allow_download: bool) -> Result<BrowserResolution, String> {
 }
 
 fn auto_download_enabled() -> bool {
-    std::env::var_os(CLOAK_DOWNLOAD_OPT_IN).is_some_and(|v| v == "1")
+    // [browser] cloak_auto_download = true; the legacy
+    // DONSETCH_CLOAK_AUTO_DOWNLOAD=1 opt-in maps through the config layer.
+    crate::config::cfg().browser.cloak_auto_download
 }
 
 fn validate_binary(path: &Path) -> Result<(), String> {
@@ -204,21 +222,28 @@ fn platform_tag() -> Result<&'static str, String> {
         ("linux", "x86_64") => Ok("linux-x64"),
         ("windows", "x86_64") => Ok("windows-x64"),
         (os, arch) => Err(format!(
-            "no public CloakBrowser binary for {os} {arch}; set CLOAKBROWSER_BINARY_PATH"
+            "no public CloakBrowser binary for {os} {arch}; set browser.cloak_path \
+             (legacy env CLOAKBROWSER_BINARY_PATH)"
         )),
     }
 }
 
 fn requested_version() -> Result<String, String> {
-    let Some(raw) = std::env::var_os("CLOAKBROWSER_VERSION") else {
+    let pinned = crate::config::cfg()
+        .browser
+        .cloak_version
+        .trim()
+        .to_string();
+    if pinned.is_empty() {
         return Ok(CLOAK_VERSION.into());
-    };
-    let value = raw.to_string_lossy().trim().to_string();
+    }
+    let value = pinned;
     if valid_version(&value) {
         Ok(value)
     } else {
         Err(format!(
-            "invalid CLOAKBROWSER_VERSION `{value}`; expected a full numeric version"
+            "invalid browser.cloak_version `{value}` (legacy env CLOAKBROWSER_VERSION); \
+             expected a full numeric version"
         ))
     }
 }
@@ -231,10 +256,15 @@ fn valid_version(value: &str) -> bool {
 }
 
 fn cache_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("CLOAKBROWSER_CACHE_DIR") {
-        PathBuf::from(path)
-    } else {
+    let configured = crate::config::cfg()
+        .browser
+        .cloak_cache_dir
+        .trim()
+        .to_string();
+    if configured.is_empty() {
         crate::paths::cache_dir().join("cloakbrowser")
+    } else {
+        PathBuf::from(configured)
     }
 }
 

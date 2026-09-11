@@ -267,8 +267,7 @@ impl Fetcher {
         // and crawl (many pages, same host) where rate limits bite.
 
         loop {
-            let env_proxy = if proxy.is_none() && !crate::config::env_flag("DONSETCH_NO_ENV_PROXY")
-            {
+            let env_proxy = if proxy.is_none() && crate::config::cfg().proxy.from_environment {
                 crate::transport::proxy::from_env_for(&current)
             } else {
                 None
@@ -612,8 +611,7 @@ impl Fetcher {
         // alt-svc that fails vanishes until a header re-vouches).
         if is_https
             && proxy.is_none()
-            && !crate::config::env_flag("DONSETCH_NO_H3")
-            && crate::config::env_flag("DONSETCH_H3")
+            && crate::config::cfg().fetch.h3
             && let Some(h3port) = crate::transport::routes::h3_route(&origin, "direct")
         {
             match crate::transport::h3::h3_fetch_direct(

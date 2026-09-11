@@ -100,7 +100,7 @@ fn path() -> PathBuf {
 /// resolution (is_handle returns false, so resolve_fetch_url
 /// refuses handles). Default: on.
 pub fn handles_enabled() -> bool {
-    !matches!(std::env::var("DONSETCH_URL_HANDLES").as_deref(), Ok("off"))
+    crate::config::cfg().mcp.url_handles
 }
 
 /// Generate a random, unguessable handle ID: prefix + 8 base62 chars

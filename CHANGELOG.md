@@ -10,12 +10,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 V4 work in progress on `master`. Nothing below ships through a release
 channel until the v4.0.0 release train.
 
+### Changed
+- Every runtime env read now flows through the typed config. The old
+  env names keep their exact historical trigger semantics and still
+  work, but they are deprecated and will be removed at the v4
+  release; `donsetch doctor` lists the ones your shell still sets and
+  maps each to its config key.
+
 ### Added
 - `just win-check`: type-checks the crate for `x86_64-pc-windows-gnu`
   from Linux (clippy, no linkage), both `--no-default-features` and
   the full feature set, so `#[cfg(windows)]` breakage from a
   Linux-only change surfaces before the push instead of in Windows
   CI. Needs mingw-w64; see CONTRIBUTING.md.
+- One typed runtime config (`src/config.rs`, issue #193): every knob
+  lives in a layered struct, defaults < `donsetch.toml`
+  (`DONSETCH_CONFIG` or `<config-dir>/donsetch/donsetch.toml`,
+  skippable via `DONSETCH_NO_CONFIG_FILE=1`) < `DONSETCH_<SECTION>__<KEY>`
+  env names. Values validate loudly at load; unknown TOML keys name
+  the offending file. `donsetch config show` prints each knob with
+  its value and origin (`--markdown` for the reference table,
+  `--legacy` for the old-name map); `donsetch doctor` warns about
+  deprecated env names active in the shell.
 - `web_screenshot` MCP tool: a rendered PNG of a page through the
   existing tier-2 browser (url, full_page, wait_ms). The capture is
   in-process only; the MCP result carries an image content block and

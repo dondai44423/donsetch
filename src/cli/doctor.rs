@@ -183,6 +183,26 @@ pub async fn run() {
     // 16. MCP client registration (detect + print blocks).
     print_mcp_section();
 
+    // 17. Legacy env vars (the pre-v4 names): still honored, but
+    // each one active in this shell gets ONE warning naming its
+    // config key. Cut at the v4 release.
+    let legacy: Vec<&'static str> = crate::config::legacy_vars_in_env();
+    if legacy.is_empty() {
+        report!("Legacy env vars", CheckResult::Pass("none set".to_string()));
+    } else {
+        let names: Vec<String> = legacy
+            .iter()
+            .map(|name| {
+                let (section, key) = crate::config::legacy_target_of(name);
+                format!("{name} -> {section}.{key}")
+            })
+            .collect();
+        report!(
+            "Legacy env vars",
+            CheckResult::Warn(format!("{} (deprecated, cut at v4)", names.join(", ")))
+        );
+    }
+
     // ── Self-healing pass (--fix) ───────────────────────────
     if fix {
         println!();
@@ -283,7 +303,7 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
 /// and the two certificate stores the connector builds from.
 /// Local-only: no network, stays in fast mode.
 fn check_fetch_egress() -> CheckResult {
-    let kill = crate::config::env_flag("DONSETCH_NO_ENV_PROXY");
+    let kill = !crate::config::cfg().proxy.from_environment;
     let resolved = if kill {
         None
     } else {
@@ -297,7 +317,8 @@ fn check_fetch_egress() -> CheckResult {
         bits.push(format!("egress via {} proxy {}:{} (env; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port));
     } else {
         bits.push(if kill {
-            "direct egress (DONSETCH_NO_ENV_PROXY=1 disables the env-proxy convention)".into()
+            "direct egress (proxy.from_environment = false disables the env-proxy convention)"
+                .into()
         } else {
             "direct egress (no proxy env vars; export HTTPS_PROXY/HTTP_PROXY to route fetches)"
                 .into()
@@ -800,7 +821,7 @@ fn check_ocr_models() -> CheckResult {
     #[cfg(feature = "ocr")]
     {
         if !crate::pdf::ocr::enabled() {
-            return CheckResult::Warn("disabled (DONSHEET_OCR=off)".into());
+            return CheckResult::Warn("disabled (fetch.ocr = false)".into());
         }
 
         let dir = crate::pdf::ocr::ocr_cache_dir();

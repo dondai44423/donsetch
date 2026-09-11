@@ -153,7 +153,7 @@ pub fn default_chrome_args(
 /// Whether sandbox is disabled via explicit opt-in.
 /// Used for testing that default launch is safe.
 pub fn sandbox_opt_in_enabled() -> bool {
-    std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1")
+    crate::config::cfg().browser.no_sandbox
 }
 
 /// Resolve the Chromium-family binary used by DonGhost.
@@ -180,6 +180,9 @@ pub fn chrome_binary() -> Result<String, FetchError> {
 }
 
 fn chromium_binary() -> Result<String, String> {
+    if !crate::config::cfg().browser.chromium_path.is_empty() {
+        return Ok(crate::config::cfg().browser.chromium_path.clone());
+    }
     if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
         let path = PathBuf::from(p);
         if !is_executable(&path) {
@@ -639,7 +642,7 @@ impl Ghost {
         // unavailable (e.g. containers without user-namespace support
         // or AppArmor restrictions). Never enabled by default :
         // requires explicit env var and prints a loud warning.
-        if std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1") {
+        if crate::config::cfg().browser.no_sandbox {
             eprintln!(
                 "[ghost] WARNING: DONGHOST_NO_SANDBOX=1 : launching Chrome with --no-sandbox and --disable-setuid-sandbox. This disables the Chromium sandbox and is UNSAFE. Only use in isolated containers."
             );
@@ -2024,19 +2027,10 @@ mod sandbox_tests {
     }
 
     #[test]
-    fn sandbox_opt_in_requires_explicit_env() {
-        // Ensure default is safe without env var.
-        // Save and restore to avoid flakiness.
-        let prev = std::env::var_os("DONGHOST_NO_SANDBOX");
-        unsafe { std::env::remove_var("DONGHOST_NO_SANDBOX") };
+    fn sandbox_opt_in_is_config_driven() {
+        // The env mapping (DONGHOST_NO_SANDBOX=1) is covered by the
+        // config-layer tests; here only the runtime default contract.
         assert!(!sandbox_opt_in_enabled());
-        unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", "1") };
-        assert!(sandbox_opt_in_enabled());
-        unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", "0") };
-        assert!(!sandbox_opt_in_enabled());
-        match prev {
-            Some(v) => unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", v) },
-            None => unsafe { std::env::remove_var("DONGHOST_NO_SANDBOX") },
-        }
+        assert!(!crate::config::DonsetchConfig::default().browser.no_sandbox);
     }
 }
