@@ -335,19 +335,19 @@
       "name": "web_memory"
     },
     {
-      "description": "Open a URL in a real (headless) browser and return the rendered page as a PNG. Needs a browser on the machine and a URL; full_page optionally captures beyond the viewport, wait_ms adds post-load settle time (max 5000). The URL must pass the usual safety guards.",
+      "description": "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height; wait_ms adds settle time after load (max 5000, default 600). Private/loopback URLs are blocked like web_fetch.",
       "inputSchema": {
         "properties": {
           "full_page": {
-            "description": "Capture the full scrollable page, not just the viewport.",
+            "description": "Capture the full page height, not just the viewport.",
             "type": "boolean"
           },
           "url": {
-            "description": "The full URL to open in the browser and capture as PNG.",
+            "description": "The URL to capture.",
             "type": "string"
           },
           "wait_ms": {
-            "description": "Extra settle time in ms after the page loads, max 5000. Default 600.",
+            "description": "Extra milliseconds to wait after load, max 5000.",
             "type": "integer"
           }
         },

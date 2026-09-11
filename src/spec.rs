@@ -581,7 +581,7 @@ const SCREENSHOT_PARAMS: &[ParamSpec] = &[
         cli: CliKind::PositionalJoined,
         required: true,
         help: "Page to render and capture.",
-        mcp_help: Some("The full URL to open in the browser and capture as PNG."),
+        mcp_help: Some("The URL to capture."),
     },
     ParamSpec {
         name: "full_page",
@@ -590,7 +590,7 @@ const SCREENSHOT_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "Capture the full scrollable page, not just the viewport.",
-        mcp_help: None,
+        mcp_help: Some("Capture the full page height, not just the viewport."),
     },
     ParamSpec {
         name: "wait_ms",
@@ -599,7 +599,7 @@ const SCREENSHOT_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "Extra settle time after load, up to 5000 ms. Default 600.",
-        mcp_help: Some("Extra settle time in ms after the page loads, max 5000. Default 600."),
+        mcp_help: Some("Extra milliseconds to wait after load, max 5000."),
     },
 ];
 
@@ -677,7 +677,7 @@ pub static TOOLS: &[ToolSpec] = &[
         cli_cmd: "screenshot",
         summary: "Open a URL in a real browser, return the page as PNG",
         description: "A rendered PNG of a page: DonSeTch opens the URL in the same tier-2 browser it already keeps for challenge walls, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport.",
-        mcp_description: "Open a URL in a real (headless) browser and return the rendered page as a PNG. Needs a browser on the machine and a URL; full_page optionally captures beyond the viewport, wait_ms adds post-load settle time (max 5000). The URL must pass the usual safety guards.",
+        mcp_description: "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height; wait_ms adds settle time after load (max 5000, default 600). Private/loopback URLs are blocked like web_fetch.",
         params: SCREENSHOT_PARAMS,
         examples: &[
             "donsetch screenshot https://example.com",
