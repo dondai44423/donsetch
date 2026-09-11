@@ -95,7 +95,7 @@ async fn main() {
 
     match cmd {
         // ── Agent tools (spec-driven, shared core, clap-parsed) ──
-        "fetch" | "search" | "answer" | "crawl" | "memory" | "screenshot" => {
+        "fetch" | "search" | "crawl" | "screenshot" => {
             let code = cli::tool::run(cmd, &args[2..]).await;
             std::process::exit(code as i32);
         }

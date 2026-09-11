@@ -93,17 +93,8 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
                 .matches_fingerprint(url, fp)
         }));
     }
-    // Local web memory rows for this crawl: pages pile up in a
-    // bounded batch (chunked flush at 256) and land on the blocking
-    // pool after the run, so the response never carries the memory
-    // bill (issue #178).
-    #[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-    let mem_rows: Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
     {
         let hist = Arc::clone(&daemon.history);
-        #[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
-        let mem_rows = Arc::clone(&mem_rows);
         opts.on_page = Some(Arc::new(
             move |url: &str, fp: Option<&str>, md: &str, title: Option<&str>| {
                 if let Some(fp) = fp {
@@ -111,21 +102,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     h.record(url, fp, md.len(), title, md);
-                }
-                // The crawl's page lands in the local web memory too.
-                #[cfg(feature = "rerank")]
-                if !crate::memory::kill_switch() {
-                    let mut rows = mem_rows
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    rows.push((
-                        url.to_string(),
-                        title.unwrap_or("").to_string(),
-                        md.to_string(),
-                    ));
-                    if rows.len() >= 256 {
-                        crate::memory::ingest_async(std::mem::take(&mut *rows));
-                    }
                 }
             },
         ));
@@ -188,16 +164,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .flush();
-            // Remaining web-memory pages from a short crawl that
-            // never reached the 256-row chunk flush.
-            #[cfg(feature = "rerank")]
-            {
-                let batch: Vec<(String, String, String)> = mem_rows
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                crate::memory::ingest_async(batch);
-            }
             r
         }
         Err(e) => {

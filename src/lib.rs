@@ -31,7 +31,6 @@ pub mod fetch;
 pub mod ghost;
 pub mod handles;
 pub mod mcp;
-pub mod memory;
 pub mod onnx;
 pub mod pages;
 pub mod paths;

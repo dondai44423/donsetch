@@ -201,9 +201,6 @@ pub async fn run() {
             if state.pool_served_total > 0 {
                 line.push_str(&format!(" · {} warm", state.pool_served_total));
             }
-            if state.answered_packs_total > 0 {
-                line.push_str(&format!(" · {} answered", state.answered_packs_total));
-            }
             if cooldowns > 0 {
                 line.push_str(&format!(" · {cooldowns} in cooldown"));
             }
@@ -215,20 +212,6 @@ pub async fn run() {
         }
     };
     cli::print_kv("route memory", &route_line);
-    // v4 phase 5.2: local web memory receipt. status for every
-    // subsystem, kill switch honored, non-rerank build says so.
-    #[cfg(not(feature = "rerank"))]
-    let mem_line = "unavailable (this build lacks the rerank feature)".to_string();
-    #[cfg(feature = "rerank")]
-    let mem_line = if crate::memory::kill_switch() {
-        "off (DONSETCH_NO_WEB_MEMORY)".to_string()
-    } else {
-        match crate::memory::rows() {
-            0 => "empty; ingests from fetch/search/crawl".to_string(),
-            rows => format!("{rows} rows · cap {}", crate::memory::cap()),
-        }
-    };
-    cli::print_kv("web memory", &mem_line);
     cli::print_kv(
         "deep fingerprint",
         "not probed (run `donsetch doctor --deep`)",

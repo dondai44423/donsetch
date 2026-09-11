@@ -47,34 +47,22 @@ pub fn instructions() -> String {
     // session whether or not we are used : keep it short.
     // tests/token_invariants.rs gates the size.
     format!(
-        "Web access: fetch, search, answer, crawl : pages, questions, or whole sites.\
+        "Web access: fetch, search, crawl : pages, or whole sites.\
         \n\n{tools}\n\n\
         Output is the page's own markdown : full wording, code blocks and tables preserved."
     )
 }
 
-/// tools/list payload : generated from the spec table. web_answer
-/// disappears when its kill switch is on (law 6: honest-off state).
+/// tools/list payload : generated straight from the spec table. No
+/// tool is config-gated: the surface is small and each tool earned
+/// its place.
 pub fn list() -> Value {
     json!({
         "tools": crate::spec::TOOLS
             .iter()
-            .filter(|tool| tool_visible(tool.name))
             .map(crate::spec::mcp_schema)
             .collect::<Vec<_>>()
     })
-}
-
-/// Kill-switch visibility: a disabled tool is not advertised at all.
-fn tool_visible(name: &str) -> bool {
-    if name == "web_answer" && !crate::config::cfg().mcp.answer_tool {
-        return false;
-    }
-    #[cfg(feature = "rerank")]
-    if name == "web_memory" && crate::memory::kill_switch() {
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]

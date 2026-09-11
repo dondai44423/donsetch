@@ -204,34 +204,6 @@
       "name": "web_search"
     },
     {
-      "description": "Factual question -> cited evidence in one call: searches the web, reads top pages, returns verbatim passages tied to source URLs with freshness stamps. No prose answer invented; you synthesize. Dead/walled pages are skipped and reported.",
-      "inputSchema": {
-        "properties": {
-          "budget_tokens": {
-            "description": "Token budget for the whole evidence pack (200-8000, default 2000).",
-            "type": "integer"
-          },
-          "deadline_ms": {
-            "description": "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang.",
-            "type": "integer"
-          },
-          "max_pages": {
-            "description": "Max pages to read evidence from (1-5, default 3).",
-            "type": "integer"
-          },
-          "query": {
-            "description": "Factual question to collect cited evidence for.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "query"
-        ],
-        "type": "object"
-      },
-      "name": "web_answer"
-    },
-    {
       "description": "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs. dataset=true returns JSONL (one object per page).",
       "inputSchema": {
         "properties": {
@@ -313,26 +285,6 @@
         "type": "object"
       },
       "name": "web_crawl"
-    },
-    {
-      "description": "Search pages this machine fetched before with a natural-language query. Results come from a bounded local index that DonSeTch maintains itself; the model runs on-device. Ranked hits (url, title, snippet, score). To read beyond the snippet fetch the URL with web_fetch.",
-      "inputSchema": {
-        "properties": {
-          "limit": {
-            "description": "Maximum hits to return, 1..=50. Default 6.",
-            "type": "integer"
-          },
-          "query": {
-            "description": "Natural-language query over the local page memory. Describe what you are looking for; hits come from pages this machine fetched before.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "query"
-        ],
-        "type": "object"
-      },
-      "name": "web_memory"
     },
     {
       "description": "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height; wait_ms adds settle time after load (max 5000, default 600). Private/loopback URLs are blocked like web_fetch.",
