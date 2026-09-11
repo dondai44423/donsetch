@@ -13,6 +13,7 @@
 //! the previous file intact.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -114,10 +115,29 @@ fn persist(entries: &[Entry]) -> Result<(), String> {
         entries: entries.to_vec(),
     };
     let body = serde_json::to_vec(&idx).map_err(|e| format!("memory: serialize: {e}"))?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let tmp = stage_path(&path);
     std::fs::write(&tmp, &body).map_err(|e| format!("memory: write: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("memory: rename: {e}"))?;
     Ok(())
+}
+
+/// A staging path unique to this write. The tmp was keyed on the PID
+/// alone, which was fine while ingest ran inline in the request task.
+/// ingest_async (issue #178) now hands every ingest to the blocking
+/// pool, and a single crawl fires it per 256-row chunk AND again on
+/// completion, so persists overlap: two writers opening one shared
+/// tmp with O_TRUNC truncate and interleave one inode, a rename moves
+/// the torn bytes into place, and the next load() parse-fails to an
+/// empty index (the whole recall cache silently wiped). A per-write
+/// suffix gives each persist its own inode; the rename is atomic, so
+/// index.json is always a complete file from some writer. PID stays
+/// in the name so a second process still never collides either.
+/// (PR #191, adopted; the companion test got the cache-dir isolation
+/// the author's SAFETY note claimed but nextest.toml does not provide.)
+fn stage_path(path: &std::path::Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{}.{}.tmp", std::process::id(), n))
 }
 
 fn store() -> &'static Mutex<Vec<Entry>> {
