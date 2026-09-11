@@ -180,14 +180,14 @@ pub fn chrome_binary() -> Result<String, FetchError> {
 }
 
 fn chromium_binary() -> Result<String, String> {
-    if !crate::config::cfg().browser.chromium_path.is_empty() {
-        return Ok(crate::config::cfg().browser.chromium_path.clone());
-    }
-    if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        let path = PathBuf::from(p);
+    // `browser.chromium_path` already layers the legacy DONGHOST_CHROME
+    // env var, so the config value is the single explicit source here.
+    let configured = &crate::config::cfg().browser.chromium_path;
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
         if !is_executable(&path) {
             return Err(format!(
-                "DONGHOST_CHROME is not an executable: {}",
+                "browser.chromium_path (legacy DONGHOST_CHROME) is not an executable: {}",
                 path.display()
             ));
         }
