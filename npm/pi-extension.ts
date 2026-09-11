@@ -389,9 +389,8 @@ function shortUrl(url: string): string {
  * engine), or the provider name ("exa", "tavily", "serper",
  * "tinyfish") for BYOK.
  */
-function getSearchProvider(sc: any): string {
-  if (!sc) return "local";
-  const provider = sc.provider;
+function getSearchProvider(sc: any, dbg: any): string {
+  const provider = (sc && sc.provider) || (dbg && dbg.provider) || null;
   if (!provider || provider === "null") return "local";
   return String(provider);
 }
@@ -493,6 +492,10 @@ export default function (pi: ExtensionAPI) {
             const isErr = result?.isError ?? false;
             const sc = result?.structuredContent ?? null;
             const dbg = result?._meta?.["com.donsetch/fetch-debug"] ?? null;
+            // Issue #172: provider moved to _meta for compact search
+            // responses, so the BYOK label must read the telemetry
+            // object too instead of blaming "local" on every search.
+            const sdbg = result?._meta?.["com.donsetch/search-debug"] ?? null;
 
             // Build details for TUI rendering
             const details: any = {
@@ -504,7 +507,7 @@ export default function (pi: ExtensionAPI) {
             if (toolName === "web_search") {
               details.results = countSearchResults(text);
               details.topResult = getFirstResultTitle(text);
-              details.provider = getSearchProvider(sc);
+              details.provider = getSearchProvider(sc, sdbg);
             } else if (toolName === "web_fetch") {
               details.source = getFetchSource(sc, dbg);
               details.status = getFetchStatus(sc);
