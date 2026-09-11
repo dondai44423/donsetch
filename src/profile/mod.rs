@@ -363,8 +363,9 @@ fn probe_installed() -> Option<(u32, bool)> {
 /// Windows: read the major version + brand truth from the browser's
 /// own `BLBeacon\version` registry value. The key family decides the
 /// brand: `Software\Google\Chrome` = Google-branded; Chromium/Edge/
-/// Thorium report their own (non-Google) brands. Honours `DONGHOST_CHROME`
-/// by probing the browser family it names first.
+/// Thorium report their own (non-Google) brands. Honours the configured
+/// `browser.chromium_path` (legacy `DONGHOST_CHROME`) by probing the
+/// browser family it names first.
 #[cfg(windows)]
 fn probe_registry() -> Option<(u32, bool)> {
     use windows_sys::Win32::System::Registry as reg;
@@ -376,13 +377,13 @@ fn probe_registry() -> Option<(u32, bool)> {
         ("Software\\Microsoft\\Edge\\BLBeacon", false),
         ("Software\\Thorium\\BLBeacon", false),
     ];
-    // Sort DONGHOST_CHROME's family to the front if it doesn't already
-    // lead : cheap, and makes the explicit choice authoritative.
-    if !crate::config::cfg().browser.chromium_path.is_empty() {
-        return Some(PathBuf::from(&crate::config::cfg().browser.chromium_path));
-    }
-    if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        let p = p.to_string_lossy().to_lowercase();
+    // Sort the configured browser's family to the front if it doesn't
+    // already lead : cheap, and makes the explicit choice authoritative.
+    // `browser.chromium_path` already layers the legacy DONGHOST_CHROME
+    // env var, so the config value is the single source here.
+    let configured = &crate::config::cfg().browser.chromium_path;
+    if !configured.is_empty() {
+        let p = configured.to_lowercase();
         for (family, key, branded) in [
             ("thorium", "Software\\Thorium\\BLBeacon", false),
             ("chrome", "Software\\Google\\Chrome\\BLBeacon", true),
