@@ -126,3 +126,11 @@ panic = "abort"
 inherits = "release"
 lto = false
 codegen-units = 256
+
+# Dependencies compile at opt-level 1: cold-graph rebuilds (each
+# dependabot bump or feature flip recompiles the whole deps tree,
+# the 90% of the pain) get ~2-3x faster codegen. The local crate
+# keeps the inherited opt-level 3 so the runtime-sensitive tests
+# stay honest. Test binaries run on opt-1 dep object code only.
+[profile.ci.package."*"]
+opt-level = 1
