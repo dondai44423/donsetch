@@ -216,9 +216,10 @@ pub async fn run() {
     cli::print_kv("route memory", &route_line);
     // v4 phase 5.2: local web memory receipt. status for every
     // subsystem, kill switch honored, non-rerank build says so.
-    let mem_line = if !cfg!(feature = "rerank") {
-        "unavailable (this build lacks the rerank feature)".to_string()
-    } else if crate::memory::kill_switch() {
+    #[cfg(not(feature = "rerank"))]
+    let mem_line = "unavailable (this build lacks the rerank feature)".to_string();
+    #[cfg(feature = "rerank")]
+    let mem_line = if crate::memory::kill_switch() {
         "off (DONSETCH_NO_WEB_MEMORY)".to_string()
     } else {
         match crate::memory::rows() {

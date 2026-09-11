@@ -185,6 +185,7 @@ pub(super) async fn search_inner(
 /// Remember snippets of the top search hits before rendering. The
 /// memory's body cap truncates us so this stays small, and the
 /// kill switch short-circuits everything.
+#[cfg_attr(not(feature = "rerank"), allow(unused_variables))]
 fn memory_ingest_outcome(out: &crate::search::SearchOutcome) {
     #[cfg(feature = "rerank")]
     if !crate::memory::kill_switch() {
