@@ -97,11 +97,11 @@ win-check: win-check-core win-check-full
 
 _win-check-prereqs:
     @command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "win-check: missing cross toolchain — sudo apt install mingw-w64 nasm cmake libclang-dev pkg-config && rustup target add x86_64-pc-windows-gnu"; exit 1; }
-    @rustup target list --installed | grep -q '^x86_64-pc-windows-gnu$' || { echo "win-check: missing rustup target — rustup target add x86_64-pc-windows-gnu"; exit 1; }
+    @rustup target list --installed --toolchain "$(rustup show active-toolchain | head -1 | cut -d ' ' -f1)" | grep -q '^x86_64-pc-windows-gnu$' || { echo "win-check: missing rustup target — rustup target add x86_64-pc-windows-gnu"; exit 1; }
 
 win-check-full: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
-    BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include)" \
+    BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
     ORT_SKIP_DOWNLOAD=1 \
     cargo clippy --target x86_64-pc-windows-gnu --all-targets --features ocr,rerank,http -- -Dwarnings
 
@@ -111,7 +111,7 @@ win-check-full: _win-check-prereqs
 # full half (no ort download step), so it is the one to run first.
 win-check-core: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
-    BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include)" \
+    BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
     cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets -- -Dwarnings
 
 # Full suite, full feature set, fail-fast. The cargo profile is
