@@ -1907,7 +1907,10 @@ pub fn origins(
 /// user:password; `config show` masks the secret part so terminal
 /// scrollback and pasted bug reports never leak it.
 fn is_secret(section: &str, key: &str) -> bool {
-    section == "proxy" && matches!(key, "http" | "https" | "all" | "pool")
+    matches!(
+        (section, key),
+        ("transport", "token") | ("proxy", "http" | "https" | "all" | "pool")
+    )
 }
 
 /// Mask the userinfo of a URL credential: scheme://user:pass@host
@@ -1917,7 +1920,7 @@ fn is_secret(section: &str, key: &str) -> bool {
 fn mask_url_secret(url: &str) -> String {
     if let Some(scheme_end) = url.find("://") {
         let rest = &url[scheme_end + 3..];
-        if let Some(at) = rest.find('@') {
+        if let Some(at) = rest.rfind('@') {
             return format!("{}://***@{}", &url[..scheme_end], &rest[at + 1..]);
         }
         return url.to_string();
@@ -1934,6 +1937,13 @@ fn mask_url_secret(url: &str) -> String {
 fn masked_value(c: &DonsetchConfig, section: &str, key: &str, shown: String) -> String {
     if !is_secret(section, key) {
         return shown;
+    }
+    if section == "transport" {
+        return if c.transport.token.is_empty() {
+            shown
+        } else {
+            "\"***\"".to_string()
+        };
     }
     if key == "pool" {
         let masked = c
@@ -2458,11 +2468,17 @@ mod tests {
     }
 
     #[test]
-    fn show_text_redacts_proxy_secrets() {
+    fn show_text_redacts_transport_and_proxy_secrets() {
         let mut c = DonsetchConfig::default();
-        c.proxy.https = "http://alice:s3cr3t@gw.example:2334".into();
+        c.transport.token = "transport-secret-sentinel".into();
+        c.proxy.http = "http://plain.proxy.example:8080".into();
+        c.proxy.https = "http://alice:pa@ss@gw.example:2334".into();
         c.proxy.all = "socks5://bob:hunter2@other.example:1080".into();
-        c.proxy.pool = vec!["http://carol:pw@a.example:8080".into()];
+        c.proxy.pool = vec![
+            "http://carol:p@ss@a.example:8080".into(),
+            "bare-user:bare-secret@b.example:8080".into(),
+        ];
+        c.proxy.no_proxy = "localhost,.internal.test".into();
         let loaded = Loaded {
             config: c,
             merged: config::Map::new(),
@@ -2470,16 +2486,43 @@ mod tests {
             file: None,
         };
         let text = super::show_text(&loaded);
-        for leak in ["s3cr3t", "hunter2", "pw@a.example"] {
+        for leak in [
+            "transport-secret-sentinel",
+            "pa@ss",
+            "hunter2",
+            "p@ss",
+            "bare-user",
+            "bare-secret",
+        ] {
             assert!(!text.contains(leak), "config show leaked {leak:?}");
         }
         for masked in [
+            "token              = \"***\"",
+            "http://plain.proxy.example:8080",
             "http://***@gw.example:2334",
             "socks5://***@other.example:1080",
             "http://***@a.example:8080",
+            "localhost,.internal.test",
+            "[\"http://***@a.example:8080\", \"***\"]",
         ] {
             assert!(text.contains(masked), "missing masked form {masked:?}");
         }
+    }
+
+    #[test]
+    fn show_text_preserves_empty_secret_fields_as_unset() {
+        let config = DonsetchConfig::default();
+        for (section, key) in [
+            ("transport", "token"),
+            ("proxy", "http"),
+            ("proxy", "https"),
+            ("proxy", "all"),
+        ] {
+            let shown = value_of(&config, section, key);
+            assert_eq!(masked_value(&config, section, key, shown), "\"\"");
+        }
+        let shown = value_of(&config, "proxy", "pool");
+        assert_eq!(masked_value(&config, "proxy", "pool", shown), "[]");
     }
 
     #[test]

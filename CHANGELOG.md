@@ -21,6 +21,9 @@ channel until the v4.0.0 release train.
   new surface).
 
 ### Changed
+- `donsetch config show` redacts bearer tokens and credential-bearing proxy
+  values, including proxy pools, while still showing whether each field is
+  configured and where its value came from.
 - Every runtime env read now flows through the typed config. The old
   env names keep their exact historical trigger semantics and still
   work, but they are deprecated and will be removed at the v4
