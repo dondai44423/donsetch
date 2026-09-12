@@ -372,24 +372,10 @@ mod tests {
     // the unacked-history replay saves the request. Child 1 must
     // outlive the write, then die; the client holds its EOF long
     // enough for the idle poll to see the death first.
-    #[cfg(unix)]
-    struct WriteThenEof(&'static [u8], bool);
-
-    #[cfg(unix)]
-    impl Read for WriteThenEof {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.1 {
-                std::thread::sleep(Duration::from_millis(900));
-                return Ok(0);
-            }
-            self.1 = true;
-            buf[..self.0.len()].copy_from_slice(self.0);
-            Ok(self.0.len())
-        }
-    }
-
-    /// Same as WriteThenEof but with a caller-set EOF delay, for the
-    /// multi-death case that needs to outlast several restart backoffs.
+    /// Serves the payload once, then holds the connection open for
+    /// a caller-set delay before EOF: the death surfaces on the
+    /// idle poll, and the EOF must outlast every poll + restart
+    /// backoff the test needs to survive.
     #[cfg(unix)]
     struct WriteThenEofAfter(&'static [u8], bool, u64);
 
