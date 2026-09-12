@@ -181,6 +181,12 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+- Modern `DONSETCH_<SECTION>__<KEY>` variables now fail loudly when a
+  recognized value is not UTF-8 or when distinct names normalize to the same
+  config key. Diagnostics identify the variable names without exposing their
+  values, and collision handling no longer depends on environment iteration
+  order.
+
 - The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by
