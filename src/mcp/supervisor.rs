@@ -425,7 +425,12 @@ mod tests {
                 c.args(["-c", if *n == 1 { "sleep 0.3; exit 0" } else { "cat" }]);
                 c
             },
-            WriteThenEof(b"ping\n", false),
+            // Hold EOF past one idle poll (500ms) + the restart
+            // backoff (500ms) + a slow CI spawn: 900ms lost the race
+            // on a loaded macOS runner (EOF drained the corpse before
+            // the replacement existed). Same reasoning as the
+            // two-death test below.
+            WriteThenEofAfter(b"ping\n", false, 4000),
             sink.clone(),
         )
         .unwrap();
