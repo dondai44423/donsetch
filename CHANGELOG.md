@@ -181,6 +181,10 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+- Typed config validation now rejects an out-of-policy TOML value with
+  file attribution even when a valid higher-precedence env value would
+  otherwise hide it; legacy out-of-range values remain warning-only.
+
 - The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by
