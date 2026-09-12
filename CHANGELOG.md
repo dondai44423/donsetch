@@ -11,6 +11,11 @@ V4 work in progress on `master`. Nothing below ships through a release
 channel until the v4.0.0 release train.
 
 ### Added
+- `just win-check`: type-checks the crate for `x86_64-pc-windows-gnu`
+  from Linux (clippy, no linkage), both `--no-default-features` and
+  the full feature set, so `#[cfg(windows)]` breakage from a
+  Linux-only change surfaces before the push instead of in Windows
+  CI. Needs mingw-w64; see CONTRIBUTING.md.
 - `web_screenshot` MCP tool: a rendered PNG of a page through the
   existing tier-2 browser (url, full_page, wait_ms). The capture is
   in-process only; the MCP result carries an image content block and

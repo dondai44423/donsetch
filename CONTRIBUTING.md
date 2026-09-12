@@ -25,6 +25,51 @@ All three must pass before a PR can merge. CI runs the same checks on Linux, mac
 
 The same tasks are wrapped as [`just`](https://just.systems) recipes — `just test`, `just lint`, `just fmt-check`, `just smoke`.
 
+### Verifying Windows compilation from Linux
+
+Linux-only changes regularly broke Windows CI in `cfg`-gated code that never
+compiled locally. `just win-check` type-checks the whole crate for
+`x86_64-pc-windows-gnu` without linking — both ends of the feature matrix
+(full `ocr,rerank,http` and `--no-default-features`), all targets,
+`-Dwarnings` — so those breaks surface before the push. It is not part of
+`just all` because it needs a cross toolchain on top of the normal build
+prerequisites (NASM, CMake and libclang are already required above). On
+Debian/Ubuntu:
+
+```bash
+sudo apt install mingw-w64 pkg-config
+rustup target add x86_64-pc-windows-gnu
+```
+
+On other distros install the equivalents: the x86_64 mingw-w64 cross
+toolchain (gcc and g++) and pkg-config. If you skipped the normal
+prerequisites, add NASM, CMake and libclang (`nasm cmake libclang-dev` on
+Debian/Ubuntu).
+
+Per recipe:
+
+- **`win-check-core`** (`--no-default-features`): `mingw-w64` (cross
+  gcc/g++), `nasm` + `cmake` (BoringSSL build), `libclang-dev`
+  (bindgen for boring-sys), and the `x86_64-pc-windows-gnu` rustup
+  target. Run this one first; it is the cheaper half.
+- **`win-check-full`** (`ocr,rerank,http`): all of the above plus
+  `pkg-config` — the ort binary downloader builds a host-side
+  `openssl-sys`, which needs pkg-config to find the system OpenSSL
+  headers (`libssl-dev`, usually already present).
+- **`win-check`** runs both.
+
+The first run compiles BoringSSL for the mingw target (a few minutes); warm
+runs take seconds. The recipe's comments in the Justfile explain the three
+environment workarounds it applies. Windows CI proper stays authoritative —
+it builds the msvc target and links — but `win-check` catches the common
+case. Type-checking is the ceiling here: an actual `cargo build` for
+`x86_64-pc-windows-gnu` fails to link even with `--no-default-features`
+(BoringSSL), so do not expect a runnable binary out of the cross setup. The
+common case is code under `#[cfg(windows)]` or `#[cfg(unix)]` that no longer compiles
+on the other side. Note that rustc reports the first error it hits, so the
+message can differ from the Windows CI log for the same break (a missing
+import surfaces before a type mismatch on the same line, for instance).
+
 ### Windows
 
 The recipes are POSIX shell (`2>/dev/null`, `head -c`, `cd fuzz && …`) and `just` runs them with `sh`,
