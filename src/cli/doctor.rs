@@ -278,7 +278,11 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
             // fetch: curl works via the env proxy, direct sockets
             // get reset. Surface the fix instead of a generic
             // "check your connection".
-            let proxy_env_set = [
+            // The advice must match what the daemon actually does:
+            // a proxy comes from the ambient env vars OR the [proxy]
+            // slots in donsetch.toml (from_env_for consults the
+            // config layer first; the pool lane adds proxy.pool).
+            let proxy_configured = [
                 "HTTPS_PROXY",
                 "https_proxy",
                 "HTTP_PROXY",
@@ -287,12 +291,19 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
                 "all_proxy",
             ]
             .iter()
-            .any(|v| std::env::var_os(v).is_some());
-            let hint = if proxy_env_set {
-                "The environment exports a proxy and the direct fetch still failed: this looks like a TLS-intercepting egress network. donsetch honors the env proxy automatically (see 'Fetch egress'); if it still fails, export SSL_CERT_FILE=<the network's CA bundle> so the re-signed certificates verify, then re-run doctor."
+            .any(|v| std::env::var_os(v).is_some())
+                || {
+                    let p = &crate::config::cfg().proxy;
+                    !p.https.trim().is_empty()
+                        || !p.http.trim().is_empty()
+                        || !p.all.trim().is_empty()
+                        || !p.pool.is_empty()
+                };
+            let hint = if proxy_configured {
+                "A proxy is configured (env vars or [proxy] in donsetch.toml) and the direct fetch still failed: this looks like a TLS-intercepting egress network. donsetch honors it automatically (see 'Fetch egress'); if it still fails, export SSL_CERT_FILE=<the network's CA bundle> or set [tls] cert_file in donsetch.toml so the re-signed certificates verify, then re-run doctor."
                     .to_string()
             } else {
-                "Check your network connection and DNS. Behind an egress proxy? Export HTTPS_PROXY/HTTP_PROXY (donsetch honors them; NO_PROXY accepted).".into()
+                "Check your network connection and DNS. Behind an egress proxy? Set [proxy] https/http in donsetch.toml or export HTTPS_PROXY/HTTP_PROXY (NO_PROXY accepted).".into()
             };
             CheckResult::Fail(e.to_string(), hint)
         }
@@ -303,21 +314,25 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
 /// and the two certificate stores the connector builds from.
 /// Local-only: no network, stays in fast mode.
 fn check_fetch_egress() -> CheckResult {
-    let kill = !crate::config::cfg().proxy.from_environment;
-    let resolved = if kill {
-        None
-    } else {
-        crate::transport::proxy::from_env_for("https://example.com")
-    };
+    let proxy = &crate::config::cfg().proxy;
+    let slot_set = !proxy.https.trim().is_empty()
+        || !proxy.http.trim().is_empty()
+        || !proxy.all.trim().is_empty();
+    // from_env_for already consults the [proxy] slots first and
+    // gates only the ambient env read on from_environment: call it
+    // unconditionally so the doctor's view matches the daemon's
+    // (a TOML proxy with from_environment = false used to be
+    // reported as direct egress).
+    let resolved = crate::transport::proxy::from_env_for("https://example.com");
     let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
     let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
 
     let mut bits = Vec::new();
     if let Some(p) = resolved {
-        bits.push(format!("egress via {} proxy {}:{} (env; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port));
+        bits.push(format!("egress via {} proxy {}:{} ({}; SOCKS5 keeps TLS end-to-end, HTTP CONNECT gets the interception-safe handshake)", if p.is_http_connect() { "http" } else { "socks5" }, p.host, p.port, if slot_set { "config" } else { "env" }));
     } else {
-        bits.push(if kill {
-            "direct egress (proxy.from_environment = false disables the env-proxy convention)"
+        bits.push(if !proxy.from_environment {
+            "direct egress (proxy.from_environment = false disables the env-proxy convention; [proxy] slots in donsetch.toml stay live)"
                 .into()
         } else {
             "direct egress (no proxy env vars; export HTTPS_PROXY/HTTP_PROXY to route fetches)"

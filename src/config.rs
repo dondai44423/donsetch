@@ -1965,6 +1965,56 @@ pub fn origins(
     out
 }
 
+/// Knobs whose values can carry credentials. Proxy URLs embed
+/// user:password; `config show` masks the secret part so terminal
+/// scrollback and pasted bug reports never leak it.
+fn is_secret(section: &str, key: &str) -> bool {
+    section == "proxy" && matches!(key, "http" | "https" | "all" | "pool")
+}
+
+/// Mask the userinfo of a URL credential: scheme://user:pass@host
+/// becomes scheme://***@host. Values without userinfo are not
+/// secrets and show as-is; bare non-URL values (never expected in
+/// these fields) mask fully rather than risk a leak.
+fn mask_url_secret(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            return format!("{}://***@{}", &url[..scheme_end], &rest[at + 1..]);
+        }
+        return url.to_string();
+    }
+    if url.is_empty() {
+        String::new()
+    } else {
+        "***".to_string()
+    }
+}
+
+/// `config show` display form for one knob: value_of output for
+/// everything, credentials masked for the secret proxy fields.
+fn masked_value(c: &DonsetchConfig, section: &str, key: &str, shown: String) -> String {
+    if !is_secret(section, key) {
+        return shown;
+    }
+    if key == "pool" {
+        let masked = c
+            .proxy
+            .pool
+            .iter()
+            .map(|p| format!("\"{}\"", mask_url_secret(p)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("[{masked}]");
+    }
+    let raw = match key {
+        "http" => c.proxy.http.as_str(),
+        "https" => c.proxy.https.as_str(),
+        _ => c.proxy.all.as_str(),
+    };
+    format!("\"{}\"", mask_url_secret(raw))
+}
+
 /// Human-readable `config show` output: every knob, value, source.
 pub fn show_text(loaded: &Loaded) -> String {
     let mut out = String::new();
@@ -1991,7 +2041,10 @@ pub fn show_text(loaded: &Loaded) -> String {
             out.push_str(&format!("[{section}]\n"));
             last_section = section;
         }
-        out.push_str(&format!("  {key:<18} = {value:<20} ({origin})\n"));
+        out.push_str(&format!(
+            "  {key:<18} = {} ({origin})\n",
+            masked_value(&loaded.config, section, key, value)
+        ));
     }
     out
 }
@@ -2345,6 +2398,11 @@ mod tests {
     /// proxy.from_environment gates the AMBIENT proxy convention, not
     /// the config-file slots: an explicit TOML proxy must survive the
     /// kill switch (the old caller-side gate starved it).
+    ///
+    /// Isolation note: relies on nextest's process-per-test runner
+    /// (env mutation + the process-wide cfg() OnceLock: the first
+    /// cfg() call freezes the config layer, so keep this out of
+    /// shared-process runners).
     #[test]
     fn from_environment_off_keeps_toml_proxy_slots_alive() {
         let guard = clean_env();
@@ -2462,6 +2520,31 @@ mod tests {
             .find(|l| l.contains("`kind`"))
             .expect("transport.kind not in the table");
         assert!(kind_row.contains("\\|"), "kind row lost its escaped pipe");
+    }
+
+    #[test]
+    fn show_text_redacts_proxy_secrets() {
+        let mut c = DonsetchConfig::default();
+        c.proxy.https = "http://alice:s3cr3t@gw.example:2334".into();
+        c.proxy.all = "socks5://bob:hunter2@other.example:1080".into();
+        c.proxy.pool = vec!["http://carol:pw@a.example:8080".into()];
+        let loaded = Loaded {
+            config: c,
+            merged: config::Map::new(),
+            warnings: Vec::new(),
+            file: None,
+        };
+        let text = super::show_text(&loaded);
+        for leak in ["s3cr3t", "hunter2", "pw@a.example"] {
+            assert!(!text.contains(leak), "config show leaked {leak:?}");
+        }
+        for masked in [
+            "http://***@gw.example:2334",
+            "socks5://***@other.example:1080",
+            "http://***@a.example:8080",
+        ] {
+            assert!(text.contains(masked), "missing masked form {masked:?}");
+        }
     }
 
     #[test]

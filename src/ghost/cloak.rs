@@ -643,6 +643,12 @@ mod tests {
         // Dondai's rule: CloakBrowser is not used unless explicitly selected.
         // A stray CLOAKBROWSER_BINARY_PATH (set for another tool) must not
         // switch the backend on its own.
+        //
+        // Isolation note: this test mutates process env and relies on
+        // nextest's process-per-test runner; the process-wide cfg()
+        // OnceLock must never have been touched before this runs
+        // (first cfg() call freezes the config layer for the whole
+        // test process). Keep it out of shared-process runners.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK
             .lock()

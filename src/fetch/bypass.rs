@@ -65,16 +65,6 @@ impl Default for BypassConfig {
     }
 }
 
-#[allow(dead_code)]
-fn env_bool_off(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "0" | "false" | "off" | "no" | "")
-        })
-        .unwrap_or(false)
-}
-
 impl BypassConfig {
     pub fn from_env() -> Self {
         // Historically this read nine env vars directly; the knobs now

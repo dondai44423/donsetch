@@ -6,22 +6,38 @@
 //! first byte. This test drives the real binary over stdio and pins
 //! both the response and the absence of the double-install error.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-#[test]
-fn mcp_daemon_boots_and_answers_initialize() {
-    // A one-shot MCP client over stdio.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_donsetch"))
-        .arg("mcp")
+fn hermetic_command() -> Command {
+    // The child must not inherit a developer's real config: a real
+    // donsetch.toml with [transport] kind = "http" (or
+    // DONSETCH_TRANSPORT=http) would boot an HTTP server instead of
+    // the stdio daemon this test drives. DONSETCH_NO_CONFIG_FILE=1
+    // skips the file layer; every other DONSETCH_* var goes too,
+    // including DONSETCH_CONFIG (NO_CONFIG_FILE + CONFIG = a hard
+    // conflict error that would kill the boot for the wrong reason).
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_donsetch"));
+    cmd.arg("mcp")
         .arg("--supervised")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .expect("daemon spawns");
+        .env("DONSETCH_NO_CONFIG_FILE", "1");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("DONSETCH_") {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd
+}
+
+#[test]
+fn mcp_daemon_boots_and_answers_initialize() {
+    // A one-shot MCP client over stdio.
+    let mut child = hermetic_command().spawn().expect("daemon spawns");
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -51,10 +67,11 @@ fn mcp_daemon_boots_and_answers_initialize() {
     );
 
     // The regression signature: the double install error killed the
-    // daemon. It must not appear anywhere on stderr.
+    // daemon. It must not appear anywhere on stderr. Read to EOF so
+    // a first-line warning can never mask a later line.
     drop(stdin);
     let mut err_text = String::new();
-    let _ = BufReader::new(stderr).read_line(&mut err_text);
+    let _ = BufReader::new(stderr).read_to_string(&mut err_text);
     let _ = child.wait();
     assert!(
         !err_text.contains("already installed"),
