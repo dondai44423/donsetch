@@ -10,6 +10,8 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G5Y624N5RE)
 
+> **These docs track `master`, the v4 work in progress.** The current release is v3.6.7. The typed configuration (donsetch.toml, `config show`, `DONSETCH_<SECTION>__<KEY>` env names) described below ships with the next release; v3.6.7 is configured with the legacy environment variables only. Nothing else here is ahead of the release.
+
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-AGPL%203.0-2563eb)](LICENSE)
@@ -274,6 +276,8 @@ donsetch doctor --fix    # repairs mechanical problems automatically
 MCP client and prints ready-to-paste registration blocks.
 
 ## ⚙️ Configuration
+
+> Unreleased: ships with the next release. v3.6.7 is configured with the legacy environment variables only.
 
 Every runtime knob lives in one typed config (`src/config.rs`). Four layers, later wins:
 
