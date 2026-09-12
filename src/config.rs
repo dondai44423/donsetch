@@ -269,6 +269,41 @@ pub struct Loaded {
     pub merged: config::Map<String, config::Value>,
 }
 
+impl Loaded {
+    fn origin_of(&self, path: &str) -> Option<&str> {
+        let (section, key) = path.split_once('.')?;
+        self.merged
+            .get(section)
+            .and_then(|value| match &value.kind {
+                config::ValueKind::Table(inner) => inner.get(key),
+                _ => None,
+            })
+            .and_then(config::Value::origin)
+    }
+
+    /// Legacy optional browser strings used presence semantics: even an
+    /// empty value was supplied. Modern/file empty strings instead clear a
+    /// lower override and restore discovery or the documented default.
+    fn browser_string_is_supplied(&self, path: &str, value: &str, legacy_name: &str) -> bool {
+        !value.is_empty() || self.origin_of(path) == Some(legacy_name)
+    }
+
+    /// A configured mirror wins by presence, including an explicit empty
+    /// reset. Only an absent config leaf falls back to the ambient OS value.
+    fn mirrored_os(
+        &self,
+        path: &str,
+        configured: &str,
+        ambient_name: &str,
+    ) -> Option<std::ffi::OsString> {
+        if self.origin_of(path).is_some() || !configured.is_empty() {
+            Some(configured.into())
+        } else {
+            std::env::var_os(ambient_name)
+        }
+    }
+}
+
 /// Load the layered config from defaults + env + TOML file and validate it.
 pub fn load() -> Result<Loaded, ConfigError> {
     let mut warnings = Vec::new();
@@ -2159,38 +2194,75 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
 // The global
 // ---------------------------------------------------------------------------
 
-static CONFIG: OnceLock<DonsetchConfig> = OnceLock::new();
+static CONFIG: OnceLock<Loaded> = OnceLock::new();
 
-/// Install a validated config (the CLI/MCP entry point does this after
-/// merging CLI flags). Errors are fatal and reported to the caller.
+fn install_loaded_inner(loaded: Loaded) -> Result<(), ConfigError> {
+    validate(&loaded.config)?;
+    CONFIG
+        .set(loaded)
+        .map_err(|_| ConfigError::Env("config is already installed in this process".into()))
+}
+
+/// Install a validated programmatic config. Errors are fatal and reported to
+/// the caller.
 /// Installing twice in one process is an error, not a silent no-op:
 /// the first install is the contract the whole daemon reads.
 pub fn install(cfg: DonsetchConfig) -> Result<(), ConfigError> {
-    validate(&cfg)?;
-    CONFIG
-        .set(cfg)
-        .map_err(|_| ConfigError::Env("config is already installed in this process".into()))
+    install_loaded_inner(Loaded {
+        config: cfg,
+        warnings: Vec::new(),
+        file: None,
+        merged: config::Map::new(),
+    })
+}
+
+/// Install the exact layered snapshot returned by [`load`]. Keeping its
+/// origins beside the typed config preserves source-sensitive compatibility
+/// without re-reading legacy environment variables in runtime consumers.
+pub fn install_loaded(loaded: Loaded) -> Result<(), ConfigError> {
+    install_loaded_inner(loaded)
 }
 
 /// The process config, initializing lazily from defaults + env + file.
 ///
 /// Errors at this path cannot be fatal (no caller context), so the error
 /// and the default config are reported to stderr and the default is used;
-/// the binary entry points call `load()` + `install()` first so real users
-/// always get the loud path.
-pub fn cfg() -> &'static DonsetchConfig {
+/// the binary entry points call `load()` + `install_loaded()` first so real
+/// users always get the loud path.
+fn installed() -> &'static Loaded {
     CONFIG.get_or_init(|| match load() {
         Ok(loaded) => {
             for w in &loaded.warnings {
                 eprintln!("[donsetch config] {w}");
             }
-            loaded.config
+            loaded
         }
         Err(e) => {
             eprintln!("[donsetch config] {e}; using defaults");
-            DonsetchConfig::default()
+            Loaded {
+                config: DonsetchConfig::default(),
+                warnings: Vec::new(),
+                file: None,
+                merged: config::Map::new(),
+            }
         }
     })
+}
+
+pub fn cfg() -> &'static DonsetchConfig {
+    &installed().config
+}
+
+pub(crate) fn browser_string_is_supplied(path: &str, value: &str, legacy_name: &str) -> bool {
+    installed().browser_string_is_supplied(path, value, legacy_name)
+}
+
+pub(crate) fn mirrored_os(
+    path: &str,
+    configured: &str,
+    ambient_name: &str,
+) -> Option<std::ffi::OsString> {
+    installed().mirrored_os(path, configured, ambient_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -2355,6 +2427,81 @@ mod tests {
             loaded.config.fetch.pdf_max_mb, 44,
             "the file layer must beat the legacy env name"
         );
+        drop(guard);
+    }
+
+    #[test]
+    fn browser_strings_distinguish_legacy_presence_modern_reset_and_ambient_fallback() {
+        let guard = clean_env();
+        let playwright = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH");
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        set_env("PLAYWRIGHT_BROWSERS_PATH", "/ambient/playwright");
+
+        let fields = [
+            (
+                "browser.chromium_path",
+                "DONGHOST_CHROME",
+                "DONSETCH_BROWSER__CHROMIUM_PATH",
+            ),
+            (
+                "browser.cloak_path",
+                "CLOAKBROWSER_BINARY_PATH",
+                "DONSETCH_BROWSER__CLOAK_PATH",
+            ),
+            (
+                "browser.cloak_version",
+                "CLOAKBROWSER_VERSION",
+                "DONSETCH_BROWSER__CLOAK_VERSION",
+            ),
+            (
+                "browser.cloak_cache_dir",
+                "CLOAKBROWSER_CACHE_DIR",
+                "DONSETCH_BROWSER__CLOAK_CACHE_DIR",
+            ),
+        ];
+
+        let absent = load().expect("absent browser overrides");
+        for (path, legacy, _) in fields {
+            assert!(!absent.browser_string_is_supplied(path, "", legacy));
+        }
+        assert_eq!(
+            absent.mirrored_os("browser.playwright_path", "", "PLAYWRIGHT_BROWSERS_PATH"),
+            Some("/ambient/playwright".into()),
+            "an absent config mirror must use the ambient OS value"
+        );
+
+        for (_, legacy, _) in fields {
+            set_env(legacy, "");
+        }
+        let legacy_empty = load().expect("empty legacy browser overrides");
+        for (path, legacy, _) in fields {
+            assert!(
+                legacy_empty.browser_string_is_supplied(path, "", legacy),
+                "{legacy}=empty was historically present"
+            );
+        }
+
+        for (_, _, modern) in fields {
+            set_env(modern, "");
+        }
+        set_env("DONSETCH_BROWSER__PLAYWRIGHT_PATH", "");
+        let reset = load().expect("modern empty reset");
+        for (path, legacy, _) in fields {
+            assert!(
+                !reset.browser_string_is_supplied(path, "", legacy),
+                "a modern empty {path} must clear the lower legacy override"
+            );
+        }
+        assert_eq!(
+            reset.mirrored_os("browser.playwright_path", "", "PLAYWRIGHT_BROWSERS_PATH"),
+            Some(std::ffi::OsString::new()),
+            "an explicit empty mirror must reset, not revive, the ambient value"
+        );
+
+        match playwright {
+            Some(value) => set_env("PLAYWRIGHT_BROWSERS_PATH", value),
+            None => unset_env("PLAYWRIGHT_BROWSERS_PATH"),
+        }
         drop(guard);
     }
 

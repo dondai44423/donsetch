@@ -6,18 +6,19 @@ use donsetch::mcp;
 /// Load the layered config, apply CLI overrides, install it process-wide.
 /// Fatal on any config error: a bad knob must stop the daemon loudly.
 fn load_and_install_config(args: &[String]) -> &'static config::DonsetchConfig {
-    let mut c = match config::load() {
+    let mut loaded = match config::load() {
         Ok(loaded) => {
             for w in &loaded.warnings {
                 eprintln!("[donsetch config] {w}");
             }
-            loaded.config
+            loaded
         }
         Err(e) => {
             eprintln!("donsetch: {e}");
             std::process::exit(1);
         }
     };
+    let c = &mut loaded.config;
     if args.iter().any(|a| a == "--http") {
         c.transport.kind = config::TransportKind::Http;
     }
@@ -33,7 +34,7 @@ fn load_and_install_config(args: &[String]) -> &'static config::DonsetchConfig {
             }
         }
     }
-    if let Err(e) = config::install(c) {
+    if let Err(e) = config::install_loaded(loaded) {
         eprintln!("donsetch: {e}");
         std::process::exit(1);
     }
