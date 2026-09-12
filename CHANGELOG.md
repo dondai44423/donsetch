@@ -168,7 +168,9 @@ channel until the v4.0.0 release train.
 - Dependencies: tokenizers 0.23.2, encoding_rs 0.8.40, brotli 9.0.0,
   zstd 0.14.0, psl 2.1.231, actions/checkout 4 -> 7.
 
-### Fixed- The supervisor's replay now survives a crash loop: the bytes
+### Fixed
+
+- The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by
   mnaza in #202, discriminating two-death test included). The
