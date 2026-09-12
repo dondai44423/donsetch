@@ -144,6 +144,14 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- The MCP supervisor no longer loses a request buffered into a
+  child that dies before consuming it. The write succeeds while
+  the child is alive, so no EPIPE ever fires, and the death only
+  surfaces on the next idle poll: the supervisor now replays the
+  child's whole unacked history (bounded to 1 MiB, duplicated
+  delivery preferred over a lost request). Caught by the macOS CI
+  run timing the crash between a successful write and the idle
+  poll.
 - Crawl resume tokens survive concurrent crawlers. The store was
   one shared JSON map saved with load-modify-save, so two
   processes issuing tokens at the same time (the daemon plus a

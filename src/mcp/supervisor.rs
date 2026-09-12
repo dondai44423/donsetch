@@ -83,6 +83,13 @@ where
     }
     let mut restarts: u32 = 0;
     let mut pending: Vec<u8> = Vec::new();
+    // Everything written to the CURRENT child since its spawn.
+    // A write that lands in a dying child's pipe buffer is
+    // reported as SUCCESS by the kernel and then discarded with
+    // the child, so the mid-write EPIPE arm alone cannot know
+    // what was lost: bytes written before the fatal write are
+    // equally gone. The unacked history is the replay window.
+    let mut written: Vec<u8> = Vec::new();
     let output = Arc::new(Mutex::new(output));
 
     // Drain OUR stdin from a thread so the main loop can also
@@ -147,6 +154,7 @@ where
                 let _ = stdin.flush();
                 pending.clear();
             }
+            written.clear();
             child = Some((c, stdin, Instant::now()));
         }
 
@@ -155,11 +163,16 @@ where
         match rx.recv_timeout(POLL) {
             Ok(In::Data(bytes)) => {
                 if stdin.write_all(&bytes).is_ok() {
+                    written.extend_from_slice(&bytes);
                     let _ = stdin.flush();
                 } else {
-                    // Child died under this write : hold the bytes
-                    // for its replacement, never drop them.
-                    pending = bytes;
+                    // Child died under this write : hold this span
+                    // of bytes for its replacement, never drop them.
+                    // Replay the whole unacked history, not just the
+                    // failed tail: every byte that reached the dead
+                    // child's pipe is uncertain, and duplicate
+                    // delivery is cheaper than a lost request.
+                    pending = replay_window(std::mem::take(&mut written), &bytes);
                     eprintln!("[supervisor] daemon died mid-write : holding request for restart");
                     restart_child(c, &mut restarts, born.elapsed());
                     child = None;
@@ -182,6 +195,17 @@ where
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Idle: is the child still alive?
                 if let Ok(Some(_status)) = c.try_wait() {
+                    // The buffered-history case: writes that the
+                    // kernel accepted are gone with the child, and
+                    // no EPIPE ever fired. Replay the unacked
+                    // history so the replacement serves them.
+                    if !written.is_empty() {
+                        pending = replay_window(std::mem::take(&mut written), &[]);
+                        eprintln!(
+                            "[supervisor] daemon died while idle : replaying {} unacked bytes",
+                            pending.len()
+                        );
+                    }
                     eprintln!("[supervisor] daemon died while idle : restarting");
                     restart_child(c, &mut restarts, born.elapsed());
                     child = None;
@@ -189,6 +213,22 @@ where
             }
         }
     }
+}
+
+/// The unacked-byte replay window: on a child death, everything
+/// the dead child may not have consumed is replayed. Duplicate
+/// delivery beats lost requests; cap the window so a long-lived
+/// daemon does not grow the history forever. 1 MiB of JSON-RPC is
+/// a lot of requests, and the overflow drops the OLDEST entries
+/// (drain keeps the tail).
+const REPLAY_WINDOW: usize = 1 << 20;
+
+fn replay_window(mut history: Vec<u8>, extra: &[u8]) -> Vec<u8> {
+    history.extend_from_slice(extra);
+    if history.len() > REPLAY_WINDOW {
+        history.drain(..history.len() - REPLAY_WINDOW);
+    }
+    history
 }
 
 /// Wait for a child that has seen EOF to exit on its own, killing
@@ -297,6 +337,64 @@ mod tests {
             buf[..self.0.len()].copy_from_slice(self.0);
             Ok(self.0.len())
         }
+    }
+
+    // A client whose request lands in the pipe buffer of a child
+    // that dies before consuming it. The write succeeds while the
+    // child is still alive, so the mid-write EPIPE arm never
+    // fires: the death surfaces on the next idle poll, and only
+    // the unacked-history replay saves the request. Child 1 must
+    // outlive the write, then die; the client holds its EOF long
+    // enough for the idle poll to see the death first.
+    #[cfg(unix)]
+    struct WriteThenEof(&'static [u8], bool);
+
+    #[cfg(unix)]
+    impl Read for WriteThenEof {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.1 {
+                std::thread::sleep(Duration::from_millis(900));
+                return Ok(0);
+            }
+            self.1 = true;
+            buf[..self.0.len()].copy_from_slice(self.0);
+            Ok(self.0.len())
+        }
+    }
+
+    /// The macOS CI signature: the request was buffered into a
+    /// dying child, the write reported success, and the request
+    /// never reached the replacement.
+    #[cfg(unix)]
+    #[test]
+    fn request_buffered_in_a_dying_child_replays_to_the_replacement() {
+        let sink = Sink::default();
+        let spawns = Arc::new(Mutex::new(0u32));
+        let spawns2 = Arc::clone(&spawns);
+        run_with(
+            move || {
+                let mut n = spawns2.lock().unwrap();
+                *n += 1;
+                let mut c = Command::new("sh");
+                // First child accepts the write, dies 300ms later
+                // without consuming it; its replacement serves.
+                c.args(["-c", if *n == 1 { "sleep 0.3; exit 0" } else { "cat" }]);
+                c
+            },
+            WriteThenEof(b"ping\n", false),
+            sink.clone(),
+        )
+        .unwrap();
+        assert!(
+            *spawns.lock().unwrap() >= 2,
+            "the dead child must have been replaced"
+        );
+        let got = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "ping\n",
+            "the buffered request must replay to the restarted child"
+        );
     }
 
     // main() restores SIGPIPE's default disposition for the CLI
