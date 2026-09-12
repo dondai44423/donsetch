@@ -324,12 +324,19 @@ pub fn load() -> Result<Loaded, ConfigError> {
     // Validate the file layer on its own so unknown keys and bad types
     // fail loudly with the file path attached, exactly once.
     if let Some(file) = &file_layer {
-        deserialize_layer_table(file).map_err(|m| ConfigError::File {
-            path: file_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            message: m.to_string(),
+        let path = file_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let source = deserialize_layer_table(file).map_err(|message| ConfigError::File {
+            path: path.clone(),
+            message: message.to_string(),
+        })?;
+        validate_modern_http_token(&source.transport.token).map_err(|message| {
+            ConfigError::File {
+                path,
+                message: message.to_string(),
+            }
         })?;
     }
 
@@ -506,13 +513,17 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         }
         None => {}
     }
-    if let Some(v) = std::env::var_os("DONSETCH_HTTP_TOKEN") {
-        put(
+    match std::env::var("DONSETCH_HTTP_TOKEN") {
+        Ok(value) => put(
             &mut m,
             "transport.token",
-            v.to_string_lossy().into_owned().into(),
+            value.into(),
             "DONSETCH_HTTP_TOKEN",
-        );
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warnings.push("ignoring DONSETCH_HTTP_TOKEN: not valid UTF-8".into())
+        }
+        Err(std::env::VarError::NotPresent) => {}
     }
     match int_env("DONSETCH_HTTP_TIMEOUT_SECS") {
         Some(n) => put_num(
@@ -1150,7 +1161,7 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "token",
             FieldKind::Str,
             "(empty)",
-            "HTTP bearer token; empty = token auth off",
+            "HTTP bearer token; empty = auth off; modern values use visible ASCII without whitespace",
         ),
         (
             "transport",
@@ -1743,7 +1754,7 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
 
     for (name, value) in std::env::vars_os() {
-        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+        let Some(name) = name.to_str() else {
             continue;
         };
         if !name.starts_with("DONSETCH_") || name == "DONSETCH_" {
@@ -1772,6 +1783,18 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
             ));
             continue;
         };
+        let Some(value) = value.to_str() else {
+            if (section, key) == ("transport", "token") {
+                errors.push(format!("{name}: {MODERN_HTTP_TOKEN_REQUIREMENT}"));
+            }
+            continue;
+        };
+        if (section, key) == ("transport", "token")
+            && let Err(message) = validate_modern_http_token(value)
+        {
+            errors.push(format!("{name}: {message}"));
+            continue;
+        }
         let vkind = match kind {
             FieldKind::Str => config::ValueKind::String(value.to_string()),
             FieldKind::Bool => match boolish(value) {
@@ -1850,6 +1873,28 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if c.search.rerank_threads > 64 {
         return err("search.rerank_threads must be 0 (auto) or 1..=64".into());
+    }
+    Ok(())
+}
+
+/// Resolve the exact bearer-token contract used by the HTTP transport.
+/// Empty means auth off; every non-empty loaded value remains auth-on and is
+/// compared byte-for-byte for backward compatibility.
+pub(crate) fn configured_http_token(token: &str) -> Option<&str> {
+    (!token.is_empty()).then_some(token)
+}
+
+/// Modern sources are strict: an explicit empty string disables auth, while
+/// configured tokens must fit safely and unambiguously in an HTTP header.
+/// Never include the token itself in the error returned to diagnostics.
+const MODERN_HTTP_TOKEN_REQUIREMENT: &str =
+    "transport.token must be empty or contain only visible ASCII without whitespace";
+
+fn validate_modern_http_token(token: &str) -> Result<(), &'static str> {
+    if configured_http_token(token)
+        .is_some_and(|token| !token.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(MODERN_HTTP_TOKEN_REQUIREMENT);
     }
     Ok(())
 }
@@ -2440,6 +2485,95 @@ mod tests {
             );
             drop(guard);
         }
+    }
+
+    #[test]
+    fn modern_http_tokens_are_strict_and_errors_never_echo_them() {
+        let guard = clean_env();
+        let file_secret = "file token sentinel";
+        let path = write_cfg(
+            &std::env::temp_dir(),
+            &format!("[transport]\ntoken = {file_secret:?}\n"),
+        );
+        set_env("DONSETCH_CONFIG", &path);
+        let error = load()
+            .err()
+            .expect("whitespace token must fail")
+            .to_string();
+        assert!(error.contains("transport.token"), "{error}");
+        assert!(!error.contains(file_secret), "file token leaked: {error}");
+
+        unset_env("DONSETCH_CONFIG");
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        let env_secret = "environment token sentinel";
+        set_env("DONSETCH_TRANSPORT__TOKEN", env_secret);
+        let error = load()
+            .err()
+            .expect("whitespace token must fail")
+            .to_string();
+        assert!(error.contains("DONSETCH_TRANSPORT__TOKEN"), "{error}");
+        assert!(!error.contains(env_secret), "env token leaked: {error}");
+
+        set_env("DONSETCH_TRANSPORT__TOKEN", "   ");
+        assert!(
+            load().is_err(),
+            "whitespace-only token must not disable auth"
+        );
+
+        set_env("DONSETCH_TRANSPORT__TOKEN", "Abc-._~+/=:");
+        let loaded = load().expect("visible ASCII token");
+        assert_eq!(loaded.config.transport.token, "Abc-._~+/=:");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            set_env(
+                "DONSETCH_TRANSPORT__TOKEN",
+                std::ffi::OsString::from_vec(b"modern-\xff-token".to_vec()),
+            );
+            let error = load().err().expect("non-UTF-8 token must fail").to_string();
+            assert!(error.contains("DONSETCH_TRANSPORT__TOKEN"), "{error}");
+            assert!(error.contains("visible ASCII"), "{error}");
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn legacy_http_token_value_survives_and_modern_empty_can_disable_auth() {
+        let guard = clean_env();
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        set_env("DONSETCH_HTTP_TOKEN", " padded legacy token ");
+        let loaded = load().expect("legacy token");
+        assert_eq!(
+            configured_http_token(&loaded.config.transport.token),
+            Some(" padded legacy token ")
+        );
+
+        set_env("DONSETCH_TRANSPORT__TOKEN", "");
+        let loaded = load().expect("modern empty override");
+        assert_eq!(loaded.config.transport.token, "");
+        assert_eq!(configured_http_token(&loaded.config.transport.token), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            unset_env("DONSETCH_TRANSPORT__TOKEN");
+            set_env(
+                "DONSETCH_HTTP_TOKEN",
+                std::ffi::OsString::from_vec(b"legacy-\xff-token".to_vec()),
+            );
+            let loaded = load().expect("legacy non-UTF-8 keeps its historical fallback");
+            assert_eq!(configured_http_token(&loaded.config.transport.token), None);
+            assert!(
+                loaded
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "ignoring DONSETCH_HTTP_TOKEN: not valid UTF-8")
+            );
+        }
+        drop(guard);
     }
 
     /// Markdown tables must never split a row: raw pipes in defaults
