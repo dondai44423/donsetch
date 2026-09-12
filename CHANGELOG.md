@@ -176,6 +176,10 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Browser backend aliases now share the typed enum as their single registry
+  and normalize casing and surrounding whitespace across config sources.
+  Unknown effective legacy values fail closed instead of silently becoming
+  `auto`; a valid higher-precedence modern setting still overrides them.
 - HTTP bearer configuration now fails closed: modern TOML/env tokens reject
   whitespace and non-visible bytes without echoing the secret, while legacy
   text tokens retain their exact historical value instead of being trimmed

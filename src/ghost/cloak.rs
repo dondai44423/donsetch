@@ -43,24 +43,7 @@ impl BrowserBackend {
     }
 }
 
-// Production reads [browser] backend through config; this parser stays
-// for the backend-string tests and documentation.
-#[cfg_attr(not(test), allow(dead_code))]
-fn parse_backend(value: Option<&str>) -> Result<Option<BrowserBackend>, String> {
-    match value {
-        None | Some("") | Some("auto") => Ok(None),
-        Some("chromium") | Some("chrome") | Some("original") => Ok(Some(BrowserBackend::Chromium)),
-        Some("headless") | Some("original-headless") => Ok(Some(BrowserBackend::HeadlessChromium)),
-        Some("cloak") | Some("cloakbrowser") => Ok(Some(BrowserBackend::CloakBrowser)),
-        Some(other) => Err(format!(
-            "invalid browser backend `{other}`; use chromium, headless, cloakbrowser, or auto"
-        )),
-    }
-}
-
 /// Whether the configured backend forces the original browser into headless mode.
-/// Invalid values return false here; `resolve_browser` reports the configuration
-/// error when the browser is actually acquired.
 pub fn headless_mode_requested() -> bool {
     config_backend() == Some(BrowserBackend::HeadlessChromium)
 }
@@ -606,37 +589,6 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backend_selection_distinguishes_cloak_and_original_headless() {
-        assert_eq!(
-            parse_backend(Some("cloakbrowser")),
-            Ok(Some(BrowserBackend::CloakBrowser))
-        );
-        assert_eq!(
-            parse_backend(Some("chromium")),
-            Ok(Some(BrowserBackend::Chromium))
-        );
-        assert_eq!(
-            parse_backend(Some("headless")),
-            Ok(Some(BrowserBackend::HeadlessChromium))
-        );
-        assert_eq!(
-            parse_backend(Some("original-headless")),
-            Ok(Some(BrowserBackend::HeadlessChromium))
-        );
-        assert_eq!(parse_backend(Some("auto")), Ok(None));
-    }
-
-    #[test]
-    fn backend_selection_rejects_unknown_values() {
-        assert!(parse_backend(Some("firefox")).is_err());
-    }
-
-    #[test]
-    fn empty_backend_value_means_auto() {
-        assert_eq!(parse_backend(Some("")), Ok(None));
-    }
 
     #[test]
     fn cloak_never_selected_by_bare_binary_path() {
