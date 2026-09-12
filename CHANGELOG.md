@@ -176,6 +176,9 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- The ONNX reranker now consumes the validated `search.rerank_threads` value
+  directly instead of leaking and reparsing a string, and reports configured
+  values as coming from the layered config. `0 = auto` behavior is unchanged.
 - HTTP bearer configuration now fails closed: modern TOML/env tokens reject
   whitespace and non-visible bytes without echoing the secret, while legacy
   text tokens retain their exact historical value instead of being trimmed
