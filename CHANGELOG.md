@@ -144,6 +144,16 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Crawl resume tokens survive concurrent crawlers. The store was
+  one shared JSON map saved with load-modify-save, so two
+  processes issuing tokens at the same time (the daemon plus a
+  CLI run, parallel test processes) wrote stale copies over each
+  other and fresh tokens read back as expired or unknown. Tokens
+  are now one immutable file each under the cache dir; the legacy
+  single-file store migrates on first touch, retires only after
+  every entry lands, and the consume-on-resume semantics are
+  unchanged. Caught by the Windows CI run while it beat on the
+  shared store in parallel.
 - `donsetch doctor --deep` no longer reports a valid Bright Data
   dynamic-IP unlocker (Web Access API zones and friends) as broken:
   the free zone probe costs nothing, and where the zone has no

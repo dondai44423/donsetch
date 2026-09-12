@@ -349,6 +349,16 @@ async fn crawl_max_pages_enforced() {
 
 #[tokio::test]
 async fn crawl_resume_continues() {
+    // Isolated cache: the resume store lives under the real cache
+    // dir, and gates run this test in parallel with the rest of
+    // the suite (nextest = process-per-test, but the CI runners
+    // share the dir across processes). One test blasting the live
+    // store with the old shared-map = clobbered other processes'
+    // tokens mid-flight.
+    let iso = std::env::temp_dir().join(format!("ds-resume-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&iso);
+    unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &iso) };
+
     let seed = format!(
         "<html><body><article><p>content words for the extractor to accept this page yes</p>{}</article></body></html>",
         (0..10)
@@ -1190,4 +1200,78 @@ fn rss_uppercase_link_tags_close_case_insensitively() {
         super::parse_feed_urls(xml, 10),
         vec!["https://example.com/1", "https://example.com/2"]
     );
+}
+
+// The pre-fix resume store = one shared JSON map saved with
+// load-modify-save: two overlapping writer processes (the daemon
+// plus a CLI run, or parallel test processes on CI) saved stale
+// copies over each other, and tokens issued milliseconds earlier
+// read back as "resume token expired or unknown". Windows CI
+// caught it live in the crawl_resume_continues run. Per-token
+// files cannot collide: every writer's token survives everyone
+// else's save.
+#[test]
+fn concurrent_issues_survive_each_other() {
+    let iso = std::env::temp_dir().join(format!("ds-resume-race-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&iso);
+    unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &iso) };
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8usize)
+        .map(|i| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let tok = format!("c16a9a0{i:x}");
+                let state = super::ResumeState {
+                    seed: format!("https://site.example/seed{i}"),
+                    queue: Vec::new(),
+                    seen: Vec::new(),
+                };
+                super::resume_store_issue(&tok, &state);
+                barrier.wait();
+                match super::resume_store_take(&tok) {
+                    Ok(back) => assert_eq!(back.seed, format!("https://site.example/seed{i}")),
+                    Err(e) => panic!("writer {i} lost its own token: {e}"),
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&iso);
+}
+
+// The v3 tokens = one shared map at <cache>/crawl-resumes.json.
+// The per-token store migrates them on first touch; the legacy
+// file retires only when every entry made it to disk, and a
+// migrated token behaves the same (read once, then consumed).
+#[test]
+fn legacy_store_migrates_and_the_token_survives() {
+    let iso = std::env::temp_dir().join(format!("ds-resume-mig-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&iso);
+    unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &iso) };
+    let legacy = iso.join("crawl-resumes.json");
+    let legacy_text = serde_json::json!({
+        "entries": {
+            "cabc123": [
+                {"seed": "https://old.example/seed", "queue": [], "seen": []},
+                1234
+            ]
+        }
+    })
+    .to_string();
+    std::fs::write(&legacy, legacy_text).unwrap();
+
+    let back = super::resume_store_take("cabc123").expect("migrated token read");
+    assert_eq!(back.seed, "https://old.example/seed");
+    assert!(
+        !legacy.exists(),
+        "legacy file retired after a full migration"
+    );
+    assert!(
+        !iso.join("crawl-resumes").join("cabc123.json").exists(),
+        "token consumed on take"
+    );
+    let _ = std::fs::remove_dir_all(&iso);
 }

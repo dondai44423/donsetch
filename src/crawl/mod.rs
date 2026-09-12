@@ -243,55 +243,157 @@ struct ResumeState {
     seen: Vec<String>,
 }
 
-/// Disk-backed resume store: tokens survive process restarts,
-/// so both the MCP daemon AND one-shot CLI runs can continue a
-/// crawl. ~/.cache/donsetch/crawl-resumes.json, 30-min TTL.
-fn resumes_path() -> std::path::PathBuf {
-    dirs_cache().join("crawl-resumes.json")
+/// Disk-backed resume store: tokens survive process restarts, so
+/// both the MCP daemon AND one-shot CLI runs can continue a crawl.
+/// One immutable JSON file per token under
+/// <cache>/crawl-resumes/. Immutable sharding instead of one shared
+/// map: a shared map is save = load-modify-save, and two concurrent
+/// crawlers (the daemon plus a CLI run, or parallel test processes)
+/// save stale copies over each other, so a token issued
+/// milliseconds ago reads back as "resume token expired or
+/// unknown". Token files are written exactly once; consumption
+/// deletes the file. Sweep = 120-minute mtime + a 50-token cap;
+/// the legacy single-file store migrates on first touch.
+const RESUME_TTL_SECS: u64 = 120 * 60;
+const RESUME_CAP: usize = 50;
+
+fn resumes_dir() -> std::path::PathBuf {
+    crate::paths::cache_dir().join("crawl-resumes")
 }
 
-fn dirs_cache() -> std::path::PathBuf {
-    crate::paths::cache_dir()
+fn legacy_resumes_path() -> std::path::PathBuf {
+    crate::paths::cache_dir().join("crawl-resumes.json")
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct ResumeFile {
-    /// token -> (state, issued_at_unix)
-    entries: std::collections::HashMap<String, (ResumeState, u64)>,
+fn token_path(dir: &std::path::Path, tok: &str) -> std::path::PathBuf {
+    // Token ids are c<hex-micros><hex-seq>: filename-safe on every
+    // platform, no traversal surface.
+    dir.join(format!("{tok}.json"))
 }
 
-impl ResumeFile {
-    fn load() -> Self {
-        std::fs::read_to_string(resumes_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+/// One-time migration: the v3 store kept every token in one JSON
+/// map; split it into per-token files so tokens already issued
+/// survive the upgrade.
+fn migrate_legacy_store() {
+    let legacy = legacy_resumes_path();
+    if !legacy.exists() {
+        return;
     }
-
-    fn save(&self) {
-        let p = resumes_path();
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(s) = serde_json::to_string(self) {
-            // Atomic write: write to temp file, then rename.
-            // Without this, a concurrent process reading the file
-            // mid-write gets partial JSON → empty store → "token
-            // expired or unknown" on a freshly-issued token.
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, s).is_ok() {
-                let _ = std::fs::rename(&tmp, &p);
+    #[derive(serde::Deserialize)]
+    struct LegacyFile {
+        entries: std::collections::HashMap<String, (ResumeState, u64)>,
+    }
+    if let Some(file) = std::fs::read_to_string(&legacy)
+        .ok()
+        .and_then(|text| serde_json::from_str::<LegacyFile>(&text).ok())
+    {
+        let total = file.entries.len();
+        let mut written = 0usize;
+        let dir = resumes_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for (tok, (state, _)) in file.entries {
+            if write_token_file(&dir, &tok, &state) {
+                written += 1;
             }
         }
+        // Only retire the legacy file after every entry it held
+        // made it to disk; a half-loss (disk full, read-only
+        // dir) is better retried on the next touch than deleted.
+        if total > 0 && written >= total {
+            let _ = std::fs::remove_file(&legacy);
+        }
     }
+}
 
-    fn sweep(&mut self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.entries
-            .retain(|_, (_, at)| now.saturating_sub(*at) < 120 * 60);
+/// Write one token file (atomic, issue-only: never rewritten after
+/// the token id carries timestamp + seq, so a collision would need
+/// the same microsecond twice in one process).
+fn write_token_file(dir: &std::path::Path, tok: &str, state: &ResumeState) -> bool {
+    let tmp = dir.join(format!("{tok}.tmp"));
+    let dst = token_path(dir, tok);
+    let ok = serde_json::to_string(state)
+        .map(|s| std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, &dst).is_ok())
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
+}
+
+/// Drop expired tokens and cap the store at 50, oldest first.
+/// Per-file mtime is the age signal: nothing else writes these.
+fn resume_store_sweep(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut alive: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let age_ok = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|t| now.saturating_sub(t.as_secs()) < RESUME_TTL_SECS)
+            .unwrap_or(false);
+        if age_ok {
+            alive.push((
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|t| t.as_secs())
+                    .unwrap_or(0),
+                path,
+            ));
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if alive.len() > RESUME_CAP {
+        alive.sort();
+        let drop_n = alive.len() - RESUME_CAP;
+        for (_, path) in alive.into_iter().take(drop_n) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Read and consume one token (the v3 semantics: a token dies when
+/// its crawl actually resumes). Unknown, corrupt, or unreadable =
+/// the same honest error.
+fn resume_store_take(tok: &str) -> Result<ResumeState, String> {
+    let dir = resumes_dir();
+    migrate_legacy_store();
+    resume_store_sweep(&dir);
+    let path = token_path(&dir, tok);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<ResumeState>(&text) {
+            Ok(state) => {
+                let _ = std::fs::remove_file(&path);
+                Ok(state)
+            }
+            Err(_) => Err(format!("resume token expired or unknown: {tok}")),
+        },
+        Err(_) => Err(format!("resume token expired or unknown: {tok}")),
+    }
+}
+
+/// Persist a freshly issued token. Failure is non-fatal: the crawl
+/// result still lands, the token just will not survive a restart.
+fn resume_store_issue(tok: &str, state: &ResumeState) {
+    let dir = resumes_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    migrate_legacy_store();
+    resume_store_sweep(&dir);
+    if !write_token_file(&dir, tok, state) {
+        eprintln!("[crawl] resume token write failed; the token will not survive a restart");
     }
 }
 
@@ -351,14 +453,8 @@ impl Crawler {
 
         // Resume without url: load the seed from the resume state.
         let (seed, seed_url, seed_host) = if seed.is_empty() {
-            let mut store = ResumeFile::load();
-            store.sweep();
             let tok = resume_token.ok_or("resume token required when url is empty")?;
-            let state = store
-                .entries
-                .get(tok)
-                .map(|(s, _)| s.clone())
-                .ok_or(format!("resume token expired or unknown: {tok}"))?;
+            let state = resume_store_take(tok)?;
             let u = Url::parse(&state.seed)
                 .map_err(|_| format!("bad seed in resume state: {}", state.seed))?;
             let h = u.host_str().ok_or("seed must have a host")?.to_string();
@@ -489,16 +585,14 @@ impl Crawler {
         let total_chars = 0usize;
         let seed_norm = frontier::normalize(&seed_url);
         if let Some(tok) = resume_token {
-            let mut store = ResumeFile::load();
-            store.sweep();
-            if let Some((state, _)) = store.entries.remove(tok) {
-                queue.restore_seen(state.seen);
-                for (u, s, d, r, p) in state.queue {
-                    queue.push_to_heap(u, s, d, r, p);
+            match resume_store_take(tok) {
+                Ok(state) => {
+                    queue.restore_seen(state.seen);
+                    for (u, s, d, r, p) in state.queue {
+                        queue.push_to_heap(u, s, d, r, p);
+                    }
                 }
-                store.save();
-            } else {
-                return Err(format!("resume token expired or unknown: {tok}"));
+                Err(e) => return Err(e),
             }
         }
         // Site-wide IDF for BM25-lite frontier scoring: built from
@@ -1540,26 +1634,7 @@ impl Crawler {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .seen_snapshot(),
                     };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let mut store = ResumeFile::load();
-                    store.sweep();
-                    store.entries.insert(id.clone(), (state, now));
-                    // Cap the file: drop oldest beyond 50 tokens.
-                    if store.entries.len() > 50 {
-                        let mut keyed: Vec<(u64, String)> = store
-                            .entries
-                            .iter()
-                            .map(|(k, (_, at))| (*at, k.clone()))
-                            .collect();
-                        keyed.sort();
-                        for (_, k) in keyed.into_iter().take(store.entries.len() - 50) {
-                            store.entries.remove(&k);
-                        }
-                    }
-                    store.save();
+                    resume_store_issue(&id, &state);
                     Some(id)
                 } else {
                     None
