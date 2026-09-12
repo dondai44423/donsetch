@@ -63,6 +63,9 @@ const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 /// Upper bound on tracked sessions; the oldest are evicted beyond it.
 const MAX_SESSIONS: usize = 1024;
 /// Default per-request timeout when DONSETCH_HTTP_TIMEOUT_SECS is unset.
+/// Historical default; the live default lives in config ([transport]
+/// timeout_secs).
+#[allow(dead_code)]
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// The GET /mcp SSE stream closes itself after this long (just inside
 /// SESSION_TTL): an unbounded idle stream would hold graceful shutdown
@@ -99,25 +102,16 @@ struct HttpState {
 pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let daemon = Arc::new(Daemon::new().await.map_err(|e| e.to_string())?);
     daemon.start_prober();
-    let auth_token = std::env::var("DONSETCH_HTTP_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
+    let t = crate::config::cfg().transport.clone();
+    let auth_token = (!t.token.trim().is_empty()).then_some(t.token.trim().to_string());
     let auth_enabled = auth_token.is_some();
-    let timeout = Duration::from_secs(
-        std::env::var("DONSETCH_HTTP_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS),
-    );
+    let timeout = Duration::from_secs(t.timeout_secs);
 
     // CORS is off by default: MCP clients are processes, not browsers,
     // and a permissive layer would let any webpage open in a local
     // browser POST to a localhost instance and read the responses.
-    // Browser-based clients can opt in with DONSETCH_HTTP_CORS.
-    let cors_enabled = matches!(
-        std::env::var("DONSETCH_HTTP_CORS").as_deref(),
-        Ok("1" | "true" | "on")
-    );
+    // Browser-based clients can opt in with [transport] cors = true.
+    let cors_enabled = t.cors;
     validate_http_config(cors_enabled, auth_enabled)?;
 
     let state = HttpState {

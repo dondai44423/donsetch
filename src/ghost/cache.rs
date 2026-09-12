@@ -328,11 +328,11 @@ fn ewma_update(cur: f32, samples: u32, ok: bool) -> f32 {
 /// persists). ROUTE_MEMORY_READONLY: consult on, record off (debug
 /// and A/B). Both fail closed through crate::config::env_flag.
 fn route_memory_enabled() -> bool {
-    !crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY")
+    crate::config::cfg().state.route_memory != crate::config::RouteMemory::Off
 }
 
 fn route_memory_readonly() -> bool {
-    crate::config::env_flag("DONSETCH_ROUTE_MEMORY_READONLY")
+    crate::config::cfg().state.route_memory == crate::config::RouteMemory::ReadOnly
 }
 
 // ────────────────────────── constants ──────────────────────────
@@ -1053,8 +1053,8 @@ impl GhostState {
     /// values. Does NOT save: the caller is already inside the
     /// state lock and the outcome record after it saves once.
     pub fn sync_tier1_cookies(&mut self, all: &[CookieRecord]) {
-        if crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT")
-            || crate::config::env_flag("DONSETCH_NO_ROUTE_MEMORY")
+        if !crate::config::cfg().state.cookie_vault
+            || crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off
         {
             return;
         }
@@ -1083,7 +1083,7 @@ impl GhostState {
     /// Cookie count for `donsetch status`: the vault must be
     /// observable, never magic.
     pub fn tier1_cookie_count(&self) -> usize {
-        !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") as usize * self.tier1_cookies.len()
+        crate::config::cfg().state.cookie_vault as usize * self.tier1_cookies.len()
     }
 
     pub fn save(&mut self) {
@@ -1111,7 +1111,7 @@ impl GhostState {
         {
             // Allow users to disable disk persistence entirely.
             // In-memory state still works during the session.
-            if std::env::var_os("DONSEEK_NO_DISK_STATE").is_some() {
+            if crate::config::cfg().state.no_disk_state {
                 return;
             }
             let p = path();
@@ -1781,14 +1781,22 @@ mod tests {
     }
 
     #[test]
-    fn note_probe_counts_and_respects_switches() {
+    fn note_probe_counts() {
         let mut state = GhostState::default();
         state.note_probe();
         state.note_probe();
         assert_eq!(state.probes_total, 2);
+    }
+
+    // The readonly kill switch maps through the config layer
+    // (DONSETCH_ROUTE_MEMORY_READONLY); set before the first cfg() touch
+    // so the process-wide config sees it.
+    #[test]
+    fn note_probe_skips_when_readonly() {
         unsafe { std::env::set_var("DONSETCH_ROUTE_MEMORY_READONLY", "1") };
+        let mut state = GhostState::default();
         state.note_probe();
-        assert_eq!(state.probes_total, 2);
+        assert_eq!(state.probes_total, 0);
         unsafe { std::env::remove_var("DONSETCH_ROUTE_MEMORY_READONLY") };
     }
 
@@ -2583,15 +2591,31 @@ mod tests {
         // touched before the flood: it is the first evicted.
         assert!(st.tier1_cookies.iter().any(|c| c.name == "k599"));
         assert!(st.tier1_cookies.iter().all(|c| c.name != "k0"));
-        // Kill switch blocks the sync.
-        unsafe { std::env::set_var("DONSETCH_NO_COOKIE_VAULT", "1") };
-        st.sync_tier1_cookies(&[rec("post", "v", ".x.com", None)]);
-        assert!(st.tier1_cookies.iter().all(|c| c.name != "post"));
-        unsafe { std::env::remove_var("DONSETCH_NO_COOKIE_VAULT") };
         // Roundtrip through serde (persistence shape).
         let json = serde_json::to_string(&st).unwrap();
         let back: GhostState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tier1_cookies.len(), TIER1_COOKIE_MAX);
+    }
+
+    // The vault kill switch maps through the config layer
+    // (DONSETCH_NO_COOKIE_VAULT); set before the first cfg() touch.
+    #[test]
+    fn tier1_sync_honors_vault_kill_switch() {
+        unsafe { std::env::set_var("DONSETCH_NO_COOKIE_VAULT", "1") };
+        let mut st = GhostState::default();
+        let rec = CookieRecord {
+            name: "post".into(),
+            value: "v".into(),
+            domain: ".x.com".into(),
+            path: "/".into(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".into(),
+        };
+        st.sync_tier1_cookies(&[rec]);
+        assert!(st.tier1_cookies.iter().all(|c| c.name != "post"));
+        unsafe { std::env::remove_var("DONSETCH_NO_COOKIE_VAULT") };
     }
 
     #[test]

@@ -163,7 +163,7 @@ async fn h3_fetch_inner(
     // packet leaves.
     let resumed = crate::transport::routes::load_h3_session(authority, egress);
     if let Some(bytes) = &resumed {
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!("[h3] session resume armed ({} bytes)", bytes.len());
         }
         cfg.enable_early_data();
@@ -398,11 +398,11 @@ async fn h3_fetch_inner(
             }
             let _ = conn.close(true, 0, b"");
             if let Some(sess) = conn.session() {
-                if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                if crate::config::cfg().debug.ghost {
                     eprintln!("[h3] session saved {} bytes", sess.len());
                 }
                 crate::transport::routes::save_h3_session(authority, egress, sess);
-            } else if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            } else if crate::config::cfg().debug.ghost {
                 eprintln!("[h3] no session ticket before close");
             }
             QUIC_TOTAL_CONN.fetch_add(1, Ordering::Relaxed);
@@ -482,7 +482,7 @@ pub async fn h3_fetch_direct(
     user_headers: Vec<(String, String)>,
     timeout: Option<Duration>,
 ) -> Result<(H3Out, QuicStats), FetchError> {
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         eprintln!("[h3] attempt {host}:{port}{path}");
     }
     let profile = crate::profile::BrowserProfile::chrome_150(crate::profile::Platform::host());
@@ -513,7 +513,7 @@ pub async fn h3_fetch_direct(
         timeout,
     };
     let (out, stats) = h3_fetch_heat(&req, &profile).await?;
-    if std::env::var_os("DONGHOST_DEBUG").is_some() {
+    if crate::config::cfg().debug.ghost {
         eprintln!(
             "[h3] stats {}:{} early={} resumed={} hs_ms={} total_ms={} pkts_in={} pkts_out={}",
             host,

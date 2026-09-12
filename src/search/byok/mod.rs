@@ -240,7 +240,7 @@ impl ByokSearcher {
                         // Try the next provider, and if all are
                         // empty, fall back to local search.
                         last_error = format!("{provider}: empty results");
-                        if std::env::var_os("DONSEEK_DEBUG").is_some() {
+                        if crate::config::cfg().debug.search {
                             eprintln!("[byok] {provider} returned 0 results, trying next");
                         }
                         continue;
@@ -272,7 +272,7 @@ impl ByokSearcher {
                 }
                 Err(key_error) => {
                     // Log the error for debugging.
-                    if std::env::var_os("DONSEEK_DEBUG").is_some() {
+                    if crate::config::cfg().debug.search {
                         eprintln!(
                             "[byok] {provider} key={}... {}",
                             key.chars().take(8).collect::<String>(),

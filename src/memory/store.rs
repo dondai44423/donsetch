@@ -50,13 +50,17 @@ pub struct MemoryHit {
     pub score: f32,
 }
 
-/// Cap from the env when set to >= 256, else the default.
+/// Cap from the layered config ([state] web_memory_cap, historically
+/// DONSETCH_WEB_MEMORY_CAP); validation already enforces 256..=100_000
+/// for explicitly set values.
 pub fn cap() -> usize {
-    std::env::var("DONSETCH_WEB_MEMORY_CAP")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v >= 256)
-        .unwrap_or(MAX_ENTRIES_DEFAULT)
+    cap_for(crate::config::cfg())
+}
+
+/// Pure cap logic (tests drive this directly).
+fn cap_for(c: &crate::config::DonsetchConfig) -> usize {
+    let cap = c.state.web_memory_cap;
+    if cap < 256 { MAX_ENTRIES_DEFAULT } else { cap }
 }
 
 pub fn index_path() -> PathBuf {
@@ -358,7 +362,8 @@ pub fn clear() -> Result<(), String> {
 /// The kill switch: the store's ingest and search are both disabled
 /// while the flag is present in the environment.
 pub fn kill_switch() -> bool {
-    std::env::var_os("DONSETCH_NO_WEB_MEMORY").is_some()
+    // True = memory DISABLED; the config field is enable-semantics.
+    !crate::config::cfg().state.web_memory
 }
 
 #[cfg(test)]
@@ -468,19 +473,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The cap floor: junk or tiny values fall back to the default,
-    /// sane values pass through. Mimics the real daemon env.
-    /// SAFETY: nextest runs each test in its own process, so the
-    /// mutations below cannot race a sibling test's environ read.
+    /// The cap floor: sub-256 values are rejected at config load, so
+    /// the runtime only ever sees sane caps; the pure logic keeps the
+    /// historical floor.
     #[test]
-    fn cap_env_floor() {
-        unsafe { std::env::set_var("DONSETCH_WEB_MEMORY_CAP", "1") };
-        assert_eq!(cap(), MAX_ENTRIES_DEFAULT);
-        unsafe { std::env::set_var("DONSETCH_WEB_MEMORY_CAP", "banana") };
-        assert_eq!(cap(), MAX_ENTRIES_DEFAULT);
-        unsafe { std::env::set_var("DONSETCH_WEB_MEMORY_CAP", "300") };
-        assert_eq!(cap(), 300);
-        unsafe { std::env::remove_var("DONSETCH_WEB_MEMORY_CAP") };
-        assert_eq!(cap(), MAX_ENTRIES_DEFAULT);
+    fn cap_config_floor() {
+        let mut c = crate::config::DonsetchConfig::default();
+        c.state.web_memory_cap = 300;
+        assert_eq!(cap_for(&c), 300);
+        let mut bad = crate::config::DonsetchConfig::default();
+        bad.state.web_memory_cap = 1;
+        assert_eq!(cap_for(&bad), MAX_ENTRIES_DEFAULT);
     }
 }

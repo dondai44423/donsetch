@@ -1,6 +1,69 @@
 use donsetch::cli;
+use donsetch::config;
 use donsetch::dev;
 use donsetch::mcp;
+
+/// Load the layered config, apply CLI overrides, install it process-wide.
+/// Fatal on any config error: a bad knob must stop the daemon loudly.
+fn load_and_install_config(args: &[String]) -> &'static config::DonsetchConfig {
+    let mut c = match config::load() {
+        Ok(loaded) => {
+            for w in &loaded.warnings {
+                eprintln!("[donsetch config] {w}");
+            }
+            loaded.config
+        }
+        Err(e) => {
+            eprintln!("donsetch: {e}");
+            std::process::exit(1);
+        }
+    };
+    if args.iter().any(|a| a == "--http") {
+        c.transport.kind = config::TransportKind::Http;
+    }
+    if let Some(h) = get_arg_value(args, "--host") {
+        c.transport.host = h;
+    }
+    if let Some(p) = get_arg_value(args, "--port") {
+        match p.parse::<u16>() {
+            Ok(port) if port != 0 => c.transport.port = port,
+            _ => {
+                eprintln!("donsetch: invalid --port {p:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Err(e) = config::install(c) {
+        eprintln!("donsetch: {e}");
+        std::process::exit(1);
+    }
+    config::cfg()
+}
+
+/// `donsetch config show [--markdown] [--legacy]`
+fn config_cli(args: &[String]) {
+    let rest = &args[1..];
+    if rest.iter().any(|a| a == "--legacy") {
+        println!("{}", config::show_legacy_markdown());
+        return;
+    }
+    match config::load() {
+        Ok(loaded) => {
+            for w in &loaded.warnings {
+                eprintln!("[donsetch config] {w}");
+            }
+            if rest.iter().any(|a| a == "--markdown") {
+                println!("{}", config::show_markdown());
+            } else {
+                print!("{}", config::show_text(&loaded));
+            }
+        }
+        Err(e) => {
+            eprintln!("donsetch: {e}");
+            std::process::exit(1);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -30,6 +93,18 @@ async fn main() {
         }
     }
 
+    // Every command hard-fails on a broken config (the lazy fallback
+    // stays for library callers): a user must see the config error,
+    // never a silent run on defaults. `config show` loads itself so
+    // it can print the layers even when env values are bad; help and
+    // version read no config at all.
+    if !matches!(
+        cmd,
+        "config" | "help" | "--help" | "-h" | "version" | "-v" | "--version"
+    ) {
+        load_and_install_config(&args);
+    }
+
     match cmd {
         // ── Agent tools (spec-driven, shared core, clap-parsed) ──
         "fetch" | "search" | "answer" | "crawl" | "memory" | "screenshot" => {
@@ -41,23 +116,21 @@ async fn main() {
         "tools" => cli::tool::print_tools_json(),
 
         // ── Management ──
+        "config" => {
+            config_cli(&args);
+            return;
+        }
         "mcp" => {
             // Transport selection: the --http flag wins, then the
-            // DONSETCH_TRANSPORT env (stdio|http) for launchers that
-            // can't pass flags, then stdio. Host/port: flags, then
-            // env, then defaults.
+            // layered config ([transport] kind via TOML or env) for
+            // launchers that can't pass flags, then stdio. Host/port:
+            // flags beat the config. The config is already installed
+            // by the block above; installing twice made install()
+            // fail its one-shot check and the daemon exit.
             #[cfg(feature = "http")]
-            let env_http = std::env::var("DONSETCH_TRANSPORT").as_deref() == Ok("http");
-            #[cfg(feature = "http")]
-            if args.iter().any(|a| a == "--http") || env_http {
-                let host = get_arg_value(&args, "--host")
-                    .or_else(|| std::env::var("DONSETCH_HTTP_HOST").ok())
-                    .unwrap_or("127.0.0.1".to_string());
-                let port = get_arg_value(&args, "--port")
-                    .or_else(|| std::env::var("DONSETCH_HTTP_PORT").ok())
-                    .unwrap_or("8765".to_string())
-                    .parse()
-                    .unwrap_or(8765);
+            if config::cfg().transport.kind == config::TransportKind::Http {
+                let host = config::cfg().transport.host.clone();
+                let port = config::cfg().transport.port;
                 eprintln!("[mcp] starting HTTP server on {}:{}", host, port);
                 if let Err(e) = mcp::http::run(host, port).await {
                     eprintln!("mcp HTTP server: {e}");
@@ -70,17 +143,14 @@ async fn main() {
             // through to stdio : fail loudly instead. (The linux-arm64
             // and macOS-x64 prebuilt binaries are core-only.)
             #[cfg(not(feature = "http"))]
-            if args.iter().any(|a| a == "--http")
-                || std::env::var("DONSETCH_TRANSPORT").as_deref() == Ok("http")
-            {
+            if config::cfg().transport.kind == config::TransportKind::Http {
                 eprintln!(
-                    "mcp: HTTP transport requested (--http / DONSETCH_TRANSPORT=http), but this \
+                    "mcp: HTTP transport requested (--http / transport.kind = http), but this \
                      binary was built without the `http` cargo feature. Rebuild with \
                      --features http, or use a prebuilt binary that includes it."
                 );
                 std::process::exit(1);
             }
-            let _ = std::env::var("DONSETCH_TRANSPORT");
             if args.iter().any(|a| a == "--supervised") {
                 // v3 crash-only design: `--supervised` spawns a child
                 // daemon and proxies stdio; a panic-abort (release runs
@@ -190,6 +260,18 @@ async fn route_help(cmd: &str) {
             println!("  No probes, no browser launch : fast.");
             println!("  For full diagnostics, run `donsetch doctor`.");
         }
+        "config" => {
+            println!("Usage: donsetch config show [--markdown] [--legacy]");
+            println!();
+            println!("  show            Print every knob, its current value and where");
+            println!("                  it came from (default / env / file / legacy env).");
+            println!("  --markdown      Print the full knob reference table as markdown");
+            println!("                  (the source of truth for the README).");
+            println!("  --legacy        Print the legacy env var -> key mapping.");
+            println!();
+            println!("  File layer: <config-dir>/donsetch/donsetch.toml, or the path in");
+            println!("  DONSETCH_CONFIG. Skip the file layer with DONSETCH_NO_CONFIG_FILE=1.");
+        }
         "doctor" => {
             println!("Usage: donsetch doctor");
             println!();
@@ -225,18 +307,28 @@ async fn route_help(cmd: &str) {
             println!("  --port PORT         Listen on this port (default: 8765)");
             println!("  --supervised        Run with crash-recovery supervisor (stdio only)");
             println!();
+            println!("Config: layered config = defaults < legacy env < donsetch.toml");
+            println!("(<config-dir>/donsetch/donsetch.toml or DONSETCH_CONFIG=...) <");
+            println!("DONSETCH_<SECTION>__<KEY>. `donsetch config show` prints the");
+            println!("resolved table, `donsetch config show --markdown` the full knob");
+            println!("reference, `donsetch config show --legacy` the old-name map.");
+            println!();
             println!("Stdio mode (default): JSON-RPC over stdin/stdout");
             println!("HTTP mode: JSON-RPC POST at http://HOST:PORT/mcp (plus the");
             println!("            GET SSE stream and DELETE session end required by");
             println!("            streamable-HTTP clients)");
             println!();
-            println!("Environment (flags win over env):");
-            println!("  DONSETCH_TRANSPORT=http       Same as --http (stdio is the default)");
-            println!("  DONSETCH_HTTP_HOST=HOST       Same as --host");
-            println!("  DONSETCH_HTTP_PORT=PORT       Same as --port");
-            println!("  DONSETCH_HTTP_TOKEN=TOKEN     Require Authorization: Bearer TOKEN on /mcp");
-            println!("  DONSETCH_HTTP_TIMEOUT_SECS=N  Per-request timeout (default 300)");
-            println!("  DONSETCH_HTTP_CORS=1          Allow cross-origin requests (default off)");
+            println!("Environment (flags win over the config):");
+            println!("  DONSETCH_TRANSPORT__KIND=http Same as --http (stdio is the default)");
+            println!("  DONSETCH_TRANSPORT__HOST=HOST Same as --host");
+            println!("  DONSETCH_TRANSPORT__PORT=PORT Same as --port");
+            println!("  DONSETCH_TRANSPORT__TOKEN=TOKEN");
+            println!("                                Require Authorization: Bearer TOKEN on /mcp");
+            println!("  DONSETCH_TRANSPORT__TIMEOUT_SECS=N  Per-request timeout (default 300)");
+            println!("  DONSETCH_TRANSPORT__CORS=1    Allow cross-origin requests (default off)");
+            println!();
+            println!("Legacy names (DONSETCH_TRANSPORT, DONSETCH_HTTP_*, ...) still");
+            println!("work and map to the keys above; `donsetch doctor` lists them.");
         }
         "login" => {
             println!("Usage: donsetch login [domain]");
@@ -264,7 +356,6 @@ async fn route_help(cmd: &str) {
 
 /// Helper function to extract argument value from args.
 /// Returns None if the argument is not present or has no value.
-#[cfg(feature = "http")]
 fn get_arg_value(args: &[String], flag: &str) -> Option<String> {
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {

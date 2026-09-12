@@ -153,7 +153,7 @@ pub fn default_chrome_args(
 /// Whether sandbox is disabled via explicit opt-in.
 /// Used for testing that default launch is safe.
 pub fn sandbox_opt_in_enabled() -> bool {
-    std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1")
+    crate::config::cfg().browser.no_sandbox
 }
 
 /// Resolve the Chromium-family binary used by DonGhost.
@@ -180,11 +180,14 @@ pub fn chrome_binary() -> Result<String, FetchError> {
 }
 
 fn chromium_binary() -> Result<String, String> {
-    if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        let path = PathBuf::from(p);
+    // `browser.chromium_path` already layers the legacy DONGHOST_CHROME
+    // env var, so the config value is the single explicit source here.
+    let configured = &crate::config::cfg().browser.chromium_path;
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
         if !is_executable(&path) {
             return Err(format!(
-                "DONGHOST_CHROME is not an executable: {}",
+                "browser.chromium_path (legacy DONGHOST_CHROME) is not an executable: {}",
                 path.display()
             ));
         }
@@ -307,7 +310,12 @@ fn playwright_entry_suffixes() -> &'static [&'static str] {
 /// Linux (Playwright honors XDG_CACHE_HOME when set).
 fn playwright_registry_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(ov) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
+    // The config knob wins when set; otherwise the ambient standard
+    // var still applies (mirror-when-set semantics).
+    let cfg_root = &crate::config::cfg().browser.playwright_path;
+    if !cfg_root.is_empty() {
+        roots.push(PathBuf::from(cfg_root));
+    } else if let Some(ov) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
         roots.push(PathBuf::from(ov));
     }
     #[cfg(not(windows))]
@@ -639,7 +647,7 @@ impl Ghost {
         // unavailable (e.g. containers without user-namespace support
         // or AppArmor restrictions). Never enabled by default :
         // requires explicit env var and prints a loud warning.
-        if std::env::var_os("DONGHOST_NO_SANDBOX").is_some_and(|v| v == "1") {
+        if crate::config::cfg().browser.no_sandbox {
             eprintln!(
                 "[ghost] WARNING: DONGHOST_NO_SANDBOX=1 : launching Chrome with --no-sandbox and --disable-setuid-sandbox. This disables the Chromium sandbox and is UNSAFE. Only use in isolated containers."
             );
@@ -2024,19 +2032,10 @@ mod sandbox_tests {
     }
 
     #[test]
-    fn sandbox_opt_in_requires_explicit_env() {
-        // Ensure default is safe without env var.
-        // Save and restore to avoid flakiness.
-        let prev = std::env::var_os("DONGHOST_NO_SANDBOX");
-        unsafe { std::env::remove_var("DONGHOST_NO_SANDBOX") };
+    fn sandbox_opt_in_is_config_driven() {
+        // The env mapping (DONGHOST_NO_SANDBOX=1) is covered by the
+        // config-layer tests; here only the runtime default contract.
         assert!(!sandbox_opt_in_enabled());
-        unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", "1") };
-        assert!(sandbox_opt_in_enabled());
-        unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", "0") };
-        assert!(!sandbox_opt_in_enabled());
-        match prev {
-            Some(v) => unsafe { std::env::set_var("DONGHOST_NO_SANDBOX", v) },
-            None => unsafe { std::env::remove_var("DONGHOST_NO_SANDBOX") },
-        }
+        assert!(!crate::config::DonsetchConfig::default().browser.no_sandbox);
     }
 }

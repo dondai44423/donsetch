@@ -23,9 +23,14 @@ const PROXY_TIMEOUT: Duration = Duration::from_secs(12);
 /// suffix match: "example.com" matches "foo.example.com".
 /// "*" disables all proxying.
 fn no_proxy_match(host: &str) -> bool {
-    let no_proxy = std::env::var("NO_PROXY")
-        .or_else(|_| std::env::var("no_proxy"))
-        .unwrap_or_default();
+    let cfg = crate::config::cfg();
+    let no_proxy = if !cfg.proxy.no_proxy.is_empty() {
+        cfg.proxy.no_proxy.clone()
+    } else {
+        std::env::var("NO_PROXY")
+            .or_else(|_| std::env::var("no_proxy"))
+            .unwrap_or_default()
+    };
     if no_proxy.is_empty() {
         return false;
     }
@@ -591,10 +596,13 @@ pub fn load_config_verbose() -> (Vec<Proxy>, usize) {
     parse_lines_verbose(&content)
 }
 
-/// Load proxies from `DONSEEK_PROXIES` env var (comma-separated).
+/// Load the configured proxy pool: `[proxy] pool` in the layered config
+/// (comma-separated). Historically the `DONSEEK_PROXIES` env var.
 pub fn load_env() -> Vec<Proxy> {
-    let raw = std::env::var("DONSEEK_PROXIES").unwrap_or_default();
-    raw.split(',')
+    crate::config::cfg()
+        .proxy
+        .pool
+        .iter()
         .filter_map(|s| Proxy::parse(s.trim()).ok())
         .collect()
 }
@@ -632,22 +640,40 @@ pub fn from_env_for(url: &str) -> Option<Proxy> {
         return None;
     }
 
-    // Scheme-specific env var, then ALL_PROXY as fallback.
-    // Check uppercase first, then lowercase (curl convention).
+    // Resolution order: the explicit config slot ([proxy] https or
+    // [proxy] http) beats the ambient env var of the same scheme, which
+    // beats the config "all" slot, which beats ALL_PROXY (curl
+    // convention, lowercase variants included).
     // Note (Q2): non-http(s) schemes fall into the HTTP_PROXY arm. DonSeTch
     // never dials non-http(s) URLs (the URL gate rejects them first), so
     // curl's "ALL_PROXY covers unknown schemes" rule is dormant here; the
     // ALL_PROXY fallback below already covers both http and https.
-    let env_name = if scheme == "https" {
-        "HTTPS_PROXY"
+    let cfg = crate::config::cfg();
+    let (cfg_slot, env_name) = if scheme == "https" {
+        (&cfg.proxy.https, "HTTPS_PROXY")
     } else {
-        "HTTP_PROXY"
+        (&cfg.proxy.http, "HTTP_PROXY")
     };
-    let env_val = std::env::var(env_name)
-        .or_else(|_| std::env::var(env_name.to_lowercase()))
-        .or_else(|_| std::env::var("ALL_PROXY"))
-        .or_else(|_| std::env::var("all_proxy"))
-        .ok()?;
+    let explicit = if !cfg_slot.trim().is_empty() {
+        Some(cfg_slot.trim())
+    } else if !cfg.proxy.all.trim().is_empty() {
+        Some(cfg.proxy.all.trim())
+    } else {
+        None
+    };
+    let env_val = match explicit {
+        Some(v) => v.to_string(),
+        // The ambient env layer is gated by proxy.from_environment:
+        // explicit [proxy] slots stay live even when the ambient
+        // convention is disabled (the gate must never starve a TOML
+        // proxy).
+        None if crate::config::cfg().proxy.from_environment => std::env::var(env_name)
+            .or_else(|_| std::env::var(env_name.to_lowercase()))
+            .or_else(|_| std::env::var("ALL_PROXY"))
+            .or_else(|_| std::env::var("all_proxy"))
+            .ok()?,
+        None => return None,
+    };
     let env_val = env_val.trim();
     if env_val.is_empty() {
         return None;

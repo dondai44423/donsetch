@@ -81,7 +81,7 @@ impl Daemon {
             let sessions = crate::ghost::cache::load_session_cookies();
             fetcher.import_cookies(&sessions).await;
             // Tier-1 jar persistence (v4 phase 1.4), kill-switched.
-            if !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") {
+            if crate::config::cfg().state.cookie_vault {
                 let jar = state.lock().await.tier1_cookies.clone();
                 fetcher.import_cookies(&jar).await;
             }
@@ -140,7 +140,7 @@ impl Daemon {
     /// Called once the daemon is inside its runtime; one-shot CLI
     /// paths never call it, so short-lived processes stay clean.
     pub fn start_prober(self: &Arc<Self>) {
-        if crate::config::env_flag("DONSETCH_NO_ROUTE_PROBES") {
+        if !crate::config::cfg().browser.route_probes {
             return;
         }
         let handle = crate::ghost::probe::spawn(Arc::clone(&self.fetcher), Arc::clone(&self.state));
@@ -186,7 +186,7 @@ impl Daemon {
             // Reset is wholesale: keep the tier-1 jar (device /
             // analytics cookies the browser-real daemon already
             // holds) so a login resync does not erase the session.
-            if !crate::config::env_flag("DONSETCH_NO_COOKIE_VAULT") {
+            if crate::config::cfg().state.cookie_vault {
                 cookies.extend(self.state.lock().await.tier1_cookies.clone());
             }
             self.fetcher.reset_to(&cookies).await;

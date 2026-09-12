@@ -363,8 +363,9 @@ fn probe_installed() -> Option<(u32, bool)> {
 /// Windows: read the major version + brand truth from the browser's
 /// own `BLBeacon\version` registry value. The key family decides the
 /// brand: `Software\Google\Chrome` = Google-branded; Chromium/Edge/
-/// Thorium report their own (non-Google) brands. Honours `DONGHOST_CHROME`
-/// by probing the browser family it names first.
+/// Thorium report their own (non-Google) brands. Honours the configured
+/// `browser.chromium_path` (legacy `DONGHOST_CHROME`) by probing the
+/// browser family it names first.
 #[cfg(windows)]
 fn probe_registry() -> Option<(u32, bool)> {
     use windows_sys::Win32::System::Registry as reg;
@@ -376,10 +377,13 @@ fn probe_registry() -> Option<(u32, bool)> {
         ("Software\\Microsoft\\Edge\\BLBeacon", false),
         ("Software\\Thorium\\BLBeacon", false),
     ];
-    // Sort DONGHOST_CHROME's family to the front if it doesn't already
-    // lead : cheap, and makes the explicit choice authoritative.
-    if let Some(p) = std::env::var_os("DONGHOST_CHROME") {
-        let p = p.to_string_lossy().to_lowercase();
+    // Sort the configured browser's family to the front if it doesn't
+    // already lead : cheap, and makes the explicit choice authoritative.
+    // `browser.chromium_path` already layers the legacy DONGHOST_CHROME
+    // env var, so the config value is the single source here.
+    let configured = &crate::config::cfg().browser.chromium_path;
+    if !configured.is_empty() {
+        let p = configured.to_lowercase();
         for (family, key, branded) in [
             ("thorium", "Software\\Thorium\\BLBeacon", false),
             ("chrome", "Software\\Google\\Chrome\\BLBeacon", true),
@@ -551,6 +555,23 @@ fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
 fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Result<String, String> {
     use std::io::Read;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // Own process group: the timeout kill must reach the
+                // browser's descendants too, or they inherit the
+                // stdout pipe and hang the reader join forever (the
+                // itoqa-found doctor hang).
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn browser version probe: {e}"))?;
@@ -647,7 +668,14 @@ fn kill_probe_tree(pid: Option<u32>) {
     }
     #[cfg(not(windows))]
     unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+        // Kill the WHOLE group: the browser's descendants inherit the
+        // parent's stdout pipe, and only when every write end is dead
+        // does the reader thread see EOF and the join return. Killing
+        // just the parent left the pipe held open and doctor hung
+        // forever (itoqa 2026-09-11). The child runs in its own group
+        // via pre_exec setpgid, so the negative pid hits it and every
+        // descendant, not our own process group.
+        libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
@@ -695,6 +723,26 @@ mod locale_tests {
 #[cfg(test)]
 mod probe_tests {
     use super::{BrowserProfile, Platform, parse_version_major, parse_version_string};
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_timeout_kills_descendants_and_returns_bounded() {
+        use super::spawn_probe_with_timeout;
+        // A wedged browser's descendant holds the stdout pipe. Pre-fix
+        // this hung FOREVER: the timeout killed only the parent, the
+        // grandchild kept the pipe open, and the stdout join never saw
+        // EOF. Post-fix the whole group dies and the probe fails in
+        // ~PROBE_SPAWN_TIMEOUT. A wild sleep 300 guards the fixture.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & wait; echo never")
+            .stdout(std::process::Stdio::piped());
+        let start = std::time::Instant::now();
+        let out = spawn_probe_with_timeout(cmd);
+        assert!(out.is_err(), "a wedged probe must fail, not hang");
+        let secs = start.elapsed().as_secs();
+        assert!(secs < 15, "probe must be bounded, took {secs}s");
+    }
 
     #[test]
     fn brand_lists_match_chrome_151_capture() {

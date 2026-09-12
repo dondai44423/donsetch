@@ -305,10 +305,20 @@ fn env_roots_fingerprint() -> Vec<(std::path::PathBuf, u64, u64)> {
 }
 
 fn env_root_paths() -> Vec<std::path::PathBuf> {
-    std::env::vars_os()
-        .filter_map(|(k, v)| (k == "SSL_CERT_FILE" || k == "SSL_CERT_DIR").then_some(v))
-        .map(std::path::PathBuf::from)
-        .collect()
+    let cfg = crate::config::cfg();
+    let mut out = Vec::new();
+    if !cfg.tls.cert_file.trim().is_empty() {
+        out.push(std::path::PathBuf::from(&cfg.tls.cert_file));
+    }
+    if !cfg.tls.cert_dir.trim().is_empty() {
+        out.push(std::path::PathBuf::from(&cfg.tls.cert_dir));
+    }
+    for (k, v) in std::env::vars_os() {
+        if k == "SSL_CERT_FILE" || k == "SSL_CERT_DIR" {
+            out.push(std::path::PathBuf::from(v));
+        }
+    }
+    out
 }
 
 fn read_env_roots() -> Vec<X509> {

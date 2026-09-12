@@ -142,7 +142,7 @@ pub async fn solve(
             }
         }
 
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[ghost] t={:.0?} html={}B verdict={:?} challenged={} streak={}",
                 start.elapsed(),
@@ -281,7 +281,7 @@ pub async fn ghost_fetch(
         html = match ghost.outer_html().await {
             Ok(h) => h,
             Err(e) => {
-                if std::env::var_os("DONGHOST_DEBUG").is_some() {
+                if crate::config::cfg().debug.ghost {
                     eprintln!(
                         "[ghost_fetch] outer_html err at t={:?}: {e}",
                         start.elapsed()
@@ -509,7 +509,7 @@ pub async fn ghost_fetch(
         }
         let dead_threshold = if cur_len < 5000 { 8 } else { 15 };
         if dead_streak >= dead_threshold {
-            if std::env::var_os("DONGHOST_DEBUG").is_some() {
+            if crate::config::cfg().debug.ghost {
                 eprintln!(
                     "[ghost_fetch] dead DOM: static + visible<80 for {dead_streak} polls, exiting early"
                 );
@@ -519,7 +519,7 @@ pub async fn ghost_fetch(
 
         prev_len = cur_len;
 
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[ghost_fetch] t={:.0?} html={}B visible={} challenged=false streak={} dead={}",
                 start.elapsed(),
@@ -545,7 +545,7 @@ pub async fn ghost_fetch(
     // checks visible text first.
     let final_verdict = walls::detect_dom_smart(html.as_bytes());
     if matches!(final_verdict, Verdict::Challenge(_) | Verdict::Blocked) {
-        if std::env::var_os("DONGHOST_DEBUG").is_some() {
+        if crate::config::cfg().debug.ghost {
             eprintln!(
                 "[ghost_fetch] timeout on challenge page ({:?}), flagging as captcha",
                 final_verdict
