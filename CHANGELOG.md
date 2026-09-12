@@ -181,6 +181,9 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+- `donsetch config show --markdown` now emits one complete Markdown table per
+  config section, so section labels no longer turn the following knob rows
+  into plain paragraphs.
 - The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by

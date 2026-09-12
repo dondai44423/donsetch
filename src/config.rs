@@ -2045,7 +2045,6 @@ pub fn show_text(loaded: &Loaded) -> String {
 /// The knob reference table as markdown (single source: this file).
 pub fn show_markdown() -> String {
     let mut out = String::new();
-    out.push_str("| Key | Type | Default | What it does |\n|---|---|---|---|\n");
     let mut last_section = "";
     for (section, key, kind, default, doc) in fieldbook() {
         let section = *section;
@@ -2057,7 +2056,11 @@ pub fn show_markdown() -> String {
             FieldKind::List => "list",
         };
         if section != last_section {
-            out.push_str(&format!("\n**`[{section}]`**\n\n"));
+            if !last_section.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("**`[{section}]`**\n\n"));
+            out.push_str("| Key | Type | Default | What it does |\n|---|---|---|---|\n");
             last_section = section;
         }
         let esc = |s: &str| s.replace('|', "\\|");
@@ -2576,26 +2579,68 @@ mod tests {
         drop(guard);
     }
 
-    /// Markdown tables must never split a row: raw pipes in defaults
-    /// and descriptions are escaped ("\\|"), so a data row has the
-    /// same " | " separator count as the header (4 = 4 columns).
+    /// Each section must be a complete Markdown table: a section label,
+    /// then a contiguous header, delimiter, and exactly one row per knob.
+    /// Raw pipes in cells stay escaped so they cannot split a row.
     #[test]
-    fn show_markdown_keeps_one_row_per_knob() {
+    fn show_markdown_renders_one_complete_table_per_section() {
         let md = super::show_markdown();
-        let header_cols = md.lines().next().unwrap().matches(" | ").count();
-        let data_rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| `")).collect();
-        assert!(data_rows.len() > 50, "fieldbook shrunk?");
-        for row in &data_rows {
-            assert_eq!(
-                row.matches(" | ").count(),
-                header_cols,
-                "row split by an unescaped pipe: {row}"
-            );
+        let blocks: Vec<&str> = md.trim().split("\n\n").collect();
+        let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (section, key, _, _, _) in fieldbook() {
+            if sections.last().map(|(name, _)| *name) != Some(*section) {
+                sections.push((*section, Vec::new()));
+            }
+            sections.last_mut().unwrap().1.push(*key);
         }
+
+        assert_eq!(
+            blocks.len(),
+            sections.len() * 2,
+            "each section must render as one label block and one table block"
+        );
+        let (block_pairs, remainder) = blocks.as_slice().as_chunks::<2>();
+        assert!(remainder.is_empty());
+
+        let mut row_count = 0;
+        for ((section, keys), pair) in sections.iter().zip(block_pairs) {
+            assert_eq!(pair[0], format!("**`[{section}]`**"));
+
+            let lines: Vec<&str> = pair[1].lines().collect();
+            assert_eq!(
+                lines.first().copied(),
+                Some("| Key | Type | Default | What it does |")
+            );
+            assert_eq!(
+                lines.get(1).copied(),
+                Some("|---|---|---|---|"),
+                "section {section} has no Markdown table delimiter"
+            );
+            assert_eq!(
+                lines.len() - 2,
+                keys.len(),
+                "section {section} does not have one row per knob"
+            );
+
+            for (row, key) in lines[2..].iter().zip(keys) {
+                assert!(
+                    row.starts_with(&format!("| `{key}` | ")),
+                    "section {section} lost or reordered knob {key}: {row}"
+                );
+                assert_eq!(
+                    row.matches(" | ").count(),
+                    3,
+                    "row split by an unescaped pipe: {row}"
+                );
+                row_count += 1;
+            }
+        }
+        assert_eq!(row_count, fieldbook().len());
+
         // The transport.kind description does contain a pipe; the escape
         // must have fired on it.
-        let kind_row = data_rows
-            .iter()
+        let kind_row = md
+            .lines()
             .find(|l| l.contains("`kind`"))
             .expect("transport.kind not in the table");
         assert!(kind_row.contains("\\|"), "kind row lost its escaped pipe");
