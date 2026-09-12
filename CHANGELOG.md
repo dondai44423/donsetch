@@ -170,6 +170,11 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- HTTP bearer configuration now fails closed: modern TOML/env tokens reject
+  whitespace and non-visible bytes without echoing the secret, while legacy
+  text tokens retain their exact historical value instead of being trimmed
+  into disabled authentication. CORS/auth validation also runs before daemon
+  work.
 - The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by

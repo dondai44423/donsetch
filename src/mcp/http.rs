@@ -100,10 +100,8 @@ struct HttpState {
 
 /// Run the HTTP MCP server until SIGTERM/SIGINT.
 pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let daemon = Arc::new(Daemon::new().await.map_err(|e| e.to_string())?);
-    daemon.start_prober();
     let t = crate::config::cfg().transport.clone();
-    let auth_token = (!t.token.trim().is_empty()).then_some(t.token.trim().to_string());
+    let auth_token = crate::config::configured_http_token(&t.token).map(str::to_owned);
     let auth_enabled = auth_token.is_some();
     let timeout = Duration::from_secs(t.timeout_secs);
 
@@ -113,6 +111,11 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
     // Browser-based clients can opt in with [transport] cors = true.
     let cors_enabled = t.cors;
     validate_http_config(cors_enabled, auth_enabled)?;
+
+    // Configuration must fail before daemon construction starts background
+    // work or touches persistent state.
+    let daemon = Arc::new(Daemon::new().await.map_err(|e| e.to_string())?);
+    daemon.start_prober();
 
     let state = HttpState {
         daemon: Arc::clone(&daemon),
@@ -588,9 +591,22 @@ mod tests {
     fn token_ok_no_token_configured_allows_all() {
         assert!(token_ok(None, &HeaderMap::new()));
         assert!(token_ok(None, &headers_with_bearer(Some("anything"))));
-        // run() filters empty env tokens, but the pure function still
-        // treats a configured (even empty) token as auth-on.
+        // The pure matcher treats Some as auth-on; configured_http_token is
+        // the single boundary that maps an exact empty value to None.
         assert!(!token_ok(Some(""), &HeaderMap::new()));
+    }
+
+    #[test]
+    fn legacy_token_is_compared_without_trimming() {
+        let expected = crate::config::configured_http_token(" padded token ");
+        assert!(token_ok(
+            expected,
+            &headers_with_bearer(Some(" padded token "))
+        ));
+        assert!(!token_ok(
+            expected,
+            &headers_with_bearer(Some("padded token"))
+        ));
     }
 
     #[test]
