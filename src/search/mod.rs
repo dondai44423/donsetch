@@ -108,8 +108,12 @@ fn norm_query(q: &str) -> String {
         "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "at", "to", "for", "and",
         "or", "what", "which", "how", "do", "does", "i", "you", "it",
     ];
+    // '+' is kept (as the intent tokenizer does): stripping it made
+    // "rust vs c++ performance" and "rust vs c performance" share
+    // one cache key, serving the first query's results to the
+    // second as cached.
     q.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric() && c != '+')
         .filter(|w| !w.is_empty() && !STOP.contains(w))
         .collect::<Vec<_>>()
         .join(" ")
@@ -169,6 +173,10 @@ pub struct Searcher {
     /// leader's result. Stampedes are an agent reality
     /// (parallel tool calls love the same query).
     inflight: Mutex<std::collections::HashSet<String>>,
+    /// BYOK single-flight: a metered provider is not re-billed by a
+    /// concurrent identical query (the local fan-out has `inflight`
+    /// for the same reason). Keyed on the byok cache key.
+    byok_inflight: Mutex<std::collections::HashSet<String>>,
     /// v3 warm handoff: enrichment bodies cached for the
     /// subsequent `web_fetch` of a top result (search → fetch
     /// is THE agent pipeline). One-shot, TTL'd, bounded.
@@ -240,6 +248,7 @@ impl Searcher {
             cache: Mutex::new(load_cache_disk()),
             failures: Mutex::new(failures),
             inflight: Mutex::new(std::collections::HashSet::new()),
+            byok_inflight: Mutex::new(std::collections::HashSet::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
             ghost: None,
         }
@@ -305,6 +314,51 @@ impl Searcher {
     /// Issue #195: persist a fresh BYOK outcome under the BYOK key
     /// namespace, TTL'd like the local cache. Skips an empty result
     /// set (the provider path errors on empty, so this is defensive).
+    /// The single-flight key for a BYOK query: the byok cache key,
+    /// deliberately NOT carrying max_results (the leader publishes
+    /// the provider's full top-12, so a max=2 caller and a max=10
+    /// caller share one provider round-trip).
+    pub fn byok_flight_key(&self, query: &str, intent: Intent) -> String {
+        byok_cache_key(query, intent)
+    }
+
+    /// BYOK single-flight: a concurrent identical query JOINS the
+    /// leader's provider round-trip instead of double-billing the
+    /// metered provider. Followers poll the byok cache (the leader
+    /// publishes there before filtering); a leader that dies or
+    /// stalls past 12s computes itself, exactly like the local
+    /// fan-out flight above.
+    pub async fn byok_flight(
+        &self,
+        key: String,
+        query: &str,
+        intent: Intent,
+        max: usize,
+        compute: impl std::future::Future<Output = Result<SearchOutcome, String>>,
+    ) -> Result<SearchOutcome, String> {
+        let leader = {
+            let mut m = self
+                .byok_inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            m.insert(key.clone())
+        };
+        if !leader {
+            for _ in 0..120 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Some(hit) = self.byok_cache_get(query, intent, max) {
+                    return Ok(hit);
+                }
+            }
+            // Leader died or stalled : compute ourselves.
+        }
+        let _guard = InflightGuard {
+            map: &self.byok_inflight,
+            key,
+        };
+        compute.await
+    }
+
     pub fn byok_cache_put(&self, query: &str, out: &SearchOutcome) {
         if out.results.is_empty() {
             return;
@@ -442,7 +496,7 @@ impl Searcher {
                         cached: true,
                         elapsed: started.elapsed(),
                         provider: None,
-                        reranked: crate::search::rerank::active(),
+                        reranked: crate::search::rerank::loaded(),
                     });
                 }
             }
@@ -487,7 +541,7 @@ impl Searcher {
                 cached: true,
                 elapsed: started.elapsed(),
                 provider: None,
-                reranked: crate::search::rerank::active(),
+                reranked: crate::search::rerank::loaded(),
             });
         }
 
@@ -848,29 +902,36 @@ impl Searcher {
         // degraded-period results expire with the moment.
         let cacheable = ok_engines >= 2 && total >= 8;
         if cacheable {
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // LRU-ish cap: drop oldest when full.
-            if cache.len() >= 500
-                && let Some(oldest) = cache
-                    .iter()
-                    .max_by_key(|(_, (at, _, _, _))| at.elapsed())
-                    .map(|(k, _)| k.clone())
-            {
-                cache.remove(&oldest);
-            }
-            cache.insert(
-                cache_key,
-                (
-                    Instant::now(),
-                    results.iter().take(12).cloned().collect(),
-                    total,
-                    report.clone(),
-                ),
-            );
-            save_cache_disk(&cache);
+            let snapshot = {
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // LRU-ish cap: drop oldest when full.
+                if cache.len() >= 500
+                    && let Some(oldest) = cache
+                        .iter()
+                        .max_by_key(|(_, (at, _, _, _))| at.elapsed())
+                        .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                }
+                cache.insert(
+                    cache_key,
+                    (
+                        Instant::now(),
+                        results.iter().take(12).cloned().collect(),
+                        total,
+                        report.clone(),
+                    ),
+                );
+                cache.clone()
+                // Serialize + write with NO lock held: the save is a
+                // 1-2MB JSON write, and holding the cache mutex
+                // across it queued every cache hit and every
+                // single-flight follower poll behind one disk write.
+            };
+            save_cache_disk(&snapshot);
         }
 
         // Persist learned engine health once per search (single
@@ -896,7 +957,7 @@ impl Searcher {
             cached: false,
             elapsed: started.elapsed(),
             provider: None,
-            reranked: crate::search::rerank::active(),
+            reranked: crate::search::rerank::loaded(),
         })
     }
 

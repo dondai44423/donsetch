@@ -286,7 +286,7 @@ impl EgressPool {
         }
         self.dead
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(egress_id.to_string(), Instant::now() + BURN_COOLDOWN);
     }
 
@@ -312,7 +312,7 @@ impl EgressPool {
         self.stress_record(false);
         self.dead
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(egress_id.to_string(), Instant::now() + AUTH_BAN);
     }
 

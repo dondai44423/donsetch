@@ -211,7 +211,11 @@ impl Fetcher {
 
         // Fresh-window cache hit: no request at all (browser-true).
         // Probes (v4 phase 0.2) skip this: a cached page is not
-        // evidence about the wall RIGHT NOW.
+        // evidence about the wall RIGHT NOW. The cache key carries
+        // the cookie lane: a jar-less search lane must never be
+        // served a body the logged-in jar fetched (and vice versa),
+        // the same reason browsers key on credentials.
+        let cache_key = format!("{}|{url_str}", if use_jar { "jar" } else { "bare" });
         let check = {
             let cache = self
                 .cache
@@ -220,7 +224,7 @@ impl Fetcher {
             if skip_cache {
                 CacheCheck::None
             } else {
-                cache.check(url_str)
+                cache.check(&cache_key)
             }
         };
         let conditional = match check {
@@ -291,14 +295,22 @@ impl Fetcher {
             // cookie-warm retry below can already ride cookies this
             // hop just set.
 
-            // 304: merge body from cache.
-            if out.status == 304
-                && let Some((body, status, headers)) = self
+            // 304: merge body from cache. A 304 whose entry is gone
+            // (evicted between the conditional check and the
+            // response) is UNUSABLE: falling through used to score
+            // the empty body as Blocked and record a wall that never
+            // existed. Fail honestly; the caller retries.
+            if out.status == 304 {
+                let merged = self
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .stored(&current)
-            {
+                    .stored(&cache_key);
+                let Some((body, status, headers)) = merged else {
+                    return Err(FetchError::Http(
+                        "304 revalidation with no stored entry (cache evicted mid-flight)".into(),
+                    ));
+                };
                 out.status = status;
                 out.headers = headers;
                 out.body = body;
@@ -354,6 +366,11 @@ impl Fetcher {
                 _ => {
                     out.verdict = walls::detect(out.status, &out.headers, &out.body);
 
+                    // Cache key for the URL that actually produced this
+                    // body (a redirect chain lands here with `current`
+                    // = the final hop, not the original url).
+                    let hop_key = format!("{}|{current}", if use_jar { "jar" } else { "bare" });
+
                     // Only real content enters the revalidation cache.
                     // A challenge interstitial with an ETag would
                     // otherwise be re-served fresh as "content" on
@@ -364,7 +381,7 @@ impl Fetcher {
                             .cache
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        cache.store(&current, out.status, &out.headers, &out.body);
+                        cache.store(&hop_key, out.status, &out.headers, &out.body);
                     }
 
                     // Wall pushed back. If it left a cookie, do ONE
@@ -384,7 +401,7 @@ impl Fetcher {
                                 .cache
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            cache.store(&current, retry.status, &retry.headers, &retry.body);
+                            cache.store(&hop_key, retry.status, &retry.headers, &retry.body);
                         }
                         out = retry;
                     }
@@ -541,7 +558,7 @@ impl Fetcher {
                 .jar
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cookie) = jar.header_for(host, &path, is_https) {
+            if let Some(cookie) = jar.header_for(host, url.path(), is_https) {
                 // Chrome 151 capture: cookie sits after sec-fetch-dest,
                 // before accept-encoding.
                 let pos = req_headers
@@ -679,7 +696,10 @@ impl Fetcher {
                     // exactly the ma= lifetime the server vouched.
                     if is_https
                         && proxy.is_none()
-                        && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
+                        && let Some((_, hdr_alt)) = out
+                            .headers
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case("alt-svc"))
                     {
                         crate::transport::routes::absorb_alt_svc(&origin, hdr_alt, "direct");
                     }
@@ -718,7 +738,10 @@ impl Fetcher {
                     // only when the server announced it for the same origin.
                     if is_https
                         && proxy.is_none()
-                        && let Some((_, hdr_alt)) = out.headers.iter().find(|(n, _)| n == "alt-svc")
+                        && let Some((_, hdr_alt)) = out
+                            .headers
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case("alt-svc"))
                     {
                         crate::transport::routes::absorb_alt_svc(&origin, hdr_alt, "direct");
                     }
@@ -775,6 +798,16 @@ impl Fetcher {
         req_headers: &[(String, String)],
         proxy: Option<&proxy::Proxy>,
     ) -> Result<FetchOutcome, FetchError> {
+        // Session key for the TLS session store (egress-scoped: the
+        // proxy id when proxied, else the bare host). tls::connect
+        // inserts under THIS key, so the TFO warm check must read the
+        // same one: the pooled-origin form (authority, proxy-prefixed)
+        // never matches on a non-default port or a proxied lane, and
+        // TFO then never arms despite a cached session.
+        let session_key = match proxy {
+            Some(p) => format!("{}|{}", p.id(), host),
+            None => host.to_string(),
+        };
         // Dial: https through an HTTP proxy goes through a CONNECT
         // tunnel; plaintext http:// through an HTTP proxy goes RAW
         // with an absolute-form request line (RFC 9112 3.2.2) —
@@ -783,7 +816,7 @@ impl Fetcher {
         let tcp = match proxy {
             Some(p) if !is_https && p.is_http_connect() => p.connect_tcp().await?,
             Some(p) => p.connect(host, port).await?,
-            None => tcp::happy_connect_with(host, port, self.sessions_has(origin)).await?,
+            None => tcp::happy_connect_with(host, port, self.sessions_has(&session_key)).await?,
         };
 
         // ── Plaintext http://: raw TCP straight into h1. ──
@@ -832,10 +865,6 @@ impl Fetcher {
             );
         }
 
-        let session_key = match proxy {
-            Some(p) => format!("{}|{}", p.id(), host),
-            None => host.to_string(),
-        };
         // Http CONNECT hops get the interception-safe handshake:
         // they are almost always TLS-terminating middleboxes whose
         // second stack can reset on GREASE/ALPS/compress_cert, and
@@ -941,7 +970,7 @@ fn finish(
 ) -> Result<FetchOutcome, FetchError> {
     let encoding = headers
         .iter()
-        .find(|(n, _)| n == "content-encoding")
+        .find(|(n, _)| n.eq_ignore_ascii_case("content-encoding"))
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
     let body = decompress::decompress(&encoding, &body)?;

@@ -180,7 +180,15 @@ where
                     // failed tail: every byte that reached the dead
                     // child's pipe is uncertain, and duplicate
                     // delivery is cheaper than a lost request.
-                    pending = replay_window(std::mem::take(&mut written), &bytes);
+                    // Fold in anything already held: a replay that
+                    // failed against the previous child left `pending`
+                    // populated with `written` cleared, and replacing
+                    // it here would silently drop the held request
+                    // one restart deeper (the exact loss this replay
+                    // window exists to prevent).
+                    let mut held = std::mem::take(&mut pending);
+                    held.extend_from_slice(&bytes);
+                    pending = replay_window(std::mem::take(&mut written), &held);
                     eprintln!("[supervisor] daemon died mid-write : holding request for restart");
                     restart_child(c, &mut restarts, born.elapsed());
                     child = None;

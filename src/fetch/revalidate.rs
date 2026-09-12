@@ -97,8 +97,17 @@ impl RevalidationCache {
         }
         let etag = get("etag");
         let last_modified = get("last-modified");
-        let fresh_until = parse_max_age(&cache_control)
-            .map(|secs| Instant::now() + Duration::from_secs(secs.min(3600)));
+        // RFC 9111 §5.2.2.4: no-cache means "store, but never reuse
+        // without validation". Serving it inside a max-age fresh
+        // window defied the origin's explicit instruction; drop the
+        // fresh window so every hit sends the conditional (the
+        // validators below still make the entry worth storing).
+        let fresh_until = if cache_control.contains("no-cache") {
+            None
+        } else {
+            parse_max_age(&cache_control)
+                .map(|secs| Instant::now() + Duration::from_secs(secs.min(3600)))
+        };
         // Cache only when there's a reason: a validator or a fresh window.
         if etag.is_none() && last_modified.is_none() && fresh_until.is_none() {
             return;
@@ -165,6 +174,27 @@ mod audit_tests {
         assert!(
             matches!(c.check("https://x.test/a"), CacheCheck::None),
             "Vary: * must not be stored (E12)"
+        );
+    }
+
+    // RFC 9111 §5.2.2.4: no-cache is stored but must NEVER be served
+    // without validation. "no-cache, max-age=3600" used to be served
+    // fresh for an hour, defying the origin's explicit instruction.
+    #[test]
+    fn no_cache_stores_but_never_serves_fresh() {
+        let mut c = RevalidationCache::new();
+        c.store(
+            "https://x.test/nc",
+            200,
+            &[
+                ("etag".into(), "\"v1\"".into()),
+                ("cache-control".into(), "no-cache, max-age=3600".into()),
+            ],
+            b"body",
+        );
+        assert!(
+            matches!(c.check("https://x.test/nc"), CacheCheck::Revalidate(_)),
+            "no-cache must send the conditional on every hit"
         );
     }
 

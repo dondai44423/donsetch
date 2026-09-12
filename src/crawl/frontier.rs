@@ -135,7 +135,11 @@ pub fn normalize(url: &Url) -> String {
     {
         let _ = u.set_port(None);
     }
-    // Strip tracking params, sort the survivors.
+    // Strip tracking params, sort the survivors. query_pairs()
+    // DECODES percent-escapes, so the rebuild must RE-encode:
+    // joining raw `{k}={v}` turned "?a=1%26b=2" into "?a=1&b=2"
+    // (a different resource) and collided distinct URLs in the
+    // seen-set, silently dropping pages.
     let pairs: Vec<(String, String)> = u
         .query_pairs()
         .filter(|(k, _)| !TRACKING_PARAMS.contains(&k.to_lowercase().as_str()))
@@ -146,11 +150,9 @@ pub fn normalize(url: &Url) -> String {
     if pairs.is_empty() {
         u.set_query(None);
     } else {
-        let qs = pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
+        let qs = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .finish();
         u.set_query(Some(&qs));
     }
     if u.path().is_empty() {

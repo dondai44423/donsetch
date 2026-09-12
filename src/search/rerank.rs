@@ -386,6 +386,18 @@ mod inner {
         get().is_some()
     }
 
+    /// True only when the cross-encoder is ALREADY loaded in this
+    /// process. Unlike active(), this NEVER initializes: no
+    /// download, no ONNX session load. The search hot paths (cache
+    /// hits, single-flight followers, report stamps) call this,
+    /// because the first active() caller used to block its tokio
+    /// worker on the whole init chain (a 120s model download + a
+    /// bounded 30s session load). Ranking itself initializes inside
+    /// its own spawn_blocking, off the reactor.
+    pub fn loaded() -> bool {
+        RERANKER.get().is_some_and(|slot| slot.is_some())
+    }
+
     pub fn is_model_cached() -> bool {
         let dir = cache_dir();
         dir.join("model_quantized.onnx").exists() && dir.join("tokenizer.json").exists()
@@ -851,6 +863,9 @@ mod inner {
     pub fn active() -> bool {
         false
     }
+    pub fn loaded() -> bool {
+        false
+    }
     pub fn cross_encoder_scores(_query: &str, _docs: &[(String, String)]) -> Option<Vec<f64>> {
         None
     }
@@ -860,4 +875,4 @@ mod inner {
     pub fn topup(_query: &str, _results: &mut [crate::search::rank::Merged], _depth: usize) {}
 }
 
-pub use inner::{active, cross_encoder_scores, is_model_cached, rerank, topup};
+pub use inner::{active, cross_encoder_scores, is_model_cached, loaded, rerank, topup};

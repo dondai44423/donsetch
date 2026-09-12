@@ -212,7 +212,7 @@ async fn main() {
 /// Falls back to top-level help for unknown commands.
 async fn route_help(cmd: &str) {
     match cmd {
-        "fetch" | "search" | "answer" | "crawl" | "memory" | "screenshot" => {
+        "fetch" | "search" | "crawl" | "screenshot" => {
             // Re-invoke with --help (clap handles the output).
             let help_args = vec!["--help".to_string()];
             let _ = cli::tool::run(cmd, &help_args).await;

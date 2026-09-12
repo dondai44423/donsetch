@@ -148,6 +148,12 @@ impl H2Conn {
         let initial_window = 6_291_456i64;
         let mut stream_window: i64 = initial_window;
         let mut got_headers = false;
+        // RFC 9113: END_STREAM may ride the HEADERS frame that opens
+        // the block OR be implied by the response ending at the final
+        // CONTINUATION (a bodyless response with a fragmented header
+        // block). Only checking the HEADERS frame hung such responses
+        // until the 30s response timeout.
+        let mut end_stream = false;
 
         loop {
             let (hdr, payload) = read_frame(&mut self.stream).await?;
@@ -176,6 +182,14 @@ impl H2Conn {
                             off += 5;
                         }
                         header_frag = payload.get(off..).unwrap_or(&[]).to_vec();
+                        // The block cap below guards CONTINUATION
+                        // accumulation; an unfragmented HEADERS frame
+                        // is bounded only by the 1 MiB frame cap, so
+                        // apply the same documented bound here.
+                        if header_frag.len() > MAX_HEADER_BLOCK {
+                            return Err(FetchError::Http("h2: header block exceeds cap".into()));
+                        }
+                        end_stream = hdr.flags & FLAG_END_STREAM != 0;
                     } else {
                         if header_frag.len() + payload.len() > MAX_HEADER_BLOCK {
                             return Err(FetchError::Http(
@@ -187,6 +201,12 @@ impl H2Conn {
                     if hdr.flags & FLAG_END_HEADERS != 0 {
                         let decoded = self.decoder.decode(&header_frag)?;
                         for (n, v) in decoded {
+                            // HTTP/2 field names are lowercase; a
+                            // nonconforming peer's mixed-case name
+                            // must not dodge the case-sensitive
+                            // content-encoding/alt-svc lookups
+                            // downstream. Normalize like the h1 reader.
+                            let n = n.to_ascii_lowercase();
                             // RFC 9113 §8.2.2: CR/LF in field values is
                             // malformed. Such a value must never reach the
                             // cookie jar : it would split later h1 requests.
@@ -198,14 +218,21 @@ impl H2Conn {
                                 ));
                             }
                             if n == ":status" {
+                                // Status 0 never exists on the wire:
+                                // missing or unparseable :status is a
+                                // malformed response, not a success
+                                // with a nonsense code.
                                 status = v.parse().unwrap_or(0);
+                                if status == 0 {
+                                    return Err(FetchError::Http("h2: unparseable :status".into()));
+                                }
                             } else if !n.starts_with(':') {
                                 resp_headers.push((n, v));
                             }
                         }
                         got_headers = true;
                         header_frag.clear();
-                        if hdr.ty == HEADERS && hdr.flags & FLAG_END_STREAM != 0 {
+                        if end_stream {
                             break;
                         }
                     }
@@ -283,6 +310,9 @@ impl H2Conn {
         }
         if !got_headers {
             return Err(FetchError::Http("h2: stream ended without headers".into()));
+        }
+        if status == 0 {
+            return Err(FetchError::Http("h2: response missing :status".into()));
         }
         Ok(H2Response {
             status,

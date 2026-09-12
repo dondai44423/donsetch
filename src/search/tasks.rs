@@ -110,6 +110,19 @@ pub(super) async fn engine_task_with_budget(
         Ok(Ok(o)) => o,
     };
     let ms = started.elapsed().as_millis() as u64;
+    // The deadline covers the FETCH only; the decode + DOM parse
+    // below run synchronously after it. A hostile (or
+    // misconfigured-proxy) 64 MiB 200 would then stall the whole
+    // fan-out in html5ever for seconds past the deadline. SERP
+    // pages are small: cap the parse input and treat oversize as a
+    // blocked response.
+    const SERP_BODY_CAP: usize = 3 << 20;
+    if out.body.len() > SERP_BODY_CAP {
+        return (
+            label,
+            Err(("blocked:oversize-serp".into(), egress_id, true)),
+        );
+    }
     let html = crate::extract::charset::decode(
         &out.body,
         out.headers

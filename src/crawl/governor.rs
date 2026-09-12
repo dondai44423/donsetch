@@ -97,6 +97,10 @@ struct HostPenalty {
     /// a long-lived daemon does not grow one struct per host it
     /// ever touched.
     last_seen: Option<Instant>,
+    /// Host-DECLARED pace (robots Crawl-delay), honored in full.
+    /// Per host: a process-global value let two concurrent crawls
+    /// of different hosts cross-pollute each other's pacing.
+    crawl_delay_secs: Option<f64>,
 }
 
 pub struct Governor {
@@ -106,8 +110,6 @@ pub struct Governor {
     hosts: Mutex<HashMap<String, HostPenalty>>,
     /// All lanes in the pool.
     pub lanes_all: Vec<Lane>,
-    /// Honors robots.txt crawl-delay when set (minimum pace).
-    crawl_delay: Mutex<Option<f64>>,
 }
 
 impl Governor {
@@ -116,32 +118,43 @@ impl Governor {
             lanes: Mutex::new(HashMap::new()),
             hosts: Mutex::new(HashMap::new()),
             lanes_all,
-            crawl_delay: Mutex::new(None),
         }
     }
 
-    pub fn set_crawl_delay(&self, d: Option<f64>) {
-        *self
-            .crawl_delay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = d;
-    }
-
-    /// Base delay honoring host-declared crawl-delay.
-    fn base(&self) -> Duration {
-        let cd = self
-            .crawl_delay
+    /// Record a host's robots Crawl-delay as the minimum pace for
+    /// THAT host. Per-host on purpose: the governor is shared by
+    /// every crawl in the process, and a global value let a
+    /// Crawl-delay: 60 crawl slow down an unrelated host's crawl
+    /// (and vice versa: the next crawl reset the first one's pace).
+    pub fn set_host_crawl_delay(&self, host: &str, d: Option<f64>) {
+        let mut hosts = self
+            .hosts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The setter is public: re-clamp here so no caller can
-        // hand `from_secs_f64` a value it panics on.
-        match *cd {
-            Some(s) if s.is_finite() && s > 0.0 => Duration::from_secs_f64(
-                s.min(super::sitemap::MAX_CRAWL_DELAY_SECS)
-                    .max(BASE_DELAY.as_secs_f64()),
-            ),
-            _ => BASE_DELAY,
-        }
+        // The value comes from robots parsing: re-clamp here so no
+        // caller can hand `from_secs_f64` a value it panics on.
+        let clamped = d.filter(|s| s.is_finite() && *s > 0.0);
+        hosts.entry(host.to_string()).or_default().crawl_delay_secs = clamped;
+    }
+
+    /// The host-declared pace floor for `host`, honored in full
+    /// (the only cap is the robots parser's 60s clamp). Hosts with
+    /// no declared delay pace at the ladder, not at this floor.
+    fn crawl_delay_floor(&self, host: &str) -> Duration {
+        let hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hosts
+            .get(host)
+            .and_then(|h| h.crawl_delay_secs)
+            .map(|s| Duration::from_secs_f64(s.min(super::sitemap::MAX_CRAWL_DELAY_SECS)))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Base delay for the adaptive ladder (self-inferred only).
+    fn base(&self) -> Duration {
+        BASE_DELAY
     }
 
     /// Deterministic jitter: remaps a counter into [0.75, 1.25].
@@ -195,6 +208,7 @@ impl Governor {
             .lanes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_lanes(&mut lanes);
         let key = (host.to_string(), lane.to_string());
         let hl = lanes.entry(key).or_default();
         let now = Instant::now();
@@ -204,11 +218,16 @@ impl Governor {
         }
 
         // Compute the new next_allowed: base * 2^rung, jittered,
-        // capped at MAX_LADDER_WAIT (law 11).
+        // capped at MAX_LADDER_WAIT (law 11 : stealth through truth,
+        // never time). The cap bounds only the SELF-INFERRED ladder;
+        // the host-DECLARED crawl-delay floor is honored in full
+        // above it, so a host declaring Crawl-delay: 30 actually
+        // sees 30s pacing instead of the 7s ladder cap.
         let rung_mult = (1u64 << hl.rung.min(MAX_BACKOFF_RUNG)) as f64;
-        let delay = base
+        let ladder = base
             .mul_f64(rung_mult * self.jitter(seq))
             .min(MAX_LADDER_WAIT);
+        let delay = ladder.max(self.crawl_delay_floor(host));
         hl.next_allowed = now + delay;
         Duration::ZERO
     }
@@ -349,6 +368,21 @@ impl Governor {
     }
 }
 
+/// Prune per-(host, lane) pacing clocks the same way prune_hosts
+/// prunes host state: a long-lived daemon crawling many hosts grew
+/// one entry per (host, lane) forever (the "*" boxed-host lane
+/// included). Idle signal = next_allowed in the past by more than
+/// the idle window (no request waited on that clock recently).
+fn prune_lanes(lanes: &mut HashMap<(String, String), HostLane>) {
+    const CAP: usize = 4096;
+    const MAX_IDLE: Duration = Duration::from_secs(3600);
+    if lanes.len() <= CAP {
+        return;
+    }
+    let now = Instant::now();
+    lanes.retain(|_, hl| now.saturating_duration_since(hl.next_allowed) < MAX_IDLE);
+}
+
 /// Prune hosts untouched for over an hour once the map passes
 /// 1024 entries: a penalty box's maximum horizon is minutes, so
 /// dropping hour-old state loses nothing but memory. Also drops
@@ -418,11 +452,32 @@ mod tests {
     fn absurd_crawl_delay_never_panics_and_is_capped() {
         for d in [f64::INFINITY, f64::NAN, 1e300, -1.0, 86400.0] {
             let g = gov(&[LaneKind::Direct]);
-            g.set_crawl_delay(Some(d));
+            g.set_host_crawl_delay("ex.com", Some(d));
             g.wait_for("ex.com", "lane0", 0);
             let w = g.wait_for("ex.com", "lane0", 1);
             assert!(w <= Duration::from_secs(90), "{d}: {w:?}");
         }
+    }
+
+    // v4 law 11: a HOST-DECLARED Crawl-delay is honored in full,
+    // above the 7s self-inferred ladder cap. A host declaring
+    // Crawl-delay: 30 must actually see 30s pacing.
+    #[test]
+    fn declared_crawl_delay_is_honored_above_the_ladder_cap() {
+        let g = gov(&[LaneKind::Direct]);
+        g.set_host_crawl_delay("ex.com", Some(30.0));
+        g.wait_for("ex.com", "lane0", 0);
+        let w = g.wait_for("ex.com", "lane0", 1);
+        assert!(
+            w >= Duration::from_secs(22),
+            "Crawl-delay: 30 must pace at 30s (minus jitter floor), got {w:?}"
+        );
+        // A different host is NOT slowed by this one's declared pace.
+        let g2 = gov(&[LaneKind::Direct]);
+        g2.set_host_crawl_delay("slow.com", Some(30.0));
+        g2.wait_for("fast.com", "lane0", 0);
+        let w2 = g2.wait_for("fast.com", "lane0", 1);
+        assert!(w2 < Duration::from_secs(1), "per-host isolation: {w2:?}");
     }
 
     #[test]

@@ -192,10 +192,30 @@ fn load() -> LoadedCatalog {
             .and_then(|n| n.to_str())
             .unwrap_or("<non-utf8>")
             .to_string();
-        let Ok(meta) = std::fs::metadata(&f) else {
-            continue;
+        // Open FIRST, then stat the open handle: the old
+        // stat-then-read raced a concurrent swap (a file replaced
+        // between the two calls bypassed the size cap entirely) and
+        // a FIFO swapped in could hang read_to_string forever
+        // inside the catalog's OnceLock, wedging the first rewrite.
+        // Reading through the handle bounds the read via take() and
+        // the +1 lets the cap check observe an overrun.
+        let file = match std::fs::File::open(&f) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[adapters] skip plugins/{name}: unreadable: {e}");
+                skips += 1;
+                continue;
+            }
         };
-        if meta.len() > MAX_FILE_BYTES {
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[adapters] skip plugins/{name}: unreadable: {e}");
+                skips += 1;
+                continue;
+            }
+        };
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
             eprintln!(
                 "[adapters] skip plugins/{name}: file is {} bytes (max {MAX_FILE_BYTES})",
                 meta.len()
@@ -203,8 +223,12 @@ fn load() -> LoadedCatalog {
             skips += 1;
             continue;
         }
-        let text = match std::fs::read_to_string(&f) {
-            Ok(t) => t,
+        let mut handle = std::io::BufReader::new(file);
+        let mut text = String::new();
+        let mut reader = std::io::Read::take(&mut handle, MAX_FILE_BYTES.saturating_add(1));
+        let read = std::io::Read::read_to_string(&mut reader, &mut text);
+        let text = match read {
+            Ok(_) => text,
             Err(e) => {
                 eprintln!("[adapters] skip plugins/{name}: unreadable: {e}");
                 skips += 1;

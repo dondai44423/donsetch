@@ -1081,7 +1081,11 @@ impl Ghost {
         // loop below, whose deadline runs concurrently. Real
         // failures surface via the poll loop, and the escalation-
         // level retry rides the warmed session.
-        if let Err(_e) = self
+        // A real Page.navigate error (SSRF guard answered
+        // BlockedByClient, DNS failure) is recorded: the poll loop
+        // below only knows "URL never advanced", which used to hide
+        // the actual cause behind a generic 20s timeout message.
+        let nav_err: Option<String> = match self
             .cdp
             .call_with_timeout(
                 Some(&self.session),
@@ -1090,7 +1094,13 @@ impl Ghost {
                 8,
             )
             .await
-        {}
+        {
+            Err(e) if !e.to_string().contains("cdp timeout") => Some(e.to_string()),
+            // Settle-window timeouts are the documented queue
+            // behavior above; the poll loop is the real referee.
+            _ => None,
+        };
+
         // Poll the target URL until it advances off the initial
         // blank page (about:blank is what createTarget starts at).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -1110,9 +1120,12 @@ impl Ghost {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err(FetchError::ghost(
-                    "navigate: target URL never advanced past about:blank",
-                ));
+                return Err(FetchError::ghost(match &nav_err {
+                    Some(why) => {
+                        format!("navigate: target URL never advanced past about:blank ({why})")
+                    }
+                    None => "navigate: target URL never advanced past about:blank".into(),
+                }));
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }

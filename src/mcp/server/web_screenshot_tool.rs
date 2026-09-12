@@ -19,7 +19,7 @@ const WAIT_MS_MAX: u64 = 5000;
 pub async fn web_screenshot_tool(
     daemon: &Arc<Daemon>,
     args: &Value,
-    _ctx: Option<super::ToolCtx>,
+    mut ctx: Option<super::ToolCtx>,
 ) -> Value {
     let url_in = match args.get("url").and_then(Value::as_str) {
         Some(u) if !u.trim().is_empty() => u.to_string(),
@@ -50,52 +50,70 @@ pub async fn web_screenshot_tool(
         Err(e) => return tool_error(e.to_string()),
     };
 
-    let mut ghost = match daemon
-        .ghost_mgr
-        .acquire_for(&daemon.profile, Some(&host))
-        .await
-    {
-        Ok(g) => g,
-        Err(e) => return tool_error(format!("web_screenshot: no browser: {e}")),
-    };
-
-    if let Err(e) =
-        crate::ghost::ops::ghost_fetch(&mut ghost, target.as_str(), Duration::from_secs(20)).await
-    {
-        return tool_error(format!("web_screenshot: page failed to render: {e}"));
-    }
-    if wait_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-    }
-    let png = match ghost.screenshot_bytes(full_page).await {
-        Ok(b) => b,
-        Err(e) => return tool_error(format!("web_screenshot: capture failed: {e}")),
-    };
-    let b64 = crate::ghost::encode_base64(&png);
-
-    json!({
-        "content": [
+    // The render path honors cancellation and a hard ceiling: the
+    // pool-slot acquire alone can wait on another call's 20-40s
+    // render, and the tool used to observe neither the deadline nor
+    // notifications/cancelled while it did.
+    let work = async {
+        let inner: Result<serde_json::Value, serde_json::Value> = async {
+            let mut ghost = match daemon
+                .ghost_mgr
+                .acquire_for(&daemon.profile, Some(&host))
+                .await
             {
-                "type": "image",
-                "data": b64,
-                "mimeType": "image/png"
-            },
+                Ok(g) => g,
+                Err(e) => return Err(tool_error(format!("web_screenshot: no browser: {e}"))),
+            };
+
+            if let Err(e) =
+                crate::ghost::ops::ghost_fetch(&mut ghost, target.as_str(), Duration::from_secs(20))
+                    .await
             {
-                "type": "text",
-                "text": format!(
-                    "Captured {} ({} view, {} PNG bytes)",
-                    url_in,
-                    if full_page { "full-page" } else { "viewport" },
-                    png.len()
-                )
+                return Err(tool_error(format!(
+                    "web_screenshot: page failed to render: {e}"
+                )));
             }
-        ],
-        "structuredContent": {
-            "ok": true,
-            "url": url_in,
-            "full_page": full_page,
-            "bytes": png.len()
-        },
-        "isError": false
+            if wait_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            }
+            let png = match ghost.screenshot_bytes(full_page).await {
+                Ok(b) => b,
+                Err(e) => return Err(tool_error(format!("web_screenshot: capture failed: {e}"))),
+            };
+            let b64 = crate::ghost::encode_base64(&png);
+            Ok(json!({
+                "content": [
+                    {
+                        "type": "image",
+                        "data": b64,
+                        "mimeType": "image/png"
+                    },
+                    {
+                        "type": "text",
+                        "text": format!(
+                            "Captured {} ({} view, {} PNG bytes)",
+                            url_in,
+                            if full_page { "full-page" } else { "viewport" },
+                            png.len()
+                        )
+                    }
+                ],
+                "structuredContent": {
+                    "ok": true,
+                    "url": url_in,
+                    "full_page": full_page,
+                    "bytes": png.len()
+                },
+                "isError": false
+            }))
+        }
+        .await;
+        match inner {
+            Ok(v) | Err(v) => v,
+        }
+    };
+    super::run_with_budget(work, Some(Duration::from_secs(60)), ctx.as_mut(), || {
+        tool_error("web_screenshot: deadline exceeded (60s)")
     })
+    .await
 }

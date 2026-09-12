@@ -4,7 +4,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+// AsyncBufReadExt carries fill_buf/consume (tokio keeps them on
+// the Ext trait, unlike std); the plain trait bounds the generic.
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use serde_json::Value;
@@ -23,22 +25,69 @@ enum Incoming {
     Eof,
 }
 
-/// `Lines::next_line` reports a line that isn't UTF-8 as
-/// `Err(InvalidData)` -- after consuming it, so the reader is
-/// positioned at the next line. Treating that Err as EOF (the old
-/// `while let Ok(Some(..))`) shut the whole daemon down on one bad
-/// byte from the client, mid-session, with every in-flight tool
-/// call orphaned. Only a real read error or EOF ends the loop.
-async fn next_incoming<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut tokio::io::Lines<R>,
-) -> Incoming {
-    match lines.next_line().await {
-        Ok(Some(l)) => Incoming::Request(l),
-        Ok(None) => Incoming::Eof,
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Incoming::Malformed(e.to_string()),
-        Err(e) => {
-            eprintln!("[mcp] stdin read failed, shutting down: {e}");
-            Incoming::Eof
+/// One stdin line may not exceed this. A legitimate JSON-RPC
+/// request (tools/call arguments) is orders of magnitude below it;
+/// the cap exists so a hostile local client cannot grow the reader
+/// buffer without bound with one endless newline-free write.
+const MAX_LINE_BYTES: usize = 16 << 20;
+
+/// One bounded line. `Lines::next_line` grew its buffer without
+/// bound and reported a non-UTF-8 line as `Err(InvalidData)` after
+/// consuming it, so the reader is positioned at the next line.
+/// Treating that Err as EOF (the old `while let Ok(Some(..))`)
+/// shut the whole daemon down on one bad byte from the client,
+/// mid-session, with every in-flight tool call orphaned. Only a
+/// real read error or EOF ends the loop; an oversized line is
+/// discarded in full and answered with a parse error.
+async fn next_incoming<R: AsyncBufRead + Unpin>(reader: &mut R) -> Incoming {
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut oversized = false;
+    loop {
+        let chunk = match reader.fill_buf().await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                // Byte-level read failures are unrecoverable (no
+                // line framing survives to resync on): shut down
+                // like the old loop did. Non-UTF-8 lines are NOT
+                // this path; they arrive as bytes and fail the
+                // from_utf8 conversion below.
+                eprintln!("[mcp] stdin read failed, shutting down: {e}");
+                return Incoming::Eof;
+            }
+        };
+        match chunk.iter().position(|b| *b == b'\n') {
+            Some(pos) => {
+                buf.extend_from_slice(&chunk[..pos]);
+                reader.consume(pos + 1);
+                if oversized || buf.len() > MAX_LINE_BYTES {
+                    return Incoming::Malformed("request line exceeds the size cap".into());
+                }
+                return match String::from_utf8(buf) {
+                    Ok(l) => Incoming::Request(l),
+                    Err(e) => Incoming::Malformed(e.to_string()),
+                };
+            }
+            None => {
+                if buf.len() + chunk.len() <= MAX_LINE_BYTES {
+                    buf.extend_from_slice(chunk);
+                } else {
+                    oversized = true;
+                }
+                let len = chunk.len();
+                reader.consume(len);
+                if len == 0 {
+                    // EOF. A trailing line without its newline still
+                    // counts (Lines::next_line returned it too).
+                    if oversized {
+                        return Incoming::Malformed("request line exceeds the size cap".into());
+                    }
+                    return match String::from_utf8(buf) {
+                        Ok(l) if !l.is_empty() => Incoming::Request(l),
+                        _ => Incoming::Eof,
+                    };
+                }
+            }
         }
     }
 }
@@ -93,9 +142,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // handshake records what the client renders.
     let mode = Arc::new(ModeCell::new());
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
-        let line = match next_incoming(&mut lines).await {
+        let line = match next_incoming(&mut stdin).await {
             Incoming::Request(l) => l,
             Incoming::Malformed(reason) => {
                 let _ = tx.send(parse_error(&reason)).await;
@@ -152,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_utf8_line_is_skipped_not_eof() {
         let input: &[u8] = b"{\"a\":1}\n\xff\xfe garbage\n{\"b\":2}\n";
-        let mut lines = BufReader::new(input).lines();
+        let mut lines = BufReader::new(input);
         assert!(
             matches!(next_incoming(&mut lines).await, Incoming::Request(l) if l == "{\"a\":1}")
         );

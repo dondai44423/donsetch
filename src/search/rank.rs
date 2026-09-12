@@ -191,7 +191,14 @@ pub fn merge(
     let mut family_best: HashMap<(String, String), f64> = HashMap::new();
     let conceptual = super::intent::is_conceptual(query);
     for (engine, hits) in per_engine {
-        let base = trust.get(engine).copied().unwrap_or(1.0);
+        // Learned trust is keyed by the engine's HEALTH key: the
+        // ddg_html retry lane books its health under "ddg", so a
+        // lookup by the lane label silently fell back to default
+        // trust and discarded everything the loop had learned.
+        let base = trust
+            .get(super::egress::health_key(engine))
+            .copied()
+            .unwrap_or(1.0);
         // Wikipedia on a conceptual query is not a "vertical
         // hint" : it IS the canonical encyclopedia engine.
         // Full weight keeps farm consensus from outranking

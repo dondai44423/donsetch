@@ -204,7 +204,21 @@ fn pypi_json_rw(u: &url::Url) -> Option<String> {
     }
     let ver = parts.next().filter(|v| !v.is_empty());
     // PEP 503 name normalization: case + -_. runs = -
-    let norm = pkg.to_lowercase().replace(['_', '.'], "-");
+    // PEP 503: runs of `-_.` collapse to ONE dash ("zope..interface"
+    // and "zope.interface" both normalize to "zope-interface"); the
+    // old per-char replace kept the run and 404'd the API call.
+    let norm: String = pkg
+        .to_lowercase()
+        .replace(['_', '.'], "-")
+        .chars()
+        .collect::<Vec<char>>()
+        .into_iter()
+        .fold(String::new(), |mut acc, c| {
+            if !(c == '-' && acc.ends_with('-')) {
+                acc.push(c);
+            }
+            acc
+        });
     let api_path = ver.map_or_else(|| format!("{norm}/json"), |v| format!("{norm}/{v}/json"));
     let u2 = url::Url::parse(&format!("https://pypi.org/pypi/{api_path}")).ok()?;
     Some(u2.to_string())
@@ -275,6 +289,14 @@ pub fn extract_json(
     opts: &crate::extract::ExtractOptions,
 ) -> Option<crate::extract::Extracted> {
     if !enabled() {
+        return None;
+    }
+    // Same cut contract as extract_html: focus/toc/must_contain/
+    // section are pipeline features the adapters don't reproduce.
+    // Without this guard, `must_contain` on an adapter-shaped URL
+    // (reddit, npm, PyPI...) silently handed the agent the FULL
+    // document instead of the promised MATCH/NO-MATCH probe.
+    if opts.focus.is_some() || opts.toc || opts.must_contain.is_some() || opts.section.is_some() {
         return None;
     }
     let looks_json = ct.contains("json") || matches!(body.first(), Some(b'{') | Some(b'['));

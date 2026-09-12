@@ -191,9 +191,12 @@ impl HandleTable {
         let dir = crate::paths::cache_dir();
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(".handles.json.tmp");
+        // Owner-only from the first byte: interned link URLs can
+        // carry query-string credentials (?api_key=...), so a
+        // umask-default 0644 staging window is a leak.
         if serde_json::to_vec(&p)
             .map_err(|e| e.to_string())
-            .and_then(|b| std::fs::write(&tmp, b).map_err(|e| e.to_string()))
+            .and_then(|b| crate::config::write_private(&tmp, &b).map_err(|e| e.to_string()))
             .is_ok()
         {
             let _ = std::fs::rename(&tmp, path());

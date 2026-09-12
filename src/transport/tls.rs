@@ -45,12 +45,17 @@ unsafe extern "C" fn cert_decompress_brotli(
         }
         let compressed = std::slice::from_raw_parts(input, in_len);
         let mut decompressed = Vec::with_capacity(uncompressed_len);
-        if std::io::Read::read_to_end(
-            &mut brotli::Decompressor::new(compressed, 1 << 20),
-            &mut decompressed,
-        )
-        .is_err()
-        {
+        // Bounded read: take(cap + 1) makes a hostile stream that
+        // expands past its declared length stop THERE (the +1 lets
+        // read_to_end observe the overrun so the equality check
+        // rejects it), instead of decompressing gigabytes to their
+        // end before the length check fires. UFCS for take: the
+        // Iterator method of the same name otherwise wins inference.
+        let mut reader = std::io::Read::take(
+            brotli::Decompressor::new(compressed, 1 << 20),
+            uncompressed_len as u64 + 1,
+        );
+        if std::io::Read::read_to_end(&mut reader, &mut decompressed).is_err() {
             return 0;
         }
         if decompressed.len() != uncompressed_len {
@@ -229,12 +234,24 @@ pub fn build_quic_ctx_builder(
     }
 
     // Platform-native root store (same trust semantics as h1/h2).
-    let roots = rustls_native_certs::load_native_certs();
+    // Parsed ONCE per process: the QUIC lane builds a fresh Config
+    // per request (quiche consumes the builder), and re-running
+    // load_native_certs + ~150 from_der parses on every h3 request
+    // dwarfed the 0-RTT fast path it exists to serve. Same
+    // process-lifetime assumption as the h1/h2 connectors, which are
+    // also built once at Fetcher::new. The env bundle (SSL_CERT_FILE)
+    // keeps its own identity-keyed cache and stays live per build.
+    static QUIC_ROOTS: std::sync::OnceLock<Vec<boring::x509::X509>> = std::sync::OnceLock::new();
+    let roots = QUIC_ROOTS.get_or_init(|| {
+        rustls_native_certs::load_native_certs()
+            .certs
+            .iter()
+            .filter_map(|c| boring::x509::X509::from_der(c.as_ref()).ok())
+            .collect::<Vec<_>>()
+    });
     let mut loaded = 0usize;
-    for cert in roots.certs {
-        if let Ok(x) = X509::from_der(cert.as_ref())
-            && b.cert_store_mut().add_cert(x).is_ok()
-        {
+    for x in roots.iter().cloned() {
+        if b.cert_store_mut().add_cert(x).is_ok() {
             loaded += 1;
         }
     }

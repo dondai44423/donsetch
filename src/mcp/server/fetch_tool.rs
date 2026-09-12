@@ -145,6 +145,12 @@ pub(super) async fn fetch_multi(
         call_args["max_chars"] = json!(b * 4);
     }
     let progress_parts = ctx.as_ref().map(|c| c.progress_parts());
+    // Cancellation must reach every sub-fetch: the batch used to
+    // drop the ctx entirely, so a cancelled 12-URL batch kept
+    // running every escalation (each holding pool slots) while the
+    // client had already moved on. Each sub-fetch watches a clone
+    // of the same cancel channel.
+    let cancel_rx = ctx.as_ref().map(|c| c.cancel_receiver());
     let n_total = urls.len();
     let futs: Vec<_> = urls
         .iter()
@@ -155,11 +161,22 @@ pub(super) async fn fetch_multi(
             let url = u.clone();
             let dl = deadline;
             let prog = progress_parts.clone();
+            let mut cancel = cancel_rx.clone();
             async move {
-                let v = run_with_budget(fetch_single(&d, &a, &url), dl, None, || {
-                    deadline_error(&url)
-                })
-                .await;
+                let v = match cancel.as_mut() {
+                    Some(rx) => tokio::select! {
+                        v = run_with_budget(fetch_single(&d, &a, &url), dl, None, || {
+                            deadline_error(&url)
+                        }) => v,
+                        _ = rx.changed() => tool_error("cancelled"),
+                    },
+                    None => {
+                        run_with_budget(fetch_single(&d, &a, &url), dl, None, || {
+                            deadline_error(&url)
+                        })
+                        .await
+                    }
+                };
                 if let Some(p) = &prog {
                     emit_progress(
                         p,
@@ -380,13 +397,27 @@ pub(super) fn render_fetch_batch(
     if ok_count == 0 {
         structured["next_action"] =
             json!("inspect the per-URL errors above; retry only transient failures individually");
+        // Classify like the search batch does: an all-permanent
+        // batch (12 SSRF-refused URLs) must not advertise "safe to
+        // retry immediately". No kind anywhere = stay conservative
+        // (transient).
+        let kinds: Vec<&str> = results
+            .iter()
+            .filter(|v| is_err(v))
+            .filter_map(|v| v.get("errorKind").and_then(Value::as_str))
+            .collect();
+        let kind = if kinds.is_empty() {
+            "transient"
+        } else {
+            super::errors::batch_failure_kind(kinds.into_iter())
+        };
         let mut error = tool_error_structured(
             format!(
                 "fetch: all {} urls failed\n\n{}",
                 results.len(),
                 text.trim_end()
             ),
-            "transient",
+            kind,
             Some(structured),
         );
         error["_meta"]["com.donsetch/fetch-batch-debug"] = debug;
@@ -2404,7 +2435,11 @@ pub(super) fn encode_query_value(s: &str) -> String {
 
 /// Wayback timestamp (YYYYMMDDhhmmss) → "YYYY-MM-DD".
 pub(super) fn wayback_date(ts: &str) -> String {
-    if ts.len() >= 8 && ts[..8].chars().all(|c| c.is_ascii_digit()) {
+    // Byte slicing via get(): a hostile archive response carrying a
+    // multibyte char across byte 8 used to panic the slice (and a
+    // panic in a tool task hangs the caller's request with no
+    // response and leaks the cancel-registry entry).
+    if ts.len() >= 8 && ts.as_bytes()[..8].iter().all(|b| b.is_ascii_digit()) {
         format!("{}-{}-{}", &ts[0..4], &ts[4..6], &ts[6..8])
     } else {
         ts.to_string()

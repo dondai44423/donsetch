@@ -38,6 +38,18 @@ pub struct CookieJar {
     vault_domains: std::collections::HashSet<String>,
 }
 
+// RFC 6265 §6.1 the server-side minimums, applied as jar bounds so a
+// hostile Set-Cookie flood cannot grow the jar for process lifetime
+// or emit a multi-megabyte Cookie header: per-cookie 4096 bytes
+// (oversized cookies are dropped, like browsers), 100 per domain,
+// 3000 total (evicting soonest-expiring, session cookies first), and
+// a 4 KiB / 50-pair ceiling on the produced Cookie header.
+const MAX_COOKIE_BYTES: usize = 4096;
+const MAX_COOKIES_PER_DOMAIN: usize = 100;
+const MAX_COOKIES_TOTAL: usize = 3000;
+const MAX_COOKIE_HEADER_BYTES: usize = 4096;
+const MAX_COOKIE_HEADER_PAIRS: usize = 50;
+
 /// Shared RFC 1035 label validation for hosts and domains:
 /// non-empty overall (<=253 bytes), labels 1-63 bytes, no
 /// leading/trailing hyphen, lower-case alnum + hyphen only.
@@ -157,6 +169,13 @@ impl CookieJar {
             let name = name.trim().to_string();
             let value = value.trim().to_string();
             if name.is_empty() {
+                continue;
+            }
+            // RFC 6265 §6.1: at least 4096 bytes per cookie must be
+            // supported; browsers DROP larger ones instead of storing
+            // them. Storing unbounded values let one Set-Cookie
+            // header bloat the jar (and later the Cookie header).
+            if name.len() + value.len() > MAX_COOKIE_BYTES {
                 continue;
             }
             // Control characters in name/value can split the
@@ -292,9 +311,58 @@ impl CookieJar {
                     http_only,
                     same_site,
                 });
+                self.enforce_caps();
             }
         }
         self.purge_expired();
+    }
+
+    /// RFC 6265 §6.1 bounds: at most 100 cookies per domain and 3000
+    /// total. Without them, a hostile host serving 10k unique-named
+    /// Set-Cookie headers per response grew the jar for process
+    /// lifetime (and every later store ran an O(jar) retain scan).
+    /// Eviction is deterministic: soonest-expiring first, session
+    /// cookies (no expiry) first among equals.
+    fn enforce_caps(&mut self) {
+        let evict = |jar: &mut Vec<Cookie>, keep: usize, domain: Option<&str>| {
+            if domain.is_none() && jar.len() <= keep {
+                return;
+            }
+            let over = jar
+                .iter()
+                .filter(|c| domain.is_none_or(|d| c.domain == d))
+                .count()
+                .saturating_sub(keep);
+            if over == 0 {
+                return;
+            }
+            let mut victims: Vec<(usize, u64)> = jar
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| domain.is_none_or(|d| c.domain == d))
+                .map(|(i, c)| (i, c.expires_at.unwrap_or(u64::MAX)))
+                .collect();
+            victims.sort_by_key(|(_, e)| *e);
+            let drop: std::collections::HashSet<usize> =
+                victims.into_iter().take(over).map(|(i, _)| i).collect();
+            let mut idx = 0usize;
+            jar.retain(|_| {
+                let keep_it = !drop.contains(&idx);
+                idx += 1;
+                keep_it
+            });
+        };
+        let domains: Vec<String> = {
+            let last = self.cookies.last();
+            match last {
+                Some(c) => vec![c.domain.clone()],
+                None => vec![],
+            }
+        };
+        for d in domains {
+            evict(&mut self.cookies, MAX_COOKIES_PER_DOMAIN, Some(&d));
+        }
+        evict(&mut self.cookies, MAX_COOKIES_TOTAL, None);
     }
 
     /// Inject a cookie harvested out-of-band (DonGhost
@@ -450,13 +518,30 @@ impl CookieJar {
         }
         // Longest path first, per RFC 6265 §5.4.
         pairs.sort_by_key(|c| std::cmp::Reverse(c.path.len()));
-        Some(
-            pairs
-                .iter()
-                .map(|c| format!("{}={}", c.name, c.value))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
+        // Bound the produced header: RFC 6265 §6.1 requires servers
+        // to accept at least 50 cookies / 4096 bytes, so anything
+        // past that is junk no sane origin needs (and a hostile jar
+        // could emit multi-megabyte request headers).
+        let mut out = String::new();
+        for (count, c) in pairs.iter().enumerate() {
+            if count >= MAX_COOKIE_HEADER_PAIRS {
+                break;
+            }
+            let pair = format!("{}={}", c.name, c.value);
+            if !out.is_empty() {
+                if out.len() + 2 + pair.len() > MAX_COOKIE_HEADER_BYTES {
+                    break;
+                }
+                out.push_str("; ");
+            } else if pair.len() > MAX_COOKIE_HEADER_BYTES {
+                break;
+            }
+            out.push_str(&pair);
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some(out)
     }
 
     /// Drop cookies whose expiry has passed.
@@ -484,9 +569,15 @@ fn parse_http_date(s: &str) -> Option<u64> {
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ];
     let month_of = |m: &str| {
-        MONTHS
-            .iter()
-            .position(|x| m.len() >= 3 && m[..3].eq_ignore_ascii_case(x))
+        // Byte slicing: m arrives from lossy-decoded headers and can
+        // be any UTF-8 string. Slicing a &str at byte 3 panicked on a
+        // multibyte month token ("Expires=Sun, 06 ÄÄx 1994 ...") = a
+        // one-request remote abort of the whole process (panic =
+        // abort in release). as_bytes never panics.
+        MONTHS.iter().position(|x| {
+            let b = m.as_bytes();
+            b.len() >= 3 && b[..3].eq_ignore_ascii_case(x.as_bytes())
+        })
     };
     let secs_of = |y: i64, mo: usize, d: i64, hh: i64, mm: i64, ss: i64| {
         if !(1..=12).contains(&(mo as i64 + 1)) || !(1..=31).contains(&d) {

@@ -557,7 +557,7 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_search",
         cli_cmd: "search",
-        summary: "Web search : 5 keyless engines merged + reranked, or your API keys",
+        summary: "Web search : 10+ keyless engines merged + reranked, or your API keys",
         description: "Web search : returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nEach result is one compact evidence row: fetch handle (or raw URL), title, host, focused snippet, and a browser-cost warning only when relevant. Rank already represents DonSeTch's scoring decision, so per-engine scores and timing are not repeated in model context. Weak or degraded retrieval remains explicitly labeled. Multi-query mode keeps one clearly labeled ranked section per formulation.\n\nEngines: 10+ keyless backends fused by cross-engine consensus + local semantic reranking (automatic). Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over automatically.\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nResponse: content[0].text is the ranked evidence list. structuredContent contains weak plus rank, URL and optional fetch handle for each result; multi-query mode keeps those lists separate. Engine health, score, cache, provider, reranker and timing diagnostics live in _meta.\n\nAfter search: fetch the best result via its S-handle : enrichment pre-fetches top results, so the next fetch is near-instant.",
         mcp_description: "Discover ranked candidate sources. Use this before fetch when you do not already have a URL; it returns titles and snippets, not page contents. A snippet supports only claims it states explicitly. Treat weak or degraded results as incomplete, and fetch a candidate when its full text is required. Search handles resolve directly in fetch; cite source URLs from the result metadata accompanying the ranked list.",
         params: SEARCH_PARAMS,
@@ -714,12 +714,12 @@ sites that need interaction. \
 --archive serves a Wayback snapshot when the live page is dead."
         }
         "search" => {
-            "Search the web across 5 keyless engines, merged with \
+            "Search the web across 10+ keyless engines, merged with \
 consensus ranking (no API keys needed). \
 Every result carries a short handle: donsetch fetch @<handle> \
 fetches it directly. \
 Use --max-results to cap the list and --intent to pick a vertical \
-(web|news|code|docs|pdf|paper|hashun); the default auto-detects. \
+(web|news|code|paper|entity); the default auto-detects. \
 --json gives the full result envelope (titles, snippets, scores, \
 engine health)."
         }

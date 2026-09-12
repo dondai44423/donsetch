@@ -121,16 +121,26 @@ impl Cdp {
         }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        {
+        let send_res = async {
             let mut w = self.write.lock().await;
-            w.send(Message::Text(msg.to_string().into()))
-                .await
-                .map_err(|e| FetchError::ghost(format!("cdp send: {e}")))?;
+            w.send(Message::Text(msg.to_string().into())).await
         }
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
-            .await
-            .map_err(|_| FetchError::ghost(format!("cdp timeout: {method}")))?
-            .map_err(|_| FetchError::ghost(format!("cdp dropped: {method}")))?;
+        .await;
+        if let Err(e) = send_res {
+            self.pending.lock().await.remove(&id);
+            return Err(FetchError::ghost(format!("cdp send: {e}")));
+        }
+        let resp =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+                Ok(r) => r.map_err(|_| FetchError::ghost(format!("cdp dropped: {method}")))?,
+                Err(_) => {
+                    // Drop our entry: a tab that accepts commands but
+                    // never answers used to leak one pending sender per
+                    // call for the life of the warm browser.
+                    self.pending.lock().await.remove(&id);
+                    return Err(FetchError::ghost(format!("cdp timeout: {method}")));
+                }
+            };
         if let Some(err) = resp.get("error") {
             return Err(FetchError::ghost(format!(
                 "cdp {method}: {}",

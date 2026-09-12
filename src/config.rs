@@ -403,19 +403,24 @@ impl config::Source for MapSource {
 
 fn deserialize_layer_table(
     map: &config::Map<String, config::Value>,
-) -> Result<DonsetchConfig, ConfigError> {
+) -> Result<DonsetchConfig, String> {
     let builder = config::Config::builder().add_source(MapSource(map.clone()));
     builder
         .build()
         .and_then(|c| c.try_deserialize::<DonsetchConfig>())
-        .map_err(|e| ConfigError::Env(e.to_string()))
+        .map_err(|e| e.to_string())
 }
 
 /// The file layer path: `DONSETCH_CONFIG` explicit, else the default
 /// location when the file exists. `None` = no file layer.
 fn toml_path() -> Option<std::path::PathBuf> {
     if let Some(explicit) = std::env::var_os("DONSETCH_CONFIG") {
-        return Some(std::path::PathBuf::from(explicit));
+        // An empty value names no file: treating it as unset gives
+        // the conventional shell semantics instead of an error
+        // about a blank path.
+        if !explicit.is_empty() {
+            return Some(std::path::PathBuf::from(explicit));
+        }
     }
     let dir = dirs::config_dir()?;
     let path = dir.join("donsetch").join("donsetch.toml");
@@ -1786,6 +1791,10 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
         let Some(value) = value.to_str() else {
             if (section, key) == ("transport", "token") {
                 errors.push(format!("{name}: {MODERN_HTTP_TOKEN_REQUIREMENT}"));
+            } else {
+                // The modern env layer is strict; a value that is
+                // not even UTF-8 must not silently vanish.
+                warnings.push(format!("ignoring {name}: value is not valid UTF-8"));
             }
             continue;
         };
@@ -1963,7 +1972,23 @@ fn is_secret(section: &str, key: &str) -> bool {
 /// secrets and show as-is; bare non-URL values (never expected in
 /// these fields) mask fully rather than risk a leak.
 fn mask_url_secret(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
+    // A real scheme is [a-z][a-z0-9+.-]* before "://" with no '@'
+    // and no ':' inside the prefix. Checking the prefix matters: a
+    // scheme-less pool entry whose PASSWORD contains "://"
+    // ("user:p://ss@host") used to misfire the find("://")
+    // heuristic and print the username plus a password prefix.
+    let scheme_end = url.find("://").filter(|i| {
+        let prefix = &url[..*i];
+        !prefix.is_empty()
+            && prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+            && prefix
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+    });
+    if let Some(scheme_end) = scheme_end {
         let rest = &url[scheme_end + 3..];
         if let Some(at) = rest.rfind('@') {
             return format!("{}://***@{}", &url[..scheme_end], &rest[at + 1..]);

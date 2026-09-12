@@ -626,8 +626,12 @@ pub fn render_list(cfg: &ByokConfig) {
 
 /// Mask a key for display: show first 8 and last 4 chars.
 fn mask_key(key: &str) -> String {
-    if key.len() <= 14 {
-        return key.to_string();
+    // Every mask shows at most the first 8 + last 4 chars: a key
+    // short enough to be printed whole (<= 14) would leak entirely.
+    if key.chars().count() <= 12 {
+        let n = key.chars().count();
+        let head: String = key.chars().take(n / 3).collect();
+        return format!("{head}***");
     }
     // Char-boundary-safe: a pasted key containing multi-byte chars
     // would panic on a raw byte slice.

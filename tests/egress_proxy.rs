@@ -97,7 +97,7 @@ async fn run_mitm() -> Mitm {
                 } else if head_s.starts_with("GET http://") || head_s.starts_with("POST http://") {
                     // Absolute-form plaintext : respond in the clear.
                     tcp.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nplain-http",
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nplain-http",
                     )
                     .await
                     .ok();

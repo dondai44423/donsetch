@@ -176,6 +176,124 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Master hardening wave (overnight full-tree audit, every finding
+  reproduced before fixing):
+- h1: a connection that closes before Content-Length is satisfied now
+  fails the transport instead of returning the partial body as
+  success. The old reader scored truncated pages clean and stored
+  them in the revalidation cache as Fresh, so every later fetch of
+  that URL served the truncated page forever. The fix caught a lying
+  Content-Length in my own egress-proxy test rig live (it claimed 12
+  bytes and sent 10).
+- h3: a QUIC connection that closes or drains mid-body is an error,
+  same truncated-success class. The route drops and h1/h2 answer.
+- Cookies: a hostile `Set-Cookie` with a multibyte month token in
+  `Expires=` panicked the date parser, and with panic=abort in
+  release that is a one-request remote kill of the daemon. Date
+  tokens now parse by bytes. Cookie path matching uses the URI path
+  only (a path-scoped cookie used to stop attaching on query URLs,
+  against RFC 6265 and every browser). The jar enforces the RFC 6265
+  section 6.1 bounds (4096-byte cookies, 100 per domain, 3000 total,
+  4 KiB / 50-pair Cookie header), so a Set-Cookie flood can neither
+  grow the jar for process lifetime nor emit megabyte headers.
+- Ghost session vault: a live daemon's state save no longer erases
+  fresh harvests or resurrects logged-out sessions. Vault writers
+  (the logout clear, the session store, the tier-1 sync) stamp a
+  vault epoch, and every save adopts whichever side wrote last.
+- Crawl resume-only (empty url + resume token) consumed the token
+  twice, always failed with "resume token expired or unknown", and
+  destroyed the saved state in the process. One take, and the
+  resume-only flow works.
+- Search hot paths no longer initialize the reranker: the first
+  `rerank::active()` on the search path blocked a tokio worker on
+  the whole init chain, up to a 120-second model download. Report
+  stamps now read a non-initializing check; ranking still
+  initializes inside its own spawn_blocking.
+- h2: a bodyless response whose header block arrives fragmented
+  (END_STREAM on HEADERS, END_HEADERS on CONTINUATION) no longer
+  hangs to the 30s timeout; a missing or unparseable `:status` is a
+  transport error instead of a success with status 0; an
+  unfragmented header frame honors the same 256 KiB block cap as
+  continuations; response header names are lowercased like h1 so a
+  nonconforming peer's mixed-case `content-encoding` cannot skip
+  decompression and its `alt-svc` cannot skip h3 discovery.
+- TLS: brotli certificate decompression is bounded by a take() cap;
+  a hostile compress_certificate stream used to decompress to its
+  full (potentially gigabyte) end before the declared-length check
+  fired.
+- Wall detection: bare prose mentions of PerimeterX, Imperva,
+  Incapsula, Sucuri and Wordfence on healthy 200 pages no longer
+  score Challenge (each false positive burned a warm retry, route
+  memory and a paid bypass call). The challenge-specific markers and
+  error-status co-signals still fire, pinned by tests.
+- Revalidation cache: `Cache-Control: no-cache` is honored (stored,
+  never served fresh); entries are keyed by cookie lane, so a
+  jar-less search lane can never be served a logged-in fetch's body
+  or the reverse; a 304 whose entry was evicted mid-flight fails
+  honestly instead of scoring an empty body as Blocked.
+- Crawl: a redirect out of the seed's host, scope, or robots rules
+  is skipped instead of landing in results, dataset and history
+  under its final URL. Frontier normalization re-encodes query
+  strings (distinct URLs with encoded `&`/`=` collided in the
+  seen-set and one of them silently never fetched). A hostile
+  `<priority>NaN</priority>` can no longer poison a resume token.
+  Too-deep items are skipped with a reason instead of aborting the
+  whole crawl and discarding the frontier. A host's declared
+  Crawl-delay is honored in full above the 7s self-inferred cap (a
+  host declaring Crawl-delay: 30 actually sees 30s pacing), stored
+  per host so concurrent crawls stop cross-polluting each other's
+  pacing. The governor prunes idle per-(host, lane) clocks instead
+  of growing them forever.
+- MCP supervisor: a failed replay write followed by new client data
+  no longer drops the held bytes; the held request folds into the
+  new replay window.
+- MCP tools: the fetch batch honors cancellation (a cancelled
+  12-URL batch no longer runs every escalation to completion);
+  web_screenshot honors deadline and cancellation with a 60s
+  ceiling; an all-failed fetch batch classifies permanent vs
+  transient like the search batch instead of always claiming
+  "safe to retry"; a hostile multibyte wayback timestamp no longer
+  panics a byte slice; oversized stdin request lines are bounded
+  and answered with a parse error instead of growing the reader
+  without bound.
+- Search: SERP bodies cap at 3 MiB before the DOM parse (one broken
+  proxy answering 200 with tens of MB stalled the whole fan-out
+  past its deadline). BYOK results carry single-flight, so two
+  concurrent identical queries bill the metered provider once, and
+  the byok cache stores the provider's full top-12 (a first search
+  at max=2 no longer serves later max=10 calls a 2-row slice as
+  cached). Provider error bodies cap at 600 chars. `+` survives
+  cache-key normalization, so "rust vs c++ performance" and "rust
+  vs c performance" stop sharing one cache entry. The search cache
+  serializes to disk outside its lock. The ddg_html retry lane
+  reads its learned trust. Short API keys are never printed whole
+  by `keys list`.
+- Adapters: the JSON fast path honors focus/toc/must_contain/section
+  (must_contain on an adapter-shaped URL used to hand the agent the
+  full document against its own contract). PyPI normalization
+  follows PEP 503 separator runs. The plugin loader opens the file,
+  stats the handle and bounds the read: a swapped FIFO could hang
+  the first rewrite and a swapped file bypass the size cap.
+- h3 lane: DNS resolution runs off the reactor with the same 10s
+  bound as the h1/h2 path; the platform trust store parses once per
+  process instead of per request; the profile's accept-encoding
+  rides the h3 request (bodies arrive compressed and the wire
+  matches Chrome); a server-declared alt-svc ma= is capped at 30
+  days; TLS session warm detection uses the same key the session
+  store writes, so TFO actually arms on non-default ports and
+  proxied lanes.
+- Hygiene: handles.json is written owner-only (interned link URLs
+  can carry query-string credentials); finished shadow-burst
+  handles are reaped in daemons; timed-out CDP calls release their
+  pending slot (a wedged tab used to leak one sender per call); a
+  Page.navigate failure surfaces its real cause instead of a
+  generic 20s timeout; egress dead-proxy and auth-fail reports use
+  poison-recovery locks; config file-layer errors stop labeling
+  themselves "invalid env value"; a non-UTF-8 modern env value
+  warns instead of vanishing; `DONSETCH_CONFIG=""` is treated as
+  unset; `donsetch help` no longer routes the removed answer/memory
+  commands; the search help lists the real intent verticals.
+
 - HTTP bearer configuration now fails closed: modern TOML/env tokens reject
   whitespace and non-visible bytes without echoing the secret, while legacy
   text tokens retain their exact historical value instead of being trimmed

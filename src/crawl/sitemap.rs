@@ -141,7 +141,16 @@ pub fn parse_sitemap(xml: &str, out: &mut Vec<SitemapEntry>, cap: usize) {
         let block = &xml[tag_off..end];
         if let Some(loc) = extract_tag(block, "loc") {
             let lastmod = extract_tag(block, "lastmod");
-            let priority = extract_tag(block, "priority").and_then(|s| s.parse::<f32>().ok());
+            // A hostile <priority>NaN</priority> must not reach the
+            // frontier score: serde_json serializes non-finite floats
+            // as null, and a resume token carrying one would then
+            // fail to load back as "expired or unknown" forever.
+            let priority = extract_tag(block, "priority").and_then(|s| {
+                s.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|f| f.is_finite() && *f >= 0.0 && *f <= 1.0)
+            });
             let is_index = close == "</sitemap>";
             out.push(SitemapEntry {
                 loc,

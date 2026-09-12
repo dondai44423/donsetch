@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
 const MA_DEFAULT: u64 = 3600; // alt-svc without ma= gets Chrome's 1h default
+/// Sanity ceiling on a server-declared ma= (30 days): a hostile
+/// u64::MAX vouch must not pin an h3 route past every eviction.
+const MAX_ALT_SVC_MA_SECS: u64 = 30 * 24 * 3600;
 // routes.json row ceiling (issue #175): everything harder than this
 // is an attack shape or a misdirected campaign, not organic browsing.
 const ROWS_MAX: usize = 512;
@@ -228,7 +231,14 @@ pub fn record_h3(origin: &str, port: u16, ma_secs: u64, egress: &str) {
         let fresh: RouteState = RouteState {
             use_h3: true,
             h3_port: port,
-            valid_until_ms: now_ms() + u128::from(ma_secs).saturating_mul(1000),
+            // Chrome-style sanity cap on a server-declared ma=: a
+            // hostile u64::MAX vouch must not pin the route (and its
+            // 0-RTT ticket) past every eviction as the freshest row
+            // for ~2 billion years. 30 days is Chrome's own ceiling
+            // class; anything longer re-vouches on the next response
+            // anyway.
+            valid_until_ms: now_ms()
+                + u128::from(ma_secs.min(MAX_ALT_SVC_MA_SECS)).saturating_mul(1000),
             egress: egress.to_string(),
             session_b64: session,
         };
@@ -434,6 +444,34 @@ mod tests {
     fn alt_svc_ma_default() {
         let (_, ma) = parse_h3_candidate("h3=\":443\"").unwrap();
         assert_eq!(ma, MA_DEFAULT);
+    }
+
+    // A server-declared ma= is honored, but only up to the 30-day
+    // sanity ceiling: a hostile u64::MAX vouch must not pin the
+    // route (and its 0-RTT ticket) past every eviction as the
+    // freshest row for ~2 billion years.
+    #[test]
+    fn hostile_ma_is_capped_at_the_ceiling() {
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-routes-mamax-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
+        assert_eq!(
+            absorb_alt_svc(
+                "mamax.test",
+                "h3=\":443\"; ma=18446744073709551615",
+                "direct"
+            ),
+            Some((443, 18446744073709551615)),
+            "the parse reports the server's declared ma; the applied lifetime is capped"
+        );
+        let valid_until = with(|mem| mem.routes["mamax.test"].valid_until_ms);
+        assert!(
+            valid_until <= now_ms() + u128::from(MAX_ALT_SVC_MA_SECS) * 1000 + 60_000,
+            "the pinned lifetime must sit at the ceiling, got {valid_until} ms"
+        );
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

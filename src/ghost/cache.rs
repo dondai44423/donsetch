@@ -285,6 +285,34 @@ pub struct GhostState {
     pub profiles: HashMap<String, DomainProfile>,
     #[serde(default)]
     pub renders: HashMap<String, RenderCache>,
+    /// Vault epoch for cross-writer reconciliation: the session
+    /// vault has TWO writer classes (the load-modify-save helpers
+    /// store_session_cookies / clear_session_cookies_for, which
+    /// never touch a daemon's live in-memory snapshot, and the
+    /// snapshot's own sync_tier1_cookies). Every vault writer
+    /// stamps a strictly larger epoch before saving; save() adopts
+    /// the disk side's vault whenever disk carries a newer one, so
+    /// a helper's harvest survives the daemon's next save and a
+    /// logout's deletion is not resurrected by it.
+    #[serde(default)]
+    pub vault_epoch: u64,
+}
+
+/// Process-local bump source for vault epochs. load() seeds the
+/// state with the epoch persisted on disk, so a strictly larger
+/// local stamp is always newer than every disk state this process
+/// has seen.
+static VAULT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stamp `state` as a fresh vault write: strictly newer than the
+/// disk state it was loaded from (load() seeded the epoch from that
+/// file, and disk may already carry a higher stamp written by another
+/// process) and than every earlier in-process stamp.
+fn bump_vault_epoch(state: &mut GhostState) {
+    state.vault_epoch = state
+        .vault_epoch
+        .max(VAULT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        + 1;
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -604,6 +632,7 @@ pub fn store_session_cookies(cookies: &[CookieRecord]) {
             excess -= drop;
         }
     }
+    bump_vault_epoch(&mut state);
     state.save();
 }
 
@@ -664,6 +693,10 @@ pub fn clear_session_cookies_for(domain: &str) -> bool {
     });
     removed |= state.renders.len() != before_r;
     if removed {
+        // Stamp the deletion so a live daemon snapshot (whose
+        // tier1_cookies / renders predate this logout) adopts the
+        // disk side on its next save instead of resurrecting them.
+        bump_vault_epoch(&mut state);
         state.save();
     }
     removed
@@ -1040,6 +1073,12 @@ impl GhostState {
     /// values. Does NOT save: the caller is already inside the
     /// state lock and the outcome record after it saves once.
     pub fn sync_tier1_cookies(&mut self, all: &[CookieRecord]) {
+        // This snapshot is now a tier-1 vault writer: stamp it newer
+        // than the disk state it came from, or a helper's concurrent
+        // logout deletion (disk epoch bump) and this sync could
+        // reorder. Writing without a stamp would also let the NEXT
+        // save adopt a stale disk tier-1 echo over this one.
+        bump_vault_epoch(self);
         if !crate::config::cfg().state.cookie_vault
             || crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off
         {
@@ -1119,6 +1158,7 @@ impl GhostState {
                 self.prewarmed_served_total =
                     self.prewarmed_served_total.max(disk.prewarmed_served_total);
                 self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
+                self.merge_vault_from_disk(&disk);
             }
             if let Ok(s) = serde_json::to_string(self) {
                 let tmp = p.with_extension("json.tmp");
@@ -1152,6 +1192,43 @@ impl GhostState {
                     eprintln!("[ghost] cookie vault persist failed: {e}");
                 }
             }
+        }
+    }
+
+    /// Adopt the disk state's session vault into this snapshot.
+    /// Pure reconciliation over one loaded disk copy; called from
+    /// save() with the file as it exists RIGHT NOW.
+    ///
+    /// The vault (profiles[].session_cookies, tier1_cookies,
+    /// renders) has TWO writer classes: the load-modify-save
+    /// helpers (store_session_cookies / clear_session_cookies_for),
+    /// which never touch a live daemon snapshot, and the snapshot
+    /// itself (sync_tier1_cookies). Both stamp a strictly larger
+    /// vault epoch before saving, so the winner is the newer stamp.
+    /// A TIE means no helper wrote since this snapshot loaded, so
+    /// its copy is exactly what disk holds (load() read the same
+    /// file) and keeping it is correct. Without this reconciliation
+    /// a daemon save rewrote the file from its boot-era snapshot:
+    /// every harvest since was erased, and every logout deletion
+    /// came back (dead sessions replayed on the next launch).
+    pub fn merge_vault_from_disk(&mut self, disk: &GhostState) {
+        if disk.vault_epoch > self.vault_epoch {
+            for (host, dp) in disk.profiles.iter() {
+                match self.profiles.get_mut(host) {
+                    // Both sides know the host: disk's vault wins.
+                    Some(p) => p.session_cookies = dp.session_cookies.clone(),
+                    // Disk-only host: a helper harvested a host this
+                    // snapshot has never seen. Adopt the whole
+                    // profile (its wall-state rode along on disk;
+                    // dropping it here would strand the harvest).
+                    None => {
+                        self.profiles.insert(host.clone(), dp.clone());
+                    }
+                }
+            }
+            self.tier1_cookies = disk.tier1_cookies.clone();
+            self.renders = disk.renders.clone();
+            self.vault_epoch = disk.vault_epoch;
         }
     }
 
@@ -1498,6 +1575,115 @@ mod tests {
             http_only: false,
             same_site: "Lax".into(),
         }
+    }
+
+    // == vault epoch reconciliation ==
+
+    // A helper's fresh harvest must survive a live snapshot's next
+    // save: the helper stamped a newer epoch, so save() must NOT
+    // adopt disk here (memory IS the newer writer) and the harvest
+    // stands.
+    #[test]
+    fn newer_snapshot_keeps_its_vault() {
+        let mut mine = GhostState::default();
+        mine.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "fresh", ".ex.com", None)];
+        bump_vault_epoch(&mut mine);
+        // Disk carries an OLDER epoch with different cookies.
+        let mut disk = GhostState {
+            vault_epoch: 0,
+            ..Default::default()
+        };
+        disk.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "stale", ".ex.com", None)];
+        mine.merge_vault_from_disk(&disk);
+        assert_eq!(mine.profiles["ex.com"].session_cookies[0].value, "fresh");
+    }
+
+    // The core resurrection bug: a live daemon snapshot (boot-era
+    // vault) saving AFTER a helper deleted a domain's session must
+    // adopt the deletion, not rewrite the dead session back.
+    #[test]
+    fn newer_disk_vault_wins_so_logout_is_not_resurrected() {
+        // The daemon snapshot, loaded at boot (epoch 7).
+        let mut mine = GhostState {
+            vault_epoch: 7,
+            ..Default::default()
+        };
+        mine.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "dead-session", ".ex.com", None)];
+        mine.tier1_cookies = vec![cr("sid", "dead-session", ".ex.com", None)];
+        // The logout helper wrote disk: deletion, newer epoch.
+        // clear_session_cookies_for keeps the profile entry and
+        // empties its cookies, so disk carries ex.com with none.
+        let mut disk = GhostState {
+            vault_epoch: 8,
+            ..Default::default()
+        };
+        disk.profiles.entry("ex.com".into()).or_default();
+        mine.merge_vault_from_disk(&disk);
+        assert!(
+            mine.profiles["ex.com"].session_cookies.is_empty(),
+            "the logged-out session must stay deleted"
+        );
+        assert!(
+            mine.tier1_cookies.is_empty(),
+            "the logged-out tier-1 echo must stay deleted"
+        );
+    }
+
+    // A helper's harvest lands on disk with a newer epoch; the live
+    // snapshot's next save must ADOPT it, not erase it.
+    #[test]
+    fn newer_disk_harvest_is_adopted_by_the_snapshot() {
+        let mut mine = GhostState {
+            vault_epoch: 3,
+            ..Default::default()
+        };
+        // Boot-era: ex.com had nothing, other.com still does.
+        mine.profiles
+            .entry("other.com".into())
+            .or_default()
+            .session_cookies = vec![cr("o", "kept", ".other.com", None)];
+        let mut disk = GhostState {
+            vault_epoch: 4,
+            ..Default::default()
+        };
+        disk.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "harvested", ".ex.com", None)];
+        mine.merge_vault_from_disk(&disk);
+        assert_eq!(
+            mine.profiles["ex.com"].session_cookies[0].value, "harvested",
+            "the harvest must survive the snapshot's next save"
+        );
+        assert_eq!(mine.vault_epoch, 4, "the adopted epoch must ride along");
+    }
+
+    // A tie means no helper wrote since this snapshot loaded, so its
+    // copy is exactly what disk holds: keep it (this is what lets a
+    // helper's own save keep its in-memory mutation).
+    #[test]
+    fn epoch_tie_keeps_the_snapshot() {
+        let mut mine = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        mine.tier1_cookies = vec![cr("t1", "mine", ".ex.com", None)];
+        let mut disk = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        disk.tier1_cookies = vec![];
+        mine.merge_vault_from_disk(&disk);
+        assert_eq!(mine.tier1_cookies.len(), 1, "tie = snapshot stands");
     }
 
     // == v4 phase 0: route memory ==

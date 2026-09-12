@@ -436,15 +436,36 @@ async fn byok_search_cached(
     if let Some(hit) = daemon.searcher.byok_cache_get(query, resolved, max) {
         return Ok(hit);
     }
-    let mut out = daemon.byok.search(query, max, intent).await?;
-    // Store the provider's own top slice before site: filtering, so a
-    // later hit filters on serve exactly as the miss path does.
-    daemon.searcher.byok_cache_put(query, &out);
-    // Issue #190: site: queries reach BYOK results too, and prewarm
-    // only the rows that survive the filter (law 5: zero added latency).
-    crate::search::site_filter(query, &mut out.results);
-    daemon.searcher.spawn_prewarm(&out.results);
-    Ok(out)
+    // Single-flight on the byok cache key: two concurrent identical
+    // queries share one provider round-trip instead of both missing
+    // the cache and both billing the metered provider.
+    let key = daemon.searcher.byok_flight_key(query, resolved);
+    let d2 = Arc::clone(daemon);
+    let q2 = query.to_string();
+    daemon
+        .searcher
+        .byok_flight(key, query, resolved, max, async move {
+            let daemon = d2;
+            let query = q2.as_str();
+            // Fetch the provider's FULL top slice (12) regardless of
+            // the caller's ask, cache that, then truncate: caching
+            // the truncated outcome meant a first search at max=2
+            // served every later larger request a 2-row slice as
+            // cached: true (the local path fixed this same bug).
+            let mut out = daemon.byok.search(query, 12, intent).await?;
+            // Store the provider's own top slice before site:
+            // filtering, so a later hit filters on serve exactly as
+            // the miss path does.
+            daemon.searcher.byok_cache_put(query, &out);
+            // Issue #190: site: queries reach BYOK results too, and
+            // prewarm only the rows that survive the filter (law 5:
+            // zero added latency).
+            crate::search::site_filter(query, &mut out.results);
+            out.results.truncate(max.clamp(1, 12));
+            daemon.searcher.spawn_prewarm(&out.results);
+            Ok(out)
+        })
+        .await
 }
 
 /// Search failure → structured error: every engine (and BYOK if

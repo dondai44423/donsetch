@@ -157,7 +157,16 @@ where
         while body.len() < cl {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                break;
+                // RFC 9112 6.3: a message that ends before
+                // Content-Length is satisfied is INCOMPLETE, not
+                // short. Returning the partial bytes as success once
+                // scored a truncated page clean and stored it into
+                // the revalidation cache as Fresh; fail the transport
+                // instead so the caller retries and nothing lies.
+                return Err(FetchError::Http(format!(
+                    "h1: connection closed after {} of {cl} body bytes (truncated response)",
+                    body.len()
+                )));
             }
             body.extend_from_slice(&tmp[..n]);
         }
@@ -265,6 +274,60 @@ where
 
 #[cfg(test)]
 mod tests {
+    // RFC 9112 6.3: a message that ends before Content-Length is
+    // satisfied is INCOMPLETE. The old reader broke out of the body
+    // loop on EOF and returned the partial bytes as success, which
+    // scored the truncated page clean and cached it as Fresh.
+    #[tokio::test]
+    async fn eof_before_content_length_is_an_error_not_a_short_body() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort-but-claimed-100";
+        let mut s = Dying(wire.to_vec());
+        let err = match get(&mut s, "/", &[]).await {
+            Ok(r) => panic!(
+                "a connection dying mid-body must fail, got status {} with {} body bytes",
+                r.status,
+                r.body.len()
+            ),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    // The stream behind the case above: serves `wire`, then EOF.
+    struct Dying(Vec<u8>);
+
+    impl tokio::io::AsyncRead for Dying {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let n = buf.remaining().min(self.0.len());
+            if n == 0 {
+                return Poll::Ready(Ok(())); // EOF
+            }
+            let chunk: Vec<u8> = self.0.drain(..n).collect();
+            buf.put_slice(&chunk);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Dying {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(data.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     // RFC 9112 6.3: differing Content-Length values = invalid message
     // (request-smuggling class). Browsers reject; we do too.
     #[tokio::test]

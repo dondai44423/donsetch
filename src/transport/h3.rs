@@ -78,12 +78,28 @@ fn accept_body_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), FetchError>
     Ok(())
 }
 
-fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, FetchError> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|_| FetchError::Http(format!("dns resolve failed for {host}")))?
-        .next()
-        .ok_or_else(|| FetchError::Http(format!("dns resolve empty for {host}")))
+/// Blocking libc resolver, run OFF the reactor with the same 10s
+/// bound the h1/h2 dial path uses: to_socket_addrs() can block for
+/// the resolver's full timeout chain, and the h3 lane runs its loop
+/// on a tokio worker.
+async fn resolve_host_async(host: String, port: u16) -> Result<SocketAddr, FetchError> {
+    // `label` answers the timeout arm; the closure moves `host` and
+    // clones its own copy for its two error labels.
+    let label = host.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let label = host.clone();
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|_| FetchError::Http(format!("dns resolve failed for {label}")))?
+            .next()
+            .ok_or_else(|| FetchError::Http(format!("dns resolve empty for {label}")))
+    });
+    match tokio::time::timeout(Duration::from_secs(10), task).await {
+        Ok(joined) => joined.map_err(|_| FetchError::Http("dns resolve task aborted".into()))?,
+        Err(_) => Err(FetchError::Http(format!(
+            "dns resolve timed out for {label}"
+        ))),
+    }
 }
 
 /// All the quiche quoting for one connection: our Chrome-true builder
@@ -149,7 +165,7 @@ async fn h3_fetch_inner(
     timeout: Duration,
 ) -> Result<(H3Out, QuicStats), FetchError> {
     let mut cfg = quic_config(profile)?;
-    let peer = resolve_host(host, port)?;
+    let peer = resolve_host_async(host.to_string(), port).await?;
     let socket = if peer.is_ipv4() {
         UdpSocket::bind("0.0.0.0:0").await?
     } else {
@@ -306,7 +322,8 @@ async fn h3_fetch_inner(
                         });
                         if is_informational {
                             for hdr in &list {
-                                if hdr.name() == b"alt-svc" {
+                                let name = String::from_utf8_lossy(hdr.name()).to_ascii_lowercase();
+                                if name == "alt-svc" {
                                     altsvc =
                                         Some(String::from_utf8_lossy(hdr.value()).into_owned());
                                 }
@@ -314,21 +331,24 @@ async fn h3_fetch_inner(
                             continue;
                         }
                         for hdr in &list {
-                            if hdr.name() == b":status" && status == 0 {
-                                status = std::str::from_utf8(hdr.value())
-                                    .ok()
-                                    .and_then(|x| x.trim().parse::<u16>().ok())
-                                    .unwrap_or(0);
+                            // HTTP/3 field names are lowercase on the
+                            // wire; normalize a nonconforming peer's
+                            // mixed-case names like the h1 reader does,
+                            // so the downstream content-encoding /
+                            // alt-svc lookups cannot be dodged.
+                            let name = String::from_utf8_lossy(hdr.name()).to_ascii_lowercase();
+                            let value = String::from_utf8_lossy(hdr.value()).into_owned();
+                            if name == ":status" && status == 0 {
+                                status = value.trim().parse::<u16>().unwrap_or(0);
                                 continue;
                             }
-                            if hdr.name() == b"alt-svc" {
-                                altsvc = Some(String::from_utf8_lossy(hdr.value()).into_owned());
+                            if name == "alt-svc" {
+                                altsvc = Some(value);
                                 continue;
                             }
-                            resp_headers.push((
-                                String::from_utf8_lossy(hdr.name()).into_owned(),
-                                String::from_utf8_lossy(hdr.value()).into_owned(),
-                            ));
+                            if !name.starts_with(':') {
+                                resp_headers.push((name, value));
+                            }
                         }
                     }
                     h3::Event::Data => {
@@ -424,28 +444,21 @@ async fn h3_fetch_inner(
             ));
         }
 
-        // Give up when the QUIC shuts down pre-response.
+        // Give up when the QUIC shuts down pre-response, or after
+        // headers but before the stream Finished. `stream_done` is
+        // the only honest completion: a connection that closed or
+        // drained early (idle timeout, hostile CONNECTION_CLOSE,
+        // server death) carries a PARTIAL body, and returning it as
+        // success once scored a truncated page clean and stored it
+        // into the cache. Drop the route; h1/h2 answer instead.
         if conn.is_closed() || conn.is_draining() {
             if status != 0 {
                 QUIC_TOTAL_CONN.fetch_add(1, Ordering::Relaxed);
-                return Ok((
-                    H3Out {
-                        status,
-                        headers: resp_headers,
-                        body: std::mem::take(&mut body),
-                        altsvc,
-                    },
-                    QuicStats {
-                        handshake_ms,
-                        early_data: rtt_landed,
-                        resumed: conn.is_resumed(),
-                        pkts_in,
-                        pkts_out,
-                        total_ms: started.elapsed().as_millis(),
-                    },
-                ));
             }
-            return Err(FetchError::Http("h3: quic closed before response".into()));
+            return Err(FetchError::Http(format!(
+                "h3: quic closed before stream finished (status {status}, {} body bytes)",
+                body.len()
+            )));
         }
 
         let now = Instant::now();
@@ -505,7 +518,7 @@ pub async fn h3_fetch_direct(
         authority,
         headers: user_headers
             .iter()
-            .filter(|(n, _)| n != "user-agent" && n != "accept" && n != "accept-encoding")
+            .filter(|(n, _)| n != "user-agent" && n != "accept")
             .cloned()
             .collect(),
         user_agent: user_agent.as_str(),
