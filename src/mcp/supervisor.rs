@@ -152,9 +152,17 @@ where
             // (Write failure: this child already died; keep pending.)
             if !pending.is_empty() && stdin.write_all(&pending).is_ok() {
                 let _ = stdin.flush();
-                pending.clear();
+                // The replayed bytes are THIS child's unacked history
+                // too: if it also dies before consuming them (a crash
+                // loop where each child buffers-then-dies), the idle
+                // poll must replay them again, not find an empty
+                // history and drop the request one restart deeper.
+                // Seed the history with what we just wrote instead of
+                // clearing it.
+                written = std::mem::take(&mut pending);
+            } else {
+                written.clear();
             }
-            written.clear();
             child = Some((c, stdin, Instant::now()));
         }
 
@@ -163,7 +171,7 @@ where
         match rx.recv_timeout(POLL) {
             Ok(In::Data(bytes)) => {
                 if stdin.write_all(&bytes).is_ok() {
-                    written.extend_from_slice(&bytes);
+                    record_written(&mut written, &bytes);
                     let _ = stdin.flush();
                 } else {
                     // Child died under this write : hold this span
@@ -223,11 +231,21 @@ where
 /// (drain keeps the tail).
 const REPLAY_WINDOW: usize = 1 << 20;
 
-fn replay_window(mut history: Vec<u8>, extra: &[u8]) -> Vec<u8> {
-    history.extend_from_slice(extra);
+/// Append to the unacked history, bounded to REPLAY_WINDOW so a
+/// long-lived HEALTHY child (which consumes everything immediately)
+/// cannot grow the accumulator without limit. The bound is the same
+/// one the replay applies, so "bounded to 1 MiB" holds for the live
+/// history and not only for the bytes produced at death. Keeps the
+/// tail: the newest requests are the ones a replacement still needs.
+fn record_written(history: &mut Vec<u8>, bytes: &[u8]) {
+    history.extend_from_slice(bytes);
     if history.len() > REPLAY_WINDOW {
         history.drain(..history.len() - REPLAY_WINDOW);
     }
+}
+
+fn replay_window(mut history: Vec<u8>, extra: &[u8]) -> Vec<u8> {
+    record_written(&mut history, extra);
     history
 }
 
@@ -362,6 +380,24 @@ mod tests {
         }
     }
 
+    /// Same as WriteThenEof but with a caller-set EOF delay, for the
+    /// multi-death case that needs to outlast several restart backoffs.
+    #[cfg(unix)]
+    struct WriteThenEofAfter(&'static [u8], bool, u64);
+
+    #[cfg(unix)]
+    impl Read for WriteThenEofAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.1 {
+                std::thread::sleep(Duration::from_millis(self.2));
+                return Ok(0);
+            }
+            self.1 = true;
+            buf[..self.0.len()].copy_from_slice(self.0);
+            Ok(self.0.len())
+        }
+    }
+
     /// The macOS CI signature: the request was buffered into a
     /// dying child, the write reported success, and the request
     /// never reached the replacement.
@@ -395,6 +431,73 @@ mod tests {
             "ping\n",
             "the buffered request must replay to the restarted child"
         );
+    }
+
+    // The crash-loop case: the replacement ALSO buffers-then-dies
+    // before consuming the replayed request. On respawn the replayed
+    // `pending` is this child's unacked history too, so it must be
+    // seeded into `written` rather than cleared. Without the seed the
+    // second idle poll finds an empty history and drops the request
+    // one restart deeper : the replay survives exactly one death.
+    // Children 1 and 2 accept the write and die; child 3 serves.
+    #[cfg(unix)]
+    #[test]
+    fn buffered_request_survives_two_consecutive_silent_deaths() {
+        let sink = Sink::default();
+        let spawns = Arc::new(Mutex::new(0u32));
+        let spawns2 = Arc::clone(&spawns);
+        run_with(
+            move || {
+                let mut n = spawns2.lock().unwrap();
+                *n += 1;
+                let mut c = Command::new("sh");
+                // First TWO children buffer the request and die; the
+                // third finally consumes and echoes it.
+                c.args(["-c", if *n <= 2 { "sleep 0.3; exit 0" } else { "cat" }]);
+                c
+            },
+            // Hold EOF well past two deaths + their restart backoffs
+            // so both are seen by the idle poll before the client
+            // closes and the survivor is drained.
+            WriteThenEofAfter(b"ping\n", false, 4000),
+            sink.clone(),
+        )
+        .unwrap();
+        assert!(
+            *spawns.lock().unwrap() >= 3,
+            "both dying children must have been replaced"
+        );
+        let got = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "ping\n",
+            "the buffered request must survive a second silent death"
+        );
+    }
+
+    // Bounded history: a healthy child consumes everything, but the
+    // accumulator must still not grow without limit. record_written
+    // keeps only the last REPLAY_WINDOW bytes (the tail a replacement
+    // would need), so "bounded to 1 MiB" is true of the live history,
+    // not only of the replay output.
+    #[test]
+    fn record_written_bounds_the_history_to_the_replay_window() {
+        let mut history = Vec::new();
+        // Write well past the window in small chunks.
+        for i in 0..(REPLAY_WINDOW / 1000 + 50) {
+            let chunk = format!("{i:04}------------------------------").repeat(30);
+            record_written(&mut history, chunk.as_bytes());
+        }
+        assert!(
+            history.len() <= REPLAY_WINDOW,
+            "history {} exceeded the {REPLAY_WINDOW}-byte window",
+            history.len()
+        );
+        // The window keeps the TAIL: the very last bytes written are
+        // still present (a replacement needs the newest requests).
+        record_written(&mut history, b"LAST-MARKER\n");
+        assert!(history.ends_with(b"LAST-MARKER\n"));
+        assert!(history.len() <= REPLAY_WINDOW);
     }
 
     // main() restores SIGPIPE's default disposition for the CLI
