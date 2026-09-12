@@ -139,6 +139,13 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- `donsetch doctor --deep` no longer reports a valid Bright Data
+  dynamic-IP unlocker (Web Access API zones and friends) as broken:
+  the free zone probe costs nothing, and where the zone has no
+  static route pool Bright Data answers 403 "Static routes not
+  found". That answer no longer reads as a failed check: the
+  probe skips with an honest, zero-credit note instead (reported
+  by tripflex on #200). A 401 always stays a failure.
 - `site:` queries no longer leak off-domain results through BYOK
   providers (issue #190): both BYOK exits (provider-first and the
   local-first fallback) sweep results through the same post-merge

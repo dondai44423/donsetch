@@ -1051,11 +1051,14 @@ fn check_bypass(deep: bool) -> CheckResult {
             .spawn(move || bright_zone_probe(&token_for_probe, &zone_for_probe))
         {
             Ok(handle) => match handle.join() {
-                Ok(Ok(n)) => {
+                Ok(ZoneProbeOut::Routed(n)) => {
                     CheckResult::Pass(format!("{base} ; live zone probe OK ({n} IPs routed)"))
                 }
-                Ok(Err(e)) => CheckResult::Warn(format!(
-                    "{base} ; live zone probe failed: {e} (free check, nothing billed)"
+                Ok(ZoneProbeOut::Skipped { reason }) => CheckResult::Pass(format!(
+                    "{base} ; live zone probe skipped: {reason} (no credits spent, nothing billed)"
+                )),
+                Ok(ZoneProbeOut::Failed { reason }) => CheckResult::Warn(format!(
+                    "{base} ; live zone probe failed: {reason} (free check, nothing billed)"
                 )),
                 Err(_) => CheckResult::Pass(base),
             },
@@ -1066,43 +1069,122 @@ fn check_bypass(deep: bool) -> CheckResult {
     }
 }
 
+/// The result of the free Bright Data zone probe.
+#[derive(Debug, PartialEq, Eq)]
+enum ZoneProbeOut {
+    /// The zone answered with its IP count.
+    Routed(usize),
+    /// The zone is valid-shaped but has no static pool to list
+    /// (Web Access API and other dynamic-IP zones): Bright Data
+    /// answers 403 "Static routes not found". Not a failure; the
+    /// token simply cannot be exercised without spending a credit.
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+/// Classify the route_ips HTTP answer before any JSON parsing.
+/// The distinction that matters: a 401 is a bad token, a 403 that
+/// says the zone has no static pool is a skip (never a failure),
+/// and every other non-200 stays a plain failure.
+fn classify_route_ips(status: u16, body: &str) -> ZoneProbeOut {
+    if status == 200 {
+        return ZoneProbeOut::Routed(0); // count parsed by the caller
+    }
+    if status == 401 {
+        return ZoneProbeOut::Failed {
+            reason: "the token was rejected (401) : check it in the Bright Data dashboard"
+                .to_string(),
+        };
+    }
+    if status == 403 {
+        let lower = body.to_ascii_lowercase();
+        if lower.contains("static routes") && lower.contains("not found") {
+            return ZoneProbeOut::Skipped {
+                reason: "the zone type has no static route pool (Bright Data: Static routes not found) : dynamic zones such as Web Access API cannot be pre-checked without spending a credit"
+                    .to_string(),
+            };
+        }
+        return ZoneProbeOut::Failed {
+            reason: "the zone name or access was refused (403) : check the zone spelling in the dashboard"
+                .to_string(),
+        };
+    }
+    ZoneProbeOut::Failed {
+        reason: format!("HTTP {status}"),
+    }
+}
+
 /// Free Bright Data validation: the zone route_ips endpoint lists
 /// the zone's IP pool without making a request, so a dead token or
 /// wrong zone name shows up here before the first paid unlock.
-fn bright_zone_probe(token: &str, zone: &str) -> Result<usize, String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+fn bright_zone_probe(token: &str, zone: &str) -> ZoneProbeOut {
+    bright_zone_probe_at("https://api.brightdata.com/zone/route_ips", token, zone)
+}
+
+/// The probe against an explicit endpoint (the production URL in
+/// the ship path, a local rig in tests).
+fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("runtime: {e}"))?;
-    rt.block_on(async {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("client: {e}"))?;
-        let resp = client
-            .get(format!(
-                "https://api.brightdata.com/zone/route_ips?zone={zone}"
-            ))
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| format!("request: {e}"))?;
-        let status = resp.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err("the token or zone name was rejected (401/403) : verify both in the Bright Data dashboard, or the zone type does not expose its route IPs".to_string());
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("runtime: {e}"),
+            };
         }
-        if status != 200 {
-            return Err(format!("HTTP {status}"));
+    };
+    rt.block_on(bright_zone_probe_async(base, token, zone))
+}
+
+async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("client: {e}"),
+            };
         }
-        let v: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-        if let Some(n) = v.get("ip_count").and_then(|x| x.as_u64()) {
-            return Ok(n as usize);
+    };
+    let url = format!("{base}/zone/route_ips?zone={zone}");
+    let resp = match client.get(url).bearer_auth(token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("request: {e}"),
+            };
         }
-        if let Some(ips) = v.get("ips").and_then(|x| x.as_array()) {
-            return Ok(ips.len());
-        }
-        Ok(0)
-    })
+    };
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    let mut out = classify_route_ips(status, &body);
+    if let ZoneProbeOut::Routed(ref mut n) = out {
+        *n = match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => {
+                if let Some(count) = v.get("ip_count").and_then(|x| x.as_u64()) {
+                    count as usize
+                } else if let Some(ips) = v.get("ips").and_then(|x| x.as_array()) {
+                    ips.len()
+                } else {
+                    0
+                }
+            }
+            Err(e) => {
+                return ZoneProbeOut::Failed {
+                    reason: format!("parse: {e}"),
+                };
+            }
+        };
+    }
+    out
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -1474,5 +1556,172 @@ mod mask_tests {
         assert_eq!(mask_key("ключключключключ"), "ключкл...ключ");
         // Bright Data `token::zone` keys mask the token only.
         assert_eq!(mask_key("0123456789abcdef::my_zone"), "012345...cdef");
+    }
+}
+
+#[cfg(test)]
+mod bright_probe_tests {
+    use super::{ZoneProbeOut, bright_zone_probe_at, classify_route_ips};
+    use std::io::{Read, Write};
+
+    /// A one-request HTTP rig: serves `status` + `body`, records the
+    /// request head so the test can assert the auth and path shape.
+    fn serve_once(
+        status: u16,
+        reason: &str,
+        body: &str,
+    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let reason = reason.to_string();
+        let body = body.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = sock.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            head
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn classify_static_routes_403_is_a_skip_not_a_failure() {
+        // The bug class: a valid dynamic zone (Web Access API) gets
+        // 403 "Static routes not found". Pre-fix this was a blanket
+        // 401/403 == token-rejected failure.
+        let cases: Vec<(u16, &str, ZoneProbeOut)> = vec![
+            (
+                403,
+                r#"{"message":"Static routes not found"}"#,
+                ZoneProbeOut::Skipped {
+                    reason: String::new(),
+                },
+            ),
+            (
+                403,
+                r#"{"error":{"code":"static_routes_not_found","message":"STATIC ROUTES NOT FOUND"}}"#,
+                ZoneProbeOut::Skipped {
+                    reason: String::new(),
+                },
+            ),
+            (
+                401,
+                r#"{"message":"unauthorized"}"#,
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                403,
+                r#"{"message":"Zone name is invalid"}"#,
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                403,
+                "",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                404,
+                "nope",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                429,
+                "slow down",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+            (
+                500,
+                "boom",
+                ZoneProbeOut::Failed {
+                    reason: String::new(),
+                },
+            ),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                std::mem::discriminant(&classify_route_ips(status, body)),
+                std::mem::discriminant(&expected),
+                "status {status} body {body:?}"
+            );
+        }
+        // The skip reason carries the diagnosis, not a generic one.
+        match classify_route_ips(403, r#"{"message":"Static routes not found"}"#) {
+            ZoneProbeOut::Skipped { reason } => {
+                assert!(reason.contains("no static route pool"), "{reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // 200 parse happens in the caller; the classifier only tags it.
+        assert_eq!(classify_route_ips(200, "{}"), ZoneProbeOut::Routed(0));
+    }
+
+    #[test]
+    fn wire_dynamic_zone_403_reports_skipped_not_failed() {
+        let (base, handle) = serve_once(
+            403,
+            "Forbidden",
+            r#"{"status":403,"message":"Static routes not found"}"#,
+        );
+        let out = bright_zone_probe_at(&base, "tok", "web-access");
+        match &out {
+            ZoneProbeOut::Skipped { reason } => {
+                assert!(reason.contains("no static route pool"), "{reason}");
+                assert!(!reason.contains("rejected"), "{reason}");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // The wire path really hit OUR rig with the right auth + path.
+        let head = String::from_utf8_lossy(&handle.join().unwrap()).into_owned();
+        let head_l = head.to_ascii_lowercase();
+        assert!(
+            head_l.contains("get /zone/route_ips?zone=web-access http/1.1"),
+            "{head}"
+        );
+        assert!(head_l.contains("authorization: bearer tok"), "{head}");
+    }
+
+    #[test]
+    fn wire_200_returns_the_ip_count() {
+        let (base, handle) =
+            serve_once(200, "OK", r#"{"ips":[{"ip":"1.2.3.4"},{"ip":"5.6.7.8"}]}"#);
+        let out = bright_zone_probe_at(&base, "tok", "static-zone");
+        assert_eq!(out, ZoneProbeOut::Routed(2));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn wire_401_stays_a_failure() {
+        let (base, handle) = serve_once(401, "Unauthorized", r#"{"message":"bad token"}"#);
+        match bright_zone_probe_at(&base, "dead-token", "any-zone") {
+            ZoneProbeOut::Failed { reason } => assert!(reason.contains("401"), "{reason}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        handle.join().unwrap();
     }
 }
