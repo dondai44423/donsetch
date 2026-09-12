@@ -24,6 +24,9 @@ channel until the v4.0.0 release train.
 - `donsetch config show` redacts bearer tokens and credential-bearing proxy
   values, including proxy pools, while still showing whether each field is
   configured and where its value came from.
+- Browser version probes now apply one deadline to process exit and bounded
+  stdout capture, terminate inherited-pipe descendants on Unix and Windows,
+  and cap captured output at 64 KiB.
 - Every runtime env read now flows through the typed config. The old
   env names keep their exact historical trigger semantics and still
   work, but they are deprecated and will be removed at the v4

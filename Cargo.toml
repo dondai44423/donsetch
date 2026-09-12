@@ -85,7 +85,7 @@ rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/b
 http = ["dep:axum", "dep:tower-http"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry"] }
+windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Pipes"] }
 
 [dev-dependencies]
 rcgen = "0.14"

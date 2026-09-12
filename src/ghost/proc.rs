@@ -42,7 +42,7 @@ pub struct Proc {
     #[cfg(windows)]
     proc_handle: fnd::HANDLE,
     #[cfg(windows)]
-    job: fnd::HANDLE,
+    job: KillOnCloseJob,
 }
 
 // ntdll process suspend/resume : always loaded, linked directly.
@@ -51,6 +51,74 @@ pub struct Proc {
 unsafe extern "system" {
     fn NtSuspendProcess(proc_handle: fnd::HANDLE) -> i32;
     fn NtResumeProcess(proc_handle: fnd::HANDLE) -> i32;
+}
+
+/// Owned Windows Job Object that terminates every assigned process when the
+/// handle closes. Both long-lived ghosts and short browser probes use this
+/// primitive so job creation, assignment, and teardown have one owner.
+#[cfg(windows)]
+pub(crate) struct KillOnCloseJob {
+    handle: fnd::HANDLE,
+}
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    pub(crate) fn new() -> Result<Self, String> {
+        unsafe {
+            let handle = job::CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return Err(format!("CreateJobObjectW failed: {}", fnd::GetLastError()));
+            }
+
+            let mut info: job::JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if job::SetInformationJobObject(
+                handle,
+                job::JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of_val(&info) as u32,
+            ) == 0
+            {
+                let error = fnd::GetLastError();
+                fnd::CloseHandle(handle);
+                return Err(format!("SetInformationJobObject failed: {error}"));
+            }
+            Ok(Self { handle })
+        }
+    }
+
+    pub(crate) fn assign(&self, process: fnd::HANDLE) -> Result<(), u32> {
+        if unsafe { job::AssignProcessToJobObject(self.handle, process) } == 0 {
+            Err(unsafe { fnd::GetLastError() })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn terminate(&self) {
+        unsafe {
+            job::TerminateJobObject(self.handle, 1);
+        }
+    }
+
+    fn raw(&self) -> fnd::HANDLE {
+        self.handle
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        unsafe {
+            fnd::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn resume_process(process: fnd::HANDLE) -> Result<(), i32> {
+    let status = unsafe { NtResumeProcess(process) };
+    if status < 0 { Err(status) } else { Ok(()) }
 }
 
 impl Proc {
@@ -84,7 +152,6 @@ impl Proc {
 
     #[cfg(windows)]
     unsafe fn from_child_win(child: &Child) -> Result<Self, FetchError> {
-        use std::mem;
         let pid = child.id().unwrap_or(0);
 
         // SAFETY: all FFI calls in this function target well-documented
@@ -115,49 +182,28 @@ impl Proc {
             }
 
             // Job Object: kernel kills the whole tree if donsetch dies.
-            let job_h = job::CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job_h.is_null() {
-                fnd::CloseHandle(proc_handle);
-                return Err(FetchError::ghost(format!(
-                    "CreateJobObjectW failed: {}",
-                    fnd::GetLastError()
-                )));
-            }
-            let mut info: job::JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if job::SetInformationJobObject(
-                job_h,
-                job::JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                mem::size_of::<job::JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) == 0
-            {
-                fnd::CloseHandle(proc_handle);
-                fnd::CloseHandle(job_h);
-                return Err(FetchError::ghost(format!(
-                    "SetInformationJobObject failed: {}",
-                    fnd::GetLastError()
-                )));
-            }
+            let job = match KillOnCloseJob::new() {
+                Ok(job) => job,
+                Err(error) => {
+                    fnd::CloseHandle(proc_handle);
+                    return Err(FetchError::ghost(error));
+                }
+            };
             // Assign the child to the job. On Win8+ nested jobs are
             // allowed, so this succeeds even if the process is already
             // in a job. If it fails we don't abort : freeze/thaw/kill
             // still work via the process handle; only the death-reap
             // safety net is lost.
-            if job::AssignProcessToJobObject(job_h, proc_handle) == 0 {
+            if let Err(error) = job.assign(proc_handle) {
                 // Non-fatal for the fetch itself, but the job is now empty:
                 // KILL_ON_JOB_CLOSE has nothing to kill, so the browser tree
                 // outlives donsetch and orphaned Chrome processes pile up.
                 // Warn unconditionally : silent degradation is what hid this.
                 eprintln!(
-                    "[ghost] AssignProcessToJobObject failed: {} : browser tree will not be reaped on exit, leaving orphaned Chrome processes",
-                    fnd::GetLastError()
+                    "[ghost] AssignProcessToJobObject failed: {error} : browser tree will not be reaped on exit, leaving orphaned Chrome processes"
                 );
             }
-            Ok(Self {
-                proc_handle,
-                job: job_h,
-            })
+            Ok(Self { proc_handle, job })
         }
     }
 
@@ -188,7 +234,7 @@ impl Proc {
         unsafe {
             for pid in self.job_pids() {
                 if let Ok(h) = open_for_suspend(pid) {
-                    NtResumeProcess(h);
+                    let _ = resume_process(h);
                     fnd::CloseHandle(h);
                 }
             }
@@ -202,9 +248,9 @@ impl Proc {
             libc::kill(-self.pid, libc::SIGKILL);
         }
         #[cfg(windows)]
-        unsafe {
+        {
             // Kills every process in the job : the whole tree.
-            job::TerminateJobObject(self.job, 1);
+            self.job.terminate();
         }
     }
 
@@ -228,7 +274,7 @@ impl Proc {
 
         let ok = unsafe {
             job::QueryInformationJobObject(
-                self.job,
+                self.job.raw(),
                 job::JobObjectBasicProcessIdList,
                 buf.as_mut_ptr() as *mut _,
                 buf_size as u32,
@@ -293,7 +339,6 @@ impl Drop for Proc {
         #[cfg(windows)]
         unsafe {
             fnd::CloseHandle(self.proc_handle);
-            fnd::CloseHandle(self.job);
         }
         #[cfg(not(windows))]
         {
