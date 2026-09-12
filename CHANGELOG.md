@@ -181,6 +181,13 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+
+- Legacy route-memory and bypass-cache controls compose in their original
+  order under the typed config: the route-memory kill switch beats read-only,
+  while a valid legacy bypass TTL applied after `DONSETCH_BYPASS_CACHE=0`
+  re-enables the cache (and TTL zero disables it). TOML and modern env
+  overrides retain their higher precedence.
+
 - The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by
