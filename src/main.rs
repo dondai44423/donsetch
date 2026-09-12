@@ -124,8 +124,9 @@ async fn main() {
             // Transport selection: the --http flag wins, then the
             // layered config ([transport] kind via TOML or env) for
             // launchers that can't pass flags, then stdio. Host/port:
-            // flags beat the config.
-            load_and_install_config(&args);
+            // flags beat the config. The config is already installed
+            // by the block above; installing twice made install()
+            // fail its one-shot check and the daemon exit.
             #[cfg(feature = "http")]
             if config::cfg().transport.kind == config::TransportKind::Http {
                 let host = config::cfg().transport.host.clone();
