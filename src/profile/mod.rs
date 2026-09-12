@@ -549,89 +549,12 @@ fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
     spawn_probe_with_timeout(cmd)
 }
 
-/// Run the built `--version` command, read its stdout, and return it.
-/// Never runs longer than `PROBE_SPAWN_TIMEOUT`; on timeout, kills the
-/// whole process tree.
-fn spawn_probe_with_timeout(mut cmd: std::process::Command) -> Result<String, String> {
-    use std::io::Read;
+mod version_probe;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                // Own process group: the timeout kill must reach the
-                // browser's descendants too, or they inherit the
-                // stdout pipe and hang the reader join forever (the
-                // itoqa-found doctor hang).
-                if libc::setpgid(0, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn browser version probe: {e}"))?;
-
-    // Read stdout on a side thread so we can still enforce the timeout
-    // if the browser never exits (the read would otherwise block us).
-    let pid = child.id();
-    let pipe = match child.stdout.take() {
-        Some(p) => p,
-        None => {
-            // Can't happen (stdout is always piped above), but never
-            // leave a spawned child running on the early-out path.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("browser version probe had no stdout pipe".into());
-        }
-    };
-    let stdout = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut rd = pipe;
-        let _ = rd.read_to_string(&mut buf);
-        buf
-    });
-
-    let deadline = std::time::Instant::now() + PROBE_SPAWN_TIMEOUT;
-    let mut reaped: Option<std::process::ExitStatus> = None;
-    while reaped.is_none() {
-        match child.try_wait() {
-            Ok(Some(status)) => reaped = Some(status),
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if reaped.is_none() && std::time::Instant::now() >= deadline {
-            // Wedged browser : kill the whole tree, not just the parent.
-            kill_probe_tree(Some(pid));
-            let _ = child.kill();
-            reaped = child.wait().ok();
-            break;
-        }
-        if reaped.is_none() {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-    if reaped.is_none() {
-        // Err branch above killed nothing; be safe.
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let out = stdout.join().unwrap_or_default();
-    match reaped {
-        Some(status) if status.success() => {
-            // "Chromium 151.0.7922.108\n" -> "151.0.7922.108".
-            // The banner word varies per build (Chromium, Chrome,
-            // Edge, CloakBrowser); the dotted token is the truth.
-            parse_version_string(&out)
-                .ok_or_else(|| format!("browser version probe returned no version token: {out:?}"))
-        }
-        Some(status) => Err(format!("browser version probe exited with {status}")),
-        None => Err("browser version probe did not exit".into()),
-    }
+/// Capture stdout and process completion under one post-spawn deadline.
+/// OS spawn and teardown latency are not a hard real-time guarantee.
+fn spawn_probe_with_timeout(cmd: std::process::Command) -> Result<String, String> {
+    version_probe::run(cmd, PROBE_SPAWN_TIMEOUT)
 }
 
 /// Parse the first full dotted Chromium version from a version banner.
@@ -652,33 +575,6 @@ pub(crate) fn parse_version_string(line: &str) -> Option<String> {
         }
     })
 }
-/// Kill the probe process and its children (Windows: taskkill /T so
-/// the whole tree dies; Unix: kill the process group-less child : its
-/// renderers exit when the browser dies).
-fn kill_probe_tree(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    #[cfg(windows)]
-    {
-        // taskkill /T /F kills the process and all descendants.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(not(windows))]
-    unsafe {
-        // Kill the WHOLE group: the browser's descendants inherit the
-        // parent's stdout pipe, and only when every write end is dead
-        // does the reader thread see EOF and the join return. Killing
-        // just the parent left the pipe held open and doctor hung
-        // forever (itoqa 2026-09-11). The child runs in its own group
-        // via pre_exec setpgid, so the negative pid hits it and every
-        // descendant, not our own process group.
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-}
-
 /// Parse the first plausible major version out of a `<name> <major>` line.
 pub(crate) fn parse_version_major(line: &str) -> Option<u32> {
     let line = line.trim();
