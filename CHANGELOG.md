@@ -191,6 +191,20 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Security review batch (#216-#219):
+  - `donsetch doctor` Bright Data zone probe hit `/zone/route_ips` twice
+    (a doubled path that 404'd every configured zone). The ship path now
+    passes the API root and builds the URL through one shared helper.
+  - h3/QUIC dial now applies the same connect-time SSRF filter as h1/h2:
+    a DNS rebind to a private/loopback address between the request-time
+    check and the dial is refused. `DONSETCH_ALLOW_PRIVATE_EGRESS` still
+    works as the explicit escape hatch.
+  - BYOK provider error bodies are capped at 600 chars before they reach
+    the agent, stderr, or the debug log (context DoS). serpapi additionally
+    scrubs the URL-borne `api_key` from a reflected error body (key leak).
+  - Crawl resume tokens that are not plain ASCII alphanumeric are refused
+    before they index the filesystem, closing a path-traversal read-then-
+    delete on agent-supplied `resume`.
 - Browser backend aliases now share the typed enum as their single registry
   and normalize casing and surrounding whitespace across config sources.
   Unknown effective legacy values fail closed instead of silently becoming
