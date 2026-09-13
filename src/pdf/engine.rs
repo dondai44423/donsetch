@@ -447,6 +447,21 @@ fn mono_font_name(name: &str) -> bool {
         || n.contains("fira code")
 }
 
+/// Is the glyph's font family a monospace font? `family` is an index
+/// into the interned `fonts` list, but it falls back to 0 whenever a
+/// glyph's font has no PDFium-reportable name (Type3, no BaseFont, an
+/// over-long name), and `fonts` is empty until the first NAMED font
+/// is interned. So a crafted PDF whose first walked glyph uses an
+/// unnamed font reaches here with family==0 and an empty `fonts` — a
+/// direct `fonts[family]` index panicked (release panic=abort → a
+/// remote DoS on a fetched PDF). Bounds-check like the sibling
+/// `font_dingbat.get(family)` a few lines down already does.
+fn font_is_mono(fonts: &[String], family: u16) -> bool {
+    fonts
+        .get(family as usize)
+        .is_some_and(|name| mono_font_name(name))
+}
+
 /// Fill `buf` with a meta tag value; returns None when empty.
 fn get_meta(doc: FpdfDocument, tag: &str, buf: &mut Vec<u16>) -> Option<String> {
     let tag = CString::new(tag).ok()?;
@@ -873,7 +888,7 @@ where
                         size,
                         weight,
                         flags: flags as u32
-                            | if mono_font_name(&raw.fonts[family as usize]) {
+                            | if font_is_mono(&raw.fonts, family) {
                                 DONSHEET_MONO_HINT
                             } else {
                                 0
@@ -924,6 +939,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A glyph whose font has no PDFium-reportable name reaches the
+    // mono check with family==0 while the interned `fonts` list is
+    // still empty (nothing named has been interned yet). The old
+    // direct index `fonts[family as usize]` panicked here — release
+    // panic=abort turns that into a remote DoS on a fetched PDF.
+    // font_is_mono must bounds-check and simply return false.
+    #[test]
+    fn font_is_mono_does_not_panic_on_empty_or_out_of_range_family() {
+        assert!(!font_is_mono(&[], 0)); // the crash input: empty list, family 0
+        assert!(!font_is_mono(&["Arial".to_string()], 7)); // out of range
+        assert!(font_is_mono(&["Courier New".to_string()], 0)); // named mono resolves
+        assert!(!font_is_mono(&["Arial".to_string()], 0)); // named non-mono
+    }
 
     #[test]
     fn decode_utf16_from_byte_count_strips_terminator_and_padding() {
