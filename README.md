@@ -668,6 +668,7 @@ donsetch keys add exa sk-exa-...        # Exa (stackable)
 donsetch keys add serper ...            # Serper.dev
 donsetch keys add serpapi ...           # SerpApi
 donsetch keys add serpbase sb-...       # SerpBase Google SERP (100 free searches)
+donsetch keys add serply ...            # Serply Google SERP (web, news, scholar)
 donsetch keys add bravesearch ...       # Brave Search API
 donsetch keys add tinyfish sk-...       # TinyFish (free tier)
 donsetch keys add parallel nKil3...     # Parallel AI (fast mode)

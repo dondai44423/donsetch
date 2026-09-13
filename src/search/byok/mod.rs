@@ -22,6 +22,7 @@ pub mod plugin;
 mod serpapi;
 mod serpbase;
 mod serper;
+mod serply;
 pub mod store;
 
 use plugin::{PluginDef, PluginStore};
@@ -370,6 +371,7 @@ async fn dispatch(
         "serper" => serper::search(client, key, query, max, intent).await,
         "serpapi" => serpapi::search(client, key, query, max, intent).await,
         "serpbase" => serpbase::search(client, key, query, max, intent).await,
+        "serply" => serply::search(client, key, query, max, intent).await,
         "bravesearch" => bravesearch::search(client, key, query, max, intent).await,
         "tinyfish" => tinyfish::search(client, key, query, max, intent).await,
         "parallel" => parallel::search(client, key, query, max, intent).await,
