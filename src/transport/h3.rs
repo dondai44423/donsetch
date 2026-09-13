@@ -88,11 +88,23 @@ async fn resolve_host_async(host: String, port: u16) -> Result<SocketAddr, Fetch
     let label = host.clone();
     let task = tokio::task::spawn_blocking(move || {
         let label = host.clone();
-        (host, port)
+        let addrs: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
             .map_err(|_| FetchError::Http(format!("dns resolve failed for {label}")))?
-            .next()
-            .ok_or_else(|| FetchError::Http(format!("dns resolve empty for {label}")))
+            .collect();
+        // Same connect-time SSRF filter the h1/h2 dial path applies
+        // in tcp::happy_connect_with: resolve, then drop private /
+        // loopback resolved IPs (unless the private-egress escape
+        // hatch is on) before dialing. ensure_url_safe already
+        // rejected private hosts at request time, but a DNS rebind
+        // between that check and this dial would otherwise reach an
+        // internal address over QUIC — h1/h2 re-filter here, h3 did
+        // not. This closes the parity gap.
+        select_dial_addr(
+            addrs,
+            crate::fetch::guards::private_egress_allowed(),
+            &label,
+        )
     });
     match tokio::time::timeout(Duration::from_secs(10), task).await {
         Ok(joined) => joined.map_err(|_| FetchError::Http("dns resolve task aborted".into()))?,
@@ -100,6 +112,38 @@ async fn resolve_host_async(host: String, port: u16) -> Result<SocketAddr, Fetch
             "dns resolve timed out for {label}"
         ))),
     }
+}
+
+/// Pick the address to dial from a resolved set, applying the same
+/// SSRF filter the h1/h2 path uses at connect time. With private
+/// egress allowed (the DONSETCH_ALLOW_PRIVATE_EGRESS escape hatch)
+/// the first address is used as-is; otherwise the first PUBLIC
+/// address is chosen, and a host that resolves ONLY to private /
+/// loopback addresses is refused (a rebind at dial time cannot reach
+/// an internal service over QUIC). Pure, so the filter is unit-tested
+/// without a resolver.
+fn select_dial_addr(
+    addrs: Vec<SocketAddr>,
+    allow_private: bool,
+    label: &str,
+) -> Result<SocketAddr, FetchError> {
+    if allow_private {
+        return addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| FetchError::Http(format!("dns resolve empty for {label}")));
+    }
+    if addrs.is_empty() {
+        return Err(FetchError::Http(format!("dns resolve empty for {label}")));
+    }
+    addrs
+        .into_iter()
+        .find(|a| !crate::fetch::guards::is_ssrf_resolved_ip(&a.ip()))
+        .ok_or_else(|| {
+            FetchError::Http(format!(
+                "dns: {label} resolves to a private/loopback address : SSRF guard"
+            ))
+        })
 }
 
 /// All the quiche quoting for one connection: our Chrome-true builder
@@ -545,6 +589,33 @@ pub async fn h3_fetch_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The h3 dial path must apply the same connect-time SSRF filter
+    // as h1/h2: a host that resolves to a private/loopback address
+    // (a DNS rebind after the request-time check) must not be dialed
+    // over QUIC. Pins the resolved-address selection.
+    #[test]
+    fn select_dial_addr_filters_private_resolved_ips() {
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let meta: SocketAddr = "169.254.169.254:443".parse().unwrap();
+        let loop_: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+        // A public address is chosen even when a private one is listed first.
+        assert_eq!(
+            select_dial_addr(vec![meta, public], false, "h").unwrap(),
+            public
+        );
+        // Resolves only to private/loopback -> refused (SSRF guard).
+        assert!(select_dial_addr(vec![meta, loop_], false, "h").is_err());
+        // Empty resolution -> the honest empty error, not a guard error.
+        let err = select_dial_addr(vec![], false, "h").unwrap_err();
+        assert!(format!("{err:?}").contains("empty"));
+        // The escape hatch takes the first address as-is (local egress).
+        assert_eq!(
+            select_dial_addr(vec![loop_, public], true, "h").unwrap(),
+            loop_
+        );
+    }
 
     // The h1 reader learned this the hard way (#144): a hostile
     // origin streaming an unbounded body must hit the shared cap,

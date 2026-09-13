@@ -109,6 +109,24 @@ impl KeyError {
     }
 }
 
+/// Cap on how much of an upstream error body is echoed into a
+/// `KeyError`. A `KeyError` reaches the model (the search error the
+/// agent sees), stderr, and the DONSEEK_DEBUG log, so echoing a raw
+/// multi-MB provider error page is both a context-budget hit and,
+/// for a provider that carries the key in the request URL (serpapi),
+/// a reflection surface: an intermediary that bounces the request
+/// line into its 4xx page would otherwise leak `?api_key=...` into
+/// all three sinks. 600 chars is enough to diagnose.
+const ERR_BODY_CAP: usize = 600;
+
+/// Bound an upstream error body before it lands in a `KeyError`.
+/// Every provider adapter routes its `HTTP {status}: <body>` echo
+/// through this so no single adapter can drift back to an uncapped
+/// echo (two capped, seven did not — the drift this centralizes).
+pub(super) fn err_body(text: &str) -> String {
+    text.chars().take(ERR_BODY_CAP).collect()
+}
+
 impl std::fmt::Display for KeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -427,6 +445,39 @@ mod tests {
             "key leaked into KeyError: {mapped}"
         );
         assert!(matches!(mapped, KeyError::UnknownError(_)));
+    }
+
+    // Every adapter echoes an upstream error body through err_body,
+    // which caps it at 600 chars. Without the cap a burned proxy's
+    // multi-MB HTML error page landed verbatim in the model context,
+    // stderr and the debug log (a context DoS), and for serpapi
+    // specifically it could carry the URL-borne api_key.
+    #[test]
+    fn err_body_caps_the_echoed_error() {
+        let huge = "x".repeat(10_000);
+        let capped = err_body(&huge);
+        assert_eq!(capped.chars().count(), ERR_BODY_CAP);
+        // Multibyte input is capped on CHARS, never mid-codepoint.
+        let cjk = "東".repeat(10_000);
+        let out = err_body(&cjk);
+        assert_eq!(out.chars().count(), ERR_BODY_CAP);
+        assert!(out.chars().all(|c| c == '東'));
+        // A short body is returned intact.
+        assert_eq!(err_body("HTTP 429 slow down"), "HTTP 429 slow down");
+    }
+
+    // serpapi puts the key in the request URL, so a reflecting
+    // intermediary can bounce it into the error body. The adapter
+    // scrubs the exact key substring before it is echoed; this pins
+    // the scrub-then-cap the adapter relies on.
+    #[test]
+    fn serpapi_style_key_scrub_removes_the_reflected_key() {
+        const KEY: &str = "sk-serpapi-SECRET-9f8e7d";
+        let reflected =
+            format!("<html>Bad request to /search?q=x&api_key={KEY} : forbidden</html>");
+        let echoed = err_body(&reflected).replace(KEY, "<redacted>");
+        assert!(!echoed.contains(KEY), "the key must not survive: {echoed}");
+        assert!(echoed.contains("<redacted>"));
     }
 
     #[test]

@@ -78,8 +78,10 @@ pub async fn search(
         // The error body rides to the agent surface: an uncapped
         // HTML error page from a burned proxy lands in the model's
         // context. Same 600-char class as the plugin adapters.
-        let text: String = text.chars().take(600).collect();
-        return Err(KeyError::UnknownError(format!("HTTP {status}: {text}")));
+        return Err(KeyError::UnknownError(format!(
+            "HTTP {status}: {}",
+            super::err_body(&text)
+        )));
     }
 
     // Parse success response.

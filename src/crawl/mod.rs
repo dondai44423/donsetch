@@ -271,6 +271,18 @@ fn token_path(dir: &std::path::Path, tok: &str) -> std::path::PathBuf {
     dir.join(format!("{tok}.json"))
 }
 
+/// A resume token is only ever ISSUED as `c<hex><hex>`, but the value
+/// consumed on resume is agent-supplied, and it is joined into a
+/// filesystem path (`<cache>/crawl-resumes/<tok>.json`). Reject
+/// anything that is not plain ASCII alphanumeric so a crafted token
+/// (`../../etc/x`, an absolute path, a NUL) cannot escape the store
+/// directory to read-then-delete a `.json` file outside it. Matches
+/// the traversal rejection paths::resolve_screenshot_path already
+/// applies to the screenshot output path.
+fn is_valid_resume_token(tok: &str) -> bool {
+    !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// One-time migration: the v3 store kept every token in one JSON
 /// map; split it into per-token files so tokens already issued
 /// survive the upgrade.
@@ -369,6 +381,12 @@ fn resume_store_sweep(dir: &std::path::Path) {
 /// its crawl actually resumes). Unknown, corrupt, or unreadable =
 /// the same honest error.
 fn resume_store_take(tok: &str) -> Result<ResumeState, String> {
+    // The token is agent-supplied and about to index the filesystem:
+    // refuse anything that is not a well-formed token before it can
+    // traverse out of the store directory (no FS touch on a bad one).
+    if !is_valid_resume_token(tok) {
+        return Err(format!("resume token expired or unknown: {tok}"));
+    }
     let dir = resumes_dir();
     migrate_legacy_store();
     resume_store_sweep(&dir);

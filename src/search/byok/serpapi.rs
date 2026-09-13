@@ -133,7 +133,12 @@ pub async fn search(
         if lower.contains("run out") || lower.contains("quota") || lower.contains("plan") {
             return Err(KeyError::CreditDepleted);
         }
-        return Err(KeyError::UnknownError(format!("HTTP {status}: {text}")));
+        // serpapi carries the key in the request URL (?api_key=...),
+        // so an intermediary that reflects the request line into its
+        // error page would echo the key here. Cap the body AND scrub
+        // the key before it reaches the model / stderr / debug log.
+        let body = super::err_body(&text).replace(key, "<redacted>");
+        return Err(KeyError::UnknownError(format!("HTTP {status}: {body}")));
     }
 
     let json: Value = serde_json::from_str(&text)
