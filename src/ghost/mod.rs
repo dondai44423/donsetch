@@ -183,7 +183,11 @@ fn chromium_binary() -> Result<String, String> {
     // `browser.chromium_path` already layers the legacy DONGHOST_CHROME
     // env var, so the config value is the single explicit source here.
     let configured = &crate::config::cfg().browser.chromium_path;
-    if !configured.is_empty() {
+    if crate::config::browser_string_is_supplied(
+        "browser.chromium_path",
+        configured,
+        "DONGHOST_CHROME",
+    ) {
         let path = PathBuf::from(configured);
         if !is_executable(&path) {
             return Err(format!(
@@ -313,10 +317,13 @@ fn playwright_registry_roots() -> Vec<PathBuf> {
     // The config knob wins when set; otherwise the ambient standard
     // var still applies (mirror-when-set semantics).
     let cfg_root = &crate::config::cfg().browser.playwright_path;
-    if !cfg_root.is_empty() {
-        roots.push(PathBuf::from(cfg_root));
-    } else if let Some(ov) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
-        roots.push(PathBuf::from(ov));
+    if let Some(root) = crate::config::mirrored_os(
+        "browser.playwright_path",
+        cfg_root,
+        "PLAYWRIGHT_BROWSERS_PATH",
+    ) && !root.is_empty()
+    {
+        roots.push(PathBuf::from(root));
     }
     #[cfg(not(windows))]
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {

@@ -299,6 +299,10 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+- Browser path overrides now preserve source presence across the typed config:
+  legacy empty values keep their historical override semantics, while modern
+  empty values reset to discovery or ambient defaults. Explicit Chromium,
+  CloakBrowser and Playwright paths remain literal.
 - The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by

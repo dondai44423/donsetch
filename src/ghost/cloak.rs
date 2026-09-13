@@ -144,7 +144,12 @@ fn resolve_browser_with_download(allow_download: bool) -> Result<BrowserResoluti
 fn resolve_chromium(backend: BrowserBackend) -> Result<BrowserResolution, String> {
     let path = super::chromium_binary()?;
     let version = crate::profile::probe_version_string_at_path(&path);
-    let source = if !crate::config::cfg().browser.chromium_path.is_empty() {
+    let configured = &crate::config::cfg().browser.chromium_path;
+    let source = if crate::config::browser_string_is_supplied(
+        "browser.chromium_path",
+        configured,
+        "DONGHOST_CHROME",
+    ) {
         "explicit"
     } else {
         "system"
@@ -158,9 +163,13 @@ fn resolve_chromium(backend: BrowserBackend) -> Result<BrowserResolution, String
 }
 
 fn resolve_cloak(allow_download: bool) -> Result<BrowserResolution, String> {
-    let configured_cloak_path = crate::config::cfg().browser.cloak_path.trim().to_string();
-    let (path, source) = if !configured_cloak_path.is_empty() {
-        let path = PathBuf::from(&configured_cloak_path);
+    let configured_cloak_path = &crate::config::cfg().browser.cloak_path;
+    let (path, source) = if crate::config::browser_string_is_supplied(
+        "browser.cloak_path",
+        configured_cloak_path,
+        "CLOAKBROWSER_BINARY_PATH",
+    ) {
+        let path = PathBuf::from(configured_cloak_path);
         validate_binary(&path).map_err(|e| {
             format!(
                 "[browser] cloak_path `{}` invalid (legacy env CLOAKBROWSER_BINARY_PATH): {e}",
@@ -229,15 +238,17 @@ fn platform_tag() -> Result<&'static str, String> {
 }
 
 fn requested_version() -> Result<String, String> {
-    let pinned = crate::config::cfg()
-        .browser
-        .cloak_version
-        .trim()
-        .to_string();
-    if pinned.is_empty() {
+    let configured = &crate::config::cfg().browser.cloak_version;
+    if !crate::config::browser_string_is_supplied(
+        "browser.cloak_version",
+        configured,
+        "CLOAKBROWSER_VERSION",
+    ) {
         return Ok(CLOAK_VERSION.into());
     }
-    let value = pinned;
+    // Version is text, not a path: historical behavior trimmed it before
+    // validating the full dotted numeric form.
+    let value = configured.trim().to_string();
     if valid_version(&value) {
         Ok(value)
     } else {
@@ -256,15 +267,15 @@ fn valid_version(value: &str) -> bool {
 }
 
 fn cache_dir() -> PathBuf {
-    let configured = crate::config::cfg()
-        .browser
-        .cloak_cache_dir
-        .trim()
-        .to_string();
-    if configured.is_empty() {
-        crate::paths::cache_dir().join("cloakbrowser")
-    } else {
+    let configured = &crate::config::cfg().browser.cloak_cache_dir;
+    if crate::config::browser_string_is_supplied(
+        "browser.cloak_cache_dir",
+        configured,
+        "CLOAKBROWSER_CACHE_DIR",
+    ) {
         PathBuf::from(configured)
+    } else {
+        crate::paths::cache_dir().join("cloakbrowser")
     }
 }
 
