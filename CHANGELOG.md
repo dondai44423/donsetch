@@ -191,6 +191,13 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Browser backend aliases now share the typed enum as their single registry
+  and normalize casing and surrounding whitespace across config sources.
+  Unknown effective legacy values fail closed instead of silently becoming
+  `auto`; a valid higher-precedence modern setting still overrides them.
+- The ONNX reranker now consumes the validated `search.rerank_threads` value
+  directly instead of leaking and reparsing a string, and reports configured
+  values as coming from the layered config. `0 = auto` behavior is unchanged.
 - Master hardening wave (overnight full-tree audit, every finding
   reproduced before fixing):
 - h1: a connection that closes before Content-Length is satisfied now
@@ -314,10 +321,28 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+- `donsetch config show --markdown` now emits one complete Markdown table per
+  config section, so section labels no longer turn the following knob rows
+  into plain paragraphs.
+- Modern `DONSETCH_<SECTION>__<KEY>` variables now fail loudly when a
+  recognized value is not UTF-8 or when distinct names normalize to the same
+  config key. Diagnostics identify the variable names without exposing their
+  values, and collision handling no longer depends on environment iteration
+  order.
+- Typed config validation now rejects an out-of-policy TOML value with
+  file attribution even when a valid higher-precedence env value would
+  otherwise hide it; legacy out-of-range values remain warning-only.
 - Browser path overrides now preserve source presence across the typed config:
   legacy empty values keep their historical override semantics, while modern
   empty values reset to discovery or ambient defaults. Explicit Chromium,
   CloakBrowser and Playwright paths remain literal.
+
+- Legacy route-memory and bypass-cache controls compose in their original
+  order under the typed config: the route-memory kill switch beats read-only,
+  while a valid legacy bypass TTL applied after `DONSETCH_BYPASS_CACHE=0`
+  re-enables the cache (and TTL zero disables it). TOML and modern env
+  overrides retain their higher precedence.
+
 - The supervisor's replay now survives a crash loop: the bytes
   replayed into a replacement were cleared from the unacked
   history, so a second silent death dropped them (reported by

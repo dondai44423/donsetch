@@ -33,11 +33,11 @@ use std::sync::OnceLock;
 // ---------------------------------------------------------------------------
 
 macro_rules! section {
-    ($name:ident { $($field:ident : $ty:ty = $default:expr),* $(,)? }) => {
+    ($name:ident { $($(#[$field_attr:meta])* $field:ident : $ty:ty = $default:expr),* $(,)? }) => {
         #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct $name {
-            $(pub $field: $ty,)*
+            $($(#[$field_attr])* pub $field: $ty,)*
         }
         impl Default for $name {
             fn default() -> Self {
@@ -130,6 +130,7 @@ section!(SearchSection {
 });
 
 section!(BrowserSection {
+    #[serde(deserialize_with = "deserialize_browser_backend")]
     backend: BrowserBackend = BrowserBackend::Auto,
     chromium_path: String = String::new(),
     no_sandbox: bool = false,
@@ -223,6 +224,26 @@ pub enum BrowserBackend {
     Headless,
     #[serde(alias = "cloakbrowser")]
     Cloak,
+}
+
+/// Normalize browser-backend strings before the enum's serde implementation
+/// applies its canonical names and aliases. The enum remains the only alias
+/// registry, while every config source gets the same trim/case behavior.
+fn deserialize_browser_backend<'de, D>(deserializer: D) -> Result<BrowserBackend, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)
+        .map_err(|_| <D::Error as serde::de::Error>::custom("browser backend must be a string"))?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    <BrowserBackend as serde::Deserialize>::deserialize(
+        serde::de::value::StrDeserializer::<D::Error>::new(&normalized),
+    )
+    .map_err(|_| {
+        <D::Error as serde::de::Error>::custom(
+            "unknown browser backend; expected auto, chromium, headless, or cloak",
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
@@ -356,14 +377,19 @@ pub fn load() -> Result<Loaded, ConfigError> {
         return Err(ConfigError::Env(e.clone()));
     }
 
-    // Validate the file layer on its own so unknown keys and bad types
-    // fail loudly with the file path attached, exactly once.
+    // Validate the file layer on its own so unknown keys, bad types and
+    // out-of-policy values fail loudly with the file path attached,
+    // exactly once.
     if let Some(file) = &file_layer {
         let path = file_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let source = deserialize_layer_table(file).map_err(|message| ConfigError::File {
+            path: path.clone(),
+            message: message.to_string(),
+        })?;
+        validate(&source).map_err(|message| ConfigError::File {
             path: path.clone(),
             message: message.to_string(),
         })?;
@@ -616,8 +642,7 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "off".into(),
             "DONSETCH_NO_ROUTE_MEMORY",
         );
-    }
-    if legacy_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
+    } else if legacy_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
         put(
             &mut m,
             "state.route_memory",
@@ -829,15 +854,33 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_BYPASS_CACHE_TTL_SECS") {
-        Some(n) => put_num(
+        // Historically the TTL was applied after the cache off switch:
+        // zero disabled the cache, while a valid positive TTL enabled it
+        // again. Preserve that composition in this layer rather than in
+        // the bypass consumer.
+        Some(0) => put(
             &mut m,
-            &mut warnings,
-            "bypass.cache_ttl_secs",
+            "bypass.cache",
+            false.into(),
             "DONSETCH_BYPASS_CACHE_TTL_SECS",
-            n,
-            1,
-            86400,
         ),
+        Some(n @ 1..=86400) => {
+            put(
+                &mut m,
+                "bypass.cache",
+                true.into(),
+                "DONSETCH_BYPASS_CACHE_TTL_SECS",
+            );
+            put(
+                &mut m,
+                "bypass.cache_ttl_secs",
+                n.into(),
+                "DONSETCH_BYPASS_CACHE_TTL_SECS",
+            );
+        }
+        Some(n) => warnings.push(format!(
+            "ignoring DONSETCH_BYPASS_CACHE_TTL_SECS={n}: out of range 0..=86400"
+        )),
         None if std::env::var_os("DONSETCH_BYPASS_CACHE_TTL_SECS").is_some() => {
             warnings.push("ignoring DONSETCH_BYPASS_CACHE_TTL_SECS: not a number".into())
         }
@@ -917,30 +960,23 @@ fn legacy_layer() -> (VMap, Vec<String>) {
     }
 
     // browser
-    if let Some(v) = std::env::var_os("DONSETCH_BROWSER_BACKEND")
-        .or_else(|| std::env::var_os("DONGHOST_BROWSER_BACKEND"))
-    {
-        let v = v.to_string_lossy().to_ascii_lowercase();
-        let backend = match v.as_str() {
-            "auto" | "" => "auto",
-            "chromium" | "chrome" | "original" => "chromium",
-            "headless" | "original-headless" => "headless",
-            "cloak" | "cloakbrowser" => "cloak",
-            _ => {
-                warnings.push(format!(
-                    "ignoring unknown browser backend {v:?} (auto | chromium | headless | cloak)"
-                ));
-                ""
-            }
+    let backend = std::env::var_os("DONSETCH_BROWSER_BACKEND")
+        .map(|value| ("DONSETCH_BROWSER_BACKEND", value))
+        .or_else(|| {
+            std::env::var_os("DONGHOST_BROWSER_BACKEND")
+                .map(|value| ("DONGHOST_BROWSER_BACKEND", value))
+        });
+    if let Some((name, value)) = backend {
+        let normalized = value.to_string_lossy().trim().to_ascii_lowercase();
+        // An empty legacy value historically meant auto. Unknown values stay
+        // in the sparse layer so the winning value is rejected by the typed
+        // enum instead of silently selecting a different browser.
+        let normalized = if normalized.is_empty() {
+            "auto".to_owned()
+        } else {
+            normalized
         };
-        if !backend.is_empty() {
-            put(
-                &mut m,
-                "browser.backend",
-                backend.into(),
-                "DONSETCH_BROWSER_BACKEND",
-            );
-        }
+        put(&mut m, "browser.backend", normalized.into(), name);
     }
     if let Some(v) = std::env::var_os("DONGHOST_CHROME") {
         put(
@@ -1789,11 +1825,27 @@ fn boolish(value: &str) -> Option<bool> {
 }
 
 fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
+    new_env_layer_from(std::env::vars_os())
+}
+
+struct ModernEnvValue {
+    name: String,
+    value: std::ffi::OsString,
+    kind: FieldKind,
+}
+
+/// Parse one immutable environment snapshot. Keeping collection outside the
+/// parser makes collision behavior testable without relying on the platform's
+/// environment iteration order.
+fn new_env_layer_from(
+    snapshot: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> (VMap, Vec<String>, Vec<String>) {
     let mut map = VMap::new();
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
+    let mut recognized = std::collections::BTreeMap::<String, Vec<ModernEnvValue>>::new();
 
-    for (name, value) in std::env::vars_os() {
+    for (name, value) in snapshot {
         let Some(name) = name.to_str() else {
             continue;
         };
@@ -1823,17 +1875,42 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
             ));
             continue;
         };
+        let canonical = format!("{section}.{key}");
+        recognized
+            .entry(canonical)
+            .or_default()
+            .push(ModernEnvValue {
+                name: name.to_string(),
+                value,
+                kind,
+            });
+    }
+
+    for (canonical, mut entries) in recognized {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        if entries.len() > 1 {
+            let mut names = entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>();
+            names.dedup();
+            errors.push(format!(
+                "{} map to the same key {canonical}; set only one",
+                names.join(", ")
+            ));
+            continue;
+        }
+
+        let ModernEnvValue { name, value, kind } = entries.pop().expect("recognized env entry");
         let Some(value) = value.to_str() else {
-            if (section, key) == ("transport", "token") {
+            if canonical == "transport.token" {
                 errors.push(format!("{name}: {MODERN_HTTP_TOKEN_REQUIREMENT}"));
             } else {
-                // The modern env layer is strict; a value that is
-                // not even UTF-8 must not silently vanish.
-                warnings.push(format!("ignoring {name}: value is not valid UTF-8"));
+                errors.push(format!("{name} contains a non-UTF-8 value"));
             }
             continue;
         };
-        if (section, key) == ("transport", "token")
+        if canonical == "transport.token"
             && let Err(message) = validate_modern_http_token(value)
         {
             errors.push(format!("{name}: {message}"));
@@ -1845,7 +1922,7 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
                 Some(b) => b.into(),
                 None => {
                     errors.push(format!(
-                        "{name}={value:?} is not a boolean (1/true/on/yes/0/false/off/no)"
+                        "{name} is not a boolean (1/true/on/yes/0/false/off/no)"
                     ));
                     continue;
                 }
@@ -1853,7 +1930,7 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
             FieldKind::Int => match value.trim().parse::<i64>() {
                 Ok(n) => n.into(),
                 Err(_) => {
-                    errors.push(format!("{name}={value:?} is not an integer"));
+                    errors.push(format!("{name} is not an integer"));
                     continue;
                 }
             },
@@ -1864,9 +1941,11 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
                 .collect::<Vec<_>>()
                 .into(),
         };
-        put(&mut map, &format!("{section}.{key}"), vkind, name);
+        put(&mut map, &canonical, vkind, &name);
     }
 
+    warnings.sort();
+    errors.sort();
     (map, warnings, errors)
 }
 
@@ -2105,7 +2184,6 @@ pub fn show_text(loaded: &Loaded) -> String {
 /// The knob reference table as markdown (single source: this file).
 pub fn show_markdown() -> String {
     let mut out = String::new();
-    out.push_str("| Key | Type | Default | What it does |\n|---|---|---|---|\n");
     let mut last_section = "";
     for (section, key, kind, default, doc) in fieldbook() {
         let section = *section;
@@ -2117,7 +2195,11 @@ pub fn show_markdown() -> String {
             FieldKind::List => "list",
         };
         if section != last_section {
-            out.push_str(&format!("\n**`[{section}]`**\n\n"));
+            if !last_section.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("**`[{section}]`**\n\n"));
+            out.push_str("| Key | Type | Default | What it does |\n|---|---|---|---|\n");
             last_section = section;
         }
         let esc = |s: &str| s.replace('|', "\\|");
@@ -2438,6 +2520,51 @@ mod tests {
         drop(guard);
     }
 
+    #[test]
+    fn invalid_file_value_is_not_hidden_by_valid_env_override() {
+        let guard = clean_env();
+        let path = write_cfg(&std::env::temp_dir(), "[transport]\nport = 0\n");
+        set_env("DONSETCH_CONFIG", &path);
+        set_env("DONSETCH_TRANSPORT__PORT", "4321");
+
+        let err = match load() {
+            Err(err) => err,
+            Ok(_) => panic!("the invalid file layer must fail before the env override"),
+        };
+        match err {
+            ConfigError::File {
+                path: reported,
+                message,
+            } => {
+                assert_eq!(reported, path.display().to_string());
+                assert!(
+                    message.contains("transport.port = 0"),
+                    "wrong file error: {message}"
+                );
+            }
+            other => panic!("the error must be attributed to the file, got {other}"),
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn valid_file_value_is_overridden_by_new_env_with_env_origin() {
+        let guard = clean_env();
+        let path = write_cfg(&std::env::temp_dir(), "[transport]\nport = 1234\n");
+        set_env("DONSETCH_CONFIG", &path);
+        set_env("DONSETCH_TRANSPORT__PORT", "4321");
+
+        let loaded = load().expect("both modern sources are valid");
+        assert_eq!(loaded.config.transport.port, 4321);
+        let origin = origins(&loaded.merged, &loaded.config)
+            .into_iter()
+            .find(|(section, key, _, _)| *section == "transport" && *key == "port")
+            .expect("transport.port row")
+            .3;
+        assert_eq!(origin, "DONSETCH_TRANSPORT__PORT");
+        drop(guard);
+    }
+
     /// The documented order is defaults < legacy < file < new env; the
     /// implementation folded legacy AFTER the file, so a legacy value
     /// beat the TOML. Pinned now.
@@ -2530,6 +2657,232 @@ mod tests {
         drop(guard);
     }
 
+    #[test]
+    fn legacy_route_memory_flags_compose_with_kill_switch_precedence() {
+        struct Case {
+            no_route_memory: Option<&'static str>,
+            readonly: Option<&'static str>,
+            modern: Option<&'static str>,
+            expected: RouteMemory,
+            origin: &'static str,
+        }
+
+        let cases = [
+            Case {
+                no_route_memory: None,
+                readonly: None,
+                modern: None,
+                expected: RouteMemory::ReadWrite,
+                origin: "default",
+            },
+            Case {
+                no_route_memory: Some("1"),
+                readonly: None,
+                modern: None,
+                expected: RouteMemory::Off,
+                origin: "DONSETCH_NO_ROUTE_MEMORY",
+            },
+            Case {
+                no_route_memory: None,
+                readonly: Some("true"),
+                modern: None,
+                expected: RouteMemory::ReadOnly,
+                origin: "DONSETCH_ROUTE_MEMORY_READONLY",
+            },
+            Case {
+                no_route_memory: Some("1"),
+                readonly: Some("1"),
+                modern: None,
+                expected: RouteMemory::Off,
+                origin: "DONSETCH_NO_ROUTE_MEMORY",
+            },
+            Case {
+                no_route_memory: Some("0"),
+                readonly: Some("on"),
+                modern: None,
+                expected: RouteMemory::ReadOnly,
+                origin: "DONSETCH_ROUTE_MEMORY_READONLY",
+            },
+            Case {
+                no_route_memory: Some("1"),
+                readonly: Some("1"),
+                modern: Some("readwrite"),
+                expected: RouteMemory::ReadWrite,
+                origin: "DONSETCH_STATE__ROUTE_MEMORY",
+            },
+        ];
+
+        for case in cases {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            if let Some(value) = case.no_route_memory {
+                set_env("DONSETCH_NO_ROUTE_MEMORY", value);
+            }
+            if let Some(value) = case.readonly {
+                set_env("DONSETCH_ROUTE_MEMORY_READONLY", value);
+            }
+            if let Some(value) = case.modern {
+                set_env("DONSETCH_STATE__ROUTE_MEMORY", value);
+            }
+
+            let loaded = load().expect("route-memory combination must load");
+            assert_eq!(loaded.config.state.route_memory, case.expected);
+            let origin = origins(&loaded.merged, &loaded.config)
+                .into_iter()
+                .find(|(section, key, _, _)| *section == "state" && *key == "route_memory")
+                .expect("route-memory origin")
+                .3;
+            assert_eq!(origin, case.origin);
+            assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn legacy_bypass_cache_and_ttl_compose_in_historical_order() {
+        struct Case {
+            cache: Option<&'static str>,
+            ttl: Option<&'static str>,
+            modern_cache: Option<&'static str>,
+            expected_cache: bool,
+            expected_ttl: u64,
+            cache_origin: &'static str,
+            ttl_origin: &'static str,
+            warning: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                cache: Some("0"),
+                ttl: None,
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE",
+                ttl_origin: "default",
+                warning: None,
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("60"),
+                modern_cache: None,
+                expected_cache: true,
+                expected_ttl: 60,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                warning: None,
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("not-a-number"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE",
+                ttl_origin: "default",
+                warning: Some("DONSETCH_BYPASS_CACHE_TTL_SECS: not a number"),
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("0"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "default",
+                warning: None,
+            },
+            Case {
+                cache: None,
+                ttl: Some("60"),
+                modern_cache: None,
+                expected_cache: true,
+                expected_ttl: 60,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                warning: None,
+            },
+            Case {
+                cache: None,
+                ttl: Some("0"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "default",
+                warning: None,
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("86401"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE",
+                ttl_origin: "default",
+                warning: Some("DONSETCH_BYPASS_CACHE_TTL_SECS=86401: out of range 0..=86400"),
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("60"),
+                modern_cache: Some("false"),
+                expected_cache: false,
+                expected_ttl: 60,
+                cache_origin: "DONSETCH_BYPASS__CACHE",
+                ttl_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                warning: None,
+            },
+            Case {
+                cache: None,
+                ttl: Some("0"),
+                modern_cache: Some("true"),
+                expected_cache: true,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS__CACHE",
+                ttl_origin: "default",
+                warning: None,
+            },
+        ];
+
+        for case in cases {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            if let Some(value) = case.cache {
+                set_env("DONSETCH_BYPASS_CACHE", value);
+            }
+            if let Some(value) = case.ttl {
+                set_env("DONSETCH_BYPASS_CACHE_TTL_SECS", value);
+            }
+            if let Some(value) = case.modern_cache {
+                set_env("DONSETCH_BYPASS__CACHE", value);
+            }
+
+            let loaded = load().expect("bypass-cache combination must load");
+            assert_eq!(loaded.config.bypass.cache, case.expected_cache);
+            assert_eq!(loaded.config.bypass.cache_ttl_secs, case.expected_ttl);
+            let rows = origins(&loaded.merged, &loaded.config);
+            let cache_origin = rows
+                .iter()
+                .find(|(section, key, _, _)| *section == "bypass" && *key == "cache")
+                .expect("cache origin")
+                .3
+                .as_str();
+            let ttl_origin = rows
+                .iter()
+                .find(|(section, key, _, _)| *section == "bypass" && *key == "cache_ttl_secs")
+                .expect("TTL origin")
+                .3
+                .as_str();
+            assert_eq!(cache_origin, case.cache_origin);
+            assert_eq!(ttl_origin, case.ttl_origin);
+            match case.warning {
+                Some(expected) => assert_eq!(loaded.warnings, [format!("ignoring {expected}")]),
+                None => assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings),
+            }
+            drop(guard);
+        }
+    }
+
     /// Legacy names keep their historical soft semantics: a value
     /// outside the sane range warns and keeps the default, never a hard
     /// failure (review finding: both caps used to exit 1).
@@ -2605,24 +2958,76 @@ mod tests {
         drop(guard);
     }
 
-    /// The legacy backend mapper dropped the headless variant; it must
-    /// map to BrowserBackend::Headless like every historical spelling.
+    /// Both historical env names must pass every spelling through the typed
+    /// enum's alias registry, including the normalization the old resolver
+    /// applied before the config migration.
     #[test]
-    fn legacy_headless_backend_still_maps() {
-        let guard = clean_env();
-        set_env("DONSETCH_NO_CONFIG_FILE", "1");
-        set_env("DONSETCH_BROWSER_BACKEND", "headless");
-        let loaded = load().expect("load");
-        assert_eq!(loaded.config.browser.backend, BrowserBackend::Headless);
-        assert!(
-            loaded
-                .warnings
-                .iter()
-                .all(|w| !w.contains("unknown browser backend")),
-            "headless is a known backend: {warnings:?}",
-            warnings = loaded.warnings
-        );
-        drop(guard);
+    fn legacy_browser_backend_aliases_use_the_typed_parser() {
+        let cases = [
+            ("auto", BrowserBackend::Auto),
+            ("chromium", BrowserBackend::Chromium),
+            ("chrome", BrowserBackend::Chromium),
+            ("original", BrowserBackend::Chromium),
+            ("headless", BrowserBackend::Headless),
+            ("original-headless", BrowserBackend::Headless),
+            ("cloak", BrowserBackend::Cloak),
+            ("cloakbrowser", BrowserBackend::Cloak),
+            ("  ChRoMe  ", BrowserBackend::Chromium),
+            ("\tORIGINAL-HEADLESS\n", BrowserBackend::Headless),
+            (" CloakBrowser ", BrowserBackend::Cloak),
+            (" \t ", BrowserBackend::Auto),
+        ];
+
+        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
+            for (value, expected) in cases {
+                let guard = clean_env();
+                set_env("DONSETCH_NO_CONFIG_FILE", "1");
+                set_env(name, value);
+                let loaded = load()
+                    .unwrap_or_else(|error| panic!("{name}={value:?} should load, got {error}"));
+                assert_eq!(loaded.config.browser.backend, expected, "{name}={value:?}");
+                drop(guard);
+            }
+        }
+    }
+
+    #[test]
+    fn effective_unknown_legacy_browser_backend_fails_without_echoing_it() {
+        const UNKNOWN: &str = "private-backend-marker";
+
+        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            set_env(name, UNKNOWN);
+            let error = match load() {
+                Ok(_) => panic!("{name} must not silently fall back to auto"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("unknown browser backend"), "{error}");
+            assert!(!error.contains(UNKNOWN), "backend value leaked: {error}");
+            drop(guard);
+        }
+    }
+
+    /// Layer precedence applies before typed validation: an invalid legacy
+    /// value that is not effective must not poison a valid modern override.
+    #[test]
+    fn modern_browser_backend_overrides_unknown_legacy_value() {
+        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            set_env(name, "private-backend-marker");
+            set_env("DONSETCH_BROWSER__BACKEND", "  ClOaKbRoWsEr  ");
+            let loaded = load().expect("the valid higher-precedence backend must win");
+            assert_eq!(loaded.config.browser.backend, BrowserBackend::Cloak);
+            let origin = origins(&loaded.merged, &loaded.config)
+                .into_iter()
+                .find(|(section, key, _, _)| *section == "browser" && *key == "backend")
+                .expect("browser.backend origin")
+                .3;
+            assert_eq!(origin, "DONSETCH_BROWSER__BACKEND");
+            drop(guard);
+        }
     }
 
     /// Kill switch wins: DONSETCH_NO_GHOST_POOL must override a slot
@@ -2748,26 +3153,68 @@ mod tests {
         drop(guard);
     }
 
-    /// Markdown tables must never split a row: raw pipes in defaults
-    /// and descriptions are escaped ("\\|"), so a data row has the
-    /// same " | " separator count as the header (4 = 4 columns).
+    /// Each section must be a complete Markdown table: a section label,
+    /// then a contiguous header, delimiter, and exactly one row per knob.
+    /// Raw pipes in cells stay escaped so they cannot split a row.
     #[test]
-    fn show_markdown_keeps_one_row_per_knob() {
+    fn show_markdown_renders_one_complete_table_per_section() {
         let md = super::show_markdown();
-        let header_cols = md.lines().next().unwrap().matches(" | ").count();
-        let data_rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| `")).collect();
-        assert!(data_rows.len() > 50, "fieldbook shrunk?");
-        for row in &data_rows {
-            assert_eq!(
-                row.matches(" | ").count(),
-                header_cols,
-                "row split by an unescaped pipe: {row}"
-            );
+        let blocks: Vec<&str> = md.trim().split("\n\n").collect();
+        let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (section, key, _, _, _) in fieldbook() {
+            if sections.last().map(|(name, _)| *name) != Some(*section) {
+                sections.push((*section, Vec::new()));
+            }
+            sections.last_mut().unwrap().1.push(*key);
         }
+
+        assert_eq!(
+            blocks.len(),
+            sections.len() * 2,
+            "each section must render as one label block and one table block"
+        );
+        let (block_pairs, remainder) = blocks.as_slice().as_chunks::<2>();
+        assert!(remainder.is_empty());
+
+        let mut row_count = 0;
+        for ((section, keys), pair) in sections.iter().zip(block_pairs) {
+            assert_eq!(pair[0], format!("**`[{section}]`**"));
+
+            let lines: Vec<&str> = pair[1].lines().collect();
+            assert_eq!(
+                lines.first().copied(),
+                Some("| Key | Type | Default | What it does |")
+            );
+            assert_eq!(
+                lines.get(1).copied(),
+                Some("|---|---|---|---|"),
+                "section {section} has no Markdown table delimiter"
+            );
+            assert_eq!(
+                lines.len() - 2,
+                keys.len(),
+                "section {section} does not have one row per knob"
+            );
+
+            for (row, key) in lines[2..].iter().zip(keys) {
+                assert!(
+                    row.starts_with(&format!("| `{key}` | ")),
+                    "section {section} lost or reordered knob {key}: {row}"
+                );
+                assert_eq!(
+                    row.matches(" | ").count(),
+                    3,
+                    "row split by an unescaped pipe: {row}"
+                );
+                row_count += 1;
+            }
+        }
+        assert_eq!(row_count, fieldbook().len());
+
         // The transport.kind description does contain a pipe; the escape
         // must have fired on it.
-        let kind_row = data_rows
-            .iter()
+        let kind_row = md
+            .lines()
             .find(|l| l.contains("`kind`"))
             .expect("transport.kind not in the table");
         assert!(kind_row.contains("\\|"), "kind row lost its escaped pipe");
@@ -2882,6 +3329,81 @@ mod tests {
         }
         assert_eq!(boolish("maybe"), None);
         assert_eq!(boolish(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recognized_modern_env_rejects_non_utf8_without_echoing_the_value() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let secret = b"secret-\xff-sentinel".to_vec();
+        let (map, warnings, errors) = new_env_layer_from([(
+            std::ffi::OsString::from("DONSETCH_FETCH__H3"),
+            std::ffi::OsString::from_vec(secret),
+        )]);
+
+        assert!(map.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("DONSETCH_FETCH__H3"));
+        assert!(errors[0].contains("non-UTF-8"));
+        assert!(!errors[0].contains("secret"), "value leaked: {}", errors[0]);
+    }
+
+    #[test]
+    fn modern_env_collisions_fail_independently_of_snapshot_order() {
+        let first = (
+            std::ffi::OsString::from("DONSETCH_FETCH__H3"),
+            std::ffi::OsString::from("first-value-sentinel"),
+        );
+        let second = (
+            std::ffi::OsString::from("DONSETCH_fetch__h3"),
+            std::ffi::OsString::from("second-value-sentinel"),
+        );
+
+        let (forward_map, forward_warnings, forward_errors) =
+            new_env_layer_from([first.clone(), second.clone()]);
+        let (reverse_map, reverse_warnings, reverse_errors) = new_env_layer_from([second, first]);
+
+        assert!(forward_map.is_empty());
+        assert!(reverse_map.is_empty());
+        assert_eq!(forward_warnings, reverse_warnings);
+        assert_eq!(forward_errors, reverse_errors);
+        assert_eq!(forward_errors.len(), 1);
+        let error = &forward_errors[0];
+        assert!(error.contains("DONSETCH_FETCH__H3"), "{error}");
+        assert!(error.contains("DONSETCH_fetch__h3"), "{error}");
+        assert!(error.contains("fetch.h3"), "{error}");
+        assert!(
+            !error.contains("first-value-sentinel"),
+            "value leaked: {error}"
+        );
+        assert!(
+            !error.contains("second-value-sentinel"),
+            "value leaked: {error}"
+        );
+    }
+
+    #[test]
+    fn modern_env_type_errors_name_variables_without_echoing_values() {
+        let (_, warnings, errors) = new_env_layer_from([
+            (
+                std::ffi::OsString::from("DONSETCH_FETCH__H3"),
+                std::ffi::OsString::from("boolean-value-sentinel"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_TRANSPORT__PORT"),
+                std::ffi::OsString::from("integer-value-sentinel"),
+            ),
+        ]);
+
+        assert!(warnings.is_empty());
+        assert_eq!(errors.len(), 2);
+        let diagnostic = errors.join("\n");
+        assert!(diagnostic.contains("DONSETCH_FETCH__H3"));
+        assert!(diagnostic.contains("DONSETCH_TRANSPORT__PORT"));
+        assert!(!diagnostic.contains("boolean-value-sentinel"));
+        assert!(!diagnostic.contains("integer-value-sentinel"));
     }
 
     #[test]
