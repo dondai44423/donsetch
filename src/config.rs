@@ -377,14 +377,19 @@ pub fn load() -> Result<Loaded, ConfigError> {
         return Err(ConfigError::Env(e.clone()));
     }
 
-    // Validate the file layer on its own so unknown keys and bad types
-    // fail loudly with the file path attached, exactly once.
+    // Validate the file layer on its own so unknown keys, bad types and
+    // out-of-policy values fail loudly with the file path attached,
+    // exactly once.
     if let Some(file) = &file_layer {
         let path = file_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let source = deserialize_layer_table(file).map_err(|message| ConfigError::File {
+            path: path.clone(),
+            message: message.to_string(),
+        })?;
+        validate(&source).map_err(|message| ConfigError::File {
             path: path.clone(),
             message: message.to_string(),
         })?;
@@ -2466,6 +2471,51 @@ mod tests {
             .3
             .clone();
         assert_eq!(origin, "DONSETCH_FETCH__PREWARM");
+        drop(guard);
+    }
+
+    #[test]
+    fn invalid_file_value_is_not_hidden_by_valid_env_override() {
+        let guard = clean_env();
+        let path = write_cfg(&std::env::temp_dir(), "[transport]\nport = 0\n");
+        set_env("DONSETCH_CONFIG", &path);
+        set_env("DONSETCH_TRANSPORT__PORT", "4321");
+
+        let err = match load() {
+            Err(err) => err,
+            Ok(_) => panic!("the invalid file layer must fail before the env override"),
+        };
+        match err {
+            ConfigError::File {
+                path: reported,
+                message,
+            } => {
+                assert_eq!(reported, path.display().to_string());
+                assert!(
+                    message.contains("transport.port = 0"),
+                    "wrong file error: {message}"
+                );
+            }
+            other => panic!("the error must be attributed to the file, got {other}"),
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn valid_file_value_is_overridden_by_new_env_with_env_origin() {
+        let guard = clean_env();
+        let path = write_cfg(&std::env::temp_dir(), "[transport]\nport = 1234\n");
+        set_env("DONSETCH_CONFIG", &path);
+        set_env("DONSETCH_TRANSPORT__PORT", "4321");
+
+        let loaded = load().expect("both modern sources are valid");
+        assert_eq!(loaded.config.transport.port, 4321);
+        let origin = origins(&loaded.merged, &loaded.config)
+            .into_iter()
+            .find(|(section, key, _, _)| *section == "transport" && *key == "port")
+            .expect("transport.port row")
+            .3;
+        assert_eq!(origin, "DONSETCH_TRANSPORT__PORT");
         drop(guard);
     }
 

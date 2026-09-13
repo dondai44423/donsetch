@@ -306,6 +306,9 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+- Typed config validation now rejects an out-of-policy TOML value with
+  file attribution even when a valid higher-precedence env value would
+  otherwise hide it; legacy out-of-range values remain warning-only.
 - Browser path overrides now preserve source presence across the typed config:
   legacy empty values keep their historical override semantics, while modern
   empty values reset to discovery or ambient defaults. Explicit Chromium,
