@@ -33,11 +33,11 @@ use std::sync::OnceLock;
 // ---------------------------------------------------------------------------
 
 macro_rules! section {
-    ($name:ident { $($field:ident : $ty:ty = $default:expr),* $(,)? }) => {
+    ($name:ident { $($(#[$field_attr:meta])* $field:ident : $ty:ty = $default:expr),* $(,)? }) => {
         #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct $name {
-            $(pub $field: $ty,)*
+            $($(#[$field_attr])* pub $field: $ty,)*
         }
         impl Default for $name {
             fn default() -> Self {
@@ -130,6 +130,7 @@ section!(SearchSection {
 });
 
 section!(BrowserSection {
+    #[serde(deserialize_with = "deserialize_browser_backend")]
     backend: BrowserBackend = BrowserBackend::Auto,
     chromium_path: String = String::new(),
     no_sandbox: bool = false,
@@ -223,6 +224,26 @@ pub enum BrowserBackend {
     Headless,
     #[serde(alias = "cloakbrowser")]
     Cloak,
+}
+
+/// Normalize browser-backend strings before the enum's serde implementation
+/// applies its canonical names and aliases. The enum remains the only alias
+/// registry, while every config source gets the same trim/case behavior.
+fn deserialize_browser_backend<'de, D>(deserializer: D) -> Result<BrowserBackend, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <String as serde::Deserialize>::deserialize(deserializer)
+        .map_err(|_| <D::Error as serde::de::Error>::custom("browser backend must be a string"))?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    <BrowserBackend as serde::Deserialize>::deserialize(
+        serde::de::value::StrDeserializer::<D::Error>::new(&normalized),
+    )
+    .map_err(|_| {
+        <D::Error as serde::de::Error>::custom(
+            "unknown browser backend; expected auto, chromium, headless, or cloak",
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
@@ -934,30 +955,23 @@ fn legacy_layer() -> (VMap, Vec<String>) {
     }
 
     // browser
-    if let Some(v) = std::env::var_os("DONSETCH_BROWSER_BACKEND")
-        .or_else(|| std::env::var_os("DONGHOST_BROWSER_BACKEND"))
-    {
-        let v = v.to_string_lossy().to_ascii_lowercase();
-        let backend = match v.as_str() {
-            "auto" | "" => "auto",
-            "chromium" | "chrome" | "original" => "chromium",
-            "headless" | "original-headless" => "headless",
-            "cloak" | "cloakbrowser" => "cloak",
-            _ => {
-                warnings.push(format!(
-                    "ignoring unknown browser backend {v:?} (auto | chromium | headless | cloak)"
-                ));
-                ""
-            }
+    let backend = std::env::var_os("DONSETCH_BROWSER_BACKEND")
+        .map(|value| ("DONSETCH_BROWSER_BACKEND", value))
+        .or_else(|| {
+            std::env::var_os("DONGHOST_BROWSER_BACKEND")
+                .map(|value| ("DONGHOST_BROWSER_BACKEND", value))
+        });
+    if let Some((name, value)) = backend {
+        let normalized = value.to_string_lossy().trim().to_ascii_lowercase();
+        // An empty legacy value historically meant auto. Unknown values stay
+        // in the sparse layer so the winning value is rejected by the typed
+        // enum instead of silently selecting a different browser.
+        let normalized = if normalized.is_empty() {
+            "auto".to_owned()
+        } else {
+            normalized
         };
-        if !backend.is_empty() {
-            put(
-                &mut m,
-                "browser.backend",
-                backend.into(),
-                "DONSETCH_BROWSER_BACKEND",
-            );
-        }
+        put(&mut m, "browser.backend", normalized.into(), name);
     }
     if let Some(v) = std::env::var_os("DONGHOST_CHROME") {
         put(
@@ -2847,24 +2861,76 @@ mod tests {
         drop(guard);
     }
 
-    /// The legacy backend mapper dropped the headless variant; it must
-    /// map to BrowserBackend::Headless like every historical spelling.
+    /// Both historical env names must pass every spelling through the typed
+    /// enum's alias registry, including the normalization the old resolver
+    /// applied before the config migration.
     #[test]
-    fn legacy_headless_backend_still_maps() {
-        let guard = clean_env();
-        set_env("DONSETCH_NO_CONFIG_FILE", "1");
-        set_env("DONSETCH_BROWSER_BACKEND", "headless");
-        let loaded = load().expect("load");
-        assert_eq!(loaded.config.browser.backend, BrowserBackend::Headless);
-        assert!(
-            loaded
-                .warnings
-                .iter()
-                .all(|w| !w.contains("unknown browser backend")),
-            "headless is a known backend: {warnings:?}",
-            warnings = loaded.warnings
-        );
-        drop(guard);
+    fn legacy_browser_backend_aliases_use_the_typed_parser() {
+        let cases = [
+            ("auto", BrowserBackend::Auto),
+            ("chromium", BrowserBackend::Chromium),
+            ("chrome", BrowserBackend::Chromium),
+            ("original", BrowserBackend::Chromium),
+            ("headless", BrowserBackend::Headless),
+            ("original-headless", BrowserBackend::Headless),
+            ("cloak", BrowserBackend::Cloak),
+            ("cloakbrowser", BrowserBackend::Cloak),
+            ("  ChRoMe  ", BrowserBackend::Chromium),
+            ("\tORIGINAL-HEADLESS\n", BrowserBackend::Headless),
+            (" CloakBrowser ", BrowserBackend::Cloak),
+            (" \t ", BrowserBackend::Auto),
+        ];
+
+        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
+            for (value, expected) in cases {
+                let guard = clean_env();
+                set_env("DONSETCH_NO_CONFIG_FILE", "1");
+                set_env(name, value);
+                let loaded = load()
+                    .unwrap_or_else(|error| panic!("{name}={value:?} should load, got {error}"));
+                assert_eq!(loaded.config.browser.backend, expected, "{name}={value:?}");
+                drop(guard);
+            }
+        }
+    }
+
+    #[test]
+    fn effective_unknown_legacy_browser_backend_fails_without_echoing_it() {
+        const UNKNOWN: &str = "private-backend-marker";
+
+        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            set_env(name, UNKNOWN);
+            let error = match load() {
+                Ok(_) => panic!("{name} must not silently fall back to auto"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("unknown browser backend"), "{error}");
+            assert!(!error.contains(UNKNOWN), "backend value leaked: {error}");
+            drop(guard);
+        }
+    }
+
+    /// Layer precedence applies before typed validation: an invalid legacy
+    /// value that is not effective must not poison a valid modern override.
+    #[test]
+    fn modern_browser_backend_overrides_unknown_legacy_value() {
+        for name in ["DONSETCH_BROWSER_BACKEND", "DONGHOST_BROWSER_BACKEND"] {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            set_env(name, "private-backend-marker");
+            set_env("DONSETCH_BROWSER__BACKEND", "  ClOaKbRoWsEr  ");
+            let loaded = load().expect("the valid higher-precedence backend must win");
+            assert_eq!(loaded.config.browser.backend, BrowserBackend::Cloak);
+            let origin = origins(&loaded.merged, &loaded.config)
+                .into_iter()
+                .find(|(section, key, _, _)| *section == "browser" && *key == "backend")
+                .expect("browser.backend origin")
+                .3;
+            assert_eq!(origin, "DONSETCH_BROWSER__BACKEND");
+            drop(guard);
+        }
     }
 
     /// Kill switch wins: DONSETCH_NO_GHOST_POOL must override a slot

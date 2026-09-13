@@ -176,6 +176,10 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- Browser backend aliases now share the typed enum as their single registry
+  and normalize casing and surrounding whitespace across config sources.
+  Unknown effective legacy values fail closed instead of silently becoming
+  `auto`; a valid higher-precedence modern setting still overrides them.
 - The ONNX reranker now consumes the validated `search.rerank_threads` value
   directly instead of leaking and reparsing a string, and reports configured
   values as coming from the layered config. `0 = auto` behavior is unchanged.
