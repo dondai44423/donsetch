@@ -350,16 +350,7 @@ pub fn merge(
     let mut deduped = Vec::with_capacity(results.len());
     let mut seen_titles: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in results {
-        let title_key = r
-            .title
-            .to_lowercase()
-            .trim()
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == ' ')
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let title_key = syndication_title_key(&r.title);
         if !title_key.is_empty() && !seen_titles.insert(title_key) {
             continue; // duplicate title : syndicated content
         }
@@ -395,6 +386,24 @@ pub fn merge(
 // consensus (a Bing hit + DDG hit = one opinion, not two).
 // google_ghost is the browser-render lane running the same
 // Google index as the plain parser would: one family.
+/// Title key for the syndication dedup: lowercase with collapsed
+/// whitespace, PUNCTUATION PRESERVED. The previous key stripped every
+/// non-alphanumeric char, which collapsed genuinely different titles
+/// on different domains — "C++ Tutorial", "C# Tutorial" and "C
+/// Tutorial" all became "c tutorial" (and "Rust 1.75" == "Rust 175"),
+/// so the lower-scoring distinct-language result was silently dropped
+/// as "syndicated content." That is a common Code-intent recall loss.
+/// Keeping punctuation means only titles that are genuinely identical
+/// after case/whitespace normalization — the syndicated-republish
+/// case the dedup targets — still collapse.
+fn syndication_title_key(title: &str) -> String {
+    title
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) fn engine_family(engine: &str) -> &str {
     match engine {
         "bing" | "ddg" | "ddg_lite" | "ddg_html" | "yahoo" => "bing",
@@ -473,6 +482,48 @@ mod tests {
         let trust = std::collections::HashMap::new();
         let out = merge(&per, "rust async runtime", Intent::Code, &trust, 10);
         assert_eq!(out[0].url, "https://a.com/x", "consensus must win");
+    }
+
+    // The syndication dedup keyed titles after stripping ALL
+    // punctuation, so "C++ Tutorial" and "C# Tutorial" on different
+    // domains collapsed to one key and the lower-scoring one was
+    // dropped as syndicated content. Distinct-language / versioned
+    // results must both survive; only genuinely identical titles
+    // (the republish case) collapse.
+    #[test]
+    fn syndication_dedup_keeps_distinct_punctuation_titles() {
+        assert_ne!(
+            syndication_title_key("C++ Tutorial"),
+            syndication_title_key("C# Tutorial")
+        );
+        assert_ne!(
+            syndication_title_key("Rust 1.75 Released"),
+            syndication_title_key("Rust 175 Released")
+        );
+        // Identical up to case/whitespace still collapses (the target).
+        assert_eq!(
+            syndication_title_key("Breaking  News"),
+            syndication_title_key("breaking news")
+        );
+
+        // End to end through merge: two different languages, different
+        // domains, punctuation-only title difference, both must survive.
+        let mut cpp = hit("https://cppreference.com/cpp", 0);
+        cpp.title = "C++ Tutorial".into();
+        let mut csharp = hit("https://learn.microsoft.com/csharp", 0);
+        csharp.title = "C# Tutorial".into();
+        let per = vec![
+            ("bing".to_string(), vec![cpp]),
+            ("mojeek".to_string(), vec![csharp]),
+        ];
+        let trust = std::collections::HashMap::new();
+        let out = merge(&per, "tutorial", Intent::Code, &trust, 10);
+        let urls: Vec<&str> = out.iter().map(|m| m.url.as_str()).collect();
+        assert!(
+            urls.contains(&"https://cppreference.com/cpp")
+                && urls.contains(&"https://learn.microsoft.com/csharp"),
+            "both distinct-language results must survive: {urls:?}"
+        );
     }
 
     #[test]
