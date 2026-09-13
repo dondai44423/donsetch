@@ -441,24 +441,25 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     if archive == "only" {
         let no_live = tool_error(format!("archive=only : skipping live fetch for {url}"));
         return match try_resurrect(daemon, url, &no_live).await {
-            Some(v) => v,
-            None => tool_error_structured(
-                format!("archive: no Wayback snapshot found for {url}"),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "next_action": "the URL was never archived : try web_search for a live alternative",
-                })),
-            ),
+            Ok(v) => v,
+            Err(f) => resurrect_error(url, &f),
         };
     }
     let result = fetch_single_inner(daemon, args, url).await;
     if archive == "off" || result.get("isError") != Some(&json!(true)) {
         return result;
     }
-    // Resurreactable failures only: dead pages and hard walls.
-    // Transient network errors mean "maybe dead", not "dead" : a
-    // snapshot would launder an unknown into fake certainty.
+    // Resurrectable failures only: dead pages, hard walls, and
+    // transport-level death (TLS handshake against a parked domain,
+    // DNS gone, port closed) : the archetypal dead links. Ambiguous
+    // transients : timeouts, resets, protocol errors : stay
+    // excluded : a snapshot would launder an unknown into fake
+    // certainty, and a reset can be an IP-level block that a
+    // snapshot must never paper over.
+    let transport_dead = result
+        .pointer("/structuredContent/fetch_error")
+        .and_then(Value::as_str)
+        .is_some_and(|k| matches!(k, "tls" | "dns" | "refused"));
     let resurrectable = result
         .pointer("/structuredContent/verdict")
         .and_then(Value::as_str)
@@ -466,13 +467,68 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
         || result
             .pointer("/structuredContent/status")
             .and_then(Value::as_u64)
-            .is_some_and(|s| s == 404 || s == 410);
+            .is_some_and(|s| s == 404 || s == 410)
+        || transport_dead;
     if !resurrectable {
         return result;
     }
     match try_resurrect(daemon, url, &result).await {
-        Some(v) => v,
-        None => result,
+        Ok(v) => v,
+        Err(f) => {
+            // The original live error stands as the primary answer;
+            // the archive attempt is recorded as context so a silent
+            // snapshot-side failure is visible in the payload.
+            let mut result = result;
+            if let Some(obj) = result
+                .pointer_mut("/structuredContent")
+                .and_then(Value::as_object_mut)
+            {
+                obj.insert("archive_stage".into(), json!(f.stage.tag()));
+            }
+            result
+        }
+    }
+}
+
+/// Build the archive=only error from the exact stage resurrection
+/// gave up at. "Never archived" is claimed ONLY when both indexes
+/// (availability + CDX) were consulted and answered empty :
+/// unreachable archives and found-but-unusable snapshots get their
+/// own honest messages.
+fn resurrect_error(url: &str, f: &ResurrectError) -> Value {
+    let tag = f.stage.tag();
+    match &f.stage {
+        ResurrectStage::LookupUnreachable => tool_error_structured(
+            format!("archive: Wayback Machine unreachable for {url}"),
+            "transient",
+            Some(json!({
+                "url": url,
+                "archive_stage": tag,
+                "next_action": "the archive lookup failed : retry, or try web_search for a live alternative",
+            })),
+        ),
+        ResurrectStage::NoSnapshot => tool_error_structured(
+            format!("archive: no Wayback snapshot found for {url}"),
+            "permanent",
+            Some(json!({
+                "url": url,
+                "archive_stage": tag,
+                "next_action": "the URL was never archived : try web_search for a live alternative",
+            })),
+        ),
+        _ => {
+            let snap = f.snapshot_url.clone().unwrap_or_default();
+            tool_error_structured(
+                format!("archive: Wayback snapshot found but unusable ({tag}) for {url}"),
+                "permanent",
+                Some(json!({
+                    "url": url,
+                    "archive_stage": tag,
+                    "snapshot_url": snap,
+                    "next_action": format!("a snapshot exists but could not be served : inspect it at {snap} or try web_search for a live alternative"),
+                })),
+            )
+        }
     }
 }
 
@@ -789,6 +845,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                     Some(json!({
                         "url": url,
                         "status": 0,
+                        "fetch_error": transport_class(&e),
                         "next_action": next_action_for(None, 0, fetch_error_kind(&e)),
                         "escalation": trace.value(),
                     })),
@@ -2301,75 +2358,312 @@ pub(super) async fn anticloak_check(
 /// the nearest snapshot : labeled ruthlessly so archived content
 /// can never masquerade as live. `archive: auto` (default) only on
 /// dead-end failures; `only` skips the live attempt; `off` never.
-pub(super) async fn try_resurrect(
-    daemon: &Arc<Daemon>,
-    url: &str,
-    live_error: &Value,
-) -> Option<Value> {
-    // 1. Availability lookup (keyless, public API).
+/// Err carries the exact stage that gave up, so the caller can
+/// never confuse "the URL was never archived" with "a snapshot
+/// exists but was unusable" or "the archive was unreachable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResurrectStage {
+    /// The availability/CDX endpoints could not be reached.
+    LookupUnreachable,
+    /// Both indexes were consulted and have no 200 capture.
+    /// (Non-200 captures never get this far: availability and CDX
+    /// are both probed until a 200 capture turns up or both answer
+    /// empty.)
+    NoSnapshot,
+    /// The snapshot page failed at the transport layer.
+    SnapshotFetch,
+    /// The snapshot page tripped the wall detector.
+    SnapshotVerdict,
+    /// The snapshot body is binary (PDF/image), not extractable HTML.
+    SnapshotBinary,
+    /// The snapshot extracted to too little text to serve.
+    SnapshotThin(usize),
+}
+
+impl ResurrectStage {
+    /// Machine-readable tag for structuredContent.archive_stage.
+    fn tag(&self) -> String {
+        match self {
+            Self::LookupUnreachable => "lookup_unreachable".into(),
+            Self::NoSnapshot => "no_snapshot".into(),
+            Self::SnapshotFetch => "snapshot_fetch_failed".into(),
+            Self::SnapshotVerdict => "snapshot_verdict_rejected".into(),
+            Self::SnapshotBinary => "snapshot_binary".into(),
+            Self::SnapshotThin(n) => format!("snapshot_extract_thin({n})"),
+        }
+    }
+}
+
+struct ResurrectError {
+    stage: ResurrectStage,
+    /// Nearest snapshot URL reached, when one was found : lets the
+    /// caller distinguish "never archived" from "archived but the
+    /// copy was unusable" (and hand over the URL for inspection).
+    snapshot_url: Option<String>,
+}
+
+/// What an archive index said about the URL.
+enum Avail {
+    /// A 200-status capture: (snapshot URL, capture timestamp).
+    Found((String, String)),
+    /// The index answered and has nothing usable.
+    Empty,
+    /// The index could not be reached (or answered with a server
+    /// error) : says nothing about the archive's contents.
+    Unreachable,
+}
+
+/// Availability API lookup (keyless, public).
+async fn availability_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
     let avail_url = format!(
         "https://archive.org/wayback/available?url={}",
         encode_query_value(url)
     );
-    let avail = tokio::time::timeout(
+    let fetched = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         daemon.fetcher.fetch(&avail_url),
     )
-    .await
-    .ok()?
-    .ok()?;
-    let v: Value = serde_json::from_slice(&avail.body).ok()?;
-    let closest = v.pointer("/archived_snapshots/closest")?.clone();
-    let snap_url = closest.get("url")?.as_str()?.to_string();
+    .await;
+    let Ok(Ok(out)) = fetched else {
+        return Avail::Unreachable;
+    };
+    if !(200..300).contains(&out.status) {
+        return Avail::Unreachable;
+    }
+    // A 200 whose body is not JSON (rate-limit HTML, an interstitial)
+    // says nothing definitive : the CDX fallback gets its shot.
+    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
+        return Avail::Empty;
+    };
+    let Some(closest) = v.pointer("/archived_snapshots/closest") else {
+        return Avail::Empty;
+    };
+    let Some(snap_url) = closest.get("url").and_then(Value::as_str) else {
+        return Avail::Empty;
+    };
     let ts = closest
         .get("timestamp")
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     // The API returns status as a STRING ("200"); accept both.
     let snap_status = closest
         .get("status")
-        .map(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .map(|s| {
+            s.as_i64()
+                .or_else(|| s.as_str().and_then(|x| x.parse().ok()))
                 .unwrap_or(0)
         })
         .unwrap_or(0);
     if snap_status != 200 {
-        return None;
+        // A non-200 "closest" may have a 200 sibling the lossy
+        // availability view missed : let the complete index decide.
+        return Avail::Empty;
     }
+    Avail::Found((snap_url.to_string(), ts))
+}
 
-    // 2. Fetch the snapshot : wayback is plain HTTP-friendly.
-    let snap = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        daemon.fetcher.fetch(&snap_url),
+/// The complete CDX capture index. `url=` goes schemeless : CDX
+/// canonicalizes the scheme away, so a capture recorded under
+/// http:// answers an https:// query (the availability API is
+/// scheme-strict and misses those). limit=-5 keeps the LAST rows,
+/// i.e. the captures nearest the present.
+async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
+    let bare = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let cdx_url = format!(
+        "https://web.archive.org/cdx/search/cdx?url={}&output=json&filter=statuscode:200&limit=-5",
+        encode_query_value(bare)
+    );
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        daemon.fetcher.fetch(&cdx_url),
     )
-    .await
-    .ok()?
-    .ok()?;
-    if !matches!(snap.verdict, Verdict::ContentOk) {
+    .await;
+    let Ok(Ok(out)) = fetched else {
+        return Avail::Unreachable;
+    };
+    // CDX answers rate limits and abuse holds with HTML, not JSON :
+    // a transient condition, never evidence of "never archived".
+    if !(200..300).contains(&out.status) {
+        return Avail::Unreachable;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
+        return Avail::Empty;
+    };
+    match cdx_latest(&v) {
+        // Rebuild from the row's `original` : it is the exact form
+        // wayback replayed and canonicalized (urlkey is computed on
+        // it, trailing slashes, :80 port and all). Rebuilding from
+        // the REQUESTED url instead mismatched the urlkey when the
+        // capture was recorded under a different path form, and
+        // wayback answered with its calendar page instead of the
+        // capture.
+        Some((ts, original)) => {
+            let target: &str = if original.is_empty() {
+                bare
+            } else {
+                original.as_str()
+            };
+            Avail::Found((format!("https://web.archive.org/web/{ts}/{target}"), ts))
+        }
+        None => Avail::Empty,
+    }
+}
+
+/// Pick the nearest-to-present 200 capture from a CDX json response.
+/// Rows are [["urlkey","timestamp","original", ...], ...] : row 0 is
+/// the header, the nearest capture is the last data row.
+fn cdx_latest(v: &Value) -> Option<(String, String)> {
+    let rows = v.as_array()?;
+    if rows.len() < 2 {
         return None;
     }
-    let ct = snap
-        .headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    if crate::fetch::guards::is_binary(&snap.body, &ct) {
-        return None;
+    let last = &rows[rows.len() - 1];
+    let ts = last.get(1)?.as_str()?.to_string();
+    let original = last
+        .get(2)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((ts, original))
+}
+
+async fn try_resurrect(
+    daemon: &Arc<Daemon>,
+    url: &str,
+    live_error: &Value,
+) -> Result<Value, ResurrectError> {
+    // 1. Lookup: the availability API first (cheap, "closest"
+    // semantics), then the complete CDX index when it comes back
+    // empty. The availability index is lossy and scheme-strict (a
+    // capture recorded under http:// is invisible to an https://
+    // query), so an empty answer alone never earns "never archived".
+    let mut transport_failed = false;
+    let mut found = match availability_lookup(daemon, url).await {
+        Avail::Found(pair) => Some(pair),
+        Avail::Empty => None,
+        Avail::Unreachable => {
+            transport_failed = true;
+            None
+        }
+    };
+    if found.is_none() {
+        found = match cdx_lookup(daemon, url).await {
+            Avail::Found(pair) => Some(pair),
+            Avail::Empty => None,
+            Avail::Unreachable => {
+                transport_failed = true;
+                None
+            }
+        };
     }
+    let (mut snap_url, mut ts) = match found {
+        Some(pair) => pair,
+        // "The archive is down" is not "the URL was never archived" :
+        // collapsing both into one message used to assert a fact the
+        // lookup never established.
+        None if transport_failed => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::LookupUnreachable,
+                snapshot_url: None,
+            });
+        }
+        None => {
+            return Err(ResurrectError {
+                stage: ResurrectStage::NoSnapshot,
+                snapshot_url: None,
+            });
+        }
+    };
+
+    // 2. Fetch the snapshot : wayback is plain HTTP-friendly. A thin
+    // extraction gets a second look first: a dead domain's last
+    // capture is very often a meta-refresh stub ("parked → redirect")
+    // that extracts to zero text but chains to the capture holding
+    // the content. Browsers follow the refresh; so does resurrection,
+    // but ONLY when wayback rewrote the target : a live-web target
+    // would fetch a URL that may still be dead, moved, or hostile.
     let opts = ExtractOptions::default();
-    let mut ex = extract::extract(&snap.body, &ct, &snap_url, &opts).ok()?;
-    // Wayback serves the ORIGINAL server-rendered HTML : thinness
-    // here usually means a genuinely small page, not a JS shell.
-    // Only truly empty extractions are useless.
-    if ex.total_chars < 50 {
-        return None;
-    }
+    let mut hops: u8 = 0;
+    let (snap, mut ex) = loop {
+        let snap = match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            daemon.fetcher.fetch(&snap_url),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotFetch,
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+        };
+        if !matches!(snap.verdict, Verdict::ContentOk) {
+            return Err(ResurrectError {
+                stage: ResurrectStage::SnapshotVerdict,
+                snapshot_url: Some(snap_url.clone()),
+            });
+        }
+        let ct = snap
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        if crate::fetch::guards::is_binary(&snap.body, &ct) {
+            return Err(ResurrectError {
+                stage: ResurrectStage::SnapshotBinary,
+                snapshot_url: Some(snap_url.clone()),
+            });
+        }
+        let ex = match extract::extract(&snap.body, &ct, &snap_url, &opts) {
+            Ok(ex) => ex,
+            Err(_) => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotThin(0),
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+        };
+        // Wayback serves the ORIGINAL server-rendered HTML : thinness
+        // here usually means a genuinely small page, not a JS shell.
+        // But wayback's redirect interstitials carry enough IA nav
+        // chrome to pass any char threshold, so serving is gated on
+        // stub markers too : a stub hops (up to MAX), a real page
+        // serves, a true empty fails.
+        let stub = ex.thin || ex.total_chars < 50 || is_wayback_stub(&snap.body);
+        let chained = if hops < MAX_RESURRECT_HOPS && stub {
+            meta_refresh_target(&snap.body).filter(|t| wayback_ts_of(t).is_some())
+        } else {
+            None
+        };
+        match chained {
+            Some(target) => {
+                hops += 1;
+                if let Some(t) = wayback_ts_of(&target) {
+                    ts = t;
+                }
+                snap_url = target;
+            }
+            None if stub => {
+                return Err(ResurrectError {
+                    stage: ResurrectStage::SnapshotThin(ex.total_chars),
+                    snapshot_url: Some(snap_url.clone()),
+                });
+            }
+            // No chain, but real-enough content : serve it.
+            None => break (snap, ex),
+        }
+    };
 
     // 3. Label everything: banner in content, fields in structure.
-    let date = wayback_date(ts);
-    let age_days = wayback_age_days(ts);
+    let date = wayback_date(&ts);
+    let age_days = wayback_age_days(&ts);
     let live_reason = live_error
         .pointer("/content/0/text")
         .and_then(Value::as_str)
@@ -2411,11 +2705,112 @@ pub(super) async fn try_resurrect(
         "live_error": live_reason,
         "escalation": trace.value(),
     });
-    Some(json!({
+    Ok(json!({
         "content": [{"type": "text", "text": format_fetch_markdown(&ex, &snap_url, url)}],
         "structuredContent": structured,
         "_meta": {"com.donsetch/fetch-debug": debug},
     }))
+}
+
+/// Redirect chains through wayback interstitials can run several
+/// captures deep (a dead domain's stub -> a host's redirect stub ->
+/// the real landing page). Bounded so a hostile chain cannot spin.
+const MAX_RESURRECT_HOPS: u8 = 4;
+
+/// Wayback's "Got an HTTP NNN at crawl time / Redirecting to... /
+/// Impatient?" interstitial and its capture-calendar page : both are
+/// wayback UI, not archived content, and both extract enough text to
+/// defeat char-count thinness checks.
+fn is_wayback_stub(body: &[u8]) -> bool {
+    // No 64KB head window: replay pages wrap captures in the full
+    // IA nav (megabytes of markup), and the interstitial markers sit
+    // AFTER it, near the redirect notice at the document's end.
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("response at crawl time")
+        || text.contains("impatient?")
+        || text.contains("redirecting to...")
+}
+
+/// Pull the refresh target out of `<meta http-equiv="refresh"
+/// content="[delay;] url=target">`. A dead domain's archived last
+/// capture is very often exactly this stub, and a browser would
+/// follow it : so does resurrection. Byte-scanned on an
+/// ASCII-lowercased copy (length-preserving, so spans index the
+/// original); the target keeps its original case because wayback
+/// capture paths are case-sensitive.
+fn meta_refresh_target(body: &[u8]) -> Option<String> {
+    let head = &body[..body.len().min(64 * 1024)];
+    let text = String::from_utf8_lossy(head).to_string();
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        let end = lower[start..].find('>').map_or(lower.len(), |e| start + e);
+        from = end.max(start + 1);
+        let tag_lower = &lower[start..end];
+        let tag_orig = &text[start..end];
+        let is_refresh = attr_value_span(tag_lower, "http-equiv")
+            .and_then(|(s, e)| tag_lower.get(s..e))
+            .is_some_and(|v| v.trim() == "refresh");
+        if !is_refresh {
+            continue;
+        }
+        let Some((cs, ce)) = attr_value_span(tag_lower, "content") else {
+            continue;
+        };
+        let content_lower = tag_lower.get(cs..ce)?;
+        let content_orig = tag_orig.get(cs..ce)?;
+        // "[delay][;] *url=target" : find the url= part case-
+        // insensitively, keep the target's original bytes.
+        let Some(urel) = content_lower.find("url=") else {
+            continue;
+        };
+        let target = content_orig[urel + 4..].trim();
+        let target = target.trim_matches(|c| c == '\'' || c == '"').trim();
+        if !target.is_empty() {
+            return Some(target.to_string());
+        }
+    }
+    None
+}
+
+/// Byte span of `name="value"` (or single quotes) inside a tag.
+/// Offsets index the string given, so callers can slice the same
+/// spans out of the original-case text.
+fn attr_value_span(tag_lower: &str, name: &str) -> Option<(usize, usize)> {
+    let pat = format!("{name}=");
+    let bytes = tag_lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = tag_lower[from..].find(&pat) {
+        let at = from + rel;
+        let boundary_ok = at == 0 || matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
+        let after = at + pat.len();
+        if boundary_ok && after < bytes.len() && matches!(bytes[after], b'"' | b'\'') {
+            let quote = bytes[after] as char;
+            let vstart = after + 1;
+            let vend = tag_lower[vstart..]
+                .find(quote)
+                .map_or(tag_lower.len(), |e| vstart + e);
+            return Some((vstart, vend));
+        }
+        from = at + pat.len();
+    }
+    None
+}
+
+/// `https://web.archive.org/web/<14-digit-ts>/<...>` → Some(ts).
+/// Only wayback-rewritten refresh targets are followed : a target
+/// pointing at the live web would silently fetch a URL that may
+/// still be dead (or hostile).
+fn wayback_ts_of(target: &str) -> Option<String> {
+    let after_scheme = target.split_once("://")?.1;
+    let (host, path) = after_scheme.split_once('/')?;
+    if !host.eq_ignore_ascii_case("web.archive.org") {
+        return None;
+    }
+    let seg = path.strip_prefix("web/")?;
+    let ts: String = seg.chars().take(14).collect();
+    (ts.len() == 14 && ts.bytes().all(|b| b.is_ascii_digit())).then_some(ts)
 }
 
 /// Percent-encode a value for a query string: everything outside
@@ -2930,5 +3325,220 @@ mod batch_output_contract_tests {
         assert_eq!(flagged_state["next_offset"], 16000);
         assert_eq!(flagged_state["cloak_suspected"], true);
         assert_eq!(flagged_state["archived"]["age_days"], 3);
+    }
+}
+
+#[cfg(test)]
+mod resurrect_tests {
+    use super::{
+        ResurrectStage, attr_value_span, cdx_latest, is_wayback_stub, meta_refresh_target,
+        wayback_ts_of,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn meta_refresh_follows_wayback_rewrite() {
+        let html = b"<html><head><script>x</script>\
+            <meta http-equiv=\"refresh\" content=\"0; url=http://web.archive.org/web/20190613084634/https://smallbusiness.yahoo.com/webhosting?source=geocities\"/>\
+            </head><body></body></html>";
+        let t = meta_refresh_target(html).expect("refresh target extracted");
+        assert!(t.starts_with("http://web.archive.org/web/20190613084634/"));
+        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20190613084634"));
+    }
+
+    #[test]
+    fn meta_refresh_is_case_insensitive_but_case_preserving() {
+        // Match must survive any case in the markup ; the target's
+        // case must survive the match (wayback paths are sensitive).
+        let html = b"<META HTTP-EQUIV='Refresh' CONTENT=\"5; URL=http://web.archive.org/web/20200101000000/HTTP://Example.COM/Page\">";
+        let t = meta_refresh_target(html).expect("refresh target extracted");
+        assert!(t.contains("Example.COM/Page"), "original case lost: {t}");
+        assert_eq!(wayback_ts_of(&t).as_deref(), Some("20200101000000"));
+    }
+
+    #[test]
+    fn meta_refresh_unquoted_and_delayed_forms() {
+        let html = b"<meta http-equiv=refresh content=30;url=http://web.archive.org/web/19990101000000/http://a.example/>";
+        assert!(
+            meta_refresh_target(html).is_none(),
+            "unquoted attr values are not misparsed"
+        );
+    }
+
+    #[test]
+    fn meta_refresh_off_wayback_or_missing_is_none() {
+        let live =
+            b"<meta http-equiv=\"refresh\" content=\"0; url=https://parking.example/for-sale\">";
+        assert_eq!(
+            meta_refresh_target(live).as_deref(),
+            Some("https://parking.example/for-sale")
+        );
+        assert_eq!(wayback_ts_of("https://parking.example/for-sale"), None);
+        assert_eq!(meta_refresh_target(b"<html><body>hi</body></html>"), None);
+        assert_eq!(
+            meta_refresh_target(b"<meta http-equiv=\"refresh\" content=\"3\">"),
+            None
+        );
+    }
+
+    #[test]
+    fn wayback_ts_rejects_non_wayback_and_malformed() {
+        assert_eq!(
+            wayback_ts_of("https://web.archive.org/web/notatime/http://x.example"),
+            None
+        );
+        assert_eq!(
+            wayback_ts_of("http://web.archive.org/other/20200101000000/x"),
+            None
+        );
+        assert_eq!(
+            wayback_ts_of("https://spoof.example/web/20200101000000/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn attr_value_span_respects_boundaries() {
+        let tag = "meta data-content=\"a\" content=\"real value\" x";
+        let (s, e) = attr_value_span(tag, "content").expect("span");
+        assert_eq!(&tag[s..e], "real value");
+        assert_eq!(attr_value_span(tag, "missing"), None);
+    }
+
+    #[test]
+    fn stage_tags_are_stable_machine_strings() {
+        assert_eq!(
+            ResurrectStage::LookupUnreachable.tag(),
+            "lookup_unreachable"
+        );
+        assert_eq!(ResurrectStage::NoSnapshot.tag(), "no_snapshot");
+        assert_eq!(ResurrectStage::SnapshotFetch.tag(), "snapshot_fetch_failed");
+        assert_eq!(
+            ResurrectStage::SnapshotVerdict.tag(),
+            "snapshot_verdict_rejected"
+        );
+        assert_eq!(ResurrectStage::SnapshotBinary.tag(), "snapshot_binary");
+        assert_eq!(
+            ResurrectStage::SnapshotThin(12).tag(),
+            "snapshot_extract_thin(12)"
+        );
+    }
+    #[test]
+    fn cdx_latest_picks_last_data_row() {
+        let v = json!([
+            [
+                "urlkey",
+                "timestamp",
+                "original",
+                "mimetype",
+                "statuscode",
+                "digest",
+                "length"
+            ],
+            [
+                "com,geocities)/",
+                "20010615131644",
+                "http://www.geocities.com/",
+                "text/html",
+                "200",
+                "AAA",
+                "1000"
+            ],
+            [
+                "com,geocities)/",
+                "20190613084634",
+                "http://www.geocities.com/",
+                "text/html",
+                "200",
+                "BBB",
+                "900"
+            ]
+        ]);
+        let (ts, original) = cdx_latest(&v).expect("capture picked");
+        assert_eq!(ts, "20190613084634", "nearest-to-present capture wins");
+        assert_eq!(original, "http://www.geocities.com/");
+    }
+
+    #[test]
+    fn cdx_latest_handles_header_only_empty_and_garbage() {
+        assert_eq!(
+            cdx_latest(&json!([["urlkey", "timestamp", "original"]])),
+            None
+        );
+        assert_eq!(cdx_latest(&json!([])), None);
+        assert_eq!(cdx_latest(&json!("not an array")), None);
+        assert_eq!(
+            cdx_latest(&json!([["u", "t"], ["missing-ts-column"]])),
+            None
+        );
+    }
+
+    #[test]
+    fn transport_classes_separate_death_from_ambiguity() {
+        use super::super::transport_class;
+        use crate::error::FetchError;
+        // Resurrectable: the site is gone.
+        assert_eq!(
+            transport_class(&FetchError::Tls("certificate verify failed".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Tls("handshake failure".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "Name or service not known"
+            ))),
+            "dns"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other("connection refused"))),
+            "refused"
+        );
+        // Excluded: ambiguous or IP-level; a snapshot would lie.
+        assert_eq!(transport_class(&FetchError::Timeout), "timeout");
+        assert_eq!(
+            transport_class(&FetchError::Tls("connection reset by peer".into())),
+            "reset"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "connection timed out"
+            ))),
+            "timeout"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Http("parser died".into())),
+            "protocol"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Ghost("no browser".into())),
+            "ghost"
+        );
+    }
+
+    #[test]
+    fn resurrectable_transport_classes_are_exactly_tls_dns_refused() {
+        let resurrectable: fn(&str) -> bool = |k| matches!(k, "tls" | "dns" | "refused");
+        assert!(resurrectable("tls"));
+        assert!(resurrectable("dns"));
+        assert!(resurrectable("refused"));
+        assert!(!resurrectable("timeout"));
+        assert!(!resurrectable("reset"));
+        assert!(!resurrectable("network"));
+        assert!(!resurrectable("protocol"));
+    }
+    #[test]
+    fn wayback_stub_markers_do_not_catch_real_pages() {
+        let interstitial = b"<html><body>Got an HTTP 301 response at crawl time.             Redirecting to... <a href=\"/web/20100101/http://x.example\">x</a>             <b>Impatient?</b></body></html>";
+        assert!(is_wayback_stub(interstitial));
+        assert!(!is_wayback_stub(
+            b"<html><body>Welcome to my Geocities page. Under construction.</body></html>"
+        ));
+        // An archived page ABOUT the wayback machine must not be
+        // misread as chrome : the calendar phrase differs from prose.
+        let article = b"<html><body><h1>History of the Wayback Machine</h1>            It preserves redirects and their targets.</body></html>";
+        assert!(!is_wayback_stub(article));
     }
 }

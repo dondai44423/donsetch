@@ -395,6 +395,45 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
         _ => "permanent",
     }
 }
+
+/// Machine class for a transport-level fetch failure, recorded in
+/// the error's structuredContent so callers (and the resurrection
+/// gate) can tell "the site is gone" from "the net is bad". Mirrors
+/// friendly_fetch_error's branching; the strings are API surface.
+pub(super) fn transport_class(e: &FetchError) -> &'static str {
+    match e {
+        FetchError::Timeout => "timeout",
+        FetchError::TooManyRedirects => "too_many_redirects",
+        FetchError::InvalidUrl(_) => "invalid_url",
+        FetchError::Ghost(_) => "ghost",
+        FetchError::Http(_) => "protocol",
+        FetchError::Tls(msg) => {
+            let m = msg.to_lowercase();
+            if m.contains("reset") || m.contains("eof") {
+                "reset"
+            } else {
+                "tls"
+            }
+        }
+        FetchError::Io(err) => {
+            let m = err.to_string().to_lowercase();
+            if m.contains("refused") {
+                "refused"
+            } else if m.contains("timed out") {
+                "timeout"
+            } else if m.contains("not found") || m.contains("no address") || m.contains("not known")
+            {
+                // getaddrinfo: "Name or service not known" (Linux),
+                // "nodename nor servname provided, or not known" (macOS).
+                "dns"
+            } else if m.contains("reset") {
+                "reset"
+            } else {
+                "network"
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod stitch_tests {
     use super::*;
