@@ -1331,3 +1331,48 @@ fn legacy_store_migrates_and_the_token_survives() {
     );
     let _ = std::fs::remove_dir_all(&iso);
 }
+
+// The resume token is agent-supplied and joined into a filesystem
+// path (<cache>/crawl-resumes/<tok>.json). A traversal token
+// (`../../…`) must be refused before it can read-then-delete a
+// `.json` file outside the store. resume_store_take rejects any
+// non-alphanumeric token, and the planted victim file survives.
+#[test]
+fn resume_token_traversal_is_refused() {
+    // Format validity itself (no FS, deterministic).
+    assert!(super::is_valid_resume_token("c16a9a0f"));
+    for bad in [
+        "",
+        "../secret",
+        "..\\secret",
+        "a/b",
+        "a.b",
+        "tok\0",
+        "c16 a9",
+    ] {
+        assert!(!super::is_valid_resume_token(bad), "must reject {bad:?}");
+    }
+
+    // End to end: a planted valid-ResumeState `.json` OUTSIDE the
+    // store must not be consumed by a traversal token.
+    let iso = std::env::temp_dir().join(format!("ds-resume-trav-{}", std::process::id()));
+    let store = iso.join("crawl-resumes");
+    let _ = std::fs::create_dir_all(&store);
+    unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &iso) };
+    let victim = iso.join("victim.json");
+    std::fs::write(
+        &victim,
+        serde_json::json!({"seed":"https://evil.example/","queue":[],"seen":[]}).to_string(),
+    )
+    .unwrap();
+    // <store>/../victim.json resolves to the planted file.
+    match super::resume_store_take("../victim") {
+        Err(e) => assert!(e.contains("expired or unknown"), "{e}"),
+        Ok(_) => panic!("a traversal token must be refused, not consumed"),
+    }
+    assert!(
+        victim.exists(),
+        "a traversal token must not delete an outside file"
+    );
+    let _ = std::fs::remove_dir_all(&iso);
+}
