@@ -616,8 +616,7 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "off".into(),
             "DONSETCH_NO_ROUTE_MEMORY",
         );
-    }
-    if legacy_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
+    } else if legacy_flag("DONSETCH_ROUTE_MEMORY_READONLY") {
         put(
             &mut m,
             "state.route_memory",
@@ -829,15 +828,33 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         );
     }
     match int_env("DONSETCH_BYPASS_CACHE_TTL_SECS") {
-        Some(n) => put_num(
+        // Historically the TTL was applied after the cache off switch:
+        // zero disabled the cache, while a valid positive TTL enabled it
+        // again. Preserve that composition in this layer rather than in
+        // the bypass consumer.
+        Some(0) => put(
             &mut m,
-            &mut warnings,
-            "bypass.cache_ttl_secs",
+            "bypass.cache",
+            false.into(),
             "DONSETCH_BYPASS_CACHE_TTL_SECS",
-            n,
-            1,
-            86400,
         ),
+        Some(n @ 1..=86400) => {
+            put(
+                &mut m,
+                "bypass.cache",
+                true.into(),
+                "DONSETCH_BYPASS_CACHE_TTL_SECS",
+            );
+            put(
+                &mut m,
+                "bypass.cache_ttl_secs",
+                n.into(),
+                "DONSETCH_BYPASS_CACHE_TTL_SECS",
+            );
+        }
+        Some(n) => warnings.push(format!(
+            "ignoring DONSETCH_BYPASS_CACHE_TTL_SECS={n}: out of range 0..=86400"
+        )),
         None if std::env::var_os("DONSETCH_BYPASS_CACHE_TTL_SECS").is_some() => {
             warnings.push("ignoring DONSETCH_BYPASS_CACHE_TTL_SECS: not a number".into())
         }
@@ -2528,6 +2545,231 @@ mod tests {
             None => unset_env("PLAYWRIGHT_BROWSERS_PATH"),
         }
         drop(guard);
+
+    #[test]
+    fn legacy_route_memory_flags_compose_with_kill_switch_precedence() {
+        struct Case {
+            no_route_memory: Option<&'static str>,
+            readonly: Option<&'static str>,
+            modern: Option<&'static str>,
+            expected: RouteMemory,
+            origin: &'static str,
+        }
+
+        let cases = [
+            Case {
+                no_route_memory: None,
+                readonly: None,
+                modern: None,
+                expected: RouteMemory::ReadWrite,
+                origin: "default",
+            },
+            Case {
+                no_route_memory: Some("1"),
+                readonly: None,
+                modern: None,
+                expected: RouteMemory::Off,
+                origin: "DONSETCH_NO_ROUTE_MEMORY",
+            },
+            Case {
+                no_route_memory: None,
+                readonly: Some("true"),
+                modern: None,
+                expected: RouteMemory::ReadOnly,
+                origin: "DONSETCH_ROUTE_MEMORY_READONLY",
+            },
+            Case {
+                no_route_memory: Some("1"),
+                readonly: Some("1"),
+                modern: None,
+                expected: RouteMemory::Off,
+                origin: "DONSETCH_NO_ROUTE_MEMORY",
+            },
+            Case {
+                no_route_memory: Some("0"),
+                readonly: Some("on"),
+                modern: None,
+                expected: RouteMemory::ReadOnly,
+                origin: "DONSETCH_ROUTE_MEMORY_READONLY",
+            },
+            Case {
+                no_route_memory: Some("1"),
+                readonly: Some("1"),
+                modern: Some("readwrite"),
+                expected: RouteMemory::ReadWrite,
+                origin: "DONSETCH_STATE__ROUTE_MEMORY",
+            },
+        ];
+
+        for case in cases {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            if let Some(value) = case.no_route_memory {
+                set_env("DONSETCH_NO_ROUTE_MEMORY", value);
+            }
+            if let Some(value) = case.readonly {
+                set_env("DONSETCH_ROUTE_MEMORY_READONLY", value);
+            }
+            if let Some(value) = case.modern {
+                set_env("DONSETCH_STATE__ROUTE_MEMORY", value);
+            }
+
+            let loaded = load().expect("route-memory combination must load");
+            assert_eq!(loaded.config.state.route_memory, case.expected);
+            let origin = origins(&loaded.merged, &loaded.config)
+                .into_iter()
+                .find(|(section, key, _, _)| *section == "state" && *key == "route_memory")
+                .expect("route-memory origin")
+                .3;
+            assert_eq!(origin, case.origin);
+            assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn legacy_bypass_cache_and_ttl_compose_in_historical_order() {
+        struct Case {
+            cache: Option<&'static str>,
+            ttl: Option<&'static str>,
+            modern_cache: Option<&'static str>,
+            expected_cache: bool,
+            expected_ttl: u64,
+            cache_origin: &'static str,
+            ttl_origin: &'static str,
+            warning: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                cache: Some("0"),
+                ttl: None,
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE",
+                ttl_origin: "default",
+                warning: None,
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("60"),
+                modern_cache: None,
+                expected_cache: true,
+                expected_ttl: 60,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                warning: None,
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("not-a-number"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE",
+                ttl_origin: "default",
+                warning: Some("DONSETCH_BYPASS_CACHE_TTL_SECS: not a number"),
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("0"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "default",
+                warning: None,
+            },
+            Case {
+                cache: None,
+                ttl: Some("60"),
+                modern_cache: None,
+                expected_cache: true,
+                expected_ttl: 60,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                warning: None,
+            },
+            Case {
+                cache: None,
+                ttl: Some("0"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                ttl_origin: "default",
+                warning: None,
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("86401"),
+                modern_cache: None,
+                expected_cache: false,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS_CACHE",
+                ttl_origin: "default",
+                warning: Some("DONSETCH_BYPASS_CACHE_TTL_SECS=86401: out of range 0..=86400"),
+            },
+            Case {
+                cache: Some("0"),
+                ttl: Some("60"),
+                modern_cache: Some("false"),
+                expected_cache: false,
+                expected_ttl: 60,
+                cache_origin: "DONSETCH_BYPASS__CACHE",
+                ttl_origin: "DONSETCH_BYPASS_CACHE_TTL_SECS",
+                warning: None,
+            },
+            Case {
+                cache: None,
+                ttl: Some("0"),
+                modern_cache: Some("true"),
+                expected_cache: true,
+                expected_ttl: 21_600,
+                cache_origin: "DONSETCH_BYPASS__CACHE",
+                ttl_origin: "default",
+                warning: None,
+            },
+        ];
+
+        for case in cases {
+            let guard = clean_env();
+            set_env("DONSETCH_NO_CONFIG_FILE", "1");
+            if let Some(value) = case.cache {
+                set_env("DONSETCH_BYPASS_CACHE", value);
+            }
+            if let Some(value) = case.ttl {
+                set_env("DONSETCH_BYPASS_CACHE_TTL_SECS", value);
+            }
+            if let Some(value) = case.modern_cache {
+                set_env("DONSETCH_BYPASS__CACHE", value);
+            }
+
+            let loaded = load().expect("bypass-cache combination must load");
+            assert_eq!(loaded.config.bypass.cache, case.expected_cache);
+            assert_eq!(loaded.config.bypass.cache_ttl_secs, case.expected_ttl);
+            let rows = origins(&loaded.merged, &loaded.config);
+            let cache_origin = rows
+                .iter()
+                .find(|(section, key, _, _)| *section == "bypass" && *key == "cache")
+                .expect("cache origin")
+                .3
+                .as_str();
+            let ttl_origin = rows
+                .iter()
+                .find(|(section, key, _, _)| *section == "bypass" && *key == "cache_ttl_secs")
+                .expect("TTL origin")
+                .3
+                .as_str();
+            assert_eq!(cache_origin, case.cache_origin);
+            assert_eq!(ttl_origin, case.ttl_origin);
+            match case.warning {
+                Some(expected) => assert_eq!(loaded.warnings, [format!("ignoring {expected}")]),
+                None => assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings),
+            }
+            drop(guard);
+        }
     }
 
     /// Legacy names keep their historical soft semantics: a value
