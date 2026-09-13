@@ -2655,6 +2655,7 @@ mod tests {
             None => unset_env("PLAYWRIGHT_BROWSERS_PATH"),
         }
         drop(guard);
+    }
 
     #[test]
     fn legacy_route_memory_flags_compose_with_kill_switch_precedence() {
