@@ -1154,15 +1154,29 @@ fn classify_route_ips(status: u16, body: &str) -> ZoneProbeOut {
     }
 }
 
+/// Bright Data API root. The route_ips endpoint is appended by
+/// `route_ips_url`; `bright_zone_probe_at` takes this root (the
+/// production value here, a local rig root in tests) and never the
+/// full endpoint, or the appended path would double.
+const BRIGHT_API_BASE: &str = "https://api.brightdata.com";
+
+/// The zone route_ips URL for a base. Kept separate so the ship
+/// path and the test rig build the URL the same way: pass the API
+/// ROOT, the endpoint path is appended exactly once.
+fn route_ips_url(base: &str, zone: &str) -> String {
+    format!("{base}/zone/route_ips?zone={zone}")
+}
+
 /// Free Bright Data validation: the zone route_ips endpoint lists
 /// the zone's IP pool without making a request, so a dead token or
 /// wrong zone name shows up here before the first paid unlock.
 fn bright_zone_probe(token: &str, zone: &str) -> ZoneProbeOut {
-    bright_zone_probe_at("https://api.brightdata.com/zone/route_ips", token, zone)
+    bright_zone_probe_at(BRIGHT_API_BASE, token, zone)
 }
 
-/// The probe against an explicit endpoint (the production URL in
-/// the ship path, a local rig in tests).
+/// The probe against an API base (the production root in the ship
+/// path, a local rig root in tests); the route_ips endpoint is
+/// appended by `route_ips_url`.
 fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1190,7 +1204,7 @@ async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZonePro
             };
         }
     };
-    let url = format!("{base}/zone/route_ips?zone={zone}");
+    let url = route_ips_url(base, zone);
     let resp = match client.get(url).bearer_auth(token).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -1597,7 +1611,9 @@ mod mask_tests {
 
 #[cfg(test)]
 mod bright_probe_tests {
-    use super::{ZoneProbeOut, bright_zone_probe_at, classify_route_ips};
+    use super::{
+        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, route_ips_url,
+    };
     use std::io::{Read, Write};
 
     /// A one-request HTTP rig: serves `status` + `body`, records the
@@ -1715,6 +1731,26 @@ mod bright_probe_tests {
         }
         // 200 parse happens in the caller; the classifier only tags it.
         assert_eq!(classify_route_ips(200, "{}"), ZoneProbeOut::Routed(0));
+    }
+
+    // The production probe must hit .../zone/route_ips exactly once.
+    // The ship base used to be the full endpoint while route_ips_url
+    // appends the endpoint again, so the real request went to
+    // /zone/route_ips/zone/route_ips (a 404) and every configured
+    // Bright Data zone read as a failed probe. The wire tests missed
+    // it because they pass a bare-root rig base. Pin the ship URL.
+    #[test]
+    fn production_route_ips_url_has_a_single_endpoint_path() {
+        let url = route_ips_url(BRIGHT_API_BASE, "web-access");
+        assert_eq!(
+            url,
+            "https://api.brightdata.com/zone/route_ips?zone=web-access"
+        );
+        assert_eq!(
+            url.matches("/zone/route_ips").count(),
+            1,
+            "the endpoint path must not be doubled: {url}"
+        );
     }
 
     #[test]
