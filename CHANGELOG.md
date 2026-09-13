@@ -306,6 +306,9 @@ channel until the v4.0.0 release train.
   text tokens retain their exact historical value instead of being trimmed
   into disabled authentication. CORS/auth validation also runs before daemon
   work.
+- `donsetch config show --markdown` now emits one complete Markdown table per
+  config section, so section labels no longer turn the following knob rows
+  into plain paragraphs.
 - Modern `DONSETCH_<SECTION>__<KEY>` variables now fail loudly when a
   recognized value is not UTF-8 or when distinct names normalize to the same
   config key. Diagnostics identify the variable names without exposing their
