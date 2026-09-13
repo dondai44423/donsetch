@@ -1825,11 +1825,27 @@ fn boolish(value: &str) -> Option<bool> {
 }
 
 fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
+    new_env_layer_from(std::env::vars_os())
+}
+
+struct ModernEnvValue {
+    name: String,
+    value: std::ffi::OsString,
+    kind: FieldKind,
+}
+
+/// Parse one immutable environment snapshot. Keeping collection outside the
+/// parser makes collision behavior testable without relying on the platform's
+/// environment iteration order.
+fn new_env_layer_from(
+    snapshot: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> (VMap, Vec<String>, Vec<String>) {
     let mut map = VMap::new();
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
+    let mut recognized = std::collections::BTreeMap::<String, Vec<ModernEnvValue>>::new();
 
-    for (name, value) in std::env::vars_os() {
+    for (name, value) in snapshot {
         let Some(name) = name.to_str() else {
             continue;
         };
@@ -1859,17 +1875,42 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
             ));
             continue;
         };
+        let canonical = format!("{section}.{key}");
+        recognized
+            .entry(canonical)
+            .or_default()
+            .push(ModernEnvValue {
+                name: name.to_string(),
+                value,
+                kind,
+            });
+    }
+
+    for (canonical, mut entries) in recognized {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        if entries.len() > 1 {
+            let mut names = entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>();
+            names.dedup();
+            errors.push(format!(
+                "{} map to the same key {canonical}; set only one",
+                names.join(", ")
+            ));
+            continue;
+        }
+
+        let ModernEnvValue { name, value, kind } = entries.pop().expect("recognized env entry");
         let Some(value) = value.to_str() else {
-            if (section, key) == ("transport", "token") {
+            if canonical == "transport.token" {
                 errors.push(format!("{name}: {MODERN_HTTP_TOKEN_REQUIREMENT}"));
             } else {
-                // The modern env layer is strict; a value that is
-                // not even UTF-8 must not silently vanish.
-                warnings.push(format!("ignoring {name}: value is not valid UTF-8"));
+                errors.push(format!("{name} contains a non-UTF-8 value"));
             }
             continue;
         };
-        if (section, key) == ("transport", "token")
+        if canonical == "transport.token"
             && let Err(message) = validate_modern_http_token(value)
         {
             errors.push(format!("{name}: {message}"));
@@ -1881,7 +1922,7 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
                 Some(b) => b.into(),
                 None => {
                     errors.push(format!(
-                        "{name}={value:?} is not a boolean (1/true/on/yes/0/false/off/no)"
+                        "{name} is not a boolean (1/true/on/yes/0/false/off/no)"
                     ));
                     continue;
                 }
@@ -1889,7 +1930,7 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
             FieldKind::Int => match value.trim().parse::<i64>() {
                 Ok(n) => n.into(),
                 Err(_) => {
-                    errors.push(format!("{name}={value:?} is not an integer"));
+                    errors.push(format!("{name} is not an integer"));
                     continue;
                 }
             },
@@ -1900,9 +1941,11 @@ fn new_env_layer() -> (VMap, Vec<String>, Vec<String>) {
                 .collect::<Vec<_>>()
                 .into(),
         };
-        put(&mut map, &format!("{section}.{key}"), vkind, name);
+        put(&mut map, &canonical, vkind, &name);
     }
 
+    warnings.sort();
+    errors.sort();
     (map, warnings, errors)
 }
 
@@ -3240,6 +3283,81 @@ mod tests {
         }
         assert_eq!(boolish("maybe"), None);
         assert_eq!(boolish(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recognized_modern_env_rejects_non_utf8_without_echoing_the_value() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let secret = b"secret-\xff-sentinel".to_vec();
+        let (map, warnings, errors) = new_env_layer_from([(
+            std::ffi::OsString::from("DONSETCH_FETCH__H3"),
+            std::ffi::OsString::from_vec(secret),
+        )]);
+
+        assert!(map.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("DONSETCH_FETCH__H3"));
+        assert!(errors[0].contains("non-UTF-8"));
+        assert!(!errors[0].contains("secret"), "value leaked: {}", errors[0]);
+    }
+
+    #[test]
+    fn modern_env_collisions_fail_independently_of_snapshot_order() {
+        let first = (
+            std::ffi::OsString::from("DONSETCH_FETCH__H3"),
+            std::ffi::OsString::from("first-value-sentinel"),
+        );
+        let second = (
+            std::ffi::OsString::from("DONSETCH_fetch__h3"),
+            std::ffi::OsString::from("second-value-sentinel"),
+        );
+
+        let (forward_map, forward_warnings, forward_errors) =
+            new_env_layer_from([first.clone(), second.clone()]);
+        let (reverse_map, reverse_warnings, reverse_errors) = new_env_layer_from([second, first]);
+
+        assert!(forward_map.is_empty());
+        assert!(reverse_map.is_empty());
+        assert_eq!(forward_warnings, reverse_warnings);
+        assert_eq!(forward_errors, reverse_errors);
+        assert_eq!(forward_errors.len(), 1);
+        let error = &forward_errors[0];
+        assert!(error.contains("DONSETCH_FETCH__H3"), "{error}");
+        assert!(error.contains("DONSETCH_fetch__h3"), "{error}");
+        assert!(error.contains("fetch.h3"), "{error}");
+        assert!(
+            !error.contains("first-value-sentinel"),
+            "value leaked: {error}"
+        );
+        assert!(
+            !error.contains("second-value-sentinel"),
+            "value leaked: {error}"
+        );
+    }
+
+    #[test]
+    fn modern_env_type_errors_name_variables_without_echoing_values() {
+        let (_, warnings, errors) = new_env_layer_from([
+            (
+                std::ffi::OsString::from("DONSETCH_FETCH__H3"),
+                std::ffi::OsString::from("boolean-value-sentinel"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_TRANSPORT__PORT"),
+                std::ffi::OsString::from("integer-value-sentinel"),
+            ),
+        ]);
+
+        assert!(warnings.is_empty());
+        assert_eq!(errors.len(), 2);
+        let diagnostic = errors.join("\n");
+        assert!(diagnostic.contains("DONSETCH_FETCH__H3"));
+        assert!(diagnostic.contains("DONSETCH_TRANSPORT__PORT"));
+        assert!(!diagnostic.contains("boolean-value-sentinel"));
+        assert!(!diagnostic.contains("integer-value-sentinel"));
     }
 
     #[test]
