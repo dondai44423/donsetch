@@ -176,6 +176,9 @@ channel until the v4.0.0 release train.
 
 ### Fixed
 
+- The ONNX reranker now consumes the validated `search.rerank_threads` value
+  directly instead of leaking and reparsing a string, and reports configured
+  values as coming from the layered config. `0 = auto` behavior is unchanged.
 - Master hardening wave (overnight full-tree audit, every finding
   reproduced before fixing):
 - h1: a connection that closes before Content-Length is satisfied now
