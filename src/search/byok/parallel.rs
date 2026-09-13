@@ -78,7 +78,10 @@ pub async fn search(
         if lower.contains("invalid") && (lower.contains("key") || lower.contains("api")) {
             return Err(KeyError::InvalidKey);
         }
-        return Err(KeyError::UnknownError(format!("HTTP {status}: {text}")));
+        return Err(KeyError::UnknownError(format!(
+            "HTTP {status}: {}",
+            super::err_body(&text)
+        )));
     }
 
     let json: Value = serde_json::from_str(&text)
