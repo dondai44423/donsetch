@@ -144,7 +144,10 @@ pub(crate) async fn search(
         {
             return Err(KeyError::InvalidKey);
         }
-        return Err(KeyError::UnknownError(format!("HTTP {status}: {text}")));
+        return Err(KeyError::UnknownError(format!(
+            "HTTP {status}: {}",
+            super::err_body(&text)
+        )));
     }
 
     // Bright Data returns parsed JSON when brd_json=1 is in the URL.
