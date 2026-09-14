@@ -46,7 +46,15 @@ pub fn compile(raw: &str) -> CompiledQuery {
     let mut filetype = None;
     let mut intitle = None;
     let mut words: Vec<&str> = Vec::new();
-    for token in raw.split_whitespace() {
+    // Peekable so a quoted operator value spanning several
+    // whitespace tokens (`intitle:"HTTP status codes"`) can be
+    // reassembled: split_whitespace alone kept only the first word
+    // ("HTTP") as the title and leaked `status codes"` (stray quote
+    // and all) into free-text ranking, and `for_engine`'s multi-word
+    // `intitle:"…"` branch was dead because compile never produced
+    // one.
+    let mut it = raw.split_whitespace().peekable();
+    while let Some(token) = it.next() {
         let lower = token.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("site:") {
             let v = rest.trim_end_matches('/');
@@ -64,15 +72,33 @@ pub fn compile(raw: &str) -> CompiledQuery {
             }
             continue;
         }
-        if let Some(rest) = lower.strip_prefix("intitle:") {
-            let v = rest.trim_matches('"').trim_end_matches('/');
-            if !v.is_empty() && intitle.is_none() {
-                // Keep original casing from the raw token for display.
-                let orig = token
-                    .split_once(':')
-                    .map(|(_, v)| v.trim_matches('"'))
-                    .unwrap_or(v);
-                intitle = Some(orig.to_string());
+        if lower.starts_with("intitle:") {
+            // Original-case value after the first colon (the operator
+            // name is ASCII, so this split is byte-safe).
+            let value = token.split_once(':').map(|(_, v)| v).unwrap_or("");
+            let phrase = if let Some(open) = value.strip_prefix('"') {
+                // Quoted value: closes in this token, or spans the
+                // following whitespace tokens until the closing quote
+                // (unterminated = best-effort, take what is there).
+                if let Some(inner) = open.strip_suffix('"') {
+                    inner.to_string()
+                } else {
+                    let mut parts = vec![open.to_string()];
+                    for next in it.by_ref() {
+                        if let Some(head) = next.strip_suffix('"') {
+                            parts.push(head.to_string());
+                            break;
+                        }
+                        parts.push(next.to_string());
+                    }
+                    parts.join(" ")
+                }
+            } else {
+                value.trim_end_matches('/').to_string()
+            };
+            let phrase = phrase.trim();
+            if !phrase.is_empty() && intitle.is_none() {
+                intitle = Some(phrase.to_string());
             }
             continue;
         }
@@ -232,6 +258,37 @@ mod tests {
         assert_eq!(c.filetype.as_deref(), Some("pdf"));
         assert_eq!(c.intitle.as_deref(), Some("hypertext"));
         assert_eq!(c.text, "rfc 7231");
+    }
+
+    // A multi-word quoted intitle must be captured whole, not split
+    // by whitespace into a one-word title with the rest ("status
+    // codes\"", stray quote and all) leaking into free text.
+    #[test]
+    fn compile_multiword_quoted_intitle() {
+        let c = compile("rfc intitle:\"HTTP status codes\" filetype:pdf");
+        assert_eq!(c.intitle.as_deref(), Some("HTTP status codes"));
+        assert_eq!(c.filetype.as_deref(), Some("pdf"));
+        assert_eq!(
+            c.text, "rfc",
+            "the quoted phrase must not leak into free text"
+        );
+        // The for_engine multi-word branch is now reachable.
+        let bing = for_engine(&c, "bing");
+        assert!(
+            bing.contains("intitle:\"HTTP status codes\""),
+            "multi-word intitle must be re-quoted for the engine: {bing}"
+        );
+        // Single-token and closed-in-one-token quoted forms still work.
+        assert_eq!(
+            compile("intitle:hypertext").intitle.as_deref(),
+            Some("hypertext")
+        );
+        assert_eq!(compile("intitle:\"solo\"").intitle.as_deref(), Some("solo"));
+        // Unterminated quote is best-effort (takes the rest), no panic.
+        assert_eq!(
+            compile("intitle:\"open ended").intitle.as_deref(),
+            Some("open ended")
+        );
     }
 
     #[test]
