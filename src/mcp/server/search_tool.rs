@@ -117,7 +117,26 @@ pub(super) fn make_ghost_hook(
                 }
             }
             let g_host = crate::search::rank::host_of(&url);
-            let mut g = match ghost_mgr.acquire_for(&profile, Some(g_host.as_str())).await {
+            // v4 E2: the ghost render must agree with the persona pin
+            // (viewport + locale) for this host, exactly as the tier-1
+            // fetch paths and web_screenshot do — otherwise the SERP
+            // render goes out on the default en-US/default-viewport
+            // wire while the persona's HTTP fetches use its own, an
+            // incoherent fingerprint (and a relaunch thrash when a
+            // default-wire and a persona-wire acquire alternate on one
+            // pool slot).
+            let wire = {
+                let s = state.lock().await;
+                s.personas
+                    .get(&g_host)
+                    .filter(|p| p.quarantine_reason.is_none())
+                    .map(|p| p.ghost_wire())
+                    .unwrap_or_default()
+            };
+            let mut g = match ghost_mgr
+                .acquire_for_wire(&profile, Some(g_host.as_str()), wire)
+                .await
+            {
                 Ok(g) => g,
                 Err(e) => return Err(format!("browser launch: {e}")),
             };
@@ -528,9 +547,21 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             );
         }
         let t0 = std::time::Instant::now();
+        // v4 E2: pre-solve on the host's persona wire, like the fetch
+        // paths — a default-wire pre-solve would render incoherently
+        // with the persona and thrash the pool slot against a
+        // persona-wire fetch.
+        let wire = {
+            let s = d.state.lock().await;
+            s.personas
+                .get(&host_str)
+                .filter(|p| p.quarantine_reason.is_none())
+                .map(|p| p.ghost_wire())
+                .unwrap_or_default()
+        };
         let Ok(mut g) = d
             .ghost_mgr
-            .acquire_for(&d.profile, Some(host_str.as_str()))
+            .acquire_for_wire(&d.profile, Some(host_str.as_str()), wire)
             .await
         else {
             return;
