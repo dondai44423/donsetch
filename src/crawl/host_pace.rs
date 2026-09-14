@@ -153,8 +153,29 @@ pub async fn wait_and_stamp(host: &str) -> Duration {
         }
     }
     write_pace(&path, host, now_ms());
-    prune(&dir);
+    // Prune is directory-wide (read_dir + a stat per file); running
+    // it on every stamped request — i.e. every fetched URL — is
+    // wasteful on the crawl hot path. Throttle it to at most once per
+    // PRUNE_INTERVAL per process; the TTL/cap only need lazy upkeep,
+    // and the CAS makes exactly one concurrent caller do the work.
+    if prune_due() {
+        prune(&dir);
+    }
     waited
+}
+
+/// At most one prune per process per PRUNE_INTERVAL. Returns true for
+/// the single caller that wins the interval.
+fn prune_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const PRUNE_INTERVAL_MS: u64 = 60_000;
+    static LAST_PRUNE_MS: AtomicU64 = AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST_PRUNE_MS.load(Ordering::Relaxed);
+    now.saturating_sub(last) >= PRUNE_INTERVAL_MS
+        && LAST_PRUNE_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
 }
 
 #[cfg(test)]
@@ -244,6 +265,20 @@ mod tests {
         assert!(
             !path.exists(),
             "stale host-pace file must be pruned on write"
+        );
+    }
+
+    // prune is directory-wide and used to run on every stamped
+    // request (the crawl hot path); prune_due throttles it to at most
+    // once per interval per process. The first call wins, an
+    // immediate second is skipped. (nextest process-per-test gives a
+    // fresh LAST_PRUNE static, so the first call always wins here.)
+    #[test]
+    fn prune_is_throttled_after_the_first_call() {
+        assert!(prune_due(), "first prune in a process must run");
+        assert!(
+            !prune_due(),
+            "an immediate second prune must be skipped by the throttle"
         );
     }
 
