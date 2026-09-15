@@ -47,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         make \
         nasm \
+        lld \
         curl \
         tar \
         git \
