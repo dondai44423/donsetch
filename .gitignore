@@ -38,5 +38,7 @@ tests/pdf-corpus/*.pdf
 # Cache directories (local state)
 .cache/
 npm/binaries/
+npm/LICENSE
+*.tgz
 bench/regression-results.json
 /libonnxruntime.so

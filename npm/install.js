@@ -169,68 +169,35 @@ function requestThroughProxy(target, proxy) {
       path: `${target.hostname}:${target.port || 443}`,
       headers: { Host: `${target.hostname}:${target.port || 443}` },
     });
-    let connected = false;
     proxyReq.once('connect', (response, socket) => {
-      connected = true;
       if (response.statusCode !== 200) {
         socket.destroy();
         reject(new Error(`proxy CONNECT returned HTTP ${response.statusCode}`));
         return;
       }
-      const secureSocket = tls.connect({
-        socket,
-        servername: target.hostname,
-      });
-      const tlsTimer = setTimeout(
-        () => secureSocket.destroy(new Error('TLS timeout')),
-        REQUEST_TIMEOUT_MS,
-      );
-      secureSocket.once('error', reject);
-      secureSocket.once('secureConnect', () => {
-        clearTimeout(tlsTimer);
-        const requestTimer = setTimeout(
-          () => secureSocket.destroy(new Error('request timeout')),
-          REQUEST_TIMEOUT_MS,
-        );
-        const req = https.request({
-          hostname: target.hostname,
-          port: target.port || 443,
-          path: `${target.pathname}${target.search}`,
-          method: 'GET',
-          headers: {
-            Host: target.hostname,
-            Accept: 'application/octet-stream',
-            'User-Agent': 'donsetch-npm-installer',
-          },
-          agent: false,
-          createConnection: () => secureSocket,
-        }, (response) => {
-          clearTimeout(requestTimer);
-          let idleTimer = setTimeout(
-            () => response.destroy(new Error('response timeout')),
-            REQUEST_TIMEOUT_MS,
-          );
-          const refreshIdleTimer = () => {
-            clearTimeout(idleTimer);
-            idleTimer = setTimeout(
-              () => response.destroy(new Error('response timeout')),
-              REQUEST_TIMEOUT_MS,
-            );
-          };
-          response.on('data', refreshIdleTimer);
-          response.once('end', () => clearTimeout(idleTimer));
-          response.once('close', () => clearTimeout(idleTimer));
-          resolve(response);
-        });
-        req.on('error', (error) => {
-          clearTimeout(requestTimer);
-          reject(error);
-        });
-      });
+      const req = https.request({
+        hostname: target.hostname,
+        port: target.port || 443,
+        path: `${target.pathname}${target.search}`,
+        method: 'GET',
+        headers: {
+          Accept: 'application/octet-stream',
+          'User-Agent': 'donsetch-npm-installer',
+        },
+        agent: false,
+        createConnection: () => tls.connect({
+          socket,
+          servername: target.hostname,
+        }),
+      }, resolve);
+      req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error('request timeout')));
+      req.on('error', reject);
+      req.end();
     });
-    proxyReq.on('error', (error) => {
-      if (!connected) reject(error);
+    proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      proxyReq.destroy(new Error('proxy CONNECT timeout'));
     });
+    proxyReq.on('error', reject);
     proxyReq.end();
   });
 }
