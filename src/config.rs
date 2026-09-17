@@ -756,24 +756,24 @@ fn legacy_layer() -> (VMap, Vec<String>) {
         }
         None => {}
     }
-    if let Some(v) = std::env::var_os("DONSHEET_OCR") {
+    if let Some(v) = std::env::var_os("DONSETCH_OCR") {
         // Historical semantics: every value except the exact string "off"
         // keeps OCR enabled.
         let on = v.to_str() != Some("off");
-        put(&mut m, "fetch.ocr", on.into(), "DONSHEET_OCR");
+        put(&mut m, "fetch.ocr", on.into(), "DONSETCH_OCR");
     }
-    match int_env("DONSHEET_OCR_MAX_PAGES") {
+    match int_env("DONSETCH_OCR_MAX_PAGES") {
         Some(n) => put_num(
             &mut m,
             &mut warnings,
             "fetch.ocr_max_pages",
-            "DONSHEET_OCR_MAX_PAGES",
+            "DONSETCH_OCR_MAX_PAGES",
             n,
             1,
             500,
         ),
-        None if std::env::var_os("DONSHEET_OCR_MAX_PAGES").is_some() => {
-            warnings.push("ignoring DONSHEET_OCR_MAX_PAGES: not a number".into())
+        None if std::env::var_os("DONSETCH_OCR_MAX_PAGES").is_some() => {
+            warnings.push("ignoring DONSETCH_OCR_MAX_PAGES: not a number".into())
         }
         None => {}
     }
@@ -1238,31 +1238,31 @@ fn legacy_layer() -> (VMap, Vec<String>) {
     if std::env::var_os("DONSEEK_DEBUG").is_some() {
         put(&mut m, "debug.search", true.into(), "DONSEEK_DEBUG");
     }
-    if std::env::var_os("DONSHEET_DEBUG").is_some() {
-        put(&mut m, "debug.pdf", true.into(), "DONSHEET_DEBUG");
+    if std::env::var_os("DONSETCH_DEBUG").is_some() {
+        put(&mut m, "debug.pdf", true.into(), "DONSETCH_DEBUG");
     }
-    if std::env::var_os("DONSHEET_DEBUG_MATRIX").is_some() {
+    if std::env::var_os("DONSETCH_DEBUG_MATRIX").is_some() {
         put(
             &mut m,
             "debug.pdf_matrix",
             true.into(),
-            "DONSHEET_DEBUG_MATRIX",
+            "DONSETCH_DEBUG_MATRIX",
         );
     }
-    if std::env::var_os("DONSHEET_DEBUG_CHARS").is_some() {
+    if std::env::var_os("DONSETCH_DEBUG_CHARS").is_some() {
         put(
             &mut m,
             "debug.pdf_chars",
             true.into(),
-            "DONSHEET_DEBUG_CHARS",
+            "DONSETCH_DEBUG_CHARS",
         );
     }
-    if std::env::var_os("DONSHEET_DEBUG_WORDS").is_some() {
+    if std::env::var_os("DONSETCH_DEBUG_WORDS").is_some() {
         put(
             &mut m,
             "debug.pdf_words",
             true.into(),
-            "DONSHEET_DEBUG_WORDS",
+            "DONSETCH_DEBUG_WORDS",
         );
     }
     if std::env::var_os("DONSIFT_DEBUG").is_some() {
@@ -1894,6 +1894,11 @@ const RESERVED_VARS: &[&str] = &[
     "DONSETCH_NO_CONFIG_FILE",
     "DONSETCH_PLUGIN",
     "DONSETCH_DEBUG",
+    "DONSETCH_NO_UPDATE_CHECK",
+    "DONSETCH_INSTALL_TAG",
+    "DONSETCH_RELEASES_BASE",
+    "DONSETCH_SKIP_DOWNLOAD",
+    "DONSETCH_FORCE_GLIBC",
     "BLESS_MCP_FIXTURES",
 ];
 
@@ -1926,8 +1931,8 @@ const LEGACY_VARS: &[&str] = &[
     "DONSETCH_NO_CRAWL_SHAPE",
     "DONSETCH_NO_PREWARM",
     "DONSETCH_PDF_MAX_MB",
-    "DONSHEET_OCR",
-    "DONSHEET_OCR_MAX_PAGES",
+    "DONSETCH_OCR",
+    "DONSETCH_OCR_MAX_PAGES",
     "DONSETCH_UNLOCKER_ZONE",
     "DONSETCH_BYPASS_MAX_DAILY",
     "DONSETCH_BYPASS_TIMEOUT_SECS",
@@ -1959,10 +1964,10 @@ const LEGACY_VARS: &[&str] = &[
     "DONSETCH_LOGIN_FORCE",
     "DONGHOST_DEBUG",
     "DONSEEK_DEBUG",
-    "DONSHEET_DEBUG",
-    "DONSHEET_DEBUG_MATRIX",
-    "DONSHEET_DEBUG_CHARS",
-    "DONSHEET_DEBUG_WORDS",
+    "DONSETCH_DEBUG",
+    "DONSETCH_DEBUG_MATRIX",
+    "DONSETCH_DEBUG_CHARS",
+    "DONSETCH_DEBUG_WORDS",
     "DONSIFT_DEBUG",
     "DONSETCH_DEBUG_ECHO",
     "DONSETCH_NO_SEARCH_EARLY",
@@ -2432,8 +2437,8 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSETCH_NO_CRAWL_SHAPE" => ("fetch", "crawl_shape"),
         "DONSETCH_NO_PREWARM" => ("fetch", "prewarm"),
         "DONSETCH_PDF_MAX_MB" => ("fetch", "pdf_max_mb"),
-        "DONSHEET_OCR" => ("fetch", "ocr"),
-        "DONSHEET_OCR_MAX_PAGES" => ("fetch", "ocr_max_pages"),
+        "DONSETCH_OCR" => ("fetch", "ocr"),
+        "DONSETCH_OCR_MAX_PAGES" => ("fetch", "ocr_max_pages"),
         "DONSETCH_UNLOCKER_ZONE" => ("bypass", "zone"),
         "DONSETCH_BYPASS_MAX_DAILY" => ("bypass", "max_daily"),
         "DONSETCH_BYPASS_TIMEOUT_SECS" => ("bypass", "timeout_secs"),
@@ -2472,10 +2477,10 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSETCH_LOGIN_FORCE" => ("browser", "login_force"),
         "DONGHOST_DEBUG" => ("debug", "ghost"),
         "DONSEEK_DEBUG" => ("debug", "search"),
-        "DONSHEET_DEBUG" => ("debug", "pdf"),
-        "DONSHEET_DEBUG_MATRIX" => ("debug", "pdf_matrix"),
-        "DONSHEET_DEBUG_CHARS" => ("debug", "pdf_chars"),
-        "DONSHEET_DEBUG_WORDS" => ("debug", "pdf_words"),
+        "DONSETCH_DEBUG" => ("debug", "pdf"),
+        "DONSETCH_DEBUG_MATRIX" => ("debug", "pdf_matrix"),
+        "DONSETCH_DEBUG_CHARS" => ("debug", "pdf_chars"),
+        "DONSETCH_DEBUG_WORDS" => ("debug", "pdf_words"),
         "DONSIFT_DEBUG" => ("debug", "extract"),
         "DONSETCH_DEBUG_ECHO" => ("debug", "echo_scorecard"),
         _ => ("", ""),
@@ -2630,7 +2635,6 @@ mod tests {
             "DONSETCH_",
             "DONSEEK_",
             "DONGHOST_",
-            "DONSHEET_",
             "DONSIFT_",
             "CLOAKBROWSER_",
         ];

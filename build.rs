@@ -305,12 +305,12 @@ fn main() {
         .output()
     {
         if let Ok(s) = String::from_utf8(out.stdout) {
-            println!("cargo:rustc-env=DONSHEET_GIT_HASH={}", s.trim());
+            println!("cargo:rustc-env=DONSETCH_GIT_HASH={}", s.trim());
         } else {
-            println!("cargo:rustc-env=DONSHEET_GIT_HASH=unknown");
+            println!("cargo:rustc-env=DONSETCH_GIT_HASH=unknown");
         }
     } else {
-        println!("cargo:rustc-env=DONSHEET_GIT_HASH=unknown");
+        println!("cargo:rustc-env=DONSETCH_GIT_HASH=unknown");
     }
 
     // PDFium variant string.
@@ -320,7 +320,7 @@ fn main() {
         PDFIUM_STATIC_TAG
     };
     let pdfium_kind = if is_shared { "shared" } else { "static" };
-    println!("cargo:rustc-env=DONSHEET_PDFIUM={pdfium_kind}, {pdfium_tag}");
+    println!("cargo:rustc-env=DONSETCH_PDFIUM={pdfium_kind}, {pdfium_tag}");
 
     // Target triple.
     let triple = match (os.as_str(), arch.as_str()) {
@@ -334,7 +334,7 @@ fn main() {
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
         _ => "unknown",
     };
-    println!("cargo:rustc-env=DONSHEET_TARGET={triple}");
+    println!("cargo:rustc-env=DONSETCH_TARGET={triple}");
 
     // Enabled feature flags.
     let mut feats = Vec::new();
@@ -349,7 +349,7 @@ fn main() {
     } else {
         feats.join(", ")
     };
-    println!("cargo:rustc-env=DONSHEET_FEATURES={feats_display}");
+    println!("cargo:rustc-env=DONSETCH_FEATURES={feats_display}");
 }
 
 fn target_pair(os: &str, arch: &str) -> &'static str {

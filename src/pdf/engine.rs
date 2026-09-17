@@ -428,7 +428,7 @@ pub fn is_dingbat_family(name: &str) -> bool {
 /// Mark a font as monospace when its NAME says so (the descriptor's
 /// FixedPitch bit is dropped by many subset pipelines : books &
 /// guides embed mono fonts without it).
-pub const DONSHEET_MONO_HINT: u32 = 0x8000_0000;
+pub const DONSETCH_MONO_HINT: u32 = 0x8000_0000;
 
 fn mono_font_name(name: &str) -> bool {
     let n = name.to_lowercase();
@@ -889,7 +889,7 @@ where
                         weight,
                         flags: flags as u32
                             | if font_is_mono(&raw.fonts, family) {
-                                DONSHEET_MONO_HINT
+                                DONSETCH_MONO_HINT
                             } else {
                                 0
                             },

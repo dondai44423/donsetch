@@ -243,7 +243,8 @@ fn platform_asset_name() -> Option<&'static str> {
         ("macos", "x86_64") => Some("darwin-x64"),
         ("macos", "aarch64") => Some("darwin-arm64"),
         ("windows", "x86_64") => Some("win32-x64"),
-        ("windows", "aarch64") => Some("win32-arm64"),
+        // No Windows ARM64 asset is built; run the x64 binary under emulation.
+        ("windows", "aarch64") => Some("win32-x64"),
         _ => None,
     }
 }

@@ -367,7 +367,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
             Some(e) => e.1 += 1,
             None => font_votes.push((c.font, 1)),
         }
-        if c.flags & (super::sys::FONT_FIXED_PITCH | super::engine::DONSHEET_MONO_HINT) != 0 {
+        if c.flags & (super::sys::FONT_FIXED_PITCH | super::engine::DONSETCH_MONO_HINT) != 0 {
             mono_glyphs += 1;
         }
         if c.flags & super::sys::FONT_ITALIC != 0 {

@@ -1093,14 +1093,14 @@ fn check_cache_dir() -> CheckResult {
 fn check_pdfium() -> CheckResult {
     #[cfg(not(windows))]
     {
-        CheckResult::Pass(option_env!("DONSHEET_PDFIUM").unwrap_or("static").into())
+        CheckResult::Pass(option_env!("DONSETCH_PDFIUM").unwrap_or("static").into())
     }
     #[cfg(windows)]
     {
         let exe = std::env::current_exe().unwrap_or_default();
         let dll = exe.parent().unwrap_or(Path::new("")).join("pdfium.dll");
         if dll.exists() {
-            CheckResult::Pass(option_env!("DONSHEET_PDFIUM").unwrap_or("dll").into())
+            CheckResult::Pass(option_env!("DONSETCH_PDFIUM").unwrap_or("dll").into())
         } else {
             CheckResult::Fail(
                 "pdfium.dll not found".into(),
@@ -1823,6 +1823,9 @@ fn print_mcp_section() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "donsetch".to_string());
+    let npm_install = exe.contains("node_modules/donsetch/")
+        || exe.contains("node_modules\\donsetch\\");
+    let command = if npm_install { "donsetch" } else { &exe };
     let found = detect_mcp_clients();
     if found.is_empty() {
         cli::check_dim("MCP clients", "none detected; generic stdio block below");
@@ -1835,19 +1838,27 @@ fn print_mcp_section() {
         }
     }
     let generic = format!(
-        "{{\"mcpServers\": {{\"donsetch\": {{\"command\": \"{exe}\", \
-         \"args\": [\"mcp\", \"--supervised\"]}}}}}}"
+        "{{\"mcpServers\": {{\"donsetch\": {{\"command\": {}, \
+         \"args\": [\"mcp\", \"--supervised\"]}}}}}}",
+        json_escape(command)
     );
     println!("      Add to an MCP client (Claude Desktop, OpenCode, .mcp.json):");
     println!("      {generic}");
     println!("      Hermes (~/.hermes/config.yaml):");
     println!("        mcp_servers:");
     println!("          donsetch:");
-    println!("            command: {exe}");
+    println!("            command: {command}");
     println!("            args: [\"mcp\", \"--supervised\"]");
     println!("            transport: stdio");
+    if npm_install {
+        println!("      For npm installs, use `npx donsetch` if `donsetch` is not on PATH.");
+    }
     println!("      Supervised mode restarts donsetch if it is ever killed,",);
     println!("      which is why the blocks above prefer it.");
+}
+
+fn json_escape(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// Known MCP client config locations. Only these small fixed files
@@ -2417,5 +2428,14 @@ mod bright_probe_tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn json_escape_handles_windows_paths() {
+        let path = r#"C:\Users\A "B"\donsetch.exe"#;
+        assert_eq!(
+            json_escape(path),
+            r#""C:\\Users\\A \"B\"\\donsetch.exe""#
+        );
     }
 }
