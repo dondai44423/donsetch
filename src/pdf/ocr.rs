@@ -11,8 +11,8 @@
 //! (monkt/paddleocr-onnx) have incompatible preprocessing; we do not use
 //! them. First use downloads ~12MB (EN) / ~21MB (CJK) to the lazy cache.
 //!
-//! DONSETCH_OCR=off disables the tier.
-//! DONSETCH_OCR_MAX_PAGES caps per-document OCR cost (default 25).
+//! DONSHEET_OCR=off disables the tier.
+//! DONSHEET_OCR_MAX_PAGES caps per-document OCR cost (default 25).
 
 #[cfg(feature = "ocr")]
 use std::path::PathBuf;
@@ -81,7 +81,7 @@ pub fn ocr_cache_dir() -> PathBuf {
 }
 
 /// Master switch. Default ON (lazy); [fetch] ocr = false (legacy
-/// DONSETCH_OCR=off) kills the tier.
+/// DONSHEET_OCR=off) kills the tier.
 pub fn enabled() -> bool {
     crate::config::cfg().fetch.ocr
 }

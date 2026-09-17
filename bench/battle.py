@@ -15,7 +15,7 @@ Usage:
 
 Env:
   DONSETCH_BIN     binary path (default target/release/donsetch)
-  DONSETCH_OCR     forwarded (set to "off" via --skip-ocr for speed)
+  DONSHEET_OCR     forwarded (set to "off" via --skip-ocr for speed)
   BATTLE_MAX_PAGES soft page cap via --max-chars fallback (default: full doc)
 """
 import os
@@ -45,7 +45,7 @@ def garbage_ratio(text: str) -> float:
 def donsetch_extract(pdf: Path, skip_ocr: bool) -> dict:
     env = dict(os.environ)
     if skip_ocr:
-        env["DONSETCH_OCR"] = "off"
+        env["DONSHEET_OCR"] = "off"
     t0 = time.monotonic()
     proc = subprocess.run(
         [BIN, "extract", "--input", str(pdf), "--max", "8000000"],

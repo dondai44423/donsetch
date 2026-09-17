@@ -2245,7 +2245,8 @@ mod mask_tests {
 #[cfg(test)]
 mod bright_probe_tests {
     use super::{
-        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, route_ips_url,
+        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, json_escape,
+        route_ips_url,
     };
     use std::io::{Read, Write};
 

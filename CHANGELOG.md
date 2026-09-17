@@ -35,7 +35,8 @@ keeps every distribution channel on the same binary.
 
 ### Changed
 - Build metadata environment names now consistently use the `DONSETCH_*`
-  prefix.
+  prefix; legacy user configuration variables retain their historical
+  names.
 - Homebrew and dsh downstream repositories can auto-track published
   releases through the npm release workflow.
 
