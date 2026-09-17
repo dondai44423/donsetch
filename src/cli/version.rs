@@ -45,8 +45,8 @@ pub async fn run() {
     // not the API : no 60-req/hour limit). Parses the first
     // <entry><title> for the latest tag. Compares semver.
 
-    let skip_update_check = std::env::var_os("DONSETCH_NO_UPDATE_CHECK").is_some()
-        || std::env::var_os("CI").is_some();
+    let skip_update_check =
+        std::env::var_os("DONSETCH_NO_UPDATE_CHECK").is_some() || std::env::var_os("CI").is_some();
     let latest = if skip_update_check {
         None
     } else {

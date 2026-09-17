@@ -1823,8 +1823,8 @@ fn print_mcp_section() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "donsetch".to_string());
-    let npm_install = exe.contains("node_modules/donsetch/")
-        || exe.contains("node_modules\\donsetch\\");
+    let npm_install =
+        exe.contains("node_modules/donsetch/") || exe.contains("node_modules\\donsetch\\");
     let command = if npm_install { "donsetch" } else { &exe };
     let found = detect_mcp_clients();
     if found.is_empty() {
@@ -2434,9 +2434,6 @@ mod bright_probe_tests {
     #[test]
     fn json_escape_handles_windows_paths() {
         let path = r#"C:\Users\A "B"\donsetch.exe"#;
-        assert_eq!(
-            json_escape(path),
-            r#""C:\\Users\\A \"B\"\\donsetch.exe""#
-        );
+        assert_eq!(json_escape(path), r#""C:\\Users\\A \"B\"\\donsetch.exe""#);
     }
 }
