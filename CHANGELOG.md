@@ -5,6 +5,40 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.2] - 2026-09-17
+
+The install-hardening wave: smaller npm installs, recoverable blocked
+postinstall scripts, bounded offline behavior, and release plumbing that
+keeps every distribution channel on the same binary.
+
+### Fixed
+- npm CLI installs no longer pull the Pi coding-agent peer dependency
+  tree; the package remains dependency-free while Pi continues to provide
+  its host runtime modules.
+- The npm shim self-heals after pnpm/bun approval blocks or
+  `--ignore-scripts`, with package-manager-neutral recovery guidance.
+- The npm installer now supports HTTPS proxies, CONNECT tunneling,
+  timeouts, retries, release mirrors, version stamps, and the
+  `DONSETCH_INSTALL_TAG` testing seam.
+- Musl detection no longer misclassifies glibc hosts with a secondary musl
+  loader (#45); true musl systems receive a source-build command.
+- Windows ARM64 uses the Windows x64 asset under emulation, and the Rust
+  updater selects the same asset.
+- Doctor MCP JSON escapes Windows paths and reports the `donsetch` npm shim
+  (with `npx donsetch` as an alternative) instead of an internal path.
+- `--version` skips update checks in CI or when requested and bounds the
+  online check to three seconds.
+- The Pi extension uses the active Node executable, allows long installs,
+  and gives `donsetch doctor` guidance when initialization times out.
+- Release publication now gates npm on all binary and checksum assets and
+  copies the repository LICENSE into the package.
+
+### Changed
+- Build metadata environment names now consistently use the `DONSETCH_*`
+  prefix.
+- Homebrew and dsh downstream repositories can auto-track published
+  releases through the npm release workflow.
+
 ## [4.1.1] - 2026-09-16
 
 The bug-hunt wave: a real regression report turned into a universal

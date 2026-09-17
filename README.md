@@ -186,6 +186,27 @@ from the terminal. Keyless engines work out of the box. See the
 [donsetch-dsh repo](https://github.com/dondai44423/donsetch-dsh) for
 the config reference and update semantics.
 
+### Troubleshooting install
+
+- **pnpm or bun:** approve the `donsetch` build script (`pnpm approve-builds`
+  or the equivalent bun approval), then reinstall. If scripts were blocked,
+  running `npx donsetch` invokes the self-healing shim.
+- **`--ignore-scripts`:** postinstall is intentionally skipped. Run
+  `node node_modules/donsetch/install.js`, or invoke `npx donsetch` to
+  download the binary when network access is available.
+- **Proxy:** set `HTTPS_PROXY` (or `https_proxy`, `HTTP_PROXY`, or
+  `http_proxy`) to an HTTP CONNECT proxy.
+- **Release mirror:** set `DONSETCH_RELEASES_BASE` to a mirror containing
+  `<tag>/<asset>` paths.
+- **Windows:** the installer requires `tar`; Windows 10 version 1803 and
+  newer include it.
+- **musl/Alpine:** the published Linux binaries use glibc. Build from source
+  with `cargo build --release` on musl systems.
+- **Windows ARM64:** the x64 build runs under Windows emulation; no native
+  ARM64 asset is required.
+
+Homebrew and dsh now auto-track published DonSeTch releases.
+
 <details>
 <summary><b>Build from source</b></summary>
 

@@ -23,6 +23,26 @@ Downloads the prebuilt binary for your platform from [GitHub Releases](https://g
 | macOS arm64 | `donsetch-darwin-arm64.tar.gz` |
 | Windows x86_64 | `donsetch-win32-x64.tar.gz` |
 
+## Troubleshooting install
+
+- **pnpm or bun:** approve the `donsetch` build script (`pnpm approve-builds`
+  or the equivalent bun approval), then reinstall. If scripts were blocked,
+  running `npx donsetch` invokes the self-healing shim.
+- **`--ignore-scripts`:** postinstall is intentionally skipped. Run
+  `node node_modules/donsetch/install.js`, or invoke `npx donsetch` to
+  download the binary when network access is available.
+- **Proxy:** set `HTTPS_PROXY` (or `https_proxy`, `HTTP_PROXY`, or
+  `http_proxy`) to an HTTP CONNECT proxy.
+- **Release mirror:** set `DONSETCH_RELEASES_BASE` to a mirror containing
+  `<tag>/<asset>` paths, for example
+  `https://mirror.example/donsetch/releases`.
+- **Windows:** the installer requires `tar`; Windows 10 version 1803 and
+  newer include it.
+- **musl/Alpine:** the published Linux binaries use glibc. Build from source
+  with `cargo build --release` on musl systems.
+- **Windows ARM64:** the x64 build runs under Windows emulation; no native
+  ARM64 asset is required.
+
 ## Two ways to use it
 
 ### MCP Server (for AI agents)
