@@ -580,6 +580,22 @@ fn parse_http_date(s: &str) -> Option<u64> {
         })
     };
     let secs_of = |y: i64, mo: usize, d: i64, hh: i64, mm: i64, ss: i64| {
+        // RFC 6265 §5.1.1: a year outside 1601..=9999, or an hour /
+        // minute / second outside its range, fails to parse and the
+        // Expires attribute is ignored (the cookie stays a session
+        // cookie). The gate also keeps the days/seconds math inside
+        // i64: these fields come verbatim from a server's Set-Cookie,
+        // and a year like 9000000000000000000 parses as i64 and then
+        // overflowed `era * 146_097` / `days * 86_400` — a panic
+        // (= remote abort) under overflow-checks, a silent wrap to a
+        // garbage far-future or instantly-expired expiry in release.
+        if !(1601..=9999).contains(&y)
+            || !(0..=23).contains(&hh)
+            || !(0..=59).contains(&mm)
+            || !(0..=59).contains(&ss)
+        {
+            return None;
+        }
         if !(1..=12).contains(&(mo as i64 + 1)) || !(1..=31).contains(&d) {
             return None;
         }
@@ -662,6 +678,33 @@ fn parse_http_date(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Expires= is server-supplied. An implausible year (or hour/min/
+    // sec) must make the date unparseable — RFC 6265 §5.1.1 — so the
+    // attribute is IGNORED, not turned into an overflowed garbage
+    // expiry. On the old parser a year like 9e18 overflowed the
+    // days-from-civil math: a panic (abort) under overflow-checks,
+    // a silent wrap in release.
+    #[test]
+    fn expires_with_absurd_year_or_time_is_unparseable_not_overflowed() {
+        assert!(
+            parse_http_date("Sun, 06 Nov 9000000000000000000 08:49:37 GMT").is_none(),
+            "an i64-scale year must fail to parse, not overflow"
+        );
+        assert!(parse_http_date("Sun, 06 Nov 1994 9000000000000000000:49:37 GMT").is_none());
+        assert!(parse_http_date("Sun, 06 Nov 1994 08:99:37 GMT").is_none());
+        assert!(
+            parse_http_date("Sun, 06 Nov 1600 08:49:37 GMT").is_none(),
+            "below 1601"
+        );
+        // RFC 850 two-digit and asctime forms route through the same gate.
+        assert!(parse_http_date("Sunday, 06-Nov-9000000000000000000 08:49:37 GMT").is_none());
+        // A normal date still parses.
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+    }
 
     fn rec(domain: &str, name: &str) -> CookieRecord {
         CookieRecord {
