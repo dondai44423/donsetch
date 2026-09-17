@@ -40,7 +40,7 @@ pub fn text_fallback(
 
     let mut paragraphs: Vec<String> = Vec::new();
     let mut current = String::new();
-    collect_fallback_text(body, &mut paragraphs, &mut current);
+    collect_fallback_text(body, &mut paragraphs, &mut current, 0);
     if !current.trim().is_empty() {
         paragraphs.push(current.trim().to_string());
     }
@@ -130,11 +130,25 @@ fn heading_level(tag: &str) -> Option<usize> {
     }
 }
 
+/// Recursion cap for the fallback walker. The two primary walkers
+/// (blocks::walk, inline::render) already cap depth; this last-resort
+/// walker did not, and it runs unconditionally — before the length
+/// gate — on the tokio worker's 2 MiB stack for exactly the deep,
+/// thin pages that reach it (blocks::walk stops at 300 and hands off
+/// as thin). A crafted nest of tens of thousands of elements, well
+/// under the body caps, overflowed that stack: a SIGSEGV that
+/// panic=abort turns into a one-request remote abort.
+const MAX_DEPTH: usize = 300;
+
 fn collect_fallback_text(
     el: scraper::ElementRef,
     paragraphs: &mut Vec<String>,
     current: &mut String,
+    depth: usize,
 ) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     for child in el.children() {
         match child.value() {
             Node::Text(t) => {
@@ -160,7 +174,7 @@ fn collect_fallback_text(
                         paragraphs.push(std::mem::take(current).trim().to_string());
                     }
                     let mut heading = String::new();
-                    collect_fallback_text(child_el, paragraphs, &mut heading);
+                    collect_fallback_text(child_el, paragraphs, &mut heading, depth + 1);
                     if !heading.trim().is_empty() {
                         paragraphs.push(format!("{} {}", "#".repeat(level), heading.trim()));
                     }
@@ -187,17 +201,58 @@ fn collect_fallback_text(
                         paragraphs.push(std::mem::take(current).trim().to_string());
                     }
                     let mut inner = String::new();
-                    collect_fallback_text(child_el, paragraphs, &mut inner);
+                    collect_fallback_text(child_el, paragraphs, &mut inner, depth + 1);
                     if !inner.trim().is_empty() {
                         paragraphs.push(inner.trim().to_string());
                     }
                 } else {
                     // Inline: recurse without flush
-                    collect_fallback_text(child_el, paragraphs, current);
+                    collect_fallback_text(child_el, paragraphs, current, depth + 1);
                 }
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    // The primary walkers cap recursion depth; this last-resort one
+    // did not, and it runs unconditionally on the tokio worker's
+    // 2 MiB stack for exactly the deep, thin pages that reach it. A
+    // crafted 20k-deep nest overflowed that stack: a SIGSEGV that
+    // panic=abort turns into a one-request remote abort. Mirrors the
+    // #145 MathML cap test — a bounded 1 MiB thread plus a deep nest.
+    // Uncapped this crashes the test process; capped it completes.
+    #[test]
+    fn deep_nesting_is_capped_not_a_stack_overflow() {
+        let depth = 20_000;
+        let mut html = String::from("<html><body>");
+        for _ in 0..depth {
+            html.push_str("<blockquote>");
+        }
+        html.push_str("deep");
+        for _ in 0..depth {
+            html.push_str("</blockquote>");
+        }
+        html.push_str("</body></html>");
+        let done = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let doc = scraper::Html::parse_document(&html);
+                let sel = scraper::Selector::parse("body").unwrap();
+                let body = doc.select(&sel).next().unwrap();
+                let mut paragraphs = Vec::new();
+                let mut current = String::new();
+                collect_fallback_text(body, &mut paragraphs, &mut current, 0);
+                true
+            })
+            .unwrap()
+            .join()
+            .expect("the capped walk must complete on a 1 MiB stack");
+        assert!(done);
     }
 }
 
@@ -231,6 +286,7 @@ mod fallback_live {
             doc.select(&body_sel).next().unwrap(),
             &mut paragraphs,
             &mut current,
+            0,
         );
         if !current.trim().is_empty() {
             paragraphs.push(current.trim().to_string());
