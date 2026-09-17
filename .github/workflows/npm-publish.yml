@@ -61,6 +61,36 @@ jobs:
             echo "Bump npm/package.json and tag releases only after both agree."
             exit 1
           fi
+          echo "RELEASE_TAG=$TAG_VERSION" >> "$GITHUB_ENV"
+
+      - name: Assert release assets exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$RELEASE_TAG"
+          expected=(
+            donsetch-linux-x64.tar.gz
+            donsetch-linux-x64.tar.gz.sha256
+            donsetch-linux-arm64.tar.gz
+            donsetch-linux-arm64.tar.gz.sha256
+            donsetch-darwin-arm64.tar.gz
+            donsetch-darwin-arm64.tar.gz.sha256
+            donsetch-darwin-x64.tar.gz
+            donsetch-darwin-x64.tar.gz.sha256
+            donsetch-win32-x64.tar.gz
+            donsetch-win32-x64.tar.gz.sha256
+          )
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for asset in "${expected[@]}"; do
+            if ! grep -Fxq "$asset" <<< "$assets"; then
+              echo "ERROR: release $TAG is missing asset $asset"
+              exit 1
+            fi
+          done
+          echo "all expected release assets exist for $TAG"
+
+      - name: Copy LICENSE into npm package
+        run: cp LICENSE npm/LICENSE
 
       - name: Publish (skip if already on the registry)
         env:
@@ -73,3 +103,27 @@ jobs:
             exit 0
           fi
           npm publish --access public
+
+  notify-downstream:
+    name: notify downstream repositories
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch release notifications
+        env:
+          DOWNSTREAM_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -z "$DOWNSTREAM_TOKEN" ]; then
+            echo "DOWNSTREAM_DISPATCH_TOKEN not set; downstream repos will pick the release up via their scheduled workflows"
+            exit 0
+          fi
+          TAG="$RELEASE_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
+          fi
+          export GH_TOKEN="$DOWNSTREAM_TOKEN"
+          gh api repos/dondai44423/homebrew-donsetch/dispatches \
+            --method POST -f event_type=donsetch-release -f "client_payload[tag]=$TAG"
+          gh api repos/dondai44423/donsetch-dsh/dispatches \
+            --method POST -f event_type=donsetch-release -f "client_payload[tag]=$TAG"

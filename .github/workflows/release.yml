@@ -182,6 +182,8 @@ jobs:
       # of shipping assets that lie about their version.
       - name: Verify binary runs and reports the tag version
         shell: bash
+        env:
+          DONSETCH_NO_UPDATE_CHECK: "1"
         run: |
           cd target/${{ matrix.target }}/release
           BIN=donsetch
