@@ -12,7 +12,7 @@
 // wrapper, we forward it to the native binary so it can clean up
 // (close connections, save ghost state, etc.) before exiting.
 
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const { existsSync } = require('fs');
 const { join } = require('path');
 
@@ -22,8 +22,26 @@ const binDir = join(__dirname, '..', 'binaries');
 const binaryPath = join(binDir, binaryName);
 
 if (!existsSync(binaryPath)) {
-  process.stderr.write('donsetch: binary not found. Run `npm rebuild donsetch` to reinstall.\n');
-  process.exit(1);
+  const installScript = join(__dirname, '..', 'install.js');
+  try {
+    execFileSync(process.execPath, [installScript], {
+      stdio: 'inherit',
+      cwd: join(__dirname, '..'),
+    });
+  } catch (_) {
+    process.stderr.write(
+      `donsetch: native binary missing and download failed. Retry with network access, ` +
+      `or run node ${installScript}; pnpm users: pnpm approve-builds then reinstall.\n`
+    );
+    process.exit(1);
+  }
+  if (!existsSync(binaryPath)) {
+    process.stderr.write(
+      `donsetch: native binary missing and download failed. Retry with network access, ` +
+      `or run node ${installScript}; pnpm users: pnpm approve-builds then reinstall.\n`
+    );
+    process.exit(1);
+  }
 }
 
 // ── spawn native binary ─────────────────────────────────────────

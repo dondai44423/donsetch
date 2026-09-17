@@ -27,7 +27,7 @@ import { join } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
 
 // ── Constants ──
-const INIT_TIMEOUT_MS = 10_000;
+const INIT_TIMEOUT_MS = 30_000;
 const CALL_TIMEOUT_MS = 120_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 
@@ -89,10 +89,10 @@ function ensureBinary(): string {
   }
 
   try {
-    execFileSync("node", [installScript], {
+    execFileSync(process.execPath, [installScript], {
       stdio: "inherit",
       cwd: __dirname,
-      timeout: 60_000,
+      timeout: 300_000,
     });
   } catch (err: any) {
     throw new Error(`Failed to download donsetch binary: ${err.message}`);
@@ -433,7 +433,11 @@ export default function (pi: ExtensionAPI) {
     try {
       await startServer();
     } catch (err: any) {
-      process.stderr.write(`[donsetch] failed to start MCP server: ${err.message}\n`);
+      const message = String(err.message || err);
+      const hint = message.includes("initialize") && message.includes("timeout")
+        ? " Run `donsetch doctor` to diagnose the installation and runtime."
+        : "";
+      process.stderr.write(`[donsetch] failed to start MCP server: ${message}.${hint}\n`);
       return;
     }
 

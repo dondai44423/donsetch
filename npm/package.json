@@ -1,6 +1,6 @@
 {
   "name": "donsetch",
-  "version": "4.1.1",
+  "version": "4.1.2",
   "description": "Web fetch, search and crawl for AI agents. Zero API keys. Chrome-true TLS.",
   "license": "AGPL-3.0-only",
   "author": "Bishesh Bhandari",
@@ -29,10 +29,6 @@
   "pi": {
     "extensions": ["./pi-extension.ts"]
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
-  },
   "bin": {
     "donsetch": "bin/donsetch.js"
   },
@@ -43,9 +39,10 @@
     "install.js",
     "bin/donsetch.js",
     "pi-extension.ts",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
-    "node": ">=14"
+    "node": ">=18"
   }
 }
