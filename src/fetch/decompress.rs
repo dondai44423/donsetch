@@ -121,7 +121,7 @@ mod audit_tests {
             enc.write_all(&layers).unwrap();
             layers = enc.finish().unwrap();
         }
-        let header = vec!["gzip"; 200].join(", ");
+        let header = ["gzip"; 200].join(", ");
         let err = decompress(&header, &layers).unwrap_err();
         assert!(
             format!("{err}").contains("nested layers"),
@@ -139,7 +139,7 @@ mod audit_tests {
             enc.write_all(&layers).unwrap();
             layers = enc.finish().unwrap();
         }
-        let header = vec!["gzip"; 3].join(", ");
+        let header = ["gzip"; 3].join(", ");
         assert_eq!(decompress(&header, &layers).unwrap(), b"deep payload");
     }
 }
