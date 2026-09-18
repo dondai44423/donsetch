@@ -77,8 +77,10 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 # No default features — the core tool (fetch, search, crawl, PDF)
 # works standalone. OCR and semantic reranking pull in ONNX Runtime,
 # a heavy C++ dependency whose static global constructors can deadlock
-# on some platforms (notably aarch64 Linux, see issue #9). CI and release
-# builds explicitly enable both with `--features ocr,rerank`.
+# on some platforms (notably aarch64 Linux, see issue #9). `http` adds the
+# axum HTTP transport. CI and release builds pick features per target: the
+# full `--features ocr,rerank,http` where supported, fewer or none elsewhere
+# (see the matrices in .github/workflows/ci.yml and release.yml).
 default = []
 ocr = ["dep:oar-ocr", "dep:image", "reqwest/blocking"]
 rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/blocking"]
