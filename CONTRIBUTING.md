@@ -16,14 +16,14 @@ cargo build --release --features ocr,rerank  # full build (adds OCR + semantic r
 ## Development workflow
 
 ```bash
-cargo test --features ocr,rerank          # 637 tests
+cargo test --features ocr,rerank          # full suite
 cargo clippy --all-targets --features ocr,rerank -- -Dwarnings   # zero warnings enforced
 cargo fmt --all -- --check    # formatting check
 ```
 
 All three must pass before a PR can merge. CI runs the same checks on Linux, macOS, and Windows.
 
-The same tasks are wrapped as [`just`](https://just.systems) recipes — `just test`, `just lint`, `just fmt-check`, `just smoke`.
+The same tasks are wrapped as [`just`](https://just.systems) recipes: `just test`, `just lint`, `just fmt-check`, `just smoke`. The recipes go through `scripts/budget.sh`, which pins the whole build tree to a quarter of the cores and passes the job cap into nested build systems (cmake, make, nasm). Prefer them on a workstation you are also using: a `-j` flag alone does not bound a Rust build, because rustc spawns its own codegen threads and some `-sys` crates spawn their own `make -j$(nproc)`.
 
 ### Verifying Windows compilation from Linux
 

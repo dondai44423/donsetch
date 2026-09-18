@@ -94,6 +94,24 @@ async fn main() {
         }
     }
 
+    // `--help`/`-h` right after a command name always means HELP, never a
+    // run. The spec-driven tools plus keys/proxy/login/adapters carry their
+    // own help; every other management command used to EXECUTE on the flag
+    // (`status --help` printed the status, `doctor --help` ran the whole
+    // health check, `update --help` checked the network, `rollback --help`
+    // touched the install, `mcp --help` opened a daemon on stdin). Route
+    // them to the same help text `donsetch help <cmd>` prints, before any
+    // dispatch or config load.
+    if matches!(args.get(2).map(String::as_str), Some("--help" | "-h"))
+        && !matches!(
+            cmd,
+            "fetch" | "search" | "crawl" | "screenshot" | "keys" | "proxy" | "login" | "adapters"
+        )
+    {
+        route_help(cmd).await;
+        return;
+    }
+
     // Every command hard-fails on a broken config (the lazy fallback
     // stays for library callers): a user must see the config error,
     // never a silent run on defaults. `config show` loads itself so
@@ -352,6 +370,13 @@ async fn route_help(cmd: &str) {
             println!("Usage: donsetch tools");
             println!();
             println!("  Prints the tool schemas as JSON (same as MCP tools/list).");
+        }
+        "stop" => {
+            println!("Usage: donsetch stop");
+            println!();
+            println!("  Kills orphaned Chrome instances and cleans stale ghost locks and");
+            println!("  temp profiles. Run after a hard interrupt; harmless when there is");
+            println!("  nothing to clean.");
         }
         _ => {
             cli::tool::print_top_help();

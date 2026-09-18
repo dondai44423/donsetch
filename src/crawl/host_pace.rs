@@ -68,7 +68,7 @@ fn read_pace(path: &Path) -> Option<PaceFile> {
 }
 
 fn write_pace(path: &Path, host: &str, last_ms: u64) {
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(path);
     let row = PaceFile {
         version: PACE_VERSION,
         host: host.to_string(),
@@ -80,6 +80,34 @@ fn write_pace(path: &Path, host: &str, last_ms: u64) {
     if std::fs::write(&tmp, &json).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+}
+
+/// The writer's own temp path. This store exists because SEPARATE
+/// processes crawl the same host, so a temp name derived only from the
+/// host is shared by every one of them: two concurrent stamps opened
+/// and wrote the same file, and whichever rename landed could publish
+/// the interleaved result, a row that no longer parses (the floor for
+/// that host is then silently lost until the next stamp). The pid makes
+/// each writer's temp its own, which is what makes the rename atomic in
+/// the sense the writer needs.
+fn tmp_path(path: &Path) -> PathBuf {
+    tmp_path_for(path, std::process::id())
+}
+
+fn tmp_path_for(path: &Path, pid: u32) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{pid}.tmp"));
+    path.with_file_name(name)
+}
+
+/// How long a `*.tmp` has to sit untouched before a prune may treat it
+/// as abandoned. A temp written seconds ago belongs to a live writer
+/// that has not renamed it yet, and deleting it breaks that writer's
+/// stamp.
+const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn tmp_is_stale(age: std::time::Duration) -> bool {
+    age >= STALE_TMP_AGE
 }
 
 /// Drop stale files past TTL and keep the store under the cap.
@@ -94,10 +122,20 @@ fn prune(dir: &Path) {
     for entry in entries.flatten() {
         let path = entry.path();
         let ext = path.extension().and_then(|x| x.to_str());
-        // Failed atomic writes leave *.tmp behind; never treat them
-        // as live rows, always drop them.
+        // A `*.tmp` is either an abandoned write or a peer's in-flight
+        // one; only an untouched-for-a-minute temp is provably
+        // abandoned. The previous rule removed every temp it saw, which
+        // let one process's prune delete another process's temp after
+        // it was written but before its rename, losing that stamp.
         if ext == Some("tmp") {
-            let _ = std::fs::remove_file(&path);
+            let age = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok());
+            if age.is_some_and(tmp_is_stale) {
+                let _ = std::fs::remove_file(&path);
+            }
             continue;
         }
         if ext != Some("json") {
@@ -228,6 +266,56 @@ mod tests {
         unsafe {
             std::env::remove_var("DONSETCH_NO_HOST_PACE_FILE");
         }
+    }
+
+    /// The store exists because SEPARATE processes crawl the same host,
+    /// so two writers must never share one temp path: a shared name let
+    /// concurrent stamps interleave inside the same file, and whichever
+    /// rename landed could publish a row that no longer parses.
+    #[test]
+    fn every_writer_gets_its_own_temp_path() {
+        let live = PathBuf::from("/cache/host-pace/abc.json");
+        let a = tmp_path_for(&live, 1001);
+        let b = tmp_path_for(&live, 2002);
+        assert_ne!(a, b, "two pids must not share one temp path");
+        assert_eq!(
+            a.file_name().unwrap().to_string_lossy(),
+            "abc.json.1001.tmp"
+        );
+        assert_eq!(
+            a.extension().and_then(|e| e.to_str()),
+            Some("tmp"),
+            "prune keys on the extension"
+        );
+    }
+
+    /// A temp written moments ago belongs to a live writer that has not
+    /// renamed it yet. The old rule deleted every temp it saw, so one
+    /// process's prune could break another process's stamp between its
+    /// write and its rename.
+    #[test]
+    fn prune_keeps_a_fresh_temp_and_still_drops_dead_rows() {
+        let dir = std::env::temp_dir().join(format!("donsetch-pace-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("abc.json.4242.tmp");
+        std::fs::write(&fresh, b"in flight").unwrap();
+        let dead = dir.join("dead.json");
+        std::fs::write(&dead, br#"{"version":1,"host":"d.example","last_ms":1}"#).unwrap();
+        prune(&dir);
+        assert!(fresh.exists(), "a fresh temp must survive a peer's prune");
+        assert!(!dead.exists(), "a row past the TTL is still pruned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a provably abandoned temp may be removed: an in-flight one
+    /// is seconds old, and the TTL is a minute.
+    #[test]
+    fn only_abandoned_temps_count_as_stale() {
+        assert!(!tmp_is_stale(Duration::from_secs(1)));
+        assert!(!tmp_is_stale(STALE_TMP_AGE - Duration::from_millis(1)));
+        assert!(tmp_is_stale(STALE_TMP_AGE));
+        assert!(tmp_is_stale(Duration::from_secs(3600)));
     }
 
     #[tokio::test]

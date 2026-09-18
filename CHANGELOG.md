@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Nested `Content-Encoding` headers are capped at 8 layers. A hostile
+  server could answer with a deeply nested gzip body plus a matching
+  header, and peeling those layers is recursive: the layer count chose
+  the client's stack depth and spent up to 64 MiB of decompression per
+  layer, bounded only by the response's own header length. Real
+  responses carry one layer, rarely two.
+- The HTTP/2 header decoder starts its dynamic table at the 65536 bytes
+  we advertise in `SETTINGS_HEADER_TABLE_SIZE`, not at 4096. A server
+  that keeps the default and never sends a dynamic table size update is
+  entitled to index everything it inserted, so entries we had already
+  evicted came back as `hpack: bad index N` and failed an otherwise
+  valid response.
+- `donsetch <command> --help` prints help for every command. The
+  management commands used to run instead: `doctor --help` started a
+  full health check, `update --help` checked the network, `rollback
+  --help` touched the install, `mcp --help` opened a daemon on stdin,
+  and `status --help` printed the status. `donsetch help stop` had no
+  page at all.
+- The ghost relay's upstream strike cache drops expired rows instead of
+  holding every host it ever failed to dial for the life of the
+  process, and its mutex no longer panics if it was poisoned.
+- The crawl pace store gives every writer its own temp file and treats
+  only temps older than a minute as abandoned. The store exists because
+  separate processes crawl the same host, and a temp named after the
+  host alone was shared by all of them: two concurrent stamps could
+  interleave in one file and publish a row that no longer parses, and
+  either side's prune could delete the other's in-flight temp before it
+  was renamed, losing that host's floor.
+- The pi extension sizes its client timeout from the call's own budget
+  (`deadline_s`, `deadline_ms`) instead of a flat 120s. A crawl at its
+  own default 120s deadline was racing the client timeout, and any
+  larger legal deadline was unreachable through pi. `web_screenshot`
+  also gets its own icon instead of the generic diamond.
+
 - A server-controlled `Set-Cookie: ...; Expires=` header no longer reaches
   unbounded i64 arithmetic in the cookie date parser: the year and clock
   fields are gated per RFC 6265 5.1.1 before any math, so an absurd year
@@ -18,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   300, matching the two primary HTML walkers: a deeply nested, text-poor
   page that reaches the fallback could overflow the tokio worker's
   2 MiB stack and abort the process on one request. (mnaza, #231)
+
+### Changed
+- MCP tool descriptions: the six parameters that inherited verbose CLI
+  wording (`tier`, `section`, `shot`, and `deadline_ms` on both fetch
+  and search, `intent`) now carry agent-facing strings. Every documented
+  fact is preserved. Measured: `tools/list` goes from 9742 to 9591
+  compact bytes (2436 to 2398 estimated tokens). The rest of the surface
+  is structural JSON (enums, `anyOf`, `maxItems`, the nested actions
+  object), not prose, so there is nothing left to trim without dropping
+  a machine-readable constraint.
 
 ## [4.1.2] - 2026-09-17
 

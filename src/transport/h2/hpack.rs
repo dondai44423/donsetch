@@ -281,9 +281,17 @@ impl Default for Decoder {
 
 impl Decoder {
     pub fn new() -> Self {
+        // RFC 7541 §4.2/§6.3: the decoder's INITIAL maximum table size is
+        // the SETTINGS_HEADER_TABLE_SIZE we advertised (Chrome's 65536,
+        // the same DYNAMIC_MAX the size-update check enforces). Starting at
+        // 4096 made us evict entries a peer that keeps the default and
+        // never sends a size update is entitled to index: the absolute
+        // index then resolved past the end of our table and the whole
+        // response died with "hpack: bad index N". A larger decoder table
+        // than the peer uses is free; a smaller one breaks the wire.
         Self {
-            dyn_table: DynTable::new(4096),
-        } // server-controlled via SETTINGS
+            dyn_table: DynTable::new(DYNAMIC_MAX),
+        } // server-controlled via SETTINGS, never above what we advertised
     }
 
     pub fn decode(&mut self, block: &[u8]) -> Result<Vec<(String, String)>, FetchError> {
@@ -355,5 +363,56 @@ impl Decoder {
             String::from_utf8_lossy(&name).into(),
             String::from_utf8_lossy(&value).into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A literal header field with incremental indexing and a brand-new
+    /// name (0x40 + name index 0), value forced raw (H=0) so the byte
+    /// count is exact.
+    fn literal_with_indexing(name: &str, value_len: usize) -> Vec<u8> {
+        let mut out = vec![0x40];
+        encode_int(&mut out, name.len() as u64, 7, 0);
+        out.extend_from_slice(name.as_bytes());
+        encode_int(&mut out, value_len as u64, 7, 0);
+        out.extend(std::iter::repeat_n(b'x', value_len));
+        out
+    }
+
+    /// The decoder's table must be as large as the HEADER_TABLE_SIZE we
+    /// advertise (65536): a peer that keeps the default and never sends a
+    /// dynamic table size update may index anything it inserted, and an
+    /// evicted entry is a "bad index" that fails the response. Old code
+    /// started the decoder at 4096 and dropped the entries below.
+    #[test]
+    fn decoder_table_starts_at_the_advertised_size() {
+        assert_eq!(Decoder::new().dyn_table.max, DYNAMIC_MAX);
+
+        let mut d = Decoder::new();
+        // Five ~1 KiB entries: ~5.2 KiB of table, past the old 4096 initial
+        // max but well under the 65536 we advertise.
+        let mut block = Vec::new();
+        for i in 0..5 {
+            block.extend(literal_with_indexing(&format!("x-fill-{i}"), 1000));
+        }
+        // Absolute index of the OLDEST of the five: 61 static entries, then
+        // the dynamic table newest-first (62 = newest, 66 = oldest).
+        encode_int(&mut block, 66, 7, 0x80);
+        let decoded = d.decode(&block).expect("the oldest entry must still index");
+        assert_eq!(decoded.len(), 6);
+        assert_eq!(decoded[5].0, "x-fill-0");
+    }
+
+    /// The size-update cap stays: a peer may not grow our decoder table
+    /// above what we advertised, whatever it sends.
+    #[test]
+    fn size_update_above_the_advertised_ceiling_is_refused() {
+        let mut d = Decoder::new();
+        let mut block = Vec::new();
+        encode_int(&mut block, (DYNAMIC_MAX + 1) as u64, 5, 0x20);
+        assert!(d.decode(&block).is_err());
     }
 }

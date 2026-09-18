@@ -159,7 +159,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "Heading name (substring, case-insensitive) : return only that section. Use after toc to target a specific part.",
-        mcp_help: None,
+        mcp_help: Some(
+            "Heading name (substring, case-insensitive): return only that section. Use after toc.",
+        ),
     },
     ParamSpec {
         name: "toc",
@@ -179,7 +181,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang. Batch mode: per-URL budget.",
-        mcp_help: None,
+        mcp_help: Some(
+            "Hard time budget in ms (500-600000). On expiry: honest error with next_action, never a silent hang. Batch mode: per-URL budget.",
+        ),
     },
     ParamSpec {
         name: "archive",
@@ -254,7 +258,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "auto (default, always use for real work): HTTP first, auto-escalates to headless browser on bot-walls/JS-shells, auto-detects and parses PDFs. \"1\" (testing): HTTP only, no browser : fails on JS sites. \"2\" (testing): browser directly : slower, skips HTTP entirely.",
-        mcp_help: None,
+        mcp_help: Some(
+            "auto (default): HTTP first, escalating to a browser on bot-walls/JS-shells; parses PDFs. \"1\": HTTP only, no browser (fails on JS sites). \"2\": browser directly, skips HTTP (slower).",
+        ),
     },
     ParamSpec {
         name: "links",
@@ -296,7 +302,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "File path : saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool.",
-        mcp_help: None,
+        mcp_help: Some(
+            "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool.",
+        ),
     },
 ];
 
@@ -343,7 +351,9 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "Hard time budget in ms (500-600000). Engines have their own timeouts; this caps the whole call. On expiry: honest deadline error.",
-        mcp_help: None,
+        mcp_help: Some(
+            "Hard time budget in ms (500-600000) for the whole call (engines keep their own timeouts). On expiry: an honest deadline error.",
+        ),
     },
     ParamSpec {
         name: "intent",
@@ -352,7 +362,9 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         cli: CliKind::Flag,
         required: false,
         help: "auto (default) detects from query. code: adds GitHub, HN, StackExchange, MDN verticals. paper: adds Scholar, arXiv. news: adds Google News, HN. entity: adds Wikipedia. web: general only.",
-        mcp_help: None,
+        mcp_help: Some(
+            "auto (default) detects from the query. code: + GitHub, HN, StackExchange, MDN. paper: + Scholar, arXiv. news: + Google News, HN. entity: + Wikipedia. web: general only.",
+        ),
     },
 ];
 

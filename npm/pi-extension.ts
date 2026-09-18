@@ -31,6 +31,33 @@ const INIT_TIMEOUT_MS = 30_000;
 const CALL_TIMEOUT_MS = 120_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 
+// The client timeout must outlive the server's OWN budget, or a call the
+// binary still considers legal gets killed here first. web_crawl accepts
+// deadline_s up to 600 and web_fetch deadline_ms up to 600000, so a fixed
+// 120s client cap cut legal crawls off at exactly the binary's default
+// deadline (deadline_s defaults to 120 : the two raced). Derive it from
+// the call's own budget plus slack instead, capped at the largest budget
+// the schemas allow so a hostile arg cannot hold a slot forever.
+const CALL_DEADLINE_SLACK_MS = 20_000;
+const MAX_CALL_TIMEOUT_MS = 620_000; // 600s budget + slack
+
+function num(v: unknown): number | null {
+  const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function callTimeoutFor(name: string, args: any): number {
+  let budgetMs: number | null = null;
+  if (name === "web_crawl") {
+    const secs = num(args?.deadline_s);
+    budgetMs = secs !== null ? secs * 1000 : 120_000; // the binary's default
+  } else if (name === "web_fetch") {
+    budgetMs = num(args?.deadline_ms);
+  }
+  if (budgetMs === null) return CALL_TIMEOUT_MS;
+  return Math.min(budgetMs + CALL_DEADLINE_SLACK_MS, MAX_CALL_TIMEOUT_MS);
+}
+
 // A raw process.stderr.write bypasses pi's TUI paint cycle and
 // corrupts the viewport (worse across parallel agents). Gate it here.
 const DEBUG_MODE =
@@ -56,6 +83,7 @@ const ICONS: Record<string, string> = {
   web_fetch:  "\u{1F310}",  // 🌐
   web_search: "\u{1F50E}",  // 🔎
   web_crawl:  "\u{1F577}\u{FE0F}",  // 🕷️
+  web_screenshot: "\u{1F4F7}",  // 📷
 };
 
 // ── MCP client state ──
@@ -312,8 +340,13 @@ function sendNotification(method: string, params: any): void {
   }
 }
 
-async function callMcpTool(name: string, args: any, signal?: AbortSignal): Promise<any> {
-  return sendRequest("tools/call", { name, arguments: args ?? {} }, CALL_TIMEOUT_MS, signal);
+async function callMcpTool(
+  name: string,
+  args: any,
+  signal?: AbortSignal,
+  timeoutMs = CALL_TIMEOUT_MS
+): Promise<any> {
+  return sendRequest("tools/call", { name, arguments: args ?? {} }, timeoutMs, signal);
 }
 
 function killServer(): void {
@@ -477,13 +510,21 @@ export default function (pi: ExtensionAPI) {
             } catch (err: any) {
               return {
                 content: [{ type: "text", text: `donsetch MCP server crashed and could not restart: ${err.message}` }],
+                // Every other result path carries `details`; pi's
+                // AgentToolResult requires it, and renderResult reads it.
+                details: { mcpTool: toolName, isError: true, error: err.message },
                 isError: true,
               };
             }
           }
 
           try {
-            const result = await callMcpTool(toolName, params, _signal);
+            const result = await callMcpTool(
+              toolName,
+              params,
+              _signal,
+              callTimeoutFor(toolName, params)
+            );
             // Join all content text blocks, skipping [meta] blocks.
             // [meta] blocks contain compact metadata for clients
             // (Claude Code, VSCode) that drop text when
