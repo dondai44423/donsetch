@@ -32,8 +32,12 @@ if rg -n '\[[a-z]probe\]' src/ --glob '!tests/**' -q; then
   exit 1
 fi
 net cargo fmt --check >/dev/null
-net cargo check --locked -q >/dev/null
-net cargo check --locked -q --features ocr,rerank,http >/dev/null
+# --profile ci, like every Justfile recipe: the dev/debug graph is what
+# clean-bloat keeps deleting (the 110G/21G recidivism), so a check in it
+# rebuilds every dependency from scratch. The gate has to be affordable
+# or it gets bypassed.
+net cargo check --locked -q --profile ci >/dev/null
+net cargo check --locked -q --profile ci --features ocr,rerank,http >/dev/null
 node --check npm/install.js >/dev/null
 node --check npm/bin/donsetch.js >/dev/null
 
