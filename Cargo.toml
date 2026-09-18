@@ -34,7 +34,7 @@ futures-util = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
 tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
 libc = "0.2"
-dirs = "6"
+dirs = "7"
 unicode-bidi = "0.3"
 # OCR tier (Tier B) — PP-OCR via ONNX Runtime, lazy model cache.
 oar-ocr = { version = "0.9", default-features = false, features = ["download-binaries", "simd"], optional = true }
