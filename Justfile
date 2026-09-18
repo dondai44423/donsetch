@@ -15,14 +15,24 @@
 #   just fuzz extract    30s fuzz burst on one target
 #   just clean-bloat     drop profiles the loop never uses + fuzz cache
 #
-# CPU citizenship (2026-09-18): this box is the operator's desktop
-# (16 threads, 7 GB RAM, live session next to every compile). Every
-# cargo-driving recipe below runs job-capped, niced, ionice-idle; the
-# pre-push hook carries the same rule. The cap lives in the machine,
-# not in memory: raw `cargo ...` on the box is how the browser drops
-# to 10 fps. BG_JOBS=<n> lifts the cap on a known-idle box.
-bg := env_var_or_default("BG_JOBS", `sh -c 'echo $(( ($(nproc) + 3) / 4 ))'`)
-courtesy := "nice -n 19 ionice -c3"
+# CPU + MEMORY citizenship (2026-09-19, hardened): this box is the
+# operator's desktop (16 threads, 7.6 GB RAM, a live session next to
+# every compile). Every cargo/build/fuzz command below runs through
+# scripts/budget.sh, which pins the whole process TREE to a quarter of
+# the cores with taskset, exports the job caps into nested build systems
+# (cmake, make, nasm), and bounds the job count by what RAM is available
+# right now. See the tool's header: a `-j` flag caps neither, because
+# rustc spawns its own codegen threads, boring-sys spawns its own
+# make -j$(nproc), and a memory-shaped box swaps instead of stalling.
+#   BG_JOBS=<n>     job count (default: min of the core quarter and the
+#                   RAM budget, one job per ~1.2 GB after reserving 1.5 GB)
+#   BG_CORES=<set>  taskset core set (default: the first quarter)
+#
+# The measurement bar before any long run: the build tree must not hold
+# more than ~25% of the cores busy, RAM must not go into swap, and the
+# session must stay interactive. Anything resembling "uncapped" is a rule
+# violation even if it looks capped.
+budget := "sh scripts/budget.sh"
 
 # Cargo never GCs stale artifacts: debug/release/fuzz caches grow
 # without bound across dep bumps (110G caught; ~99G was bloat). This
@@ -62,7 +72,7 @@ preflight-full: all gates
 # Manifest/lock coherence: the bump-invalidates-lock failure must die
 # here in seconds, never in CI.
 lockgate:
-    {{courtesy}} cargo check -j {{bg}} --locked --profile ci --all-targets --features ocr,rerank,http
+    {{budget}} cargo check --locked --profile ci --all-targets --features ocr,rerank,http
 
 # The tag-time gates (linux-x64 mirror of release.yml), against the
 # fast binary: sizes/version/dylib presence/ONNX probe/QEMU all hold
@@ -72,7 +82,7 @@ ci-gates: bin
 
 # The tag-time gates (linux-x64 mirror of release.yml).
 gates:
-    CARGO_BUILD_JOBS={{bg}} {{courtesy}} cargo build --release -j {{bg}} --features ocr,rerank,http
+    {{budget}} cargo build --release --features ocr,rerank,http
     @sh scripts/gates.sh linux-x64 target/release
 
 fmt:
@@ -84,7 +94,7 @@ fmt-check:
 # Clippy on the full feature set; --profile ci reuses the test
 # artifact graph instead of compiling a dev one.
 lint:
-    {{courtesy}} cargo clippy -j {{bg}} --profile ci --all-targets --features ocr,rerank,http -- -Dwarnings
+    {{budget}} cargo clippy --profile ci --all-targets --features ocr,rerank,http -- -Dwarnings
 
 # Windows cross-check from Linux: type-checks every cfg(windows)
 # path with the full feature set — the exact breakage a Linux-only
@@ -112,8 +122,7 @@ win-check-full: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
     BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
     ORT_SKIP_DOWNLOAD=1 \
-    CARGO_BUILD_JOBS={{bg}} \
-    {{courtesy}} cargo clippy --target x86_64-pc-windows-gnu --all-targets --features ocr,rerank,http -- -Dwarnings
+    {{budget}} cargo clippy --target x86_64-pc-windows-gnu --all-targets --features ocr,rerank,http -- -Dwarnings
 
 # The no-features half of the matrix: a feature-gated `use` can
 # satisfy a cfg(windows) path that the core build then lacks, so
@@ -122,27 +131,26 @@ win-check-full: _win-check-prereqs
 win-check-core: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
     BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
-    CARGO_BUILD_JOBS={{bg}} \
-    {{courtesy}} cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets -- -Dwarnings
+    {{budget}} cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets -- -Dwarnings
 
 # Full suite, full feature set, fail-fast. The cargo profile is
 # pinned via CLI: nextest 0.9.x ignores the config-level key, and an
 # unpinned run compiles the debug graph (the 110G/21G recidivism).
 test:
-    CARGO_BUILD_JOBS={{bg}} {{courtesy}} cargo nextest run -j {{bg}} --cargo-profile ci --features ocr,rerank,http
+    {{budget}} cargo nextest run --cargo-profile ci --features ocr,rerank,http
 
 # Scoped test run with the SAME pin: `just t crawl::frontier`
 # is the only local way to run a subset without growing debug.
 t expression:
-    CARGO_BUILD_JOBS={{bg}} {{courtesy}} cargo nextest run -j {{bg}} --cargo-profile ci --features ocr,rerank,http -E 'test({{expression}})' 
+    {{budget}} cargo nextest run --cargo-profile ci --features ocr,rerank,http -E 'test({{expression}})'
 
 # The binary for live smoke runs (fast profile, real behavior).
 bin:
-    {{courtesy}} cargo build -j {{bg}} --profile ci --features ocr,rerank,http
+    {{budget}} cargo build --profile ci --features ocr,rerank,http
 
 # Compile-only full-feature check, fastest structural signal.
 check:
-    {{courtesy}} cargo check -j {{bg}} --profile ci --all-targets --features ocr,rerank,http
+    {{budget}} cargo check --profile ci --all-targets --features ocr,rerank,http
 
 # Live smoke: payload, normal site, walled site, search.
 smoke: bin
@@ -153,8 +161,11 @@ smoke: bin
     echo
 
 # 30-second fuzz burst on one target: just fuzz extract
+# Fuzzing is the one thing that can escape a job cap entirely (the
+# libFuzzer process plus a second cargo target graph), so it rides the
+# same taskset-bounded budget wrapper as everything else.
 fuzz target:
-    cd fuzz && CARGO_BUILD_JOBS={{bg}} {{courtesy}} cargo fuzz run {{target}} -s none -- -max_total_time=30
+    cd fuzz && ../scripts/budget.sh cargo fuzz run {{target}} -s none -- -max_total_time=30
 
 # Release everything in one command. The CHANGELOG [version] section
 # must already exist; the recipe bumps both manifests + the lock,

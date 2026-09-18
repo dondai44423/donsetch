@@ -13,11 +13,14 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# CPU citizenship: capped + niced so a push from the live desktop
-# never starves it. Same rule the Justfile recipes carry; BG_JOBS
-# escapes on a known-idle box.
-export CARGO_BUILD_JOBS=$(( ($(nproc) + 3) / 4 ))
-net() { nice -n 19 ionice -c3 "$@"; }
+# CPU citizenship (status.md mechanic 5): the checks below are cargo
+# commands, so they ride the SAME budget wrapper as the Justfile
+# recipes. The wrapper is the cap: the whole process tree is pinned to a
+# quarter of the cores, niced and ionice-idle, and the job caps are
+# exported into build scripts. A bare `nice cargo ...` here was the old
+# "looks capped" form that still let rustc codegen threads and
+# boring-sys's make -j$(nproc) take every core.
+net() { sh scripts/budget.sh "$@"; }
 
 staged=$(git diff --cached --name-only; git diff --name-only origin/master..HEAD 2>/dev/null || true)
 if echo "$staged" | rg -q '^(design/|status\.md|project\.md)'; then

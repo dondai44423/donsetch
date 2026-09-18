@@ -73,7 +73,7 @@
             "type": "integer"
           },
           "deadline_ms": {
-            "description": "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang. Batch mode: per-URL budget.",
+            "description": "Hard time budget in ms (500-600000). On expiry: honest error with next_action, never a silent hang. Batch mode: per-URL budget.",
             "type": "integer"
           },
           "focus": {
@@ -105,7 +105,7 @@
             "type": "integer"
           },
           "section": {
-            "description": "Heading name (substring, case-insensitive) : return only that section. Use after toc to target a specific part.",
+            "description": "Heading name (substring, case-insensitive): return only that section. Use after toc.",
             "type": "string"
           },
           "selector": {
@@ -113,7 +113,7 @@
             "type": "string"
           },
           "shot": {
-            "description": "File path : saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool.",
+            "description": "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool.",
             "type": "string"
           },
           "since_last": {
@@ -125,7 +125,7 @@
             "type": "boolean"
           },
           "tier": {
-            "description": "auto (default, always use for real work): HTTP first, auto-escalates to headless browser on bot-walls/JS-shells, auto-detects and parses PDFs. \"1\" (testing): HTTP only, no browser : fails on JS sites. \"2\" (testing): browser directly : slower, skips HTTP entirely.",
+            "description": "auto (default): HTTP first, escalating to a browser on bot-walls/JS-shells; parses PDFs. \"1\": HTTP only, no browser (fails on JS sites). \"2\": browser directly, skips HTTP (slower).",
             "enum": [
               "auto",
               "1",
@@ -164,11 +164,11 @@
       "inputSchema": {
         "properties": {
           "deadline_ms": {
-            "description": "Hard time budget in ms (500-600000). Engines have their own timeouts; this caps the whole call. On expiry: honest deadline error.",
+            "description": "Hard time budget in ms (500-600000) for the whole call (engines keep their own timeouts). On expiry: an honest deadline error.",
             "type": "integer"
           },
           "intent": {
-            "description": "auto (default) detects from query. code: adds GitHub, HN, StackExchange, MDN verticals. paper: adds Scholar, arXiv. news: adds Google News, HN. entity: adds Wikipedia. web: general only.",
+            "description": "auto (default) detects from the query. code: + GitHub, HN, StackExchange, MDN. paper: + Scholar, arXiv. news: + Google News, HN. entity: + Wikipedia. web: general only.",
             "enum": [
               "auto",
               "web",
