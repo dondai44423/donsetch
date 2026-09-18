@@ -51,6 +51,7 @@ impl StrikeCache {
     }
 
     fn note_failure(&mut self, host_key: &str) {
+        self.prune();
         let now = std::time::Instant::now();
         let (n, at) = self.strikes.entry(host_key.to_owned()).or_insert((0, now));
         // A strike that already expired counts as healed: restart the
@@ -65,6 +66,15 @@ impl StrikeCache {
 
     fn note_success(&mut self, host_key: &str) {
         self.strikes.remove(host_key);
+    }
+
+    /// Drop entries whose TTL already passed. Without this the map only
+    /// ever grew: a refusal is checked for freshness on read, so nothing
+    /// ever removed the healed rows, and a long browser session dialing
+    /// thousands of hosts kept every one of them forever. Runs on the
+    /// failure path (the only writer), so it cannot touch a hot read.
+    fn prune(&mut self) {
+        self.strikes.retain(|_, (_, at)| at.elapsed() < STRIKE_TTL);
     }
 }
 
@@ -172,7 +182,10 @@ async fn serve_socks5_client(
     let port = u16::from_be_bytes(port_bytes);
 
     let host_key = format!("{host}:{port}");
-    let refused = strikes.lock().unwrap().refused(&host_key);
+    let refused = strikes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .refused(&host_key);
     if refused {
         // Refused fast: Chrome skips the asset, the page hydrates.
         let _ = client
@@ -194,7 +207,10 @@ async fn serve_socks5_client(
             // A successful connect clears the host's strikes: the
             // outage that struck it is over, and a fast-reject held
             // past the healing would starve the page forever.
-            strikes.lock().unwrap().note_success(&host_key);
+            strikes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .note_success(&host_key);
             Ok(())
         }
         Err(e) => {
@@ -202,7 +218,10 @@ async fn serve_socks5_client(
                 "[relay] upstream dial failed for {host}:{port} through {}: {e}",
                 proxy.host
             );
-            strikes.lock().unwrap().note_failure(&host_key);
+            strikes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .note_failure(&host_key);
             let _ = client
                 .write_all(&[5u8, 1u8, 0u8, 1u8, 0, 0, 0, 0, 0, 0])
                 .await;
@@ -365,5 +384,33 @@ mod tests {
         assert!(c.refused("h:2"));
         c.note_success("h:2");
         assert!(!c.refused("h:2"), "success must clear strikes");
+    }
+
+    /// The map must not accumulate healed rows forever: a browser session
+    /// dials thousands of hosts, and `refused` only checks freshness on
+    /// read, so nothing used to remove them. Pruning runs on the failure
+    /// path (the only writer) and drops exactly the expired rows.
+    #[test]
+    fn expired_rows_are_pruned_not_kept_forever() {
+        let mut c = StrikeCache {
+            strikes: Default::default(),
+        };
+        // One live host and one healed long ago.
+        for _ in 0..STRIKE_LIMIT {
+            c.note_failure("live:443");
+        }
+        c.note_failure("healed:443");
+        let healed = c.strikes.get_mut("healed:443").expect("row inserted");
+        healed.1 = std::time::Instant::now() - STRIKE_TTL - std::time::Duration::from_secs(1);
+        assert_eq!(c.strikes.len(), 2);
+
+        // Any later failure prunes the expired row, keeps the live one.
+        c.note_failure("other:443");
+        assert!(
+            !c.strikes.contains_key("healed:443"),
+            "an expired strike row must be dropped, not kept for the process lifetime"
+        );
+        assert!(c.strikes.contains_key("live:443"));
+        assert_eq!(c.strikes.len(), 2, "live + other, healed pruned");
     }
 }
