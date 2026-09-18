@@ -522,8 +522,29 @@ mod tests {
                 let mut n = spawns2.lock().unwrap();
                 *n += 1;
                 let mut c = Command::new("sh");
-                // First child dies instantly; its replacement serves.
-                c.args(["-c", if *n == 1 { "exit 0" } else { "cat" }]);
+                // First child closes its own stdin and stays ALIVE; its
+                // replacement serves. Timing-free on purpose: the write
+                // to a closed pipe comes back EPIPE whether the child is
+                // mid-exit or idle, so this arm cannot lose the race a
+                // loaded macOS runner used to lose (the shipped version
+                // had child 1 `exit 0` and a 300ms delayed write: when
+                // sh took longer than 300ms to start, the write landed in
+                // a LIVE child's pipe buffer, no EPIPE fired, the death
+                // never reached the restart path, and the spawn assert
+                // below failed on 1).
+                c.args([
+                    "-c",
+                    if *n == 1 {
+                        // `exec sleep` replaces the shell, so the child
+                        // the supervisor kills IS the sleeper: a plain
+                        // `sleep` here would be a grandchild that
+                        // survives the kill as an orphan (nextest flags
+                        // the leaked process).
+                        "exec 0<&-; exec sleep 30"
+                    } else {
+                        "cat"
+                    },
+                ]);
                 c
             },
             DelayedOnce(b"ping\n", false),
