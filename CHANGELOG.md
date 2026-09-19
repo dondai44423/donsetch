@@ -5,7 +5,7 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.2.2] - 2026-09-19
 
 ### Fixed
 - The tier-1 persona fetch path (MCP `web_fetch`, and the CLI `fetch` that
@@ -15,8 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traffic through a forward proxy, every tool call failed with "Network is
   unreachable" while `donsetch doctor` reported egress healthy: two call
   chains into the same dialer, and only one of them read the ambient proxy.
-  Search engine hops and the render prefetch assets follow the same
-  convention now. Reported by theangrykangaroo.
+  Search engine hops, the search prewarm fetches of result URLs and the
+  render prefetch assets follow the same convention now. A direct dial on
+  the prewarm lane did not just fail: it scored the result
+  `QualityObs::Dead`, so live results were demoted to dead links because
+  of the egress rather than the page. Reported by theangrykangaroo.
 - The mid-write daemon-restart test is causal instead of timed: the client
   waits for the child to close its own stdin before writing, so it no
   longer races `sh` startup on a loaded macOS runner. That race is what
@@ -29,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report above came in as a suspected deployment problem because of it.
   The check now reports `generic and tool lanes`, and says which lane
   failed when they disagree.
+- Build hygiene, both found by review (Mart-Bogdan, #240, #241): the
+  `guard` recipe's size test never evaluated (`$$(...)` is Makefile
+  escaping, not just, so sh saw `<pid>(du -sm target | cut -f1)` and the
+  test was silently false, which is why the bloat prune had never fired;
+  it prunes past 25G now), and the `fuzz` recipe kept a hardcoded path to
+  the budget wrapper instead of riding the `budget` variable like every
+  other recipe.
+- The CI test step's 30-minute cap was also the cold-build budget: a PR
+  branch starts with an empty dependency cache, and on the macos-x86_64
+  Intel runner a cold build plus the suite ran past 30 minutes and was
+  killed mid-compile, reddening a lane with no test failure behind it.
+  Raised to 60, which is a build-phase backstop only: a hung test is
+  still caught by nextest's own per-test timeout.
 
 ## [4.2.1] - 2026-09-19
 

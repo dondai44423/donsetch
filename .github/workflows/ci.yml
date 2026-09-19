@@ -209,9 +209,16 @@ jobs:
 
       - name: Test (nextest)
         run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }}
-        # 15m was exhausted on macos-arm64 cold builds (nextest spawns
-        # one process per test; ~950 tests on the slowest runner).
-        timeout-minutes: 30
+        # This step is also the COLD BUILD. A PR branch starts with an
+        # empty rust-cache (per-branch keys, so one branch cannot poison
+        # another's warm tree), and on the macos-x86_64 Intel runner a
+        # cold dependency build plus ~1300 tests ran past 30m and was
+        # killed mid-compile ("timed out after 30 minutes", last line
+        # still "Compiling ..."). Test-level hangs are caught by
+        # nextest's own per-test slow-timeout (.config/nextest.toml, 30s
+        # in the ci profile), so this number is a build-phase backstop and
+        # only has to clear the slowest cold build.
+        timeout-minutes: 60
 
       # Windows: compile-check the release feature set without the
       # 305MB MSVC static link. Catches feature-gating typos and
