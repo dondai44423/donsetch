@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Intent, KeyError, ProviderResult, SearchHit};
+use super::{Intent, KeyError, SearchHit};
 use crate::search::byok::store::{KeyState, PROVIDERS, RATE_LIMIT_COOLDOWN, now_ts};
 
 /// The contract version we emit and accept. Bump (and add a
@@ -453,14 +453,19 @@ impl PluginError {
 
     /// Classify into the same `KeyError` variants a native adapter
     /// produces from an HTTP status, so a plugin can retire its own
-    /// key rather than being retried forever.
-    fn into_key_error(self, plugin_name: &str) -> KeyError {
-        let msg = format!("plugin {plugin_name}: {}", self.message);
-        match self.kind.as_deref() {
+    /// key rather than being retried forever, and keep the plugin's
+    /// own words beside it. Three of those variants are payload-free
+    /// (a native 401 has nothing worth echoing), so the text rides
+    /// in `ProviderFailure::detail`: without it `keys add plugin
+    /// --test` printed a bare `invalid key` at exactly the moment a
+    /// user is debugging their credentials.
+    fn into_failure(self, plugin_name: &str) -> super::ProviderFailure {
+        let detail = format!("plugin {plugin_name}: {}", self.message);
+        let key = match self.kind.as_deref() {
             Some("invalid_key") => KeyError::InvalidKey,
             Some("credit_depleted") => KeyError::CreditDepleted,
             Some("rate_limited") => KeyError::RateLimited,
-            Some("server_error") => KeyError::ServerError(msg),
+            Some("server_error") => KeyError::ServerError(detail.clone()),
             Some("network_error") => KeyError::NetworkError,
             // No kind, or one from a contract we do not know yet.
             // Fall back to `retryable`, which was the whole
@@ -468,12 +473,13 @@ impl PluginError {
             // way, so an existing plugin keeps its behavior.
             _ => {
                 if self.retryable {
-                    KeyError::ServerError(msg)
+                    KeyError::ServerError(detail.clone())
                 } else {
-                    KeyError::UnknownError(msg)
+                    KeyError::UnknownError(detail.clone())
                 }
             }
-        }
+        };
+        super::ProviderFailure::new(key, detail)
     }
 }
 
@@ -487,15 +493,20 @@ impl PluginError {
 /// duplicate-heavy plugin output silently deliver fewer unique
 /// results than the agent asked for.
 ///
-/// The error arm is a `KeyError` rather than a string so that an
-/// envelope carrying an `error_kind` keeps its classification all
-/// the way to the key-state machine; every other failure here is
+/// The error arm is a `ProviderFailure` rather than a string so
+/// that an envelope carrying an `error_kind` keeps both its
+/// classification (which drives key state) and the plugin's own
+/// words all the way to the caller; every other failure here is
 /// malformed output, which stays `UnknownError` as before.
 fn parse_envelope(
     bytes: &[u8],
     plugin_name: &str,
-) -> Result<(Vec<SearchHit>, bool, usize), KeyError> {
-    let malformed = |msg: String| KeyError::UnknownError(format!("plugin {plugin_name}: {msg}"));
+) -> Result<(Vec<SearchHit>, bool, usize), super::ProviderFailure> {
+    let malformed = |msg: String| {
+        super::ProviderFailure::of(KeyError::UnknownError(format!(
+            "plugin {plugin_name}: {msg}"
+        )))
+    };
 
     let v: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| malformed(format!("stdout is not valid JSON: {e}")))?;
@@ -514,7 +525,7 @@ fn parse_envelope(
     if obj.contains_key("error") {
         let failure = PluginError::from_envelope(obj)
             .unwrap_or_else(|| PluginError::unspecified("unspecified plugin error"));
-        return Err(failure.into_key_error(plugin_name));
+        return Err(failure.into_failure(plugin_name));
     }
 
     let results = obj
@@ -614,13 +625,13 @@ pub(crate) async fn run_plugin(
     query: &str,
     max: usize,
     intent: &Intent,
-) -> ProviderResult {
+) -> Result<super::ProviderOutcome, super::ProviderFailure> {
     let started = Instant::now();
     let request = build_request(query, max, intent, def.timeout_ms);
 
     let mut child = match spawn_plugin(name, def) {
         Ok(c) => c,
-        Err(e) => return Err(KeyError::UnknownError(e)),
+        Err(e) => return Err(super::ProviderFailure::of(KeyError::UnknownError(e))),
     };
     let stderr_pipe = child.stderr.take();
     // Drain stderr from the moment of spawn: a full pipe must
@@ -660,16 +671,16 @@ pub(crate) async fn run_plugin(
         Err(_) => {
             // Dropping the child (kill_on_drop) SIGKILLs it.
             let ms = started.elapsed().as_millis();
-            return Err(KeyError::UnknownError(format!(
+            return Err(super::ProviderFailure::of(KeyError::UnknownError(format!(
                 "plugin {name}: timed out after {ms}ms (process killed)"
-            )));
+            ))));
         }
     };
 
     if body.len() as u64 > MAX_STDOUT_BYTES {
-        return Err(KeyError::UnknownError(format!(
+        return Err(super::ProviderFailure::of(KeyError::UnknownError(format!(
             "plugin {name}: stdout exceeded the {MAX_STDOUT_BYTES}-byte cap (process killed)"
-        )));
+        ))));
     }
 
     let stderr_trimmed: String = stderr
@@ -694,18 +705,20 @@ pub(crate) async fn run_plugin(
             // Non-zero exit: prefer the error envelope if stdout
             // happens to be one, else stderr, else the raw code.
             if let Some(failure) = extract_error_envelope(&body) {
-                return Err(failure.into_key_error(name));
+                return Err(failure.into_failure(name));
             }
             let msg = if !stderr_trimmed.is_empty() {
                 stderr_trimmed
             } else {
                 format!("exited with status {code}")
             };
-            Err(KeyError::UnknownError(format!("plugin {name}: {msg}")))
+            Err(super::ProviderFailure::of(KeyError::UnknownError(format!(
+                "plugin {name}: {msg}"
+            ))))
         }
-        Err(e) => Err(KeyError::UnknownError(format!(
+        Err(e) => Err(super::ProviderFailure::of(KeyError::UnknownError(format!(
             "plugin {name}: failed to collect exit status: {e}"
-        ))),
+        )))),
     }
 }
 
@@ -841,7 +854,10 @@ impl PluginStore {
 pub async fn probe(name: &str, def: &PluginDef) -> Result<usize, String> {
     match run_plugin(name, def, "DonSeTch plugin probe", 3, &Intent::Web).await {
         Ok(outcome) => Ok(outcome.hits.len()),
-        Err(e) => Err(e.to_string()),
+        // The full text, plugin name included: this is the one place
+        // a user reads why their freshly registered adapter failed,
+        // so a payload-free `invalid key` is not good enough.
+        Err(e) => Err(e.detail),
     }
 }
 
@@ -1156,7 +1172,7 @@ mod tests {
         for (kind, expected) in cases {
             let env = format!(r#"{{"format":1,"error":"nope","error_kind":"{kind}"}}"#);
             let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
-            assert_eq!(e.to_key_state(), expected, "error_kind {kind}");
+            assert_eq!(e.key.to_key_state(), expected, "error_kind {kind}");
         }
     }
 
@@ -1164,7 +1180,7 @@ mod tests {
     fn error_kind_ignores_case_and_padding() {
         let env = r#"{"format":1,"error":"nope","error_kind":"  Rate_Limited "}"#;
         let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
-        assert_eq!(e.to_key_state(), Some(KeyState::RateLimited));
+        assert_eq!(e.key.to_key_state(), Some(KeyState::RateLimited));
     }
 
     #[test]
@@ -1173,8 +1189,8 @@ mod tests {
         // retire the plugin: it degrades to the pre-error_kind meaning.
         let env = r#"{"format":1,"error":"nope","error_kind":"teapot","retryable":true}"#;
         let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
-        assert!(matches!(e, KeyError::ServerError(_)), "{e}");
-        assert_eq!(e.to_key_state(), None);
+        assert!(matches!(e.key, KeyError::ServerError(_)), "{e}");
+        assert_eq!(e.key.to_key_state(), None);
     }
 
     #[test]
@@ -1184,9 +1200,113 @@ mod tests {
         for retryable in [true, false] {
             let env = format!(r#"{{"format":1,"error":"boom","retryable":{retryable}}}"#);
             let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
-            assert_eq!(e.to_key_state(), None, "retryable={retryable}");
+            assert_eq!(e.key.to_key_state(), None, "retryable={retryable}");
             assert!(e.to_string().contains("boom"), "{e}");
         }
+    }
+
+    #[test]
+    fn parked_kinds_keep_the_plugins_own_words() {
+        // The three parked variants carry no payload, so the text
+        // rides in `detail`. Losing it made `keys add plugin --test`
+        // print a bare "invalid key" at the exact moment a user is
+        // debugging their credentials.
+        for kind in ["invalid_key", "credit_depleted", "rate_limited"] {
+            let env = format!(
+                r#"{{"format":1,"error":"401 Unauthorized: API key revoked","error_kind":"{kind}"}}"#
+            );
+            let e = parse_envelope(env.as_bytes(), "myplug").unwrap_err();
+            assert!(
+                e.key.to_key_state().is_some(),
+                "{kind} must park the plugin"
+            );
+            assert!(
+                e.detail.contains("myplug") && e.detail.contains("API key revoked"),
+                "{kind}: the plugin's name and words must survive: {}",
+                e.detail
+            );
+            // Display is the detail, so every `{e}` site shows them too.
+            assert_eq!(e.to_string(), e.detail, "{kind}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_exit_error_envelope_parks_and_keeps_its_text() {
+        // The non-zero-exit branch is the SECOND place an envelope is
+        // read, and nothing covered it.
+        let def = PluginDef {
+            cmd: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo '{\"format\":1,\"error\":\"401 Unauthorized: API key revoked\",\"error_kind\":\"invalid_key\"}'; exit 3"
+                    .into(),
+            ],
+            timeout_ms: 10_000,
+            ..PluginDef::default()
+        };
+        let f = run_plugin("counted", &def, "q", 5, &Intent::Web)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(f.key, KeyError::InvalidKey),
+            "the envelope on a non-zero exit must classify: {f}"
+        );
+        assert_eq!(f.key.to_key_state(), Some(KeyState::Invalid));
+        assert!(
+            f.detail.contains("API key revoked") && f.detail.contains("counted"),
+            "{}",
+            f.detail
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_exit_legacy_envelope_keeps_text_and_records_no_state() {
+        // The compatibility side of the same branch: no error_kind
+        // means no state, with the text intact either way round.
+        for retryable in [true, false] {
+            let def = PluginDef {
+                cmd: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "echo '{{\"format\":1,\"error\":\"upstream is down\",\"retryable\":{retryable}}}'; exit 3"
+                    ),
+                ],
+                timeout_ms: 10_000,
+                ..PluginDef::default()
+            };
+            let f = run_plugin("legacy", &def, "q", 5, &Intent::Web)
+                .await
+                .unwrap_err();
+            assert_eq!(f.key.to_key_state(), None, "retryable={retryable}");
+            assert!(
+                f.detail.contains("upstream is down") && f.detail.contains("legacy"),
+                "retryable={retryable}: {}",
+                f.detail
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_reports_the_plugins_own_words() {
+        // `keys add plugin --test` is the one place a user reads why
+        // their freshly registered adapter failed.
+        let def = PluginDef {
+            cmd: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo '{\"format\":1,\"error\":\"401 Unauthorized: API key revoked\",\"error_kind\":\"invalid_key\"}'; exit 1"
+                    .into(),
+            ],
+            timeout_ms: 10_000,
+            ..PluginDef::default()
+        };
+        let e = probe("probeplug", &def).await.unwrap_err();
+        assert!(e.contains("API key revoked"), "{e}");
+        assert!(e.contains("probeplug"), "{e}");
     }
 
     #[test]

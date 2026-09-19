@@ -19,6 +19,7 @@ use crate::cli;
 use crate::fetch::client::Fetcher;
 use crate::paths;
 use crate::profile::BrowserProfile;
+use crate::search::byok::store::KeyState;
 
 #[derive(Debug)]
 enum CheckResult {
@@ -1239,11 +1240,25 @@ fn check_plugins() -> CheckResult {
     // by the exec at run time, and absence there already yields
     // a clear error on the first search.
     let mut missing: Vec<String> = Vec::new();
+    // A plugin that reported itself invalid, out of credit or
+    // rate-limited is registered and parked: it will not be spawned,
+    // which is exactly how a search quietly loses that provider.
+    // `keys list` shows the state; doctor is where a user looks when
+    // a provider vanished, so the loop closes here too.
+    let mut parked: Vec<String> = Vec::new();
     for n in &names {
-        let prog = &cfg.plugins[n].cmd[0];
+        let def = &cfg.plugins[n];
+        // A hand-edited plugins.json can carry an empty argv; that is
+        // a registration problem, not a panic in the doctor.
+        let prog = def.cmd.first().map(String::as_str).unwrap_or("");
         let is_path_form = prog.contains('/') || prog.contains('\\') || prog.starts_with('.');
-        if is_path_form && !std::path::Path::new(prog).exists() {
+        if def.cmd.is_empty() {
+            missing.push(format!("{n}: no command registered"));
+        } else if is_path_form && !std::path::Path::new(prog).exists() {
             missing.push(format!("{n}: {prog}"));
+        }
+        if def.state != KeyState::Active {
+            parked.push(format!("{n}: {}", def.state.label()));
         }
     }
     let detail = format!(
@@ -1251,13 +1266,21 @@ fn check_plugins() -> CheckResult {
         names.len(),
         names.join(", ")
     );
-    if missing.is_empty() {
+    let mut problems: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!("program not found: {}", missing.join(", ")));
+    }
+    if !parked.is_empty() {
+        problems.push(format!(
+            "parked, so not spawned: {} (re-register with `donsetch keys add plugin <name> --cmd ...` \
+             after fixing the credentials; a rate-limited plugin recovers on its own)",
+            parked.join(", ")
+        ));
+    }
+    if problems.is_empty() {
         CheckResult::Pass(detail)
     } else {
-        CheckResult::Warn(format!(
-            "{detail}; program not found: {}",
-            missing.join(", ")
-        ))
+        CheckResult::Warn(format!("{detail}; {}", problems.join("; ")))
     }
 }
 
@@ -2140,6 +2163,51 @@ mod doctor_ultra_tests {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.dir);
             }
+        }
+    }
+
+    #[test]
+    fn a_parked_plugin_warns_instead_of_passing() {
+        // The gap: a plugin sitting in `invalid` passed the check, so
+        // the only place its state showed was `keys list`.
+        let _g = isolated_cache();
+        let mut cfg = crate::search::byok::plugin::PluginConfig::empty();
+        let none = std::collections::HashSet::new();
+        cfg.add("parkedplug", vec!["/bin/true".into()], 30_000, &none)
+            .unwrap();
+        cfg.add("liveplug", vec!["/bin/true".into()], 30_000, &none)
+            .unwrap();
+        cfg.mark_state("parkedplug", KeyState::Invalid);
+        cfg.save();
+
+        match check_plugins() {
+            CheckResult::Warn(detail) => {
+                assert!(detail.contains("parkedplug: invalid"), "{detail}");
+                assert!(
+                    !detail.contains("liveplug:"),
+                    "an active plugin must not be named as parked: {detail}"
+                );
+            }
+            other => panic!("a parked plugin must warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_with_no_command_warns_instead_of_panicking() {
+        // A hand-edited plugins.json can carry an empty argv; the old
+        // `cmd[0]` indexed straight into a panic.
+        let _g = isolated_cache();
+        let dir = std::env::var("DONSETCH_CACHE_DIR").unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("plugins.json"),
+            r#"{"version":1,"plugins":{"broken":{"cmd":[],"timeout_ms":30000}},"order":["broken"]}"#,
+        )
+        .unwrap();
+        match check_plugins() {
+            CheckResult::Warn(detail) => {
+                assert!(detail.contains("broken: no command registered"), "{detail}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
         }
     }
 
