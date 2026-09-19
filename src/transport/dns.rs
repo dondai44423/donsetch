@@ -96,7 +96,7 @@ pub async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchErro
                     LOOKUP_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(|e| FetchError::Dns(format!("could not resolve {host}: {e}")))?
+            .map_err(|e| classify_lookup_error(host, &e))?
             .collect();
     if addrs.is_empty() {
         return Err(FetchError::Dns(format!("{host} resolved to no addresses")));
@@ -105,6 +105,27 @@ pub async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchErro
         store(host, port, &addrs, ttl);
     }
     Ok(addrs)
+}
+
+/// A resolver that could not answer NOW (EAI_AGAIN: resolv.conf
+/// unreachable, SERVFAIL, a VPN flap) is the same transient signal as
+/// one that did not answer in time, not a name that does not exist.
+/// #248 made `Dns` permanent, so this arm has to stay `DnsTimeout` or
+/// an outage reads as a dead name and the caller is told not to
+/// retry. getaddrinfo's EAI code never reaches std, only its text:
+/// glibc/macOS "Temporary failure in name resolution", musl "Try
+/// again", Windows WSATRY_AGAIN 11002.
+fn classify_lookup_error(host: &str, e: &std::io::Error) -> FetchError {
+    let text = e.to_string();
+    let lower = text.to_ascii_lowercase();
+    let again = lower.contains("temporary failure")
+        || lower.contains("try again")
+        || e.raw_os_error() == Some(11002);
+    if again {
+        FetchError::DnsTimeout(format!("the resolver could not answer for {host}: {text}"))
+    } else {
+        FetchError::Dns(format!("could not resolve {host}: {text}"))
+    }
 }
 
 fn cached(host: &str, port: u16, ttl: Duration) -> Option<Vec<SocketAddr>> {
@@ -184,6 +205,32 @@ mod tests {
                 .expect_err("loopback must be refused");
             assert!(matches!(err, FetchError::Ssrf(_)), "got {err:?}");
         }
+    }
+
+    // #248 made `Dns` permanent ("do not retry"). getaddrinfo's
+    // EAI_AGAIN (resolver unreachable, SERVFAIL) arrives as the same
+    // io::Error type as NXDOMAIN; only the text tells them apart, so
+    // the transient one must be routed to the transient variant.
+    #[test]
+    fn a_resolver_that_cannot_answer_now_is_transient_not_a_dead_name() {
+        use std::io::Error;
+        let again = [
+            "failed to lookup address information: Temporary failure in name resolution",
+            "failed to lookup address information: Try again",
+        ];
+        for msg in again {
+            let e = classify_lookup_error("example.com", &Error::other(msg));
+            assert!(matches!(e, FetchError::DnsTimeout(_)), "{msg} -> {e:?}");
+        }
+        let win = Error::from_raw_os_error(11002);
+        assert!(matches!(
+            classify_lookup_error("example.com", &win),
+            FetchError::DnsTimeout(_)
+        ));
+        let nx = Error::other("failed to lookup address information: Name or service not known");
+        let e = classify_lookup_error("nope.invalid", &nx);
+        assert!(matches!(e, FetchError::Dns(_)), "{e:?}");
+        assert!(e.to_string().contains("nope.invalid"));
     }
 
     // Long-lived daemon, unbounded map: the entry cap has to hold.

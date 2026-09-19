@@ -145,7 +145,8 @@ impl Searcher {
                     // Outer timeout / transport timeout = a slow but
                     // alive page. Demoting it as dead would punish
                     // anything slow, so stay neutral.
-                    Err(_) | Ok(Err(FetchError::Timeout)) => {
+                    Err(_) => (i, None, Some(String::new()), QualityObs::Neutral),
+                    Ok(Err(e)) if slow_not_dead(&e) => {
                         (i, None, Some(String::new()), QualityObs::Neutral)
                     }
                     // Refused / DNS-dead / nothing recovered = dead.
@@ -315,10 +316,31 @@ fn extract_description(html: &str) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// A transport error that says "slow", not "dead": the connect timed
+/// out, or the resolver did not answer in time. #248 split the
+/// resolver timeout out of `Timeout` into `DnsTimeout`, and this leg
+/// still matched `Timeout` alone, so a 5s resolver blip during enrich
+/// demoted a live result 50% and marked its host's quality down.
+fn slow_not_dead(e: &FetchError) -> bool {
+    matches!(e, FetchError::Timeout | FetchError::DnsTimeout(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::BrowserProfile;
+
+    #[test]
+    fn a_resolver_timeout_is_slow_not_dead() {
+        assert!(slow_not_dead(&FetchError::Timeout));
+        assert!(slow_not_dead(&FetchError::DnsTimeout(
+            "the resolver did not answer within 5s".into()
+        )));
+        assert!(!slow_not_dead(&FetchError::Dns("no such host".into())));
+        assert!(!slow_not_dead(&FetchError::Http(
+            "connection refused".into()
+        )));
+    }
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 

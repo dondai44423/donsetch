@@ -5,6 +5,23 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A resolver that could not answer (getaddrinfo EAI_AGAIN: resolv.conf
+  unreachable, SERVFAIL, a VPN flap) was reported as `network.dns` with
+  `errorKind: permanent` and a do-not-retry next action, the mirror of
+  the #248 report: the outage read as a dead name. The lookup error's
+  text is the only thing std exposes, so "Temporary failure in name
+  resolution" / "Try again" / WSATRY_AGAIN now classify as the
+  transient `DnsTimeout`; a name that does not exist stays permanent.
+- Search enrichment demoted a live result 50% and marked its host's
+  quality down when the resolver timed out during the prefetch. That
+  leg stayed neutral on a connect timeout, and #248 moved the resolver
+  timeout to its own variant that the leg did not know; both now read
+  as slow, not dead. The ghost probe's failure class and the search
+  task status label learned the new variants the same way.
+
 ## [4.2.4] - 2026-09-19
 
 ### Added

@@ -122,7 +122,7 @@ pub(super) async fn engine_task_with_budget(
         Err(_) => return (label, Err(("timeout".into(), egress_id, true))),
         Ok(Err(e)) => {
             let status = match &e {
-                FetchError::Timeout => "timeout",
+                FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout",
                 FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail",
                 FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy",
                 _ => "net",

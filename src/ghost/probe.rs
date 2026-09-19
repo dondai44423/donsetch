@@ -143,9 +143,10 @@ async fn probe_one(fetcher: &Arc<Fetcher>, state: &Arc<Mutex<GhostState>>, host:
         },
         Ok(Err(e)) => {
             let class = match &e {
-                crate::error::FetchError::Timeout | crate::error::FetchError::Io(_) => {
-                    FailClass::Network
-                }
+                crate::error::FetchError::Timeout
+                | crate::error::FetchError::Io(_)
+                | crate::error::FetchError::Dns(_)
+                | crate::error::FetchError::DnsTimeout(_) => FailClass::Network,
                 crate::error::FetchError::Tls(_) => FailClass::Tls,
                 _ => FailClass::Other,
             };
