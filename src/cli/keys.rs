@@ -793,7 +793,7 @@ fn print_help() {
         green("default")
     );
     println!(
-        "    {} [provider]         Reset key states to active (fixes rate-limited/dead keys)",
+        "    {} [provider]         Reset key states to active (fixes rate-limited/credit-depleted/invalid keys)",
         green("reset")
     );
     println!(

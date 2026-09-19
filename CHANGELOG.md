@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The BYOK key store's CLI said "dead" for a key state the file does not
+  accept. `keys list`'s legend printed one ✗ labelled "dead" for two states,
+  its no-usable-key warning said "all keys are dead", `keys --help` said
+  `reset` "fixes rate-limited/dead keys", and the store module's own doc
+  called the states dead, while the serialized states are exactly `active`,
+  `rate_limited`, `credit_depleted` and `invalid`, and anything else makes
+  the loader warn "corrupt key file" and run with no keys at all. An
+  operator who wrote `"state": "dead"` by hand, because that was the word
+  the program taught, silently lost every key and read the keyless answer
+  as "no provider fallback". Every human-facing string now names the state
+  the file names. Strings only; no behaviour change. Reported by
+  daniel-plescia.
 - A short page that loads Cloudflare Turnstile's public embed
   (`challenges.cloudflare.com/turnstile/v0/api.js`) without a form was
   read as a challenge interstitial, so a browser fetch that had already

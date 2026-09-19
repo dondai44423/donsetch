@@ -6,8 +6,8 @@
 //! Key states:
 //!   active         : ready to use
 //!   rate_limited   : 429, auto-recovers after RATE_LIMIT_COOLDOWN
-//!   credit_depleted : 402, stays dead until user resets
-//!   invalid        : 401/403, permanently dead (wrong/revoked key)
+//!   credit_depleted : 402, skipped until the user runs `keys reset`
+//!   invalid        : 401/403, skipped until the user runs `keys reset` (wrong/revoked key)
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -594,7 +594,7 @@ pub fn render_list(cfg: &ByokConfig) {
     }
 
     println!(
-        "  {}  {} active  {} rate-limited  {} dead",
+        "  {}  {} active  {} rate-limited  {} credit-depleted / invalid",
         cli::dim("legend:"),
         cli::green("\u{2713}"),
         cli::yellow("\u{23F1}"),
@@ -612,7 +612,7 @@ pub fn render_list(cfg: &ByokConfig) {
     if !any_active {
         println!();
         println!(
-            "  {} all keys are dead : search falls back to local engine",
+            "  {} no usable key (every key is credit-depleted or invalid) : search falls back to local engine",
             cli::yellow("\u{26A0}")
         );
         println!(
