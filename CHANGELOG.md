@@ -5,6 +5,24 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A crawl seeded on a page at the host root (`/p0.html`, `/index.php`)
+  returned the seed alone, or nothing, with `stop: FrontierEmpty` and
+  `complete: true`. The auto-scope rule that keeps `/tokio` on docs.rs
+  inside `/tokio/*` was applied to the file name too, so the scope became
+  `/p0.html/*` and every sibling link was filtered out before it reached
+  the frontier. A root-level file now scopes to the host, as `/` does;
+  a bare segment (`/tokio`, `/v1.2`) keeps the section rule (#249).
+- The crawl quality gate skipped a low-quality page before harvesting
+  its outlinks. A hub page (a link list with almost no prose) is the
+  lowest-quality page on a site and the one a crawl is seeded from, so
+  with `min_quality` above its score the crawl ended empty and the
+  next-action text blamed the seed ("no links discovered"). The gate
+  still keeps the page out of the results and the page budget, but its
+  links now feed the frontier, the same as the navigation-only path.
+
 ## [4.2.4] - 2026-09-19
 
 ### Added

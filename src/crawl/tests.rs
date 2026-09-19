@@ -227,6 +227,110 @@ fn html(title: &str, body: &str) -> String {
     )
 }
 
+// ── Hub seeds (issue #249) ────────────────────────────────
+
+/// A hub page: a dozen links and almost no prose, padded to the
+/// reporter's ~128 KB. `title` = None drops <title> so the quality
+/// score has nothing but density (~0) to stand on.
+/// (With a title the hub scores ~0.2 and passes the gate.)
+fn hub_html(title: Option<&str>, dir: &str) -> String {
+    let links: String = (1..=12)
+        .map(|i| format!("<a href=\"{dir}p{i}.html\">page {i}</a> "))
+        .collect();
+    let pad = "<!-- ".to_string() + &"x".repeat(1000) + " -->\n";
+    let head = title
+        .map(|t| format!("<head><title>{t}</title></head><body><h1>{t}</h1>"))
+        .unwrap_or_else(|| "<body>".to_string());
+    format!(
+        "<html>{head}<p>{links}</p>{}</body></html>",
+        pad.repeat(125)
+    )
+}
+
+fn hub_site(dir: &str, title: Option<&str>) -> MockSite {
+    let mut site = MockSite::new().page(
+        &format!("https://ex.com{dir}p0.html"),
+        200,
+        &hub_html(title, dir),
+    );
+    for i in 1..=12 {
+        site = site.page(
+            &format!("https://ex.com{dir}p{i}.html"),
+            200,
+            &html(&format!("Page {i}"), "real article content"),
+        );
+    }
+    site
+}
+
+// A seed like `/p0.html` (a page at the host root) was auto-scoped
+// as if it were a project section (`/p0.html/*`, the docs.rs rule
+// for `/tokio`), so every sibling link `/pN.html` was filtered out
+// and the crawl ended FrontierEmpty with only the seed, marked
+// complete. A root-level page's section is the host itself.
+#[tokio::test]
+async fn root_level_page_seed_is_not_scoped_to_itself() {
+    let (fetch, _hits) = hub_site("/", Some("Page 0")).fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 4;
+    let r = crawler
+        .crawl("https://ex.com/p0.html", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.filtered_out, 0,
+        "sibling pages of a root-level seed are in scope; stop={:?} skipped={:?}",
+        r.stop, r.skipped
+    );
+    assert_eq!(r.pages.len(), 4, "stop={:?}", r.stop);
+    assert_eq!(r.stop, StopReason::MaxPages);
+}
+
+// The quality gate skipped a low-quality page BEFORE its outlinks
+// were harvested, so a hub seed (the page you crawl FROM) fed the
+// frontier nothing: FrontierEmpty, pages=[], reported complete, and
+// next_action blamed the seed ("no links discovered"). The
+// navigation-only scope path already harvests links from pages it
+// does not keep; the quality gate must do the same.
+#[tokio::test]
+async fn low_quality_hub_seed_still_feeds_the_frontier() {
+    let (fetch, _hits) = hub_site("/docs/", None).fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 4;
+    // A bare link list scores ~0.08; the articles score ~0.47. Any
+    // min_quality between the two makes the hub a skip and keeps
+    // the articles: the gate must not also eat the hub's links.
+    o.min_quality = 0.2;
+    let r = crawler
+        .crawl("https://ex.com/docs/p0.html", o, None)
+        .await
+        .unwrap();
+    assert!(
+        r.skipped
+            .iter()
+            .any(|(u, why)| u.ends_with("/p0.html") && why.starts_with("low quality")),
+        "the hub itself is honestly skipped as low quality: skipped={:?} pages={:?}",
+        r.skipped,
+        r.pages
+            .iter()
+            .map(|p| (&p.url, p.quality))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        r.pages.len(),
+        4,
+        "hub outlinks must be harvested even though the hub is skipped; stop={:?} filtered_out={}",
+        r.stop,
+        r.filtered_out
+    );
+    assert!(r.pages.iter().all(|p| !p.url.ends_with("/p0.html")));
+    assert_eq!(r.stop, StopReason::MaxPages);
+}
+
 // ── Map mode ──────────────────────────────────────────────
 
 #[tokio::test]

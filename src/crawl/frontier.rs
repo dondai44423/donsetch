@@ -456,6 +456,13 @@ pub fn auto_scope(seed_path: &str) -> Option<String> {
     // Page path: use parent directory.
     let prefix = match path.rfind('/') {
         Some(0) => {
+            // A root-level FILE (`/p0.html`, `/index.php`) is a
+            // page whose section is the host: scoping it to
+            // `/p0.html/*` filtered every sibling link and the
+            // crawl ended empty, marked complete (#249).
+            if looks_like_file(&path[1..]) {
+                return None;
+            }
             // Single-segment path like `/tokio` : scope to
             // `/tokio/*` instead of returning None. This is
             // critical for multi-tenant hosts (docs.rs,
@@ -472,6 +479,19 @@ pub fn auto_scope(seed_path: &str) -> Option<String> {
     }
 
     Some(format!("{prefix}*"))
+}
+
+/// `index.html`, `about.php`, `README.md`: a short alphabetic
+/// extension marks a page, not a section. `v1.2` (digit
+/// extension) and `tokio` (none) stay sections.
+fn looks_like_file(segment: &str) -> bool {
+    let Some((stem, ext)) = segment.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && (1..=5).contains(&ext.len())
+        && ext.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Common non-content path patterns. Safety net merged with
@@ -722,6 +742,22 @@ mod tests {
             Some("/tokio-rs/tokio/*".into())
         );
         assert_eq!(auto_scope("/docs/payments"), Some("/docs/*".into()));
+    }
+
+    // #249: a page at the host root is not a project section.
+    // `/p0.html/*` matched nothing, so a crawl seeded on such a
+    // page filtered every sibling and returned empty.
+    #[test]
+    fn auto_scope_root_level_file_is_whole_host() {
+        assert_eq!(auto_scope("/p0.html"), None);
+        assert_eq!(auto_scope("/index.php"), None);
+        assert_eq!(auto_scope("/README.md"), None);
+        // Section-like single segments keep the multi-tenant rule.
+        assert_eq!(auto_scope("/tokio"), Some("/tokio/*".into()));
+        assert_eq!(auto_scope("/v1.2"), Some("/v1.2/*".into()));
+        assert_eq!(auto_scope("/.well-known"), Some("/.well-known/*".into()));
+        // Deeper files already used the parent directory.
+        assert_eq!(auto_scope("/docs/p0.html"), Some("/docs/*".into()));
     }
 
     #[test]
