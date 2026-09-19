@@ -57,6 +57,64 @@ const DISMISS_MODALS_JS: &str = r#"(() => {
   window.scrollTo(0, document.body.scrollHeight * 0.6);
 })();"#;
 
+/// Where to click a Turnstile checkbox, and which lookup found it:
+/// `"iframe"`, `"widget"` (the widget's container), or `"fallback"`
+/// (a fixed point, when neither is on the page).
+async fn turnstile_click_target(ghost: &Ghost) -> (f64, f64, &'static str) {
+    // The Turnstile iframe usually lives in a closed shadow root that
+    // querySelector cannot reach (the Cloudflare interstitial has no
+    // iframe in its light DOM). The container of the hidden
+    // `cf-turnstile-response` input is in the light DOM and spans the
+    // widget. Either way the checkbox sits at the left edge, ~20px in
+    // (measured on the interstitial, Chrome 152), vertically centered.
+    // Attribute values are quoted: unquoted `challenges.cloudflare` is
+    // invalid CSS, querySelector throws, and the lookup finds nothing.
+    const LOOKUP: &str = r#"(() => {
+  const at = (el, via) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    return JSON.stringify({ x: r.x + Math.min(22, r.width / 2), y: r.y + r.height / 2, via });
+  };
+  const f = document.querySelector('iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"], .cf-turnstile iframe');
+  const hit = f && at(f, 'iframe');
+  if (hit) return hit;
+  const i = document.querySelector('input[name="cf-turnstile-response"]');
+  return (i && i.parentElement && at(i.parentElement, 'widget')) || null;
+})()"#;
+    let reply = ghost
+        .cdp
+        .call(
+            Some(&ghost.session),
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": LOOKUP, "returnByValue": true }),
+        )
+        .await;
+    let found = reply
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("result")?.get("value")?.as_str().map(String::from))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|c| {
+            let via = if c.get("via")?.as_str()? == "iframe" {
+                "iframe"
+            } else {
+                "widget"
+            };
+            Some((c.get("x")?.as_f64()?, c.get("y")?.as_f64()?, via))
+        });
+    if found.is_none() && crate::config::cfg().debug.ghost {
+        let why = match &reply {
+            Err(e) => e.to_string(),
+            Ok(v) => v
+                .get("exceptionDetails")
+                .map(|d| d.to_string().chars().take(300).collect())
+                .unwrap_or_else(|| "no widget in the light DOM".into()),
+        };
+        eprintln!("[turnstile] target lookup found nothing: {why}");
+    }
+    found.unwrap_or((480.0, 420.0, "fallback"))
+}
+
 /// SOLVE mode: navigate into a wall, wait for the
 /// challenge to clear, harvest everything.
 ///
@@ -173,40 +231,19 @@ pub async fn solve(
             return Ok(SolveOutcome::CaptchaWalled);
         }
 
-        // Turnstile-style checkbox: find the actual iframe position
-        // via JS and click at its center. Fixed coordinates miss
-        // because Turnstile renders at different positions per site.
+        // Turnstile-style checkbox: locate it on the page and click.
+        // Fixed coordinates miss because Turnstile renders at
+        // different positions per site.
         if !clicked
             && small
             && (lower.contains("challenges.cloudflare.com")
                 || lower.contains("turnstile")
                 || lower.contains("verify you are human"))
         {
-            // Use Runtime.evaluate to find the Turnstile iframe's
-            // bounding rect, then click at its center.
-            let turnstile_pos = ghost
-                .cdp
-                .call(
-                    Some(&ghost.session),
-                    "Runtime.evaluate",
-                    serde_json::json!({
-                        "expression": "(() => { const f = document.querySelector('iframe[src*=challenges.cloudflare], iframe[src*=turnstile], cf-turnstile > div > iframe'); if (f) { const r = f.getBoundingClientRect(); return JSON.stringify({x: r.x + r.width/2, y: r.y + r.height/2}); } return null; })()",
-                        "returnByValue": true
-                    }),
-                )
-                .await
-                .ok()
-                .and_then(|v| v.get("result").and_then(|r| r.get("value")).cloned())
-                .and_then(|v| v.as_str().map(String::from))
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-            let (x, y) = if let Some(ref coords) = turnstile_pos {
-                (
-                    coords.get("x").and_then(|v| v.as_f64()).unwrap_or(480.0),
-                    coords.get("y").and_then(|v| v.as_f64()).unwrap_or(420.0),
-                )
-            } else {
-                (480.0, 420.0)
-            };
+            let (x, y, via) = turnstile_click_target(ghost).await;
+            if crate::config::cfg().debug.ghost {
+                eprintln!("[ghost] turnstile click via={via} at ({x:.0}, {y:.0})");
+            }
             let _ = ghost.click(x, y).await;
             clicked = true;
         }
@@ -343,29 +380,14 @@ pub async fn ghost_fetch(
                     || lower.contains("turnstile")
                     || lower.contains("verify you are human"))
             {
-                let turnstile_pos = ghost
-                    .cdp
-                    .call(
-                        Some(&ghost.session),
-                        "Runtime.evaluate",
-                        serde_json::json!({
-                            "expression": "(() => { const f = document.querySelector('iframe[src*=challenges.cloudflare], iframe[src*=turnstile], cf-turnstile > div > iframe'); if (f) { const r = f.getBoundingClientRect(); return JSON.stringify({x: r.x + r.width/2, y: r.y + r.height/2}); } return null; })()",
-                            "returnByValue": true
-                        }),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("result").and_then(|r| r.get("value")).cloned())
-                    .and_then(|v| v.as_str().map(String::from))
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-                let (x, y) = if let Some(ref coords) = turnstile_pos {
-                    (
-                        coords.get("x").and_then(|v| v.as_f64()).unwrap_or(480.0),
-                        coords.get("y").and_then(|v| v.as_f64()).unwrap_or(420.0),
-                    )
-                } else {
-                    (480.0, 420.0)
-                };
+                let (x, y, via) = turnstile_click_target(ghost).await;
+                if crate::config::cfg().debug.ghost {
+                    eprintln!(
+                        "[ghost_fetch] t={:.0?} turnstile click #{} via={via} at ({x:.0}, {y:.0})",
+                        start.elapsed(),
+                        clicked_challenge + 1,
+                    );
+                }
                 let _ = ghost.click(x, y).await;
                 clicked_challenge += 1;
                 last_click_at = std::time::Instant::now();
