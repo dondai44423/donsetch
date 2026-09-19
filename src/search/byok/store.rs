@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 use crate::cli;
 
 /// Cooldown for rate-limited keys. After this elapses,
-/// the key auto-recovers to active on next pick.
-const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+/// the key auto-recovers to active on next pick. Plugins share
+/// it, so a throttled plugin and a throttled native key wait the
+/// same amount of time.
+pub(super) const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Valid provider names (checked at CLI boundary).
 pub const PROVIDERS: &[&str] = &[
@@ -495,7 +497,7 @@ impl ByokStore {
     }
 }
 
-fn now_ts() -> u64 {
+pub(super) fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

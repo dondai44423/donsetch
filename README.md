@@ -365,7 +365,7 @@ Request on stdin, response on stdout:
 {"format":1,"results":[{"title":"...","url":"https://...","snippet":"...","score":0.9}]}
 ```
 
-Errors: exit non-zero with a message on stderr, or answer `{"format":1,"error":"...","retryable":true}`. Constraints that keep it reliable: hard timeout (default 30s, `--timeout` to change), 8 MiB stdout cap, direct exec with no shell, killed on cancellation, and a malformed response degrades gracefully down the fallback chain. Keys belong in the adapter's own environment, never in DonSeTch config.
+Errors: exit non-zero with a message on stderr, or answer `{"format":1,"error":"...","retryable":true,"error_kind":"rate_limited"}`. `error_kind` is optional and says what actually went wrong: `invalid_key`, `credit_depleted`, `rate_limited`, `server_error`, `network_error`. Report one of the first three and the plugin is parked the way a native key in that state is parked, rate-limited for a 60s cooldown then retried, invalid or depleted until you re-register it with `keys add plugin`, and `keys list` shows which. Leave the field out and nothing changes: `retryable` alone still only picks between retrying this search elsewhere and reporting the failure. Constraints that keep it reliable: hard timeout (default 30s, `--timeout` to change), 8 MiB stdout cap, direct exec with no shell, killed on cancellation, and a malformed response degrades gracefully down the fallback chain. Keys belong in the adapter's own environment, never in DonSeTch config.
 
 <div align="center">
 

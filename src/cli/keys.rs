@@ -11,13 +11,13 @@
 //!
 //! Providers: tavily, exa, serper, serpapi, serpbase, bravesearch, tinyfish, parallel, brightdata, unlocker
 
-use super::{bold, dim, green, red};
+use super::{bold, dim, green, red, yellow};
 
 use crate::DISPLAY_NAME;
 use crate::search::byok::plugin::{
     DEFAULT_TIMEOUT_MS, PluginConfig, tokenize_cmd, validate_plugin_name,
 };
-use crate::search::byok::store::{ByokConfig, PROVIDERS, render_list};
+use crate::search::byok::store::{ByokConfig, KeyState, PROVIDERS, render_list};
 
 /// Normalize provider aliases to canonical names.
 /// `bd` -> `brightdata`
@@ -517,11 +517,25 @@ fn cmd_list() {
             format!("{marker} {name}")
         };
         println!("  {label}");
+        // Same icon vocabulary the key list uses, so a plugin that
+        // reported itself dead reads the same as a dead key. An
+        // active plugin prints exactly what it printed before.
+        let state_icon = match def.state {
+            KeyState::Active => green(def.state.icon()),
+            KeyState::RateLimited => yellow(def.state.icon()),
+            KeyState::CreditDepleted | KeyState::Invalid => red(def.state.icon()),
+        };
+        let health = if def.state == KeyState::Active {
+            String::new()
+        } else {
+            format!("  {}", dim(def.state.label()))
+        };
         println!(
-            "    {} {}  (timeout {}s)",
-            green("\u{2713}"),
+            "    {} {}  (timeout {}s){}",
+            state_icon,
             dim(&def.cmd.join(" ")),
-            def.timeout_ms / 1000
+            def.timeout_ms / 1000,
+            health
         );
         println!();
     }

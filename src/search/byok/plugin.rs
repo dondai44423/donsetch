@@ -15,7 +15,16 @@
 //!                           "snippet":"...","score":0.9}],"degraded":false}
 //!
 //! Errors: non-zero exit (stderr is the message) or the envelope
-//! {"format":1,"error":"...","retryable":true} with any exit code.
+//!   {"format":1,"error":"...","retryable":true,
+//!    "error_kind":"rate_limited"}
+//! with any exit code. `error_kind` is optional and is how a
+//! plugin drives its own state the way a native adapter's HTTP
+//! status does: invalid_key and credit_depleted retire it until
+//! the user re-registers it, rate_limited earns the same cooldown
+//! a throttled native key gets, server_error and network_error
+//! are transient. An absent or unrecognised kind falls back to
+//! `retryable`, which changes no state, so a plugin written
+//! against the original contract behaves exactly as before.
 //!
 //! Runtime discipline: direct exec (never a shell), hard stdout/
 //! stderr caps, per-plugin timeout with SIGKILL, kill-on-drop so
@@ -29,7 +38,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{Intent, KeyError, ProviderResult, SearchHit};
-use crate::search::byok::store::PROVIDERS;
+use crate::search::byok::store::{KeyState, PROVIDERS, RATE_LIMIT_COOLDOWN, now_ts};
 
 /// The contract version we emit and accept. Bump (and add a
 /// parser arm) when the envelope shape changes; old adapters
@@ -58,10 +67,34 @@ pub struct PluginDef {
     pub cmd: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// Health as the plugin itself last reported it, mirroring the
+    /// per-key state natives carry in byok-keys.json. Defaulted so
+    /// a plugin file written before this field loads unchanged.
+    #[serde(default = "default_state")]
+    pub state: KeyState,
+    /// When the state last changed (Unix epoch seconds), for the
+    /// rate-limit cooldown.
+    #[serde(default)]
+    pub ts: u64,
 }
 
 fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_MS
+}
+
+fn default_state() -> KeyState {
+    KeyState::Active
+}
+
+impl Default for PluginDef {
+    fn default() -> Self {
+        Self {
+            cmd: Vec::new(),
+            timeout_ms: default_timeout(),
+            state: default_state(),
+            ts: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -172,12 +205,49 @@ impl PluginConfig {
             PluginDef {
                 cmd,
                 timeout_ms: timeout_ms.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS),
+                // Re-registering is the recovery path: it is what a
+                // user does after fixing the credentials that made
+                // the plugin report invalid_key.
+                state: KeyState::Active,
+                ts: 0,
             },
         );
         if !self.order.iter().any(|n| n == name) {
             self.order.push(name.to_string());
         }
         Ok(())
+    }
+
+    /// Record the state a plugin reported for itself.
+    pub fn mark_state(&mut self, name: &str, state: KeyState) {
+        if let Some(def) = self.plugins.get_mut(name) {
+            def.state = state;
+            def.ts = now_ts();
+        }
+    }
+
+    /// Whether a plugin should be spawned at all, with the same
+    /// auto-recovery a rate-limited native key gets. Returns true
+    /// alongside a flag saying the state was healed, so the caller
+    /// can persist that.
+    fn take_usable(&mut self, name: &str) -> (bool, bool) {
+        let Some(def) = self.plugins.get_mut(name) else {
+            return (false, false);
+        };
+        match def.state {
+            KeyState::Active => (true, false),
+            KeyState::RateLimited => {
+                let elapsed = now_ts().saturating_sub(def.ts);
+                if Duration::from_secs(elapsed) >= RATE_LIMIT_COOLDOWN {
+                    def.state = KeyState::Active;
+                    def.ts = now_ts();
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+            KeyState::CreditDepleted | KeyState::Invalid => (false, false),
+        }
     }
 
     /// Remove a plugin. Returns true if one was removed.
@@ -336,6 +406,77 @@ fn build_request(query: &str, max: usize, intent: &Intent, timeout_ms: u64) -> S
     .to_string()
 }
 
+/// An error envelope as the plugin wrote it, before it is turned
+/// into a `KeyError`.
+#[derive(Debug)]
+struct PluginError {
+    message: String,
+    retryable: bool,
+    kind: Option<String>,
+}
+
+impl PluginError {
+    /// Read the envelope out of an already-parsed JSON object.
+    /// `None` when there is no usable `error` member, which is how
+    /// both callers tell "this is not an error envelope" from "this
+    /// is one".
+    fn from_envelope(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        let err = obj.get("error")?.as_str()?.trim();
+        if err.is_empty() {
+            return None;
+        }
+        Some(Self {
+            // #164: cap like the sibling stderr trim. An envelope
+            // error must not ride the full 8 MiB stdout budget onto
+            // the model surface.
+            message: super::err_body(err),
+            retryable: obj
+                .get("retryable")
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false),
+            kind: obj
+                .get("error_kind")
+                .and_then(|k| k.as_str())
+                .map(|k| k.trim().to_ascii_lowercase()),
+        })
+    }
+
+    /// An envelope whose `error` member is present but unusable
+    /// (absent, not a string, or blank).
+    fn unspecified(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            retryable: false,
+            kind: None,
+        }
+    }
+
+    /// Classify into the same `KeyError` variants a native adapter
+    /// produces from an HTTP status, so a plugin can retire its own
+    /// key rather than being retried forever.
+    fn into_key_error(self, plugin_name: &str) -> KeyError {
+        let msg = format!("plugin {plugin_name}: {}", self.message);
+        match self.kind.as_deref() {
+            Some("invalid_key") => KeyError::InvalidKey,
+            Some("credit_depleted") => KeyError::CreditDepleted,
+            Some("rate_limited") => KeyError::RateLimited,
+            Some("server_error") => KeyError::ServerError(msg),
+            Some("network_error") => KeyError::NetworkError,
+            // No kind, or one from a contract we do not know yet.
+            // Fall back to `retryable`, which was the whole
+            // vocabulary before and changes no key state either
+            // way, so an existing plugin keeps its behavior.
+            _ => {
+                if self.retryable {
+                    KeyError::ServerError(msg)
+                } else {
+                    KeyError::UnknownError(msg)
+                }
+            }
+        }
+    }
+}
+
 /// Parse + validate a stdout envelope into hits. Invalid entries
 /// are dropped (bad title/url), other problems are errors naming
 /// the exact cause. Returns (hits, degraded, dropped_count).
@@ -345,44 +486,44 @@ fn build_request(query: &str, max: usize, intent: &Intent, timeout_ms: u64) -> S
 /// `to_merged` AFTER URL dedup. Truncating before dedup let
 /// duplicate-heavy plugin output silently deliver fewer unique
 /// results than the agent asked for.
+///
+/// The error arm is a `KeyError` rather than a string so that an
+/// envelope carrying an `error_kind` keeps its classification all
+/// the way to the key-state machine; every other failure here is
+/// malformed output, which stays `UnknownError` as before.
 fn parse_envelope(
     bytes: &[u8],
     plugin_name: &str,
-) -> Result<(Vec<SearchHit>, bool, usize), String> {
+) -> Result<(Vec<SearchHit>, bool, usize), KeyError> {
+    let malformed = |msg: String| KeyError::UnknownError(format!("plugin {plugin_name}: {msg}"));
+
     let v: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| format!("plugin {plugin_name}: stdout is not valid JSON: {e}"))?;
+        .map_err(|e| malformed(format!("stdout is not valid JSON: {e}")))?;
     let obj = v
         .as_object()
-        .ok_or_else(|| format!("plugin {plugin_name}: stdout is not a JSON object"))?;
+        .ok_or_else(|| malformed("stdout is not a JSON object".to_string()))?;
 
     if let Some(fmt) = obj.get("format").and_then(|f| f.as_u64())
         && fmt != FORMAT_VERSION as u64
     {
-        return Err(format!(
-            "plugin {plugin_name}: unsupported format {fmt} (expected {FORMAT_VERSION})"
-        ));
+        return Err(malformed(format!(
+            "unsupported format {fmt} (expected {FORMAT_VERSION})"
+        )));
     }
 
-    if let Some(err) = obj.get("error") {
-        let msg = err
-            .as_str()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unspecified plugin error".to_string());
-        // #164: cap like the sibling stderr trim (600 chars). An
-        // envelope error must not ride the full 8 MiB stdout budget
-        // onto the model surface.
-        let msg: String = msg.chars().take(600).collect();
-        return Err(format!("plugin {plugin_name}: {msg}"));
+    if obj.contains_key("error") {
+        let failure = PluginError::from_envelope(obj)
+            .unwrap_or_else(|| PluginError::unspecified("unspecified plugin error"));
+        return Err(failure.into_key_error(plugin_name));
     }
 
     let results = obj
         .get("results")
         .and_then(|r| r.as_array())
         .ok_or_else(|| {
-            format!(
-                "plugin {plugin_name}: envelope has no \"results\" array (format {FORMAT_VERSION})"
-            )
+            malformed(format!(
+                "envelope has no \"results\" array (format {FORMAT_VERSION})"
+            ))
         })?;
 
     let degraded = obj
@@ -446,10 +587,10 @@ fn parse_envelope(
         );
     }
     if !results.is_empty() && hits.is_empty() {
-        return Err(format!(
-            "plugin {plugin_name}: all {} results failed validation (need non-empty title and an http(s) url)",
+        return Err(malformed(format!(
+            "all {} results failed validation (need non-empty title and an http(s) url)",
             results.len()
-        ));
+        )));
     }
     Ok((hits, degraded, dropped))
 }
@@ -547,13 +688,13 @@ pub(crate) async fn run_plugin(
                 let ms = started.elapsed().as_millis() as u64;
                 Ok(super::ProviderOutcome { hits, ms, degraded })
             }
-            Err(e) => Err(KeyError::UnknownError(e)),
+            Err(e) => Err(e),
         },
         Ok(code) => {
             // Non-zero exit: prefer the error envelope if stdout
             // happens to be one, else stderr, else the raw code.
-            if let Ok((messages, _)) = extract_error_envelope(&body) {
-                return Err(KeyError::UnknownError(messages));
+            if let Some(failure) = extract_error_envelope(&body) {
+                return Err(failure.into_key_error(name));
             }
             let msg = if !stderr_trimmed.is_empty() {
                 stderr_trimmed
@@ -569,24 +710,9 @@ pub(crate) async fn run_plugin(
 }
 
 /// Best-effort pull of an error envelope from stdout bytes.
-fn extract_error_envelope(bytes: &[u8]) -> Result<(String, bool), ()> {
-    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| ())?;
-    let obj = v.as_object().ok_or(())?;
-    let Some(err) = obj.get("error").and_then(|e| e.as_str()) else {
-        return Err(());
-    };
-    let retryable = obj
-        .get("retryable")
-        .and_then(|r| r.as_bool())
-        .unwrap_or(false);
-    if err.trim().is_empty() {
-        return Err(());
-    }
-    // #164: cap like the sibling stderr trim (600 chars): an error
-    // envelope must not ride the full 8 MiB stdout budget onto the
-    // model surface.
-    let msg: String = err.trim().chars().take(600).collect();
-    Ok((msg, retryable))
+fn extract_error_envelope(bytes: &[u8]) -> Option<PluginError> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    PluginError::from_envelope(v.as_object()?)
 }
 
 fn spawn_plugin(name: &str, def: &PluginDef) -> Result<tokio::process::Child, String> {
@@ -669,6 +795,32 @@ impl PluginStore {
             .config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = new_cfg;
+    }
+
+    /// Record the state a plugin reported for itself, and persist
+    /// it: a CLI search is a one-shot process, so an in-memory
+    /// note would be forgotten before the next query.
+    pub fn mark_state(&self, name: &str, state: KeyState) {
+        let mut cfg = self
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cfg.mark_state(name, state);
+        cfg.save();
+    }
+
+    /// Whether this plugin should be spawned, healing an expired
+    /// rate-limit cooldown on the way past.
+    pub fn is_usable(&self, name: &str) -> bool {
+        let mut cfg = self
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (usable, healed) = cfg.take_usable(name);
+        if healed {
+            cfg.save();
+        }
+        usable
     }
 
     /// Snapshot of the plugin definitions (cheap: BTreeMap of
@@ -881,7 +1033,7 @@ mod tests {
     #[test]
     fn parse_envelope_all_dropped_is_error() {
         let env = r#"{"format":1,"results":[{"title":"","url":"https://x.com"}]}"#;
-        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err().to_string();
         assert!(e.contains("failed validation"), "{e}");
     }
 
@@ -921,21 +1073,21 @@ mod tests {
     #[test]
     fn parse_envelope_format_mismatch() {
         let env = r#"{"format":7,"results":[]}"#;
-        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err().to_string();
         assert!(e.contains("unsupported format 7"), "{e}");
     }
 
     #[test]
     fn parse_envelope_missing_results() {
         let env = r#"{"format":1,"foo":1}"#;
-        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err().to_string();
         assert!(e.contains("results"), "{e}");
     }
 
     #[test]
     fn parse_envelope_error_envelope() {
         let env = r#"{"format":1,"error":"rate limit hit","retryable":true}"#;
-        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err().to_string();
         assert!(e.contains("rate limit hit"), "{e}");
     }
 
@@ -946,14 +1098,16 @@ mod tests {
         // sibling stderr.
         let big = "x".repeat(5000);
         let env = format!(r#"{{"format":1,"error":"{big}"}}"#);
-        let e = parse_envelope(env.as_bytes(), "t").unwrap_err();
+        let e = parse_envelope(env.as_bytes(), "t").unwrap_err().to_string();
         let payload = e.strip_prefix("plugin t: ").unwrap();
         assert_eq!(payload.chars().count(), 600, "error text must be capped");
     }
 
     #[test]
     fn parse_envelope_not_json() {
-        let e = parse_envelope(b"<html>oops</html>", "t").unwrap_err();
+        let e = parse_envelope(b"<html>oops</html>", "t")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("not valid JSON"), "{e}");
     }
 
@@ -966,12 +1120,13 @@ mod tests {
 
     #[test]
     fn extract_error_envelope_works() {
-        let (msg, retryable) =
+        let failure =
             extract_error_envelope(br#"{"format":1,"error":"boom","retryable":true}"#).unwrap();
-        assert_eq!(msg, "boom");
-        assert!(retryable);
-        assert!(extract_error_envelope(b"{}").is_err());
-        assert!(extract_error_envelope(b"<html>").is_err());
+        assert_eq!(failure.message, "boom");
+        assert!(failure.retryable);
+        assert_eq!(failure.kind, None);
+        assert!(extract_error_envelope(b"{}").is_none());
+        assert!(extract_error_envelope(b"<html>").is_none());
     }
 
     #[test]
@@ -980,9 +1135,103 @@ mod tests {
         // surface unbounded.
         let big = "y".repeat(8000);
         let env = format!(r#"{{"error":"{big}"}}"#);
-        let (msg, retryable) = extract_error_envelope(env.as_bytes()).unwrap();
-        assert_eq!(msg.chars().count(), 600, "envelope error must be capped");
-        assert!(!retryable);
+        let failure = extract_error_envelope(env.as_bytes()).unwrap();
+        assert_eq!(
+            failure.message.chars().count(),
+            600,
+            "envelope error must be capped"
+        );
+        assert!(!failure.retryable);
+    }
+
+    #[test]
+    fn error_kind_selects_the_key_state() {
+        let cases = [
+            ("invalid_key", Some(KeyState::Invalid)),
+            ("credit_depleted", Some(KeyState::CreditDepleted)),
+            ("rate_limited", Some(KeyState::RateLimited)),
+            ("server_error", None),
+            ("network_error", None),
+        ];
+        for (kind, expected) in cases {
+            let env = format!(r#"{{"format":1,"error":"nope","error_kind":"{kind}"}}"#);
+            let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
+            assert_eq!(e.to_key_state(), expected, "error_kind {kind}");
+        }
+    }
+
+    #[test]
+    fn error_kind_ignores_case_and_padding() {
+        let env = r#"{"format":1,"error":"nope","error_kind":"  Rate_Limited "}"#;
+        let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
+        assert_eq!(e.to_key_state(), Some(KeyState::RateLimited));
+    }
+
+    #[test]
+    fn unknown_error_kind_falls_back_to_retryable() {
+        // A kind from a newer contract than this build knows must not
+        // retire the plugin: it degrades to the pre-error_kind meaning.
+        let env = r#"{"format":1,"error":"nope","error_kind":"teapot","retryable":true}"#;
+        let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
+        assert!(matches!(e, KeyError::ServerError(_)), "{e}");
+        assert_eq!(e.to_key_state(), None);
+    }
+
+    #[test]
+    fn legacy_envelope_keeps_its_old_meaning() {
+        // The compatibility guarantee: a plugin written before
+        // error_kind existed changes no state, either way round.
+        for retryable in [true, false] {
+            let env = format!(r#"{{"format":1,"error":"boom","retryable":{retryable}}}"#);
+            let e = parse_envelope(env.as_bytes(), "p").unwrap_err();
+            assert_eq!(e.to_key_state(), None, "retryable={retryable}");
+            assert!(e.to_string().contains("boom"), "{e}");
+        }
+    }
+
+    #[test]
+    fn plugin_state_gates_selection_and_recovers() {
+        let mut cfg = PluginConfig::empty();
+        cfg.add("p", vec!["true".into()], DEFAULT_TIMEOUT_MS, &keyed())
+            .unwrap();
+        assert_eq!(cfg.take_usable("p"), (true, false));
+
+        cfg.mark_state("p", KeyState::Invalid);
+        assert_eq!(cfg.take_usable("p"), (false, false));
+        cfg.mark_state("p", KeyState::CreditDepleted);
+        assert_eq!(cfg.take_usable("p"), (false, false));
+
+        // Rate limiting is a cooldown, not a death: parked inside
+        // the window, back in the chain once it has passed.
+        cfg.mark_state("p", KeyState::RateLimited);
+        assert_eq!(cfg.take_usable("p"), (false, false));
+        cfg.plugins.get_mut("p").unwrap().ts = now_ts() - RATE_LIMIT_COOLDOWN.as_secs() - 1;
+        assert_eq!(cfg.take_usable("p"), (true, true), "cooldown must expire");
+        assert_eq!(cfg.plugins["p"].state, KeyState::Active);
+
+        assert_eq!(cfg.take_usable("never-registered"), (false, false));
+    }
+
+    #[test]
+    fn re_registering_revives_a_parked_plugin() {
+        // The recovery path for invalid_key and credit_depleted: fix
+        // the credentials the plugin uses, register it again.
+        let mut cfg = PluginConfig::empty();
+        cfg.add("p", vec!["true".into()], DEFAULT_TIMEOUT_MS, &keyed())
+            .unwrap();
+        cfg.mark_state("p", KeyState::Invalid);
+        cfg.add("p", vec!["true".into()], DEFAULT_TIMEOUT_MS, &keyed())
+            .unwrap();
+        assert_eq!(cfg.plugins["p"].state, KeyState::Active);
+        assert_eq!(cfg.take_usable("p"), (true, false));
+    }
+
+    #[test]
+    fn plugin_file_written_before_state_loads_active() {
+        let def: PluginDef =
+            serde_json::from_str(r#"{"cmd":["true"],"timeout_ms":30000}"#).unwrap();
+        assert_eq!(def.state, KeyState::Active);
+        assert_eq!(def.ts, 0);
     }
 
     #[test]
@@ -1010,6 +1259,7 @@ mod tests {
                     .into(),
             ],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let outcome = run_plugin("shecho", &def, "hello world", 5, &Intent::Web)
             .await
@@ -1031,6 +1281,7 @@ mod tests {
                 "echo 'upstream rate limited' >&2; exit 3".into(),
             ],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let e = run_plugin("failer", &def, "q", 5, &Intent::Web)
             .await
@@ -1049,6 +1300,7 @@ mod tests {
                 "echo '<html>oops</html>'".into(),
             ],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let e = run_plugin("garbage", &def, "q", 5, &Intent::Web)
             .await
@@ -1069,6 +1321,7 @@ mod tests {
                     .into(),
             ],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let e = run_plugin("flood", &def, "q", 5, &Intent::Web)
             .await
@@ -1082,6 +1335,7 @@ mod tests {
         let def = PluginDef {
             cmd: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
             timeout_ms: 1_500,
+            ..PluginDef::default()
         };
         let start = Instant::now();
         let e = run_plugin("slowpoke", &def, "q", 5, &Intent::Web)
@@ -1100,6 +1354,7 @@ mod tests {
         let def = PluginDef {
             cmd: vec!["/nonexistent/definitely-not-here-xyz".into()],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let e = run_plugin("ghostbin", &def, "q", 5, &Intent::Web)
             .await
@@ -1122,6 +1377,7 @@ mod tests {
                     .into(),
             ],
             timeout_ms: 15_000,
+            ..PluginDef::default()
         };
         let outcome = run_plugin("chatty", &def, "q", 5, &Intent::Web)
             .await
@@ -1144,6 +1400,7 @@ mod tests {
                 "sleep 3; echo '{\"format\":1,\"results\":[{\"title\":\"c\",\"url\":\"https://c.example\"}]}'".into(),
             ],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let def = std::sync::Arc::new(def);
         let start = Instant::now();
@@ -1189,6 +1446,7 @@ mod tests {
                 bat.to_string_lossy().into_owned(),
             ],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let outcome = run_plugin("winecho", &def, "hello", 5, &Intent::Web)
             .await
@@ -1208,6 +1466,7 @@ mod tests {
                 "echo upstream rate limited 1>&2 & exit /b 3".into(),
             ],
             timeout_ms: 10_000,
+            ..PluginDef::default()
         };
         let e = run_plugin("wfail", &def, "q", 5, &Intent::Web)
             .await

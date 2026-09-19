@@ -243,6 +243,7 @@ impl ByokSearcher {
                 }
             };
             tried.insert((provider.clone(), key.clone()));
+            let is_plugin = plugin_def.is_some();
 
             // Dispatch to the provider adapter.
             let result = match plugin_def {
@@ -305,8 +306,15 @@ impl ByokSearcher {
                     last_error = format!("{provider}: {key_error}");
 
                     // Update key state if this is a key-level error.
+                    // A plugin's credentials live inside the plugin,
+                    // so its state is recorded against the plugin
+                    // rather than against a key we hold.
                     if let Some(new_state) = key_error.to_key_state() {
-                        self.store.update_key_state(&provider, &key, new_state);
+                        if is_plugin {
+                            self.plugins.mark_state(&provider, new_state);
+                        } else {
+                            self.store.update_key_state(&provider, &key, new_state);
+                        }
                     }
 
                     // Transient errors (server, network) don't mark
@@ -321,7 +329,9 @@ impl ByokSearcher {
     /// Combine the two lookups: Try a plugin named as default
     /// first (they live outside the keyed provider chain), then
     /// fall back to keyed providers (default-first), then
-    /// remaining plugins in registration order.
+    /// remaining plugins in registration order. A plugin that
+    /// reported itself invalid, out of credit or rate-limited is
+    /// skipped, the same way pick_key_skipping skips such a key.
     fn pick_any_skipping(
         &self,
         tried: &std::collections::HashSet<(String, String)>,
@@ -332,6 +342,7 @@ impl ByokSearcher {
             let pair = (default.clone(), default.clone());
             if let Some(def) = snap.plugins.get(&default).cloned()
                 && !tried.contains(&pair)
+                && self.plugins.is_usable(&default)
             {
                 return Some((default.clone(), default, Some(def)));
             }
@@ -347,7 +358,9 @@ impl ByokSearcher {
             if tried.contains(&pair) {
                 continue;
             }
-            if let Some(def) = snap.plugins.get(name).cloned() {
+            if let Some(def) = snap.plugins.get(name).cloned()
+                && self.plugins.is_usable(name)
+            {
                 return Some((name.clone(), name.clone(), Some(def)));
             }
         }
