@@ -139,7 +139,7 @@ mod linux {
             // these behind : a new Xvfb can't bind to a stale socket,
             // and our readiness check would see the stale file and
             // think Xvfb is ready when it isn't.
-            let sock_path = format!("/tmp/.X11-unix/X{}", display_num());
+            let sock_path = x_socket_path();
             let x_lock_path = format!("/tmp/.X{}-lock", display_num());
             let _ = std::fs::remove_file(&sock_path);
             let _ = std::fs::remove_file(&x_lock_path);
@@ -182,18 +182,15 @@ mod linux {
                 ))
             })?;
 
-            // Wait for the display to be ready by polling the X11
-            // socket file AND verifying we can connect to it.
-            // Xvfb creates /tmp/.X11-unix/X99 when it's ready to
-            // accept connections. We also try connecting to make
-            // sure the socket is live, not just present.
+            // Wait for the display to be ready by connecting to the
+            // X11 socket Xvfb binds once it accepts clients. Both
+            // namespaces count (see x_socket_alive): on WSLg the
+            // filesystem socket can never appear, and insisting on
+            // it there cost 10s and the headful mode entirely.
             // 10s timeout: WSL and some containers are slower to start.
-            let sock_path = format!("/tmp/.X11-unix/X{}", display_num());
             let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
-                    if std::fs::exists(&sock_path).unwrap_or(false)
-                        && std::os::unix::net::UnixStream::connect(&sock_path).is_ok()
-                    {
+                    if x_socket_alive() {
                         return;
                     }
                     // Check if Xvfb died early.
@@ -205,7 +202,7 @@ mod linux {
             })
             .await;
 
-            if ready.is_err() || !std::fs::exists(&sock_path).unwrap_or(false) {
+            if ready.is_err() || !x_socket_alive() {
                 // Gather the real reason: Xvfb's own final words beat
                 // any generic guess (bad driver, missing xkb dir,
                 // permission problem : none of which are fixed by
@@ -354,6 +351,48 @@ mod linux {
         }
     }
 
+    /// Path of the display's filesystem X11 socket.
+    pub(super) fn x_socket_path() -> String {
+        format!("/tmp/.X11-unix/X{}", display_num())
+    }
+
+    /// Is anyone serving this display? Xvfb binds the socket name
+    /// twice: once under /tmp/.X11-unix, once in the Linux abstract
+    /// namespace (the `@`-prefixed entry in `ss -x`). WSLg mounts
+    /// /tmp/.X11-unix read-only, so there Xvfb can only ever bind
+    /// the abstract one : probing the file alone reports a perfectly
+    /// healthy display as dead, the 10s readiness budget is burned
+    /// on a path that can never appear, and the whole pool silently
+    /// degrades to --headless=new.
+    ///
+    /// The file is tried first: it is the common case, it is what a
+    /// stale-socket check needs (a tombstone file refuses connect),
+    /// and it keeps the fast path one syscall deep.
+    pub(super) fn x_socket_alive() -> bool {
+        let sock = x_socket_path();
+        if std::fs::exists(&sock).unwrap_or(false)
+            && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        {
+            return true;
+        }
+        abstract_socket_alive(&sock)
+    }
+
+    /// Connect to the abstract-namespace twin of `name`. The API is
+    /// Linux/Android-only, which is exactly the platform set this
+    /// module compiles on (`linux_like`).
+    pub(super) fn abstract_socket_alive(name: &str) -> bool {
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixStream};
+
+        SocketAddr::from_abstract_name(name.as_bytes())
+            .map(|addr| UnixStream::connect_addr(&addr).is_ok())
+            .unwrap_or(false)
+    }
+
     /// Check if Xvfb binary is available on the system.
     pub fn is_available() -> bool {
         std::process::Command::new("which")
@@ -365,18 +404,12 @@ mod linux {
             .unwrap_or(false)
     }
 
-    /// Check if an X display is alive by testing the X11
-    /// socket file AND verifying someone is listening. A stale
+    /// Check if an X display is alive by verifying someone is
+    /// listening on its X11 socket, in either namespace. A stale
     /// socket (from a killed Xvfb process) will still have the
     /// file but no server: connecting fails with ECONNREFUSED.
     async fn display_alive() -> bool {
-        let sock = format!("/tmp/.X11-unix/X{}", display_num());
-        if !std::fs::exists(&sock).unwrap_or(false) {
-            return false;
-        }
-        // Socket exists: is anyone listening? Try connecting. If it
-        // fails, the socket is stale.
-        if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+        if !x_socket_alive() {
             return false;
         }
         // A tombstone socket left behind by a zombie'd Xvfb (kill
@@ -506,6 +539,42 @@ mod tests {
             Some("cannot open display :99")
         );
         assert_eq!(x::tail_line("\n  \n"), None);
+    }
+
+    // WSLg mounts /tmp/.X11-unix read-only, so Xvfb there binds only
+    // the abstract-namespace socket. A probe that looks at the file
+    // alone calls that healthy display dead and the pool silently
+    // degrades to --headless=new. Bind a real abstract socket under
+    // a name that has no file behind it and assert the probe sees it.
+    #[test]
+    fn probe_sees_an_abstract_socket_with_no_file_behind_it() {
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+
+        // Unique per run: abstract names are global to the netns.
+        let name = format!("/tmp/.X11-unix/X-donsetch-test-{}", std::process::id());
+        assert!(
+            !std::path::Path::new(&name).exists(),
+            "the test name must have no file behind it"
+        );
+        // Nothing bound yet: the probe must not claim a live display.
+        assert!(!x::abstract_socket_alive(&name));
+
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).expect("abstract name");
+        let listener = UnixListener::bind_addr(&addr).expect("bind abstract");
+        assert!(
+            x::abstract_socket_alive(&name),
+            "a bound abstract socket must read as alive even with no file"
+        );
+
+        drop(listener);
+        assert!(
+            !x::abstract_socket_alive(&name),
+            "unbound abstract socket must read as dead"
+        );
     }
 
     #[test]
