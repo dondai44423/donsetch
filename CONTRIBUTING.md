@@ -14,7 +14,7 @@ cargo build --release                     # core build (fetch, search, crawl, PD
 cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking)
 ```
 
-**Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#install) for platform-specific install commands.
+**Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#-install) for platform-specific install commands.
 
 ## Development workflow
 

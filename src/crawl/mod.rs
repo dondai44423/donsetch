@@ -1270,12 +1270,19 @@ impl Crawler {
                     // the page budget : low-quality pages should not
                     // steal slots from real content. The total_fetched
                     // safety valve (3x cap) prevents infinite loops.
-                    if !duplicate && r.quality < opts_worker.min_quality {
+                    // The skip is a RESULT decision only: the page's
+                    // outlinks are still harvested below, like the
+                    // navigation-only path. A hub page (link list,
+                    // ~zero prose) is the lowest-quality page on a
+                    // site and the one a crawl is seeded from; the
+                    // old `continue` here left the frontier empty
+                    // and reported the crawl complete (#249).
+                    let low_quality = !duplicate && r.quality < opts_worker.min_quality;
+                    if low_quality {
                         skipped
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), format!("low quality ({:.2})", r.quality)));
-                        continue 'work;
                     }
 
                     // Scope gate for results: the seed is ALWAYS
@@ -1301,7 +1308,10 @@ impl Crawler {
                         r.fingerprint.as_deref().is_some_and(|fp| f(&page.url, fp))
                     });
 
-                    if !in_scope {
+                    if low_quality {
+                        // Already recorded in skipped[]; fall through
+                        // to the outlink harvest.
+                    } else if !in_scope {
                         // Navigation-only: don't add to results,
                         // don't count against page budget. Still
                         // harvest outlinks (seed → in-scope pages).
