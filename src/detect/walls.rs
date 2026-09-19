@@ -183,7 +183,6 @@ const INTERSTITIAL_TITLES: &[&str] = &[
 const INTERSTITIAL_MARKERS: &[&str] = &[
     "challenge-platform",
     "cf-chl",
-    "challenges.cloudflare.com",
     "captcha-delivery.com",
     "px-captcha",
     "_Incapsula_Resource",
@@ -212,9 +211,16 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     // Near-empty route: tiny visible text + challenge script + no
     // form (a login/contact page with a Turnstile widget has BOTH a
     // form and real visible text : it must not match).
+    // `challenges.cloudflare.com` is not a marker on its own: it also
+    // serves Turnstile's public embed (`/turnstile/v0/api.js`), which
+    // a short real page keeps loading after the challenge is passed
+    // (scrapingcourse.com's solved page). It counts only with a
+    // widget on the page, the bare `cf-turnstile` shell.
+    let turnstile_shell =
+        text.contains("challenges.cloudflare.com") && text.contains("cf-turnstile");
     let visible = visible_text_count(body);
     if visible < 400
-        && INTERSTITIAL_MARKERS.iter().any(|m| text.contains(m))
+        && (turnstile_shell || INTERSTITIAL_MARKERS.iter().any(|m| text.contains(m)))
         && !text.contains("<form")
         && !text.contains("<input")
     {
@@ -945,6 +951,31 @@ mod tests {
         assert!(detect_interstitial(body).is_some());
         let v = detect_dom_smart(body);
         assert!(matches!(v, Verdict::Challenge(_)), "got {v:?}");
+    }
+
+    /// scrapingcourse.com/cloudflare-challenge 2026-09 golden fixture:
+    /// the ghost DOM after the challenge was passed. A short real page
+    /// (no form) that keeps loading Turnstile's public `api.js`. It
+    /// used to read as an interstitial on every poll, so the ghost
+    /// never settled and the fetch ended walled.
+    #[test]
+    fn cf_solved_page_loading_turnstile_script_is_content() {
+        let body = include_bytes!("../../tests/fixtures/cf-challenge-solved.html");
+        assert!(detect_interstitial(body).is_none());
+        let v = detect_dom_smart(body);
+        assert!(matches!(v, Verdict::ContentOk), "got {v:?}");
+    }
+
+    /// Same URL before the challenge is passed: the live Cloudflare
+    /// interstitial as the ghost rendered it (Linux, Xvfb).
+    #[test]
+    fn cf_live_interstitial_is_challenge() {
+        let body = include_bytes!("../../tests/fixtures/cf-challenge-interstitial.html");
+        let v = detect_dom_smart(body);
+        assert!(
+            matches!(v, Verdict::Challenge(Vendor::Cloudflare)),
+            "got {v:?}"
+        );
     }
 
     /// glassdoor 2026-09 golden fixture: CF block pages put EVERY
