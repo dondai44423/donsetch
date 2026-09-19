@@ -192,7 +192,7 @@ async fn shadow_burst(
                         fetcher.fetch_once_via_class(
                             &asset_url,
                             &[],
-                            None,
+                            crate::transport::proxy::from_env_for(&asset_url).as_ref(),
                             true,
                             Some(page_url),
                             class,

@@ -583,11 +583,28 @@ impl Fetcher {
         let mut conditional = conditional.to_vec();
         let mut hops = 0u8;
         loop {
+            // Ambient proxy, resolved for the CURRENT url and
+            // re-resolved at every hop (curl parity, E15: a redirect
+            // into a NO_PROXY-covered host dials direct instead of
+            // riding the env proxy for the rest of the chain). An
+            // explicit lane stays pinned for the whole chain by design.
+            // Without this the tier-1 persona lane, which every MCP
+            // web_fetch and CLI fetch call rides, ignored
+            // HTTP_PROXY/HTTPS_PROXY entirely: on a host whose only
+            // route out is a forward proxy it died with "Network is
+            // unreachable" while doctor and the archive fallback, both
+            // on fetch_via_jar_opts, reported egress healthy.
+            let env_proxy = if proxy.is_none() {
+                crate::transport::proxy::from_env_for(cur.as_str())
+            } else {
+                None
+            };
+            let effective = proxy.or(env_proxy.as_ref());
             let out = self
                 .fetch_once_via_identity(
                     cur.as_str(),
                     &conditional,
-                    proxy,
+                    effective,
                     use_jar,
                     referer,
                     identity,

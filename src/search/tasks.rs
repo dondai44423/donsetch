@@ -99,15 +99,22 @@ pub(super) async fn engine_task_with_budget(
     let Some(url) = engines::serp_url(&engine, &query) else {
         return (label, Err(("no-url".into(), egress_id, true)));
     };
+    // The search lane hands over a picked egress lane, and with no pool
+    // configured (the default) that is None, which used to mean a DIRECT
+    // dial even with HTTP_PROXY/HTTPS_PROXY set: search engines were
+    // unreachable on any host whose only route out is a forward proxy.
+    // Same convention as every other request path.
+    let env_proxy = if proxy.is_none() {
+        crate::transport::proxy::from_env_for(&url)
+    } else {
+        None
+    };
+    let lane = proxy.as_ref().or(env_proxy.as_ref());
     let out = match tokio::time::timeout_at(deadline, async {
         if let Some(ua) = google_ua {
-            fetcher
-                .fetch_once_via_user_agent(&url, proxy.as_ref(), ua)
-                .await
+            fetcher.fetch_once_via_user_agent(&url, lane, ua).await
         } else {
-            fetcher
-                .fetch_once_via(&url, &[], proxy.as_ref(), false, None)
-                .await
+            fetcher.fetch_once_via(&url, &[], lane, false, None).await
         }
     })
     .await

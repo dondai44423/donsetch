@@ -306,12 +306,9 @@ fn check_binary() -> CheckResult {
 }
 
 async fn check_network(fetcher: &Fetcher) -> CheckResult {
-    match fetcher.fetch("https://example.com").await {
-        Ok(out) if out.status == 200 => CheckResult::Pass(format!(
-            "example.com 200 OK ({:.0}ms)",
-            out.elapsed.as_secs_f64() * 1000.0,
-        )),
-        Ok(out) => CheckResult::Warn(format!("example.com returned HTTP {}", out.status)),
+    let generic = match fetcher.fetch("https://example.com").await {
+        Ok(out) if out.status == 200 => out,
+        Ok(out) => return CheckResult::Warn(format!("example.com returned HTTP {}", out.status)),
         Err(e) => {
             // Egress-filter environments are the one common case
             // where a "network is fine" box still fails every
@@ -345,8 +342,30 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
             } else {
                 "Check your network connection and DNS. Behind an egress proxy? Set [proxy] https/http in donsetch.toml or export HTTPS_PROXY/HTTP_PROXY (NO_PROXY accepted).".into()
             };
-            CheckResult::Fail(e.to_string(), hint)
+            return CheckResult::Fail(e.to_string(), hint);
         }
+    };
+    // The tool lane is a SEPARATE call chain into the same dialer:
+    // fetch_persona, the tier-1 navigation identity that every MCP
+    // web_fetch and CLI fetch rides. Probing it here is what makes this
+    // line a prediction of tool behaviour instead of a prediction of the
+    // update check: a bug that broke only the persona lane once had this
+    // check report healthy egress while every tool call failed, and the
+    // misdiagnosis sent the report to the deployment instead of here.
+    // fetch_persona reports no timing of its own (elapsed is zero on that
+    // path), so only the generic lane's RTT is quoted.
+    match fetcher.fetch_persona("https://example.com", None).await {
+        Ok(t) if t.status == 200 => CheckResult::Pass(format!(
+            "example.com 200 OK ({:.0}ms, generic and tool lanes)",
+            generic.elapsed.as_secs_f64() * 1000.0,
+        )),
+        Ok(t) => CheckResult::Warn(format!(
+            "example.com: the generic lane got HTTP {} but the tool lane (web_fetch) got HTTP {}",
+            generic.status, t.status
+        )),
+        Err(e) => CheckResult::Warn(format!(
+            "example.com: the generic lane reached it but the tool lane (web_fetch) failed: {e}"
+        )),
     }
 }
 
