@@ -5,6 +5,21 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A short page that loads Cloudflare Turnstile's public embed
+  (`challenges.cloudflare.com/turnstile/v0/api.js`) without a form was
+  read as a challenge interstitial, so a browser fetch that had already
+  passed the challenge never settled and ended `walled` after both
+  solve passes. scrapingcourse.com's Cloudflare test page, solved in
+  about 5 s on Windows, came back walled after 42 s; it returns the page
+  in about 10 s now. The embed host alone is no longer an interstitial
+  marker: it counts only with a `cf-turnstile` widget on the page, so a
+  bare Turnstile shell still reads as a challenge. Two golden fixtures
+  pin both sides: the solved page and the live interstitial, its
+  per-visit tokens replaced (Mart-Bogdan).
+
 ## [4.2.5] - 2026-09-19
 
 ### Changed
