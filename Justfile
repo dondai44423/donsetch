@@ -32,7 +32,8 @@
 # more than ~25% of the cores busy, RAM must not go into swap, and the
 # session must stay interactive. Anything resembling "uncapped" is a rule
 # violation even if it looks capped.
-budget := "sh scripts/budget.sh"
+# Absolute, so a recipe that cd's first (fuzz) can still use it.
+budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
 
 # Cargo never GCs stale artifacts: debug/release/fuzz caches grow
 # without bound across dep bumps (110G caught; ~99G was bloat). This
@@ -165,7 +166,7 @@ smoke: bin
 # libFuzzer process plus a second cargo target graph), so it rides the
 # same taskset-bounded budget wrapper as everything else.
 fuzz target:
-    cd fuzz && ../scripts/budget.sh cargo fuzz run {{target}} -s none -- -max_total_time=30
+    cd fuzz && {{budget}} cargo fuzz run {{target}} -s none -- -max_total_time=30
 
 # Release everything in one command. The CHANGELOG [version] section
 # must already exist; the recipe bumps both manifests + the lock,
