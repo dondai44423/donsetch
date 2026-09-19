@@ -44,7 +44,7 @@ clean-bloat:
 # One du + compare (~2s), prune-through only when bloat exists. The
 # second GIB recheck uses 30G so the gate pays no extra rebuild.
 guard:
-	@if [ -d target ] && [ "$$(du -sm target | cut -f1)" -gt 25000 ]; then \
+	@if [ -d target ] && [ "$(du -sm target | cut -f1)" -gt 25000 ]; then \
 		echo "guard: pruning bloat profiles (target > 25G)"; \
 		rm -rf target/debug target/release fuzz/target target/x86_64-pc-windows-gnu; \
 	fi
