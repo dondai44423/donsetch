@@ -128,6 +128,13 @@ pub struct SitemapEntry {
 /// Streaming sitemap parser: finds `<url>`/`<sitemap>` blocks
 /// and lifts `<loc>` + `<lastmod>` from each. Tolerates stray
 /// namespace prefixes and junk between tags.
+/// sitemaps.org caps a <loc> at 2048 characters; a lastmod is a W3C
+/// datetime. Anything past that is not a sitemap entry, and one
+/// 64 MiB <loc> per file × 32 files was 2 GiB of Strings held by the
+/// map, the frontier, the IDF table and the resume token.
+const MAX_LOC_LEN: usize = 2048;
+const MAX_LASTMOD_LEN: usize = 64;
+
 pub fn parse_sitemap(xml: &str, out: &mut Vec<SitemapEntry>, cap: usize) {
     let b = xml.as_bytes();
     let mut pos = 0usize;
@@ -139,8 +146,8 @@ pub fn parse_sitemap(xml: &str, out: &mut Vec<SitemapEntry>, cap: usize) {
             break;
         };
         let block = &xml[tag_off..end];
-        if let Some(loc) = extract_tag(block, "loc") {
-            let lastmod = extract_tag(block, "lastmod");
+        if let Some(loc) = extract_tag(block, "loc").filter(|l| l.len() <= MAX_LOC_LEN) {
+            let lastmod = extract_tag(block, "lastmod").filter(|l| l.len() <= MAX_LASTMOD_LEN);
             // A hostile <priority>NaN</priority> must not reach the
             // frontier score: serde_json serializes non-finite floats
             // as null, and a resume token carrying one would then
@@ -235,7 +242,12 @@ fn xml_text(raw: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(semi) = rest.find(';').filter(|&s| s <= 10) else {
+        // Look for the ';' inside the entity window only. Searching
+        // the whole remainder and filtering afterwards rescanned to
+        // the end on every '&' that has no ';' behind it, O(n²) on a
+        // <loc> made of '&'s: a 64 MiB gz-bombed sitemap held the
+        // worker for hours. ';' is ASCII, so the index is a boundary.
+        let Some(semi) = rest.as_bytes().iter().take(11).position(|&b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -383,7 +395,7 @@ fn absorb(text: String, queue: &mut Vec<String>, entries: &mut Vec<SitemapEntry>
         // publishes sitemap.txt).
         for line in text.lines().take(10_000) {
             let u = line.trim();
-            if u.starts_with("http") {
+            if u.starts_with("http") && u.len() <= MAX_LOC_LEN {
                 here.push(SitemapEntry {
                     loc: u.to_string(),
                     lastmod: None,
@@ -494,6 +506,54 @@ mod tests {
             ]
         );
         assert_eq!(out[0].lastmod.as_deref(), Some("2026-01-02"));
+    }
+
+    // Every '&' without a ';' behind it rescanned the remainder: a
+    // 2M-'&' text took minutes. Linear now.
+    #[test]
+    fn xml_text_is_linear_on_ampersands_without_semicolons() {
+        let raw = "&".repeat(2_000_000);
+        let started = std::time::Instant::now();
+        let out = xml_text(&raw);
+        assert_eq!(out, raw);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        // A ';' far past the entity window must not rescue it either.
+        let raw = format!("{};", "&".repeat(500_000));
+        let started = std::time::Instant::now();
+        assert_eq!(xml_text(&raw), raw);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn oversized_loc_and_lastmod_are_not_entries() {
+        let long = "x".repeat(MAX_LOC_LEN + 1);
+        let ok = "x".repeat(MAX_LOC_LEN - 20);
+        let xml = format!(
+            "<urlset><url><loc>https://ex.com/{long}</loc></url>\
+             <url><loc>https://ex.com/{ok}</loc><lastmod>{long}</lastmod></url></urlset>"
+        );
+        let mut out = Vec::new();
+        parse_sitemap(&xml, &mut out, 100);
+        assert_eq!(out.len(), 1, "the over-long loc is not an entry");
+        assert!(out[0].loc.ends_with(&ok));
+        assert_eq!(
+            out[0].lastmod, None,
+            "an over-long lastmod is dropped, the entry kept"
+        );
+
+        let mut queue = Vec::new();
+        let mut entries = Vec::new();
+        absorb(
+            format!("https://ex.com/{long}\nhttps://ex.com/a\n"),
+            &mut queue,
+            &mut entries,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].loc, "https://ex.com/a");
     }
 
     #[test]

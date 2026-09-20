@@ -5,6 +5,23 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A sitemap element whose text held many `&` without a `;` behind them
+  (a `<loc>` of ampersands; 64 MiB of them fits a small `.xml.gz`)
+  held the crawl's worker for hours: the entity decoder searched the
+  whole remainder for the `;` on every `&` and only then asked
+  whether it was within the ten-character entity window. The search
+  is bounded to the window now, and the decoder is linear.
+- A `<loc>` or `<lastmod>` of any length was kept as a sitemap entry,
+  and a text sitemap line likewise; one 64 MiB entry per file across
+  the 32 files a discovery may read was 2 GiB of strings carried by
+  the map, the frontier, the focus IDF table and the resume token.
+  sitemaps.org caps a `<loc>` at 2048 characters; longer ones are not
+  entries, and a `<lastmod>` past 64 characters is dropped from an
+  otherwise kept entry.
+
 ## [4.2.8] - 2026-09-20
 
 ### Changed
