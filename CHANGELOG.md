@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- With `proxy.fetch_rotate` on, a fetch of a host that does not resolve
+  benched the proxy lane it was riding for ten minutes, on disk. The
+  4.2.5 lane-health sweep read the new `Dns`/`DnsTimeout` variants as
+  the lane's own name failing, but those come from the SSRF guard,
+  which resolves the origin before any lane dials; a lane whose own
+  name fails still arrives as an `Io` from the proxy connect. After as
+  many dead hosts as there are lanes (typos, dead domains, or pages
+  that redirect to one) every lane was benched, `pick_fetch` fell
+  through to `direct`, and the fetch left on the real address with
+  rotation configured. The origin's name now leaves lane health alone
+  (mnaza, #265).
 - A search plugin registered with an empty command (a hand-edited
   `plugins.json`; the CLI refuses one) panicked the daemon on every
   `web_search`. 4.2.5 guarded the doctor against that entry; the search
@@ -21,7 +32,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A plugin result's `title` and `url` were taken verbatim while the
   snippet was capped at 8 KiB. A title is now cut at 512 characters and
   a result with a url over 4 KiB is dropped, counted with the other
-  dropped entries.
+  dropped entries (mnaza, #266).
+- A URL with an IPv6 literal host (`http://[2606:4700::1111]/`, or
+  `http://[::1]:8799/` under the private-egress hatch) failed with a
+  DNS error: the host string keeps its brackets and the resolver does
+  not know `[::1]`. A literal is now answered without a lookup, the
+  same address set a lookup would give, and is judged by the same
+  filter.
+- The SSRF guard judges the IPv4 address embedded in a NAT64 address
+  (`64:ff9b::/96`, `64:ff9b:1::/48`) or a 6to4 address (`2002::/16`),
+  as it already did for the `::ffff:` mapped form. On an IPv6-only
+  network the translator that turns `64:ff9b::a9fe:a9fe` into a packet
+  for 169.254.169.254 sits inside the network, so the v6 form reached
+  what the v4 rule refuses; a literal, a resolved AAAA answer and the
+  connect-time filter all go through this one predicate (mnaza, #267).
+- A sitemap element whose text held many `&` without a `;` behind them
+  (a `<loc>` of ampersands; 64 MiB of them fits a small `.xml.gz`)
+  held the crawl's worker for hours: the entity decoder searched the
+  whole remainder for the `;` on every `&` and only then asked
+  whether it was within the ten-character entity window. The search
+  is bounded to the window now, and the decoder is linear.
+- A `<loc>` or `<lastmod>` of any length was kept as a sitemap entry,
+  and a text sitemap line likewise; one 64 MiB entry per file across
+  the 32 files a discovery may read was 2 GiB of strings carried by
+  the map, the frontier, the focus IDF table and the resume token.
+  sitemaps.org caps a `<loc>` at 2048 characters; longer ones are not
+  entries, and a `<lastmod>` past 64 characters is dropped from an
+  otherwise kept entry (mnaza, #268).
+- A crawl ignored a relative `<base href>` (`<base href="/app/">`, the
+  common form): the base was parsed as an absolute URL, failed, and
+  every link on the page resolved against the page instead, so the
+  pages the site actually links to were never fetched. The base now
+  resolves against the document URL, as a browser does, and a base
+  that is not http(s) is ignored (mnaza, #269).
+- The revalidation cache capped each body at 8 MiB and the entry count
+  at 512, but not what they add up to: a daemon whose agent fetched a
+  few hundred large pages carrying an ETag or a fresh window held up
+  to 4 GiB of them in memory for as long as it ran. Resident bodies
+  are now budgeted at 64 MiB, evicting the oldest entries first, the
+  same order the entry cap uses (mnaza, #270).
 
 ## [4.2.8] - 2026-09-20
 
