@@ -182,7 +182,7 @@ jobs:
         run: |
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # Cache key: <target>-dep-<DEP_HASH>-ci1.
+      # Cache key: <target>-<CACHE_KIND>-dep-<DEP_HASH>-ci1.
       # DEP_HASH hashes Cargo.lock + Cargo.toml with `version`
       # lines stripped. That is the single most important line in
       # this workflow: a release commit bumps the version in
@@ -212,10 +212,30 @@ jobs:
           )
           echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
 
+      # What this job actually BUILDS, which is not always what the
+      # matrix declares: the windows lane is `tests: none` and still
+      # builds the suite on every non-PR event (mirrors the `if:` on
+      # "Test (nextest, Windows core suite, non-PR)" below). The two
+      # shapes must not share a cache entry : `cargo check` leaves
+      # rmeta and no codegen, so a test build that restores a
+      # check-shaped entry recompiles the whole dependency tree, and
+      # rust-cache does not re-save on an exact key hit, so the
+      # wrong shape sticks until DEP_HASH moves. That is what the
+      # windows lane has been doing since it started running tests:
+      # 223 crates recompiled per run, ~7 min.
+      - name: Compute cache kind
+        shell: bash
+        run: |
+          KIND='${{ matrix.tests }}'
+          if [ '${{ matrix.name }}' = 'windows-x86_64' ] && [ '${{ github.event_name }}' != 'pull_request' ]; then
+            KIND=full
+          fi
+          echo "CACHE_KIND=$KIND" >> "$GITHUB_ENV"
+
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-dep-${{ env.DEP_HASH }}-ci1
+          key: ${{ matrix.target }}-${{ env.CACHE_KIND }}-dep-${{ env.DEP_HASH }}-ci1
           add-rust-environment-hash-key: "false"
           # A red run must still warm the cache: the next push is
           # right behind it and should not pay full price again.
