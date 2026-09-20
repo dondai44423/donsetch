@@ -169,6 +169,17 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Every source's title passes through the merge once; a provider
+/// body is bounded only by the 64 MiB fetch cap, and the plugin
+/// adapter already cuts its titles at this length (#266). Cut here
+/// so the rendered line and structuredContent cannot carry a
+/// multi-MiB title from any provider.
+const MAX_TITLE_CHARS: usize = 512;
+
+fn title_of(s: &str) -> String {
+    collapse_ws(s).chars().take(MAX_TITLE_CHARS).collect()
+}
+
 /// Merge all engine hits into one ranked list.
 /// `trust` maps engine -> 0.0..=2.0 (learned EWMA).
 pub fn merge(
@@ -221,7 +232,7 @@ pub fn merge(
             // Normalized once per hit: every comparison below is
             // length-based, so mixing raw and collapsed strings
             // would pick winners by whitespace count.
-            let hit_title = collapse_ws(&hit.title);
+            let hit_title = title_of(&hit.title);
             let hit_snippet = collapse_ws(&hit.snippet);
             let key = norm_key(&hit.url);
             let contribution = tw / (RRF_K + hit.rank as f64 + 1.0);
@@ -468,6 +479,20 @@ mod tests {
             rank,
             published: None,
         }
+    }
+
+    // The plugin adapter cuts its titles (#266); the nine native
+    // providers and the HTML scrapers did not, and this is the one
+    // point every source passes.
+    #[test]
+    fn a_provider_title_is_cut_at_the_merge() {
+        let mut h = hit("https://ex.com/a", 0);
+        h.title = "t".repeat(20_000);
+        let per = vec![("serper".to_string(), vec![h])];
+        let trust = HashMap::new();
+        let out = merge(&per, "q", Intent::Web, &trust, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title.chars().count(), MAX_TITLE_CHARS);
     }
 
     #[test]

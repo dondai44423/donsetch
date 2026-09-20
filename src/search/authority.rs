@@ -432,7 +432,11 @@ fn iso_days_ago(iso: &str) -> Option<i64> {
     let y: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
     let d: i64 = it.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // The year is provider text (an RSS pubDate token, parsed as
+    // i64): days_from_civil does era * 146_097 on it, which
+    // overflows past ~6e13 and wraps into a garbage age in release.
+    // A date outside the Gregorian range is not a date.
+    if !(1..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
     let then = days_from_civil(y, m, d);
@@ -528,6 +532,25 @@ pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A Google News pubDate is provider text; rss_date_to_iso copies
+    // its year token verbatim. i64::MAX as a year overflowed
+    // days_from_civil's era * 146_097 (panic under overflow checks,
+    // a wrapped garbage age in release).
+    #[test]
+    fn an_absurd_year_is_not_a_date_and_does_not_overflow() {
+        assert_eq!(iso_days_ago("9223372036854775807-01-01"), None);
+        assert_eq!(iso_days_ago("-9223372036854775808-01-01"), None);
+        assert_eq!(iso_days_ago("99999999999-06-15"), None);
+        assert_eq!(iso_days_ago("0-01-01"), None);
+        assert!(iso_days_ago("2026-01-01").is_some());
+        assert!(iso_days_ago("9999-12-31").is_some());
+        let iso = crate::search::verticals::rss_date_to_iso(
+            "Thu, 01 Jan 9223372036854775807 00:00:00 GMT",
+        )
+        .unwrap();
+        assert_eq!(iso_days_ago(&iso), None);
+    }
 
     #[test]
     fn official_domains_simple_token() {

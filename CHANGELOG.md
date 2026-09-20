@@ -5,6 +5,20 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A news result whose `pubDate` carried an absurd year (the RSS date
+  token is copied as is) overflowed the freshness arithmetic: a panic
+  under overflow checks, a wrapped garbage age and a wrong freshness
+  multiplier in release. A year outside 1..=9999 is not a date now and
+  ranks neutral, the same gate the cookie jar got for `Expires`.
+- A search result's title from a native provider or a SERP page was
+  taken at any length; the plugin adapter cut its titles at 512
+  characters in 4.2.9 and the other sources did not, so one result
+  could carry a multi-MiB title into the tool text and the structured
+  content. Every source passes the merge once; titles are cut there.
+
 ## [4.2.9] - 2026-09-20
 
 ### Fixed
