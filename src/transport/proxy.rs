@@ -200,9 +200,11 @@ impl Proxy {
         // password both may.
         let (user, pass, addr) = match rest.rsplit_once('@') {
             Some((auth, addr)) => {
-                let (u, p) = auth
-                    .split_once(':')
-                    .ok_or_else(|| FetchError::Http(format!("proxy: bad auth in {s}")))?;
+                let (u, p) = auth.split_once(':').ok_or_else(|| {
+                    FetchError::Http(
+                        "proxy: bad auth (expected scheme://user:pass@host:port)".into(),
+                    )
+                })?;
                 (u.to_string(), p.to_string(), addr)
             }
             None => (String::new(), String::new(), rest),
@@ -210,11 +212,11 @@ impl Proxy {
 
         let (host, port) = addr
             .rsplit_once(':')
-            .ok_or_else(|| FetchError::Http(format!("proxy: bad addr in {s}")))?;
+            .ok_or_else(|| FetchError::Http("proxy: bad address (expected host:port)".into()))?;
         // rsplit_once handles IPv6 brackets too: [::1]:1080 → ("[::1]", "1080")
         let port: u16 = port
             .parse()
-            .map_err(|_| FetchError::Http(format!("proxy: bad port in {s}")))?;
+            .map_err(|_| FetchError::Http(format!("proxy: bad port {port:?}")))?;
         // Strip IPv6 brackets if present.
         let host = host
             .strip_prefix('[')
@@ -766,6 +768,17 @@ mod tests {
     #[test]
     fn proxy_parse_rejects_unsupported_schemes() {
         assert!(Proxy::parse("socks4://127.0.0.1:1080").is_err());
+        // The Debug impl redacts the password; the parse errors used
+        // to echo the whole string, password included, into a
+        // FetchError that can surface in a tool result.
+        for bad in [
+            "http://user:s3cret@host:notaport",
+            "http://user:s3cret@hostonly",
+            "http://users3cret@host:1080",
+        ] {
+            let e = Proxy::parse(bad).unwrap_err().to_string();
+            assert!(!e.contains("s3cret"), "{bad} -> {e}");
+        }
         assert!(Proxy::parse("https://127.0.0.1:3128").is_err());
         assert!(Proxy::parse("ftp://127.0.0.1:21").is_err());
         // supported schemes still parse

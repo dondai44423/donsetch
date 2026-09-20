@@ -5,6 +5,19 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The Bright Data unlocker's answer was read with no size cap, where
+  every other transport stops at 64 MiB: the target page comes back
+  inside a JSON string, then was decoded and base64-encoded for the
+  cache, three copies of whatever size the page chose. It is read in
+  chunks and refused past the same cap now.
+- A malformed proxy entry's error echoed the whole entry, password
+  included, into a fetch error that can surface in a tool result; the
+  Debug form was already redacted. The messages name the expected
+  shape instead.
+
 ## [4.2.9] - 2026-09-20
 
 ### Fixed

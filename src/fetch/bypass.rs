@@ -326,6 +326,30 @@ impl BypassFail {
 ///   JSON `status`/`status_code` wrapper fields).
 ///
 /// Returns (target_status, content_type, body) on success.
+/// The unlocker answers with the target page inside a JSON string,
+/// so its body is the page plus quoting. Every other transport stops
+/// at `transport::MAX_BODY`; reqwest's `bytes()` has no cap, and a
+/// page that large was then copied twice more (the decoded body and
+/// the base64 cache line). Read in chunks and stop at the same cap.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, BypassFail> {
+    let cap = crate::transport::MAX_BODY;
+    let mut out = Vec::new();
+    loop {
+        let chunk = resp
+            .chunk()
+            .await
+            .map_err(|e| BypassFail::Network(format!("bypass response truncated ({e})")))?;
+        let Some(chunk) = chunk else { break };
+        if out.len() + chunk.len() > cap {
+            return Err(BypassFail::Network(format!(
+                "bypass response exceeded the {cap}-byte cap"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 pub fn parse_response(
     api_status: u16,
     headers: &reqwest::header::HeaderMap,
@@ -679,10 +703,7 @@ pub async fn unlock(
     };
     let api_status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| BypassFail::Network(format!("bypass response truncated ({e})")))?;
+    let bytes = read_capped(resp).await?;
     let mut result = parse_response(api_status, &headers, &bytes);
     // One retry for the transient solve classes Bright Data names
     // as retry-friendly: a different unlocker peer frequently
@@ -703,10 +724,7 @@ pub async fn unlock(
         };
         let api_status = resp.status().as_u16();
         let headers = resp.headers().clone();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| BypassFail::Network(format!("bypass response truncated ({e})")))?;
+        let bytes = read_capped(resp).await?;
         result = parse_response(api_status, &headers, &bytes);
     }
     let outcome = result.map(|(status, content_type, body)| BypassOutcome {
@@ -785,6 +803,44 @@ mod tests {
         assert!(check_and_bump_daily(&path, 3));
         assert!(!check_and_bump_daily(&path, 3));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // reqwest's bytes() has no cap; the unlocker's answer is a page
+    // of the attacker's choosing wrapped in JSON.
+    #[tokio::test]
+    async fn an_oversized_unlocker_response_is_refused_at_the_body_cap() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Consume the request head before answering.
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut buf);
+            let total = crate::transport::MAX_BODY + (1 << 20);
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+            );
+            let block = vec![b'x'; 1 << 20];
+            let mut sent = 0usize;
+            while sent < total {
+                if sock.write_all(&block).is_err() {
+                    break;
+                }
+                sent += block.len();
+            }
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        let err = read_capped(resp).await.unwrap_err();
+        assert!(
+            matches!(&err, BypassFail::Network(m) if m.contains("exceeded")),
+            "{err:?}"
+        );
     }
 
     #[test]
