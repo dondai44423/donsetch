@@ -5,6 +5,23 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A URL with an IPv6 literal host (`http://[2606:4700::1111]/`, or
+  `http://[::1]:8799/` under the private-egress hatch) failed with a
+  DNS error: the host string keeps its brackets and the resolver does
+  not know `[::1]`. A literal is now answered without a lookup, the
+  same address set a lookup would give, and is judged by the same
+  filter.
+- The SSRF guard judges the IPv4 address embedded in a NAT64 address
+  (`64:ff9b::/96`, `64:ff9b:1::/48`) or a 6to4 address (`2002::/16`),
+  as it already did for the `::ffff:` mapped form. On an IPv6-only
+  network the translator that turns `64:ff9b::a9fe:a9fe` into a packet
+  for 169.254.169.254 sits inside the network, so the v6 form reached
+  what the v4 rule refuses; a literal, a resolved AAAA answer and the
+  connect-time filter all go through this one predicate.
+
 ## [4.2.8] - 2026-09-20
 
 ### Changed

@@ -79,6 +79,19 @@ fn ttl() -> Option<Duration> {
 /// to nothing, `DnsTimeout` for a resolver that does not answer. Both are
 /// name failures, never policy blocks (see `mcp::server::errors`).
 pub async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, FetchError> {
+    // A literal needs no resolver. `Url::host_str` keeps the brackets
+    // on an IPv6 literal, and getaddrinfo does not know "[::1]", so
+    // every v6-literal URL failed here with a DNS error; the guard's
+    // v6 rules were never reached end to end. Same answer set as a
+    // lookup would give, and nothing to cache.
+    if let Ok(ip) = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+    {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
     let ttl = ttl();
     if let Some(ttl) = ttl
         && let Some(addrs) = cached(host, port, ttl)
@@ -231,6 +244,24 @@ mod tests {
         let e = classify_lookup_error("nope.invalid", &nx);
         assert!(matches!(e, FetchError::Dns(_)), "{e:?}");
         assert!(e.to_string().contains("nope.invalid"));
+    }
+
+    // The bracketed form is what Url::host_str hands over; getaddrinfo
+    // refuses it, so a v6-literal URL never dialed.
+    #[tokio::test]
+    async fn a_bracketed_v6_literal_is_answered_without_the_resolver() {
+        let got = resolve("[::1]", 8080).await.unwrap();
+        assert_eq!(got, vec!["[::1]:8080".parse::<SocketAddr>().unwrap()]);
+        let got = resolve("[2606:4700::1111]", 443).await.unwrap();
+        assert_eq!(
+            got[0].ip(),
+            "2606:4700::1111".parse::<std::net::IpAddr>().unwrap()
+        );
+        let got = resolve("127.0.0.1", 80).await.unwrap();
+        assert_eq!(got, vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()]);
+        let (_, misses_before) = stats();
+        let _ = resolve("[::1]", 1).await.unwrap();
+        assert_eq!(stats().1, misses_before, "a literal is not a cache miss");
     }
 
     // Long-lived daemon, unbounded map: the entry cap has to hold.

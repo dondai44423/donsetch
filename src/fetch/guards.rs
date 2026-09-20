@@ -105,6 +105,19 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                     return is_private_ip(&IpAddr::V4(v4));
                 }
             }
+            // Translated / tunnelled forms carry a v4 address in the
+            // low bits, and the box that turns them back into v4
+            // packets sits INSIDE the network: NAT64 (RFC 6052
+            // well-known 64:ff9b::/96, RFC 8215 local-use
+            // 64:ff9b:1::/48) is how IPv6-only hosts reach v4 at all,
+            // so 64:ff9b::a9fe:a9fe is 169.254.169.254 there. 6to4
+            // (2002:V4::/16) embeds it in the next 32 bits. Judge the
+            // embedded address, as the mapped form above is judged.
+            if let Some(v4) = embedded_ipv4(v6)
+                && is_private_ip(&IpAddr::V4(v4))
+            {
+                return true;
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -119,6 +132,26 @@ fn is_private_ip(ip: &IpAddr) -> bool {
                 || (v6.segments()[0] == 0x0100)
         }
     }
+}
+
+/// The IPv4 address a NAT64 or 6to4 IPv6 address stands for, if any.
+fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    let low = |a: u16, b: u16| std::net::Ipv4Addr::from(((a as u32) << 16) | b as u32);
+    // NAT64 well-known prefix 64:ff9b::/96 and local-use 64:ff9b:1::/48.
+    if s[0] == 0x0064 && s[1] == 0xff9b {
+        if s[2..6] == [0, 0, 0, 0] {
+            return Some(low(s[6], s[7]));
+        }
+        if s[2] == 0x0001 {
+            return Some(low(s[6], s[7]));
+        }
+    }
+    // 6to4: 2002:AABB:CCDD::/48 stands for AA.BB.CC.DD.
+    if s[0] == 0x2002 {
+        return Some(low(s[1], s[2]));
+    }
+    None
 }
 
 /// Centralized URL safety check (synchronous part).
@@ -394,6 +427,53 @@ mod tests {
         assert!(is_ssrf_host("[::ffff:10.0.0.1]"));
         assert!(is_ssrf_host("[fd12:3456::1]"));
         assert!(is_ssrf_host("[fe80::1]"));
+    }
+
+    // End to end through the async tier: the literal now reaches
+    // dns::resolve as an answer (no lookup) and is judged there too.
+    #[tokio::test]
+    async fn ensure_url_safe_refuses_a_nat64_literal_and_reads_a_public_v6_literal() {
+        let e = ensure_url_safe("http://[64:ff9b::a9fe:a9fe]/")
+            .await
+            .unwrap_err();
+        assert!(matches!(e, crate::error::FetchError::Ssrf(_)), "{e:?}");
+        let e = ensure_url_safe("http://[::1]:8799/").await.unwrap_err();
+        assert!(matches!(e, crate::error::FetchError::Ssrf(_)), "{e:?}");
+        // A public v6 literal used to die here with Dns("[2606:...]").
+        let u = ensure_url_safe("http://[2606:4700::1111]/").await.unwrap();
+        assert_eq!(u.host_str(), Some("[2606:4700::1111]"));
+    }
+
+    // A NAT64 translator delivers 64:ff9b::<v4> to <v4> from inside
+    // the network; 6to4 embeds the v4 address the same way. The
+    // embedded address is judged like the mapped form, at every tier
+    // (literal, resolved AAAA, connect-time filter share this
+    // predicate).
+    #[test]
+    fn ssrf_blocks_nat64_and_6to4_embedding_a_private_v4() {
+        // NAT64 well-known prefix: metadata, loopback, RFC1918.
+        assert!(is_ssrf_host("[64:ff9b::a9fe:a9fe]"));
+        assert!(is_ssrf_host("[64:ff9b::7f00:1]"));
+        assert!(is_ssrf_host("[64:ff9b::169.254.169.254]"));
+        assert!(is_ssrf_host("[64:ff9b::10.0.0.1]"));
+        // RFC 8215 local-use prefix.
+        assert!(is_ssrf_host("[64:ff9b:1::7f00:1]"));
+        assert!(is_ssrf_host("[64:ff9b:1:abcd::a9fe:a9fe]"));
+        // 6to4 with an embedded loopback / link-local.
+        assert!(is_ssrf_host("[2002:7f00:1::1]"));
+        assert!(is_ssrf_host("[2002:a9fe:a9fe::]"));
+        // The same forms around a public v4 stay reachable.
+        assert!(!is_ssrf_host("[64:ff9b::5db8:d822]")); // 93.184.216.34
+        assert!(!is_ssrf_host("[64:ff9b:1::5db8:d822]"));
+        assert!(!is_ssrf_host("[2002:5db8:d822::1]"));
+        // Neighbouring prefixes are ordinary global addresses.
+        assert!(!is_ssrf_host("[64:ff9c::7f00:1]"));
+        assert!(!is_ssrf_host("[2003:7f00:1::1]"));
+        let ip: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert!(
+            is_ssrf_resolved_ip(&ip),
+            "a resolved AAAA is judged the same way"
+        );
     }
 
     #[test]
