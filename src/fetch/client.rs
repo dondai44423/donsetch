@@ -329,12 +329,7 @@ impl Fetcher {
                 Ok(o) => o,
                 Err(e) => {
                     if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
-                        match lane_note(&e) {
-                            Some(LaneNote::Timeout) => pool.note_fetch_timeout(&fetch_host, id),
-                            Some(LaneNote::AuthFail) => pool.note_fetch_auth_fail(&fetch_host, id),
-                            Some(LaneNote::Dead) => pool.note_fetch_dead(&fetch_host, id),
-                            None => {}
-                        }
+                        note_lane_outcome(pool, &fetch_host, id, &e);
                     }
                     return Err(e);
                 }
@@ -1237,15 +1232,38 @@ enum LaneNote {
 /// (the message reads "dns timeout", which `contains("timed out")`
 /// never matched).
 ///
-/// A lane dials with the target host but resolves its own, so a name
-/// failure here belongs to the lane, not the origin. A policy refusal
-/// (`Ssrf`) is about the URL and a protocol error is about the origin:
-/// neither says anything about the lane.
+/// Lane accounting for one failed hop on a pool lane.
+fn note_lane_outcome(
+    pool: &crate::search::egress::EgressPool,
+    host: &str,
+    egress_id: &str,
+    e: &FetchError,
+) {
+    match lane_note(e) {
+        Some(LaneNote::Timeout) => pool.note_fetch_timeout(host, egress_id),
+        Some(LaneNote::AuthFail) => pool.note_fetch_auth_fail(host, egress_id),
+        Some(LaneNote::Dead) => pool.note_fetch_dead(host, egress_id),
+        None => {}
+    }
+}
+
+/// `Dns`/`DnsTimeout` are the ORIGIN's name, never the lane's: the
+/// only producer is `transport::dns::resolve`, reached from the SSRF
+/// guard (which resolves the target before any lane dials, proxy
+/// lanes included) and from the direct dials. A lane's own name
+/// failing arrives as `Io` from `TcpStream::connect` in
+/// `transport::proxy`. Benching the lane for the target's NXDOMAIN
+/// retired every lane after N dead hosts (or N pages redirecting to
+/// one) and `pick_fetch` then fell through to direct: the fetch left
+/// on the real address with rotation configured. A policy refusal
+/// (`Ssrf`) is about the URL and a protocol error is about the
+/// origin: neither says anything about the lane either.
 fn lane_note(e: &FetchError) -> Option<LaneNote> {
     let msg = e.to_string();
     match e {
-        FetchError::Timeout | FetchError::DnsTimeout(_) => Some(LaneNote::Timeout),
-        FetchError::Dns(_) | FetchError::Io(_) | FetchError::Tls(_) => Some(LaneNote::Dead),
+        FetchError::Dns(_) | FetchError::DnsTimeout(_) => None,
+        FetchError::Timeout => Some(LaneNote::Timeout),
+        FetchError::Io(_) | FetchError::Tls(_) => Some(LaneNote::Dead),
         // A proxy that demands credentials. Ahead of the text arms:
         // "CONNECT -> 407" must never read as a dead lane.
         _ if msg.contains("CONNECT -> 407") => Some(LaneNote::AuthFail),
@@ -1261,23 +1279,24 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
 mod transport_exit_tests {
     use super::*;
 
-    // #248 split Dns/DnsTimeout out of Io/Timeout; this site's lane
-    // accounting kept matching the old variants, so a proxy lane was
-    // never retired when its own name stopped resolving, and a resolver
-    // timeout was not counted at all.
+    // #248 split Dns/DnsTimeout out of Io/Timeout. Those variants
+    // describe the ORIGIN's name (the guard resolves the target before
+    // the lane dials; the lane's own name fails as Io from the proxy
+    // connect), so they must leave lane health alone: the first sweep
+    // benched the lane for the target's NXDOMAIN.
     #[test]
     fn lane_notes_know_the_dns_variants() {
         assert_eq!(
             lane_note(&FetchError::Dns(
-                "could not resolve gw.example: no such host".into()
+                "could not resolve nope.invalid: no such host".into()
             )),
-            Some(LaneNote::Dead)
+            None
         );
         assert_eq!(
             lane_note(&FetchError::DnsTimeout(
-                "the resolver did not answer within 5s for gw.example".into()
+                "the resolver did not answer within 5s for nope.invalid".into()
             )),
-            Some(LaneNote::Timeout)
+            None
         );
         assert_eq!(lane_note(&FetchError::Timeout), Some(LaneNote::Timeout));
         assert_eq!(
@@ -1297,6 +1316,61 @@ mod transport_exit_tests {
             None
         );
         assert_eq!(lane_note(&FetchError::Http("parser died".into())), None);
+    }
+
+    // The consequence, on a real pool: N fetches of hosts that do not
+    // resolve must not retire the proxy lanes, because once every lane
+    // is benched `pick_fetch(_, direct_ok=true)` hands back "direct"
+    // and a rotation-configured fetch leaves on the real address.
+    #[test]
+    fn a_dead_target_name_does_not_bench_the_lane_or_fall_through_to_direct() {
+        use crate::search::egress::EgressPool;
+        use crate::transport::proxy::Proxy;
+        let dir = std::env::temp_dir().join(format!("donsetch-lane-dns-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // SAFETY: test-only mutation of the process env; nextest runs
+        // each test in its own process.
+        unsafe {
+            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
+        }
+        let proxy = Proxy::parse("http://127.0.0.1:34567").unwrap();
+        let id = proxy.id();
+        let pool = EgressPool::new(vec![proxy]);
+        let lane = pool.pick_fetch("nope.invalid", true).unwrap();
+        assert_eq!(lane.id, id, "a healthy proxy lane is picked first");
+
+        for _ in 0..3 {
+            note_lane_outcome(
+                &pool,
+                "nope.invalid",
+                &id,
+                &FetchError::Dns("could not resolve nope.invalid: no such host".into()),
+            );
+            note_lane_outcome(
+                &pool,
+                "nope.invalid",
+                &id,
+                &FetchError::DnsTimeout("the resolver did not answer within 5s".into()),
+            );
+        }
+        assert!(
+            !pool.is_dead(&id),
+            "the origin's name is not the lane's fault"
+        );
+        assert_eq!(
+            pool.pick_fetch("nope.invalid", true).map(|e| e.id),
+            Some(id.clone()),
+            "the lane stays on the proxy; direct is not reached"
+        );
+        // The lane's OWN connect failing is still a dead lane.
+        note_lane_outcome(
+            &pool,
+            "nope.invalid",
+            &id,
+            &FetchError::Io(std::io::Error::other("connection refused")),
+        );
+        assert!(pool.is_dead(&id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The h3 lane used to hand back a literal Verdict::ContentOk for

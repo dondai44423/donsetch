@@ -5,6 +5,20 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- With `proxy.fetch_rotate` on, a fetch of a host that does not resolve
+  benched the proxy lane it was riding for ten minutes, on disk. The
+  4.2.5 lane-health sweep read the new `Dns`/`DnsTimeout` variants as
+  the lane's own name failing, but those come from the SSRF guard,
+  which resolves the origin before any lane dials; a lane whose own
+  name fails still arrives as an `Io` from the proxy connect. After as
+  many dead hosts as there are lanes (typos, dead domains, or pages
+  that redirect to one) every lane was benched, `pick_fetch` fell
+  through to `direct`, and the fetch left on the real address with
+  rotation configured. The origin's name now leaves lane health alone.
+
 ## [4.2.8] - 2026-09-20
 
 ### Changed
