@@ -11,13 +11,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The integration tests build as one binary instead of ten. Every file
   directly under `tests/` was its own crate, so each one linked the whole
   library and dependency tree again and re-generated the library's generic
-  code it used; they are now modules of `tests/it/`. At the `ci` profile's
-  opt-level 3 that cut the integration tests' compile time from about 93s
-  of combined unit time to under 9s on a local build. nextest still runs
-  every test in its own process, so isolation is unchanged. A new
-  integration test goes in `tests/it/` with a `mod` line in
-  `tests/it/main.rs`: a new top-level `tests/*.rs` file would quietly
-  become a separate binary again (Mart-Bogdan).
+  code it used; they are now modules of `tests/it/`, sharing one link. At
+  the `ci` profile's opt-level 3 the integration tests' combined unit time
+  drops from 81.5s to 10.1s on a local build. On a machine with spare cores
+  the wall time does not move (those units were never on the critical
+  path); the gain is where cores are scarce, about 5% on the linux-x86_64
+  lane and about 9% on a warm Windows lane. nextest still runs every test
+  in its own process, so the isolation the `DONSETCH_CACHE_DIR` tests rely
+  on is unchanged. A new integration test goes in `tests/it/` with a `mod`
+  line in `tests/it/main.rs`: a new top-level `tests/*.rs` file would
+  quietly become a separate binary again (Mart-Bogdan).
+
+### Fixed
+- The `[meta]` block no longer runs into the document's first line. In
+  text-only mode the fold prepends `[meta] {...}` as its own content block,
+  but a separate block carries no boundary to the model: most harnesses
+  concatenate the blocks, and Claude Code joins adjacent text blocks with no
+  delimiter at all, so `...example.com/"}# Example Domain` arrived glued and
+  the heading stopped being markdown. The meta line ends with a blank line
+  now. Two newlines rather than one, because a single `\n` only separates
+  content that can interrupt a paragraph in CommonMark (an ATX heading, a
+  fence, a thematic break), and a page opening with a plain paragraph or a
+  table row would lazily continue the `[meta]` line instead, which is the
+  same failure with none of the visibility. Every tool emits exactly one
+  text block and the fold is the only place a second one is prepended, so
+  one change covers `web_fetch`, `web_search`, `web_crawl` and
+  `web_screenshot`. Harmless where a client does keep the blocks apart: a
+  trailing blank line is trimmed on render, and OpenCode already joins text
+  blocks with `\n\n` of its own, so there it doubles a separator that was
+  going to be there anyway and still reads as one paragraph break.
 
 ## [4.2.6] - 2026-09-19
 

@@ -151,9 +151,25 @@ pub fn shape_result(mut result: Value) -> Value {
     }
     // Prepend, not append: next_offset / resume / next_action stay
     // visible even when only the head of a long response is read.
-    // A separate block, never concatenated: agents read the two
-    // surfaces as different kinds of information.
-    let meta_text = format!("[meta] {}", Value::Object(meta));
+    //
+    // Trailing blank line, despite these being separate blocks: most
+    // models just see the blocks concatenated. Sometimes that is a
+    // model restriction, otherwise the harness concatenates them --
+    // Claude Code joins text blocks with no delimiter at all, so
+    // `...example.com/"}# Heading` arrives glued and the heading stops
+    // being markdown. Two newlines, not one: a single `\n` only works
+    // for content that can interrupt a paragraph in CommonMark (ATX
+    // headings, fences, rules); a page opening with a plain paragraph
+    // or a table row would lazily continue the `[meta]` line instead.
+    // Extra line breaks are harmless everywhere, so this is safe to
+    // apply unconditionally: markdown collapses consecutive blank
+    // lines, and a client that keeps the blocks distinct trims the
+    // trailing one on render. OpenCode already joins adjacent text
+    // blocks with `\n\n` of its own, so there it merely doubles a
+    // separator that was going to be there anyway -- still one
+    // paragraph break, nothing lost for agents that do tell the two
+    // surfaces apart.
+    let meta_text = format!("[meta] {}\n\n", Value::Object(meta));
     let mut content = result
         .get("content")
         .and_then(Value::as_array)
@@ -196,6 +212,9 @@ mod tests {
         assert!(meta.starts_with("[meta] "));
         assert!(meta.contains("\"next_offset\":4096"));
         assert!(meta.contains("content_ok"));
+        // Blank line at the end: clients that concatenate the blocks
+        // must not glue the meta JSON onto the document's first line.
+        assert!(meta.ends_with("}\n\n"));
         // The document block is untouched and second.
         assert_eq!(content[1]["text"], "# Example page\n\nbody");
         assert_eq!(content[1]["type"], "text");
