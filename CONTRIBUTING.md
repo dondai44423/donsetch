@@ -39,6 +39,11 @@ those compile another artifact graph, and recompiling it is the slowest thing in
 this repository. CI is the full gate (5 platforms, in parallel); `just all` is
 the only local gate you need before pushing.
 
+A Windows-shaped failure fails the gate: the Windows lane runs the core suite on
+master pushes, tags and the nightly, while PR cycles keep a compile-only check
+there because the MSVC link is the expensive part. `macos-x86_64` is still
+compile-only for the same reason.
+
 [`sccache`](https://github.com/mozilla/sccache) is picked up automatically when
 installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
 profiles, feature sets and branches become cache hits, and it wraps the C/C++
