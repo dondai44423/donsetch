@@ -5,6 +5,16 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A crawl scope pattern with several `*` (`/*/docs/*/api/*`) matched
+  against a link the page chose could hold the crawl worker for hours:
+  the glob matcher tried every split at every `*`, exponential on a
+  mismatch, and one 8 KiB href with the right shape was enough. The
+  matcher is iterative and polynomial now; every pattern that matched
+  before still matches, and only that.
+
 ## [4.2.9] - 2026-09-20
 
 ### Fixed

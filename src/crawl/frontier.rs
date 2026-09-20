@@ -228,23 +228,36 @@ pub fn glob_match(pat: &str, s: &str) -> bool {
     glob_at(pat.as_bytes(), s.as_bytes())
 }
 
-fn glob_at(pat: &[u8], s: &[u8]) -> bool {
-    if pat.is_empty() {
-        return s.is_empty();
-    }
-    match pat[0] {
-        b'*' => {
-            // '*' consumes zero or more.
-            for skip in 0..=s.len() {
-                if glob_at(&pat[1..], &s[skip..]) {
-                    return true;
-                }
-            }
-            false
+/// Iterative last-star matcher: O(n·m) on a non-matching pair. The
+/// recursive shape before it tried every split at every `*`, O(n^k)
+/// for k stars, and both inputs are attacker-influenced: the
+/// pattern is a caller's `include_paths` (a legitimate
+/// `/*/docs/*/api/*` has three) and the path is a link the fetched
+/// page chose, so one 8 KiB href held the crawl worker for hours.
+fn glob_at(p: &[u8], t: &[u8]) -> bool {
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // The last `*` and the text position it currently covers up to;
+    // on a mismatch it eats one more character and we retry.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, ti));
+        } else {
+            return false;
         }
-        c if !s.is_empty() && s[0] == c => glob_at(&pat[1..], &s[1..]),
-        _ => false,
     }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// The crawl frontier: queued URLs with per-URL priority.
@@ -569,6 +582,35 @@ mod tests {
         assert!(glob_match("*", ""));
         assert!(glob_match("*/x", "a/b/x"));
         assert!(!glob_match("*/x", "a/b/y"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(!glob_match("a", ""));
+        assert!(glob_match("a**b", "ab"));
+        assert!(glob_match("/*/docs/*/api/*", "/v1/docs/x/api/y"));
+        assert!(!glob_match("/*/docs/*/api/*", "/v1/docs/x/apix/y"));
+        assert!(glob_match("*a*b*c", "xxaxxbxxc"));
+        assert!(!glob_match("*a*b*c", "xxaxxbxx"));
+    }
+
+    // Both inputs are attacker-influenced: a caller's multi-star
+    // include pattern against a link path the page chose must not
+    // take exponential time on a mismatch.
+    #[test]
+    fn glob_match_is_polynomial_on_a_hostile_pair() {
+        let pat = format!("/{}b", "*a".repeat(30));
+        let path = format!("/{}", "a".repeat(3000));
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pat, &path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // The documented three-star shape against an 8 KiB href.
+        let path = format!("/v1/docs/{}/apix/y", "x".repeat(8000));
+        let started = std::time::Instant::now();
+        assert!(!glob_match("/*/docs/*/api/*", &path));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
