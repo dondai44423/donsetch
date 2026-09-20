@@ -289,16 +289,29 @@ fn find_blobs(html: &str) -> Vec<Blob> {
     let mut out: Vec<Blob> = Vec::new();
 
     // 1. Known JS globals: `var NAME = <json>` or `window.NAME = <json>`.
-    for key in KNOWN_GLOBALS {
+    //
+    // A failed value scan runs to the end of the document (no brace
+    // after the marker, or one that never closes), and the marker is
+    // page text: a page repeating `window.__NEXT_DATA__ = ` with no
+    // value made every occurrence rescan the rest, N × the document.
+    // A real page has a handful of markers, each scanned once, so a
+    // budget of a few document lengths covers it; past it the
+    // remaining markers are left alone.
+    let mut budget = html.len().saturating_mul(SCAN_BUDGET_MULTIPLIER);
+    'keys: for key in KNOWN_GLOBALS {
         let search = format!("{key} = ");
         let mut from = 0;
         while let Some(idx) = html[from..].find(&search) {
             let start = from + idx + search.len();
-            if let Some((raw, consumed)) = extract_js_value(&html[start..]) {
+            let (found, scanned) = extract_js_value_counted(&html[start..]);
+            budget = budget.saturating_sub(scanned);
+            if let Some((raw, consumed)) = found {
                 if !out.iter().any(|b: &Blob| b.raw == raw) {
                     out.push(Blob { raw });
                 }
                 from = start + consumed;
+            } else if budget == 0 {
+                break 'keys;
             } else {
                 // Advance to the next CHAR boundary (a replacement
                 // char is 3 bytes; a naive +1 slices mid-char), and
@@ -576,7 +589,14 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
 /// this to advance past the value, not into it: using the raw
 /// string's length alone misses bytes between the search match
 /// and the opening bracket, which can land mid-character.
-fn extract_js_value(s: &str) -> Option<(String, usize)> {
+/// Bytes the global-assignment scan may examine per document, as a
+/// multiple of the document length.
+const SCAN_BUDGET_MULTIPLIER: usize = 4;
+
+/// The first balanced `{…}`/`[…]` after the marker, with the number
+/// of bytes examined so the caller can bound the total work over
+/// many markers.
+fn extract_js_value_counted(s: &str) -> (Option<(String, usize)>, usize) {
     let bytes = s.as_bytes();
     let mut start = None;
     for (i, &b) in bytes.iter().enumerate() {
@@ -585,7 +605,9 @@ fn extract_js_value(s: &str) -> Option<(String, usize)> {
             break;
         }
     }
-    let start = start?;
+    let Some(start) = start else {
+        return (None, bytes.len());
+    };
     let open = bytes[start];
     let mut depth = 0usize;
     let mut in_str = false;
@@ -609,13 +631,13 @@ fn extract_js_value(s: &str) -> Option<(String, usize)> {
                 depth = depth.saturating_sub(1);
                 if depth == 0 && b == close {
                     let raw = &s[start..=i];
-                    return Some((raw.to_string(), i + 1));
+                    return (Some((raw.to_string(), i + 1)), i + 1);
                 }
             }
             _ => {}
         }
     }
-    None
+    (None, bytes.len())
 }
 
 // ── JSON walk ─────────────────────────────────────────────────
@@ -953,6 +975,27 @@ mod tests {
         ])
         .into_owned();
         let _ = find_blobs(&html);
+    }
+
+    // Every marker with no value behind it rescanned the rest of the
+    // document: 512 KiB of them was minutes.
+    #[test]
+    fn repeated_valueless_markers_are_bounded_by_the_scan_budget() {
+        let html = "window.__NEXT_DATA__ = ".repeat(512 * 1024 / 23);
+        let started = std::time::Instant::now();
+        let blobs = find_blobs(&html);
+        assert!(blobs.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        // The same markers with a value at the end: the value is
+        // still found, once, before the budget matters.
+        let html = format!("{}{{\"a\":1}}", "window.__NEXT_DATA__ = ".repeat(1000));
+        let blobs = find_blobs(&html);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].raw, "{\"a\":1}");
     }
 
     #[test]

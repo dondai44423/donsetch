@@ -1804,6 +1804,46 @@ fn jsonld_unicode_escape_decoded() {
 // 24. TABLE WITHOUT <th> : FIRST ROW PROMOTED TO HEADERS
 // ════════════════════════════════════════════════════════════
 
+// Tables nested d deep: the table scans used descendant selects, so
+// every level re-scanned every nested cell below it, quadratic per
+// level and the walk recursed a level and repeated it. 1000 levels
+// (18 KB) took minutes on the tokio worker.
+#[test]
+fn deeply_nested_tables_extract_in_linear_time() {
+    let d = 1000;
+    let html = format!(
+        "<html><body><article>{}x{}</article></body></html>",
+        "<table><tr><td>".repeat(d),
+        "</td></tr></table>".repeat(d)
+    );
+    let started = std::time::Instant::now();
+    let r = extract_html(&html);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(r.markdown.contains('x'));
+}
+
+// A table nested in a cell is that cell's content, not extra rows of
+// the outer table.
+#[test]
+fn nested_table_rows_are_not_merged_into_the_outer_table() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>inner</td><td><table><tr><td>a</td></tr><tr><td>b</td></tr><tr><td>c</td></tr></table></td></tr>
+<tr><td>after</td><td>done</td></tr>
+</table>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(r.markdown.contains("| Key | Value |"), "{}", r.markdown);
+    assert!(r.markdown.contains("| after | done |"), "{}", r.markdown);
+    // The inner rows do not become `| a |` rows of the outer table.
+    assert!(!r.markdown.contains("| a |"), "{}", r.markdown);
+}
+
 #[test]
 fn table_without_th_promotes_first_row() {
     let html = r#"<html><body><article>
@@ -2494,4 +2534,41 @@ fn fallback_br_line_and_paragraph_breaks() {
         !m.contains("\n "),
         "no leading space after any br newline, got: {m:?}"
     );
+}
+
+// html5ever's tree builder scans the open-element stack per tag,
+// O(n²) in nesting depth with no cap (browsers stop at 512): 4 000
+// nested <div> parsed in 3.4 s here, a 1 MiB page of them is hours,
+// on the thread that parses. The gate refuses such a body before the
+// parse; a wide page of the same size is untouched.
+#[test]
+fn a_page_nested_thousands_deep_is_refused_before_the_parse() {
+    let n = 50_000;
+    let html = format!(
+        "<html><body><article>{}x{}</article></body></html>",
+        "<div>".repeat(n),
+        "</div>".repeat(n)
+    );
+    let started = std::time::Instant::now();
+    let err = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://ex.com/",
+        &ExtractOptions::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("nested deeper"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    // Same byte count, wide instead of deep: extracted as usual.
+    let html = format!(
+        "<html><body><article>{}</article></body></html>",
+        "<p>a paragraph with enough words to be kept by the extractor here</p>".repeat(n / 10)
+    );
+    let r = extract_html(&html);
+    assert!(r.markdown.contains("a paragraph"));
 }

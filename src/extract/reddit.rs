@@ -15,6 +15,11 @@ use super::{ContentKind, ExtractOptions, Extracted, inline};
 
 /// Entry point. Tries the reddit extractor; returns `None`
 /// to signal "not reddit, or unrecognized : use generic".
+/// Nesting the renderers follow before stopping. blocks.rs and
+/// math.rs cap theirs; these recursed unbounded, and a deep enough
+/// `<div>`/`<ul>` nest under a comment overflowed the stack (abort).
+const MAX_DEPTH: usize = 100;
+
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
     // Respect explicit selectors and TOC : let DonSift handle.
     if opts.selector.is_some() || opts.toc {
@@ -286,6 +291,9 @@ fn render_comment(
     opts: &ExtractOptions,
     count: &mut usize,
 ) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     let indent = "  ".repeat(depth.min(6));
 
     let author = el.value().attr("data-author").unwrap_or("[deleted]");
@@ -348,6 +356,13 @@ fn render_comment(
 // ── Reddit .md content → markdown ──────────────────────────────
 
 fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
+    render_md_at(el, url, opts, 0)
+}
+
+fn render_md_at(el: ElementRef, url: &str, opts: &ExtractOptions, depth: usize) -> String {
+    if depth > MAX_DEPTH {
+        return String::new();
+    }
     // Reddit comments always need links : links to playgrounds,
     // docs, code are content, not navigation.
     let md_opts = ExtractOptions {
@@ -387,7 +402,7 @@ fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                         }
                     }
                     "blockquote" => {
-                        let inner = render_md(c, url, opts);
+                        let inner = render_md_at(c, url, opts, depth + 1);
                         for line in inner.lines() {
                             if line.is_empty() {
                                 out.push_str(">\n");
@@ -398,11 +413,11 @@ fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                         out.push('\n');
                     }
                     "ul" => {
-                        render_list(c, url, false, 0, &mut out, &md_opts);
+                        render_list(c, url, false, depth + 1, &mut out, &md_opts);
                         out.push('\n');
                     }
                     "ol" => {
-                        render_list(c, url, true, 0, &mut out, &md_opts);
+                        render_list(c, url, true, depth + 1, &mut out, &md_opts);
                         out.push('\n');
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -417,7 +432,7 @@ fn render_md(el: ElementRef, url: &str, opts: &ExtractOptions) -> String {
                     }
                     // Unknown block: recurse for nested content.
                     "div" => {
-                        let inner = render_md(c, url, opts);
+                        let inner = render_md_at(c, url, opts, depth + 1);
                         if !inner.is_empty() {
                             out.push_str(&inner);
                         }
@@ -446,8 +461,17 @@ fn render_list(
     out: &mut String,
     opts: &ExtractOptions,
 ) {
-    let li_sel = Selector::parse("li").unwrap();
-    for (i, li) in el.select(&li_sel).enumerate() {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    // The list's own items: a descendant select also returned every
+    // item of every nested list, rendering each of them once per
+    // ancestor and making a deep nest quadratic.
+    let items = el
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|c| c.value().name() == "li");
+    for (i, li) in items.enumerate() {
         let prefix = if ordered {
             format!("{}. ", i + 1)
         } else {
@@ -458,9 +482,12 @@ fn render_list(
         if !m.is_empty() {
             out.push_str(&format!("{indent}{prefix}{m}\n"));
         }
-        // Nested lists.
-        let nested_sel = Selector::parse("ul, ol").unwrap();
-        for nested in li.select(&nested_sel) {
+        // Nested lists: the item's own.
+        let nested = li
+            .children()
+            .filter_map(ElementRef::wrap)
+            .filter(|c| matches!(c.value().name(), "ul" | "ol"));
+        for nested in nested {
             render_list(
                 nested,
                 url,
@@ -518,4 +545,42 @@ fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
     let slice: String = chars[offset..end].iter().collect();
     let next = if end < chars.len() { Some(end) } else { None };
     (slice, next)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    // The #231 shape: a bounded 1 MiB thread plus a deep nest. The
+    // renderers recursed without a cap, so this overflowed the stack
+    // (abort) instead of returning. 3 000 levels is under the
+    // pre-parse gate in extract::nesting, so a page like this does
+    // reach the adapter.
+    #[test]
+    fn deep_nesting_in_a_post_body_is_capped_not_a_stack_overflow() {
+        let n = 3_000;
+        let html = format!(
+            "<html><body><div class=\"thing link\" data-author=\"a\"><a class=\"title\">T</a>\
+             <time class=\"live-timestamp\">1h</time>\
+             <div class=\"usertext-body\"><div class=\"md\">{}<ul><li>x{}</li></ul>{}</div></div></div></body></html>",
+            "<div>".repeat(n),
+            "<ul><li>y".repeat(n),
+            "</div>".repeat(n)
+        );
+        let done = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let opts = ExtractOptions::default();
+                let out = extract(
+                    &html,
+                    "https://www.reddit.com/r/rust/comments/abc/t/",
+                    &opts,
+                );
+                out.is_some()
+            })
+            .unwrap()
+            .join()
+            .expect("the renderer must return, not overflow");
+        assert!(done, "the reddit adapter still claims the page");
+    }
 }

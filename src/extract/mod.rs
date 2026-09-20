@@ -20,6 +20,7 @@ pub mod junk;
 pub mod language;
 pub mod math;
 pub mod metadata;
+pub mod nesting;
 pub mod reddit;
 pub mod render;
 pub mod score;
@@ -150,12 +151,15 @@ pub enum ContentKind {
 #[derive(Debug)]
 pub enum ExtractError {
     BadSelector(String),
+    /// The body was refused or the parse did not finish.
+    Failed(String),
 }
 
 impl std::fmt::Display for ExtractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExtractError::BadSelector(s) => write!(f, "invalid CSS selector: {s}"),
+            ExtractError::Failed(s) => write!(f, "{s}"),
         }
     }
 }
@@ -446,6 +450,12 @@ pub fn extract(
     // --- HTML upstream ---
     let html_text = charset::decode(body, &ct);
     let raw_len = body.len();
+    if nesting::max_nesting(&html_text) > nesting::MAX_NESTING {
+        return Err(ExtractError::Failed(format!(
+            "markup nested deeper than {} levels: not a document",
+            nesting::MAX_NESTING
+        )));
+    }
 
     // Reddit dedicated extractor: bypasses DonSift for
     // old.reddit.com, produces compact structured output.

@@ -5,6 +5,33 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A page nested thousands of elements deep held the extractor for
+  hours: the HTML parser scans its stack of open elements on every
+  tag, as the specification writes it, so the parse is quadratic in
+  nesting depth and nothing capped the depth (browsers stop at 512).
+  4 000 nested `<div>` parsed in 3.4 s; a 1 MiB page of them is hours.
+  A linear pre-parse scan now refuses a body nested deeper than 4096
+  levels as not a document, counting only what the parser's stack
+  keeps (void, self-closing, raw-text and sibling-closed elements are
+  left out), on the HTML path and the feed path.
+- Tables nested in tables were extracted in time quadratic in the
+  nesting, and a nested table's rows were merged into the outer
+  table: the row and cell scans were descendant selects. They read
+  the table's own rows (directly or through `thead`/`tbody`/`tfoot`)
+  and the row's own cells now; 1 000 nested tables take a fraction of
+  a second and a nested table stays inside its cell.
+- A page repeating a known JS-data marker (`window.__NEXT_DATA__ = `)
+  with no value behind it rescanned the rest of the document once per
+  marker; 512 KiB of them was minutes. The scan has a budget of a few
+  document lengths.
+- The old-reddit renderer recursed without a depth cap and its list
+  renderer used descendant selects, so a post body nested a few
+  thousand levels deep overflowed the stack (an abort) after a
+  quadratic render. Both carry the same caps as the main extractor.
+
 ## [4.2.9] - 2026-09-20
 
 ### Fixed

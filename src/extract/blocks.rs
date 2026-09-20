@@ -556,6 +556,44 @@ fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) 
 /// - it is effectively single-column.
 ///
 /// Data tables (specs, pricing, comparisons) stay pipe tables.
+/// A table's own rows: `tr` children, directly or through its
+/// `thead`/`tbody`/`tfoot`. The descendant select used before
+/// (`el.select("tr")`) also returned every row of every table nested
+/// in a cell, so a nested table's rows were merged into the outer
+/// one, and on a page of tables nested d deep the outer row "held"
+/// all d nested cells, each scanned down to the bottom: quadratic
+/// per level, and the walk then recursed a level and did it again.
+/// 18 KB of `<table><tr><td>` × 1000 took minutes.
+fn own_rows<'a>(table: ElementRef<'a>) -> Vec<ElementRef<'a>> {
+    let mut rows = Vec::new();
+    for child in table.children() {
+        let Some(c) = ElementRef::wrap(child) else {
+            continue;
+        };
+        match c.value().name() {
+            "tr" => rows.push(c),
+            "thead" | "tbody" | "tfoot" => {
+                for gc in c.children() {
+                    if let Some(g) = ElementRef::wrap(gc)
+                        && g.value().name() == "tr"
+                    {
+                        rows.push(g);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// A row's own cells, in document order.
+fn own_cells<'a>(tr: ElementRef<'a>) -> impl Iterator<Item = ElementRef<'a>> {
+    tr.children()
+        .filter_map(ElementRef::wrap)
+        .filter(|c| matches!(c.value().name(), "td" | "th"))
+}
+
 fn is_prose_table(el: ElementRef<'_>) -> bool {
     if el.value().attr("role") == Some("presentation") {
         return true;
@@ -563,10 +601,10 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
     let mut max_cell = 0usize;
     let mut rows = 0usize;
     let mut max_cols = 0usize;
-    for tr in el.select(&scraper::Selector::parse("tr").unwrap()).take(40) {
+    for tr in own_rows(el).into_iter().take(40) {
         rows += 1;
         let mut cols = 0usize;
-        for cell in tr.select(&scraper::Selector::parse("td,th").unwrap()) {
+        for cell in own_cells(tr) {
             cols += 1;
             let t = crate::extract::junk::text_size(cell, 400);
             max_cell = max_cell.max(t);
@@ -590,10 +628,7 @@ fn table_block(el: ElementRef<'_>, headings: &[(u8, String)]) -> Option<Block> {
     let mut headers = Vec::new();
     let mut rows = Vec::new();
     let mut truncated = false;
-    for (i, tr) in el
-        .select(&scraper::Selector::parse("tr").unwrap())
-        .enumerate()
-    {
+    for (i, tr) in own_rows(el).into_iter().enumerate() {
         if i >= 40 {
             truncated = true;
             break;
@@ -603,8 +638,7 @@ fn table_block(el: ElementRef<'_>, headings: &[(u8, String)]) -> Option<Block> {
         // Selecting <th> and <td> separately (the old shape) only
         // ever used <th> for the header row, so every data row's
         // label vanished and its remaining cells shifted left.
-        let cells: Vec<(bool, String)> = tr
-            .select(&scraper::Selector::parse("th, td").unwrap())
+        let cells: Vec<(bool, String)> = own_cells(tr)
             .map(|c| {
                 let is_th = c.value().name() == "th";
                 let t = inline::plain(c).replace('|', "\\|"); // unescaped pipes break md tables

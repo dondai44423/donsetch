@@ -63,6 +63,11 @@ fn extract_xml_feed(text: &str, url: &str, opts: &ExtractOptions) -> Option<Extr
     let text = text
         .replace("<link>", "<rsslink>")
         .replace("</link>", "</rsslink>");
+    // Unknown elements stay on the parser's stack until closed; a
+    // feed nested thousands deep is the html5ever quadratic too.
+    if super::nesting::max_nesting(&text) > super::nesting::MAX_NESTING {
+        return None;
+    }
     let doc = scraper::Html::parse_document(&text);
 
     // RSS: channel > title/rsslink/description, item > ...
