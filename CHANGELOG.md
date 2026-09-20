@@ -5,6 +5,22 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `web_fetch` of a PDF parsed it on the async runtime's worker thread:
+  pdfium rasterizes and lays out every page synchronously, so for the
+  whole parse that worker did nothing else, the call's own
+  `deadline_ms` could not fire (the future never yielded inside it),
+  and other tool calls scheduled there waited. The crawl already ran
+  PDFs on the blocking pool under a five-minute budget; both paths
+  now share that helper.
+- A PDF was read to its last page whatever the count. The size gate
+  admits a document of hundreds of thousands of near-empty pages, and
+  each page costs a rasterization, so that was hours of work for a
+  note saying the pages were blank. The first 500 pages are read; the
+  true page count is reported and a note says how many were read.
+
 ## [4.2.9] - 2026-09-20
 
 ### Fixed

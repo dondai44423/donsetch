@@ -1158,7 +1158,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 })),
             );
         }
-        match extract::extract(&o.body, &ct, &o.url, &opts) {
+        match extract::extract_off_worker(&o.body, &ct, &o.url, &opts).await {
             Ok(e) => {
                 final_url = o.url.clone();
                 final_ex = Some(e);
@@ -1215,7 +1215,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             .unwrap_or_default();
         let mut lopts = opts.clone();
         lopts.include_links = true;
-        if let Ok(e3) = extract::extract(&o.body, &ct, &o.url, &lopts)
+        if let Ok(e3) = extract::extract_off_worker(&o.body, &ct, &o.url, &lopts).await
             && !e3.thin
         {
             final_ex = Some(e3);
@@ -1452,7 +1452,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 let html2 = crate::extract::charset::decode(&fetched.body, &ct2);
                 let mut popts = opts.clone();
                 popts.max_chars = Some(8_000);
-                match extract::extract(&fetched.body, &ct2, &fetched.url, &popts) {
+                match extract::extract_off_worker(&fetched.body, &ct2, &fetched.url, &popts).await {
                     Ok(pe) => {
                         let md = strip_part_frontmatter(&pe.markdown);
                         total += md.len();
@@ -1668,18 +1668,19 @@ pub(super) async fn try_bypass(
         );
         return None;
     }
-    let ex = match extract::extract(&outcome.body, &outcome.content_type, url, opts) {
-        Ok(e) => e,
-        Err(e) => {
-            trace.step(
-                "bypass",
-                "extract",
-                &format!("{e}"),
-                t0.elapsed().as_millis(),
-            );
-            return None;
-        }
-    };
+    let ex =
+        match extract::extract_off_worker(&outcome.body, &outcome.content_type, url, opts).await {
+            Ok(e) => e,
+            Err(e) => {
+                trace.step(
+                    "bypass",
+                    "extract",
+                    &format!("{e}"),
+                    t0.elapsed().as_millis(),
+                );
+                return None;
+            }
+        };
     trace.step(
         "bypass",
         "unlocker",

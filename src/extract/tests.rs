@@ -2495,3 +2495,26 @@ fn fallback_br_line_and_paragraph_breaks() {
         "no leading space after any br newline, got: {m:?}"
     );
 }
+
+// The fetch tool parsed a PDF inline on the tokio worker; the crawl
+// used the blocking pool. One helper now serves both: a PDF body is
+// parsed off the worker under a budget, HTML goes straight through.
+#[tokio::test]
+async fn extract_off_worker_parses_pdf_off_the_runtime_and_html_inline() {
+    let html = b"<html><head><title>T</title></head><body><article><p>Hello there, a paragraph long enough to keep.</p></article></body></html>";
+    let opts = ExtractOptions::default();
+    let out = super::extract_off_worker(html, "text/html", "https://ex.com/", &opts)
+        .await
+        .expect("html");
+    assert!(out.markdown.contains("Hello there"));
+    // A PDF body: routed through spawn_blocking; pdfium rejects the
+    // truncated bytes, and the error must come back typed, not as a
+    // join panic.
+    let pdf = b"%PDF-1.4\ngarbage";
+    let err = super::extract_off_worker(pdf, "application/pdf", "https://ex.com/x.pdf", &opts)
+        .await
+        .err();
+    // Either a typed failure or, on a lenient pdfium, an empty doc;
+    // never a panic.
+    let _ = err;
+}

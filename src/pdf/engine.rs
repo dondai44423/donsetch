@@ -82,7 +82,16 @@ pub struct RawDoc {
     pub meta: RawMeta,
     pub outline: Vec<OutlineItem>,
     pub page_count: usize,
+    /// Pages actually read: `page_count` capped at `MAX_PAGES`.
+    pub pages_read: usize,
 }
+
+/// Pages parsed per document. Each page is a rasterization (up to
+/// 80 M px) plus the text, layout and table passes; the size gate
+/// (`pdf_max_mb`, 100 MB) admits a document of a few hundred
+/// thousand near-empty pages, which is hours of work for a note that
+/// says "scanned". The remainder is reported, not read.
+pub const MAX_PAGES: usize = 500;
 
 /// What the wrapper itself can fail with.
 #[derive(Debug)]
@@ -553,6 +562,8 @@ pub struct LoadOpts {
     pub want_forms: bool,
     /// DPi override (0.0 = 96). Higher for OCR; forms do not need this.
     pub dpi: f32,
+    /// Pages read per document; `MAX_PAGES` unless a test says less.
+    pub max_pages: usize,
 }
 
 /// The per-page bundle the sink receives. Pixel/form extras empty unless
@@ -744,13 +755,15 @@ where
         };
 
         let page_count = FPDF_GetPageCount(doc).max(0) as usize;
+        let pages_read = page_count.min(opts.max_pages);
         let mut raw = RawDoc {
             fonts: Vec::new(),
             meta: RawMeta::default(),
             outline: walk_outlines(doc),
             page_count,
+            pages_read,
         };
-        let mut pages_out: Vec<P> = Vec::with_capacity(page_count);
+        let mut pages_out: Vec<P> = Vec::with_capacity(pages_read);
         let mut font_index: std::collections::HashMap<String, u16> =
             std::collections::HashMap::new();
         let mut font_dingbat: Vec<bool> = Vec::new();
@@ -764,7 +777,7 @@ where
         raw.meta.created = get_meta(doc, "CreationDate", &mut mbuf);
         raw.meta.modified = get_meta(doc, "ModDate", &mut mbuf);
 
-        for pi in 0..page_count {
+        for pi in 0..pages_read {
             let page = FPDF_LoadPage(doc, pi as i32);
             if page.is_null() {
                 continue;

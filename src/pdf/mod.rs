@@ -113,6 +113,11 @@ fn pdf_date(raw: &Option<String>) -> Option<String> {
 
 /// Parse `bytes` into DonSift blocks with full honesty flags.
 pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
+    parse_with(bytes, engine::MAX_PAGES)
+}
+
+/// `parse` with the per-document page cap chosen by the caller.
+pub(crate) fn parse_with(bytes: &[u8], max_pages: usize) -> Result<ParsedPdf, PdfFailure> {
     // [fetch] pdf_max_mb (legacy DONSETCH_PDF_MAX_MB); validation
     // enforces 1..=4096 at load, so this is always >= 1 MB.
     let limit = crate::config::cfg().fetch.pdf_max_mb * 1024 * 1024;
@@ -124,6 +129,7 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
         want_pixels: true,
         want_forms: true,
         dpi: 96.0,
+        max_pages,
     };
     let mut pages: Vec<layout::PageLines> = Vec::new();
     let mut raw_chars_total = 0usize;
@@ -364,6 +370,12 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedPdf, PdfFailure> {
     }
 
     let mut notes: Vec<String> = Vec::new();
+    if raw.pages_read < raw.page_count {
+        notes.push(format!(
+            "document has {} pages; the first {} were read (per-document page cap)",
+            raw.page_count, raw.pages_read
+        ));
+    }
     if ocr_pages > 0 {
         let mean = if ocr_conf_pages > 0 {
             ocr_conf_sum / ocr_conf_pages as f32
