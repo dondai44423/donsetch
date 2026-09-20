@@ -5,6 +5,16 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The revalidation cache capped each body at 8 MiB and the entry count
+  at 512, but not what they add up to: a daemon whose agent fetched a
+  few hundred large pages carrying an ETag or a fresh window held up
+  to 4 GiB of them in memory for as long as it ran. Resident bodies
+  are now budgeted at 64 MiB, evicting the oldest entries first, the
+  same order the entry cap uses.
+
 ## [4.2.8] - 2026-09-20
 
 ### Changed

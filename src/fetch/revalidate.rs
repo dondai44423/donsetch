@@ -30,16 +30,23 @@ pub struct RevalidationCache {
     /// Insert order for FIFO eviction (the map's own iteration order
     /// is arbitrary and can pick a hot victim).
     queue: std::collections::VecDeque<String>,
+    /// Sum of `body.len()` over `map`, kept in step by `store`.
+    total_bytes: usize,
 }
 
 const MAX_ENTRIES: usize = 512;
 const MAX_BODY: usize = 8 << 20; // 8 MiB
+/// Resident body bytes across all entries. The entry cap alone let
+/// 512 × 8 MiB = 4 GiB sit in one long-lived daemon; a Fetcher lives
+/// as long as the process.
+const MAX_TOTAL_BYTES: usize = 64 << 20; // 64 MiB
 
 impl RevalidationCache {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
             queue: std::collections::VecDeque::new(),
+            total_bytes: 0,
         }
     }
 
@@ -112,19 +119,34 @@ impl RevalidationCache {
         if etag.is_none() && last_modified.is_none() && fresh_until.is_none() {
             return;
         }
-        if self.map.len() >= MAX_ENTRIES
-            && !self.map.contains_key(url)
-            && let Some(k) = self.queue.pop_front()
+        // Evict the oldest inserts (FIFO) until the new entry fits
+        // both the entry cap and the byte budget. The arbitrary
+        // keys().next() victim a HashMap iteration order yields
+        // could evict a hot entry; FIFO is the browser-near default
+        // for a bounded cache this small. A re-store of an existing
+        // key replaces its bytes, so its old size is not counted.
+        let replacing = self.map.get(url).map_or(0, |e| e.body.len());
+        let mut resident = self.total_bytes - replacing;
+        while (self.map.len() >= MAX_ENTRIES && !self.map.contains_key(url))
+            || resident + body.len() > MAX_TOTAL_BYTES
         {
-            // Evict the oldest insert (FIFO). The arbitrary
-            // keys().next() victim a HashMap iteration order yields
-            // could evict a hot entry; FIFO is the browser-near
-            // default for a bounded cache this small.
-            self.map.remove(&k);
+            let Some(k) = self.queue.pop_front() else {
+                break;
+            };
+            if k == url {
+                // The key being re-stored is the oldest: dropping its
+                // queue slot alone is enough, the insert re-queues it.
+                self.map.remove(&k);
+                continue;
+            }
+            if let Some(gone) = self.map.remove(&k) {
+                resident -= gone.body.len();
+            }
         }
         if !self.map.contains_key(url) {
             self.queue.push_back(url.to_string());
         }
+        self.total_bytes = resident + body.len();
         self.map.insert(
             url.to_string(),
             CacheEntry {
@@ -196,6 +218,41 @@ mod audit_tests {
             matches!(c.check("https://x.test/nc"), CacheCheck::Revalidate(_)),
             "no-cache must send the conditional on every hit"
         );
+    }
+
+    // 512 entries of 8 MiB each was 4 GiB resident. The byte budget
+    // evicts oldest-first until the new body fits.
+    #[test]
+    fn resident_bytes_stay_under_the_budget() {
+        let mut c = RevalidationCache::new();
+        let big = vec![b'x'; MAX_BODY];
+        for i in 0..16 {
+            c.store(
+                &format!("https://x.test/big/{i}"),
+                200,
+                &[("etag".into(), format!("\"e{i}\""))],
+                &big,
+            );
+            let sum: usize = c.map.values().map(|e| e.body.len()).sum();
+            assert!(sum <= MAX_TOTAL_BYTES, "after {i}: {sum} resident");
+            assert_eq!(c.total_bytes, sum, "the counter tracks the map");
+        }
+        assert_eq!(c.map.len(), MAX_TOTAL_BYTES / MAX_BODY);
+        assert!(
+            !c.map.contains_key("https://x.test/big/0"),
+            "oldest evicted first"
+        );
+        assert!(c.map.contains_key("https://x.test/big/15"), "newest kept");
+        // A re-store of an existing key swaps its bytes, no double count.
+        c.store(
+            "https://x.test/big/15",
+            200,
+            &[("etag".into(), "\"e15b\"".into())],
+            b"small",
+        );
+        let sum: usize = c.map.values().map(|e| e.body.len()).sum();
+        assert_eq!(c.total_bytes, sum);
+        assert_eq!(c.map.len(), MAX_TOTAL_BYTES / MAX_BODY);
     }
 
     #[test]
