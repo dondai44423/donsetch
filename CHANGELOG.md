@@ -5,6 +5,27 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The `[meta]` block no longer runs into the document's first line. In
+  text-only mode the fold prepends `[meta] {...}` as its own content block,
+  but a separate block carries no boundary to the model: most harnesses
+  concatenate the blocks, and Claude Code joins adjacent text blocks with no
+  delimiter at all, so `...example.com/"}# Example Domain` arrived glued and
+  the heading stopped being markdown. The meta line ends with a blank line
+  now. Two newlines rather than one, because a single `\n` only separates
+  content that can interrupt a paragraph in CommonMark — an ATX heading, a
+  fence, a thematic break — and a page opening with a plain paragraph or a
+  table row would lazily continue the `[meta]` line instead, which is the
+  same failure with none of the visibility. Every tool emits exactly one
+  text block and the fold is the only place a second one is prepended, so
+  one change covers `web_fetch`, `web_search`, `web_crawl` and
+  `web_screenshot`. Harmless where a client does keep the blocks apart: a
+  trailing blank line is trimmed on render, and OpenCode already joins text
+  blocks with `\n\n` of its own, so there it doubles a separator that was
+  going to be there anyway and still reads as one paragraph break.
+
 ## [4.2.6] - 2026-09-19
 
 ### Added
