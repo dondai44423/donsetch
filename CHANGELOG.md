@@ -5,6 +5,24 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A search plugin registered with an empty command (a hand-edited
+  `plugins.json`; the CLI refuses one) panicked the daemon on every
+  `web_search`. 4.2.5 guarded the doctor against that entry; the search
+  path now returns the same registration error instead of indexing an
+  empty argv.
+- A plugin that wrote past the 8 MiB stdout cap and kept running sat
+  until its `timeout_ms` and came back as a timeout. Nobody reads the
+  pipe past the cap, so the plugin blocked on it; it is killed as soon
+  as the cap is crossed, as the contract said, and the error names the
+  cap.
+- A plugin result's `title` and `url` were taken verbatim while the
+  snippet was capped at 8 KiB. A title is now cut at 512 characters and
+  a result with a url over 4 KiB is dropped, counted with the other
+  dropped entries.
+
 ## [4.2.8] - 2026-09-20
 
 ### Changed

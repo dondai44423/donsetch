@@ -48,6 +48,11 @@ pub const FORMAT_VERSION: u32 = 1;
 const MAX_STDOUT_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
 const MAX_STDERR_BYTES: u64 = 64 * 1024;
 const MAX_SNIPPET_CHARS: usize = 8 * 1024;
+/// Title and url ride the same cap discipline as the snippet: one
+/// hit must not carry megabytes into the ranked set. A title is cut;
+/// an over-long url is dropped, since a cut url is not a url.
+const MAX_TITLE_CHARS: usize = 512;
+const MAX_URL_CHARS: usize = 4096;
 const MAX_RESULTS: usize = 50;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MIN_TIMEOUT_MS: u64 = 1_000;
@@ -549,12 +554,25 @@ fn parse_envelope(
             dropped += 1;
             continue;
         };
-        let title = entry
+        let title: String = entry
             .get("title")
             .and_then(|t| t.as_str())
             .map(str::trim)
-            .unwrap_or("");
+            .unwrap_or("")
+            .chars()
+            .take(MAX_TITLE_CHARS)
+            .collect();
         let url = match entry.get("url").and_then(|u| u.as_str()) {
+            Some(u) if u.len() > MAX_URL_CHARS => {
+                dropped += 1;
+                if crate::config::cfg().debug.search {
+                    eprintln!(
+                        "[plugin] {plugin_name}: dropped result with a {}-byte url",
+                        u.len()
+                    );
+                }
+                continue;
+            }
             Some(u) if is_http_url(u) => u.to_string(),
             Some(u) => {
                 dropped += 1;
@@ -585,7 +603,7 @@ fn parse_envelope(
             .map(|s| s.clamp(0.0, 1.0) as f32)
             .unwrap_or(1.0);
         hits.push(SearchHit {
-            title: title.to_string(),
+            title,
             url,
             snippet,
             score,
@@ -656,6 +674,12 @@ pub(crate) async fn run_plugin(
         let mut body = Vec::new();
         if let Some(so) = child.stdout.take() {
             let _ = so.take(MAX_STDOUT_BYTES + 1).read_to_end(&mut body).await;
+        }
+        // Past the cap nobody reads the pipe any more: a plugin still
+        // writing blocks on it and `wait` would sit until timeout_ms.
+        // The contract says SIGKILL, so kill before waiting.
+        if body.len() as u64 > MAX_STDOUT_BYTES {
+            let _ = child.start_kill();
         }
         let status = child.wait().await;
         (body, status)
@@ -729,9 +753,17 @@ fn extract_error_envelope(bytes: &[u8]) -> Option<PluginError> {
 }
 
 fn spawn_plugin(name: &str, def: &PluginDef) -> Result<tokio::process::Child, String> {
-    let program = def.cmd.first().map(String::as_str).unwrap_or("");
+    // The CLI refuses an empty command at registration; a hand-edited
+    // plugins.json can still carry one. Doctor already reports it
+    // instead of panicking; the search path must not abort the daemon
+    // on `&cmd[1..]` of an empty vec either.
+    let Some((program, args)) = def.cmd.split_first() else {
+        return Err(format!(
+            "plugin {name}: no command registered (re-register with `donsetch keys add plugin {name} --cmd ...`)"
+        ));
+    };
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(&def.cmd[1..])
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1068,6 +1100,30 @@ mod tests {
         );
         let (hits, _, _) = parse_envelope(env.as_bytes(), "t").unwrap();
         assert_eq!(hits[0].snippet.chars().count(), MAX_SNIPPET_CHARS);
+    }
+
+    // The snippet cap had two uncapped siblings.
+    #[test]
+    fn parse_envelope_title_cut_and_long_url_dropped() {
+        let big = "t".repeat(20_000);
+        let env = format!(
+            r#"{{"format":1,"results":[{{"title":"{big}","url":"https://a.com","snippet":"s"}}]}}"#
+        );
+        let (hits, _, _) = parse_envelope(env.as_bytes(), "t").unwrap();
+        assert_eq!(hits[0].title.chars().count(), MAX_TITLE_CHARS);
+
+        let long_url = format!("https://a.com/{}", "u".repeat(MAX_URL_CHARS));
+        let env = format!(
+            r#"{{"format":1,"results":[{{"title":"A","url":"{long_url}","snippet":"s"}},{{"title":"B","url":"https://b.com","snippet":"s"}}]}}"#
+        );
+        let (hits, _, dropped) = parse_envelope(env.as_bytes(), "t").unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the over-long url is dropped, the sibling kept"
+        );
+        assert_eq!(hits[0].url, "https://b.com");
+        assert_eq!(dropped, 1);
     }
 
     #[test]
@@ -1447,6 +1503,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("exceeded"), "{e}");
+    }
+
+    // Over the cap the reader stops draining the pipe; a plugin that
+    // keeps writing blocks on it and the old shape sat in `wait` until
+    // timeout_ms. The cap error must come back at once, not after the
+    // timeout with the wrong reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_over_cap_is_killed_now_not_at_timeout() {
+        let def = PluginDef {
+            cmd: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "yes 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' | head -c 9000000; sleep 30"
+                    .into(),
+            ],
+            timeout_ms: 10_000,
+            ..PluginDef::default()
+        };
+        let start = Instant::now();
+        let e = run_plugin("flood", &def, "q", 5, &Intent::Web)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("exceeded"), "{e}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the cap must kill, not wait for timeout_ms: {:?}",
+            start.elapsed()
+        );
+    }
+
+    // A hand-edited plugins.json with `"cmd": []` loads (serde has no
+    // validation) and reaches spawn on every web_search. `&cmd[1..]`
+    // on an empty vec panicked there, aborting the daemon; doctor got
+    // the guard, the search path did not.
+    #[tokio::test]
+    async fn spawn_empty_command_is_an_error_not_a_panic() {
+        let def = PluginDef {
+            cmd: vec![],
+            timeout_ms: 10_000,
+            ..PluginDef::default()
+        };
+        let e = run_plugin("broken", &def, "q", 5, &Intent::Web)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("no command registered"), "{e}");
     }
 
     #[cfg(unix)]
