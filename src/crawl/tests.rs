@@ -331,6 +331,42 @@ async fn low_quality_hub_seed_still_feeds_the_frontier() {
     assert_eq!(r.stop, StopReason::MaxPages);
 }
 
+// ── <base href> ───────────────────────────────────────────
+
+// `<base href="/a/app/">` (root-relative, the common form) is not
+// an absolute URL, so Url::parse refused it and the harvest fell
+// back to the page URL: `href="p"` on /a/b.html went to /a/p instead
+// of /a/app/p, and the real page was never fetched. (The base stays
+// inside the seed's auto-scope so scope is not what decides here.)
+#[tokio::test]
+async fn relative_base_href_resolves_against_the_page() {
+    let site = MockSite::new()
+        .page(
+            "https://ex.com/a/b.html",
+            200,
+            &html("Hub", "<base href=\"/a/app/\"><a href=\"p\">p</a>"),
+        )
+        .page("https://ex.com/a/app/p", 200, &html("P", "under app"));
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 3;
+    let r = crawler
+        .crawl("https://ex.com/a/b.html", o, None)
+        .await
+        .unwrap();
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        hits.iter().any(|h| h == "https://ex.com/a/app/p"),
+        "link resolved against the base: hits={hits:?} pages={:?}",
+        r.pages.iter().map(|p| &p.url).collect::<Vec<_>>()
+    );
+    assert!(!hits.iter().any(|h| h == "https://ex.com/a/p"));
+}
+
 // ── Map mode ──────────────────────────────────────────────
 
 #[tokio::test]

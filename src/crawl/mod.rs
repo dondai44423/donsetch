@@ -1379,13 +1379,17 @@ impl Crawler {
                             .unwrap_or_else(|| String::from_utf8_lossy(&page.body).into_owned());
                         // <base href> handling: resolve relative
                         // links against the base URL when present.
-                        let base = if let Some(bh) = extract_base_href(&html) {
-                            Url::parse(&bh).unwrap_or_else(|_| {
-                                Url::parse(&page.url).unwrap_or_else(|_| parsed.clone())
-                            })
-                        } else {
-                            Url::parse(&page.url).unwrap_or_else(|_| parsed.clone())
-                        };
+                        // The base itself resolves against the
+                        // document URL (HTML §4.2.3): `<base
+                        // href="/app/">` is the common form, and
+                        // Url::parse alone refused it, so every link
+                        // under it resolved against the page instead.
+                        let page_url_parsed =
+                            Url::parse(&page.url).unwrap_or_else(|_| parsed.clone());
+                        let base = extract_base_href(&html)
+                            .and_then(|bh| page_url_parsed.join(&bh).ok())
+                            .filter(|b| matches!(b.scheme(), "http" | "https"))
+                            .unwrap_or(page_url_parsed);
 
                         // Harvest <a href> links early so we can check
                         // focus match across all link sources (pagination,

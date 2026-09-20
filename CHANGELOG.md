@@ -5,6 +5,16 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- A crawl ignored a relative `<base href>` (`<base href="/app/">`, the
+  common form): the base was parsed as an absolute URL, failed, and
+  every link on the page resolved against the page instead, so the
+  pages the site actually links to were never fetched. The base now
+  resolves against the document URL, as a browser does, and a base
+  that is not http(s) is ignored.
+
 ## [4.2.8] - 2026-09-20
 
 ### Changed
