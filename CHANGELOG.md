@@ -5,6 +5,17 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `robots.txt` rules with `*` or a trailing `$` (`Disallow: /*.pdf$`,
+  `Disallow: /*?`, `Disallow: /private*/`) were matched as literal
+  prefixes, so they matched nothing and a crawl with `respect_robots`
+  fetched what the site had disallowed. RFC 9309 §2.2.3 makes both
+  required; rules are matched that way now, longest rule still wins
+  and `Allow` still wins a tie. The matcher is iterative and
+  polynomial on a hostile rule.
+
 ## [4.2.9] - 2026-09-20
 
 ### Fixed

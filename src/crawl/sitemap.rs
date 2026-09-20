@@ -99,17 +99,60 @@ impl Robots {
         let mut best_dis = 0usize;
         let mut best_allow = 0usize;
         for d in &self.disallow {
-            if path.starts_with(d.as_str()) && d.len() > best_dis {
+            if rule_matches(d, path) && d.len() > best_dis {
                 best_dis = d.len();
             }
         }
         for a in &self.allow {
-            if path.starts_with(a.as_str()) && a.len() > best_allow {
+            if rule_matches(a, path) && a.len() > best_allow {
                 best_allow = a.len();
             }
         }
         best_allow >= best_dis
     }
+}
+
+/// RFC 9309 §2.2.3 rule matching: the rule is a path prefix, `*`
+/// matches any run of characters, and a trailing `$` anchors the
+/// end. Plain prefix matching read `/*.pdf$` and `/*?` literally, so
+/// they matched nothing and respect_robots fetched what the site
+/// had disallowed. Iterative two-pointer wildcard match: O(n·m) on a
+/// hostile rule, never exponential (both strings are attacker text).
+fn rule_matches(rule: &str, path: &str) -> bool {
+    // An unanchored rule is a prefix: the same as `rule*` matched
+    // against the whole path.
+    let pat: Vec<u8> = match rule.strip_suffix('$') {
+        Some(r) => r.as_bytes().to_vec(),
+        None => {
+            let mut v = rule.as_bytes().to_vec();
+            v.push(b'*');
+            v
+        }
+    };
+    let (p, t) = (pat.as_slice(), path.as_bytes());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // The last `*` seen and the text position it is currently
+    // assumed to cover up to; on a mismatch the star eats one more.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, ti));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// One sitemap URL entry.
@@ -430,6 +473,49 @@ mod tests {
         assert!(!r.allowed("/private"));
         assert!(r.allowed("/ok"));
         assert_eq!(r.crawl_delay, Some(2.0));
+    }
+
+    // RFC 9309 §2.2.3: `*` and `$` are required. Plain prefix
+    // matching took them literally, so these rules never matched.
+    #[test]
+    fn robots_wildcard_and_end_anchor_rules_match() {
+        let r = Robots::parse(
+            "User-agent: *\nDisallow: /*.pdf$\nDisallow: /*?\nDisallow: /private*/\nDisallow: /tmp$\nAllow: /public/*.pdf$\n",
+            "ex.com",
+        );
+        assert!(!r.allowed("/x/y.pdf"));
+        assert!(r.allowed("/x/y.pdfx"), "$ anchors the end");
+        assert!(!r.allowed("/search?q=1"));
+        assert!(r.allowed("/search"));
+        assert!(!r.allowed("/private-docs/a"));
+        assert!(!r.allowed("/private/a"));
+        assert!(r.allowed("/priv/a"));
+        assert!(!r.allowed("/tmp"));
+        assert!(r.allowed("/tmpfile"), "anchored rule does not prefix-match");
+        assert!(r.allowed("/public/a.pdf"), "the longer Allow wins");
+        // Prefix semantics are unchanged for plain rules.
+        assert!(rule_matches("/a", "/a/b"));
+        assert!(!rule_matches("/a/b", "/a"));
+        assert!(rule_matches("/", "/anything"));
+        assert!(rule_matches("/*", "/"));
+        assert!(rule_matches("/a*", "/a"));
+        assert!(rule_matches("/a**b*", "/axxbyy"));
+        assert!(!rule_matches("/a*b$", "/axxbyy"));
+    }
+
+    // Both strings are attacker text: a rule of many stars against a
+    // long path must not backtrack exponentially.
+    #[test]
+    fn robots_wildcard_matching_is_polynomial() {
+        let rule = format!("/{}b", "*a".repeat(30));
+        let path = format!("/{}", "a".repeat(3000));
+        let started = std::time::Instant::now();
+        assert!(!rule_matches(&rule, &path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
