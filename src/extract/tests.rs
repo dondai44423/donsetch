@@ -1800,6 +1800,58 @@ fn jsonld_unicode_escape_decoded() {
     assert_eq!(meta.byline.as_deref(), Some("维基媒体"));
 }
 
+// html5ever's tree builder scans the open-element stack per tag: the
+// parse is O(n²) in nesting depth (8 000 nested <div> 0.4 s, 32 000
+// 6.6 s measured here) and nothing capped the depth (browsers stop at
+// 512). The gate refuses such a body before the parse; a wide page of
+// the same size is untouched.
+#[test]
+fn a_page_nested_thousands_deep_is_refused_before_the_parse() {
+    let n = 50_000;
+    let html = format!(
+        "<html><body><article>{}x{}</article></body></html>",
+        "<div>".repeat(n),
+        "</div>".repeat(n)
+    );
+    let started = std::time::Instant::now();
+    let err = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://ex.com/",
+        &ExtractOptions::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("nested deeper"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    // The self-closing slash is ignored by the HTML parser, so this
+    // shape nests for real too and is refused the same way.
+    let html = format!(
+        "<html><body><article>{}x</article></body></html>",
+        "<div/>".repeat(n)
+    );
+    let err = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://ex.com/",
+        &ExtractOptions::default(),
+    )
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("nested deeper"), "{err}");
+    // Same byte count, wide instead of deep: extracted as usual.
+    let html = format!(
+        "<html><body><article>{}</article></body></html>",
+        "<p>a paragraph with enough words to be kept by the extractor here</p>".repeat(n / 10)
+    );
+    let r = extract_html(&html);
+    assert!(r.markdown.contains("a paragraph"));
+}
+
 // ════════════════════════════════════════════════════════════
 // 24. TABLE WITHOUT <th> : FIRST ROW PROMOTED TO HEADERS
 // ════════════════════════════════════════════════════════════
@@ -2534,41 +2586,4 @@ fn fallback_br_line_and_paragraph_breaks() {
         !m.contains("\n "),
         "no leading space after any br newline, got: {m:?}"
     );
-}
-
-// html5ever's tree builder scans the open-element stack per tag,
-// O(n²) in nesting depth with no cap (browsers stop at 512): 4 000
-// nested <div> parsed in 3.4 s here, a 1 MiB page of them is hours,
-// on the thread that parses. The gate refuses such a body before the
-// parse; a wide page of the same size is untouched.
-#[test]
-fn a_page_nested_thousands_deep_is_refused_before_the_parse() {
-    let n = 50_000;
-    let html = format!(
-        "<html><body><article>{}x{}</article></body></html>",
-        "<div>".repeat(n),
-        "</div>".repeat(n)
-    );
-    let started = std::time::Instant::now();
-    let err = extract(
-        html.as_bytes(),
-        "text/html",
-        "https://ex.com/",
-        &ExtractOptions::default(),
-    )
-    .err()
-    .expect("refused");
-    assert!(err.to_string().contains("nested deeper"), "{err}");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(3),
-        "took {:?}",
-        started.elapsed()
-    );
-    // Same byte count, wide instead of deep: extracted as usual.
-    let html = format!(
-        "<html><body><article>{}</article></body></html>",
-        "<p>a paragraph with enough words to be kept by the extractor here</p>".repeat(n / 10)
-    );
-    let r = extract_html(&html);
-    assert!(r.markdown.contains("a paragraph"));
 }
