@@ -14,7 +14,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetched what the site had disallowed. RFC 9309 §2.2.3 makes both
   required; rules are matched that way now, longest rule still wins
   and `Allow` still wins a tie. The matcher is iterative and
-  polynomial on a hostile rule.
+  polynomial on a hostile rule (mnaza, #271).
+- A news result whose `pubDate` carried an absurd year (the RSS date
+  token is copied as is) overflowed the freshness arithmetic: a panic
+  under overflow checks, a wrapped garbage age and a wrong freshness
+  multiplier in release. A year outside 1..=9999 is not a date now and
+  ranks neutral, the same gate the cookie jar got for `Expires`
+  (mnaza, #272).
+- A search result's title from a native provider or a SERP page was
+  taken at any length; the plugin adapter cut its titles at 512
+  characters in 4.2.9 and the other sources did not, so one result
+  could carry a multi-MiB title into the tool text and the structured
+  content. Every source passes the merge once; titles are cut there
+  (mnaza, #272).
+- A crawl scope pattern with several `*` (`/*/docs/*/api/*`) matched
+  against a link the page chose could hold the crawl worker for hours:
+  the glob matcher tried every split at every `*`, exponential on a
+  mismatch, and one 8 KiB href with the right shape was enough. The
+  matcher is iterative and polynomial now; every pattern that matched
+  before still matches, and only that (mnaza, #273).
+- The Bright Data unlocker's answer was read with no size cap, where
+  every other transport stops at 64 MiB: the target page comes back
+  inside a JSON string, then was decoded and base64-encoded for the
+  cache, three copies of whatever size the page chose. It is read in
+  chunks and refused past the same cap now (mnaza, #274).
+- A malformed proxy entry's error echoed the whole entry, password
+  included, into a fetch error that can surface in a tool result; the
+  Debug form was already redacted. The messages name the expected
+  shape (mnaza, #274).
+- `web_fetch` of a PDF parsed it on the async runtime's worker thread:
+  pdfium rasterizes and lays out every page synchronously, so for the
+  whole parse that worker did nothing else, the call's own
+  `deadline_ms` could not fire (the future never yielded inside it),
+  and other tool calls scheduled there waited. The crawl already ran
+  PDFs on the blocking pool under a five-minute budget; both paths now
+  share that helper, the ghost retry and the wayback snapshot included
+  (mnaza, #275).
+- A PDF was read to its last page whatever the count. The size gate
+  admits a document of hundreds of thousands of near-empty pages, and
+  each page costs a rasterization, so that was hours of work for a
+  note saying the pages were blank. The first 500 pages are read; the
+  true page count is reported and a note says how many were read
+  (mnaza, #275).
+- A page nested thousands of elements deep held the extractor for
+  hours: the HTML parser scans its stack of open elements on every
+  tag, as the specification writes it, so the parse is quadratic in
+  nesting depth and nothing capped the depth (browsers stop at 512).
+  4 000 nested `<div>` parsed in 3.4 s; a 1 MiB page of them is hours.
+  A linear pre-parse scan now refuses a body nested deeper than 4096
+  levels as not a document, counting what the parser's stack keeps
+  (void, raw-text and sibling-closed elements are left out; the
+  self-closing slash is ignored, as the HTML parser ignores it), on
+  the HTML path and the feed path (mnaza, #276).
+- Tables nested in tables were extracted in time quadratic in the
+  nesting, and a nested table's rows were merged into the outer
+  table: the row and cell scans were descendant selects. They read
+  the table's own rows (directly or through `thead`/`tbody`/`tfoot`)
+  and the row's own cells now; 1 000 nested tables take a fraction of
+  a second and a nested table stays inside its cell (mnaza, #276).
+- A page repeating a known JS-data marker (`window.__NEXT_DATA__ = `)
+  with no value behind it rescanned the rest of the document once per
+  marker; 512 KiB of them was minutes. The scan has a budget of a few
+  document lengths (mnaza, #276).
+- The old-reddit renderer recursed without a depth cap and its list
+  renderer used descendant selects, so a post body nested a few
+  thousand levels deep overflowed the stack (an abort) after a
+  quadratic render. Both carry the same caps as the main extractor
+  (mnaza, #276).
 
 ## [4.2.9] - 2026-09-20
 
