@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory, the second spawns zero browsers.
 
 ### Fixed
+- A small page with no `<script>` but an inline load-time handler
+  (`<body onload="…">`, `<img onerror="…">`) can still build itself
+  after load; the scriptless fast path from 4.2.10 skipped the tier-2
+  settle floor for it. Load-time handlers count as script again;
+  click handlers, which need a user, do not.
 - `robots.txt` rules with `*` or a trailing `$` (`Disallow: /*.pdf$`,
   `Disallow: /*?`, `Disallow: /private*/`) were matched as literal
   prefixes, so they matched nothing and a crawl with `respect_robots`

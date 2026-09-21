@@ -321,11 +321,20 @@ pub struct GhostPage {
 /// 559B with zero scripts, complete at t=0). Large DOMs are already
 /// rendered and keep no floor. `lower` is the poll's lowercased HTML.
 fn small_dom_settle_floor(cur_len: usize, lower: &str) -> Duration {
-    if cur_len < 50_000 && lower.contains("<script") {
+    if cur_len < 50_000 && can_hydrate(lower) {
         Duration::from_secs(4)
     } else {
         Duration::ZERO
     }
+}
+
+/// Whether anything in the document can run after load and grow the
+/// DOM. A `<script` is the usual carrier; an inline load-time handler
+/// (`<body onload="…">`, `<img onerror="…">`) runs script with no
+/// script element at all, so a shell built that way must keep the
+/// floor too. Click-time handlers need a user and are not counted.
+fn can_hydrate(lower: &str) -> bool {
+    lower.contains("<script") || lower.contains("onload=") || lower.contains("onerror=")
 }
 
 /// Unified tier-2 fetch. Success oracle = CONTENT QUALITY,
@@ -811,6 +820,26 @@ mod ghost_fetch_tests {
             super::small_dom_settle_floor(8_000, html),
             Duration::from_secs(4)
         );
+    }
+
+    // No <script>, but an inline load-time handler runs script all
+    // the same and can build the page after load.
+    #[test]
+    fn settle_floor_inline_load_handler_counts_as_scripted() {
+        let html = r#"<html><body onload="fetch('/app').then(r=>r.text()).then(t=>document.body.innerHTML=t)"><div id="root"></div></body></html>"#;
+        assert_eq!(
+            super::small_dom_settle_floor(200, html),
+            Duration::from_secs(4)
+        );
+        let html = r#"<html><body><img src="x" onerror="document.body.innerHTML='<p>late</p>'"></body></html>"#;
+        assert_eq!(
+            super::small_dom_settle_floor(200, html),
+            Duration::from_secs(4)
+        );
+        // A click handler needs a user: still scriptless for settling.
+        let html =
+            r##"<html><body><a href="#" onclick="return false">x</a><p>static</p></body></html>"##;
+        assert_eq!(super::small_dom_settle_floor(200, html), Duration::ZERO);
     }
 
     #[test]
