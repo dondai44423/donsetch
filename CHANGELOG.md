@@ -57,10 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   true page count is reported and a note says how many were read
   (mnaza, #275).
 - A page nested thousands of elements deep held the extractor for
-  hours: the HTML parser scans its stack of open elements on every
-  tag, as the specification writes it, so the parse is quadratic in
-  nesting depth and nothing capped the depth (browsers stop at 512).
-  4 000 nested `<div>` parsed in 3.4 s; a 1 MiB page of them is hours.
+  minutes, and hours on a larger body: the HTML parser scans its
+  stack of open elements on every tag, as the specification writes
+  it, so the parse is quadratic in nesting depth (8 000 nested
+  `<div>` 0.4 s, 32 000 6.6 s) and nothing capped the depth (browsers
+  stop at 512).
   A linear pre-parse scan now refuses a body nested deeper than 4096
   levels as not a document, counting what the parser's stack keeps
   (void, raw-text and sibling-closed elements are left out; the
