@@ -4,17 +4,20 @@
 //! every start and end tag scans the stack of open elements
 //! (`in_scope`, implied end tags), so a document nested n deep costs
 //! O(n²) to parse. Browsers cap parser nesting at 512; html5ever has
-//! no cap. Measured here: 4 000 nested `<div>` parse in 3.4 s, so a
-//! 1 MiB page of them (200 000 deep) is hours, on whichever thread
-//! runs the parse. No document is nested thousands deep; a page
-//! that is gets refused before the parse instead of after.
+//! no cap. Measured here on parse alone: 8 000 nested `<div>` 0.4 s,
+//! 16 000 1.6 s, 32 000 6.6 s (4× per doubling), so the 1 MiB /
+//! 200 000-deep page is minutes of work on whichever thread runs the
+//! parse. No document is nested thousands deep; a page that is gets
+//! refused before the parse instead of after.
 //!
 //! The estimate is a linear scan that counts only what the tree
-//! builder's stack actually keeps: void elements, self-closing tags,
-//! raw-text bodies (`<script>`, `<style>`, …), comments and the
-//! elements the parser closes implicitly at a sibling (`<p>`, `<li>`,
-//! `<td>`, …) are left out, so unclosed tags of those kinds on real
-//! pages do not count against it.
+//! builder's stack actually keeps: void elements, raw-text bodies
+//! (`<script>`, `<style>`, …), comments and the elements the parser
+//! closes implicitly at a sibling (`<p>`, `<li>`, `<td>`, …) are left
+//! out, so unclosed tags of those kinds on real pages do not count
+//! against it. The self-closing slash on a non-void tag is not left
+//! out: the HTML parser ignores it (`<div/>` nests), so the scan must
+//! count it too.
 
 /// Deeper than this and the body is not a document.
 pub const MAX_NESTING: usize = 4096;
@@ -49,9 +52,8 @@ pub fn max_nesting(text: &str) -> usize {
             continue;
         }
         let name = b[name_start..j].to_ascii_lowercase();
-        // End of the tag, noting `/>`.
+        // End of the tag, quotes kept whole.
         let mut k = j;
-        let mut self_closing = false;
         let mut quote: Option<u8> = None;
         while k < b.len() {
             let c = b[k];
@@ -65,7 +67,6 @@ pub fn max_nesting(text: &str) -> usize {
                     if c == b'"' || c == b'\'' {
                         quote = Some(c);
                     } else if c == b'>' {
-                        self_closing = k > j && b[k - 1] == b'/';
                         break;
                     }
                 }
@@ -79,7 +80,7 @@ pub fn max_nesting(text: &str) -> usize {
             }
             continue;
         }
-        if self_closing || !counts(&name) {
+        if !counts(&name) {
             if is_raw_text(&name) {
                 // Skip to the matching end tag: markup inside is text.
                 let mut close = b"</".to_vec();
@@ -196,8 +197,7 @@ mod tests {
             max_nesting("<html><body><div><span>x</span></div></body></html>"),
             4
         );
-        // Unclosed void / sibling-closed / self-closing / raw text do
-        // not accumulate.
+        // Unclosed void / sibling-closed / raw text do not accumulate.
         let page = format!(
             "<div>{}{}{}<script>{}</script><p>a<p>b<p>c</div>",
             "<br>".repeat(500),
@@ -221,6 +221,11 @@ mod tests {
         let html = format!("<ul>{}x", "<ul><li>".repeat(n));
         assert!(max_nesting(&html) > MAX_NESTING);
         let html = format!("{}x", "<b>".repeat(n));
+        assert!(max_nesting(&html) > MAX_NESTING);
+        // A self-closing slash on a non-void tag is ignored by the HTML
+        // parser, so these nest for real and must count (review probe:
+        // `<div/>` reached DOM depth 32 000 while the scan reported 0).
+        let html = format!("{}x", "<div/>".repeat(n));
         assert!(max_nesting(&html) > MAX_NESTING);
         // A wide page is not a deep one (<p> is sibling-closed, so
         // div + b).
