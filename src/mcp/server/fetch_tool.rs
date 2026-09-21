@@ -1956,7 +1956,7 @@ pub(super) async fn ghost_escalate(
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
         if !crate::fetch::guards::is_binary(&r.body, &ct)
-            && let Ok(e) = extract::extract(&r.body, &ct, &r.url, opts)
+            && let Ok(e) = extract::extract_off_worker(&r.body, &ct, &r.url, opts).await
         {
             let thin = e.thin;
             replay_content_ok = !thin;
@@ -2937,7 +2937,7 @@ async fn try_resurrect(
                 snapshot_url: Some(snap_url.clone()),
             });
         }
-        let ex = match extract::extract(&snap.body, &ct, &snap_url, &opts) {
+        let ex = match extract::extract_off_worker(&snap.body, &ct, &snap_url, &opts).await {
             Ok(ex) => ex,
             Err(_) => {
                 return Err(ResurrectError {

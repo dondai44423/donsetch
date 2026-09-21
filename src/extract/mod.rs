@@ -150,7 +150,7 @@ pub enum ContentKind {
 #[derive(Debug)]
 pub enum ExtractError {
     BadSelector(String),
-    /// The off-worker parse did not finish (budget, or the task died).
+    /// The body was refused (nesting gate) or the parse did not finish off the worker (budget, or the task died).
     Failed(String),
 }
 
