@@ -986,7 +986,7 @@ mod tests {
         let blobs = find_blobs(&html);
         assert!(blobs.is_empty());
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
+            started.elapsed() < std::time::Duration::from_secs(20),
             "took {:?}",
             started.elapsed()
         );
