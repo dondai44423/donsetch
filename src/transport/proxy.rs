@@ -216,7 +216,7 @@ impl Proxy {
         // rsplit_once handles IPv6 brackets too: [::1]:1080 → ("[::1]", "1080")
         let port: u16 = port
             .parse()
-            .map_err(|_| FetchError::Http(format!("proxy: bad port {port:?}")))?;
+            .map_err(|_| FetchError::Http("proxy: bad port (expected 1-65535)".into()))?;
         // Strip IPv6 brackets if present.
         let host = host
             .strip_prefix('[')
@@ -770,11 +770,15 @@ mod tests {
         assert!(Proxy::parse("socks4://127.0.0.1:1080").is_err());
         // The Debug impl redacts the password; the parse errors used
         // to echo the whole string, password included, into a
-        // FetchError that can surface in a tool result.
+        // FetchError that can surface in a tool result. The port token
+        // is dropped too: without an `@`, or with the order swapped,
+        // the last colon segment is the password.
         for bad in [
             "http://user:s3cret@host:notaport",
             "http://user:s3cret@hostonly",
             "http://users3cret@host:1080",
+            "http://user:s3cret",
+            "http://host:1080@user:s3cret",
         ] {
             let e = Proxy::parse(bad).unwrap_err().to_string();
             assert!(!e.contains("s3cret"), "{bad} -> {e}");
