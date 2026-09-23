@@ -2,8 +2,8 @@
 #
 # Test runs use cargo-nextest with the `ci` cargo profile (release
 # opts, no fat LTO), so full test links take seconds, not minutes.
-# Deploy target/ artifacts are cached per platform (rust-cache), so
-# steady-state Windows runs are minutes, not 20.
+# Build output is cached per platform (see .github/workflows/CACHING.md),
+# so steady-state Windows runs are minutes, not 20.
 #
 # Two payload gates beyond compilation, because compile success has
 # shipped dead binaries before (v3.3.0 ONNX feature leak):
@@ -192,64 +192,83 @@ jobs:
         run: |
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # Cache key: <target>-<CACHE_KIND>-dep-<DEP_HASH>-ci1.
-      # DEP_HASH hashes Cargo.lock + Cargo.toml with `version`
-      # lines stripped. That is the single most important line in
-      # this workflow: a release commit bumps the version in
-      # Cargo.toml, which under rust-cache's DEFAULT keying
-      # invalidates the whole dependency cache on every release
-      # and turns every tag build into a 15-25 min cold rebuild
-      # across 5 platforms. With version stripped, releases build
-      # warm: only donsetch itself recompiles. Real dependency or
-      # profile changes still change the hash and invalidate
-      # correctly. CI and release use separate suffixes so the
-      # release build's RUSTFLAGS artifacts never churn CI's.
+      # Caching is explained in .github/workflows/CACHING.md. Two caches:
+      # ~/.cargo via rust-cache, target/ via actions/cache with a sweep
+      # before saving. DEP_HASH ignores donsetch's own version, so a
+      # release commit keeps the cache warm.
       - name: Compute version-insensitive dep hash
         shell: bash
-        run: |
-          DEP_HASH=$(python3 - <<'EOF'
-          import hashlib, pathlib, re
-          h = hashlib.sha256()
-          lock = pathlib.Path('Cargo.lock').read_text()
-          lock = re.sub(r'name = "donsetch"\nversion = "[^"]+"',
-                        'name = "donsetch"', lock)
-          h.update(lock.encode())
-          for p in sorted(pathlib.Path('.').rglob('Cargo.toml')):
-              t = re.sub(r'\n\s*version\s*=\s*"[^"]*"', '', p.read_text())
-              h.update(p.name.encode()); h.update(t.encode())
-          print(h.hexdigest()[:16])
-          EOF
-          )
-          echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
+        run: echo "DEP_HASH=$(python3 scripts/dep-hash.py)" >> "$GITHUB_ENV"
 
-      # What this job actually BUILDS, which is not always what the
-      # matrix declares: the windows lane is `tests: none` and still
-      # builds the suite on every non-PR event (mirrors the `if:` on
-      # "Test (nextest, Windows core suite, non-PR)" below). The two
-      # shapes must not share a cache entry : `cargo check` leaves
-      # rmeta and no codegen, so a test build that restores a
-      # check-shaped entry recompiles the whole dependency tree, and
-      # rust-cache does not re-save on an exact key hit, so the
-      # wrong shape sticks until DEP_HASH moves. That is what the
-      # windows lane has been doing since it started running tests:
-      # 223 crates recompiled per run, ~7 min.
+      # Build-shape part of the key. Windows is keyed `full` on every
+      # event, so its check-only PRs restore master's test-built tree.
+      # Safe only because PRs never save (CACHING.md, "Pull requests
+      # never save").
       - name: Compute cache kind
         shell: bash
         run: |
           KIND='${{ matrix.tests }}'
-          if [ '${{ matrix.name }}' = 'windows-x86_64' ] && [ '${{ github.event_name }}' != 'pull_request' ]; then
+          if [ '${{ matrix.name }}' = 'windows-x86_64' ]; then
             KIND=full
           fi
           echo "CACHE_KIND=$KIND" >> "$GITHUB_ENV"
 
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+      # Key: tgt-<target>-<kind>-<rustc>-v1-<DEP_HASH>-<WF_HASH>. A miss
+      # falls back to the newest older entry. WF_HASH (this file) makes
+      # any change to how a lane builds re-save. Bump v1 for a cold
+      # reset. CACHING.md, "The target/ key".
+      - name: Compute target/ cache key
+        shell: bash
+        run: |
+          RUSTC=$(rustc -vV | sed -n 's/^commit-hash: //p' | cut -c1-9)
+          WF_HASH=$(python3 -c "import hashlib; print(hashlib.sha256(open('.github/workflows/ci.yml', 'rb').read().replace(b'\r\n', b'\n')).hexdigest()[:8])")
+          PREFIX="tgt-${{ matrix.target }}-${CACHE_KIND}-${RUSTC}-v1-"
+          echo "TARGET_CACHE_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          echo "TARGET_CACHE_DEPS_PREFIX=${PREFIX}${DEP_HASH}-" >> "$GITHUB_ENV"
+          echo "TARGET_CACHE_KEY=${PREFIX}${DEP_HASH}-${WF_HASH}" >> "$GITHUB_ENV"
+
+      # ~/.cargo only (CACHING.md, "Two caches per lane"). MUST run
+      # before the target/ restore: on a partial match it cleans
+      # target/ even with cache-targets false. SHA-pinned: v2 moves.
+      - name: Cache ~/.cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ${{ matrix.target }}-${{ env.CACHE_KIND }}-dep-${{ env.DEP_HASH }}-ci1
-          add-rust-environment-hash-key: "false"
-          # A red run must still warm the cache: the next push is
-          # right behind it and should not pay full price again.
+          key: ${{ matrix.target }}
+          cache-targets: "false"
           cache-on-failure: "true"
+          # Pull requests never save, as for target/.
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      # Windows runners ship with last-access updates off, which would
+      # make the sweep delete the whole tree. Fail rather than risk it.
+      - name: Enable NTFS last-access updates (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          fsutil.exe behavior set disablelastaccess 0
+          fsutil.exe behavior query disablelastaccess | tee lastaccess.txt
+          grep -q 'Updates ENABLED' lastaccess.txt
+
+      # Most specific first: the same key (finds a red run's -partial-
+      # entry), the same deps under an older workflow, any older state.
+      - name: Restore target/
+        id: target-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: target
+          key: ${{ env.TARGET_CACHE_KEY }}
+          restore-keys: |
+            ${{ env.TARGET_CACHE_KEY }}
+            ${{ env.TARGET_CACHE_DEPS_PREFIX }}
+            ${{ env.TARGET_CACHE_PREFIX }}
+
+      # Marks the start of the build for the sweep (CACHING.md, "Keeping
+      # the cache bounded"). Nothing may read target/ between the
+      # restore and here, not even `du`.
+      - name: Prepare target/ for the sweep
+        if: steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        shell: bash
+        run: python3 scripts/ci-sweep.py prepare
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -327,6 +346,56 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
+      # ── Save target/. Keep these the LAST steps: the sweep deletes
+      # whatever the earlier steps did not read. Pull requests never
+      # save (CACHING.md, "Pull requests never save").
+
+      # Green run: keep only what this run used, drop donsetch's own
+      # units (every commit rebuilds them), save under the exact key.
+      - name: Sweep target/
+        id: sweep
+        if: success() && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          python3 scripts/ci-sweep.py sweep
+          cargo clean -p donsetch --profile ci --target ${{ matrix.target }}
+          cargo clean -p donsetch --profile ci
+
+      - name: Save target/
+        if: success() && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ env.TARGET_CACHE_KEY }}
+
+      # Red run, timeouts included: save UNSWEPT under a -partial- key so
+      # the next run resumes (CACHING.md, "When a run fails"). First stop
+      # leftover compilers, which keep writing after a step times out;
+      # TERM before KILL so make and cc can delete half-written output.
+      - name: Stop leftover build processes (red run)
+        if: failure() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && steps.sweep.outcome == 'skipped' && github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            names="cargo.exe cargo-nextest.exe rustc.exe build-script-build.exe cl.exe link.exe lld-link.exe cmake.exe"
+            for p in $names; do taskkill //T //IM "$p" >/dev/null 2>&1 || true; done
+            sleep 10
+            for p in $names; do taskkill //F //T //IM "$p" >/dev/null 2>&1 || true; done
+          else
+            names='cargo|cargo-nextest|rustc|build-script-build|cc|c\+\+|cc1|cc1plus|as|ld|ld\.lld|clang|cmake|make'
+            pkill -TERM -x "$names" || true
+            sleep 10
+            pkill -KILL -x "$names" || true
+          fi
+          sleep 2
+
+      - name: Save partial target/ (red run, unswept)
+        if: failure() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && steps.sweep.outcome == 'skipped' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ env.TARGET_CACHE_KEY }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
+
   # ── Supply chain: licenses + RustSec advisories + sources ──
   supply-chain:
     name: cargo-deny
@@ -361,8 +430,10 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
+      # Same pin as build-test and rust-toolchain.toml: `@stable` let
+      # this job drift to whatever stable is on the nightly date.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98
         with:
           targets: ${{ matrix.target }}
       - name: Cache cargo + target

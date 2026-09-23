@@ -127,35 +127,27 @@ jobs:
         run: |
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # Cache key: <target>-dep-<DEP_HASH>-rel1 (see ci.yml for the
-      # full rationale). The version-insensitive hash is what makes
-      # release builds warm: without it, every version bump nukes
-      # the dependency cache and every tag build is a cold 15-25
-      # min rebuild on all five platforms.
+      # Cache key: release-<target>-dep-<DEP_HASH>-rel2, DEP_HASH from
+      # scripts/dep-hash.py (see ci.yml).
+      #
+      # Tag runs restore but never SAVE. GitHub scopes a cache to the
+      # ref that saved it: a run for tag vX can read its own tag's
+      # entries and the default branch's, never another tag's. Nothing
+      # on master saves a release key, so a tag-saved entry can never
+      # be restored by the next release (every v4.3.x build logged "No
+      # cache found") and only takes space in the repo's 10 GB pool,
+      # evicting CI's entries. Dispatch runs on a branch still save.
       - name: Compute version-insensitive dep hash
         shell: bash
-        run: |
-          DEP_HASH=$(python3 - <<'EOF'
-          import hashlib, pathlib, re
-          h = hashlib.sha256()
-          lock = pathlib.Path('Cargo.lock').read_text()
-          lock = re.sub(r'name = "donsetch"\nversion = "[^"]+"',
-                        'name = "donsetch"', lock)
-          h.update(lock.encode())
-          for p in sorted(pathlib.Path('.').rglob('Cargo.toml')):
-              t = re.sub(r'\n\s*version\s*=\s*"[^"]*"', '', p.read_text())
-              h.update(p.name.encode()); h.update(t.encode())
-          print(h.hexdigest()[:16])
-          EOF
-          )
-          echo "DEP_HASH=$DEP_HASH" >> "$GITHUB_ENV"
+        run: echo "DEP_HASH=$(python3 scripts/dep-hash.py)" >> "$GITHUB_ENV"
 
       - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}-dep-${{ env.DEP_HASH }}-rel2
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build
         env:
