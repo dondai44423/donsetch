@@ -875,7 +875,7 @@ impl Ghost {
         // uses the Job Object's KILL_ON_JOB_CLOSE.
         #[cfg(linux_like)]
         unsafe {
-            cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec);
+            cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec());
         }
         let mut child = cmd
             .kill_on_drop(true)

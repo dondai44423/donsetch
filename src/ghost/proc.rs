@@ -302,16 +302,31 @@ impl Proc {
 }
 
 /// `PR_SET_PDEATHSIG` : kernel kills the child if donsetch dies.
-/// Called in `pre_exec` (child context). Linux-only; macOS has no
-/// `prctl` equivalent.
+/// Returns the closure for `pre_exec` (child context). Linux-only;
+/// macOS has no `prctl` equivalent.
+///
+/// The signal arms only from the prctl call on: a parent that died
+/// between fork and prctl leaves a child that never gets it. The
+/// parent's pid is taken here, before the fork, and the child checks
+/// it is still its parent after arming, so that window fails the
+/// spawn instead of leaking an orphan.
 #[cfg(linux_like)]
-pub fn pdeath_pre_exec() -> std::io::Result<()> {
-    unsafe {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-            return Err(std::io::Error::last_os_error());
+pub fn pdeath_pre_exec() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    let parent = std::process::id();
+    move || {
+        // SAFETY: async-signal-safe calls only between fork and exec.
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other(
+                    "parent exited before the child started",
+                ));
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Open a process handle for suspend/resume (Windows only).

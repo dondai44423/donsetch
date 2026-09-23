@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tiers and the ask.
 
 ### Fixed
+- The parent-death signal a browser or Xvfb child arms in `pre_exec`
+  covers a parent that dies after the child started; a parent that died
+  between the fork and the `prctl` left a child that never got it. The
+  child now checks its parent is still the one that forked it and
+  fails the spawn otherwise, and the killed-parent path has a test.
 
 - pkg.go.dev URLs that pin a version (`/module@v1.2.3`) map to the
   Go proxy's pinned `.info` endpoint now. The `@` used to ride along

@@ -189,7 +189,7 @@ mod linux {
             // primitive the browser child already uses.
             unsafe {
                 cmd.as_std_mut()
-                    .pre_exec(crate::ghost::proc::pdeath_pre_exec);
+                    .pre_exec(crate::ghost::proc::pdeath_pre_exec());
             }
 
             let mut child = cmd.spawn().map_err(|e| {
@@ -799,6 +799,105 @@ mod tests {
     }
 
     // #280: shutdown kills the owned child and waits for the reap,
+    /// `/proc/<pid>/stat` state letter, or None once the pid is gone.
+    #[cfg(target_os = "linux")]
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // "pid (comm) S ..." : the state follows the last ')'.
+        let after = stat.rsplit_once(')')?.1;
+        after.split_whitespace().next()?.chars().next()
+    }
+
+    /// A live (non-zombie) Xvfb serving `display`, by /proc cmdline.
+    #[cfg(target_os = "linux")]
+    fn find_xvfb_pid(display: &str) -> Option<u32> {
+        for entry in std::fs::read_dir("/proc").ok()? {
+            let entry = entry.ok()?;
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let parts: Vec<&[u8]> = cmd.split(|b| *b == 0).collect();
+            if parts.len() >= 2
+                && parts[0].ends_with(b"Xvfb")
+                && parts[1] == display.as_bytes()
+                && proc_state(pid) != Some('Z')
+            {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    // The other half of #280: a parent that ends without running any
+    // cleanup (a supervisor's SIGKILL, an exit on an error path). The
+    // parent-death signal must take the display down with it. The
+    // parent here is a child process of this test binary that starts
+    // an Xvfb through the real code and then blocks.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_xvfb_dies_with_a_parent_that_was_killed_outright() {
+        let _lock = SERIAL.lock().await;
+        let exe = std::env::current_exe().unwrap();
+        let mut parent = tokio::process::Command::new(exe)
+            .args([
+                "--exact",
+                "ghost::xvfb::tests::helper_start_xvfb_and_block",
+                "--nocapture",
+            ])
+            .env("DONSETCH_XVFB_DISPLAY", "109")
+            .env("DONSETCH_XVFB_HELPER", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn helper");
+        let mut xvfb_pid: Option<u32> = None;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Some(p) = find_xvfb_pid(":109") {
+                xvfb_pid = Some(p);
+                break;
+            }
+        }
+        let xvfb_pid = xvfb_pid.expect("helper's Xvfb :109 came up");
+        // Kill the parent outright: no Drop, no shutdown.
+        parent.start_kill().unwrap();
+        let _ = parent.wait().await;
+        let mut gone = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if proc_state(xvfb_pid).is_none() {
+                gone = true;
+                break;
+            }
+        }
+        if !gone {
+            unsafe {
+                libc::kill(xvfb_pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        // The killed parent could not remove its gate; do it here so
+        // the next starter is not held for the stale window.
+        let _ = std::fs::remove_file("/tmp/.donsetch-xvfb-109.lock");
+        assert!(gone, "Xvfb {xvfb_pid} outlived its killed parent");
+    }
+
+    /// Body of the helper process for the test above; a no-op when
+    /// run as an ordinary test.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn helper_start_xvfb_and_block() {
+        if std::env::var_os("DONSETCH_XVFB_HELPER").is_none() {
+            return;
+        }
+        let owned = x::Xvfb::start().await.expect("helper start");
+        assert!(!owned.is_borrowed());
+        // Block until killed; the Xvfb must not outlive us.
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    }
+
     // so a caller can rely on the display being gone on return.
     #[cfg(target_os = "linux")]
     #[tokio::test]
