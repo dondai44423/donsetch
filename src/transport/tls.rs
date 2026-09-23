@@ -541,6 +541,16 @@ pub fn classify_handshake_error<E: std::error::Error>(e: &E) -> String {
     text
 }
 
+/// True when a classified TLS message describes a certificate/trust
+/// failure: the certificate the far side presented, never lane health.
+/// The vocabulary is exactly what `classify_handshake_error` emits for
+/// verify problems, and it is the one predicate the mcp error mapping
+/// (tls.verify) and the fetch egress accounting both key off, so the
+/// two can never drift apart.
+pub fn is_cert_verify_failure(msg: &str) -> bool {
+    msg.starts_with("TLS certificate verification failed") || msg.contains("trusted root")
+}
+
 /// What to tell a user when the transport dies mid-handshake: the
 /// two situations that produce this are an egress filter killing
 /// direct HTTPS (use the env proxy convention, opt out with the
@@ -616,6 +626,28 @@ mod tests {
     fn unrelated_errors_pass_through_untouched() {
         let input = "an opaque handshake failure";
         assert_eq!(classify_handshake_error(&BogusErr(input.into())), input);
+    }
+
+    /// The verify-vs-egress vocabulary is shared with the egress
+    /// accounting and the mcp tls.verify class: both key off this one
+    /// predicate. Note the hints: only CERT_HINT carries "trusted
+    /// root"; EGRESS_HINT's SSL_CERT_FILE must not match.
+    #[test]
+    fn cert_verify_vocabulary_is_shared() {
+        assert!(is_cert_verify_failure(
+            "TLS certificate verification failed. The presentation cert chain \
+             was not issued by any trusted root. In a TLS-intercepting network \
+             the proxy re-signs certificates with its own CA: export \
+             SSL_CERT_FILE ..."
+        ));
+        let egress =
+            classify_handshake_error(&BogusErr("os error 104: connection reset by peer".into()));
+        assert!(!is_cert_verify_failure(&egress), "{egress}");
+        assert!(!is_cert_verify_failure(
+            "TLS handshake cut short (peer closed the connection). The egress \
+             path is killing HTTPS out of band: ... SSL_CERT_FILE ..."
+        ));
+        assert!(!is_cert_verify_failure("an opaque handshake failure"));
     }
 
     #[test]

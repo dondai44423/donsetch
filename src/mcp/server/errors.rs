@@ -417,12 +417,7 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
         {
             "tls.egress"
         }
-        FetchError::Tls(msg)
-            if msg.starts_with("TLS certificate verification failed")
-                || msg.contains("trusted root") =>
-        {
-            "tls.verify"
-        }
+        FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => "tls.verify",
         _ => "permanent",
     }
 }

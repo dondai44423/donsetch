@@ -23,7 +23,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 /// A running relay bound to one upstream lane. Dropping it aborts
-/// the accept loop; Chrome dies with it.
+/// the accept loop (new connections are refused from then on);
+/// in-flight tunnels are their own tasks and end when their streams
+/// do, so a drop never cuts Chrome mid-connection.
 pub struct Relay {
     pub port: u16,
     handle: Option<JoinHandle<()>>,

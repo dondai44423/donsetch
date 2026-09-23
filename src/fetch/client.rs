@@ -1263,6 +1263,15 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
     match e {
         FetchError::Dns(_) | FetchError::DnsTimeout(_) => None,
         FetchError::Timeout => Some(LaneNote::Timeout),
+        // A certificate-verify failure is the certificate the far
+        // side presented, not lane health: on a SOCKS5 tunnel and a
+        // plain CONNECT tunnel alike the TLS peer is the origin, so a
+        // self-signed/expired/mismatched origin cert used to retire a
+        // healthy lane for every host for 10 minutes (the #248 class
+        // again). Egress-flavored TLS failures ("handshake aborted" /
+        // "cut short": the classifier's tls.egress vocabulary) still
+        // bench.
+        FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => None,
         FetchError::Io(_) | FetchError::Tls(_) => Some(LaneNote::Dead),
         // A proxy that demands credentials. Ahead of the text arms:
         // "CONNECT -> 407" must never read as a dead lane.
@@ -1316,6 +1325,78 @@ mod transport_exit_tests {
             None
         );
         assert_eq!(lane_note(&FetchError::Http("parser died".into())), None);
+    }
+
+    // The vocabulary split: cert-verify failures are origin-side;
+    // egress-flavored handshake failures stay lane-level.
+    #[test]
+    fn cert_verify_failures_leave_lane_health_alone() {
+        assert_eq!(
+            lane_note(&FetchError::Tls(
+                "TLS certificate verification failed. The presentation cert chain was not issued by any trusted root.".into()
+            )),
+            None
+        );
+        assert_eq!(
+            lane_note(&FetchError::Tls(
+                "TLS handshake aborted (connection reset or cut mid-negotiation).".into()
+            )),
+            Some(LaneNote::Dead)
+        );
+        assert_eq!(
+            lane_note(&FetchError::Tls(
+                "TLS handshake cut short (peer closed the connection).".into()
+            )),
+            Some(LaneNote::Dead)
+        );
+    }
+
+    // A bad origin certificate must not bench the lane: fetching a
+    // self-signed/expired site through a pool lane used to retire the
+    // lane globally for 10 minutes, so two or three such probes
+    // degraded the whole pool to direct.
+    #[test]
+    fn a_bad_origin_certificate_does_not_bench_the_lane() {
+        use crate::search::egress::EgressPool;
+        use crate::transport::proxy::Proxy;
+        let dir = std::env::temp_dir().join(format!("donsetch-lane-cert-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // SAFETY: test-only mutation of the process env; nextest runs
+        // each test in its own process.
+        unsafe {
+            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
+        }
+        let proxy = Proxy::parse("http://127.0.0.1:34568").unwrap();
+        let id = proxy.id();
+        let pool = EgressPool::new(vec![proxy]);
+        for _ in 0..3 {
+            note_lane_outcome(
+                &pool,
+                "self-signed.example",
+                &id,
+                &FetchError::Tls("TLS certificate verification failed.".into()),
+            );
+        }
+        assert!(
+            !pool.is_dead(&id),
+            "an origin certificate is not the lane's fault"
+        );
+        assert_eq!(
+            pool.pick_fetch("self-signed.example", true).map(|e| e.id),
+            Some(id.clone()),
+            "the lane stays on the proxy; direct is not reached"
+        );
+        // An egress-flavored TLS failure is still a dead lane.
+        note_lane_outcome(
+            &pool,
+            "self-signed.example",
+            &id,
+            &FetchError::Tls(
+                "TLS handshake aborted (connection reset or cut mid-negotiation).".into(),
+            ),
+        );
+        assert!(pool.is_dead(&id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The consequence, on a real pool: N fetches of hosts that do not

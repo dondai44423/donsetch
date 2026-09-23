@@ -79,6 +79,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries ride the content host. Wiki pages and share links (`/s/`)
   stay pages (no JSON shape); `redd.it` shortlinks resolve through
   the redirect into the thread card.
+- The egress pool no longer retires a proxy lane for a certificate
+  problem at the origin. Any TLS failure read as a dead lane, so
+  fetching a self-signed, expired or hostname-mismatched site
+  through a pool lane benched that lane globally for 10 minutes:
+  two or three such probes degraded the whole pool to direct.
+  Certificate-verify failures now leave lane health alone (the same
+  vocabulary the tls.verify error class uses); egress-flavored TLS
+  failures (handshake reset or cut short) still bench.
+- A proxy dial can no longer burn over a minute per attempt: the
+  per-step 12s timeouts stacked (a SOCKS5 handshake is up to nine
+  steps), so a lane that accepted TCP and stalled mid-handshake
+  stalled every fetch, and the Chrome relay re-paid it per browser
+  request before its strike cache armed. One 30s budget now bounds
+  the whole dial+handshake.
+- NO_PROXY entries that combine brackets and a port ("[::1]:8443")
+  match again: the port strip skipped any host containing ':', so
+  the bracketed IPv6 + port form matched nothing at all.
+- An empty proxy env var counts as unset: HTTPS_PROXY="" used to
+  short-circuit the fallback chain, sending https traffic direct
+  and starving the lowercase variant and ALL_PROXY.
+- Proxy credentials with an empty user name (":token@host:port")
+  are no longer dropped: the CONNECT header, the raw-hop
+  Proxy-Authorization and the save round trip carry them, matching
+  the ghost tier's user-or-pass definition of an authenticated lane.
+- IPv6 literal targets ride proxy lanes correctly: a bare literal
+  (the shape the Chrome relay forwards from ATYP 0x04) is bracketed
+  for the CONNECT line and Host header, and SOCKS5 sends IP
+  literals with their native address type instead of as an
+  unresolvable domain name.
+- Doc fixes: from_env_for's resolution-order comment described an
+  order the code never had (config slot, then config all, then the
+  env chain: exactly what doctor reports), and the relay's drop
+  comment overstated what aborting the accept loop cuts.
 
 ## [4.3.2] - 2026-09-23
 
