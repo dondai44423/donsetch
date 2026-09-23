@@ -16,6 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A repeated block was replaced by a marker whenever the marker was
+  one character shorter, and the marker named nothing. Sites that
+  wrap every LINE in its own element (lyrics, verse, subtitles,
+  transcripts) hand the extractor blocks barely longer than the
+  marker, so a repeated stanza came back as a run of anonymous
+  `*[repeated block omitted]*` lines: on one such page 13 markers
+  stood in for 12 of the 32 lines, four in a row where a stanza
+  belonged. A marker has to be two thirds of the block's length or
+  less now, so those lines print verbatim (32 of 32 return), and a
+  marker that does stand in names its source: `*[repeated block
+  omitted, same as block 16: "…"]*`. The ordinal identifies the
+  copy, because openings collide (a refrain's lines, a table of
+  "Not applicable" rows), and the quoted opening is what a human
+  reads. Blocks big enough for collapsing to pay are unaffected
+  (Mart-Bogdan, #292).
 - pkg.go.dev URLs that pin a version (`/module@v1.2.3`) map to the
   Go proxy's pinned `.info` endpoint now. The `@` used to ride along
   into the `@latest` rewrite, which the proxy read as part of the

@@ -1322,10 +1322,13 @@ fn short_pdf_is_not_classified_as_an_html_shell() {
 
 #[test]
 fn dedup_identical_paragraphs() {
+    // Paragraph-sized on purpose: a marker only stands in for a
+    // block it is much shorter than, so a fixture trimmed to a few
+    // words would be kept verbatim and test nothing.
     let html = r#"<html><body><article>
-<p>Duplicate content that appears multiple times.</p>
-<p>Duplicate content that appears multiple times.</p>
-<p>Unique content that only appears once.</p>
+<p>Duplicate content that appears multiple times on this page, long enough that a marker standing in for it is the cheaper of the two.</p>
+<p>Duplicate content that appears multiple times on this page, long enough that a marker standing in for it is the cheaper of the two.</p>
+<p>Unique content that only appears once, and stays whatever the duplicate above it does.</p>
 </article></body></html>"#;
     let r = extract_html(html);
     // "Duplicate content" should appear only once.

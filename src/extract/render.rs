@@ -7,9 +7,78 @@ use super::metadata::Meta;
 /// #292: every omission marker starts with this. The fetch layer
 /// counts the markers for `structuredContent.omitted_repeats`.
 pub(crate) const REPEATED_MARKER_PREFIX: &str = "*[repeated ";
-/// Duplicates of at least this many chars get an in-place marker;
-/// shorter ones (badges, one-liners) stay silent.
+/// Below this length a duplicate is dropped without a marker:
+/// badges and one-word labels carry nothing a reader would miss.
 const MIN_MARKED_DUP: usize = 24;
+/// Opening characters quoted in a marker, so a reader can tell
+/// which block was dropped. Capped: the quote is a hint, not the
+/// block.
+const MARKER_QUOTE_CHARS: usize = 48;
+
+/// What to do with a block that repeats an earlier one.
+#[derive(Debug, PartialEq)]
+enum DupAction {
+    /// Drop it, no marker: a badge or a one-word label.
+    Silent,
+    /// Print it: no marker for it is short enough to be worth the
+    /// hole it would leave.
+    Keep,
+    Mark(String),
+}
+
+/// Whether a repeated block is dropped, replaced by a marker, or
+/// printed, and what the marker says.
+///
+/// A block is only worth hiding when the marker is much shorter
+/// (`worth_hiding`). Sites that wrap each LINE in its own element
+/// (lyrics, verse, subtitles, transcripts) turn a stanza into a
+/// run of blocks barely longer than a marker, where replacing
+/// them buys nothing and empties the page.
+///
+/// The marker names its source: the ordinal identifies it, since
+/// openings collide freely (a refrain's lines, "Not applicable"
+/// rows), and the quoted opening is what a human reads.
+/// `first_seen_at` is a position in the document's block stream,
+/// assigned before pagination, so it still points at the first
+/// copy in a slice that does not contain it.
+fn dup_action(md: &str, first_seen_at: usize) -> DupAction {
+    if md.chars().count() < MIN_MARKED_DUP {
+        return DupAction::Silent;
+    }
+    let first_line = md.lines().next().unwrap_or(md).trim();
+    let quote: String = first_line.chars().take(MARKER_QUOTE_CHARS).collect();
+    let ellipsis = if first_line.chars().count() > MARKER_QUOTE_CHARS {
+        "…"
+    } else {
+        ""
+    };
+    let len = md.chars().count();
+    // Quoted first: the opening is what a human reads. The bare
+    // reference is the fallback for a block the quote would
+    // outgrow, and it still names the source.
+    let quoted = format!(
+        "{REPEATED_MARKER_PREFIX}block omitted, same as block {first_seen_at}: \"{quote}{ellipsis}\"]*"
+    );
+    if worth_hiding(&quoted, len) {
+        return DupAction::Mark(quoted);
+    }
+    let bare = format!("{REPEATED_MARKER_PREFIX}block omitted, same as block {first_seen_at}]*");
+    if worth_hiding(&bare, len) {
+        return DupAction::Mark(bare);
+    }
+    DupAction::Keep
+}
+
+/// Whether a marker is short enough to stand in for the block:
+/// two thirds of its length or less.
+///
+/// A marginal saving is not worth the hole. Replacing a line with
+/// a marker a few characters shorter costs the reader the line and
+/// breaks the stanza, list or table it sits in, so the threshold
+/// is a ratio rather than "shorter by any amount".
+fn worth_hiding(marker: &str, block_len: usize) -> bool {
+    marker.chars().count() * 3 <= block_len * 2
+}
 
 pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOptions) -> String {
     // Repeated boilerplate sections collapse before rendering
@@ -59,7 +128,9 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
     let mut title_heading_dropped = false;
     // Cross-block exact-duplicate suppression: badge
     // dupes, repeated teasers. Keyed on normalized text.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Value = where the first copy sits in the block stream, so a
+    // marker can name it (#292 follow-up).
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     // #292: whether the previous block was a heading. A block that
     // opens its own section is the section's content: a repeat
     // there is structure, never boilerplate.
@@ -104,16 +175,26 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 if looks_like_data_blob(md) {
                     continue;
                 }
-                if !seen.insert(normalize(md)) && !prev_heading {
-                    // Exact duplicate of an earlier block (#292): a
-                    // section's own opener stays (structure), and
-                    // elsewhere the omission is visible, marked in
-                    // place. Tiny chrome dupes (badges) stay silent.
-                    if md.len() >= MIN_MARKED_DUP {
-                        out.push_str(&format!("{REPEATED_MARKER_PREFIX}block omitted]*"));
-                        out.push_str("\n\n");
+                // Exact duplicate of an earlier block (#292). A
+                // block that opens its own section is the
+                // section's content, so it is never suppressed;
+                // anywhere else `dup_action` decides.
+                let key = normalize(md);
+                match seen.get(&key).copied() {
+                    Some(first_seen_at) if !prev_heading => match dup_action(md, first_seen_at) {
+                        DupAction::Silent => continue,
+                        DupAction::Mark(marker) => {
+                            out.push_str(&marker);
+                            out.push_str("\n\n");
+                            continue;
+                        }
+                        // Falls through and emits the block below.
+                        DupAction::Keep => {}
+                    },
+                    Some(_) => {}
+                    None => {
+                        seen.insert(key, idx + 1);
                     }
-                    continue;
                 }
                 // Bare numbers: vote counts, rank numbers.
                 if md.len() < 8 && md.chars().all(|c| c.is_ascii_digit() || c == ',') {
@@ -494,6 +575,113 @@ mod tests {
         assert_eq!(code_fence("x\n````\ny"), "`````");
         assert_eq!(code_fence("`````\n"), "``````");
         assert_eq!(code_fence(""), "```");
+    }
+}
+
+#[cfg(test)]
+mod dup_action_tests {
+    use super::*;
+
+    // Fails if the length gate goes away and a badge starts
+    // leaving a marker longer than the badge itself.
+    #[test]
+    fn a_badge_sized_repeat_stays_silent() {
+        assert_eq!(dup_action("Read more", 3), DupAction::Silent);
+        assert_eq!(dup_action("Sign in", 3), DupAction::Silent);
+    }
+
+    // One line per element: the shape that turns a stanza into a
+    // run of marker-sized blocks. Fails if a marker may replace a
+    // block no longer than itself.
+    #[test]
+    fn a_line_shorter_than_its_marker_is_kept() {
+        let line = "Shipping is free on orders over ten";
+        assert_eq!(line.len(), 35);
+        assert_eq!(dup_action(line, 7), DupAction::Keep);
+    }
+
+    // The band just above the bare marker's own length. Fails if
+    // `worth_hiding` accepts any saving instead of a ratio.
+    #[test]
+    fn a_marginal_saving_does_not_justify_a_marker() {
+        let line = "A line just a little longer than the marker is.";
+        assert!(line.len() > 44 && line.len() < 70);
+        assert_eq!(dup_action(line, 16), DupAction::Keep);
+    }
+
+    // A paragraph is worth replacing, and the marker carries both
+    // halves of the reference: the ordinal and the opening.
+    #[test]
+    fn a_paragraph_is_marked_with_its_source_and_opening() {
+        let para = "Protect your purchase with a plan covering accidental damage, drops, \
+                    spills and mechanical failure, with support around the clock and no \
+                    deductible on an approved claim.";
+        let DupAction::Mark(marker) = dup_action(para, 12) else {
+            panic!("a paragraph this long must be marked");
+        };
+        // The fetch layer counts markers by this prefix.
+        assert!(marker.starts_with(REPEATED_MARKER_PREFIX));
+        assert!(marker.contains("same as block 12"));
+        assert!(marker.contains("Protect your purchase"));
+        assert!(
+            marker.chars().count() < para.chars().count(),
+            "a marker must never be longer than the block it replaced"
+        );
+    }
+
+    // Two blocks can share an opening (a refrain's lines, a table
+    // of "Not applicable" rows), so the ordinal has to be what
+    // identifies the source. Fails if the marker drops it.
+    #[test]
+    fn same_opening_different_source_reads_differently() {
+        let body = "The quick brown fox jumps over the lazy dog and keeps on running \
+                    until it reaches the far side of the field.";
+        let (a, b) = (dup_action(body, 4), dup_action(body, 9));
+        assert_ne!(a, b);
+        let (DupAction::Mark(a), DupAction::Mark(b)) = (a, b) else {
+            panic!("both must be marked");
+        };
+        assert!(a.contains("same as block 4") && b.contains("same as block 9"));
+    }
+
+    // A long opening is cut at the cap, and the cut is visible in
+    // the marker. Fails if the quote grows with the block.
+    #[test]
+    fn the_quote_is_capped() {
+        let long = "x".repeat(400);
+        let DupAction::Mark(marker) = dup_action(&long, 1) else {
+            panic!("must be marked");
+        };
+        assert!(marker.contains('…'));
+        assert!(marker.chars().count() < 120);
+    }
+
+    // Multi-byte text must not panic on the quote cut: the cap
+    // counts chars, and a Cyrillic char is two bytes.
+    #[test]
+    fn a_multibyte_opening_cuts_on_a_char_boundary() {
+        let md = "Перегляньте цю сторінку, щоб дізнатися більше про виконавця, \
+                  його пісні, переклади та коментарі інших користувачів сайту, \
+                  а також про те, як додати власний переклад і підписатися на \
+                  оновлення улюблених авторів.";
+        let DupAction::Mark(marker) = dup_action(md, 2) else {
+            panic!("must be marked");
+        };
+        assert!(marker.contains("Перегляньте"));
+    }
+
+    // The band between the two markers: too long to print twice,
+    // too short for the quoted form. Fails if the fallback tier
+    // goes away and such a block is printed instead.
+    #[test]
+    fn a_midsized_block_falls_back_to_the_bare_reference() {
+        let md = "A shipping disclaimer printed under every item row on this page, in full.";
+        let DupAction::Mark(marker) = dup_action(md, 1) else {
+            panic!("must be marked");
+        };
+        assert!(marker.contains("same as block 1"));
+        assert!(!marker.contains('"'), "no quote at this size");
+        assert!(marker.chars().count() < md.chars().count());
     }
 }
 
