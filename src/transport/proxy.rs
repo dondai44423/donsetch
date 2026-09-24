@@ -415,9 +415,15 @@ impl Proxy {
         target_host: &str,
         target_port: u16,
     ) -> Result<(), FetchError> {
-        // Step 1: greeting : offer no-auth (0x00) and if we
-        // have credentials, username/password (0x02).
-        let has_auth = !self.user.is_empty() || !self.pass.is_empty();
+        // Step 1: greeting : offer no-auth (0x00) and, when RFC 1929
+        // can actually be satisfied, username/password (0x02). ULEN
+        // and PLEN are both 1..255, so a shape with an empty field
+        // (":token@host", "user@host") has no valid sub-negotiation:
+        // it offers no-auth alone rather than sending a zero-length
+        // field a strict server rejects. The token still rides the
+        // CONNECT header and the raw-hop Proxy-Authorization (HTTP
+        // side).
+        let has_auth = !self.user.is_empty() && !self.pass.is_empty();
         let methods: &[u8] = if has_auth { &[0x00, 0x02] } else { &[0x00] };
         let greeting = {
             let mut g = vec![0x05, methods.len() as u8];
@@ -1497,6 +1503,104 @@ u:p@also_valid:8080
             started.elapsed()
         );
         server.abort();
+    }
+
+    // RFC 1929 wants both ULEN and PLEN in 1..255, so a credential
+    // shape with an empty field (":token@host", "user@host") has no
+    // valid SOCKS5 sub-negotiation: the greeting must offer no-auth
+    // alone, never 0x02 with a zero-length field (a strict server
+    // rejects the frame; the old code sent ULEN=0 for a token). The
+    // token still rides the HTTP-side headers and the save round trip
+    // (`password_only_credentials_are_carried`).
+    #[tokio::test]
+    async fn socks5_offers_no_auth_alone_when_a_field_is_empty() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn run_case(user: &str, pass: &str) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listen_port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut greeting = [0u8; 3];
+                s.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(
+                    greeting,
+                    [0x05, 0x01, 0x00],
+                    "no valid sub-negotiation exists: offer no-auth alone"
+                );
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let mut head = [0u8; 4];
+                s.read_exact(&mut head).await.unwrap();
+                assert_eq!(head[3], 0x03, "domain name target");
+                let mut len = [0u8; 1];
+                s.read_exact(&mut len).await.unwrap();
+                let mut rest = vec![0u8; len[0] as usize + 2];
+                s.read_exact(&mut rest).await.unwrap();
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                    .await
+                    .unwrap();
+            });
+            let p = Proxy {
+                host: "127.0.0.1".into(),
+                port: listen_port,
+                user: user.into(),
+                pass: pass.into(),
+                scheme: ProxyScheme::Socks5,
+            };
+            p.connect("example.com", 443)
+                .await
+                .expect("no-auth handshake completes");
+            server.await.unwrap();
+        }
+
+        run_case("", "tok3n").await;
+        run_case("alice", "").await;
+    }
+
+    // A full credential still negotiates RFC 1929: both methods are
+    // offered, the sub-negotiation carries user then password, and
+    // the handshake completes on the server's 0x00.
+    #[tokio::test]
+    async fn socks5_negotiates_auth_when_both_fields_are_present() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 4];
+            s.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x02, 0x00, 0x02]);
+            s.write_all(&[0x05, 0x02]).await.unwrap();
+            let mut auth = [0u8; 2 + 5 + 1 + 6];
+            s.read_exact(&mut auth).await.unwrap();
+            let mut want = vec![0x01, 5];
+            want.extend_from_slice(b"alice");
+            want.push(6);
+            want.extend_from_slice(b"s3cr3t");
+            assert_eq!(auth.to_vec(), want, "RFC 1929: user then password");
+            s.write_all(&[0x01, 0x00]).await.unwrap();
+            let mut head = [0u8; 4];
+            s.read_exact(&mut head).await.unwrap();
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await.unwrap();
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            s.read_exact(&mut rest).await.unwrap();
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+        });
+        let p = Proxy {
+            host: "127.0.0.1".into(),
+            port: listen_port,
+            user: "alice".into(),
+            pass: "s3cr3t".into(),
+            scheme: ProxyScheme::Socks5,
+        };
+        p.connect("example.com", 443)
+            .await
+            .expect("auth handshake completes");
+        server.await.unwrap();
     }
 
     // An empty proxy env value counts as unset (curl parity): it must

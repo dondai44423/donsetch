@@ -793,6 +793,17 @@ impl EgressPool {
         self.rotate_fetch(host);
     }
 
+    /// Origin-side TLS failure (certificate verify) on the fetch
+    /// path: pair-scoped probation + rotation, never a global bench.
+    /// The failed certificate is the far side's, so the lane stays
+    /// healthy for other hosts; the host moves anyway, because a
+    /// lane that intercepts TLS re-signs every host it carries and a
+    /// sticky host would otherwise retry the same lane forever.
+    pub fn note_fetch_origin_tls(&self, host: &str, egress_id: &str) {
+        self.report_blocked(host, egress_id);
+        self.rotate_fetch(host);
+    }
+
     /// CONNECT-dead or auth on the fetch path: global bench + rotate.
     pub fn note_fetch_dead(&self, host: &str, egress_id: &str) {
         self.report_dead(egress_id);

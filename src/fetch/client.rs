@@ -1220,6 +1220,9 @@ enum LaneNote {
     Timeout,
     AuthFail,
     Dead,
+    /// Origin-side TLS (certificate verify): the host rotates off
+    /// the lane (pair probation), the lane itself stays healthy.
+    OriginTls,
 }
 
 /// Lane health from a transport failure, by variant rather than by
@@ -1243,6 +1246,7 @@ fn note_lane_outcome(
         Some(LaneNote::Timeout) => pool.note_fetch_timeout(host, egress_id),
         Some(LaneNote::AuthFail) => pool.note_fetch_auth_fail(host, egress_id),
         Some(LaneNote::Dead) => pool.note_fetch_dead(host, egress_id),
+        Some(LaneNote::OriginTls) => pool.note_fetch_origin_tls(host, egress_id),
         None => {}
     }
 }
@@ -1268,10 +1272,16 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
         // plain CONNECT tunnel alike the TLS peer is the origin, so a
         // self-signed/expired/mismatched origin cert used to retire a
         // healthy lane for every host for 10 minutes (the #248 class
-        // again). Egress-flavored TLS failures ("handshake aborted" /
-        // "cut short": the classifier's tls.egress vocabulary) still
+        // again). The lane stays healthy; the HOST moves off it
+        // (pair probation + rotation), because a lane that intercepts
+        // TLS re-signs every host it carries and a sticky host would
+        // otherwise retry the same lane forever (#296 review).
+        // Egress-flavored TLS failures ("handshake aborted" / "cut
+        // short": the classifier's tls.egress vocabulary) still
         // bench.
-        FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => None,
+        FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => {
+            Some(LaneNote::OriginTls)
+        }
         FetchError::Io(_) | FetchError::Tls(_) => Some(LaneNote::Dead),
         // A proxy that demands credentials. Ahead of the text arms:
         // "CONNECT -> 407" must never read as a dead lane.
@@ -1327,7 +1337,8 @@ mod transport_exit_tests {
         assert_eq!(lane_note(&FetchError::Http("parser died".into())), None);
     }
 
-    // The vocabulary split: cert-verify failures are origin-side;
+    // The vocabulary split: cert-verify failures are origin-side (the
+    // host moves off the lane; the lane itself is never benched);
     // egress-flavored handshake failures stay lane-level.
     #[test]
     fn cert_verify_failures_leave_lane_health_alone() {
@@ -1335,7 +1346,7 @@ mod transport_exit_tests {
             lane_note(&FetchError::Tls(
                 "TLS certificate verification failed. The presentation cert chain was not issued by any trusted root.".into()
             )),
-            None
+            Some(LaneNote::OriginTls)
         );
         assert_eq!(
             lane_note(&FetchError::Tls(
@@ -1351,12 +1362,12 @@ mod transport_exit_tests {
         );
     }
 
-    // A bad origin certificate must not bench the lane: fetching a
-    // self-signed/expired site through a pool lane used to retire the
-    // lane globally for 10 minutes, so two or three such probes
-    // degraded the whole pool to direct.
+    // A bad origin certificate must not bench the lane, but the host
+    // must still move off the lane that failed it: a sticky host on
+    // a TLS-intercepting lane used to retry the same lane forever
+    // (#296 review). The lane stays healthy for other hosts.
     #[test]
-    fn a_bad_origin_certificate_does_not_bench_the_lane() {
+    fn a_bad_origin_certificate_moves_the_host_without_benching_the_lane() {
         use crate::search::egress::EgressPool;
         use crate::transport::proxy::Proxy;
         let dir = std::env::temp_dir().join(format!("donsetch-lane-cert-{}", std::process::id()));
@@ -1366,36 +1377,44 @@ mod transport_exit_tests {
         unsafe {
             std::env::set_var("DONSETCH_CACHE_DIR", &dir);
         }
-        let proxy = Proxy::parse("http://127.0.0.1:34568").unwrap();
-        let id = proxy.id();
-        let pool = EgressPool::new(vec![proxy]);
-        for _ in 0..3 {
-            note_lane_outcome(
-                &pool,
-                "self-signed.example",
-                &id,
-                &FetchError::Tls("TLS certificate verification failed.".into()),
-            );
-        }
+        let bad = Proxy::parse("http://127.0.0.1:34568").unwrap();
+        let good = Proxy::parse("http://127.0.0.1:34569").unwrap();
+        let pool = EgressPool::new(vec![bad.clone(), good.clone()]);
+        let cert_fail = FetchError::Tls(
+            "TLS certificate verification failed. The presentation cert chain was not issued by any trusted root."
+                .into(),
+        );
+        // First pick: the first clean lane.
+        assert_eq!(
+            pool.pick_fetch("self-signed.example", true).map(|e| e.id),
+            Some(bad.id()),
+            "a healthy proxy lane is picked first"
+        );
+        note_lane_outcome(&pool, "self-signed.example", &bad.id(), &cert_fail);
         assert!(
-            !pool.is_dead(&id),
+            !pool.is_dead(&bad.id()),
             "an origin certificate is not the lane's fault"
         );
         assert_eq!(
             pool.pick_fetch("self-signed.example", true).map(|e| e.id),
-            Some(id.clone()),
-            "the lane stays on the proxy; direct is not reached"
+            Some(good.id()),
+            "the host rotates off the lane that failed it"
         );
+        // A second failure on the same pair only hardens it (probation
+        // to burned): the lane still never benches for an origin
+        // certificate.
+        note_lane_outcome(&pool, "self-signed.example", &bad.id(), &cert_fail);
+        assert!(!pool.is_dead(&bad.id()));
         // An egress-flavored TLS failure is still a dead lane.
         note_lane_outcome(
             &pool,
             "self-signed.example",
-            &id,
+            &good.id(),
             &FetchError::Tls(
                 "TLS handshake aborted (connection reset or cut mid-negotiation).".into(),
             ),
         );
-        assert!(pool.is_dead(&id));
+        assert!(pool.is_dead(&good.id()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
