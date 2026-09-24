@@ -8,17 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- `donsetch.exe` died at process start, with no output, on a CPU without
-  AVX (#277: a first-generation Core i7): ONNX Runtime was linked
-  statically and its global constructors run AVX before `main`. Windows
-  now loads ONNX Runtime the way Linux does, at runtime behind the CPUID
-  gate, from Microsoft's own `onnxruntime.dll` shipped beside the exe
-  (pinned by version and sha256 in the release workflow, CPU provider
-  only). On an old CPU OCR and rerank report "disabled" in `doctor` and
-  everything else works; the hard `DirectML.dll` import, which kept the
-  exe from starting on Server Core and pre-1903 Windows 10, is gone
-  with the static link. The self-updater carries the DLL across updates
-  like `pdfium.dll`.
+- `donsetch.exe` crashed at start, with no output, on CPUs without AVX
+  (#277: a first-generation Core i7). ONNX Runtime was linked
+  statically, and its global constructors run AVX instructions before
+  `main`, so the crash hit every command. Windows now loads ONNX Runtime
+  the way Linux does: at runtime, only after the CPU check passes, from
+  Microsoft's `onnxruntime.dll` (CPU-only build, pinned by version and
+  sha256 in `build.rs`) shipped beside the exe. On a CPU without AVX,
+  `doctor` reports OCR and rerank as disabled and everything else works.
+- The exe no longer imports `DirectML.dll`. That import came with the
+  static link and stopped the exe from starting on Server Core and
+  Windows 10 before 1903.
+- The self-updater now carries `onnxruntime.dll` across updates the same
+  way as `pdfium.dll`. (#298, @mnaza)
 
 ## [4.3.3] - 2026-09-24
 
