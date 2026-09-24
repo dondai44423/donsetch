@@ -147,6 +147,12 @@ pub(super) fn parse_provider_json(status: u16, text: &str) -> Result<serde_json:
     })
 }
 
+/// The error when no (provider, key) pair was usable at all. Held
+/// to one clause with no comma or colon after the prefix, so
+/// `compact_failure` carries it whole into the degraded line.
+const NO_USABLE_KEY: &str =
+    "all keys exhausted: no usable key (all invalid or depleted or cooling down)";
+
 /// A one-line summary of a BYOK exhaustion error for the visible
 /// degraded trail (#285): "brightdata parse error at HTTP 200" on the
 /// search line, where the full diagnostic would not fit. The shape is
@@ -154,12 +160,6 @@ pub(super) fn parse_provider_json(status: u16, text: &str) -> Result<serde_json:
 /// "all providers exhausted after N attempts: ..."); anything
 /// unrecognized passes through, bounded, so a future error never
 /// disappears from the trail.
-/// The error when no (provider, key) pair was usable at all. Held
-/// to one clause with no comma or colon after the prefix, so
-/// `compact_failure` carries it whole into the degraded line.
-const NO_USABLE_KEY: &str =
-    "all keys exhausted: no usable key (all invalid or depleted or cooling down)";
-
 pub(crate) fn compact_failure(err: &str) -> String {
     let rest = err
         .strip_prefix("all keys exhausted: ")
