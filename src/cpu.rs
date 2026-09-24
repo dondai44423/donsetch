@@ -5,11 +5,13 @@
 //! may upgrade their CPU). Once AVX is confirmed, the cache file
 //! records `"avx":true` and no CPUID check is ever performed again.
 //!
-//! This gates ONNX Runtime loading: the prebuilt ONNX static archive
-//! contains unguarded AVX instructions in its C++ global constructors.
-//! Statically linking it causes SIGILL on non-AVX CPUs at process
-//! start. With `load-dynamic`, ONNX is dlopen'd at runtime, but only
-//! after this check confirms AVX support.
+//! This used to gate ONNX Runtime loading: pyke's prebuilt ONNX
+//! static archive contains unguarded AVX instructions in its C++
+//! global constructors, and statically linking it causes SIGILL on
+//! non-AVX CPUs at process start. The dlopen targets ship Microsoft's
+//! own build instead, which dispatches at runtime and runs without
+//! AVX (see src/onnx.rs, "Why there is no AVX gate"), so the result
+//! is a doctor diagnostic now and gates nothing.
 
 #[cfg(target_arch = "x86_64")]
 use std::path::PathBuf;

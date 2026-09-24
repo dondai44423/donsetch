@@ -8,14 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- OCR and rerank were disabled on any x86-64 CPU without AVX (#277: a
+  Celeron J1900) by a CPUID gate written for pyke's static ONNX archive,
+  whose constructors do need AVX. The runtime the dlopen targets ship is
+  Microsoft's own build, which selects its kernels at runtime: it loads
+  and OCRs a scanned PDF on an SSE4.2-only CPU (verified under QEMU).
+  The gate is gone; `doctor` still names the CPU class, and the release
+  workflow now checks the runtime is reported present on a non-AVX CPU.
 - `donsetch.exe` crashed at start, with no output, on CPUs without AVX
   (#277: a first-generation Core i7). ONNX Runtime was linked
   statically, and its global constructors run AVX instructions before
   `main`, so the crash hit every command. Windows now loads ONNX Runtime
-  the way Linux does: at runtime, only after the CPU check passes, from
-  Microsoft's `onnxruntime.dll` (CPU-only build, pinned by version and
-  sha256 in `build.rs`) shipped beside the exe. On a CPU without AVX,
-  `doctor` reports OCR and rerank as disabled and everything else works.
+  the way Linux does: at runtime, from Microsoft's `onnxruntime.dll`
+  (CPU-only build, pinned by version and sha256 in `build.rs`) shipped
+  beside the exe.
 - The exe no longer imports `DirectML.dll`. That import came with the
   static link and stopped the exe from starting on Server Core and
   Windows 10 before 1903.

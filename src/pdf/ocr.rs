@@ -211,7 +211,7 @@ mod imp {
         };
         cell.get_or_init(|| {
             // Gate: ensure ONNX Runtime is loaded (AVX check + dlopen).
-            // If the CPU lacks AVX or the .so is missing, return an error;
+            // If the runtime library is missing or fails to init, return an error;
             // OCR falls back to the glyph stream.
             crate::onnx::ensure_loaded()?;
             let (det, rec, dict) = ensure_models(kind)?;

@@ -246,7 +246,7 @@ mod inner {
     /// RRF+BM25.
     fn init() -> Option<Reranker> {
         // Gate: ensure ONNX Runtime is loaded (AVX check + dlopen).
-        // If the CPU lacks AVX or the .so is missing, return None;
+        // If the runtime library is missing or fails to init, return None;
         // reranking falls back to RRF+BM25.
         if let Err(e) = crate::onnx::ensure_loaded() {
             eprintln!("[rerank] {e}");

@@ -290,7 +290,6 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends qemu-user >/dev/null 2>&1 || true
           cd target/${{ matrix.target }}/release
-          # Clear AVX cache so the CPUID check is actually performed.
           rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
           output=$(qemu-x86_64 -cpu qemu64 ./donsetch --version 2>&1 || true)
           if [ -z "$output" ]; then
@@ -299,6 +298,16 @@ jobs:
           fi
           echo "OK: binary runs on non-AVX CPU (QEMU qemu64)"
           echo "$output" | head -1
+          # The shipped runtime itself must be usable on a CPU without
+          # AVX (SSE4.2 class, #277): no gate protects it any more, so
+          # doctor has to report it present there, not "disabled".
+          doc=$(qemu-x86_64 -cpu Nehalem ./donsetch doctor 2>&1 || true)
+          echo "$doc" | grep -q "ONNX Runtime.*shared library present" || {
+            echo "ERROR: doctor on a non-AVX CPU did not report the runtime present"
+            echo "$doc" | grep -i onnx || true
+            exit 1
+          }
+          echo "OK: ONNX runtime reported present on non-AVX CPU (QEMU Nehalem)"
 
       # Package only DonSeTch release assets. CloakBrowser remains a
       # user-managed runtime dependency and is never bundled here.

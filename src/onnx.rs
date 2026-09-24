@@ -3,12 +3,16 @@
 //! ONNX Runtime backs OCR and the semantic reranker. It is acquired,
 //! linked and initialized differently on every target:
 //!
-//! - **Linux x86_64** : dlopen'd at runtime behind an AVX gate
+//! - **Linux x86_64** : dlopen'd at runtime; Microsoft's own release
+//!   build of the shared library, shipped beside the binary
 //! - **Linux aarch64** : no ONNX; released without `ocr,rerank`
 //! - **macOS arm64** : statically linked
 //! - **macOS x86_64** : no ONNX; released without `ocr,rerank`
-//! - **Windows x64** : dlopen'd at runtime behind the same AVX gate;
-//!   the DLL is Microsoft's own release build, shipped beside the exe
+//! - **Windows x64** : dlopen'd at runtime; Microsoft's own release
+//!   build of the DLL, shipped beside the exe
+//!
+//! Neither dlopen target gates the load on AVX any more; see "Why
+//! there is no AVX gate" below.
 //!
 //! Which targets get OCR/rerank at all is decided in the release matrix
 //! (`.github/workflows/release.yml`).
@@ -28,16 +32,28 @@
 //! static link. Read the section for the platform or failure you are
 //! actually touching.
 //!
-//! ## Linux x86_64 : dlopen behind an AVX gate
+//! ## Linux x86_64 : dlopen
 //!
-//! Dynamically loaded to avoid SIGILL on non-AVX CPUs. The prebuilt ONNX
-//! static archive contains unguarded AVX instructions in C++ global
-//! constructors that run before `main()`, so statically linking it kills
-//! the process at startup on any CPU without AVX. With `ort`'s
-//! `load-dynamic` feature ONNX is NOT statically linked: a shared library
-//! (`.so`) is built from the prebuilt archive at compile time, shipped
-//! beside the binary, and dlopen'd at runtime after an AVX check. Non-AVX
-//! CPUs get a working binary minus OCR/rerank instead of a SIGILL.
+//! Dynamically loaded to avoid SIGILL on non-AVX CPUs. pyke's prebuilt
+//! ONNX *static* archive contains unguarded AVX instructions in C++
+//! global constructors that run before `main()`, so statically linking
+//! it kills the process at startup on any CPU without AVX (#57). With
+//! `ort`'s `load-dynamic` feature ONNX is NOT statically linked: the
+//! shared library is Microsoft's own release build, fetched by
+//! `build.rs`, shipped beside the binary and dlopen'd at runtime.
+//!
+//! ## Why there is no AVX gate
+//!
+//! Until 4.3.x the dlopen was additionally gated on `cpu::has_avx()`,
+//! on the assumption that the shared library had the same constructor
+//! problem as the static archive. It does not: Microsoft's build
+//! selects its kernels at runtime (MLAS dispatch), and the shipped
+//! `libonnxruntime.so` both loads and runs OCR on a CPU with SSE4.2
+//! and no AVX (verified under `qemu-x86_64 -cpu Nehalem`: a scanned
+//! PDF OCR'd at 99% confidence; #277's Celeron J1900 is that class of
+//! CPU). The gate was therefore the only thing disabling OCR and
+//! rerank on such machines. `cpu::has_avx()` stays as a doctor
+//! diagnostic; nothing is gated on it.
 //!
 //! ## Linux aarch64 : no ONNX
 //!
@@ -151,10 +167,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "ocr", feature = "rerank"))]
 use std::time::Duration;
-/// Error returned when the CPU lacks AVX support (Linux and Windows,
-/// the dlopen targets).
-pub const NO_AVX_MSG: &str = "ONNX Runtime requires AVX CPU support. Your CPU does not support AVX (pre-2011 Intel or virtualized without AVX passthrough). OCR and rerank are disabled. All other features work normally.";
-
 /// Message when an init attempt deadlocked inside the dynamic
 /// loader (pykeio/ort #579/#560 class). Kept as a stable, actionable
 /// line: the user can still run without OCR/rerank.
@@ -229,19 +241,16 @@ pub fn ensure_loaded() -> Result<(), String> {
     any(feature = "ocr", feature = "rerank")
 ))]
 fn load_and_init() -> Result<(), String> {
-    // 1. AVX gate (disk-cached, permanent if true).
-    if !crate::cpu::has_avx() {
-        return Err(NO_AVX_MSG.to_string());
-    }
+    // No AVX gate here: see "Why there is no AVX gate" at the top.
 
-    // 2. Find the shared library.
+    // 1. Find the shared library.
     let lib_path = find_shared_lib().ok_or_else(|| {
         "ONNX Runtime shared library not found. \
             OCR and rerank are disabled."
             .to_string()
     })?;
 
-    // 3. dlopen and init.
+    // 2. dlopen and init.
     //    ort::init_from loads the .so via libloading.
     //    builder.commit() initializes the ONNX environment.
     let builder = ort::init_from(&lib_path).map_err(|e| {
@@ -354,11 +363,6 @@ mod tests {
     #[cfg(any(feature = "ocr", feature = "rerank"))]
     #[test]
     fn onnx_payload_probe_initializes() {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        if !crate::cpu::has_avx() {
-            eprintln!("skipping ONNX payload probe: host has no AVX");
-            return;
-        }
         super::ensure_loaded().expect("ONNX Runtime failed to initialize");
         // A second call must reuse the memoized state, not re-init.
         super::ensure_loaded().expect("ONNX Runtime failed to initialize (recheck)");
