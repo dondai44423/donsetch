@@ -291,7 +291,12 @@ impl Fetcher {
             None
         };
         let pool_lane_id = pool_lane.as_ref().map(|e| e.id.clone());
-        let use_pool_lane = pool_lane.is_some();
+        // Only a real lane pins the request and mutes env proxies. A
+        // `direct` answer from the pool (every lane dead, or burned
+        // for this host) must leave the env-proxy path in charge:
+        // otherwise HTTPS_PROXY is silently ignored and the request
+        // leaves on the real address (#302 review).
+        let use_pool_lane = pool_lane_is_proxy(pool_lane.as_ref());
         let pinned_pool = pool_lane.as_ref().and_then(|e| e.proxy.as_ref());
 
         // Resolve env-var proxy (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
@@ -1225,6 +1230,12 @@ enum LaneNote {
     OriginTls,
 }
 
+/// True when the pool handed back a real lane (a proxy), not the
+/// `direct` egress.
+fn pool_lane_is_proxy(lane: Option<&crate::search::egress::Egress>) -> bool {
+    lane.is_some_and(|e| e.proxy.is_some())
+}
+
 /// Lane health from a transport failure, by variant rather than by
 /// prose.
 ///
@@ -1471,6 +1482,29 @@ mod transport_exit_tests {
         );
         assert!(pool.is_dead(&id));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A `direct` answer from the pool is not a pinned lane: it must
+    // not mute HTTPS_PROXY. The client used to treat any pool answer
+    // as a lane, so when the pool handed back `direct` (every lane
+    // dead, or burned for this host) a configured env proxy was
+    // silently skipped and the fetch left on the real address
+    // (#302 review).
+    #[test]
+    fn a_direct_pool_answer_is_not_a_pinned_lane() {
+        use crate::search::egress::Egress;
+        use crate::transport::proxy::Proxy;
+        let lane = Egress {
+            id: "p1".into(),
+            proxy: Some(Proxy::parse("http://127.0.0.1:24099").unwrap()),
+        };
+        let direct = Egress {
+            id: "direct".into(),
+            proxy: None,
+        };
+        assert!(pool_lane_is_proxy(Some(&lane)));
+        assert!(!pool_lane_is_proxy(Some(&direct)));
+        assert!(!pool_lane_is_proxy(None));
     }
 
     // The h3 lane used to hand back a literal Verdict::ContentOk for
