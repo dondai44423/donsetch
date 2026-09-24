@@ -68,7 +68,7 @@
 //! without `ocr,rerank` because `ort-sys` publishes no prebuilt for that
 //! target.
 //!
-//! ## Windows x64 : dlopen behind the same AVX gate
+//! ## Windows x64 : dlopen at runtime
 //!
 //! Until 4.3.x Windows linked ONNX statically, on the reasoning that AVX
 //! issues are rare and that pyke ships no `onnxruntime.dll` (its Windows
@@ -83,7 +83,8 @@
 //! for every release, built without the DirectML provider.
 //!
 //! So Windows now does what Linux does: `load-dynamic`, the DLL beside
-//! the exe, `find_shared_lib` + `cpu::has_avx()` before `init_from`.
+//! the exe, `find_shared_lib` then `init_from` (no gate: the runtime
+//! dispatches its kernels, see the section above).
 //! `build.rs` fetches the pinned Microsoft zip, verifies its sha256 and
 //! places `onnxruntime.dll` beside every build's exe (dev builds too, the
 //! same `fetch_onnx_prebuilt` path as the Linux `.so`); `release.yml`

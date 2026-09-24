@@ -154,8 +154,8 @@ jobs:
           # x86_64: target the baseline ISA (SSE2, no AVX) so Rust
           # code runs on QEMU-emulated x86_64 and older CPUs.
           # ONNX Runtime AVX is handled separately via dynamic loading
-          # (ort load-dynamic + a runtime AVX gate; build.rs fetches
-          # Microsoft's shared library for Linux and Windows).
+          # (ort load-dynamic; build.rs fetches Microsoft's shared
+          # library for Linux and Windows).
           # Linux legs also pin -fuse-ld=lld per matrix.rustflags:
           # bfd 2.38 (22.04) cannot link rustc 1.98 output (.crel).
           RUSTFLAGS: ${{ matrix.rustflags }}

@@ -61,12 +61,11 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"], 
 ndarray = { version = "0.17", optional = true }
 num_cpus = { version = "1.17", optional = true }
 
-# Linux and Windows: dlopen'd at runtime behind an AVX gate — the prebuilt
-# static archive runs unguarded AVX in global constructors and SIGILLs
-# pre-`main` on non-AVX CPUs (#57, #277). Linux builds the .so at compile time;
-# Windows ships Microsoft's own onnxruntime.dll (release.yml pins the version
-# and its sha256). Either way the library sits beside the binary and is loaded
-# only after the CPUID check.
+# Linux and Windows: dlopen'd at runtime — the prebuilt static archive runs
+# unguarded AVX in global constructors and SIGILLs pre-`main` on non-AVX CPUs
+# (#57, #277). Linux builds the .so at compile time; Windows ships Microsoft's
+# own onnxruntime.dll (release.yml pins the version and its sha256). Either way
+# the library sits beside the binary and is loaded from there at runtime.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"], optional = true }
 
