@@ -88,6 +88,20 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     // wrappers never double-emit.
     let any_sel =
         Selector::parse("h1, h2, h3, h4, p, ul, ol, pre, table, blockquote, div").unwrap();
+    // Every element with a block-level descendant, marked once: each
+    // block match walks up to the root and stops at the first
+    // ancestor already marked, so the pass is linear. Asking the
+    // question per candidate with a descendant select re-scanned the
+    // wrapper's subtree for every leaf div under it, quadratic in
+    // the leaf count.
+    let mut has_block = std::collections::HashSet::new();
+    for b in root.select(&block_sel) {
+        for a in b.ancestors() {
+            if !has_block.insert(a.id()) || a.id() == root.id() {
+                break;
+            }
+        }
+    }
     for el in root.select(&any_sel) {
         let is_div = el.value().name() == "div";
         // Descendant select: a <p> inside a <li> or <blockquote>,
@@ -101,9 +115,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
             .filter_map(ElementRef::wrap)
             .any(|a| {
                 block_sel.matches(&a)
-                    || (is_div
-                        && a.value().name() == "div"
-                        && !has_block_descendant(&a, &block_sel))
+                    || (is_div && a.value().name() == "div" && !has_block.contains(&a.id()))
             });
         if nested {
             continue;
@@ -111,7 +123,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         if is_div {
             // A wrapper holding block elements is skipped: its
             // blocks emit on their own.
-            if !has_block_descendant(&el, &block_sel) {
+            if !has_block.contains(&el.id()) {
                 let (m, _) = crate::extract::inline::markdown(el, url, &body_opts);
                 if !m.trim().is_empty() {
                     body.push_str(m.trim());
@@ -265,10 +277,6 @@ fn text_of(el: ElementRef) -> String {
 /// #293: does anything block-level live inside this element? A div
 /// whose subtree holds blocks is a wrapper; its blocks emit on
 /// their own.
-fn has_block_descendant(el: &ElementRef, block_sel: &Selector) -> bool {
-    el.select(block_sel).next().is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +302,34 @@ mod tests {
         <pre>code sample</pre>
       </main>
       </body></html>"#;
+
+    // A wrapper div holding many leaf divs before its first block
+    // element: every leaf's ancestor check re-scanned the wrapper's
+    // subtree up to that block, so the walk was quadratic in the
+    // number of leaves (#293 follow-up). 20 000 leaves took minutes
+    // on the extraction thread.
+    #[test]
+    fn many_leaf_divs_under_one_wrapper_extract_in_linear_time() {
+        let n = 20_000;
+        let nav: String = (0..5)
+            .map(|i| format!(r#"<a class="menu__link" href="/d/{i}/">D{i}</a>"#))
+            .collect();
+        let page = format!(
+            r#"<html><body><div id="__docusaurus"><nav>{nav}</nav>{}<p>end</p></div></body></html>"#,
+            "<div>x</div>".repeat(n)
+        );
+        let started = std::time::Instant::now();
+        let ex = extract(&page, "https://docs.example.com/", &opts()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
+        // The first page (16 000 chars by default) is all leaf
+        // paragraphs; the closing <p> sits on a later page.
+        let xs = ex.markdown.matches("x\n").count();
+        assert!(xs >= 1_000, "the leaf divs are content: {xs} of {n}");
+    }
 
     #[test]
     fn mkdocs_outline_renders() {
