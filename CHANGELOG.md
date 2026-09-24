@@ -8,19 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+
 - `donsetch.exe` crashed at start, with no output, on CPUs without AVX
   (#277: a first-generation Core i7). ONNX Runtime was linked
   statically, and its global constructors run AVX instructions before
-  `main`, so the crash hit every command. Windows now loads ONNX Runtime
-  the way Linux does: at runtime, only after the CPU check passes, from
-  Microsoft's `onnxruntime.dll` (CPU-only build, pinned by version and
-  sha256 in `build.rs`) shipped beside the exe. On a CPU without AVX,
-  `doctor` reports OCR and rerank as disabled and everything else works.
-- The exe no longer imports `DirectML.dll`. That import came with the
-  static link and stopped the exe from starting on Server Core and
-  Windows 10 before 1903.
-- The self-updater now carries `onnxruntime.dll` across updates the same
-  way as `pdfium.dll`. (#298, @mnaza)
+  `main`, so the crash hit every command. Windows now loads ONNX
+  Runtime the way Linux does: at runtime, from Microsoft's
+  `onnxruntime.dll` (CPU-only build, pinned by version and sha256 in
+  `build.rs`) shipped beside the exe; the hard `DirectML.dll` import
+  (a static-link leftover that stopped the exe from starting on Server
+  Core and Windows 10 before 1903) is gone, and the self-updater
+  carries `onnxruntime.dll` across updates the same way as
+  `pdfium.dll`. (mnaza, #298)
+- OCR and rerank were disabled on any x86-64 CPU without AVX (#277: a
+  Celeron J1900) by a CPUID gate written for pyke's static ONNX
+  archive, whose constructors do need AVX. The runtime the dlopen
+  targets ship is Microsoft's own build, which selects its kernels at
+  runtime: it loads and OCRs a scanned PDF on an SSE4.2-only CPU
+  (verified under QEMU; Windows under Intel SDE). The gate is gone;
+  `doctor` names the CPU class and proves the library loads, and the
+  release workflow checks the runtime on a non-AVX CPU. (mnaza, #300)
+- The test suite no longer reads or writes the user's real cache
+  directory: a crawl test's governor loaded
+  `~/.cache/donsetch/crawl-governor.json`, saved its mock hosts
+  there, and under nextest's process-per-test the governor tests read
+  each other's throttle state back, failing on a loaded box depending
+  on which process wrote last. A unit test without
+  `DONSETCH_CACHE_DIR` gets a temp root of its own
+  (`$TMP/donsetch-test/<id>/cache`, swept at exit on every platform),
+  and the daemon-boot integration test stops handing its child the
+  real cache. (mnaza, #299)
+- The BYOK search degraded line names the reason when no key could
+  even be tried: with every key invalid, depleted or cooling down (and
+  every plugin striking) the status read `(byok: )` with no word in
+  it. It reads `no usable key (all invalid or depleted or cooling
+  down)` now, and `compact_failure` never returns an empty status.
+  (mnaza, #301)
+- A fetch no longer falls through to the real address while an
+  unburned lane exists. Probation after one block seats its lane again
+  (it scored 0, and the seat check `score > best_score` with
+  best_score 0 never let it through, so a one-lane pool went direct
+  after a single 429); a burned pair rests its cooldown instead of
+  being re-seated on every fetch of that host (re-seating voided the
+  cooldown and held a rate-limiting lane under constant requests); a
+  live lane bound to another host's persona serves before direct
+  (exclusivity is preferred, not absolute, and a shared exit is less
+  identifying than the real address); and a `direct` answer from the
+  pool no longer mutes `HTTPS_PROXY`. (mnaza, #302)
+- The docs-outline adapter walks a wrapper div's leaf divs in linear
+  time again: asking every candidate's every ancestor whether a block
+  lives below it re-scanned the wrapper's subtree once per leaf,
+  quadratic in the leaf count (20 000 leaf divs, a 240 KB page, ran
+  for minutes). The set of elements with a block descendant is built
+  once, in one pass. (mnaza, #303)
 
 ## [4.3.3] - 2026-09-24
 
