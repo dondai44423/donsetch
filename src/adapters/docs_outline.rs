@@ -274,9 +274,6 @@ fn text_of(el: ElementRef) -> String {
     inline::visible_text_raw(el).trim().to_string()
 }
 
-/// #293: does anything block-level live inside this element? A div
-/// whose subtree holds blocks is a wrapper; its blocks emit on
-/// their own.
 #[cfg(test)]
 mod tests {
     use super::*;
