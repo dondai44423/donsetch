@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds the placements, starting with Fluxion AI (Gold, banner
   pinned at the top), and "Sponsor this project" carries the
   tiers and the ask.
+- CI keeps the compiled tree warm across dependency bumps: `target/`
+  has its own cache keyed on the target, the build kind, the
+  compiler and a version-insensitive dependency hash, a restore
+  falls back to the previous entry, a red run saves an unswept
+  `-partial-` entry the next run resumes from, and a
+  fingerprint-based sweep before each save drops only what the run
+  did not use. Pull requests and tags restore but never save, so
+  release builds stop filling the 10 GB pool with entries they can
+  never read (Mart-Bogdan, #297).
 
 ### Fixed
 
@@ -79,6 +88,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries ride the content host. Wiki pages and share links (`/s/`)
   stay pages (no JSON shape); `redd.it` shortlinks resolve through
   the redirect into the thread card.
+- A repeated block was replaced by a marker whenever the marker came
+  out one character shorter, and the marker named nothing. Sites
+  that wrap every LINE in its own element (lyrics, verse,
+  subtitles, transcripts) hand the extractor blocks barely longer
+  than the marker, so a repeated stanza came back as a run of
+  anonymous `*[repeated block omitted]*` lines: on one such page 13
+  markers stood in for 12 of the 32 lines. A marker must now be two
+  thirds of the block's length or less, so those lines print
+  verbatim (32 of 32), and a marker that does stand in names its
+  source: `*[repeated block omitted, same as block 16: "..."]*`,
+  with the ordinal identifying the copy and the quoted opening what
+  a human reads. Blocks big enough for collapsing to pay are
+  unaffected (Mart-Bogdan, #294).
+- The parent-death signal a browser or Xvfb child arms in
+  `pre_exec` covers a parent that dies after the child started; a
+  parent that died between the fork and the `prctl` left a child
+  that never got it. The child now verifies it is still its
+  parent's child after arming and fails the spawn instead of
+  leaking an orphan, and the killed-parent path has a test (mnaza,
+  #295).
+- The egress pool no longer retires a proxy lane for a certificate
+  problem at the origin. Any TLS failure read as a dead lane, so
+  fetching a self-signed, expired or hostname-mismatched site
+  through a pool lane benched that lane globally for 10 minutes:
+  two or three such probes degraded the whole pool to direct.
+  Certificate-verify failures now leave lane health alone and move
+  the HOST off the lane (pair probation + rotation), so a lane that
+  intercepts TLS cannot pin a host; egress-flavored TLS failures
+  (handshake reset or cut short) still bench.
+- A proxy dial can no longer burn over a minute per attempt: the
+  per-step 12s timeouts stacked (a SOCKS5 handshake is up to nine
+  steps), so a lane that accepted TCP and stalled mid-handshake
+  stalled every fetch, and the Chrome relay re-paid it per browser
+  request before its strike cache armed. One 30s budget now bounds
+  the whole dial+handshake.
+- NO_PROXY entries that combine brackets and a port ("[::1]:8443")
+  match again: the port strip skipped any host containing ':', so
+  the bracketed IPv6 + port form matched nothing at all.
+- An empty proxy env var counts as unset: HTTPS_PROXY="" used to
+  short-circuit the fallback chain, sending https traffic direct
+  and starving the lowercase variant and ALL_PROXY.
+- Proxy credentials with an empty user name (":token@host:port")
+  are no longer dropped: the CONNECT header, the raw-hop
+  Proxy-Authorization and the save round trip carry them, matching
+  the ghost tier's user-or-pass definition of an authenticated lane.
+  SOCKS5 offers username/password negotiation only when both fields
+  are present (RFC 1929 wants ULEN and PLEN in 1..255); otherwise it
+  offers no-auth alone.
+- IPv6 literal targets ride proxy lanes correctly: a bare literal
+  (the shape the Chrome relay forwards from ATYP 0x04) is bracketed
+  for the CONNECT line and Host header, and SOCKS5 sends IP
+  literals with their native address type instead of as an
+  unresolvable domain name.
+- Doc fixes: from_env_for's resolution-order comment described an
+  order the code never had (config slot, then config all, then the
+  env chain: exactly what doctor reports), and the relay's drop
+  comment overstated what aborting the accept loop cuts.
 
 ## [4.3.2] - 2026-09-23
 
