@@ -5,6 +5,16 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The test suite read and wrote the user's real cache directory: a
+  crawl test's governor loaded `~/.cache/donsetch/crawl-governor.json`,
+  saved its mock hosts there, and under nextest's process-per-test the
+  governor tests read each other's throttle state back, failing on a
+  loaded box depending on which process wrote last. A unit test that
+  does not set `DONSETCH_CACHE_DIR` now gets a temp root of its own.
+
 ## [4.3.3] - 2026-09-24
 
 ### Changed
