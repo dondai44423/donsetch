@@ -154,6 +154,12 @@ pub(super) fn parse_provider_json(status: u16, text: &str) -> Result<serde_json:
 /// "all providers exhausted after N attempts: ..."); anything
 /// unrecognized passes through, bounded, so a future error never
 /// disappears from the trail.
+/// The error when no (provider, key) pair was usable at all. Held
+/// to one clause with no comma or colon after the prefix, so
+/// `compact_failure` carries it whole into the degraded line.
+const NO_USABLE_KEY: &str =
+    "all keys exhausted: no usable key (all invalid or depleted or cooling down)";
+
 pub(crate) fn compact_failure(err: &str) -> String {
     let rest = err
         .strip_prefix("all keys exhausted: ")
@@ -180,6 +186,10 @@ pub(crate) fn compact_failure(err: &str) -> String {
         .chars()
         .take(60)
         .collect();
+    if short.is_empty() {
+        // An empty status is the one shape a reader cannot act on.
+        return "no usable key".to_string();
+    }
     if provider.is_empty() {
         short
     } else {
@@ -348,6 +358,15 @@ impl ByokSearcher {
             let (provider, key, plugin_def) = match self.pick_any_skipping(&tried) {
                 Some(pk) => pk,
                 None => {
+                    // Nothing was pickable on the first pass: every
+                    // key is invalid, depleted or cooling down and
+                    // every plugin is striking. `last_error` is still
+                    // empty here, and the bare prefix rendered as an
+                    // empty engine status ("byok: ") in the degraded
+                    // trail, the one case #285 exists for.
+                    if last_error.is_empty() {
+                        return Err(NO_USABLE_KEY.to_string());
+                    }
                     return Err(format!("all keys exhausted: {last_error}"));
                 }
             };
@@ -1011,5 +1030,20 @@ mod tests {
             ),
             "badplugin exited with status exit status: 1"
         );
+    }
+
+    // A store whose every key is invalid, depleted or cooling down
+    // reaches the exhausted arm before any attempt, so there is no
+    // last error to quote. The line still has to say why: an empty
+    // "byok: " status is the only report status that carries no word.
+    #[test]
+    fn an_exhausted_store_with_no_attempt_still_names_the_reason() {
+        assert_eq!(
+            compact_failure(NO_USABLE_KEY),
+            "no usable key (all invalid or depleted or cooling down)"
+        );
+        // The bare prefix (the pre-fix shape) never yields an empty status.
+        assert_eq!(compact_failure("all keys exhausted: "), "no usable key");
+        assert_eq!(compact_failure(""), "no usable key");
     }
 }
