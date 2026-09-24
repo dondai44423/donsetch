@@ -31,11 +31,22 @@ pub fn cache_dir() -> PathBuf {
     if true {
         return test_cache_root().clone();
     }
-    // Layered config fallback ([paths] cache_dir in donsetch.toml).
+    default_cache_dir()
+}
+
+/// The production default: the layered config's `[paths] cache_dir`
+/// when set, else the platform cache dir under `donsetch`.
+fn default_cache_dir() -> PathBuf {
     let configured = crate::config::cfg().paths.cache_dir.trim();
     if !configured.is_empty() {
         return PathBuf::from(configured);
     }
+    platform_cache_dir()
+}
+
+/// `dirs::cache_dir()/donsetch`: the platform's own default root,
+/// with the temp-dir fallback for accounts the platform cannot name.
+fn platform_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("donsetch")
@@ -44,15 +55,19 @@ pub fn cache_dir() -> PathBuf {
 /// One temp root per test process, created on first use and removed
 /// at exit. nextest runs each test in its own process, so this is per
 /// test; under plain `cargo test` it is per binary, which is still
-/// never the user's dir. The leaf is named `donsetch` like the real
-/// root, so code that reasons about the directory name sees the same
-/// shape.
+/// never the user's dir. The sandbox is `donsetch-test/<id>`, shared
+/// parent and all, with the cache root at its `cache/` child (room
+/// for a sibling `config/` later). The id is random, not the PID: a
+/// root left behind by a failed run plus a recycled PID would hand
+/// the next test the dead one's state.
 #[cfg(test)]
 fn test_cache_root() -> &'static PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
-        let parent = std::env::temp_dir().join(format!("donsetch-test-{}", std::process::id()));
-        let dir = parent.join("donsetch");
+        let dir = std::env::temp_dir()
+            .join("donsetch-test")
+            .join(crate::handles::random_base62(16))
+            .join("cache");
         let _ = std::fs::create_dir_all(&dir);
         extern "C" fn sweep() {
             if let Some(root) = ROOT.get()
@@ -62,12 +77,12 @@ fn test_cache_root() -> &'static PathBuf {
             }
         }
         // SAFETY: registering a plain extern "C" fn with no arguments.
-        #[cfg(unix)]
+        // Unconditional: libc exposes atexit on Windows too, and with
+        // the old unix-only gate every Windows test process left its
+        // sandbox behind (97 after one lib-only run).
         unsafe {
             libc::atexit(sweep);
         }
-        #[cfg(not(unix))]
-        let _ = sweep;
         dir
     })
 }
@@ -226,31 +241,40 @@ fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_unit_test_never_sees_the_users_cache_dir() {
         // SAFETY: test-only env mutation; nextest runs each test in
         // its own process.
         unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
-        let d = super::cache_dir();
+        let d = cache_dir();
         let user = dirs::cache_dir().map(|c| c.join("donsetch"));
         assert_ne!(Some(d.clone()), user, "{d:?}");
         assert!(d.starts_with(std::env::temp_dir()), "{d:?}");
         assert!(d.exists());
-        assert!(d.ends_with("donsetch"), "{d:?}");
+        assert_eq!(
+            d.file_name().and_then(|n| n.to_str()),
+            Some("cache"),
+            "{d:?}"
+        );
+        assert_eq!(
+            d.parent().and_then(|p| p.parent()),
+            Some(std::env::temp_dir().join("donsetch-test").as_path()),
+            "one sandbox per process under the shared parent: {d:?}"
+        );
         // The explicit override still wins.
         unsafe { std::env::set_var("DONSETCH_CACHE_DIR", "/tmp/donsetch-override-probe") };
         assert_eq!(
-            super::cache_dir(),
+            cache_dir(),
             std::path::PathBuf::from("/tmp/donsetch-override-probe")
         );
         unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
     }
 
-    use super::*;
-
     #[test]
-    fn cache_dir_ends_with_donsetch() {
-        assert!(cache_dir().ends_with("donsetch"));
+    fn platform_cache_dir_ends_with_donsetch() {
+        assert!(platform_cache_dir().ends_with("donsetch"));
     }
 
     #[test]
