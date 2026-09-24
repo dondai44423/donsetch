@@ -1207,12 +1207,24 @@ fn check_onnx() -> CheckResult {
                 false
             };
             let cache = paths::cache_dir().join("onnx").join(lib_name).exists();
-            if found || cache {
-                CheckResult::Pass(format!("{cpu}, shared library present"))
-            } else {
+            if !(found || cache) {
                 CheckResult::Warn(format!(
                     "{cpu} but shared library missing : reinstall donsetch"
                 ))
+            } else {
+                // Presence is not proof: the library must load and
+                // initialize. A text file dressed as onnxruntime.dll
+                // passed the old exists() check, which made the
+                // release workflow's no-AVX doctor run assert
+                // nothing about the runtime (review of #300). This
+                // is the same payload probe the macOS branch runs.
+                match crate::onnx::ensure_loaded() {
+                    Ok(()) => CheckResult::Pass(format!("{cpu}, shared library present")),
+                    Err(e) if e.contains("not found") => CheckResult::Warn(format!(
+                        "{cpu} but shared library missing : reinstall donsetch"
+                    )),
+                    Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e),
+                }
             }
         }
     }
