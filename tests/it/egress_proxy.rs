@@ -159,6 +159,7 @@ fn write_ca_bundle(pem: &[u8]) -> std::path::PathBuf {
 // must stay pinned for its whole body.
 #[allow(clippy::await_holding_lock)]
 async fn fetch_via_intercepting_proxy_succeeds_with_trusted_ca() {
+    crate::sandbox();
     let _env = ENV_LOCK.lock().unwrap();
     let mitm = spawn_mitm().await;
     set_env_https_proxy(&mitm);
@@ -190,6 +191,7 @@ async fn fetch_via_intercepting_proxy_succeeds_with_trusted_ca() {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn fetch_via_intercepting_proxy_fails_honestly_without_ca() {
+    crate::sandbox();
     let _env = ENV_LOCK.lock().unwrap();
     let mitm = spawn_mitm().await;
     set_env_https_proxy(&mitm);
@@ -234,6 +236,7 @@ async fn fetch_via_intercepting_proxy_fails_honestly_without_ca() {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn persona_fetch_uses_the_env_proxy_like_fetch_does() {
+    crate::sandbox();
     let _env = ENV_LOCK.lock().unwrap();
     let mitm = spawn_mitm().await;
     set_env_https_proxy(&mitm);
@@ -258,6 +261,7 @@ async fn persona_fetch_uses_the_env_proxy_like_fetch_does() {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn plaintext_http_through_env_proxy_uses_absolute_form() {
+    crate::sandbox();
     let _env = ENV_LOCK.lock().unwrap();
     let mitm = spawn_mitm().await;
     set_env_https_proxy(&mitm);
@@ -287,6 +291,7 @@ async fn plaintext_http_through_env_proxy_uses_absolute_form() {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn plaintext_http_through_credentialed_proxy_sends_proxy_authorization() {
+    crate::sandbox();
     let _env = ENV_LOCK.lock().unwrap();
     let mitm = spawn_mitm().await;
     // SAFETY: process-scoped, single-threaded with respect to env.
@@ -400,6 +405,7 @@ async fn spawn_socks5() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::await_holding_lock)]
 async fn plaintext_http_through_socks5_uses_origin_form() {
+    crate::sandbox();
     let _env = ENV_LOCK.lock().unwrap();
     let (addr, seen) = spawn_socks5().await;
     // SAFETY: process-scoped, single-threaded with respect to env.

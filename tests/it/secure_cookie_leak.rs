@@ -60,6 +60,7 @@ fn serve(listener: TcpListener, saw_secret: Arc<AtomicBool>) {
 
 #[tokio::test]
 async fn secure_cookie_never_leaks_over_plain_http() {
+    crate::sandbox();
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     // Drop the guard before any await: the fetch runs on the
     // runtime and must not hold the env lock across it.
