@@ -9,19 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- OpenCode 2.x received the split result shape and showed the model
-  metadata only: `web_fetch` and `web_crawl` reached it as
-  `{"content_ok": true, "url": ...}` with none of the page text (#306).
-  OpenCode 2 reports `clientInfo.name` as `cli` (its
-  `OPENCODE_CLIENT ?? "cli"` default, never set by `serve`), so the
-  text-only client list from #27 no longer matched it, while its Code
-  Mode keeps `structuredContent` and drops `content` like Claude Code.
-  The handshake is recognised by its fingerprint now (a 2.x-or-later
-  version together with the `elicitation.form.applyDefaults`
-  capability only OpenCode 2 sends), and a bare `cli` without it
-  keeps the default split. `mcp.text_only` is described as what it
-  does, the `[meta]` fold for every client; it never stripped image
-  blocks.
+- A unit test no longer reads the developer's own `donsetch.toml`
+  (#305, the config side of #299): the file layer under test is empty
+  unless `DONSETCH_CONFIG` names a file, so a local `[state]
+  no_disk_state = true` can no longer flip the governor's persistence,
+  nor can any other key in that file shape a test's behavior from
+  outside the test. (mnaza, #312)
+- `mcp.text_only`'s description said "strip image blocks from tool
+  output"; the fold never touched image blocks, and `web_screenshot`
+  returning its PNG with the knob on is correct. The field is
+  described as what it does: fold `structuredContent` into a leading
+  `[meta]` text block for every client (#306, reported on 4.3.3). The
+  README covers the one client that needs the knob today: OpenCode
+  2.x reports `clientInfo.name` as `cli` (its
+  `process.env.OPENCODE_CLIENT ?? "cli"` default, which `serve` never
+  overrides), too generic to match in the text-only list, and its
+  Code Mode shows the model `structuredContent` only. Set
+  `[mcp] text_only = true` (or `DONSETCH_MCP__TEXT_ONLY=1`) for it
+  until OpenCode restores a usable name upstream; a handshake
+  fingerprint was considered and rejected, because the
+  `elicitation.form.applyDefaults` capability is a TypeScript-SDK
+  opt-in, not an OpenCode signature, so matching on it would misfire
+  on later SDK-based clients. (mnaza, #311)
 
 ## [4.3.4] - 2026-09-25
 

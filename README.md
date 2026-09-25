@@ -235,13 +235,22 @@ donsetch crawl https://docs.python.org --mode map --topic asyncio
 
 An MCP result has two surfaces: `content` (the page markdown) and `structuredContent` (raw URLs behind the `S3` handles, `next_offset`, resume tokens, `content_ok`, `thin`, error codes, `next_action`). MCP never said which one a client renders, so clients drop one: Claude Code and VS Code keep `structuredContent` and discard `content`, OpenCode v1 (tested on 1.18.3) keeps `content` and discards `structuredContent`, and OpenCode 2 (Code Mode on by default, tested on 2.0.16) keeps `structuredContent` and discards `content`, like Claude Code.
 
-Symptoms: tool metadata but no page text, or page text but no citable URL behind an `S3` handle, no pagination, no error codes. The fix is the same for both: DonSeTch folds the state into a compact leading `[meta]` text block, keeps the markdown as a clean block behind it, and omits `structuredContent`. The known clients get the fold automatically, detected at the handshake: by `clientInfo.name`, or for OpenCode 2, which reports itself as `cli`, by its version together with the elicitation capability only it sends. Any other client (a wrapper or fork under a different name, `claude-code-proxy` say) is not detected and keeps the token-optimal split:
+Symptoms: tool metadata but no page text, or page text but no citable URL behind an `S3` handle, no pagination, no error codes. The fix is the same for both: DonSeTch folds the state into a compact leading `[meta]` text block, keeps the markdown as a clean block behind it, and omits `structuredContent`. The three known clients get the fold automatically, detected by `clientInfo.name` at the handshake. Any other client (a wrapper or fork under a different name, `claude-code-proxy` say) is not detected and keeps the token-optimal split:
 
 ```bash
-DONSETCH_MCP_TEXT_ONLY=1 donsetch mcp   # force the fold for every client
+DONSETCH_MCP__TEXT_ONLY=1 donsetch mcp   # force the fold for every client
 ```
 
-Fail-closed like the other flags: only an explicit `1`/`true` turns it on.
+or in `donsetch.toml`:
+
+```toml
+[mcp]
+text_only = true
+```
+
+Fail-closed like the other flags: only an explicit `1`/`true` turns it on; the legacy `DONSETCH_MCP_TEXT_ONLY` name still works (`donsetch config show --legacy` maps the old names).
+
+**OpenCode 2.x needs one of those today.** It reports `clientInfo.name` as `cli` (its `process.env.OPENCODE_CLIENT ?? "cli"` default, which `serve` never overrides), too generic to claim in the name list, and its Code Mode shows the model `structuredContent` only. Until OpenCode restores a usable name upstream, set `text_only` for it.
 
 </details>
 

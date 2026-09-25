@@ -107,37 +107,11 @@ pub fn mode_from_params(params: &Value) -> ClientMode {
         .and_then(Value::as_str)
         .unwrap_or("");
     let name = name.trim().to_ascii_lowercase();
-    if TEXT_ONLY_CLIENTS.contains(&name.as_str()) || is_opencode_2(params, &name) {
+    if TEXT_ONLY_CLIENTS.contains(&name.as_str()) {
         ClientMode::TextOnly
     } else {
         ClientMode::Default
     }
-}
-
-/// OpenCode 2.x no longer says "opencode" at the handshake: its
-/// `clientInfo.name` is `process.env.OPENCODE_CLIENT ?? "cli"`, and
-/// the `serve` service never sets the variable, so every default
-/// install reports `cli` (#306). With Code Mode on by default it
-/// keeps `structuredContent` and drops `content`, so the fold is
-/// needed as much as for v1, and the name list cannot see it. "cli"
-/// alone is too generic to claim; the 2.x handshake is still
-/// recognisable by its version together with the
-/// `elicitation.form.applyDefaults` capability, which no other
-/// client sends.
-fn is_opencode_2(params: &Value, name: &str) -> bool {
-    if name != "cli" {
-        return false;
-    }
-    let major_ok = params
-        .pointer("/clientInfo/version")
-        .and_then(Value::as_str)
-        .and_then(|v| v.split('.').next())
-        .and_then(|major| major.trim().parse::<u32>().ok())
-        .is_some_and(|major| major >= 2);
-    major_ok
-        && params
-            .pointer("/capabilities/elicitation/form/applyDefaults")
-            .is_some()
 }
 
 /// Manual override. Fail-closed parse (same convention as the other
@@ -340,44 +314,6 @@ mod tests {
         // An unlisted client keeps the token-optimal split shape.
         let other = json!({ "clientInfo": { "name": "cursor" } });
         assert_eq!(mode_from_params(&other), ClientMode::Default);
-    }
-
-    // #306: OpenCode 2.x reports `clientInfo.name` "cli", so the
-    // name list misses it; the 2.0.16 handshake as captured (version
-    // + the elicitation.form.applyDefaults capability) is recognised,
-    // and a generic "cli" without that fingerprint is not.
-    #[test]
-    fn opencode_2_is_recognised_by_its_handshake_not_its_name() {
-        let oc2 = json!({
-            "protocolVersion": "2025-11-25",
-            "capabilities": {
-                "elicitation": { "form": { "applyDefaults": true }, "url": {} },
-                "roots": {}
-            },
-            "clientInfo": { "name": "cli", "version": "2.0.16" }
-        });
-        assert_eq!(mode_from_params(&oc2), ClientMode::TextOnly);
-        // A later major keeps the fold until the exit plan says otherwise.
-        let oc3 = json!({
-            "capabilities": { "elicitation": { "form": { "applyDefaults": true } } },
-            "clientInfo": { "name": "cli", "version": "3.1.0" }
-        });
-        assert_eq!(mode_from_params(&oc3), ClientMode::TextOnly);
-        // "cli" alone is anyone's name: no capability, no fold.
-        let bare = json!({ "clientInfo": { "name": "cli", "version": "2.0.16" } });
-        assert_eq!(mode_from_params(&bare), ClientMode::Default);
-        // The capability with a 1.x version is not OpenCode 2 either.
-        let v1 = json!({
-            "capabilities": { "elicitation": { "form": { "applyDefaults": true } } },
-            "clientInfo": { "name": "cli", "version": "1.18.3" }
-        });
-        assert_eq!(mode_from_params(&v1), ClientMode::Default);
-        // OpenCode's web client keeps its own name and the default split.
-        let web = json!({
-            "capabilities": { "elicitation": { "form": { "applyDefaults": true } } },
-            "clientInfo": { "name": "opencode-web", "version": "2.0.16" }
-        });
-        assert_eq!(mode_from_params(&web), ClientMode::Default);
     }
 
     #[test]
