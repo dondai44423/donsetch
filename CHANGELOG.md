@@ -5,6 +5,24 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- OpenCode 2.x received the split result shape and showed the model
+  metadata only: `web_fetch` and `web_crawl` reached it as
+  `{"content_ok": true, "url": ...}` with none of the page text (#306).
+  OpenCode 2 reports `clientInfo.name` as `cli` (its
+  `OPENCODE_CLIENT ?? "cli"` default, never set by `serve`), so the
+  text-only client list from #27 no longer matched it, while its Code
+  Mode keeps `structuredContent` and drops `content` like Claude Code.
+  The handshake is recognised by its fingerprint now (a 2.x-or-later
+  version together with the `elicitation.form.applyDefaults`
+  capability only OpenCode 2 sends), and a bare `cli` without it
+  keeps the default split. `mcp.text_only` is described as what it
+  does, the `[meta]` fold for every client; it never stripped image
+  blocks.
+
 ## [4.3.4] - 2026-09-25
 
 ### Fixed
