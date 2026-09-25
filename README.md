@@ -655,7 +655,6 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | robots.txt is ON for crawl | `respect_robots=true` for crawl. `fetch` does not check robots. |
 | Keyless search rate-limits without a proxy | It hits engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
 | Rerank in a CPU-limited container | Auto-clamped to cgroup parallelism on Linux, `DONSEEK_RERANK_THREADS` to override. |
-| Windows needs DirectML.dll | In-box since Windows 10 1903. Only trimmed Server Core/Nano images need the NuGet copy beside the binary. |
 
 | It cannot | Why |
 |---|---|

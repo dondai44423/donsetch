@@ -679,8 +679,12 @@ impl EgressPool {
     /// Sticky fetch lane for a host. First call picks and
     /// remembers; later calls return the same exit while it
     /// stays alive and unburned for this host. Among equally-clean
-    /// lanes the lowest measured RTT wins. Direct is last
-    /// resort only (protect the home IP).
+    /// lanes the lowest measured RTT wins. Lanes outside the free
+    /// set are ordered permissively on purpose: a burned pair is
+    /// skipped while its cooldown runs, a live lane bound to
+    /// another host's persona serves before direct (exclusivity is
+    /// preferred, not absolute), and direct is the last resort only
+    /// (protect the home IP).
     pub fn pick_fetch(&self, host: &str, direct_ok: bool) -> Option<Egress> {
         if host.is_empty() {
             return None;
@@ -705,27 +709,38 @@ impl EgressPool {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(host);
         }
-        // Prefer a healthy, non-dead proxy that is not burned for
-        // this host and not exclusively bound to another persona.
-        // Unknown RTT counts as healthy (optimistic, matches pick());
-        // among equally-ranked lanes the lowest measured RTT wins, so a
+        // Prefer a healthy, non-dead proxy that is free (not bound to
+        // another persona) and not burned for this host. Unknown RTT
+        // counts as healthy (optimistic, matches pick()); among
+        // equally-ranked lanes the lowest measured RTT wins, so a
         // clean-but-slow lane in file order can never shadow a fast one
         // (first-healthy-wins made lane 1 the exit for every new host).
-        let mut best: Option<&Egress> = None;
-        let mut best_score = 0u8;
-        let mut best_rtt = f64::MAX;
+        let mut best: Option<(&Egress, u8, f64)> = None;
+        // A live lane exclusively bound to a different host, kept
+        // aside: exclusivity is preferred while a free lane exists,
+        // but when there is none, sharing an exit still beats
+        // leaving on the real address (the pool is the user's
+        // egress policy, #265) and a foreign lane carries no
+        // failure for this host.
+        let mut foreign: Option<(&Egress, u8, f64)> = None;
         for e in &self.egresses {
             if e.proxy.is_none() {
                 continue;
             }
-            if self.is_dead(&e.id) || self.pair_burned(host, &e.id) {
+            if self.is_dead(&e.id) {
                 continue;
             }
-            if !self.persona_lane_ok(host, &e.id) {
+            // A burned pair rests for BURN_COOLDOWN. Seating it here
+            // would re-send every fetch of this host through a lane
+            // it just rejected (429, challenge, timeout, intercepted
+            // TLS), extend its own burn on each hit, and void the
+            // cooldown the mechanism exists for (#302 review).
+            if self.pair_burned(host, &e.id) {
                 continue;
             }
             // 0 = this host's pair is in probation after a block:
-            // never win against a clean lane (rotation must move).
+            // never win against a clean lane (rotation must move),
+            // but still beat a foreign lane and direct.
             let score = if self.pair_suspect(host, &e.id) {
                 0
             } else if self
@@ -737,13 +752,20 @@ impl EgressPool {
                 2
             };
             let rtt = self.rtt_ms(&e.id).unwrap_or(f64::MAX);
-            if score > best_score || (best.is_some() && score == best_score && rtt < best_rtt) {
-                best = Some(e);
-                best_score = score;
-                best_rtt = rtt;
+            if !self.persona_lane_ok(host, &e.id) {
+                if foreign.is_none_or(|(_, s, r)| score > s || (score == s && rtt < r)) {
+                    foreign = Some((e, score, rtt));
+                }
+                continue;
+            }
+            // The first eligible lane is seated whatever its score:
+            // probation scores 0, and `0 > 0` never seated it, so a
+            // one-lane pool fell to direct after a single block.
+            if best.is_none_or(|(_, s, r)| score > s || (score == s && rtt < r)) {
+                best = Some((e, score, rtt));
             }
         }
-        if let Some(e) = best {
+        if let Some(e) = best.or(foreign).map(|(e, _, _)| e) {
             self.sticky
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1126,6 +1148,142 @@ mod pacing_tests {
             c.id, a.id,
             "429 must rotate off the burned lane (got the same one again)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
+    }
+
+    // A pool with one lane, a host that served once and then answers
+    // 429: the pair goes into probation, and probation scored 0 could
+    // never pass the `0 > 0` seat check, so the fetch fell through to
+    // direct and left on the real address with rotation configured.
+    // The comment promised a probation lane would only lose to a
+    // clean lane. Once the pair burns (a second block), the lane
+    // keeps its cooldown instead: re-seating a burned pair would
+    // hammer the lane that is refusing this host and renew the burn
+    // on every fetch (#302 review).
+    #[test]
+    fn a_one_lane_pool_keeps_the_host_on_the_lane_until_the_pair_burns() {
+        let dir = isolate_cache("one-lane-block");
+        let p = Proxy::parse("http://127.0.0.1:24061").unwrap();
+        let id = p.id();
+        let pool = EgressPool::new(vec![p]);
+        assert_eq!(
+            pool.pick_fetch("example.com", true).map(|e| e.id),
+            Some(id.clone())
+        );
+        pool.report_ok("example.com", &id);
+        pool.note_fetch_rate_limited("example.com", &id);
+        assert_eq!(
+            pool.pick_fetch("example.com", true).map(|e| e.id),
+            Some(id.clone()),
+            "one 429 must not hand the host to direct"
+        );
+        // A second block burns the pair for BURN_COOLDOWN; the burn
+        // rests, and direct is the documented last resort meanwhile.
+        pool.note_fetch_rate_limited("example.com", &id);
+        assert_eq!(
+            pool.pick_fetch("example.com", true).map(|e| e.id),
+            Some("direct".to_string()),
+            "a burned pair rests; direct is the documented last resort"
+        );
+        // The burn is per host, not per lane: another host still
+        // gets the lane.
+        assert_eq!(
+            pool.pick_fetch("other.example", true).map(|e| e.id),
+            Some(id),
+            "burns are scoped to the host that earned them"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
+    }
+
+    // Persona exclusivity is preferred, not absolute (#302 review):
+    // on a 1-lane pool the first host fetched owns the lane, and
+    // every other host used to fall through to direct from its very
+    // first fetch. A foreign-bound lane serves instead of the real
+    // address; a free lane still wins while one exists, and a burned
+    // pair waits out its cooldown instead of re-serving.
+    #[test]
+    fn a_persona_bind_does_not_send_other_hosts_direct() {
+        let dir = isolate_cache("persona-direct");
+        let p1 = Proxy::parse("http://127.0.0.1:24081").unwrap();
+        let p2 = Proxy::parse("http://127.0.0.1:24082").unwrap();
+        let (id1, id2) = (p1.id(), p2.id());
+        let pool = EgressPool::new(vec![p1, p2]);
+        // What ensure_persona_egress does on the first web_fetch of
+        // a.example: a free lane is bound to that host exclusively.
+        let lane = pool.pick_persona_lane("a.example").expect("a free lane");
+        pool.bind_persona_lane("a.example", &lane.id);
+        assert_eq!(lane.id, id1);
+        // While a free lane exists, it wins over the bound one.
+        assert_eq!(
+            pool.pick_fetch("b.example", true).map(|e| e.id),
+            Some(id2.clone()),
+            "a free lane is preferred over another host's"
+        );
+        // Burn the free lane for b.example; the bound lane serves
+        // before the real address.
+        pool.note_fetch_rate_limited("b.example", &id2);
+        pool.note_fetch_rate_limited("b.example", &id2);
+        assert_eq!(
+            pool.pick_fetch("b.example", true).map(|e| e.id),
+            Some(id1.clone()),
+            "a live lane exists, so b.example must not leave on the real address"
+        );
+        // With the bound lane burned for b.example too, the pool
+        // hands back direct: burned pairs rest.
+        pool.note_fetch_rate_limited("b.example", &id1);
+        pool.note_fetch_rate_limited("b.example", &id1);
+        assert_eq!(
+            pool.pick_fetch("b.example", true).map(|e| e.id),
+            Some("direct".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
+    }
+
+    // Probation loses to a clean lane (rotation moves), a clean lane
+    // that burns hands the host back to the probation lane, and
+    // direct is reached only when every lane is dead.
+    #[test]
+    fn a_probation_lane_loses_to_a_clean_lane_but_beats_direct() {
+        let dir = isolate_cache("probation-order");
+        let p1 = Proxy::parse("http://127.0.0.1:24071").unwrap();
+        let p2 = Proxy::parse("http://127.0.0.1:24072").unwrap();
+        let (id1, id2) = (p1.id(), p2.id());
+        let pool = EgressPool::new(vec![p1, p2]);
+        assert_eq!(
+            pool.pick_fetch("example.com", true).map(|e| e.id),
+            Some(id1.clone())
+        );
+        pool.report_ok("example.com", &id1);
+        pool.note_fetch_rate_limited("example.com", &id1);
+        assert_eq!(
+            pool.pick_fetch("example.com", true).map(|e| e.id),
+            Some(id2.clone()),
+            "the host rotates to the clean lane"
+        );
+        pool.note_fetch_rate_limited("example.com", &id2);
+        pool.note_fetch_rate_limited("example.com", &id2);
+        assert_eq!(
+            pool.pick_fetch("example.com", true).map(|e| e.id),
+            Some(id1.clone()),
+            "with the clean lane burned, probation beats direct"
+        );
+        pool.report_dead(&id1);
+        pool.report_dead(&id2);
+        assert_eq!(
+            pool.pick_fetch("example.com", true).map(|e| e.id),
+            Some("direct".to_string()),
+            "every lane dead: direct is the documented last resort"
+        );
+        assert!(pool.pick_fetch("example.com", false).is_none());
         let _ = std::fs::remove_dir_all(&dir);
         unsafe {
             std::env::remove_var("DONSETCH_CACHE_DIR");

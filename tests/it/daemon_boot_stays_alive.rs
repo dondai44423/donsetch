@@ -11,14 +11,16 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-fn hermetic_command() -> Command {
+fn hermetic_command(cache_dir: &std::path::Path) -> Command {
     // The child must not inherit a developer's real config: a real
     // donsetch.toml with [transport] kind = "http" (or
     // DONSETCH_TRANSPORT=http) would boot an HTTP server instead of
     // the stdio daemon this test drives. DONSETCH_NO_CONFIG_FILE=1
     // skips the file layer; every other DONSETCH_* var goes too,
     // including DONSETCH_CONFIG (NO_CONFIG_FILE + CONFIG = a hard
-    // conflict error that would kill the boot for the wrong reason).
+    // conflict error that would kill the boot for the wrong reason);
+    // DONSETCH_CACHE_DIR is re-pointed at a temp root below, so the
+    // daemon never touches the real cache (review of #299).
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_donsetch"));
     cmd.arg("mcp")
         .arg("--supervised")
@@ -31,13 +33,22 @@ fn hermetic_command() -> Command {
             cmd.env_remove(&k);
         }
     }
+    cmd.env("DONSETCH_CACHE_DIR", cache_dir);
     cmd
 }
 
 #[test]
 fn mcp_daemon_boots_and_answers_initialize() {
+    let cache_dir = std::env::temp_dir().join(format!(
+        "donsetch-test-daemon-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     // A one-shot MCP client over stdio.
-    let mut child = hermetic_command().spawn().expect("daemon spawns");
+    let mut child = hermetic_command(&cache_dir).spawn().expect("daemon spawns");
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -77,4 +88,5 @@ fn mcp_daemon_boots_and_answers_initialize() {
         !err_text.contains("already installed"),
         "double-install regression: {err_text}"
     );
+    let _ = std::fs::remove_dir_all(&cache_dir);
 }

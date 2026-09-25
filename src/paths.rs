@@ -20,14 +20,71 @@ pub fn cache_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("DONSETCH_CACHE_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(d);
     }
-    // Layered config fallback ([paths] cache_dir in donsetch.toml).
+    // A unit test that did not set the override gets a root of its
+    // own, never the user's cache. Without this the crawl tests'
+    // Governor loaded and saved ~/.cache/donsetch/crawl-governor.json
+    // (mock hosts ex.com in the real file) and, with nextest running
+    // each test in its own process, read each other's throttle state
+    // back: three governor tests failed on a loaded box depending on
+    // which process wrote the file last.
+    #[cfg(test)]
+    if true {
+        return test_cache_root().clone();
+    }
+    default_cache_dir()
+}
+
+/// The production default: the layered config's `[paths] cache_dir`
+/// when set, else the platform cache dir under `donsetch`.
+fn default_cache_dir() -> PathBuf {
     let configured = crate::config::cfg().paths.cache_dir.trim();
     if !configured.is_empty() {
         return PathBuf::from(configured);
     }
+    platform_cache_dir()
+}
+
+/// `dirs::cache_dir()/donsetch`: the platform's own default root,
+/// with the temp-dir fallback for accounts the platform cannot name.
+fn platform_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("donsetch")
+}
+
+/// One temp root per test process, created on first use and removed
+/// at exit. nextest runs each test in its own process, so this is per
+/// test; under plain `cargo test` it is per binary, which is still
+/// never the user's dir. The sandbox is `donsetch-test/<id>`, shared
+/// parent and all, with the cache root at its `cache/` child (room
+/// for a sibling `config/` later). The id is random, not the PID: a
+/// root left behind by a failed run plus a recycled PID would hand
+/// the next test the dead one's state.
+#[cfg(test)]
+fn test_cache_root() -> &'static PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = std::env::temp_dir()
+            .join("donsetch-test")
+            .join(crate::handles::random_base62(16))
+            .join("cache");
+        let _ = std::fs::create_dir_all(&dir);
+        extern "C" fn sweep() {
+            if let Some(root) = ROOT.get()
+                && let Some(parent) = root.parent()
+            {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+        // SAFETY: registering a plain extern "C" fn with no arguments.
+        // Unconditional: libc exposes atexit on Windows too, and with
+        // the old unix-only gate every Windows test process left its
+        // sandbox behind (97 after one lib-only run).
+        unsafe {
+            libc::atexit(sweep);
+        }
+        dir
+    })
 }
 
 /// Screenshots live under the cache root: `cache_dir()/screenshots`.
@@ -187,8 +244,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_dir_ends_with_donsetch() {
-        assert!(cache_dir().ends_with("donsetch"));
+    fn a_unit_test_never_sees_the_users_cache_dir() {
+        // SAFETY: test-only env mutation; nextest runs each test in
+        // its own process.
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+        let d = cache_dir();
+        let user = dirs::cache_dir().map(|c| c.join("donsetch"));
+        assert_ne!(Some(d.clone()), user, "{d:?}");
+        assert!(d.starts_with(std::env::temp_dir()), "{d:?}");
+        assert!(d.exists());
+        assert_eq!(
+            d.file_name().and_then(|n| n.to_str()),
+            Some("cache"),
+            "{d:?}"
+        );
+        assert_eq!(
+            d.parent().and_then(|p| p.parent()),
+            Some(std::env::temp_dir().join("donsetch-test").as_path()),
+            "one sandbox per process under the shared parent: {d:?}"
+        );
+        // The explicit override still wins.
+        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", "/tmp/donsetch-override-probe") };
+        assert_eq!(
+            cache_dir(),
+            std::path::PathBuf::from("/tmp/donsetch-override-probe")
+        );
+        unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
+    }
+
+    #[test]
+    fn platform_cache_dir_ends_with_donsetch() {
+        assert!(platform_cache_dir().ends_with("donsetch"));
     }
 
     #[test]
