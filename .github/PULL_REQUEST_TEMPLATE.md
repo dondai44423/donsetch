@@ -13,10 +13,10 @@
 
 ## Checks
 
-- [ ] `cargo test --features ocr,rerank` passes (622+ tests)
-- [ ] `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` passes (zero warnings)
+- [ ] `cargo nextest run --all-features` passes (not `cargo test`: several tests rely on nextest's one process per test)
+- [ ] `cargo clippy --all-targets --all-features -- -Dwarnings` passes (zero warnings)
 - [ ] `cargo fmt --all -- --check` passes
-- [ ] CI is green on all 3 platforms (Linux, macOS, Windows)
+- [ ] CI is green on all 5 lanes (Linux x86_64 and aarch64, macOS arm64 and x86_64, Windows)
 
 ## Breaking changes
 

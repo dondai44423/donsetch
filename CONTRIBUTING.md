@@ -164,7 +164,7 @@ DonSeTch is built from scratch — no dependency on existing OSS web tooling:
 2. Write tests for your change: unit tests in a `#[cfg(test)]` module next to the code, integration tests as a module under `tests/it/` (registered in `tests/it/main.rs`, so they share one binary). Do not add a new top-level `tests/*.rs` file: each one becomes a separate test binary that links the whole crate again.
 3. Ensure `just all` passes and let CI (the full matrix) be the gate.
 4. Open a PR with a conventional commit title.
-5. CI must be green on all 3 platforms before merge.
+5. CI must be green on all 5 lanes before merge.
 
 ## Reporting issues
 
