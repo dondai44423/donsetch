@@ -511,6 +511,15 @@ fn toml_path() -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(explicit));
         }
     }
+    // A unit test that did not name a file gets no file layer, never
+    // the developer's own donsetch.toml: a local `[state]
+    // no_disk_state = true` flipped the governor's persistence under
+    // test, and any key in that file could shape a test the same way
+    // (#305; the cache root got the same default in #299).
+    #[cfg(test)]
+    if true {
+        return None;
+    }
     let dir = dirs::config_dir()?;
     let path = dir.join("donsetch").join("donsetch.toml");
     path.is_file().then_some(path)
@@ -2686,6 +2695,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    // #305: the default location is the developer's real config. A
+    // test that sets no `DONSETCH_CONFIG` must not read it, even when
+    // a file sits there (planted under a private XDG_CONFIG_HOME here,
+    // which `dirs::config_dir()` honours on Linux; elsewhere the
+    // platform dir is fixed and the assertion holds for that reason).
+    #[test]
+    fn the_default_config_location_is_not_read_under_test() {
+        let _guard = clean_env();
+        let home = std::env::temp_dir().join(format!(
+            "donsetch-cfg-home-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let dir = home.join("donsetch");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("donsetch.toml"), "[state]\nno_disk_state = true\n").unwrap();
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        set_env("XDG_CONFIG_HOME", &home);
+        let found = toml_path();
+        match saved_xdg {
+            Some(v) => set_env("XDG_CONFIG_HOME", v),
+            None => unset_env("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            found, None,
+            "the planted default-location file was picked up"
+        );
+        // An explicit path is still honoured.
+        let tmp = std::env::temp_dir();
+        let path = write_cfg(&tmp, "[state]\nno_disk_state = true\n");
+        set_env("DONSETCH_CONFIG", &path);
+        assert_eq!(toml_path().as_deref(), Some(path.as_path()));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     fn write_cfg(tmp: &std::path::Path, text: &str) -> std::path::PathBuf {
