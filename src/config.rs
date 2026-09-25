@@ -1359,7 +1359,7 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "text_only",
             FieldKind::Bool,
             "false",
-            "strip image blocks from tool output",
+            "fold structuredContent into a leading [meta] text block for every client",
         ),
         (
             "mcp",
