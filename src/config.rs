@@ -2700,8 +2700,11 @@ mod tests {
     // #305: the default location is the developer's real config. A
     // test that sets no `DONSETCH_CONFIG` must not read it, even when
     // a file sits there (planted under a private XDG_CONFIG_HOME here,
-    // which `dirs::config_dir()` honours on Linux; elsewhere the
-    // platform dir is fixed and the assertion holds for that reason).
+    // which `dirs::config_dir()` honours on Linux, so there the first
+    // half is a red-on-old check; Windows and macOS ignore XDG, so on
+    // a clean box the test asserts the short-circuit itself, while a
+    // box that has a real `%APPDATA%\donsetch\donsetch.toml` still
+    // gets the red-on-old check).
     #[test]
     fn the_default_config_location_is_not_read_under_test() {
         let _guard = clean_env();
