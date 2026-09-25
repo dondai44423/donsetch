@@ -45,7 +45,8 @@ Before writing any code for an issue:
    design.
 
 If, after reading the thread, the change you would make conflicts with what
-a maintainer wrote there, stop and comment on the issue first. Reaching
+a maintainer wrote there, stop and bring it to the person driving you: the
+disagreement goes on the issue, posted by them, before any code. Reaching
 agreement in the thread is cheaper than a changes-requested review.
 
 ## What a PR must contain
@@ -54,15 +55,23 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
 
 - **State what you read.** Name the comments on the issue that shaped the
   fix, and say explicitly if you are taking the reporter's proposal as is.
-- **A test that fails without the fix**, built from the real capture where
-  one exists, and at least one negative case that shows the fix does not
-  fire where it must not.
+- **For a code change, a test that fails without the fix**, built from the
+  real capture where one exists, and at least one negative case that shows
+  the fix does not fire where it must not.
+- **Tests isolate their own state instead of relying on the runner.** A
+  per-test temp dir isolates nothing when it reaches the code through
+  `DONSETCH_CACHE_DIR`: the variable is process-wide, so under libtest
+  parallel tests overwrite each other's value. Pass the path in where the
+  code allows it. A test that has to set the variable depends on nextest;
+  say so in a comment on the test.
 - **Doc comments describe contract, not history.** A `///` says what
   callers can rely on; the reasoning behind a choice goes in `//` inside
   the body, and the story goes in the PR.
 - **Check doc-comment rebinding.** After inserting or deleting a top-level
   item, look at the neighbouring `///` blocks: a comment can silently
-  attach to the wrong item, and nothing lints it.
+  attach to the wrong item. Clippy flags only a blank line between a `///`
+  block and its item; a block sitting directly on the wrong item, as in
+  #301 and #303, passes rustfmt, clippy and the tests.
 - **Keep the change to the issue.** Drive-by rewording elsewhere goes in a
   separate PR, unless the issue thread asked for it.
 
@@ -79,15 +88,17 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
 - Bare `cargo test` is not a supported runner; use the `just` recipes in
   CONTRIBUTING.md, which run `cargo nextest`. Nextest gives each test its
   own process, and several tests depend on that: they set process-global
-  state such as the `DONSETCH_CACHE_DIR` environment variable, or write to
-  the real cache directory under a per-process name. Under libtest, where
-  all tests share one process and run on threads, that state leaks between
-  tests and produces failures that have nothing to do with your change. If
-  you see one, say which runner produced it before calling it a
-  regression. New tests must isolate their own state (a per-test temp dir
-  for `DONSETCH_CACHE_DIR`) rather than rely on the runner.
-- MCP tool descriptions and schemas in `src/mcp/spec.rs` are what every
-  connected client sees. Treat edits there as user-facing.
+  state such as the `DONSETCH_CACHE_DIR` environment variable, or rely on
+  the temp cache root a unit test gets without it, which exists once per
+  process (`test_cache_root` in `src/paths.rs`, `#[cfg(test)]` only, so an
+  integration test under `tests/it/` still has to set the variable). Under
+  libtest, where all tests share one process and run on threads, that
+  state leaks between tests and produces failures that have nothing to do
+  with your change. If you see one, say which runner produced it before
+  calling it a regression.
+- The tool spec table in `src/spec.rs` generates both the MCP tool
+  descriptions and schemas and the CLI subcommands. Every connected client
+  and every CLI user sees what it holds: treat edits there as user-facing.
 - The version is bumped by the maintainer at release time. Do not touch it
   in a PR.
 - Commit messages follow Conventional Commits. Do not append tool or
