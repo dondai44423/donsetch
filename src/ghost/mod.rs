@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Instant;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 #[cfg(linux_like)]
 use std::os::unix::process::CommandExt as _;
@@ -1493,8 +1495,7 @@ impl Ghost {
             .and_then(Value::as_str)
             .ok_or_else(|| FetchError::ghost("no screenshot data"))?
             .to_string();
-        // base64 decode (no new dep: manual).
-        let bytes = b64decode(data.as_bytes());
+        let bytes = decode_screenshot_data(&data)?;
         std::fs::write(&dest, bytes).map_err(|e| FetchError::ghost(format!("screenshot: {e}")))
     }
 
@@ -1514,7 +1515,7 @@ impl Ghost {
             .and_then(Value::as_str)
             .ok_or_else(|| FetchError::ghost("no screenshot data"))?
             .to_string();
-        Ok(b64decode(data.as_bytes()))
+        decode_screenshot_data(&data)
     }
 
     /// One trusted click with a human-ish pre-move path.
@@ -2021,65 +2022,15 @@ fn sweep_crashpad() {
 #[cfg(not(linux_like))]
 fn sweep_crashpad() {}
 
-/// Minimal base64 decode (avoids a dep for one call).
-fn b64decode(s: &[u8]) -> Vec<u8> {
-    fn val(b: u8) -> u8 {
-        match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => 0,
-        }
-    }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let clean: Vec<u8> = s
-        .iter()
-        .copied()
-        .filter(|b| !b"=\n\r ".contains(b))
-        .collect();
-    for chunk in clean.chunks(4) {
-        if chunk.len() < 4 {
-            break;
-        }
-        let n = ((val(chunk[0]) as u32) << 18)
-            | ((val(chunk[1]) as u32) << 12)
-            | ((val(chunk[2]) as u32) << 6)
-            | (val(chunk[3]) as u32);
-        out.push((n >> 16) as u8);
-        out.push((n >> 8) as u8);
-        out.push(n as u8);
-    }
-    out
-}
-
-const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Minimal base64 encoder (the sibling of `b64decode`, same
-/// no-new-dependency rule). Input is raw PNG bytes, output feeds
-/// the MCP image content block (issue #171).
-pub fn encode_base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(B64_ALPHA[(n >> 18) as usize & 63] as char);
-        out.push(B64_ALPHA[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            B64_ALPHA[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            B64_ALPHA[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+/// Decodes the `data` field of a CDP `Page.captureScreenshot` reply
+/// (standard alphabet, padded) into the image bytes. Malformed input
+/// is an error, never a partial image.
+fn decode_screenshot_data(data: &str) -> Result<Vec<u8>, FetchError> {
+    // Strict decode: Chromium emits canonical padded base64 with no
+    // line breaks, so anything else means the reply is not an image.
+    BASE64_STANDARD
+        .decode(data)
+        .map_err(|e| FetchError::ghost(format!("screenshot data is not base64: {e}")))
 }
 
 /// Scan Chrome's stderr for the "DevTools listening on ws://…"
@@ -2228,5 +2179,48 @@ mod sandbox_tests {
         // config-layer tests; here only the runtime default contract.
         assert!(!sandbox_opt_in_enabled());
         assert!(!crate::config::DonsetchConfig::default().browser.no_sandbox);
+    }
+}
+
+#[cfg(test)]
+mod screenshot_data_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_rfc4648_vectors_including_the_padded_tail() {
+        // The hand-rolled decoder this replaced skipped a final group
+        // shorter than four symbols once `=` was stripped, so any image
+        // whose length was not a multiple of 3 lost its last 1-2 bytes.
+        for (encoded, raw) in [
+            ("", ""),
+            ("Zg==", "f"),
+            ("Zm8=", "fo"),
+            ("Zm9v", "foo"),
+            ("Zm9vYg==", "foob"),
+            ("Zm9vYmE=", "fooba"),
+            ("Zm9vYmFy", "foobar"),
+        ] {
+            assert_eq!(
+                decode_screenshot_data(encoded).unwrap(),
+                raw.as_bytes(),
+                "{encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn png_signature_round_trips() {
+        let png_head = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let encoded = BASE64_STANDARD.encode(png_head);
+        assert_eq!(decode_screenshot_data(&encoded).unwrap(), png_head);
+    }
+
+    #[test]
+    fn malformed_data_is_an_error_not_a_partial_image() {
+        // The old decoder mapped unknown symbols to 0 and returned
+        // garbage bytes; a bad reply must now fail the capture.
+        assert!(decode_screenshot_data("Zm9v!!!!").is_err());
+        assert!(decode_screenshot_data("Zm9vYg").is_err(), "missing padding");
+        assert!(decode_screenshot_data("Zm9v\nYmFy").is_err(), "line break");
     }
 }

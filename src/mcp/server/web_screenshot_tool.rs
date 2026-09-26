@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
 use super::Daemon;
@@ -103,7 +105,7 @@ pub async fn web_screenshot_tool(
                 Ok(b) => b,
                 Err(e) => return Err(tool_error(format!("web_screenshot: capture failed: {e}"))),
             };
-            let b64 = crate::ghost::encode_base64(&png);
+            let b64 = BASE64_STANDARD.encode(&png);
             Ok(json!({
                 "content": [
                     {
