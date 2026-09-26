@@ -5,6 +5,24 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The in-process integration modules no longer read the developer's
+  own `donsetch.toml` or cache (#315, the rest of #299 and #312):
+  `tests/it` links the lib without `cfg(test)`, so the unit-test
+  defaults never reached `crawl_fresh_fetch`, `egress_proxy`,
+  `request_class`, `revalidate_redirect`, `secure_cookie_leak`,
+  `bypass_live`, `token_invariants`, `soak` (whose page-history load
+  counted the developer's real file toward its growth bound) and
+  `auth_login` (which isolated its cache but not its config, and left
+  one temp directory per test process behind), and a local proxy
+  setting or timeout could shape them on one box and not on CI. Every
+  test in those modules now calls a shared sandbox first: no config
+  file layer, a private cache root under `$TMP/donsetch-test/`, swept
+  at exit. (mnaza, #317)
+
 ## [4.3.5] - 2026-09-25
 
 ### Fixed

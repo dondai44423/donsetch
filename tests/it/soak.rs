@@ -17,6 +17,10 @@ fn rss_kb() -> u64 {
 #[test]
 #[cfg(target_os = "linux")]
 fn soak_rss_stays_bounded() {
+    // First: the handle table and page history load from the cache
+    // root after the baseline is taken, so the developer's real
+    // page-history.json would count toward the growth bound.
+    crate::sandbox();
     let corpus = std::fs::read(format!(
         "{}/tests/fixtures/corpus/wiki-rust.html",
         env!("CARGO_MANIFEST_DIR")

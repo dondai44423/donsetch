@@ -47,6 +47,7 @@ fn serve(listener: TcpListener, hits: std::sync::Arc<AtomicUsize>) {
 
 #[tokio::test]
 async fn recrawl_never_serves_the_fresh_window() {
+    crate::sandbox();
     unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
 
     let origin = TcpListener::bind("127.0.0.1:0").expect("bind origin");
