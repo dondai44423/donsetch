@@ -1,8 +1,9 @@
 //! End-to-end tests for `donsetch login`: the full login → vault →
 //! tier-1 replay loop, logout isolation, and the security invariants.
 //!
-//! All state goes to a per-run temp dir via DONSETCH_CACHE_DIR so
-//! these tests can never touch a real user vault.
+//! All state goes to the per-test sandbox (`crate::sandbox()`: a
+//! private cache root and no config file layer) so these tests can
+//! never touch a real user vault or config.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -14,18 +15,16 @@ use donsetch::ghost::cache::{
 };
 
 fn isolate_state() {
-    // One static temp root for the whole file: each test still uses
-    // distinct domains so parallel runs cannot step on each other.
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("donsetch-auth-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp state dir");
-        unsafe { std::env::set_var("DONSETCH_CACHE_DIR", dir) };
-        // The fetch SSRF guard treats loopback as hostile by default:
-        // this file is the one place that must reach it.
-        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
-    });
+    // The sandbox owns the state root: nothing may set
+    // DONSETCH_CACHE_DIR before it runs, or it would take that as an
+    // explicit override and never register its sweep (the old per-file
+    // root here was never removed: one directory per test process).
+    // Each test still uses distinct domains so parallel runs cannot
+    // step on each other.
+    crate::sandbox();
+    // The fetch SSRF guard treats loopback as hostile by default:
+    // this file is the one place that must reach it.
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
     // Registry + vault reads are lazy, so nothing else needed.
 }
 
