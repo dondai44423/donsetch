@@ -17,10 +17,8 @@ use donsetch::ghost::cache::{
 fn isolate_state() {
     // The sandbox owns the state root: nothing may set
     // DONSETCH_CACHE_DIR before it runs, or it would take that as an
-    // explicit override and never register its sweep (the old per-file
-    // root here was never removed: one directory per test process).
-    // Each test still uses distinct domains so parallel runs cannot
-    // step on each other.
+    // explicit override and never register its sweep. Each test still
+    // uses distinct domains so parallel runs cannot step on each other.
     crate::sandbox();
     // The fetch SSRF guard treats loopback as hostile by default:
     // this file is the one place that must reach it.
