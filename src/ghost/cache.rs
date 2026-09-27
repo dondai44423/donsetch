@@ -676,6 +676,35 @@ pub fn load_session_cookies() -> Vec<CookieRecord> {
     out
 }
 
+/// The cookie set a daemon replays from its persistent stores: the
+/// tier-1 jar echo, minus every key the session vault owns, then the
+/// vault's own cookies (#319). A login must outrank a jar entry for
+/// the same name and domain: the echo is browser truth, but a
+/// logged-out render can have written anonymous values over the
+/// login cookie, and replaying those keeps every later fetch
+/// anonymous until someone clears the jar. Jar-unique cookies
+/// (device and analytics ids) still replay; the vault rides last so
+/// any collision the filter cannot see still resolves its way
+/// inside the jar store itself.
+pub fn vault_over_jar(sessions: &[CookieRecord], jar: &[CookieRecord]) -> Vec<CookieRecord> {
+    // Compare domains the way the jar normalizes them: a leading
+    // dot and letter case must not hide a collision.
+    fn domain_key(d: &str) -> String {
+        d.trim_start_matches('.').to_ascii_lowercase()
+    }
+    let owned: std::collections::HashSet<(String, String)> = sessions
+        .iter()
+        .map(|c| (c.name.clone(), domain_key(&c.domain)))
+        .collect();
+    let mut out: Vec<CookieRecord> = jar
+        .iter()
+        .filter(|c| !owned.contains(&(c.name.clone(), domain_key(&c.domain))))
+        .cloned()
+        .collect();
+    out.extend(sessions.iter().cloned());
+    out
+}
+
 /// Logout helper: drop every vaulted cookie whose domain belongs
 /// to `domain` (apex + subdomains + host-only subdomain cookies
 /// that feed the same session). Returns true if anything was
@@ -2943,6 +2972,51 @@ mod tests {
         st.sync_tier1_cookies(&[rec]);
         assert!(st.tier1_cookies.iter().all(|c| c.name != "post"));
         unsafe { std::env::remove_var("DONSETCH_NO_COOKIE_VAULT") };
+    }
+
+    // The vault outranks the tier-1 echo (#319): the replay set a
+    // daemon builds from (vault sessions, jar) must never let a jar
+    // entry shadow a login cookie for the same name and domain, and
+    // jar-unique cookies must still replay.
+    #[test]
+    fn vault_outranks_the_tier1_echo_on_the_same_key() {
+        let sessions = vec![
+            cr("token_v2", "LOGIN", ".reddit.com", None),
+            cr("reddit_session", "LOGIN2", ".reddit.com", None),
+        ];
+        // The echo: an anonymous value under a login key (dot and
+        // case differences must not hide it), a cookie of its own,
+        // and one from another domain.
+        let jar = vec![
+            cr("token_v2", "ANON", "reddit.com", Some(now() + 999)),
+            cr("loid", "anon-id", ".reddit.com", Some(now() + 999)),
+            cr("sid", "other", ".example.com", Some(now() + 999)),
+        ];
+        let replay = vault_over_jar(&sessions, &jar);
+        assert!(
+            replay
+                .iter()
+                .any(|c| c.name == "token_v2" && c.value == "LOGIN"),
+            "the login value must survive"
+        );
+        assert!(
+            replay.iter().all(|c| c.value != "ANON"),
+            "the anonymous echo must not shadow the login"
+        );
+        assert!(replay.iter().any(|c| c.name == "loid"), "jar-unique stays");
+        assert!(
+            replay
+                .iter()
+                .any(|c| c.name == "sid" && c.domain == ".example.com"),
+            "other domains are untouched"
+        );
+        // The vault rides last: a collision the filter cannot see
+        // still resolves in its favor inside the jar store itself.
+        assert_eq!(
+            replay.last().map(|c| c.name.as_str()),
+            Some("reddit_session")
+        );
+        assert_eq!(replay.len(), 4);
     }
 
     #[test]

@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-rolled codecs in the browser module and the Bing redirect
   decoder now use the `base64` crate; Bing's unpadded base64url
   links decode as before (Mart-Bogdan, #318).
+- Login cookies outrank the tier-1 jar again (#319, reported on
+  4.3.5): the daemon replayed its persisted jar echo after the
+  session vault at every boot and vault resync, so a jar entry for
+  the same name and domain, typically the anonymous value a
+  logged-out render had written over the login cookie, replaced the
+  login value and every later fetch went out anonymous until someone
+  cleared the jar (Reddit's `token_v2`, `csrf_token`,
+  `session_tracker`). Both replay points now build their cookie set
+  with the vault winning every key both stores hold; jar-unique
+  cookies still replay.
 
 ## [4.3.5] - 2026-09-25
 

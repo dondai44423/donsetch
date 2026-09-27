@@ -79,12 +79,18 @@ impl Daemon {
         // only after the browser has visited it once.
         {
             let sessions = crate::ghost::cache::load_session_cookies();
-            fetcher.import_cookies(&sessions).await;
             // Tier-1 jar persistence (v4 phase 1.4), kill-switched.
-            if crate::config::cfg().state.cookie_vault {
-                let jar = state.lock().await.tier1_cookies.clone();
-                fetcher.import_cookies(&jar).await;
-            }
+            // The vault outranks the jar echo for a key both hold: a
+            // logged-out render can write anonymous values for a
+            // login cookie's name, and replaying those keeps every
+            // later fetch anonymous until the jar is cleared (#319).
+            let jar = if crate::config::cfg().state.cookie_vault {
+                state.lock().await.tier1_cookies.clone()
+            } else {
+                Vec::new()
+            };
+            let replay = crate::ghost::cache::vault_over_jar(&sessions, &jar);
+            fetcher.import_cookies(&replay).await;
         }
 
         // Build ghost escalation hook for the crawl: renders
@@ -186,13 +192,19 @@ impl Daemon {
             changed
         };
         if changed {
-            let mut cookies = crate::ghost::cache::load_session_cookies();
+            let sessions = crate::ghost::cache::load_session_cookies();
             // Reset is wholesale: keep the tier-1 jar (device /
             // analytics cookies the browser-real daemon already
             // holds) so a login resync does not erase the session.
-            if crate::config::cfg().state.cookie_vault {
-                cookies.extend(self.state.lock().await.tier1_cookies.clone());
-            }
+            // The vault outranks the jar echo for a key both hold
+            // (#319): the echo's anonymous values for a login
+            // cookie's name must not survive the rebuild.
+            let jar = if crate::config::cfg().state.cookie_vault {
+                self.state.lock().await.tier1_cookies.clone()
+            } else {
+                Vec::new()
+            };
+            let cookies = crate::ghost::cache::vault_over_jar(&sessions, &jar);
             self.fetcher.reset_to(&cookies).await;
         }
     }
