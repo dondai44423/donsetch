@@ -183,7 +183,7 @@ RUSTFLAGS="-C link-arg=-fuse-ld=lld" cargo build --release
 
 The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built on Ubuntu 22.04 and runs there directly.
 
-**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64 and Windows-x64; linux-arm64 and macOS-x64 are core-only, because ONNX has no working prebuilt there. Linux ARM64 carries two honest limits: no OCR/rerank (the aarch64 ONNX prebuilt deadlocks at load) and fragile PDF (a loader hang in some paths, tracked in CI).
+**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64, macOS-x64 and Windows-x64; linux-arm64 is core-only, because the aarch64 ONNX runtime deadlocks in its loader. On macOS, OCR and rerank need macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary). Linux ARM64 carries one more honest limit: fragile PDF (a loader hang in some paths, tracked in CI).
 
 </details>
 
@@ -658,7 +658,7 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | Surprise | Why |
 |---|---|
 | First build ~2 min | BoringSSL compiles from source, cached after. Go is a build dependency too, BoringSSL's build system is Go-based. |
-| OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, Windows-x64. |
+| OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. |
 | First OCR/rerank use downloads models | ~24MB reranker, ~37MB OCR, cached forever. |
 | Captchas need an unlocker key | hCaptcha, reCAPTCHA and Turnstile cannot be solved locally, by design. With `donsetch keys add unlocker <key>[::zone]` they come through rendered; without one you get a clear honest error, never a hang. |
 | robots.txt is ON for crawl | `respect_robots=true` for crawl. `fetch` does not check robots. |

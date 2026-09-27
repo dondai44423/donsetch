@@ -53,25 +53,24 @@ semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
 psl = { version = "=2.1.235" }
-# OCR/rerank support deps. `ort` itself goes ONLY in the per-target sections
-# below, never here: Cargo unions features across matching target sections, so
-# a shared entry leaks `load-dynamic` onto Windows/macOS and silently strips
-# ONNX from those builds (the 3.3.0 bug — full story in src/onnx.rs).
+# OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
+# below, never here: Cargo unions features across every matching target
+# section, so declaring it in more than one place is how `load-dynamic` once
+# leaked onto macOS and silently stripped ONNX from those builds (the 3.3.0
+# bug — full story in src/onnx.rs). One section, one feature set, since #316.
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 ndarray = { version = "0.17", optional = true }
 num_cpus = { version = "1.17", optional = true }
 
-# Linux and Windows: dlopen'd at runtime — the prebuilt static archive runs
-# unguarded AVX in global constructors and SIGILLs pre-`main` on non-AVX CPUs
-# (#57, #277). Linux builds the .so at compile time; Windows ships Microsoft's
-# own onnxruntime.dll (release.yml pins the version and its sha256). Either way
-# the library sits beside the binary and is loaded from there at runtime.
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"], optional = true }
-
-# macOS: statically linked. arm64 has no AVX concept, so no gate is needed.
-[target.'cfg(not(any(target_os = "linux", target_os = "windows")))'.dependencies]
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "copy-dylibs", "api-24"], optional = true }
+# Every ONNX target dlopen's Microsoft's shared library at runtime: the
+# prebuilt static archives run unguarded AVX in C++ global constructors and
+# SIGILL pre-`main` on non-AVX CPUs (#57, #277), and one `load-dynamic`
+# config removes the feature-union hazard the old Linux/Windows vs macOS
+# split carried (#316). build.rs pins the version (1.24.2 Linux/Windows;
+# 1.23.2 macOS, the last Developer-ID-signed macOS build) and its sha256,
+# and the library sits beside the binary, loaded from there at runtime.
+[target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-23"], optional = true }
 
 [features]
 # No default features — the core tool (fetch, search, crawl, PDF)

@@ -69,9 +69,10 @@ jobs:
           - name: darwin-x64
             os: macos-15-intel
             target: x86_64-apple-darwin
-            # ort-sys ships no prebuilt ONNX Runtime for x86_64-apple-darwin —
-            # core build (same trade-off as linux-arm64).
-            features: ''
+            # ONNX dlopens on Intel too since #316 (Microsoft's
+            # signed 1.23.2 dylib ships beside the binary): the full
+            # feature set like the other release targets.
+            features: --features ocr,rerank,http
             rustflags: ''
           - name: win32-x64
             os: windows-latest
@@ -207,9 +208,9 @@ jobs:
       # the ONNX archive was silently absent from win32-x64 and
       # darwin-arm64). These gates are the tripwire: the shipped
       # bytes must be big enough to contain what they claim, the
-      # Linux dylib must ship beside the binary, and `doctor` must
-      # actually PROBE the ONNX payload instead of printing a
-      # cfg constant.
+      # ONNX shared library must ship beside the binary on every
+      # dlopen target, and `doctor` must actually PROBE the ONNX
+      # payload instead of printing a cfg constant.
       - name: Payload integrity gates
         shell: bash
         run: |
@@ -219,7 +220,8 @@ jobs:
           SIZE=$(wc -c < "$BIN")
           case "${{ matrix.name }}" in
             win32-x64)    NEED=12000000; EXPECT="shared library present" ;;
-            darwin-arm64) NEED=11000000; EXPECT="commit probe ok" ;;
+            darwin-arm64) NEED=12000000; EXPECT="shared library present" ;;
+            darwin-x64)   NEED=12000000; EXPECT="shared library present" ;;
             linux-x64)    NEED=15000000; EXPECT="shared library present" ;;
             *)            NEED=6000000;  EXPECT="not compiled" ;;
           esac
@@ -231,6 +233,12 @@ jobs:
           if [ "${{ matrix.name }}" = "linux-x64" ]; then
             if [ ! -f libonnxruntime.so ] || [ "$(wc -c < libonnxruntime.so)" -lt 10000000 ]; then
               echo "payload gate FAIL: libonnxruntime.so missing or too small"
+              exit 1
+            fi
+          fi
+          if [ "${{ matrix.name }}" = "darwin-arm64" ] || [ "${{ matrix.name }}" = "darwin-x64" ]; then
+            if [ ! -f libonnxruntime.dylib ] || [ "$(wc -c < libonnxruntime.dylib)" -lt 10000000 ]; then
+              echo "payload gate FAIL: libonnxruntime.dylib missing or too small"
               exit 1
             fi
           fi
@@ -320,11 +328,14 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          # Include ONNX shared lib if present (Linux x64, fetched by
-          # build.rs for runtime dlopen). macOS links statically;
+          # Include the ONNX shared lib when present: libonnxruntime.so
+          # on Linux x64, libonnxruntime.dylib on both macOS arches
+          # (build.rs fetches it for runtime dlopen, #298/#316).
           # Windows packages its DLL in the step below.
           if [ -f libonnxruntime.so ]; then
             tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch libonnxruntime.so
+          elif [ -f libonnxruntime.dylib ]; then
+            tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch libonnxruntime.dylib
           else
             tar czf $GITHUB_WORKSPACE/donsetch-${{ matrix.name }}.tar.gz donsetch
           fi

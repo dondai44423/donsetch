@@ -8,8 +8,9 @@
 # Two payload gates beyond compilation, because compile success has
 # shipped dead binaries before (v3.3.0 ONNX feature leak):
 #   1. The onnx_payload_probe unit test runs inside the features-on
-#      suites (linux-x64 dynamic load, macos-arm64 static link) and
-#      fails if the ONNX environment cannot initialize.
+#      suites on every lane that builds them (linux-x64 and both
+#      macOS lanes, all dynamic load), and fails if the ONNX
+#      environment cannot initialize.
 #   2. Windows compile-checks the full release feature set
 #      (ocr,rerank,http) without linking: MSVC's 305MB static ONNX
 #      link stays a release-time cost. The complete Windows payload
@@ -93,9 +94,11 @@ jobs:
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            # Static ONNX link: the payload probe test proves the
-            # archive is really linked in (the exact check that would
-            # have caught v3.3.0's darwin-arm64 regression).
+            # ONNX dlopens Microsoft's signed 1.23.2 dylib from
+            # beside the binary since #316; the smoke set runs the
+            # payload probe, which proves it loads (the exact check
+            # that would have caught v3.3.0's darwin-arm64
+            # regression).
             features: --features ocr,rerank
             extra-args: ''
             release-check: false
@@ -106,8 +109,10 @@ jobs:
           - name: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
-            # ort-sys has no prebuilt ONNX Runtime for x86_64-apple-darwin.
-            features: ''
+            # ONNX dlopens here too since #316 (Microsoft's signed
+            # 1.23.2 dylib), so the smoke set runs the same payload
+            # probe as arm64.
+            features: --features ocr,rerank
             extra-args: ''
             release-check: false
             # The slowest runner in the matrix, and the only one that used
@@ -294,7 +299,7 @@ jobs:
       # `heavy` job and in every platform's full matrix there.
       - name: Test (nextest, smoke)
         if: matrix.tests == 'smoke'
-        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} -E 'test(mcp::supervisor) | test(profile::) | test(extract::) | test(pdf::) | test(ghost::)'
+        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} -E 'test(mcp::supervisor) | test(profile::) | test(extract::) | test(pdf::) | test(ghost::) | test(onnx::)'
         timeout-minutes: 30
 
       # The cross-platform check for the lanes that run no suite: compile

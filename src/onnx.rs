@@ -6,26 +6,27 @@
 //! - **Linux x86_64** : dlopen'd at runtime; Microsoft's own release
 //!   build of the shared library, shipped beside the binary
 //! - **Linux aarch64** : no ONNX; released without `ocr,rerank`
-//! - **macOS arm64** : statically linked
-//! - **macOS x86_64** : no ONNX; released without `ocr,rerank`
+//! - **macOS arm64 / x86_64** : dlopen'd at runtime; Microsoft's
+//!   signed 1.23.2 dylib, shipped beside the binary
 //! - **Windows x64** : dlopen'd at runtime; Microsoft's own release
 //!   build of the DLL, shipped beside the exe
 //!
-//! Neither dlopen target gates the load on AVX any more; see "Why
+//! No ONNX target gates the load on AVX any more; see "Why
 //! there is no AVX gate" below.
 //!
 //! Which targets get OCR/rerank at all is decided in the release matrix
 //! (`.github/workflows/release.yml`).
 //!
-//! **The one rule that has already broken a release:** declare `ort` only
-//! in the two mutually exclusive `[target.'cfg(...)'.dependencies]`
-//! sections of `Cargo.toml`, never in shared `[dependencies]`. Cargo
-//! **unions** features across every target section whose cfg matches : it
-//! does not pick one : so a shared entry leaks `load-dynamic` onto macOS,
-//! where it wins over static linking and ships a binary with no ONNX in
-//! it, no dylib beside it, and no error anywhere. That is exactly how
-//! v3.3.0 went out with OCR and rerank dead on win32-x64 and
-//! darwin-arm64.
+//! **The rule that has already broken a release:** declare `ort` in
+//! exactly ONE `[target.'cfg(...)'.dependencies]` section of
+//! `Cargo.toml`, with one feature set. Cargo **unions** features across
+//! every target section whose cfg matches : it does not pick one : so a
+//! second, differently configured section (or a shared entry) leaks
+//! `load-dynamic` onto targets it was not meant for and ships a binary
+//! with no ONNX in it, no dylib beside it, and no error anywhere. That is
+//! exactly how v3.3.0 went out with OCR and rerank dead on win32-x64 and
+//! darwin-arm64. Since #316 every target shares the one section, so the
+//! hazard is gone by construction.
 //!
 //! Everything below is reference detail: per-platform rationale, a
 //! postmortem of the v3.3.0 wiring bug, and the history of the Windows
@@ -64,12 +65,17 @@
 //! constructors can deadlock there (issue #9), so the features are simply
 //! not built rather than shipped broken.
 //!
-//! ## macOS : static link (arm64 only)
+//! ## macOS : dlopen, both arches (since #316)
 //!
-//! arm64 links statically via `download-binaries`; there is no AVX concept
-//! on ARM (NEON), so no gate is needed. x86_64-apple-darwin is released
-//! without `ocr,rerank` because `ort-sys` publishes no prebuilt for that
-//! target.
+//! arm64 used to link statically via `download-binaries`, and
+//! x86_64-apple-darwin was released without `ocr,rerank` (`ort-sys`
+//! publishes no prebuilt for it; Intel Macs lost OCR and rerank). Both now
+//! take the dlopen path with Microsoft's macOS shared library: the pinned
+//! 1.23.2 build (the last Developer-ID-signed macOS release; see
+//! `build.rs` for why not 1.24.2), loaded from beside the binary like
+//! Linux and Windows. The `api-23` floor serves it. On ARM there is no AVX
+//! concept (NEON); on Intel Macs the runtime dispatches its kernels like
+//! everywhere else.
 //!
 //! ## Windows x64 : dlopen at runtime
 //!
@@ -116,11 +122,12 @@
 //! caught the violation. `load-dynamic` implies `ort-sys/disable-linking`,
 //! and `ort-sys`'s build script early-returns on that flag : before
 //! downloading anything and before `copy-dylibs` runs : so there is no
-//! build-time error, only a runtime dlopen that finds nothing. At runtime,
-//! `load_and_init()` below still discards `commit()`'s `Result`, and the
-//! doctor's "static link, compiled in" line is a `cfg` constant rather
-//! than a probe, so neither surfaced it either. Worth fixing if you touch
-//! this again. The tell in the shipped artifacts was the Windows exe
+//! build-time error, only a runtime dlopen that finds nothing. At the
+//! time, `load_and_init()` discarded `commit()`'s `Result` and the
+//! doctor's "static link, compiled in" line was a `cfg` constant rather
+//! than a probe, so neither surfaced it either; both have since been fixed
+//! (commit() failures error, and the doctor probe is real). The tell in
+//! the shipped artifacts was the Windows exe
 //! dropping 35.6MB -> 16.3MB : the missing ONNX static archive.
 //!
 //! ## History : the Windows `DirectML.dll` import (removed in #298)
@@ -136,7 +143,7 @@
 //! CPU-only `onnxruntime.dll` references DirectML.
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "windows"),
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
     any(feature = "ocr", feature = "rerank")
 ))]
 use std::path::PathBuf;
@@ -216,7 +223,7 @@ pub fn ensure_loaded() -> Result<(), String> {
 // ── Linux / Windows: dynamic loading ───────────────────────────
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "windows"),
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
     any(feature = "ocr", feature = "rerank")
 ))]
 fn load_and_init() -> Result<(), String> {
@@ -257,7 +264,7 @@ fn load_and_init() -> Result<(), String> {
 /// 1. Next to the current executable (primary).
 /// 2. `cache_dir()/onnx/` (fallback for relocatable installs).
 #[cfg(all(
-    any(target_os = "linux", target_os = "windows"),
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
     any(feature = "ocr", feature = "rerank")
 ))]
 fn find_shared_lib() -> Option<PathBuf> {
@@ -282,35 +289,17 @@ fn find_shared_lib() -> Option<PathBuf> {
 
 /// The runtime's file name beside the binary on the dlopen targets.
 #[cfg(all(
-    any(target_os = "linux", target_os = "windows"),
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
     any(feature = "ocr", feature = "rerank")
 ))]
 pub(crate) fn shared_lib_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
     } else {
         "libonnxruntime.so"
     }
-}
-
-// ── macOS: static linking ──────────────────────────────────────
-
-#[cfg(all(
-    not(any(target_os = "linux", target_os = "windows")),
-    any(feature = "ocr", feature = "rerank")
-))]
-fn load_and_init() -> Result<(), String> {
-    // macOS ARM64: no AVX concept (ARM NEON). Always works.
-    // Just initialize the ONNX environment (static link).
-    // Surface commit() failures: the 3.3.0 leak shipped binaries
-    // where the static archive was never linked in and this call
-    // failed silently : treat it as an error instead.
-    // NOTE: commit() reports bool on this path too.
-    if !ort::init().commit() {
-        return Err("ONNX Runtime init failed (static)".to_string());
-    }
-    eprintln!("[onnx] Runtime initialized (static link)");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -325,6 +314,12 @@ mod tests {
     #[test]
     fn shared_lib_name_is_dll_on_windows() {
         assert_eq!(super::shared_lib_name(), "onnxruntime.dll");
+    }
+
+    #[cfg(all(target_os = "macos", any(feature = "ocr", feature = "rerank")))]
+    #[test]
+    fn shared_lib_name_is_dylib_on_macos() {
+        assert_eq!(super::shared_lib_name(), "libonnxruntime.dylib");
     }
 
     /// Payload probe: the ONNX environment must actually initialize

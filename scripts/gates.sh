@@ -19,9 +19,10 @@ if [ "$platform" = "win32-x64" ]; then
 else
     BIN=donsetch
     case "$platform" in
-        darwin-arm64) NEED=11000000; EXPECT="commit probe ok" ;;
+        darwin-arm64) NEED=12000000; EXPECT="shared library present" ;;
+        darwin-x64)   NEED=12000000; EXPECT="shared library present" ;;
         linux-x64)    NEED=15000000; EXPECT="shared library present" ;;
-        linux-arm64)  NEED=15000000; EXPECT="shared library present" ;;
+        linux-arm64)  NEED=15000000; EXPECT="not compiled" ;;
         *)            NEED=6000000;  EXPECT="not compiled" ;;
     esac
 fi
@@ -44,6 +45,11 @@ if [ "$platform" = "linux-x64" ]; then
         OUT=$(qemu-x86_64 -cpu qemu64 "./$BIN" --version 2>&1 || true)
         [ -n "$OUT" ] || { echo "gates FAIL: binary crashed on non-AVX CPU (SIGILL)"; exit 1; }
     fi
+fi
+
+if [ "$platform" = "darwin-arm64" ] || [ "$platform" = "darwin-x64" ]; then
+    [ -f libonnxruntime.dylib ] || { echo "gates FAIL: libonnxruntime.dylib missing"; exit 1; }
+    [ "$(wc -c < libonnxruntime.dylib)" -ge 10000000 ] || { echo "gates FAIL: libonnxruntime.dylib too small"; exit 1; }
 fi
 
 # Version check: the binary must report the Cargo.toml version.

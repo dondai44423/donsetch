@@ -488,10 +488,15 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
 }
 
 /// Runtime libraries a release tarball may ship beside the binary
-/// on Unix. Linux ships `libonnxruntime.so` (dlopen'd from the exe
-/// dir by onnx.rs); macOS links ONNX statically and ships nothing.
-#[cfg(unix)]
+/// on Unix and the updater must carry across upgrades: Linux ships
+/// `libonnxruntime.so`, macOS `libonnxruntime.dylib` since #316
+/// (both dlopen'd from the exe dir by onnx.rs). A tarball without
+/// one simply stages nothing.
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) const SIBLING_LIBS: &[&str] = &["libonnxruntime.so"];
+
+#[cfg(all(unix, target_os = "macos"))]
+pub(crate) const SIBLING_LIBS: &[&str] = &["libonnxruntime.dylib"];
 
 #[cfg(unix)]
 fn sibling_tmp(exe_dir: &Path, name: &str) -> std::path::PathBuf {
