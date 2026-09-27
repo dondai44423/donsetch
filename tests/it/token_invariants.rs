@@ -21,6 +21,7 @@ fn opts_with(f: impl FnOnce(&mut ExtractOptions)) -> ExtractOptions {
 
 #[test]
 fn focus_cuts_at_least_40_percent_on_a_long_page() {
+    crate::sandbox();
     let body = corpus("wiki-rust.html");
     let full = extract::extract(
         &body,
@@ -50,6 +51,7 @@ fn focus_cuts_at_least_40_percent_on_a_long_page() {
 
 #[test]
 fn toc_costs_under_5_percent_of_the_full_page() {
+    crate::sandbox();
     let body = corpus("wiki-rust.html");
     let full = extract::extract(
         &body,
@@ -80,6 +82,7 @@ fn toc_costs_under_5_percent_of_the_full_page() {
 
 #[test]
 fn probe_output_stays_tiny() {
+    crate::sandbox();
     let body = corpus("wiki-rust.html");
     let probe = extract::extract(
         &body,
@@ -109,6 +112,7 @@ fn probe_output_stays_tiny() {
 
 #[test]
 fn mcp_instructions_stay_cheap() {
+    crate::sandbox();
     // The handshake blurb is the one string an agent pays for in
     // every session, whether or not it ever calls us : so it is a
     // token invariant like any response size. Generated live, not
@@ -129,6 +133,7 @@ fn mcp_instructions_stay_cheap() {
 
 #[test]
 fn split_mcp_contract_stays_under_3000_estimated_tokens() {
+    crate::sandbox();
     // chars/4 is the repository-wide offline estimator. Exact tokenizer
     // measurements belong in the external evaluation report. The
     // ceiling tracks the 4-tool contract (web_answer + web_memory
@@ -143,6 +148,7 @@ fn split_mcp_contract_stays_under_3000_estimated_tokens() {
 
 #[test]
 fn links_on_renders_real_links() {
+    crate::sandbox();
     // Wikipedia article body: hundreds of interwiki links. With
     // links=true the pipeline must render them as markdown links
     // (handle rewriting is the MCP layer's job on top).

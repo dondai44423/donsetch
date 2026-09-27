@@ -45,6 +45,7 @@ fn header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
 
 #[tokio::test]
 async fn legacy_user_agent_is_single_and_request_local() {
+    crate::sandbox();
     unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
     let fetcher =
         donsetch::fetch::client::Fetcher::new(donsetch::profile::BrowserProfile::host_default())
@@ -85,6 +86,7 @@ async fn legacy_user_agent_is_single_and_request_local() {
 
 #[tokio::test]
 async fn legacy_user_agent_rejects_header_injection_before_network() {
+    crate::sandbox();
     let fetcher =
         donsetch::fetch::client::Fetcher::new(donsetch::profile::BrowserProfile::host_default())
             .unwrap();
@@ -100,6 +102,7 @@ async fn legacy_user_agent_rejects_header_injection_before_network() {
 
 #[tokio::test]
 async fn subresource_class_goes_out_on_the_wire() {
+    crate::sandbox();
     unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
     let (port, rx) = serve_once();
     let fetcher =
@@ -137,6 +140,7 @@ async fn subresource_class_goes_out_on_the_wire() {
 
 #[tokio::test]
 async fn navigation_class_stays_the_historical_set() {
+    crate::sandbox();
     unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
     let (port, rx) = serve_once();
     let fetcher =

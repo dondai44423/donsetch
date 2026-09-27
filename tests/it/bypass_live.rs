@@ -96,6 +96,7 @@ async fn run_one(
 
 #[tokio::test]
 async fn unlock_legacy_json_wrapper() {
+    crate::sandbox();
     let dir = tmp_dir("legacy");
     let _ = std::fs::remove_dir_all(&dir);
     let (ep, _hits) = spin(|req| {
@@ -119,6 +120,7 @@ async fn unlock_legacy_json_wrapper() {
 
 #[tokio::test]
 async fn unlock_header_contract() {
+    crate::sandbox();
     // Current docs: outer 200, target status in x-brd-status-code
     // header, body still in the JSON wrapper.
     let dir = tmp_dir("header");
@@ -133,6 +135,7 @@ async fn unlock_header_contract() {
 
 #[tokio::test]
 async fn unlock_auth_rejection_maps_to_api() {
+    crate::sandbox();
     let dir = tmp_dir("auth");
     let _ = std::fs::remove_dir_all(&dir);
     let (ep, hits) = spin(|req| {
@@ -154,6 +157,7 @@ async fn unlock_auth_rejection_maps_to_api() {
 
 #[tokio::test]
 async fn unlock_transient_solve_failure_retries_once_then_succeeds() {
+    crate::sandbox();
     let dir = tmp_dir("retry");
     let _ = std::fs::remove_dir_all(&dir);
     let (ep, hits) = spin({
@@ -182,6 +186,7 @@ async fn unlock_transient_solve_failure_retries_once_then_succeeds() {
 
 #[tokio::test]
 async fn unlock_zone_not_found_is_config() {
+    crate::sandbox();
     let dir = tmp_dir("zone");
     let _ = std::fs::remove_dir_all(&dir);
     let (ep, hits) = spin(|_req| "400\n\nzone \"mcp_unlocker\" not found".to_string());
@@ -193,6 +198,7 @@ async fn unlock_zone_not_found_is_config() {
 
 #[tokio::test]
 async fn solve_cache_second_hit_never_calls_api() {
+    crate::sandbox();
     let dir = tmp_dir("cache");
     let _ = std::fs::remove_dir_all(&dir);
     let (ep, hits) = spin(|_req| {

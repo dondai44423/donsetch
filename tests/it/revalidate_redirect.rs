@@ -44,6 +44,7 @@ fn serve(listener: TcpListener, log: Arc<Mutex<Vec<String>>>, routes: Vec<(Strin
 
 #[tokio::test]
 async fn revalidation_conditionals_never_ride_a_redirect_hop() {
+    crate::sandbox();
     unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
 
     let origin = TcpListener::bind("127.0.0.1:0").expect("bind origin");
@@ -142,6 +143,7 @@ static ENV_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 #[tokio::test]
 async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
+    crate::sandbox();
     // Atomic test-order gate (cargo test runs both tests on one
     // runtime; nextest would isolate anyway).
     if ENV_LOCK.swap(true, std::sync::atomic::Ordering::SeqCst) {
