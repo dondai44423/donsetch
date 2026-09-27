@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The in-process integration modules no longer read the developer's
+  own `donsetch.toml` or cache (#315, the rest of #299 and #312):
+  `tests/it` links the lib without `cfg(test)`, so the unit-test
+  defaults never reached `crawl_fresh_fetch`, `egress_proxy`,
+  `request_class`, `revalidate_redirect`, `secure_cookie_leak`,
+  `bypass_live`, `token_invariants`, `soak` (whose page-history load
+  counted the developer's real file toward its growth bound) and
+  `auth_login` (which isolated its cache but not its config, and left
+  one temp directory per test process behind), and a local proxy
+  setting or timeout could shape them on one box and not on CI. Every
+  test in those modules now calls a shared sandbox first: no config
+  file layer, a private cache root under `$TMP/donsetch-test/`, swept
+  at exit. (mnaza, #317)
 - Screenshots lost their last one or two bytes whenever the PNG's
   length was not a multiple of 3: the hand-rolled decoder for
   Chrome's base64 capture dropped the final group once its `=`
@@ -18,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails instead of turning unknown symbols into zero bytes. Both
   hand-rolled codecs in the browser module and the Bing redirect
   decoder now use the `base64` crate; Bing's unpadded base64url
-  links decode as before (Mart-Bogdan).
+  links decode as before (Mart-Bogdan, #318).
 
 ## [4.3.5] - 2026-09-25
 
