@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test in those modules now calls a shared sandbox first: no config
   file layer, a private cache root under `$TMP/donsetch-test/`, swept
   at exit. (mnaza, #317)
+- Screenshots lost their last one or two bytes whenever the PNG's
+  length was not a multiple of 3: the hand-rolled decoder for
+  Chrome's base64 capture dropped the final group once its `=`
+  padding was stripped, which cut into the checksum of the image's
+  closing `IEND` chunk. `web_screenshot` and the captcha `shot` file
+  now get the whole image, and a capture that is not valid base64
+  fails instead of turning unknown symbols into zero bytes. Both
+  hand-rolled codecs in the browser module and the Bing redirect
+  decoder now use the `base64` crate; Bing's unpadded base64url
+  links decode as before (Mart-Bogdan, #318).
 
 ## [4.3.5] - 2026-09-25
 
