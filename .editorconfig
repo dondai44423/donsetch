@@ -1,0 +1,25 @@
+# EditorConfig: https://editorconfig.org
+#
+# Applies when an editor saves a file. .gitattributes normalizes line
+# endings when git stores or checks out a file; this keeps editors from
+# writing CRLF, a UTF-8 BOM or trailing whitespace in the first place.
+# Indentation is left to each file type's existing style and to rustfmt.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Two trailing spaces are a hard line break in Markdown.
+[*.md]
+trim_trailing_whitespace = false
+
+# Captured pages and recorded results must stay byte-exact.
+[{tests/fixtures/**,bench/fetch/results/**,bench/*_results.json}]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset
