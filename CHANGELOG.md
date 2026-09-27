@@ -32,6 +32,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-rolled codecs in the browser module and the Bing redirect
   decoder now use the `base64` crate; Bing's unpadded base64url
   links decode as before (Mart-Bogdan, #318).
+- Login cookies outrank the tier-1 jar again (#319, reported on
+  4.3.5): the daemon replayed its persisted jar echo after the
+  session vault at every boot and vault resync, so a jar entry for
+  the same name and domain, typically the anonymous value a
+  logged-out render had written over the login cookie, replaced the
+  login value and every later fetch went out anonymous until someone
+  cleared the jar (Reddit's `token_v2`, `csrf_token`,
+  `session_tracker`). Both replay points now build their cookie set
+  with the vault winning every key both stores hold; jar-unique
+  cookies still replay.
+- macOS loads ONNX Runtime dynamically like Linux and Windows, and
+  Intel Macs get OCR and rerank back (#316): both macOS targets now
+  dlopen Microsoft's shared library from beside the binary instead
+  of the static `download-binaries` link, and the darwin-x64 release
+  builds the `ocr,rerank,http` feature set for the first time. The
+  pinned macOS runtime is 1.23.2, the last release Microsoft shipped
+  with a Developer ID signature (1.24.2+ macOS dylibs are ad-hoc
+  only and raise the minimum to macOS 14; 1.23.2 asks 13.4), and
+  the crate's API floor moves from `api-24` to `api-23` to serve it
+  (the `GetApi` table is append-only; measured on Windows against a
+  1.23.2 runtime). The binary no longer carries the statically
+  linked runtime, the release gates check the dylib beside the
+  binary, both macOS CI lanes run the payload probe, and the
+  Homebrew formula installs the library beside the binary. The
+  remaining step is a manual pass on stock Mac hardware (Gatekeeper
+  and signing behaviour), tracked on the issue. (proposed by
+  Mart-Bogdan, signature analysis by mnaza)
 
 ## [4.3.5] - 2026-09-25
 
