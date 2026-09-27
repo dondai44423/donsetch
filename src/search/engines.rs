@@ -2,6 +2,9 @@
 //! layered fallbacks. A parse that yields <3 hits counts
 //! as engine failure (the health system hears about it).
 
+use base64::Engine as _;
+use base64::alphabet;
+use base64::engine::general_purpose::{GeneralPurpose, PAD_INDIFFERENT};
 use scraper::{Html, Selector};
 
 pub mod google_wml;
@@ -86,31 +89,19 @@ fn decode_bing(href: &str) -> String {
     href.to_string()
 }
 
+/// base64url (RFC 4648 section 5), padded or not, decoded to UTF-8.
+/// `None` when the input is not base64url or not UTF-8.
 fn base64url_decode(s: &str) -> Option<String> {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut vals = Vec::with_capacity(s.len());
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let pos = T.iter().position(|&t| t == c)?;
-        vals.push(pos as u32);
-    }
-    let mut out = Vec::with_capacity(vals.len() * 6 / 8);
-    for chunk in vals.chunks(4) {
-        let mut n = 0u32;
-        for (i, &v) in chunk.iter().enumerate() {
-            n |= v << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    String::from_utf8(out).ok()
+    // Lenient on purpose, matching the hand-rolled decoder this
+    // replaced: Bing's `u=` value is third-party data, seen both with
+    // and without `=`, and nonzero unused bits in the last symbol do
+    // not change the bytes a URL decodes to.
+    const BING_URL_SAFE: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::URL_SAFE,
+        PAD_INDIFFERENT.with_decode_allow_trailing_bits(true),
+    );
+    let bytes = BING_URL_SAFE.decode(s).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Check if a URL is a search engine results page (SERP).
@@ -677,6 +668,70 @@ mod tests {
             decode_bing("https://example.com/page"),
             "https://example.com/page"
         );
+    }
+
+    #[test]
+    fn bing_decodes_live_unpadded_redirects() {
+        // `u=` values from a live SERP (2026-09-26): URL-safe alphabet,
+        // `a1` prefix, `=` padding stripped, so the last group can be
+        // 2, 3 or 4 symbols long. One case per tail length.
+        let ck = |u: &str| format!("https://www.bing.com/ck/a?!&&p=abc&ptn=3&ver=2&u=a1{u}&ntb=1");
+        for (u, url) in [
+            (
+                "aHR0cHM6Ly9kb2NzLnJzL2Jhc2U2NC9sYXRlc3QvYmFzZTY0Lw",
+                "https://docs.rs/base64/latest/base64/",
+            ),
+            (
+                "aHR0cHM6Ly9kb2NzLnJzL2NyYXRlL2Jhc2U2NC9sYXRlc3Q",
+                "https://docs.rs/crate/base64/latest",
+            ),
+            (
+                "aHR0cHM6Ly9naXRodWIuY29tL21hcnNoYWxscGllcmNlL3J1c3QtYmFzZTY0",
+                "https://github.com/marshallpierce/rust-base64",
+            ),
+        ] {
+            assert_eq!(decode_bing(&ck(u)), url, "{u}");
+        }
+    }
+
+    #[test]
+    fn bing_decode_uses_the_url_safe_alphabet() {
+        // `-` and `_` are 62 and 63 in base64url; the standard `+`/`/`
+        // alphabet would reject both.
+        assert_eq!(
+            base64url_decode("aHR0cHM6Ly9leGFtcGxlLmNvbS9hP2I9fn5-Pg").as_deref(),
+            Some("https://example.com/a?b=~~~>")
+        );
+        // The vertical-nav stubs in tests/fixtures/bing-serp.html decode
+        // to a relative path, which decode_bing then drops.
+        assert_eq!(
+            base64url_decode("L2ltYWdlcy9zZWFyY2g_cT10ZXN0K3F1ZXJ5JkZPUk09SERSU0My").as_deref(),
+            Some("/images/search?q=test+query&FORM=HDRSC2")
+        );
+        assert_eq!(
+            decode_bing(
+                "https://www.bing.com/ck/a?!&&p=x&u=a1L2ltYWdlcy9zZWFyY2g_cT10ZXN0K3F1ZXJ5JkZPUk09SERSU0My&ntb=1"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn bing_decode_is_lenient_like_the_hand_rolled_decoder() {
+        // Padded and unpadded forms decode alike.
+        assert_eq!(base64url_decode("aHR0cA==").as_deref(), Some("http"));
+        assert_eq!(base64url_decode("aHR0cA").as_deref(), Some("http"));
+        // Nonzero unused bits in the last symbol (`B` instead of `A`)
+        // are ignored rather than rejected.
+        assert_eq!(base64url_decode("aHR0cB").as_deref(), Some("http"));
+        // Standard-alphabet symbols and invalid UTF-8 are rejected, as
+        // before.
+        assert_eq!(base64url_decode("aHR0cA+/"), None);
+        assert_eq!(base64url_decode("_w"), None);
+        // A lone trailing symbol carries only 6 bits and no encoder
+        // emits one. The old decoder guessed a byte from it ("htt" +
+        // 'p' here); now the input is refused.
+        assert_eq!(base64url_decode("aHR0c"), None);
     }
 
     #[test]
