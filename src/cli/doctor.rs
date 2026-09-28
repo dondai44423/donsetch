@@ -857,9 +857,16 @@ fn check_state_permissions() -> CheckResult {
     {
         use std::os::unix::fs::PermissionsExt;
         let dir = paths::cache_dir();
-        // Files that carry cookies, TLS sessions, or auth material.
-        // handles.json is opaque tokens, not secrets: leave it out.
-        let secret_files = ["ghost-state.json", "routes.json", "byok-keys.json"];
+        // Files that carry cookies, TLS sessions, auth material, or
+        // fetched page content (page-history keeps whole markdown,
+        // including pages fetched behind a login). handles.json is
+        // opaque tokens, not secrets: leave it out.
+        let secret_files = [
+            "ghost-state.json",
+            "routes.json",
+            "byok-keys.json",
+            "page-history.json",
+        ];
         let mut fixed = Vec::new();
         let mut failed = Vec::new();
         let mut present = 0u32;
@@ -2297,19 +2304,30 @@ mod doctor_ultra_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let f = paths::cache_dir().join("routes.json");
-            std::fs::write(&f, b"{}").unwrap();
-            let mut perm = std::fs::metadata(&f).unwrap().permissions();
-            perm.set_mode(0o644);
-            std::fs::set_permissions(&f, perm).unwrap();
+            let make = |name: &str| {
+                let f = paths::cache_dir().join(name);
+                std::fs::write(&f, b"{}").unwrap();
+                let mut perm = std::fs::metadata(&f).unwrap().permissions();
+                perm.set_mode(0o644);
+                std::fs::set_permissions(&f, perm).unwrap();
+                f
+            };
+            let routes = make("routes.json");
+            // page-history keeps whole page markdown (including pages
+            // fetched behind a session) and was missed by the
+            // original list.
+            let history = make("page-history.json");
             match check_state_permissions() {
                 CheckResult::Fixed(d) => {
                     assert!(d.contains("routes.json"), "{d}");
+                    assert!(d.contains("page-history.json"), "{d}");
                 }
                 other => panic!("expected Fixed, got {other:?}"),
             }
-            let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
+            for f in [routes, history] {
+                let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", f.display());
+            }
         }
     }
 }

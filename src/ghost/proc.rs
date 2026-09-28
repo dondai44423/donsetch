@@ -141,7 +141,14 @@ impl Proc {
     pub fn from_child(child: &Child) -> Result<Self, FetchError> {
         #[cfg(unix)]
         {
-            let pid = child.id().unwrap_or(0) as i32;
+            // The pid is the process-group id every signal path uses
+            // (`kill(-pid, ...)`). A zero pid must never become a
+            // Proc: `kill(0, ...)` does not fail, it signals the
+            // CALLER's whole process group, so a pid-less child would
+            // stop or kill donsetch itself.
+            let pid = child.id().ok_or_else(|| {
+                FetchError::ghost("child has no pid (already reaped); refusing to own it")
+            })? as i32;
             Ok(Self { pid })
         }
         #[cfg(windows)]
@@ -210,8 +217,12 @@ impl Proc {
     /// Suspend the whole process tree. CPU → 0, RAM goes cold.
     pub fn freeze(&self) {
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-self.pid, libc::SIGSTOP);
+        {
+            if self.pid > 0 {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGSTOP);
+                }
+            }
         }
         #[cfg(windows)]
         unsafe {
@@ -227,8 +238,12 @@ impl Proc {
     /// Resume the whole process tree.
     pub fn thaw(&self) {
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-self.pid, libc::SIGCONT);
+        {
+            if self.pid > 0 {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGCONT);
+                }
+            }
         }
         #[cfg(windows)]
         unsafe {
@@ -244,8 +259,12 @@ impl Proc {
     /// Kill the whole tree.
     pub fn kill_group(&self) {
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-self.pid, libc::SIGKILL);
+        {
+            if self.pid > 0 {
+                unsafe {
+                    libc::kill(-self.pid, libc::SIGKILL);
+                }
+            }
         }
         #[cfg(windows)]
         {
@@ -359,5 +378,43 @@ impl Drop for Proc {
         {
             let _ = self;
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    // The pid is the process-group id every signal path uses
+    // (`kill(-pid, ...)`), so a zero pid must never become a Proc:
+    // `kill(0, ...)` does not fail, it signals the CALLER's whole
+    // process group. A reaped child has no pid and is refused.
+    #[tokio::test]
+    async fn from_child_refuses_a_reaped_child() {
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        child.wait().await.unwrap();
+        assert!(child.id().is_none(), "a reaped child has no pid");
+        // `expect_err` would need Debug on Proc; match instead.
+        let err = match Proc::from_child(&child) {
+            Ok(_) => panic!("no-pid child must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("pid"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn from_child_keeps_a_live_pid_and_kill_group_reaps_the_tree() {
+        // The production shape: own process group, then the group
+        // signal; `kill(-pid)` only reaches the tree when the child
+        // leads its own group.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        Proc::prepare_cmd(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let proc = Proc::from_child(&child).expect("live child");
+        assert!(proc.pid > 0);
+        proc.kill_group();
+        let status = child.wait().await.unwrap();
+        assert!(!status.success(), "SIGKILLed child must not exit cleanly");
     }
 }

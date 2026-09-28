@@ -171,8 +171,12 @@ impl PageHistory {
         let dir = crate::paths::cache_dir();
         let _ = std::fs::create_dir_all(&dir);
         let tmp = dir.join(".page-history.json.tmp");
+        // Owner-only from the first byte, like the handle table: the
+        // store keeps page markdown (up to 64 KB per URL), including
+        // pages fetched behind a session, so a umask-default 0644
+        // staging window is a leak. doctor tightens a legacy file.
         if let Ok(bytes) = serde_json::to_vec(&p)
-            && std::fs::write(&tmp, bytes).is_ok()
+            && crate::config::write_private(&tmp, &bytes).is_ok()
         {
             let _ = std::fs::rename(&tmp, path());
         }

@@ -25,6 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as given. When the browser dies before DevTools comes up, the
   launch error now carries its last stderr lines instead of a bare
   "devtools ws timeout".
+- The page-history store (`~/.cache/donsetch/page-history.json`) is
+  owner-only now, like the rest of the session-bearing state: it keeps
+  up to 64 KB of page markdown per URL, including pages fetched behind
+  a login, but it was written with a plain `std::fs::write` and sat at
+  `0644` under a default umask while `ghost-state.json` and
+  `routes.json` were `0600`, and `doctor`'s permissions check did not
+  look at it. Writes go through the same owner-only path as the handle
+  table now, and `doctor` tightens an existing world-readable file on
+  sight (self-audit, 2026-09-28).
+- The ghost's process handle refuses a child without a pid
+  (self-audit, 2026-09-28): freeze, thaw and kill all signal
+  `kill(-pid, ...)`, and a zero pid would not fail there, it would
+  signal the caller's own process group, stopping or killing donsetch
+  itself. The window was theoretical (a just-spawned, unreaped child
+  always carries a pid), but the failure mode is the whole process
+  group, so the invariant is enforced and covered by tests.
 
 ## [4.3.6] - 2026-09-27
 
