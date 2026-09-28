@@ -381,11 +381,13 @@ fn resolve_snap_chrome(_path: &std::path::Path) -> Option<PathBuf> {
 /// are kilobytes (Arch's ELF launcher is ~14 KB, Void's shell script
 /// 205 B); real Chromium-family browsers are 100 MB and up, so
 /// anything bigger is never even read.
+#[cfg(linux_like)]
 const LAUNCHER_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Smallest file accepted as the real browser behind a launcher.
 /// Guards the resolution against latching onto a small helper that
 /// lives in the same directory (`chrome-sandbox` is an executable ELF).
+#[cfg(linux_like)]
 const REAL_BROWSER_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// If `path` is a distro launcher wrapper, resolve the real browser
