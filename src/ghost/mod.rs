@@ -293,10 +293,7 @@ fn chromium_binary() -> Result<String, String> {
     }
     for path in known_chrome_paths() {
         if is_executable(&path) {
-            if let Some(real) = resolve_snap_chrome(&path) {
-                return Ok(real.to_string_lossy().into_owned());
-            }
-            return Ok(path.to_string_lossy().into_owned());
+            return Ok(resolve_past_launchers(&path).to_string_lossy().into_owned());
         }
     }
     if let Some(path_var) = std::env::var_os("PATH") {
@@ -304,7 +301,9 @@ fn chromium_binary() -> Result<String, String> {
             for name in chrome_names() {
                 let candidate = dir.join(name);
                 if is_executable(&candidate) {
-                    return Ok(candidate.to_string_lossy().into_owned());
+                    return Ok(resolve_past_launchers(&candidate)
+                        .to_string_lossy()
+                        .into_owned());
                 }
             }
         }
@@ -376,6 +375,145 @@ fn resolve_snap_chrome(path: &std::path::Path) -> Option<PathBuf> {
 #[cfg(not(linux_like))]
 fn resolve_snap_chrome(_path: &std::path::Path) -> Option<PathBuf> {
     None
+}
+
+/// Largest file still treated as a launcher wrapper. Distro launchers
+/// are kilobytes (Arch's ELF launcher is ~14 KB, Void's shell script
+/// 205 B); real Chromium-family browsers are 100 MB and up, so
+/// anything bigger is never even read.
+const LAUNCHER_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Smallest file accepted as the real browser behind a launcher.
+/// Guards the resolution against latching onto a small helper that
+/// lives in the same directory (`chrome-sandbox` is an executable ELF).
+const REAL_BROWSER_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// If `path` is a distro launcher wrapper, resolve the real browser
+/// binary it execs. Several distros install `/usr/bin/chromium` as a
+/// launcher that PREPENDS host flags before exec'ing the browser:
+/// Arch's (a small ELF) reads `/etc/chromium-flags.conf` and
+/// `$XDG_CONFIG_HOME/chromium-flags.conf`, Void and Debian ship
+/// shell scripts. Those flags are desktop preferences a controlled
+/// ghost must never inherit: `--ozone-platform=wayland` swaps the
+/// platform Chromium would pick in headless mode (it only defaults
+/// to `--ozone-platform=headless` when the switch is unset), the
+/// GPU process then keeps failing until Chromium intentionally
+/// aborts (`GPU process isn't usable. Goodbye.`, issue #321), and
+/// `--load-extension` entries are host fingerprints.
+///
+/// A wrapper is recognized by shape: a small file carrying an
+/// embedded absolute path. Every candidate target must be an
+/// executable ELF of real-browser size whose file name looks like a
+/// Chromium binary, so a mis-parse falls back to `path` (today's
+/// behavior) rather than to something random.
+#[cfg(linux_like)]
+fn resolve_launcher_binary(path: &std::path::Path) -> Option<PathBuf> {
+    use std::io::Read;
+
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > LAUNCHER_MAX_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    std::fs::File::open(path)
+        .ok()?
+        .read_to_end(&mut bytes)
+        .ok()?;
+
+    // ASCII path-shaped tokens: bytes that can live in a path,
+    // starting at a slash. Quotes, shell metacharacters and
+    // whitespace end a token, which both splits `VAR=/path` shapes
+    // correctly and keeps trailing syntax out.
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut token = String::new();
+    for &b in bytes.iter().chain(std::iter::once(&0u8)) {
+        let printable = (0x21..=0x7e).contains(&b);
+        let delimiter = matches!(
+            b,
+            b'"' | b'\''
+                | b'`'
+                | b'$'
+                | b'('
+                | b')'
+                | b'<'
+                | b'>'
+                | b'|'
+                | b'&'
+                | b';'
+                | b'='
+                | b','
+                | b'\\'
+                | b':'
+                | b'*'
+                | b'?'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+        );
+        if printable && !delimiter {
+            token.push(b as char);
+            continue;
+        }
+        if let Some(pos) = token.find('/') {
+            let cand = &token[pos..];
+            if cand.len() <= 300
+                && !found
+                    .iter()
+                    .any(|p| p.as_os_str().to_string_lossy().as_ref() == cand)
+            {
+                found.push(PathBuf::from(cand));
+            }
+        }
+        token.clear();
+    }
+
+    // The operative exec is the LAST absolute path a launcher
+    // touches (scripts exec on their final line; earlier mentions
+    // are comments, env exports or helper paths).
+    for cand in found.iter().rev() {
+        let Ok(meta) = std::fs::metadata(cand) else {
+            continue;
+        };
+        if !meta.is_file() || !is_executable(cand) || meta.len() < REAL_BROWSER_MIN_BYTES {
+            continue;
+        }
+        let chromium_shaped = cand
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase().contains("chrom"))
+            .unwrap_or(false);
+        if !chromium_shaped {
+            continue;
+        }
+        let mut magic = [0u8; 4];
+        let is_elf = std::fs::File::open(cand)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .is_ok()
+            && &magic == b"\x7fELF";
+        if is_elf {
+            return Some(cand.clone());
+        }
+    }
+    None
+}
+
+#[cfg(not(linux_like))]
+fn resolve_launcher_binary(_path: &std::path::Path) -> Option<PathBuf> {
+    None
+}
+
+/// Discovery-level wrapper resolution: snap confinement and distro
+/// launcher wrappers both hide the real browser behind a shim that
+/// cannot carry the ghost's flags cleanly. Callers fall back to
+/// `path` itself when nothing better is found.
+fn resolve_past_launchers(path: &std::path::Path) -> PathBuf {
+    if let Some(real) = resolve_snap_chrome(path) {
+        return real;
+    }
+    if let Some(real) = resolve_launcher_binary(path) {
+        return real;
+    }
+    path.to_path_buf()
 }
 
 /// Playwright keeps every historical Chromium layout; version
@@ -892,13 +1030,24 @@ impl Ghost {
             .take()
             .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
         let mut reader = BufReader::new(stderr);
+        let mut stderr_tail: Vec<String> = Vec::new();
         let ws_url = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            scan_for_ws_url(&mut reader),
+            scan_for_ws_url(&mut reader, &mut stderr_tail),
         )
         .await
-        .map_err(|_| FetchError::ghost("devtools ws timeout"))?
-        .ok_or_else(|| FetchError::ghost("no devtools ws line"))?;
+        .map_err(|_| {
+            FetchError::ghost(format!(
+                "devtools ws timeout ({})",
+                launch_failure_detail(&stderr_tail)
+            ))
+        })?
+        .ok_or_else(|| {
+            FetchError::ghost(format!(
+                "no devtools ws line ({})",
+                launch_failure_detail(&stderr_tail)
+            ))
+        })?;
 
         let cdp = cdp::Cdp::connect(&ws_url).await?;
         // Replant the session vault: login/session cookies harvested
@@ -2040,7 +2189,12 @@ fn decode_screenshot_data(data: &str) -> Result<Vec<u8>, FetchError> {
 /// used to end the scan and fail the launch with a misleading
 /// "no devtools ws line" while Chrome was actually up. The ws line
 /// itself is pure ASCII, so lossy decoding can never corrupt it.
-async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<String> {
+/// The last few non-endpoint lines are kept in `tail` for the
+/// launch-failure message.
+async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    tail: &mut Vec<String>,
+) -> Option<String> {
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -2052,6 +2206,27 @@ async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> 
         if let Some(i) = line.find("ws://") {
             return Some(line[i..].trim().to_string());
         }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            tail.push(trimmed.chars().take(200).collect());
+            if tail.len() > 6 {
+                tail.remove(0);
+            }
+        }
+    }
+}
+
+/// The browser's final stderr lines, folded into a launch-failure
+/// message. When the browser dies before DevTools comes up, its
+/// stderr is the only explanation available, and a bare "devtools ws
+/// timeout" sends people hunting the wrong layer (issue #321:
+/// Chromium aborted with `GPU process isn't usable. Goodbye.` about
+/// eight seconds in and the fetch error said nothing about it).
+fn launch_failure_detail(tail: &[String]) -> String {
+    if tail.is_empty() {
+        "browser said nothing".into()
+    } else {
+        format!("browser said: {}", tail.join(" | "))
     }
 }
 
@@ -2072,11 +2247,34 @@ mod sandbox_tests {
         let wire: &[u8] = b"Fontconfig warning: \xff\xfe/bad/path\n\
                             DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc\n";
         let mut r = BufReader::new(wire);
+        let mut tail = Vec::new();
         assert_eq!(
-            scan_for_ws_url(&mut r).await.as_deref(),
+            scan_for_ws_url(&mut r, &mut tail).await.as_deref(),
             Some("ws://127.0.0.1:9222/devtools/browser/abc"),
             "a non-UTF-8 stderr line must not end the scan"
         );
+        assert_eq!(tail.len(), 1, "the fontconfig line is kept as tail");
+    }
+
+    // The reporter's crash shape (#321): the browser dies before
+    // DevTools with Chromium's intentional GPU abort on stderr. The
+    // launch error must carry that line instead of hiding it.
+    #[tokio::test]
+    async fn ws_scan_keeps_the_stderr_tail_for_launch_failures() {
+        let wire: &[u8] = b"\
+            [123:456:0927/144807.570012:FATAL:content/browser/gpu/gpu_data_manager_impl_private.cc:417] GPU process isn't usable. Goodbye.\n";
+        let mut r = BufReader::new(wire);
+        let mut tail = Vec::new();
+        assert_eq!(scan_for_ws_url(&mut r, &mut tail).await, None);
+        assert_eq!(tail.len(), 1);
+        assert!(
+            tail[0].contains("GPU process isn't usable. Goodbye."),
+            "{}",
+            tail[0]
+        );
+        let detail = launch_failure_detail(&tail);
+        assert!(detail.contains("browser said:"), "{detail}");
+        assert!(detail.contains("Goodbye."), "{detail}");
     }
 
     #[test]
@@ -2179,6 +2377,135 @@ mod sandbox_tests {
         // config-layer tests; here only the runtime default contract.
         assert!(!sandbox_opt_in_enabled());
         assert!(!crate::config::DonsetchConfig::default().browser.no_sandbox);
+    }
+
+    // ── Launcher resolution (issue #321) ──
+    //
+    // Distro chromium packages install a launcher at the discovered
+    // path that PREPENDS host flags before exec'ing the real browser
+    // (Arch: a tiny ELF reading chromium-flags.conf; Void/Debian:
+    // shell scripts). The ghost must launch the real binary instead.
+    // Fixtures use a sparse stand-in for the real browser so the
+    // "browser-sized ELF" acceptance check is exercised without
+    // writing 100 MB.
+
+    #[cfg(linux_like)]
+    fn fake_real_browser(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(b"\x7fELF").unwrap();
+        f.seek(SeekFrom::Start(9_000_000)).unwrap();
+        f.write_all(&[0]).unwrap();
+        drop(f);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(linux_like)]
+    fn launcher_fixture_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-launcher-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_script_resolves_to_the_real_binary() {
+        // Void's shape: export the wrapper env, prepend CHROME_FLAGS,
+        // exec the real binary on the last line.
+        let dir = launcher_fixture_dir("script");
+        let real = fake_real_browser(&dir, "chromium");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nexport CHROME_WRAPPER={p}\nexport CHROME_DESKTOP=chromium.desktop\nCHROME_FLAGS=\"--enable-gpu-rasterization $CHROME_FLAGS\"\nexec {p} $CHROME_FLAGS \"$@\"\n",
+                p = real.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(resolve_launcher_binary(&script), Some(real));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn elf_launcher_resolves_from_embedded_paths() {
+        // Arch's shape: no shebang, a small ELF whose rodata carries
+        // the real binary's absolute path.
+        let dir = launcher_fixture_dir("elf");
+        let real = fake_real_browser(&dir, "chromium");
+        let launcher = dir.join("launcher-elf");
+        let mut bytes = b"\x7fELF\x02\x01\x01\x00junk".to_vec();
+        bytes.extend_from_slice(real.display().to_string().as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(b"\x00tail");
+        std::fs::write(&launcher, &bytes).unwrap();
+        assert_eq!(resolve_launcher_binary(&launcher), Some(real));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_resolution_takes_the_last_reference_that_checks_out() {
+        let dir = launcher_fixture_dir("last");
+        let decoy = fake_real_browser(&dir, "chromium-old");
+        let real = fake_real_browser(&dir, "chromium");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n# older reference first\nexec {decoy} \"$@\"\nexec {real} \"$@\"\n",
+                decoy = decoy.display(),
+                real = real.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_launcher_binary(&script),
+            Some(real),
+            "the final exec is the operative one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_resolution_refuses_targets_it_cannot_prove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = launcher_fixture_dir("reject");
+        // A small executable ELF in the same directory (the
+        // chrome-sandbox shape): the size gate must refuse it even
+        // though the name is chromium-ish.
+        let helper = dir.join("chromium-sandbox-helper");
+        std::fs::write(&helper, b"\x7fELFsmall").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A browser-sized ELF that is not chromium-shaped.
+        let foreign = fake_real_browser(&dir, "somewhere-else");
+        // A target that does not exist at all.
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nexec {missing} \"$@\"\nexec {helper} \"$@\"\nexec {foreign} \"$@\"\n",
+                missing = dir.join("nowhere").display(),
+                helper = helper.display(),
+                foreign = foreign.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_launcher_binary(&script),
+            None,
+            "unproven targets must fall back to the wrapper"
+        );
+        // And a real-sized browser binary is never re-scanned.
+        let real = fake_real_browser(&dir, "chromium");
+        assert_eq!(resolve_launcher_binary(&real), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

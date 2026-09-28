@@ -5,6 +5,27 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The tier-2 ghost no longer launches through a distro's Chromium
+  launcher wrapper when one sits at the discovered path (#321,
+  reported on 4.3.6): Arch's `/usr/bin/chromium` reads
+  `chromium-flags.conf`, Void's script prepends `CHROME_FLAGS`, and
+  either way the host's desktop flags rode into the ghost's argv. An
+  injected `--ozone-platform=wayland` costs the ghost the headless
+  platform Chromium only picks when the switch is unset, and on the
+  reporter's build the repeated GPU-process failure ends in
+  Chromium's intentional `FATAL:GPU process isn't usable. Goodbye.`
+  about eight seconds in, so every tier-2 render died. Discovery now
+  resolves a launcher to the real browser binary it references (an
+  executable ELF of browser size with a Chromium-shaped name) and
+  launches that; an explicit `browser.chromium_path` is still taken
+  as given. When the browser dies before DevTools comes up, the
+  launch error now carries its last stderr lines instead of a bare
+  "devtools ws timeout".
+
 ## [4.3.6] - 2026-09-27
 
 ### Fixed
