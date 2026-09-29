@@ -5,6 +5,22 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The self-update lock refused an update nobody was running, and
+  did not stop two that started together. `update.lock` was a file
+  holding a pid and nothing else: it was never removed, so the next
+  `-u` depended on that pid being dead and reported "another
+  donsetch update is already running" whenever any other live
+  process had since been given it (common after a reboot or a killed
+  update), and two runs starting at once both passed the check
+  before either wrote the file. It is an OS file lock now, exclusive
+  while held and released when the holder exits however it exits;
+  the pid in the file only names the holder in the refusal.
+  (mnaza, #327)
+
 ## [4.4.0] - 2026-09-29
 
 ### Fixed
