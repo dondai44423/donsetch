@@ -1977,10 +1977,7 @@ mod resume_store_mode_tests {
     #[test]
     fn a_resume_token_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "donsetch-token-mode-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("donsetch-token-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let state = ResumeState {

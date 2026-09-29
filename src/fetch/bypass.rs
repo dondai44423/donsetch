@@ -575,8 +575,11 @@ fn cache_put(cache_dir: &Path, url: &str, outcome: &BypassOutcome, max_entries: 
     };
     let path = dir.join(format!("{key}.json"));
     let tmp = dir.join(format!("{key}.tmp"));
-    if crate::config::write_private(&tmp, serde_json::to_string(&entry).unwrap_or_default().as_bytes())
-        .is_ok()
+    if crate::config::write_private(
+        &tmp,
+        serde_json::to_string(&entry).unwrap_or_default().as_bytes(),
+    )
+    .is_ok()
     {
         let _ = std::fs::rename(&tmp, &path);
     }

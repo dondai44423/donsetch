@@ -12,7 +12,10 @@ pub fn run() {
         // in `~/.cache`, `+`/`(`/`[` in a user name) silently loosens
         // the match -- orphans survive -- or over-matches into other
         // processes' command lines.
-        let pattern = format!("user-data-dir={}", escape_ere(&profile.display().to_string()));
+        let pattern = format!(
+            "user-data-dir={}",
+            escape_ere(&profile.display().to_string())
+        );
         // Kills every Chrome process using the ghost profile,
         // including renderers and GPU processes that share the
         // --user-data-dir argument.
@@ -129,7 +132,8 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("donsetch-stop-test-{}-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-stop-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
@@ -184,14 +188,10 @@ mod tests {
     fn pkill_pattern_escapes_regex_metacharacters() {
         let got = escape_ere("/home/u/.cache/donsetch/ghost-profile");
         assert_eq!(
-            got,
-            "/home/u/\\.cache/donsetch/ghost-profile",
+            got, "/home/u/\\.cache/donsetch/ghost-profile",
             "dots must be literal"
         );
         let got = escape_ere("a+b(c)[d]{e}|f^g$h*i?j\\k");
-        assert_eq!(
-            got,
-            "a\\+b\\(c\\)\\[d\\]\\{e\\}\\|f\\^g\\$h\\*i\\?j\\\\k"
-        );
+        assert_eq!(got, "a\\+b\\(c\\)\\[d\\]\\{e\\}\\|f\\^g\\$h\\*i\\?j\\\\k");
     }
 }

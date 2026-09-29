@@ -948,7 +948,12 @@ fn check_state_permissions() -> CheckResult {
         // and unlocker-cached page bodies. Files written before they
         // were sealed stay on disk, so they are tightened where they
         // lie.
-        for sub in ["screenshots", "ghost-debug", "crawl-resumes", "bypass-cache"] {
+        for sub in [
+            "screenshots",
+            "ghost-debug",
+            "crawl-resumes",
+            "bypass-cache",
+        ] {
             let (seen, tightened, stuck) = tighten_tree(&dir.join(sub));
             if seen > 0 {
                 present += 1;

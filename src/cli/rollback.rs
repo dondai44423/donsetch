@@ -313,7 +313,6 @@ mod tests {
         std::fs::read_to_string(p).unwrap_or_default()
     }
 
-
     // restore_sibling_libs must cover every name the updater stages.
     // 4.3.7's Windows rollback restored pdfium.dll only, so a
     // rolled-back binary kept a newer onnxruntime.dll. This is the

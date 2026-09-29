@@ -678,7 +678,10 @@ mod tests {
         replace_binary(&exe, &temp_dir).expect("replace");
 
         assert_eq!(read(&exe), "new-bin");
-        assert_eq!(read(&exe_dir.join(format!("{}.bak", bin_name()))), "old-bin");
+        assert_eq!(
+            read(&exe_dir.join(format!("{}.bak", bin_name()))),
+            "old-bin"
+        );
         for name in SIBLING_LIBS {
             assert_eq!(
                 read(&exe_dir.join(name)),
