@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+
 - The self-update lock refused an update nobody was running, and
   did not stop two that started together. `update.lock` was a file
   holding a pid and nothing else: it was never removed, so the next
@@ -37,23 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restoring a library and keeping its roll-forward copy no longer
   loses that copy: the next rollback finds it in the stash, so
   rolling forward moves the library with the binary. (mnaza, #325)
-
-- Three update and rollback edges that could pair a binary with the
-  wrong runtime library or the wrong label. An update that ships no
-  runtime library now drops the library backup an earlier update
-  left, which was older than the binary backup and would have been
-  swapped in beside the restored binary. A failed backup copy no
-  longer leaves `donsetch.bak.ver` naming this version for a backup
-  that is an older binary or a partial file; both are removed, and
-  rollback reports that there is none. A rollback interrupted between
-  restoring a library and keeping its roll-forward copy no longer
-  loses that copy: the next rollback finds it in the stash, so
-  rolling forward moves the library with the binary. (mnaza, #325)
-
-## [Unreleased]
-
-### Fixed
-
+- The egress health store (`egress-health.json`) names every host
+  a fetch was blocked on and the proxy it left through, and was still
+  written readable by others; it is sealed like the pace and governor
+  stores. `doctor` now also tightens the sealed stores it did not
+  list: `crawl-governor.json`, `search-trust.json`,
+  `search-quality.json`, `outcome-feedback.json` and the rows under
+  `host-pace/`, which otherwise kept their old mode until their next
+  save (a pace row for a host not fetched again, until its 7-day
+  prune). (mnaza, #324)
 - The docs-outline walk test no longer fails on a loaded or slow
   box: it bounded the whole extraction of a deeply nested page at 20
   seconds of wall clock, and most of that time is the HTML parser,
@@ -66,15 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The egress health store (`egress-health.json`) names every host
-  a fetch was blocked on and the proxy it left through, and was still
-  written readable by others; it is sealed like the pace and governor
-  stores. `doctor` now also tightens the sealed stores it did not
-  list: `crawl-governor.json`, `search-trust.json`,
-  `search-quality.json`, `outcome-feedback.json` and the rows under
-  `host-pace/`, which otherwise kept their old mode until their next
-  save (a pace row for a host not fetched again, until its 7-day
-  prune). (mnaza, #324)
 - The ghost still launched Debian's `/usr/bin/chromium` wrapper, so
   the flags that wrapper sources from `/etc/chromium.d/` kept riding
   into its argv (the #321 class): Debian's script never writes the
