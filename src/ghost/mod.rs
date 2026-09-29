@@ -404,10 +404,11 @@ const REAL_BROWSER_MIN_BYTES: u64 = 8 * 1024 * 1024;
 /// `--load-extension` entries are host fingerprints.
 ///
 /// A wrapper is recognized by shape: a small file carrying an
-/// embedded absolute path. Every candidate target must be an
-/// executable ELF of real-browser size whose file name looks like a
-/// Chromium binary, so a mis-parse falls back to `path` (today's
-/// behavior) rather than to something random.
+/// absolute path, written out or, in a script, built from the
+/// script's own plain variable assignments. Every candidate target
+/// must be an executable ELF of real-browser size whose file name
+/// looks like a Chromium binary, so a mis-parse falls back to `path`
+/// (today's behavior) rather than to something random.
 #[cfg(linux_like)]
 fn resolve_launcher_binary(path: &std::path::Path) -> Option<PathBuf> {
     use std::io::Read;
@@ -426,54 +427,36 @@ fn resolve_launcher_binary(path: &std::path::Path) -> Option<PathBuf> {
     // starting at a slash. Quotes, shell metacharacters and
     // whitespace end a token, which both splits `VAR=/path` shapes
     // correctly and keeps trailing syntax out.
-    let mut found: Vec<PathBuf> = Vec::new();
+    // (offset, path): where in the file the reference ends, so
+    // written-out and variable-built references keep one order.
+    let mut found: Vec<(usize, PathBuf)> = Vec::new();
     let mut token = String::new();
-    for &b in bytes.iter().chain(std::iter::once(&0u8)) {
-        let printable = (0x21..=0x7e).contains(&b);
-        let delimiter = matches!(
-            b,
-            b'"' | b'\''
-                | b'`'
-                | b'$'
-                | b'('
-                | b')'
-                | b'<'
-                | b'>'
-                | b'|'
-                | b'&'
-                | b';'
-                | b'='
-                | b','
-                | b'\\'
-                | b':'
-                | b'*'
-                | b'?'
-                | b'['
-                | b']'
-                | b'{'
-                | b'}'
-        );
-        if printable && !delimiter {
+    for (at, &b) in bytes.iter().chain(std::iter::once(&0u8)).enumerate() {
+        if is_path_byte(b) {
             token.push(b as char);
             continue;
         }
         if let Some(pos) = token.find('/') {
             let cand = &token[pos..];
-            if cand.len() <= 300
-                && !found
-                    .iter()
-                    .any(|p| p.as_os_str().to_string_lossy().as_ref() == cand)
-            {
-                found.push(PathBuf::from(cand));
+            if cand.len() <= 300 && !found.iter().any(|(_, p)| p.as_os_str() == cand) {
+                found.push((at, PathBuf::from(cand)));
             }
         }
         token.clear();
     }
+    // Debian's script never writes the browser's path: it sets
+    // `LIBDIR=/usr/lib/$APPNAME` and execs `$LIBDIR/$APPNAME`.
+    for (at, cand) in variable_built_paths(&bytes) {
+        if !found.iter().any(|(_, p)| p == &cand) {
+            found.push((at, cand));
+        }
+    }
+    found.sort_by_key(|(at, _)| *at);
 
     // The operative exec is the LAST absolute path a launcher
     // touches (scripts exec on their final line; earlier mentions
     // are comments, env exports or helper paths).
-    for cand in found.iter().rev() {
+    for (_, cand) in found.iter().rev() {
         let Ok(meta) = std::fs::metadata(cand) else {
             continue;
         };
@@ -502,6 +485,168 @@ fn resolve_launcher_binary(path: &std::path::Path) -> Option<PathBuf> {
 #[cfg(not(linux_like))]
 fn resolve_launcher_binary(_path: &std::path::Path) -> Option<PathBuf> {
     None
+}
+
+/// True for a byte that can be part of a path token in a launcher:
+/// printable ASCII that is not shell or string punctuation.
+#[cfg(linux_like)]
+fn is_path_byte(b: u8) -> bool {
+    let printable = (0x21..=0x7e).contains(&b);
+    let delimiter = matches!(
+        b,
+        b'"' | b'\''
+            | b'`'
+            | b'$'
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'|'
+            | b'&'
+            | b';'
+            | b'='
+            | b','
+            | b'\\'
+            | b':'
+            | b'*'
+            | b'?'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+    );
+    printable && !delimiter
+}
+
+/// Absolute paths a launcher script builds from its own variables,
+/// each with the byte offset of the end of the line that uses it.
+/// Only plain assignments count, applied top-down; a value that is
+/// computed (`$(...)`, backticks, `${X:-...}`) or that refers to an
+/// unknown name leaves its variable unknown, and a token that touches
+/// an unknown variable yields no path. Empty for anything that is
+/// not a `#!` script.
+#[cfg(linux_like)]
+fn variable_built_paths(bytes: &[u8]) -> Vec<(usize, PathBuf)> {
+    // Marks an unknown variable inside an expanded line: it stays in
+    // its token so the token can be dropped whole.
+    const UNKNOWN: char = '\u{1}';
+
+    fn is_name(s: &str) -> bool {
+        let mut chars = s.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    // `None` when the text cannot be expanded at all (a `${...}` form
+    // that is not a bare name, or an unreasonable length).
+    fn expand(text: &str, vars: &std::collections::HashMap<String, String>) -> Option<String> {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find('$') {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + 1..];
+            let (name, used) = if let Some(braced) = after.strip_prefix('{') {
+                let close = braced.find('}')?;
+                if !is_name(&braced[..close]) {
+                    return None;
+                }
+                (&braced[..close], close + 2)
+            } else {
+                let len = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                (&after[..len], len)
+            };
+            if is_name(name) {
+                match vars.get(name) {
+                    Some(v) => out.push_str(v),
+                    None => out.push(UNKNOWN),
+                }
+                rest = &after[used..];
+            } else {
+                // `$@`, `$1`, `$(`, `$$`: not a variable of the script.
+                out.push(' ');
+                rest = after;
+            }
+            if out.len() > 4096 {
+                return None;
+            }
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    if !text.starts_with("#!") {
+        return Vec::new();
+    }
+    let mut vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    let mut end = 0usize;
+    for line in text.split_inclusive('\n') {
+        end += line.len();
+        let stmt = line.trim();
+        if stmt.is_empty() || stmt.starts_with('#') || !stmt.contains(['$', '=']) {
+            continue;
+        }
+        if stmt.contains('$')
+            && let Some(expanded) = expand(stmt, &vars)
+        {
+            let mut token = String::new();
+            for c in expanded.chars().chain(std::iter::once(' ')) {
+                if c == UNKNOWN || (c.is_ascii() && is_path_byte(c as u8)) {
+                    token.push(c);
+                    continue;
+                }
+                if token.starts_with('/') && token.len() <= 300 && !token.contains(UNKNOWN) {
+                    out.push((end, PathBuf::from(&token)));
+                }
+                token.clear();
+            }
+        }
+        let decl = stmt
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(stmt);
+        let Some((name, raw)) = decl.split_once('=') else {
+            continue;
+        };
+        if !is_name(name) {
+            continue;
+        }
+        let value = match raw.chars().next() {
+            Some(quote @ ('"' | '\'')) => raw[1..]
+                .find(quote)
+                .map(|close| (&raw[1..1 + close], quote == '\'')),
+            _ => Some((
+                raw.split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(';'),
+                false,
+            )),
+        };
+        let known = match value {
+            Some((v, true)) => Some(v.to_string()),
+            Some((v, false)) if !v.contains("$(") && !v.contains('`') => {
+                expand(v, &vars).filter(|e| !e.contains(UNKNOWN))
+            }
+            _ => None,
+        };
+        match known {
+            Some(v) if v.len() <= 1024 => {
+                vars.insert(name.to_string(), v);
+            }
+            _ => {
+                vars.remove(name);
+            }
+        }
+    }
+    out
 }
 
 /// Discovery-level wrapper resolution: snap confinement and distro
@@ -2470,6 +2615,59 @@ mod sandbox_tests {
             resolve_launcher_binary(&script),
             Some(real),
             "the final exec is the operative one"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Debian's /usr/bin/chromium (154.0.8037.57-1) never writes the
+    // browser's path: it builds it from two variables
+    // (`APPNAME=chromium`, `LIBDIR=/usr/lib/$APPNAME`,
+    // `exec $LIBDIR/$APPNAME $CHROMIUM_FLAGS "$@"`), and sources
+    // /etc/chromium.d/* for host flags on the way. Same shape here,
+    // with the fixture dir in place of /usr/lib.
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_script_resolves_a_path_built_from_variables() {
+        let dir = launcher_fixture_dir("vars");
+        let libdir = dir.join("chromium");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let real = fake_real_browser(&libdir, "chromium");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\nAPPNAME=chromium\nLIBDIR={base}/$APPNAME\nCHROMIUM_FLAGS=\"\"\nfor file in /etc/chromium.d/*; do . $file; done\nexport CHROMIUM_FLAGS=\"$CHROMIUM_FLAGS --disable-extensions-except=$(echo $CHROMIUM_FLAGS | cut -d= -f2)\"\nexport CHROME_WRAPPER=\"/usr/bin/$APPNAME\"\nif [ $want_temp_profile -eq 0 ] ; then\n    exec $LIBDIR/$APPNAME $CHROMIUM_FLAGS \"$@\"\nelse\n    ${{LIBDIR}}/${{APPNAME}} $CHROMIUM_FLAGS \"$@\"\nfi\n",
+                base = dir.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(resolve_launcher_binary(&script), Some(real));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Expansion adds candidates, never trust: a variable-built path
+    // goes through the same proof as a literal one, an undefined or
+    // computed variable resolves nothing, and a self-referencing
+    // assignment cannot loop.
+    #[cfg(linux_like)]
+    #[test]
+    fn launcher_variable_expansion_proves_its_targets_like_literals() {
+        let dir = launcher_fixture_dir("vars-reject");
+        let foreign = fake_real_browser(&dir, "somewhere-else");
+        let script = dir.join("wrap-chromium");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nNAME=somewhere-else\nDIR={base}\nLOOP=$LOOP/x\nHERE=$(dirname \"$0\")\nexec $DIR/$NAME \"$@\"\nexec $HERE/chromium \"$@\"\nexec $UNSET/chromium \"$@\"\nexec $LOOP/chromium \"$@\"\n",
+                base = dir.display()
+            ),
+        )
+        .unwrap();
+        assert!(foreign.is_file());
+        assert_eq!(
+            resolve_launcher_binary(&script),
+            None,
+            "a name that is not chromium-shaped stays unproven, expanded or not"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
