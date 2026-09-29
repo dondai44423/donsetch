@@ -850,8 +850,57 @@ async fn check_browser_launch() -> CheckResult {
     }
 }
 
+/// Sets every regular file under `root` that others can read to
+/// 0600 and returns (files seen, files tightened, files it could not
+/// change). Symlinks are neither followed nor changed, and the walk
+/// stops after 10 000 entries.
+#[cfg(unix)]
+fn tighten_tree(root: &std::path::Path) -> (u32, u32, u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut seen, mut tightened, mut stuck) = (0u32, 0u32, 0u32);
+    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        return (seen, tightened, stuck);
+    }
+    let mut visited = 0u32;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > 10_000 {
+                return (seen, tightened, stuck);
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            seen += 1;
+            if meta.permissions().mode() & 0o077 == 0 {
+                continue;
+            }
+            if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).is_ok() {
+                tightened += 1;
+            } else {
+                stuck += 1;
+            }
+        }
+    }
+    (seen, tightened, stuck)
+}
+
 /// Session-bearing state must not be world-readable. Covers the
-/// cookie vault (ghost-state.json) and the TLS-session routes file.
+/// cookie vault (ghost-state.json), the TLS-session routes file, the
+/// key and page-history stores, and the page artifacts under
+/// `screenshots/` and `ghost-debug/`.
 fn check_state_permissions() -> CheckResult {
     #[cfg(unix)]
     {
@@ -889,6 +938,21 @@ fn check_state_permissions() -> CheckResult {
                 fixed.push(format!("{name} {mode:o}→600"));
             } else {
                 failed.push(format!("{name} is {mode:o}"));
+            }
+        }
+        // Page artifacts: what the ghost rendered, a logged-in page
+        // included. Files written before they were sealed stay on
+        // disk, so they are tightened where they lie.
+        for sub in ["screenshots", "ghost-debug"] {
+            let (seen, tightened, stuck) = tighten_tree(&dir.join(sub));
+            if seen > 0 {
+                present += 1;
+            }
+            if tightened > 0 {
+                fixed.push(format!("{sub}/ {tightened} file(s) →600"));
+            }
+            if stuck > 0 {
+                failed.push(format!("{sub}/* has {stuck} file(s) others can read"));
             }
         }
         if !failed.is_empty() {
@@ -2328,6 +2392,50 @@ mod doctor_ultra_tests {
                 let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o600, "{}", f.display());
             }
+        }
+    }
+
+    // Screenshots and debug DOM dumps written before they were sealed
+    // stay on disk; doctor tightens them where they lie, subfolders
+    // included, and never follows a link out of the tree.
+    #[test]
+    fn state_permissions_tightens_page_artifacts() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let make = |rel: &str| {
+                let f = paths::cache_dir().join(rel);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, b"x").unwrap();
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+                f
+            };
+            let shot = make("screenshots/a.png");
+            let nested = make("screenshots/sub/b.png");
+            let dom = make("ghost-debug/dom-app_example_com.html");
+            let outside = make("elsewhere/kept.txt");
+            std::os::unix::fs::symlink(&outside, paths::cache_dir().join("screenshots/link.png"))
+                .unwrap();
+            match check_state_permissions() {
+                CheckResult::Fixed(d) => {
+                    assert!(d.contains("screenshots/"), "{d}");
+                    assert!(d.contains("ghost-debug/"), "{d}");
+                }
+                other => panic!("expected Fixed, got {other:?}"),
+            }
+            let mode =
+                |f: &std::path::Path| std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+            for f in [&shot, &nested, &dom] {
+                assert_eq!(mode(f), 0o600, "{}", f.display());
+            }
+            assert_eq!(
+                mode(&outside),
+                0o644,
+                "a link's target is not ours to change"
+            );
+            // A second run has nothing left to fix.
+            assert!(matches!(check_state_permissions(), CheckResult::Pass(_)));
         }
     }
 }

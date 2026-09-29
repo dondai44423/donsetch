@@ -1954,14 +1954,11 @@ pub(super) async fn ghost_escalate(
         t1.elapsed().as_millis(),
     );
     if crate::config::cfg().debug.ghost {
-        let safe: String = host
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect();
-        let dir = crate::paths::cache_dir().join("ghost-debug");
-        let _ = std::fs::create_dir_all(&dir);
-        let p = dir.join(format!("dom-{safe}.html"));
-        let _ = std::fs::write(&p, &page.html);
+        let p = dump_ghost_dom(
+            &crate::paths::cache_dir().join("ghost-debug"),
+            host,
+            &page.html,
+        );
         eprintln!(
             "[ghost_escalate] dom={}B dumped to {}",
             page.html.len(),
@@ -3760,6 +3757,38 @@ pub(super) async fn bind_search_urls(daemon: &Arc<Daemon>, urls: &[String]) -> V
     let hs = ht.set_search_results(urls);
     // Search handles are in-memory only : no flush.
     hs
+}
+
+/// Writes a rendered page's DOM to `dir/dom-<host>.html` for the
+/// `debug.ghost` dump, readable by its owner only, and returns that
+/// path. Best effort: a failed write is not an error for the fetch.
+fn dump_ghost_dom(dir: &std::path::Path, host: &str, html: &str) -> std::path::PathBuf {
+    let safe: String = host
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let _ = std::fs::create_dir_all(dir);
+    let p = dir.join(format!("dom-{safe}.html"));
+    let _ = crate::config::write_private(&p, html.as_bytes());
+    p
+}
+
+#[cfg(test)]
+mod ghost_dom_dump_tests {
+    // The dump is the DOM the ghost rendered with the session vault
+    // replanted: a logged-in page's markup.
+    #[cfg(unix)]
+    #[test]
+    fn the_ghost_debug_dom_dump_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-dom-mode-{}", std::process::id()));
+        let p = super::dump_ghost_dom(&dir, "app.example.com", "<html>inbox</html>");
+        assert_eq!(p, dir.join("dom-app_example_com.html"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "<html>inbox</html>");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(mode, 0o600);
+    }
 }
 
 #[cfg(test)]

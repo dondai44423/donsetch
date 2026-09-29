@@ -1647,7 +1647,7 @@ impl Ghost {
             .ok_or_else(|| FetchError::ghost("no screenshot data"))?
             .to_string();
         let bytes = decode_screenshot_data(&data)?;
-        std::fs::write(&dest, bytes).map_err(|e| FetchError::ghost(format!("screenshot: {e}")))
+        save_screenshot(&dest, &bytes)
     }
 
     /// PNG capture as in-memory bytes (web_screenshot tool, issue
@@ -2173,6 +2173,15 @@ fn sweep_crashpad() {
 #[cfg(not(linux_like))]
 fn sweep_crashpad() {}
 
+/// Writes a captured image to `dest`, readable by its owner only.
+fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {
+    // The ghost renders with the session vault replanted, so the
+    // image can show a logged-in page: same seal as the stores that
+    // hold the session itself.
+    crate::config::write_private(dest, bytes)
+        .map_err(|e| FetchError::ghost(format!("screenshot: {e}")))
+}
+
 /// Decodes the `data` field of a CDP `Page.captureScreenshot` reply
 /// (standard alphabet, padded) into the image bytes. Malformed input
 /// is an error, never a partial image.
@@ -2535,6 +2544,21 @@ mod screenshot_data_tests {
                 "{encoded}"
             );
         }
+    }
+
+    // The ghost renders with the session vault replanted, so an image
+    // of what it rendered can show a logged-in page.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_screenshot_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-shot-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("page.png");
+        save_screenshot(&dest, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
