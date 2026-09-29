@@ -454,30 +454,62 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
 
     #[cfg(windows)]
     {
+        // Stage the sibling DLLs the tarball ships beside the exe
+        // BEFORE anything is renamed, so the one realistic failure
+        // here -- disk full on a ~20MB copy -- leaves the install
+        // untouched. The old rename-then-copy loop ignored every
+        // error (`let _ =`): a failed copy left ZERO pdfium.dll next
+        // to a freshly swapped exe while `-u` printed "updated in
+        // place".
+        let mut staged_libs: Vec<&str> = Vec::new();
+        for name in SIBLING_LIBS {
+            if !temp_dir.join(name).exists() {
+                continue;
+            }
+            if let Err(e) = stage_sibling_dll(exe_dir, temp_dir, name) {
+                for staged in &staged_libs {
+                    let _ = std::fs::remove_file(sibling_tmp(exe_dir, staged));
+                }
+                return Err(e);
+            }
+            staged_libs.push(name);
+        }
+
         // Rename running .exe to .bak (Windows allows renaming a running exe).
         let bak = exe.with_extension("exe.bak");
         let _ = std::fs::remove_file(&bak); // Remove old .bak from previous update.
 
-        std::fs::rename(&exe, &bak).map_err(|e| format!("rename old: {e}"))?;
+        std::fs::rename(&exe, &bak).map_err(|e| {
+            for staged in &staged_libs {
+                let _ = std::fs::remove_file(sibling_tmp(exe_dir, staged));
+            }
+            format!("rename old: {e}")
+        })?;
 
         std::fs::copy(&new_binary, &exe).map_err(|e| {
             // Restore from backup on failure.
             let _ = std::fs::rename(&bak, &exe);
+            for staged in &staged_libs {
+                let _ = std::fs::remove_file(sibling_tmp(exe_dir, staged));
+            }
             format!("copy new: {e}")
         })?;
 
         // Write version metadata for rollback.
         let _ = std::fs::write(exe_dir.join("donsetch.bak.ver"), env!("CARGO_PKG_VERSION"));
 
-        // Runtime DLLs the tarball ships beside the exe (SIBLING_LIBS).
-        for name in SIBLING_LIBS {
-            let new_dll = temp_dir.join(name);
-            if new_dll.exists() {
-                let dll_path = exe_dir.join(name);
-                let dll_bak = exe_dir.join(format!("{name}.bak"));
-                let _ = std::fs::remove_file(&dll_bak);
-                let _ = std::fs::rename(&dll_path, &dll_bak);
-                let _ = std::fs::copy(&new_dll, &dll_path);
+        // Land the staged DLLs. A loaded DLL on Windows may be
+        // renamed but not written or deleted, so the live one moves
+        // aside to `<name>.bak` and the staged file takes its place.
+        // The binary is already updated, so a failure here is a
+        // warning naming the file -- same contract as the Unix
+        // sibling swap above -- never a silent `Ok`.
+        for name in staged_libs {
+            if let Err(e) = land_sibling_dll(exe_dir, name) {
+                println!(
+                    "  {} Warning: could not replace {name} ({e})",
+                    cli::icon_warn()
+                );
             }
         }
     }
@@ -501,9 +533,49 @@ pub(crate) const SIBLING_LIBS: &[&str] = &["libonnxruntime.dylib"];
 #[cfg(windows)]
 pub(crate) const SIBLING_LIBS: &[&str] = &["pdfium.dll", "onnxruntime.dll"];
 
-#[cfg(unix)]
 fn sibling_tmp(exe_dir: &Path, name: &str) -> std::path::PathBuf {
     exe_dir.join(format!(".{name}.update.tmp"))
+}
+
+/// Stage one sibling runtime from the extract dir beside the exe as
+/// `.{name}.update.tmp`. Nothing live is touched: a failure here
+/// (disk full, unreadable source) leaves the install exactly as it
+/// was. Compiled for the Windows swap and for its unit tests.
+#[cfg(any(windows, test))]
+fn stage_sibling_dll(exe_dir: &Path, temp_dir: &Path, name: &str) -> Result<(), String> {
+    let new_dll = temp_dir.join(name);
+    let dll_tmp = sibling_tmp(exe_dir, name);
+    if let Err(e) = std::fs::copy(&new_dll, &dll_tmp) {
+        let _ = std::fs::remove_file(&dll_tmp);
+        return Err(format!("{name}: copy: {e}"));
+    }
+    Ok(())
+}
+
+/// Land a staged sibling runtime: the live file moves aside to
+/// `<name>.bak` (a loaded DLL on Windows can be renamed but not
+/// written or deleted, so backup-by-rename is the only sequence that
+/// works there) and the staged file takes its place. On failure the
+/// previous file is put back, so the exe dir never ends up with zero
+/// copies of a runtime the binary needs.
+#[cfg(any(windows, test))]
+fn land_sibling_dll(exe_dir: &Path, name: &str) -> Result<(), String> {
+    let dll = exe_dir.join(name);
+    let dll_bak = exe_dir.join(format!("{name}.bak"));
+    let dll_tmp = sibling_tmp(exe_dir, name);
+    let _ = std::fs::remove_file(&dll_bak);
+    let had_live = dll.exists();
+    if had_live {
+        std::fs::rename(&dll, &dll_bak).map_err(|e| format!("{name}: move current aside: {e}"))?;
+    }
+    if let Err(e) = std::fs::rename(&dll_tmp, &dll) {
+        let _ = std::fs::remove_file(&dll_tmp);
+        if had_live {
+            let _ = std::fs::rename(&dll_bak, &dll);
+        }
+        return Err(format!("{name}: install new: {e}"));
+    }
+    Ok(())
 }
 
 /// Rollback's counterpart to the sibling-lib refresh in
@@ -550,11 +622,10 @@ fn cleanup_previous(exe: &Path) {
     let temp_dir = paths::cache_dir().join("update-tmp");
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    // Unix temp files (half-written binary / lib from an interrupted
-    // update).
+    // Staging temps from an interrupted update (half-written binary
+    // / lib / DLL).
     let tmp = exe_dir.join(".donsetch.update.tmp");
     let _ = std::fs::remove_file(&tmp);
-    #[cfg(unix)]
     for name in SIBLING_LIBS {
         let _ = std::fs::remove_file(sibling_tmp(exe_dir, name));
     }
@@ -798,6 +869,81 @@ mod tests {
                 "{name} after rollback"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The Windows DLL swap used to rename the live dll aside and then
+    // `let _ =` the copy of the new one: a failed copy (disk full, AV
+    // lock) left ZERO dlls beside the freshly swapped exe while `-u`
+    // still printed "updated in place". Staging must be all-or-
+    // nothing BEFORE anything live is touched.
+    #[test]
+    fn sibling_dll_staging_failure_leaves_the_install_untouched() {
+        let root = scratch("dll-stagefail");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let name = "pdfium.dll";
+        std::fs::write(exe_dir.join(name), "old-dll").unwrap();
+        std::fs::write(exe_dir.join(format!("{name}.bak")), "older-dll").unwrap();
+        // A directory where the source file should be: copy fails.
+        std::fs::create_dir_all(temp_dir.join(name)).unwrap();
+
+        stage_sibling_dll(&exe_dir, &temp_dir, name).expect_err("staging must fail");
+        assert_eq!(read(&exe_dir.join(name)), "old-dll", "live dll was touched");
+        assert_eq!(
+            read(&exe_dir.join(format!("{name}.bak"))),
+            "older-dll",
+            "backup was touched"
+        );
+        assert!(
+            !sibling_tmp(&exe_dir, name).exists(),
+            "half-written staging tmp left behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Landing must keep a live dll at every instant and put the old
+    // one back if the staged file cannot take its place: the exe dir
+    // must never end up with zero copies of a runtime the binary
+    // needs.
+    #[test]
+    fn sibling_dll_land_restores_the_previous_dll_when_the_install_fails() {
+        let root = scratch("dll-landfail");
+        let exe_dir = root.join("bin");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let name = "onnxruntime.dll";
+        std::fs::write(exe_dir.join(name), "old-dll").unwrap();
+        // No staged file (an interrupted update): the install rename
+        // fails and the old dll must come back, not sit in .bak with
+        // nothing at `name`.
+        land_sibling_dll(&exe_dir, name).expect_err("install must fail");
+        assert_eq!(
+            read(&exe_dir.join(name)),
+            "old-dll",
+            "old dll was not restored"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sibling_dll_stage_land_swaps_and_keeps_the_backup() {
+        let root = scratch("dll-swap");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let name = "pdfium.dll";
+        std::fs::write(exe_dir.join(name), "old-dll").unwrap();
+        std::fs::write(temp_dir.join(name), "new-dll").unwrap();
+
+        stage_sibling_dll(&exe_dir, &temp_dir, name).expect("stage");
+        land_sibling_dll(&exe_dir, name).expect("land");
+
+        assert_eq!(read(&exe_dir.join(name)), "new-dll");
+        assert_eq!(read(&exe_dir.join(format!("{name}.bak"))), "old-dll");
+        assert!(!sibling_tmp(&exe_dir, name).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -47,6 +47,7 @@ pub fn run() {
 
 /// Escape POSIX extended-regular-expression metacharacters so a
 /// filesystem path is matched literally by `pkill -f`.
+#[cfg(any(unix, test))]
 fn escape_ere(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {

@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interpolated the profile path unescaped, so a `.` or `+` in it
   loosened the match and orphans survived (or over-matched); the
   path is ERE-escaped now. (self-audit, 2026-09-29)
+- Windows self-update could silently lose a runtime DLL. The swap
+  renamed the live `pdfium.dll`/`onnxruntime.dll` aside and then
+  `let _ =` the copy of the new one, so a failed copy (disk full, AV
+  lock) left zero DLLs beside a freshly swapped exe while `-u`
+  printed "updated in place". Sibling DLLs are staged all-or-nothing
+  before anything live is touched now, and landing restores the
+  previous file if the install rename fails. A Windows rollback that
+  crashed between renaming the exe aside and copying the backup used
+  to delete `.donsetch.rollback.tmp` on the next attempt, destroying
+  the last copy of the binary; it recovers that temp when the exe is
+  gone. (self-audit, 2026-09-29)
 
 ## [4.3.7] - 2026-09-28
 

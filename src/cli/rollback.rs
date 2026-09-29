@@ -139,8 +139,11 @@ pub fn run() {
         // copy .bak to .exe, then rename .rollback.tmp to .bak.
         let tmp = exe_dir.join(".donsetch.rollback.tmp");
 
-        // Remove stale temp from interrupted rollback.
-        let _ = std::fs::remove_file(&tmp);
+        // Recover (or drop) the stale temp from an interrupted
+        // rollback. Between the two steps below the binary lives ONLY
+        // at `.donsetch.rollback.tmp`; a crash there must not have the
+        // next rollback delete that last copy.
+        recover_stale_rollback_tmp(&exe, &tmp);
 
         // Rename current running exe to temp.
         if let Err(e) = std::fs::rename(&exe, &tmp).map_err(|e| e.to_string()) {
@@ -209,6 +212,23 @@ fn restore_sibling_libs(exe_dir: &std::path::Path) {
                 cli::icon_warn()
             );
         }
+    }
+}
+
+/// Recover a stale `.donsetch.rollback.tmp` from an interrupted
+/// rollback. On Windows the swap renames the running exe aside to
+/// `tmp` and only then copies the backup into place: a crash in
+/// between leaves the ONLY copy of the current binary at `tmp` and
+/// nothing at the exe path. The next rollback used to `remove_file`
+/// that temp outright -- destroying the last copy before discovering
+/// there was no exe to rename. Put it back instead; a temp next to a
+/// healthy exe is just debris and is dropped.
+#[cfg(any(windows, test))]
+fn recover_stale_rollback_tmp(exe: &Path, tmp: &Path) {
+    if !exe.exists() && tmp.exists() {
+        let _ = std::fs::rename(tmp, exe);
+    } else {
+        let _ = std::fs::remove_file(tmp);
     }
 }
 
@@ -320,6 +340,40 @@ mod tests {
                 "{name} roll-forward missing"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // An interrupted rollback leaves the ONLY copy of the current
+    // binary at `.donsetch.rollback.tmp` (the window between renaming
+    // the exe aside and copying the backup into place). The next
+    // rollback used to delete that temp outright, destroying the last
+    // copy. Red proof: the old `remove_file` leaves the exe missing.
+    #[test]
+    fn a_stale_rollback_tmp_is_restored_when_the_exe_is_gone() {
+        let dir = scratch("recover-gone");
+        let exe = dir.join("donsetch.exe");
+        let tmp = dir.join(".donsetch.rollback.tmp");
+        std::fs::write(&tmp, "current-bin").unwrap();
+
+        recover_stale_rollback_tmp(&exe, &tmp);
+
+        assert_eq!(read(&exe), "current-bin", "last copy of the binary lost");
+        assert!(!tmp.exists(), "temp left behind after recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_rollback_tmp_is_dropped_when_the_exe_is_present() {
+        let dir = scratch("recover-present");
+        let exe = dir.join("donsetch.exe");
+        let tmp = dir.join(".donsetch.rollback.tmp");
+        std::fs::write(&exe, "current-bin").unwrap();
+        std::fs::write(&tmp, "debris").unwrap();
+
+        recover_stale_rollback_tmp(&exe, &tmp);
+
+        assert_eq!(read(&exe), "current-bin");
+        assert!(!tmp.exists(), "debris kept next to a healthy exe");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
