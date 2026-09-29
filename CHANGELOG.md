@@ -5,6 +5,30 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The ghost still launched Debian's `/usr/bin/chromium` wrapper, so
+  the flags that wrapper sources from `/etc/chromium.d/` kept riding
+  into its argv (the #321 class): Debian's script never writes the
+  browser's path, it builds it from two variables
+  (`LIBDIR=/usr/lib/$APPNAME`, `exec $LIBDIR/$APPNAME ...`), and the
+  launcher resolution only saw paths written out. A script's own
+  plain variable assignments are followed now; a path built from them
+  has to pass the same proof as a written one (an executable ELF of
+  browser size with a chromium-shaped name), and a value that is
+  computed or unknown resolves nothing. (mnaza, #322)
+- Screenshots and the `debug.ghost` DOM dump were written with a
+  plain write and landed readable by others under the default umask
+  (0644, or 0664 where the umask is 002), while the ghost renders
+  with the session vault replanted: an image or the markup of a
+  logged-in page sat beside stores that are all 0600. Both go through
+  `config::write_private` now, and `doctor` tightens what is already
+  on disk under `screenshots/` and `ghost-debug/`, subfolders
+  included, without following links. The same class as the
+  page-history store in 4.3.7. (mnaza, #323)
+
 ## [4.3.7] - 2026-09-28
 
 ### Fixed
