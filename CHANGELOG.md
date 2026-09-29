@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The docs-outline walk test no longer fails on a loaded or slow
+  box: it bounded the whole extraction of a deeply nested page at 20
+  seconds of wall clock, and most of that time is the HTML parser,
+  whose own cost grows with nesting depth. It now bounds the
+  extraction at four times the parse of the same page, which holds
+  under any load or build profile and still catches the ancestor
+  walk it guards (about 14 times the parse). (mnaza, #328)
 - The ghost still launched Debian's `/usr/bin/chromium` wrapper, so
   the flags that wrapper sources from `/etc/chromium.d/` kept riding
   into its argv (the #321 class): Debian's script never writes the
