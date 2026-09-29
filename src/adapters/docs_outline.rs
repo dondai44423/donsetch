@@ -333,30 +333,51 @@ mod tests {
     // #304: the ancestor walk itself, not just the wrapper scan. With
     // the wrapper set precomputed, every candidate still walked its
     // whole ancestor chain (selector match + set lookup per level),
-    // so D wrapper divs around N leaf divs cost about N*D steps. On
-    // this box's fast profile the pre-fix walk measured 11.4 s at
-    // 5 000 leaves and 24.4 s at 16 000 (this test, against the 20 s
-    // bound) where the single walk takes 0.37 s and 1.1 s.
+    // so D wrapper divs around N leaf divs cost about N*D steps.
+    //
+    // Judged against the parse of the same page, not against the
+    // clock. The parser's own cost grows with N*D too (every tag
+    // walks the open-element stack), so it dominates this page and a
+    // wall-clock bound measures the machine: the 20 s bound this
+    // replaces took 13 s alone in a debug build and 21 to 27 s under
+    // a full parallel run. The ratio holds in both: the single walk
+    // extracts in about 1.2x the parse, the ancestor walk took about
+    // 14x at every size tried.
     #[test]
     fn deep_wrappers_with_many_leaf_divs_walk_once() {
         let nav: String = (0..5)
             .map(|i| format!(r#"<a class="menu__link" href="/d/{i}/">D{i}</a>"#))
             .collect();
-        let (depth, n) = (4_000, 16_000);
+        let (depth, n) = (1_000, 4_000);
         let page = format!(
             r#"<html><body><div id="__docusaurus"><nav>{nav}</nav>{}{}<p>end</p>{}</div></body></html>"#,
             "<div>".repeat(depth),
             "<div>x</div>".repeat(n),
             "</div>".repeat(depth),
         );
-        let started = std::time::Instant::now();
-        let ex = extract(&page, "https://docs.example.com/", &opts()).unwrap();
+        // The better of two runs each, so one preempted run does not
+        // decide the ratio.
+        fn best_of_two(mut run: impl FnMut()) -> std::time::Duration {
+            (0..2)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    run();
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        }
+        let parse = best_of_two(|| drop(scraper::Html::parse_document(&page)));
+        let mut xs = 0;
+        let full = best_of_two(|| {
+            let ex = extract(&page, "https://docs.example.com/", &opts()).unwrap();
+            xs = ex.markdown.matches("x\n").count();
+        });
+        let ratio = full.as_secs_f64() / parse.as_secs_f64().max(1e-6);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
-            "took {:?}",
-            started.elapsed()
+            ratio < 4.0,
+            "extract took {ratio:.1}x the parse ({full:?} vs {parse:?}): the walk is not linear"
         );
-        let xs = ex.markdown.matches("x\n").count();
         assert!(xs >= 1_000, "the leaf divs are content: {xs} of {n}");
     }
 

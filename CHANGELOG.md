@@ -5,6 +5,34 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Three update and rollback edges that could pair a binary with the
+  wrong runtime library or the wrong label. An update that ships no
+  runtime library now drops the library backup an earlier update
+  left, which was older than the binary backup and would have been
+  swapped in beside the restored binary. A failed backup copy no
+  longer leaves `donsetch.bak.ver` naming this version for a backup
+  that is an older binary or a partial file; both are removed, and
+  rollback reports that there is none. A rollback interrupted between
+  restoring a library and keeping its roll-forward copy no longer
+  loses that copy: the next rollback finds it in the stash, so
+  rolling forward moves the library with the binary. (mnaza, #325)
+
+## [Unreleased]
+
+### Fixed
+
+- The docs-outline walk test no longer fails on a loaded or slow
+  box: it bounded the whole extraction of a deeply nested page at 20
+  seconds of wall clock, and most of that time is the HTML parser,
+  whose own cost grows with nesting depth. It now bounds the
+  extraction at four times the parse of the same page, which holds
+  under any load or build profile and still catches the ancestor
+  walk it guards (about 14 times the parse). (mnaza, #328)
+
 ## [4.4.0] - 2026-09-29
 
 ### Fixed
