@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on disk under `screenshots/` and `ghost-debug/`, subfolders
   included, without following links. The same class as the
   page-history store in 4.3.7. (mnaza, #323)
+- Windows rollback restored `pdfium.dll` but not `onnxruntime.dll`,
+  so a rolled-back binary kept the newer ONNX runtime beside it
+  while `update` stages both DLLs. One `SIBLING_LIBS` list now drives
+  update and rollback on every platform (Linux `.so`, macOS `.dylib`,
+  Windows `pdfium.dll` + `onnxruntime.dll`), and the sibling-lib
+  tests run on the Windows lane too. (self-audit, 2026-09-29)
 
 ## [4.3.7] - 2026-09-28
 

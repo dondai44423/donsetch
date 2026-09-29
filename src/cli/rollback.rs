@@ -127,18 +127,10 @@ pub fn run() {
             }
         }
 
-        // The previous binary gets its previous runtime lib back
-        // (update keeps it as `<lib>.bak`); the current lib becomes
-        // the roll-forward backup, same as the binary. Not fatal:
+        // The previous binary gets its previous runtime back
+        // (update keeps each sibling as `<name>.bak`). Not fatal:
         // the binary rollback above already succeeded.
-        for name in crate::cli::update::SIBLING_LIBS {
-            if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
-                println!(
-                    "  {} Rolled back the binary, but could not restore {name}: {e}",
-                    cli::icon_warn()
-                );
-            }
-        }
+        restore_sibling_libs(exe_dir);
     }
 
     #[cfg(windows)]
@@ -185,17 +177,10 @@ pub fn run() {
             }
         }
 
-        // The previous binary gets its previous runtime DLLs back
-        // (update keeps each as `<name>.bak`); the current DLL becomes
-        // the roll-forward backup, same as the binary. Not fatal.
-        for name in crate::cli::update::SIBLING_LIBS {
-            if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
-                println!(
-                    "  {} Rolled back the binary, but could not restore {name}: {e}",
-                    cli::icon_warn()
-                );
-            }
-        }
+        // The previous binary gets its previous runtime back
+        // (update keeps each sibling as `<name>.bak`). Not fatal:
+        // the binary rollback above already succeeded.
+        restore_sibling_libs(exe_dir);
     }
 
     println!("  {} rolled back", cli::icon_pass());
@@ -209,6 +194,21 @@ pub fn run() {
         println!("  Rolled back {current} -> {bak_ver}");
     } else {
         println!("  Rolled back to previous version");
+    }
+}
+
+/// Put every sibling runtime `update` staged back beside the
+/// previous binary. One list (`SIBLING_LIBS`) drives this on every
+/// platform so a rolled-back binary never keeps a newer runtime
+/// (4.3.7's Windows branch restored `pdfium.dll` only).
+fn restore_sibling_libs(exe_dir: &std::path::Path) {
+    for name in crate::cli::update::SIBLING_LIBS {
+        if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
+            println!(
+                "  {} Rolled back the binary, but could not restore {name}: {e}",
+                cli::icon_warn()
+            );
+        }
     }
 }
 
@@ -275,7 +275,7 @@ fn swap_unix(
     Ok(None)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -293,6 +293,37 @@ mod tests {
         std::fs::read_to_string(p).unwrap_or_default()
     }
 
+
+    // restore_sibling_libs must cover every name the updater stages.
+    // 4.3.7's Windows rollback restored pdfium.dll only, so a
+    // rolled-back binary kept a newer onnxruntime.dll. This is the
+    // red proof: drop a name from the restore list and it fails.
+    #[test]
+    fn restore_sibling_libs_covers_every_staged_runtime() {
+        let dir = scratch("restore-libs");
+        for name in crate::cli::update::SIBLING_LIBS {
+            std::fs::write(dir.join(name), format!("new-{name}")).unwrap();
+            std::fs::write(dir.join(format!("{name}.bak")), format!("old-{name}")).unwrap();
+        }
+
+        restore_sibling_libs(&dir);
+
+        for name in crate::cli::update::SIBLING_LIBS {
+            assert_eq!(
+                read(&dir.join(name)),
+                format!("old-{name}"),
+                "{name} not restored"
+            );
+            assert_eq!(
+                read(&dir.join(format!("{name}.bak"))),
+                format!("new-{name}"),
+                "{name} roll-forward missing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn swap_exchanges_binary_and_backup() {
         let dir = scratch("swap");
@@ -326,6 +357,7 @@ mod tests {
     // its place), which trips the same invariant. The rename case
     // is covered by ordering: `.bak` is not written until after the
     // rename has succeeded.
+    #[cfg(unix)]
     #[test]
     fn failure_before_the_swap_leaves_the_backup_intact() {
         let dir = scratch("stagefail");
