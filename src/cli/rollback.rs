@@ -9,7 +9,7 @@
 //!   Unix:   atomic rename swap. The running process keeps its
 //!           inode open.
 //!   Windows: rename running .exe to .bak, copy old .bak to .exe.
-//!           Also swaps pdfium.dll if a .dll.bak exists.
+//!           Also swaps pdfium.dll and onnxruntime.dll if a .bak exists.
 
 use std::path::{Path, PathBuf};
 
@@ -185,18 +185,15 @@ pub fn run() {
             }
         }
 
-        // Swap pdfium.dll if backups exist.
-        let dll_path = exe_dir.join("pdfium.dll");
-        let dll_bak = exe_dir.join("pdfium.dll.bak");
-        if dll_bak.exists() && dll_path.exists() {
-            let dll_tmp = exe_dir.join(".pdfium.rollback.tmp");
-            let _ = std::fs::remove_file(&dll_tmp);
-            if std::fs::rename(&dll_path, &dll_tmp).is_ok() {
-                if std::fs::copy(&dll_bak, &dll_path).is_ok() {
-                    let _ = std::fs::rename(&dll_tmp, &dll_bak);
-                } else {
-                    let _ = std::fs::rename(&dll_tmp, &dll_path);
-                }
+        // The previous binary gets its previous runtime DLLs back
+        // (update keeps each as `<name>.bak`); the current DLL becomes
+        // the roll-forward backup, same as the binary. Not fatal.
+        for name in crate::cli::update::SIBLING_LIBS {
+            if let Err(e) = crate::cli::update::swap_sibling_lib(exe_dir, name) {
+                println!(
+                    "  {} Rolled back the binary, but could not restore {name}: {e}",
+                    cli::icon_warn()
+                );
             }
         }
     }
