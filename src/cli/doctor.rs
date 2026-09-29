@@ -2443,6 +2443,41 @@ mod doctor_ultra_tests {
             assert!(matches!(check_state_permissions(), CheckResult::Pass(_)));
         }
     }
+
+    // Crawl resume tokens and unlocker bypass entries carry frontier
+    // URLs and page bodies: same tighten as the page artifacts.
+    #[test]
+    fn state_permissions_tightens_crawl_and_bypass_stores() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let make = |rel: &str| {
+                let f = paths::cache_dir().join(rel);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, b"x").unwrap();
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+                f
+            };
+            let tok = make("crawl-resumes/c0001.json");
+            let cache = make("bypass-cache/abc.json");
+            let single = make("search-cache.json");
+            match check_state_permissions() {
+                CheckResult::Fixed(d) => {
+                    assert!(d.contains("crawl-resumes/"), "{d}");
+                    assert!(d.contains("bypass-cache/"), "{d}");
+                    assert!(d.contains("search-cache.json"), "{d}");
+                }
+                other => panic!("expected Fixed, got {other:?}"),
+            }
+            let mode =
+                |f: &std::path::Path| std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+            for f in [&tok, &cache, &single] {
+                assert_eq!(mode(f), 0o600, "{}", f.display());
+            }
+            assert!(matches!(check_state_permissions(), CheckResult::Pass(_)));
+        }
+    }
 }
 
 #[cfg(test)]
