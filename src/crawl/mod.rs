@@ -1966,14 +1966,13 @@ mod anchor_text_guard_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod resume_store_mode_tests {
     use super::{ResumeState, write_token_file};
 
     // Frontier URLs can name a private target: the token file is
     // owner-only, same seal as the session-bearing stores (the
     // 4.3.7 page-history class, continued 2026-09-29).
-    #[cfg(unix)]
     #[test]
     fn a_resume_token_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
