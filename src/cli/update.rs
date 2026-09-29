@@ -70,7 +70,7 @@ pub async fn run() {
     // ── Latest version (atom feed : no API, no rate limits) ──
 
     let spinner = cli::Spinner::new("checking for updates...");
-    let latest = match fetch_latest_version(&fetcher).await {
+    let latest = match fetch_latest_version(&fetcher, is_prerelease(current)).await {
         Ok(v) => v,
         Err(e) => {
             spinner.stop();
@@ -273,7 +273,9 @@ fn platform_asset_name() -> Option<&'static str> {
     }
 }
 
-/// Fetch the releases.atom feed and parse the latest release tag.
+/// Fetch the releases.atom feed and parse the release an install
+/// moves to: the newest entry, or for a stable install
+/// (`follow_prereleases` false) the newest that is not a prerelease.
 ///
 /// The atom feed is a regular GitHub web page (not an API call),
 /// so it is NOT subject to the 60-req/hour API rate limit.
@@ -281,7 +283,10 @@ fn platform_asset_name() -> Option<&'static str> {
 /// Uses the `<id>` tag (not `<title>`) because release titles can
 /// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
 /// semver parsing. The `<id>` tag always ends with `/v<version>`.
-async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
+async fn fetch_latest_version(
+    fetcher: &Fetcher,
+    follow_prereleases: bool,
+) -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases.atom");
     let out = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;
 
@@ -289,38 +294,42 @@ async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
         return Err(format!("HTTP {} from releases feed", out.status));
     }
 
-    let body = String::from_utf8_lossy(&out.body);
+    latest_in_feed(&String::from_utf8_lossy(&out.body), follow_prereleases)
+}
 
-    // Find the first <entry> block, then the <id> within it.
-    let entry_pos = body
-        .find("<entry>")
-        .ok_or_else(|| "no releases found in feed".to_string())?;
-
-    // The <id> tag always ends with /v<version> : clean, no extra text.
-    let id_tag = body[entry_pos..]
-        .find("<id>")
-        .ok_or_else(|| "could not parse feed: no <id> in first entry".to_string())?
-        + entry_pos;
-
-    let content_start = body[id_tag..]
-        .find('>')
-        .ok_or_else(|| "could not parse feed: malformed <id>".to_string())?
-        + id_tag
-        + 1;
-
-    let content_end = body[content_start..]
-        .find("</id>")
-        .ok_or_else(|| "could not parse feed: no </id>".to_string())?
-        + content_start;
-
-    // <id> looks like: tag:github.com,2008:Repository/123/v1.0.0
-    // Extract everything after the last '/'.
-    let id_content = body[content_start..content_end].trim();
-    let tag = id_content.rsplit('/').next().unwrap_or(id_content);
-
-    // Strip 'v' prefix (v0.5.0-beta.1 -> 0.5.0-beta.1).
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    Ok(version.to_string())
+/// The version a releases.atom body offers an install: its first
+/// entry in feed order, skipping prereleases unless
+/// `follow_prereleases`. A feed holding nothing but prereleases
+/// yields the newest of them, so the caller can name what it is not
+/// moving to.
+fn latest_in_feed(body: &str, follow_prereleases: bool) -> Result<String, String> {
+    let mut newest: Option<String> = None;
+    // Everything before the first <entry> is the feed's own header,
+    // which has an <id> of its own.
+    for entry in body.split("<entry>").skip(1) {
+        let entry = entry.split("</entry>").next().unwrap_or(entry);
+        // The <id> tag always ends with /v<version> : clean, no
+        // extra text.
+        let id_tag = entry
+            .find("<id>")
+            .ok_or_else(|| "could not parse feed: no <id> in an entry".to_string())?;
+        let content_start = id_tag + "<id>".len();
+        let content_end = entry[content_start..]
+            .find("</id>")
+            .ok_or_else(|| "could not parse feed: no </id>".to_string())?
+            + content_start;
+        // <id> looks like: tag:github.com,2008:Repository/123/v1.0.0
+        // Extract everything after the last '/'.
+        let id_content = entry[content_start..content_end].trim();
+        let tag = id_content.rsplit('/').next().unwrap_or(id_content);
+        // Strip 'v' prefix (v0.5.0-beta.1 -> 0.5.0-beta.1).
+        let version = tag.strip_prefix('v').unwrap_or(tag);
+        if follow_prereleases || !is_prerelease(version) {
+            return Ok(version.to_string());
+        }
+        newest.get_or_insert_with(|| version.to_string());
+    }
+    newest.ok_or_else(|| "no releases found in feed".to_string())
 }
 
 /// True when `version` carries a prerelease label (1.2.3-beta.1,
@@ -1192,6 +1201,60 @@ mod tests {
         assert_eq!(read(&exe_dir.join(format!("{name}.bak"))), "old-dll");
         assert!(!sibling_tmp(&exe_dir, name).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn feed(tags: &[&str]) -> String {
+        let entries: String = tags
+            .iter()
+            .map(|t| {
+                format!(
+                    "<entry><id>tag:github.com,2008:Repository/1/{t}</id><title>{t} : notes</title></entry>"
+                )
+            })
+            .collect();
+        format!("<?xml version=\"1.0\"?><feed><id>tag:github.com,2008:feed</id>{entries}</feed>")
+    }
+
+    // The feed is in publish order, prereleases included. With one on
+    // top, a stable install has to find the newest stable below it,
+    // or it stops receiving updates until a stable release is
+    // published after that prerelease.
+    #[test]
+    fn a_stable_install_looks_past_a_prerelease_to_the_newest_stable() {
+        let body = feed(&["v4.5.0-beta.1", "v4.4.0", "v4.3.7"]);
+        assert_eq!(latest_in_feed(&body, false).as_deref(), Ok("4.4.0"));
+        let body = feed(&["v4.5.0-rc.2", "v4.5.0-rc.1", "v4.4.1", "v4.4.0"]);
+        assert_eq!(latest_in_feed(&body, false).as_deref(), Ok("4.4.1"));
+    }
+
+    #[test]
+    fn a_prerelease_install_follows_the_newest_entry() {
+        let body = feed(&["v4.5.0-beta.1", "v4.4.0", "v4.3.7"]);
+        assert_eq!(latest_in_feed(&body, true).as_deref(), Ok("4.5.0-beta.1"));
+        // No prerelease on top: both kinds of install see the same.
+        let body = feed(&["v4.4.0", "v4.4.0-rc.1", "v4.3.7"]);
+        assert_eq!(latest_in_feed(&body, true).as_deref(), Ok("4.4.0"));
+        assert_eq!(latest_in_feed(&body, false).as_deref(), Ok("4.4.0"));
+    }
+
+    // Nothing stable to offer: the newest entry is still named, so
+    // the caller can say which prerelease it is not moving to.
+    #[test]
+    fn a_feed_of_only_prereleases_names_the_newest_one() {
+        let body = feed(&["v5.0.0-beta.2", "v5.0.0-beta.1"]);
+        assert_eq!(latest_in_feed(&body, false).as_deref(), Ok("5.0.0-beta.2"));
+    }
+
+    #[test]
+    fn a_feed_without_a_usable_entry_is_an_error() {
+        let empty = "<?xml version=\"1.0\"?><feed><id>tag:github.com,2008:feed</id></feed>";
+        assert!(
+            latest_in_feed(empty, false)
+                .unwrap_err()
+                .contains("no releases")
+        );
+        let no_id = "<feed><entry><title>v4.4.0</title></entry></feed>";
+        assert!(latest_in_feed(no_id, false).is_err());
     }
 
     // The releases.atom feed lists prereleases. A stable install must

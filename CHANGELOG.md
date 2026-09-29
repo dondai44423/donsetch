@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A stable install stopped receiving updates while a prerelease was
+  the newest published release: `-u` read only the first entry of
+  the releases feed, saw the prerelease and stayed put, even with a
+  newer stable release right below it. It now takes the newest entry
+  that is not a prerelease; a prerelease install still follows the
+  newest entry, and a feed holding only prereleases still names the
+  one it is not moving to. (mnaza, #326)
 - Three update and rollback edges that could pair a binary with the
   wrong runtime library or the wrong label. An update that ships no
   runtime library now drops the library backup an earlier update
