@@ -899,9 +899,11 @@ fn tighten_tree(root: &std::path::Path) -> (u32, u32, u32) {
 
 /// Session-bearing state must not be world-readable. Covers the
 /// cookie vault (ghost-state.json), the TLS-session routes file, the
-/// key, page-history, search-cache and crawl-resume stores, and the
-/// page artifacts under `screenshots/`, `ghost-debug/`,
-/// `crawl-resumes/` and `bypass-cache/`.
+/// key, page-history, search-cache and crawl-resume stores, the
+/// host-bearing stores (crawl governor, egress health, search trust,
+/// search quality, outcome feedback), and the files under
+/// `screenshots/`, `ghost-debug/`, `crawl-resumes/`, `bypass-cache/`
+/// and `host-pace/`.
 fn check_state_permissions() -> CheckResult {
     #[cfg(unix)]
     {
@@ -918,6 +920,11 @@ fn check_state_permissions() -> CheckResult {
             "page-history.json",
             "search-cache.json",
             "crawl-resumes.json",
+            "crawl-governor.json",
+            "egress-health.json",
+            "search-trust.json",
+            "search-quality.json",
+            "outcome-feedback.json",
         ];
         let mut fixed = Vec::new();
         let mut failed = Vec::new();
@@ -953,6 +960,7 @@ fn check_state_permissions() -> CheckResult {
             "ghost-debug",
             "crawl-resumes",
             "bypass-cache",
+            "host-pace",
         ] {
             let (seen, tightened, stuck) = tighten_tree(&dir.join(sub));
             if seen > 0 {
@@ -2451,6 +2459,51 @@ mod doctor_ultra_tests {
 
     // Crawl resume tokens and unlocker bypass entries carry frontier
     // URLs and page bodies: same tighten as the page artifacts.
+    // The pace, governor, egress and search-learning stores name the
+    // hosts that were fetched and searched; the ones written before
+    // they were sealed are tightened where they lie.
+    #[test]
+    fn state_permissions_tightens_the_host_bearing_stores() {
+        let _g = isolated_cache();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let make = |rel: &str| {
+                let f = paths::cache_dir().join(rel);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(&f, b"{}").unwrap();
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+                f
+            };
+            let files = [
+                make("crawl-governor.json"),
+                make("egress-health.json"),
+                make("search-trust.json"),
+                make("search-quality.json"),
+                make("outcome-feedback.json"),
+                make("host-pace/0a1b2c3d.json"),
+            ];
+            let report = match check_state_permissions() {
+                CheckResult::Fixed(d) => d,
+                other => panic!("expected Fixed, got {other:?}"),
+            };
+            for name in [
+                "crawl-governor.json",
+                "egress-health.json",
+                "search-trust.json",
+                "search-quality.json",
+                "outcome-feedback.json",
+                "host-pace/",
+            ] {
+                assert!(report.contains(name), "{name} missing from: {report}");
+            }
+            for f in &files {
+                let mode = std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", f.display());
+            }
+        }
+    }
+
     #[test]
     fn state_permissions_tightens_crawl_and_bypass_stores() {
         let _g = isolated_cache();
