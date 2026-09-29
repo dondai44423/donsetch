@@ -66,6 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every published release). A stable install now stays put and says
   so; a prerelease install still follows prereleases. (self-audit,
   2026-09-29)
+- The npm postinstall left debris and could lie about why it failed.
+  A bare `response.pipe(file)` left the write stream open when the
+  download errored, so the unlink of a partial tarball failed with
+  EBUSY on Windows and the half-download sat in `binaries/`; the
+  tarball and checksum were only removed on a SHA mismatch, so any
+  other failure kept them forever; and `mkdirSync` ran outside
+  `main().catch`, so an unwritable install dir produced a raw Node
+  stack instead of the curated message. Downloads go through
+  `stream/promises.pipeline` (both ends destroyed on error), the
+  artifacts are dropped in a `finally`, and the workspace is created
+  inside `main()`. Self-update likewise names the real cause when the
+  extract workspace cannot be created instead of failing later with
+  "unpack ...: No such file or directory". (self-audit, 2026-09-29)
 
 ## [4.3.7] - 2026-09-28
 

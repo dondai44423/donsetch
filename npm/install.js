@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { pipeline } = require('stream/promises');
 
 const REPO = 'dondai44423/donsetch';
 const VERSION = require('./package.json').version;
@@ -116,8 +117,6 @@ if (fs.existsSync(binaryPath) && fs.existsSync(stampPath)) {
   }
   console.log(`donsetch: binary version stamp mismatch; re-downloading ${VERSION}`);
 }
-
-fs.mkdirSync(binDir, { recursive: true });
 
 const releasesBase = (process.env.DONSETCH_RELEASES_BASE
   || `https://github.com/${REPO}/releases/download`).replace(/\/+$/, '');
@@ -253,15 +252,11 @@ async function download(url, dest) {
         await drain(response);
         throw error;
       }
-      await new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(dest);
-        response.pipe(file);
-        file.on('finish', () => {
-          file.close(resolve);
-        });
-        file.on('error', reject);
-        response.on('error', reject);
-      });
+      // pipeline destroys BOTH ends on error. A bare
+      // `response.pipe(file)` leaves the write stream open when the
+      // source errors (documented Node behavior), so the unlink below
+      // fails with EBUSY on Windows and the partial download survives.
+      await pipeline(response, fs.createWriteStream(dest));
       return;
     } catch (error) {
       try { fs.unlinkSync(dest); } catch (_) {}
@@ -277,6 +272,10 @@ async function main() {
   const tarball = path.join(binDir, plat.asset);
   const checksumFile = path.join(binDir, 'checksum.sha256');
 
+  // Inside main() so an unwritable install dir gets the curated
+  // error below, not a raw Node stack trace from a top-level throw.
+  fs.mkdirSync(binDir, { recursive: true });
+
   if (process.platform === 'win32') {
     try {
       execFileSync('tar', ['--version'], { stdio: 'ignore' });
@@ -289,29 +288,33 @@ async function main() {
   }
 
   console.log(`donsetch: downloading ${plat.asset} from ${TAG}...`);
-  await download(assetUrl, tarball);
-  console.log('donsetch: verifying checksum...');
-  await download(checksumUrl, checksumFile);
+  try {
+    await download(assetUrl, tarball);
+    console.log('donsetch: verifying checksum...');
+    await download(checksumUrl, checksumFile);
 
-  const expectedHash = fs.readFileSync(checksumFile, 'utf8').trim().split(/\s+/)[0];
-  const actualHash = crypto.createHash('sha256').update(fs.readFileSync(tarball)).digest('hex');
-  if (!/^[a-f0-9]{64}$/.test(expectedHash) || actualHash !== expectedHash) {
+    const expectedHash = fs.readFileSync(checksumFile, 'utf8').trim().split(/\s+/)[0];
+    const actualHash = crypto.createHash('sha256').update(fs.readFileSync(tarball)).digest('hex');
+    if (!/^[a-f0-9]{64}$/.test(expectedHash) || actualHash !== expectedHash) {
+      throw new Error(`SHA256 mismatch (expected ${expectedHash}, actual ${actualHash})`);
+    }
+
+    console.log('donsetch: extracting...');
+    execFileSync('tar', ['xzf', tarball, '-C', binDir], { stdio: 'inherit' });
+
+    if (!fs.existsSync(binaryPath)) {
+      throw new Error(`expected ${plat.binary} not found after extraction in ${binDir}`);
+    }
+    if (process.platform !== 'win32') fs.chmodSync(binaryPath, 0o755);
+    fs.writeFileSync(stampPath, `${VERSION}\n`);
+    console.log(`donsetch: installed ${plat.binary} to ${binaryPath}`);
+  } finally {
+    // Always drop the download artifacts: a failed checksum fetch, a
+    // failed extract, or a missing binary must not leave the tarball
+    // and checksum sitting in ./binaries/ forever.
     try { fs.unlinkSync(tarball); } catch (_) {}
     try { fs.unlinkSync(checksumFile); } catch (_) {}
-    throw new Error(`SHA256 mismatch (expected ${expectedHash}, actual ${actualHash})`);
   }
-
-  console.log('donsetch: extracting...');
-  execFileSync('tar', ['xzf', tarball, '-C', binDir], { stdio: 'inherit' });
-  try { fs.unlinkSync(tarball); } catch (_) {}
-  try { fs.unlinkSync(checksumFile); } catch (_) {}
-
-  if (!fs.existsSync(binaryPath)) {
-    throw new Error(`expected ${plat.binary} not found after extraction in ${binDir}`);
-  }
-  if (process.platform !== 'win32') fs.chmodSync(binaryPath, 0o755);
-  fs.writeFileSync(stampPath, `${VERSION}\n`);
-  console.log(`donsetch: installed ${plat.binary} to ${binaryPath}`);
 }
 
 main().catch((error) => {

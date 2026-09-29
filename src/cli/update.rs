@@ -200,8 +200,11 @@ pub async fn run() {
     // ── Extract ──────────────────────────────────────────────
 
     let temp_dir = paths::cache_dir().join("update-tmp");
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).ok();
+    if let Err(e) = prepare_temp_dir(&temp_dir) {
+        println!("  {} {}", cli::icon_fail(), e);
+        println!("    Check that the cache directory is writable.");
+        std::process::exit(1);
+    }
 
     let files = match extract_tarball(&tarball, &temp_dir) {
         Ok(f) => f,
@@ -324,6 +327,18 @@ fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Wipe and recreate the per-update extract workspace.
+///
+/// The old `create_dir_all(...).ok()` swallowed an unwritable cache
+/// dir: extraction then failed with "unpack ...: No such file or
+/// directory", which names neither the cache dir nor the real cause,
+/// and the permission hint in `run` never matched. Propagate it.
+fn prepare_temp_dir(temp_dir: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(temp_dir);
+    std::fs::create_dir_all(temp_dir)
+        .map_err(|e| format!("cannot create update workspace {}: {e}", temp_dir.display()))
 }
 
 /// Decompress gzip and extract the tar archive into `dest`.
@@ -981,5 +996,50 @@ mod tests {
         assert!(!is_prerelease("4.3.7"));
         assert!(!is_prerelease("4.4.0"));
         assert!(!is_prerelease("not-a-version"));
+    }
+
+    // `create_dir_all(...).ok()` used to swallow a workspace that
+    // cannot be created (unwritable cache dir, cache path pointing at
+    // a file): extraction then failed with "unpack ...: No such file
+    // or directory" and the real cause never reached the user. Red
+    // proof: this call must return Err naming the workspace, not Ok.
+    #[test]
+    fn an_uncreatable_update_workspace_reports_the_real_cause() {
+        let root = scratch("noworkspace");
+        // A regular file where a directory must go: create_dir_all
+        // cannot succeed, same failure class as an unwritable cache.
+        let blocker = root.join("cache-is-a-file");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let temp_dir = blocker.join("update-tmp");
+
+        let err =
+            prepare_temp_dir(&temp_dir).expect_err("must fail, not create a phantom workspace");
+        assert!(
+            err.contains("cannot create update workspace"),
+            "error must say the workspace could not be created: {err}"
+        );
+        assert!(
+            err.contains("update-tmp"),
+            "error must name the workspace path: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The happy path: prepare_temp_dir wipes a previous extract and
+    // leaves a usable empty workspace.
+    #[test]
+    fn prepare_temp_dir_recreates_a_stale_workspace() {
+        let root = scratch("stalews");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("leftover.bin"), "stale").unwrap();
+
+        prepare_temp_dir(&temp_dir).expect("create");
+        assert!(temp_dir.is_dir());
+        assert!(
+            !temp_dir.join("leftover.bin").exists(),
+            "stale extract must be wiped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
