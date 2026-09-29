@@ -505,17 +505,30 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
 
         // Save backup (copy, not rename : keeps the original in place).
         let bak = exe_dir.join("donsetch.bak");
-        if let Err(e) = std::fs::copy(&exe, &bak) {
-            // The atomic replace below is still checked; but if the
-            // backup copy failed, rollback will be impossible after
-            // the swap : the user must know BEFORE it happens.
-            println!(
-                "  {} Warning: backup copy failed ({e}) : rollback will not be possible for this update",
-                cli::icon_warn()
-            );
+        let bak_ver = exe_dir.join("donsetch.bak.ver");
+        match std::fs::copy(&exe, &bak) {
+            // Version metadata for rollback, only for a backup that
+            // was written.
+            Ok(_) => {
+                let _ = std::fs::write(&bak_ver, env!("CARGO_PKG_VERSION"));
+            }
+            Err(e) => {
+                // The atomic replace below is still checked; but if
+                // the backup copy failed, rollback will be impossible
+                // after the swap : the user must know BEFORE it
+                // happens.
+                println!(
+                    "  {} Warning: backup copy failed ({e}) : rollback will not be possible for this update",
+                    cli::icon_warn()
+                );
+                // What sits at the backup path now is an older
+                // binary or a partial copy. Left in place with a
+                // version file, rollback would install it while
+                // naming this version.
+                let _ = std::fs::remove_file(&bak);
+                let _ = std::fs::remove_file(&bak_ver);
+            }
         }
-        // Write version metadata for rollback.
-        let _ = std::fs::write(exe_dir.join("donsetch.bak.ver"), env!("CARGO_PKG_VERSION"));
 
         // Atomic replace.
         std::fs::rename(&tmp, &exe).map_err(|e| {
@@ -525,6 +538,8 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
             }
             format!("rename: {e}")
         })?;
+
+        drop_stale_lib_backups(exe_dir, &staged_libs);
 
         // Swap the staged libs in, same shape as the binary: back up
         // by COPY so a live lib exists at every instant, then one
@@ -602,6 +617,8 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
 
         // Write version metadata for rollback.
         let _ = std::fs::write(exe_dir.join("donsetch.bak.ver"), env!("CARGO_PKG_VERSION"));
+
+        drop_stale_lib_backups(exe_dir, &staged_libs);
 
         // Land the staged DLLs. A loaded DLL on Windows may be
         // renamed but not written or deleted, so the live one moves
@@ -683,10 +700,25 @@ fn land_sibling_dll(exe_dir: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Removes `<name>.bak` for every sibling runtime this update did
+/// not stage. The binary backup now holds the version this update
+/// replaced, and an unstaged runtime stays as it is beside the new
+/// binary, so a backup of it left by an earlier update is older than
+/// the binary rollback would restore.
+fn drop_stale_lib_backups(exe_dir: &Path, staged: &[&str]) {
+    for name in SIBLING_LIBS {
+        if !staged.contains(name) {
+            let _ = std::fs::remove_file(exe_dir.join(format!("{name}.bak")));
+        }
+    }
+}
+
 /// Rollback's counterpart to the sibling-lib refresh in
 /// `replace_binary`: swap `name` and `name.bak` so the previous
-/// binary gets its previous runtime back. No `.bak` means the last
-/// update shipped no lib (or predates this): nothing to do.
+/// binary gets its previous runtime back. With neither a `.bak` nor
+/// a stash the last update shipped no lib (or predates this):
+/// nothing to do. A stash without a `.bak` is the roll-forward copy
+/// of a swap that was interrupted, and is taken as the backup.
 ///
 /// The current lib is stashed by hard link (copy if the filesystem
 /// refuses), so `name` exists at every instant and a crash midway
@@ -694,10 +726,15 @@ fn land_sibling_dll(exe_dir: &Path, name: &str) -> Result<(), String> {
 pub(crate) fn swap_sibling_lib(exe_dir: &Path, name: &str) -> Result<(), String> {
     let cur = exe_dir.join(name);
     let bak = exe_dir.join(format!("{name}.bak"));
-    if !bak.exists() {
-        return Ok(());
-    }
     let stash = exe_dir.join(format!(".{name}.rollback.tmp"));
+    if !bak.exists() {
+        // The stash is written before the backup is renamed away, so
+        // a stash with no backup beside it is complete.
+        if !stash.exists() {
+            return Ok(());
+        }
+        std::fs::rename(&stash, &bak).map_err(|e| format!("{name}: recover stash: {e}"))?;
+    }
     let _ = std::fs::remove_file(&stash);
     let have_cur = cur.exists();
     if have_cur
@@ -904,6 +941,108 @@ mod tests {
                 !exe_dir.join(format!("{name}.bak")).exists(),
                 "{name}.bak must not appear when the tarball shipped no lib"
             );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // An earlier update left `<name>.bak` (lib N-1); this one ships
+    // no lib, so the live lib stays N beside the new binary and the
+    // binary backup is N. The old lib backup has to go, or rollback
+    // swaps lib N-1 in beside binary N.
+    #[test]
+    fn replace_binary_drops_a_stale_lib_backup_when_the_tarball_has_none() {
+        let root = scratch("nolib-stale-bak");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let exe = exe_dir.join(bin_name());
+        std::fs::write(&exe, "bin-n").unwrap();
+        std::fs::write(temp_dir.join(bin_name()), "bin-n-plus-1").unwrap();
+        for name in SIBLING_LIBS {
+            std::fs::write(exe_dir.join(name), format!("lib-n-{name}")).unwrap();
+            std::fs::write(
+                exe_dir.join(format!("{name}.bak")),
+                format!("lib-n-minus-1-{name}"),
+            )
+            .unwrap();
+        }
+
+        replace_binary(&exe, &temp_dir).expect("replace");
+
+        for name in SIBLING_LIBS {
+            assert_eq!(read(&exe_dir.join(name)), format!("lib-n-{name}"), "{name}");
+            assert!(
+                !exe_dir.join(format!("{name}.bak")).exists(),
+                "{name}.bak is from an older update than the binary backup"
+            );
+            // What rollback would do with it: nothing, so the lib
+            // that shipped with the restored binary stays.
+            swap_sibling_lib(&exe_dir, name).unwrap();
+            assert_eq!(read(&exe_dir.join(name)), format!("lib-n-{name}"), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The backup copy can fail (here: the backup path is a
+    // directory). The update goes on and says rollback will not be
+    // possible; the version file must not then describe a backup
+    // that was never written.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_backup_copy_leaves_no_backup_metadata() {
+        let root = scratch("bak-copy-fails");
+        let exe_dir = root.join("bin");
+        let temp_dir = root.join("update-tmp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let exe = exe_dir.join(bin_name());
+        std::fs::write(&exe, "bin-n").unwrap();
+        std::fs::write(temp_dir.join(bin_name()), "bin-n-plus-1").unwrap();
+        std::fs::create_dir_all(exe_dir.join("donsetch.bak")).unwrap();
+        std::fs::write(exe_dir.join("donsetch.bak.ver"), "0.0.1").unwrap();
+
+        replace_binary(&exe, &temp_dir).expect("the update itself succeeds");
+
+        assert_eq!(read(&exe), "bin-n-plus-1");
+        assert!(
+            !exe_dir.join("donsetch.bak.ver").exists(),
+            "no backup was written, so no version may be claimed for one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A rollback killed between restoring the backup and keeping the
+    // roll-forward copy leaves that copy in the stash and no `.bak`.
+    // The next rollback (the roll forward) has to find it, or the
+    // binary goes forward alone.
+    #[test]
+    fn swap_sibling_lib_recovers_the_roll_forward_copy_of_an_interrupted_swap() {
+        let root = scratch("stash-recover");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in SIBLING_LIBS {
+            let stash = root.join(format!(".{name}.rollback.tmp"));
+            std::fs::write(root.join(name), format!("restored-{name}")).unwrap();
+            std::fs::write(&stash, format!("newer-{name}")).unwrap();
+
+            swap_sibling_lib(&root, name).unwrap();
+
+            assert_eq!(read(&root.join(name)), format!("newer-{name}"), "{name}");
+            assert_eq!(
+                read(&root.join(format!("{name}.bak"))),
+                format!("restored-{name}"),
+                "{name}"
+            );
+            assert!(!stash.exists(), "{name}: the stash is consumed");
+        }
+        // No stash and no backup is still nothing to do.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        for name in SIBLING_LIBS {
+            std::fs::write(bare.join(name), "only").unwrap();
+            swap_sibling_lib(&bare, name).unwrap();
+            assert_eq!(read(&bare.join(name)), "only");
+            assert!(!bare.join(format!("{name}.bak")).exists());
         }
         let _ = std::fs::remove_dir_all(&root);
     }
