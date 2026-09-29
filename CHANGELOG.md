@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The egress health store (`egress-health.json`) names every host
+  a fetch was blocked on and the proxy it left through, and was still
+  written readable by others; it is sealed like the pace and governor
+  stores. `doctor` now also tightens the sealed stores it did not
+  list: `crawl-governor.json`, `search-trust.json`,
+  `search-quality.json`, `outcome-feedback.json` and the rows under
+  `host-pace/`, which otherwise kept their old mode until their next
+  save (a pace row for a host not fetched again, until its 7-day
+  prune). (mnaza, #324)
 - The ghost still launched Debian's `/usr/bin/chromium` wrapper, so
   the flags that wrapper sources from `/etc/chromium.d/` kept riding
   into its argv (the #321 class): Debian's script never writes the

@@ -220,6 +220,22 @@ fn prune_due() -> bool {
 mod tests {
     use super::*;
 
+    // A pace row names a host that was fetched.
+    #[cfg(unix)]
+    #[test]
+    fn a_pace_row_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-pace-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let row = dir.join("row.json");
+        write_pace(&row, "fetched.example", 1);
+        let mode = std::fs::metadata(&row).unwrap().permissions().mode() & 0o777;
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+        assert_eq!(left.len(), 1, "the writer's temp is renamed, not left");
+    }
+
     fn isolate_cache(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("donsetch-pace-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -316,7 +316,7 @@ impl EgressPool {
             return;
         }
         let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
+        if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
@@ -1031,6 +1031,30 @@ mod pacing_tests {
     /// A burned proxy pair must survive process restart: drop the pool,
     /// rebuild from the same cache dir, and the next pick must skip that
     /// lane (not re-learn the burn from zero).
+    // The health file names every (host, lane) pair a fetch was
+    // blocked on: the hosts that were fetched and the proxies they
+    // left through. Same seal as the pace and governor stores.
+    // Sets DONSETCH_CACHE_DIR, so it depends on nextest's one process
+    // per test.
+    #[cfg(unix)]
+    #[test]
+    fn the_health_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = isolate_cache("health-mode");
+        let proxy = Proxy::parse("http://127.0.0.1:24081").unwrap();
+        let id = proxy.id();
+        let pool = EgressPool::new(vec![proxy]);
+        pool.note_fetch_rate_limited("fetched.example", &id);
+        let file = dir.join("egress-health.json");
+        assert!(file.is_file(), "a block is persisted");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DONSETCH_CACHE_DIR");
+        }
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     fn burned_pair_survives_restart() {
         let dir = std::env::temp_dir().join(format!(

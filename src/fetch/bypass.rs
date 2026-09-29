@@ -751,6 +751,29 @@ mod tests {
     use super::*;
     use crate::search::byok::store::{KeyEntry, ProviderConfig};
 
+    // A cache entry is a page body the unlocker returned.
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_entry_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("donsetch-bypass-mode-{}", std::process::id()));
+        let outcome = BypassOutcome {
+            status: 200,
+            content_type: "text/html".into(),
+            body: b"<html>page</html>".to_vec(),
+            cached: false,
+        };
+        cache_put(&dir, "https://example.com/a", &outcome, 8);
+        let entries: Vec<_> = std::fs::read_dir(bypass_cache_dir(&dir))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1, "one entry, no temp left behind");
+        let mode = entries[0].metadata().unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     fn parse_key_token_only() {
         let (token, zone) = parse_key("abc123", "web_unlocker1").unwrap();
