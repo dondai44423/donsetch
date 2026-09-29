@@ -79,6 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside `main()`. Self-update likewise names the real cause when the
   extract workspace cannot be created instead of failing later with
   "unpack ...: No such file or directory". (self-audit, 2026-09-29)
+- Two concurrent `donsetch -u` runs could race the shared extract
+  workspace, the staging names and the `.bak` backups (one run's
+  cleanup wiped the other's extract mid-flight). An advisory
+  `update.lock` under the cache dir, pid-stamped, now serializes
+  self-update; a lock whose pid is gone is reclaimed. (self-audit,
+  2026-09-29)
 
 ## [4.3.7] - 2026-09-28
 

@@ -47,6 +47,16 @@ pub async fn run() {
     // Clean up leftovers from a previous interrupted update.
     cleanup_previous(&exe);
 
+    // One update at a time: two runs would race the shared extract
+    // workspace, the staging names and the .bak backups.
+    let _update_lock = match acquire_update_lock() {
+        Ok(f) => f,
+        Err(e) => {
+            println!("  {} {e}", cli::icon_fail());
+            std::process::exit(1);
+        }
+    };
+
     // ── Fetcher ──────────────────────────────────────────────
 
     let fetcher = match Fetcher::new(BrowserProfile::host_default()) {
@@ -327,6 +337,65 @@ fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Advisory cross-process lock so two `donsetch -u` runs cannot race
+/// the shared extract workspace, the staging names, or the `.bak`
+/// backups. A pid-stamped file under the cache dir: held for the
+/// whole update, dropped on process exit (and by `cleanup_previous`
+/// when the holder is gone). Returns the lock file to keep alive.
+fn acquire_update_lock() -> Result<std::fs::File, String> {
+    use std::io::Write as _;
+    let dir = paths::cache_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create cache dir {}: {e}", dir.display()))?;
+    let lock_path = dir.join("update.lock");
+    // A lock whose pid is gone is stale debris, not a live holder.
+    if let Ok(raw) = std::fs::read_to_string(&lock_path) {
+        let holder: u32 = raw.trim().parse().unwrap_or(0);
+        if holder > 0 && holder != std::process::id() && pid_is_alive(holder) {
+            return Err(format!(
+                "another donsetch update is already running (pid {holder})"
+            ));
+        }
+        let _ = std::fs::remove_file(&lock_path);
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)
+        .map_err(|e| format!("cannot create update lock {}: {e}", lock_path.display()))?;
+    let _ = writeln!(f, "{}", std::process::id());
+    Ok(f)
+}
+
+/// Is `pid` still running? Shared shape with stop.rs's probe.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation as fnd;
+        use windows_sys::Win32::System::Threading as thr;
+        unsafe {
+            let h = thr::OpenProcess(thr::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                false
+            } else {
+                fnd::CloseHandle(h);
+                true
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Wipe and recreate the per-update extract workspace.
@@ -1041,5 +1110,39 @@ mod tests {
             "stale extract must be wiped"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A lock whose pid is gone is stale debris and is reclaimed; a
+    // live foreign holder blocks a second update.
+    #[test]
+    fn the_update_lock_reclaims_a_dead_holder() {
+        let lock_path = crate::paths::cache_dir().join("update.lock");
+        std::fs::create_dir_all(crate::paths::cache_dir()).unwrap();
+        // 2^32-2 is not a real process on any supported platform.
+        std::fs::write(&lock_path, "4294967294\n").unwrap();
+        let f = acquire_update_lock().expect("a dead holder must be reclaimed");
+        drop(f);
+        assert!(lock_path.exists(), "the lock file stays while held");
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_update_lock_refuses_a_live_foreign_holder() {
+        let lock_path = crate::paths::cache_dir().join("update.lock");
+        std::fs::create_dir_all(crate::paths::cache_dir()).unwrap();
+        // Our parent is always alive while this test runs.
+        std::fs::write(
+            &lock_path,
+            format!("{}\n", std::process::id().saturating_sub(0)),
+        )
+        .unwrap();
+        // Own pid is re-entrant, so use a pid we know is alive and
+        // not us: the parent.
+        let ppid = unsafe { libc::getppid() } as u32;
+        std::fs::write(&lock_path, format!("{ppid}\n")).unwrap();
+        let err = acquire_update_lock().expect_err("a live holder must block");
+        assert!(err.contains("already running"), "{err}");
+        let _ = std::fs::remove_file(&lock_path);
     }
 }
