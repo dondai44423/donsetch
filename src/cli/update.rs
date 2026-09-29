@@ -94,6 +94,17 @@ pub async fn run() {
         _ => {} // Proceed : version is newer or unparseable.
     }
 
+    // The atom feed lists prereleases too. A stable install never
+    // moves onto one; a prerelease install (a tester) follows them.
+    if is_prerelease(&latest) && !is_prerelease(current) {
+        println!(
+            "  {} Latest published is a prerelease ({latest}); staying on {current}.",
+            cli::icon_warn()
+        );
+        println!("    Install a prerelease explicitly if you want one.");
+        return;
+    }
+
     // ── Platform asset ───────────────────────────────────────
 
     let asset = match platform_asset_name() {
@@ -297,6 +308,16 @@ async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
     // Strip 'v' prefix (v0.5.0-beta.1 -> 0.5.0-beta.1).
     let version = tag.strip_prefix('v').unwrap_or(tag);
     Ok(version.to_string())
+}
+
+/// True when `version` carries a prerelease label (1.2.3-beta.1,
+/// 1.2.3-rc.2, ...). The releases.atom feed lists every published
+/// release including prereleases, so `-u` has to refuse to move a
+/// stable install onto one.
+fn is_prerelease(version: &str) -> bool {
+    semver::Version::parse(version)
+        .map(|v| !v.pre.is_empty())
+        .unwrap_or(false)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -948,5 +969,17 @@ mod tests {
         assert_eq!(read(&exe_dir.join(format!("{name}.bak"))), "old-dll");
         assert!(!sibling_tmp(&exe_dir, name).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The releases.atom feed lists prereleases. A stable install must
+    // not land on one; a prerelease install may follow them.
+    #[test]
+    fn prerelease_versions_are_detected() {
+        assert!(is_prerelease("4.4.0-beta.1"));
+        assert!(is_prerelease("4.4.0-rc.2"));
+        assert!(is_prerelease("1.0.0-alpha"));
+        assert!(!is_prerelease("4.3.7"));
+        assert!(!is_prerelease("4.4.0"));
+        assert!(!is_prerelease("not-a-version"));
     }
 }

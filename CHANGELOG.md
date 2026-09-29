@@ -61,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to delete `.donsetch.rollback.tmp` on the next attempt, destroying
   the last copy of the binary; it recovers that temp when the exe is
   gone. (self-audit, 2026-09-29)
+- `donsetch -u` would move a stable install onto a prerelease when
+  one was the newest published tag (the releases.atom feed lists
+  every published release). A stable install now stays put and says
+  so; a prerelease install still follows prereleases. (self-audit,
+  2026-09-29)
 
 ## [4.3.7] - 2026-09-28
 
