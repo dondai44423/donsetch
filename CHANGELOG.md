@@ -34,6 +34,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update and rollback on every platform (Linux `.so`, macOS `.dylib`,
   Windows `pdfium.dll` + `onnxruntime.dll`), and the sibling-lib
   tests run on the Windows lane too. (self-audit, 2026-09-29)
+- Crawl resume tokens, the search cache, the unlocker bypass cache,
+  the crawl governor and host-pace stores were written with a plain
+  `fs::write` and sat world-readable under a default umask. All of
+  them can carry what the user asked for (frontier URLs, queries and
+  results, page bodies the unlocker returned): they go through
+  `config::write_private` now, and `doctor` tightens
+  `crawl-resumes/`, `bypass-cache/` and the new single-file stores
+  the same way as the page artifacts. (self-audit, 2026-09-29)
+- `donsetch stop` had two live-wipe bugs. The ghost temp-profile
+  sweep deleted every `donsetch-ghost-*` directory, including the
+  throwaway profile of a concurrent session still running (ripping
+  the user-data-dir out from under a live Chrome); it now only
+  removes profiles whose owning pid is gone. The `pkill -f` pattern
+  interpolated the profile path unescaped, so a `.` or `+` in it
+  loosened the match and orphans survived (or over-matched); the
+  path is ERE-escaped now. (self-audit, 2026-09-29)
 
 ## [4.3.7] - 2026-09-28
 

@@ -57,7 +57,7 @@ pub(crate) fn save_cache_disk(cache: &CacheMap) {
         .collect();
     if let Ok(json) = serde_json::to_string(&entries) {
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, json).is_ok() {
+        if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
             let _ = std::fs::rename(tmp, path);
         }
     }
@@ -236,7 +236,7 @@ pub(crate) fn save_health_disk(
         return;
     };
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, json).is_ok() {
+    if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
         let _ = std::fs::rename(tmp, path);
     }
 }
@@ -371,7 +371,7 @@ pub(crate) fn save_quality_disk(map: &QualityMap) {
         return;
     };
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, json).is_ok() {
+    if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
         let _ = std::fs::rename(tmp, path);
     }
 }
@@ -515,7 +515,7 @@ pub(crate) fn save_outcome_disk(map: &OutcomeMap) {
         return;
     };
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, json).is_ok() {
+    if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
         let _ = std::fs::rename(tmp, path);
     }
 }

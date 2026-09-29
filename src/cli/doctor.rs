@@ -899,8 +899,9 @@ fn tighten_tree(root: &std::path::Path) -> (u32, u32, u32) {
 
 /// Session-bearing state must not be world-readable. Covers the
 /// cookie vault (ghost-state.json), the TLS-session routes file, the
-/// key and page-history stores, and the page artifacts under
-/// `screenshots/` and `ghost-debug/`.
+/// key, page-history, search-cache and crawl-resume stores, and the
+/// page artifacts under `screenshots/`, `ghost-debug/`,
+/// `crawl-resumes/` and `bypass-cache/`.
 fn check_state_permissions() -> CheckResult {
     #[cfg(unix)]
     {
@@ -915,6 +916,8 @@ fn check_state_permissions() -> CheckResult {
             "routes.json",
             "byok-keys.json",
             "page-history.json",
+            "search-cache.json",
+            "crawl-resumes.json",
         ];
         let mut fixed = Vec::new();
         let mut failed = Vec::new();
@@ -940,10 +943,12 @@ fn check_state_permissions() -> CheckResult {
                 failed.push(format!("{name} is {mode:o}"));
             }
         }
-        // Page artifacts: what the ghost rendered, a logged-in page
-        // included. Files written before they were sealed stay on
-        // disk, so they are tightened where they lie.
-        for sub in ["screenshots", "ghost-debug"] {
+        // Page artifacts and session-bearing stores: what the ghost
+        // rendered (a logged-in page included), crawl resume frontiers,
+        // and unlocker-cached page bodies. Files written before they
+        // were sealed stay on disk, so they are tightened where they
+        // lie.
+        for sub in ["screenshots", "ghost-debug", "crawl-resumes", "bypass-cache"] {
             let (seen, tightened, stuck) = tighten_tree(&dir.join(sub));
             if seen > 0 {
                 present += 1;

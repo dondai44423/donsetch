@@ -263,7 +263,7 @@ impl Governor {
             return;
         }
         let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
+        if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }

@@ -553,7 +553,9 @@ fn cache_touch(cache_dir: &Path, url: &str) {
     };
     entry.ts = now_ts();
     if let Ok(json) = serde_json::to_string(&entry) {
-        let _ = std::fs::write(&path, json);
+        // Page bodies the unlocker returned: owner-only like the
+        // rest of the page-bearing stores.
+        let _ = crate::config::write_private(&path, json.as_bytes());
     }
 }
 
@@ -573,7 +575,9 @@ fn cache_put(cache_dir: &Path, url: &str, outcome: &BypassOutcome, max_entries: 
     };
     let path = dir.join(format!("{key}.json"));
     let tmp = dir.join(format!("{key}.tmp"));
-    if std::fs::write(&tmp, serde_json::to_string(&entry).unwrap_or_default()).is_ok() {
+    if crate::config::write_private(&tmp, serde_json::to_string(&entry).unwrap_or_default().as_bytes())
+        .is_ok()
+    {
         let _ = std::fs::rename(&tmp, &path);
     }
     cache_prune(&dir, max_entries);

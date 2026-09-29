@@ -77,7 +77,7 @@ fn write_pace(path: &Path, host: &str, last_ms: u64) {
     let Ok(json) = serde_json::to_vec(&row) else {
         return;
     };
-    if std::fs::write(&tmp, &json).is_ok() {
+    if crate::config::write_private(&tmp, &json).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
 }
