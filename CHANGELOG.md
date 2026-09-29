@@ -5,6 +5,18 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A stable install stopped receiving updates while a prerelease was
+  the newest published release: `-u` read only the first entry of
+  the releases feed, saw the prerelease and stayed put, even with a
+  newer stable release right below it. It now takes the newest entry
+  that is not a prerelease; a prerelease install still follows the
+  newest entry, and a feed holding only prereleases still names the
+  one it is not moving to. (mnaza, #326)
+
 ## [4.4.0] - 2026-09-29
 
 ### Fixed
