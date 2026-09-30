@@ -312,6 +312,18 @@ fn request_allowed(
     Ok(())
 }
 
+/// Consumes a tool call's progress lines for the life of the call.
+///
+/// The HTTP transport has nowhere to deliver progress (a POST gets
+/// one response), but the tool's forwarder still sends every line
+/// into the bounded channel and `handle` awaits that forwarder after
+/// the tool returns. Without a reader, the 257th line blocked the
+/// forwarder, the await never finished, and a call that had
+/// completed timed out. Drained here from the start instead.
+fn spawn_progress_sink(mut rx: mpsc::Receiver<String>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { while rx.recv().await.is_some() {} })
+}
+
 /// Bearer-auth check shared by every /mcp method (health stays open).
 fn authorized(state: &HttpState, headers: &HeaderMap) -> bool {
     token_ok(state.auth_token.as_deref(), headers)
@@ -588,9 +600,10 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
         }
     };
 
-    // Writer sink for in-flight progress notifications. Each request
-    // gets a fresh channel; nothing else consumes it.
-    let (progress_tx, mut progress_rx) = mpsc::channel::<String>(256);
+    // Progress notifications have no reader on a POST: a sink drains
+    // them for the life of the call so the forwarder never blocks.
+    let (progress_tx, progress_rx) = mpsc::channel::<String>(256);
+    let _sink = spawn_progress_sink(progress_rx);
     let request_id = req.get("id").and_then(cancel_key);
 
     let outcome = tokio::time::timeout(
@@ -629,15 +642,8 @@ async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: B
         Ok(None) => {
             // Notification: no body, 202 Accepted per the streamable-HTTP
             // spec (204 would also be "no content", but the spec names
-            // 202 for notification-only POSTs). The sender MUST be
-            // dropped before draining : recv() only returns None once
-            // every sender is gone, and progress_tx is still in scope
-            // here, so draining first would wait forever. (This exact
-            // deadlock hung the notifications/initialized POST and with
-            // it every streamable-HTTP client's connect; it also would
-            // have hung POSTs for cancelled tools/call requests.)
-            drop(progress_tx);
-            while progress_rx.recv().await.is_some() {}
+            // 202 for notification-only POSTs). The progress sink has
+            // been reading since before the call, so nothing waits here.
             StatusCode::ACCEPTED.into_response()
         }
     };
@@ -787,6 +793,30 @@ mod tests {
         let mut both = host("attacker.example:8765");
         both.insert("origin", HeaderValue::from_static("http://localhost:8765"));
         assert!(request_allowed(&both, false, &bound).is_err());
+    }
+
+    // A crawl with a progress token beats once every 2 s for up to
+    // 600 s: past the channel's 256 slots the forwarder used to block
+    // and the finished call timed out.
+    #[tokio::test]
+    async fn progress_is_drained_while_a_tool_runs() {
+        let (tx, rx) = mpsc::channel::<String>(256);
+        let sink = spawn_progress_sink(rx);
+        let pushed = tokio::time::timeout(Duration::from_secs(2), async {
+            for i in 0..1_000 {
+                tx.send(format!("progress {i}")).await.unwrap();
+            }
+        })
+        .await;
+        assert!(
+            pushed.is_ok(),
+            "1 000 progress lines must not block the tool"
+        );
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), sink)
+            .await
+            .expect("the sink ends with its sender")
+            .unwrap();
     }
 
     #[test]
