@@ -359,10 +359,23 @@ pub fn load() -> Result<Loaded, ConfigError> {
 
     let mut file_layer: Option<config::Map<String, config::Value>> = None;
     let mut file_path: Option<std::path::PathBuf> = None;
-    let skip_file = std::env::var("DONSETCH_NO_CONFIG_FILE")
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .is_some_and(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"));
+    // The same words as every other boolean the loader reads: an
+    // empty export or a value that is not a boolean keeps the file.
+    let skip_file = match std::env::var("DONSETCH_NO_CONFIG_FILE") {
+        Ok(raw) => match boolish(&raw) {
+            Some(b) => b,
+            None => {
+                if !raw.trim().is_empty() {
+                    warnings.push(format!(
+                        "DONSETCH_NO_CONFIG_FILE={} is not a boolean (1/true/on/yes or 0/false/off/no); the config file stays in use",
+                        raw.trim()
+                    ));
+                }
+                false
+            }
+        },
+        Err(_) => false,
+    };
     if !skip_file {
         match toml_path() {
             Some(path) => {
@@ -2733,6 +2746,53 @@ mod tests {
         let path = write_cfg(&tmp, "[state]\nno_disk_state = true\n");
         set_env("DONSETCH_CONFIG", &path);
         assert_eq!(toml_path().as_deref(), Some(path.as_path()));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // `DONSETCH_NO_CONFIG_FILE` is the one opt-out flag in the loader:
+    // it used to skip the file for any value that was not an off-word,
+    // an empty export included (`VAR= cmd`, a `[env]` block with a
+    // blank value), which silently dropped the developer's config and,
+    // with `DONSETCH_CONFIG` also set, failed the load naming a `=1`
+    // the user never wrote. It reads like every other boolean now.
+    #[test]
+    fn no_config_file_takes_only_a_true_word() {
+        let _guard = clean_env();
+        let tmp = std::env::temp_dir();
+        let path = write_cfg(&tmp, "[state]\nno_disk_state = true\n");
+        set_env("DONSETCH_CONFIG", &path);
+        for keeps in ["", "  ", "0", "false", "off", "no", "n", "N", "maybe"] {
+            set_env("DONSETCH_NO_CONFIG_FILE", keeps);
+            let loaded = load().unwrap_or_else(|e| panic!("{keeps:?} must keep the file: {e}"));
+            assert_eq!(loaded.file.as_deref(), Some(path.as_path()), "{keeps:?}");
+            assert!(
+                loaded.config.state.no_disk_state,
+                "{keeps:?}: the file was read"
+            );
+        }
+        // A value that is not a boolean is said so, once.
+        set_env("DONSETCH_NO_CONFIG_FILE", "maybe");
+        let loaded = load().unwrap();
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("DONSETCH_NO_CONFIG_FILE") && w.contains("maybe")),
+            "{:?}",
+            loaded.warnings
+        );
+        // A true word skips the file, and with DONSETCH_CONFIG set that
+        // is the documented hard error.
+        for skips in ["1", "true", "on", "yes", "Y"] {
+            set_env("DONSETCH_NO_CONFIG_FILE", skips);
+            assert!(
+                load().is_err(),
+                "{skips:?} with DONSETCH_CONFIG must be refused"
+            );
+        }
+        unset_env("DONSETCH_CONFIG");
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        assert_eq!(load().unwrap().file, None);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

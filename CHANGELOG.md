@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `DONSETCH_NO_CONFIG_FILE` read any value that was not an off-word
+  as on, an empty export included (`DONSETCH_NO_CONFIG_FILE= donsetch`,
+  a blank value in a `.cargo/config.toml` `[env]` block), so it
+  silently dropped `donsetch.toml`, and with `DONSETCH_CONFIG` also
+  set it failed the load naming a `=1` the user never wrote. It reads
+  the same words as every other boolean now, and a value that is not
+  a boolean is reported once and keeps the file. (mnaza, #335)
 - Pi search results could be fetched but not cited: pi hands the
   model `content` only, and the extension was not a detected
   client, so the result URLs stayed in the `structuredContent` the
