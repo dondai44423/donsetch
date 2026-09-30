@@ -388,6 +388,19 @@ function getPreview(text: string, maxLen = 72): string {
   return "";
 }
 
+/** Parse the server's folded state block: a leading "[meta] {json}". */
+function parseFoldedMeta(blocks: string[]): any {
+  for (const b of blocks) {
+    if (!b.startsWith("[meta] ")) continue;
+    try {
+      return JSON.parse(b.slice("[meta] ".length).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /** Count numbered search results in text. */
 function countSearchResults(text: string): number {
   const matches = text.match(/^\d+\.\s/gm);
@@ -525,17 +538,22 @@ export default function (pi: ExtensionAPI) {
               _signal,
               callTimeoutFor(toolName, params)
             );
-            // Join all content text blocks, skipping [meta] blocks.
-            // [meta] blocks contain compact metadata for clients
-            // (Claude Code, VSCode) that drop text when
-            // structuredContent is present. Pi reads structuredContent
-            // directly for details, so meta blocks are redundant here.
-            const text = (result?.content ?? [])
-              .map((b: any) => b?.text ?? "")
-              .filter((t: string) => !t.startsWith("[meta]"))
-              .join("") || "";
+            // Every content block, joined verbatim: this is exactly
+            // what pi hands the model. The server folds state into a
+            // leading [meta] block for the clients whose model sees
+            // only `content` (pi among them), and that block carries
+            // the result URLs behind the S handles, next_offset and
+            // error codes, so it must not be dropped here. The detail
+            // helpers below skip meta-shaped lines where they look
+            // for prose.
+            const blocks = (result?.content ?? []).map((b: any) => b?.text ?? "");
+            const text = blocks.join("") || "";
             const isErr = result?.isError ?? false;
-            const sc = result?.structuredContent ?? null;
+            // Folded sessions omit structuredContent; when it is
+            // absent, recover the same state from the [meta] block so
+            // the TUI badge readers (blocked / thin / source) keep
+            // working.
+            const sc = result?.structuredContent ?? parseFoldedMeta(blocks);
             const dbg = result?._meta?.["com.donsetch/fetch-debug"] ?? null;
             // Issue #172: provider moved to _meta for compact search
             // responses, so the BYOK label must read the telemetry

@@ -1,11 +1,14 @@
 //! MCP client-compat layer for harnesses that show the model only
 //! one surface and discard the other.
 //!
-//! Two observed failure modes:
+//! Three observed failure modes:
 //! - `structuredContent` only, `content` dropped (Claude Code, VS Code:
 //!   the model sees tool metadata but never the document).
 //! - `content` only, `structuredContent` dropped (OpenCode v1: the model
 //!   sees the document but never the compact state).
+//! - `content` only, `structuredContent` kept off the model surface
+//!   (the pi extension: the model sees the document but never the
+//!   compact state).
 //!
 //! DonSeTch's shape is deliberately split: `content` carries the
 //! document markdown, `structuredContent` carries compact actionable
@@ -81,6 +84,8 @@ impl Default for ModeCell {
 ///
 /// - Claude Code / VS Code: keep `structuredContent`, drop `content`.
 /// - OpenCode v1: keep `content`, drop `structuredContent`.
+/// - The pi extension (`pi-donsetch`): hands the model `content`
+///   only; `structuredContent` is not a model-facing surface there.
 ///
 /// Wrappers reusing one of these names get one redundant surface at
 /// worst (a client that renders text AND matches here sees the meta
@@ -94,6 +99,7 @@ const TEXT_ONLY_CLIENTS: &[&str] = &[
     "claude-code", // renders structuredContent
     "opencode",    // renders only content
     "vscode",      // renders structuredContent
+    "pi-donsetch", // the pi extension hands the model content only
 ];
 
 /// Handshake-detected mode from `clientInfo.name`. Lenient by
@@ -311,6 +317,10 @@ mod tests {
         assert_eq!(mode_from_params(&oc), ClientMode::TextOnly);
         let vs = json!({ "clientInfo": { "name": "vscode" } });
         assert_eq!(mode_from_params(&vs), ClientMode::TextOnly);
+        // The pi extension's handshake name; the model there sees
+        // `content` only, so it folds like the rest.
+        let pi = json!({ "clientInfo": { "name": "pi-donsetch" } });
+        assert_eq!(mode_from_params(&pi), ClientMode::TextOnly);
         // An unlisted client keeps the token-optimal split shape.
         let other = json!({ "clientInfo": { "name": "cursor" } });
         assert_eq!(mode_from_params(&other), ClientMode::Default);
