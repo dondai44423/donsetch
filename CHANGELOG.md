@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The HTTP transport checked neither `Origin` nor `Host`, so with
+  auth off (the default) any web page open in a local browser could
+  fire tool calls at it blind through a cross-site POST that no CORS
+  preflight stops, and a page whose name resolves to 127.0.0.1 (DNS
+  rebinding) could read the answers. Every `/mcp` route now refuses
+  a browser `Origin` unless the page is on loopback or CORS mode
+  (which requires the token) is on, and a server bound to loopback
+  refuses a `Host` that is not a loopback name on its own port.
+  Native clients send no `Origin` and are unaffected. (mnaza, #333)
 - Pi search results could be fetched but not cited: pi hands the
   model `content` only, and the extension was not a detected
   client, so the result URLs stayed in the `structuredContent` the

@@ -220,7 +220,7 @@ Aliases: `original` for `chromium`, `original-headless` for `headless`. Public C
 
 `--supervised` is the crash-only daemon: a panic is a blip, the daemon restarts itself, the session survives. Without a global install, use `"command": "npx", "args": ["donsetch", "mcp"]`.
 
-HTTP transport instead of stdio: `donsetch mcp --http --port 8765`, clients connect to `http://localhost:8765/mcp`. Sessions, cancellation, `/health`, token auth via `DONSETCH_HTTP_TOKEN` and per-request timeouts are documented in `donsetch mcp --help`.
+HTTP transport instead of stdio: `donsetch mcp --http --port 8765`, clients connect to `http://localhost:8765/mcp`. Sessions, cancellation, `/health`, token auth via `DONSETCH_HTTP_TOKEN` and per-request timeouts are documented in `donsetch mcp --help`. A request that carries a browser `Origin` is refused unless the page is on loopback or CORS mode (`DONSETCH_HTTP_CORS`, which requires the token) is on, and a server bound to loopback answers only to loopback `Host` names on its own port, so a web page cannot drive it and a DNS-rebound name cannot read from it.
 
 **CLI (for humans and scripts).** Same engine, thin adapter:
 

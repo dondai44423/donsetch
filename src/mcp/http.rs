@@ -96,6 +96,8 @@ struct HttpState {
     /// When set, requests must carry `Authorization: Bearer <token>`.
     auth_token: Option<String>,
     timeout: Duration,
+    cors_enabled: bool,
+    bound: Bound,
 }
 
 /// Run the HTTP MCP server until SIGTERM/SIGINT.
@@ -124,6 +126,8 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
         }),
         auth_token,
         timeout,
+        cors_enabled,
+        bound: Bound::new(&host, port),
     };
 
     let app = Router::new()
@@ -215,6 +219,99 @@ fn validate_http_config(cors_enabled: bool, auth_enabled: bool) -> Result<(), St
     Ok(())
 }
 
+/// Where the server listens, as the request checks need it.
+#[derive(Clone, Debug)]
+struct Bound {
+    loopback: bool,
+    port: u16,
+}
+
+impl Bound {
+    fn new(host: &str, port: u16) -> Self {
+        Self {
+            loopback: is_loopback_name(host),
+            port,
+        }
+    }
+}
+
+/// True for the names a loopback server answers to: `localhost`,
+/// `127.0.0.1` (any 127/8 literal), `::1`, with or without brackets.
+fn is_loopback_name(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") || h == "::1" {
+        return true;
+    }
+    h.parse::<std::net::Ipv4Addr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+        || h.parse::<std::net::Ipv6Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Splits `host[:port]` as it appears in a Host header or an Origin
+/// authority, bracketed IPv6 included. `None` when the port is not a
+/// number.
+fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
+    let a = authority.trim();
+    if let Some(rest) = a.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        return match &rest[end + 1..] {
+            "" => Some((host, None)),
+            p => Some((host, Some(p.strip_prefix(':')?.parse().ok()?))),
+        };
+    }
+    match a.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => Some((host, Some(port.parse().ok()?))),
+        _ => Some((a, None)),
+    }
+}
+
+/// The request checks that run before auth on every /mcp route.
+///
+/// - `Origin`: a browser sets it on every cross-site request, a
+///   native MCP client never does. With CORS off (auth may be off
+///   too) only a loopback page is admitted; CORS mode, which
+///   `validate_http_config` allows only with auth, admits any.
+/// - `Host`: a server bound to loopback answers only to loopback
+///   names on its own port, so a page whose name resolves to
+///   127.0.0.1 (DNS rebinding) is refused; a request without a Host
+///   header is not a browser's; a server the operator bound to a
+///   reachable address answers to any name.
+///
+/// `Err` carries the word for the refusal.
+fn request_allowed(
+    headers: &HeaderMap,
+    cors_enabled: bool,
+    bound: &Bound,
+) -> Result<(), &'static str> {
+    if let Some(origin) = headers.get("origin") {
+        let origin = origin.to_str().unwrap_or("");
+        let loopback_origin = origin
+            .split_once("://")
+            .and_then(|(_, rest)| split_host_port(rest))
+            .is_some_and(|(host, _)| is_loopback_name(host));
+        if !cors_enabled && !loopback_origin {
+            return Err("origin not allowed");
+        }
+    }
+    // A browser always sends Host and a rebound name needs one, so
+    // only a Host that is present and foreign is refused.
+    if bound.loopback
+        && let Some(raw) = headers.get("host")
+    {
+        let Some((host, port)) = raw.to_str().ok().and_then(split_host_port) else {
+            return Err("host not allowed");
+        };
+        if !is_loopback_name(host) || port.is_some_and(|p| p != bound.port) {
+            return Err("host not allowed");
+        }
+    }
+    Ok(())
+}
+
 /// Bearer-auth check shared by every /mcp method (health stays open).
 fn authorized(state: &HttpState, headers: &HeaderMap) -> bool {
     token_ok(state.auth_token.as_deref(), headers)
@@ -264,6 +361,9 @@ fn silent_stream(max: Duration) -> impl Stream<Item = Result<Event, Infallible>>
 /// OpenCode notably : treat as fatal. See the module docs for the
 /// lifetime/reconnect reasoning.
 async fn sse_handler(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if request_allowed(&headers, state.cors_enabled, &state.bound).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if !authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -287,6 +387,9 @@ async fn sse_handler(State(state): State<HttpState>, headers: HeaderMap) -> Resp
 /// Session termination: drop the cancellation registry so a vanished
 /// client's entry cannot linger until the idle TTL collects it.
 async fn delete_handler(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if request_allowed(&headers, state.cors_enabled, &state.bound).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if !authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -421,7 +524,12 @@ impl HttpState {
 /// all work identically on both transports. See the module docs for
 /// the session and cancellation model.
 async fn mcp_handler(State(state): State<HttpState>, headers: HeaderMap, body: Bytes) -> Response {
-    // Auth gate: applies to /mcp only; /health stays open for probes.
+    // Origin and Host first: a browser page or a rebound name gets a
+    // 403 before anything is parsed. Then the auth gate: applies to
+    // /mcp only; /health stays open for probes.
+    if let Err(why) = request_allowed(&headers, state.cors_enabled, &state.bound) {
+        return rpc_error(StatusCode::FORBIDDEN, -32000, why);
+    }
     if !authorized(&state, &headers) {
         return rpc_error(StatusCode::UNAUTHORIZED, -32000, "unauthorized");
     }
@@ -585,6 +693,100 @@ mod tests {
     fn no_cors_is_always_allowed_regardless_of_auth() {
         assert!(validate_http_config(false, false).is_ok());
         assert!(validate_http_config(false, true).is_ok());
+    }
+
+    // Browser pages are the one client class the server never asked
+    // for: with auth off (the default) a page in a local browser can
+    // POST a JSON-RPC body as a "simple request" that no CORS
+    // preflight stops, and with DNS rebinding it reads the answer.
+    // Native clients send no Origin and pass; a loopback page passes;
+    // CORS mode (auth required) admits any origin on purpose.
+    #[test]
+    fn a_browser_origin_is_refused_unless_loopback_or_cors_mode() {
+        let bound = Bound::new("127.0.0.1", 8765);
+        let with = |name: &'static str, v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_str(v).unwrap());
+            h
+        };
+        let none = HeaderMap::new();
+        assert!(
+            request_allowed(&none, false, &bound).is_ok(),
+            "no Origin: a native client"
+        );
+        for origin in [
+            "https://evil.example",
+            "http://evil.example:8765",
+            "null",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example:8765",
+        ] {
+            assert!(
+                request_allowed(&with("origin", origin), false, &bound).is_err(),
+                "{origin} must be refused"
+            );
+            assert!(
+                request_allowed(&with("origin", origin), true, &bound).is_ok(),
+                "{origin} is admitted in CORS mode, which requires auth"
+            );
+        }
+        for origin in [
+            "http://localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1:8765",
+            "https://127.0.0.1",
+            "http://[::1]:8765",
+            "HTTP://LOCALHOST:8765",
+        ] {
+            assert!(
+                request_allowed(&with("origin", origin), false, &bound).is_ok(),
+                "{origin} is a loopback page"
+            );
+        }
+    }
+
+    // The Host header is what DNS rebinding forges: a page at
+    // attacker.example resolving to 127.0.0.1 reaches the server
+    // with `Host: attacker.example`. A server bound to loopback only
+    // answers to loopback names on its own port.
+    #[test]
+    fn a_loopback_server_refuses_a_foreign_host_header() {
+        let bound = Bound::new("127.0.0.1", 8765);
+        let host = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("host", HeaderValue::from_str(v).unwrap());
+            h
+        };
+        for ok in [
+            "127.0.0.1:8765",
+            "localhost:8765",
+            "[::1]:8765",
+            "LOCALHOST:8765",
+            "127.0.0.1",
+            "localhost",
+        ] {
+            assert!(request_allowed(&host(ok), false, &bound).is_ok(), "{ok}");
+        }
+        for bad in [
+            "attacker.example",
+            "attacker.example:8765",
+            "127.0.0.1:9999",
+            "127.0.0.1.attacker.example:8765",
+            "",
+        ] {
+            assert!(
+                request_allowed(&host(bad), false, &bound).is_err(),
+                "{bad:?}"
+            );
+        }
+        // Bound to every interface on purpose: the operator chose a
+        // reachable server, and no single name is the right one.
+        let wide = Bound::new("0.0.0.0", 8765);
+        assert!(request_allowed(&host("attacker.example:8765"), false, &wide).is_ok());
+        // A loopback Origin still cannot come with a foreign Host.
+        let mut both = host("attacker.example:8765");
+        both.insert("origin", HeaderValue::from_static("http://localhost:8765"));
+        assert!(request_allowed(&both, false, &bound).is_err());
     }
 
     #[test]
