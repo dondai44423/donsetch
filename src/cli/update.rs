@@ -387,12 +387,33 @@ fn acquire_update_lock_in(dir: &Path) -> Result<std::fs::File, String> {
         // A filesystem that cannot lock (some network mounts): the
         // update goes on unserialized, as every update did before
         // this lock existed, rather than being refused for good.
-        Err(std::fs::TryLockError::Error(_)) => {}
+        // Say so loudly: nothing else tells the user that two
+        // updates can race here.
+        Err(std::fs::TryLockError::Error(cause)) => {
+            println!(
+                "  {} {}",
+                cli::icon_warn(),
+                lock_unavailable_note(&lock_path, &cause)
+            );
+            println!(
+                "    continuing without the update lock: a parallel update would not be detected."
+            );
+        }
     }
     let _ = f.set_len(0);
     let _ = f.rewind();
     let _ = writeln!(f, "{}", std::process::id());
     Ok(f)
+}
+
+/// The degraded-path warning line, split out so its wording is pinned
+/// by a test without needing a filesystem that cannot lock. The
+/// caller prints it and continues.
+fn lock_unavailable_note(lock_path: &Path, cause: &std::io::Error) -> String {
+    format!(
+        "{} cannot be locked on this filesystem ({cause});",
+        lock_path.display()
+    )
 }
 
 /// Wipe and recreate the per-update extract workspace.
@@ -1345,5 +1366,20 @@ mod tests {
             drop(held);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The degraded path (a filesystem that cannot lock) cannot be
+    // produced in a test, so what is pinned here is the note the
+    // warning prints, built from the io error the attempt returned.
+    // The end-to-end behavior carries a live receipt instead.
+    #[test]
+    fn a_filesystem_that_cannot_lock_gets_a_named_note() {
+        let lock_path = std::path::Path::new("/cache/update.lock");
+        let cause = std::io::Error::from_raw_os_error(37); // ENOLCK on Linux; any io error works
+        let note = lock_unavailable_note(lock_path, &cause);
+        assert!(note.contains("update.lock"), "{note}");
+        assert!(note.contains("cannot be locked"), "{note}");
+        assert!(note.contains(&cause.to_string()), "{note}");
+        assert!(note.ends_with(';'), "{note}");
     }
 }
