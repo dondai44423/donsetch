@@ -5,6 +5,23 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Pi search results could be fetched but not cited: pi hands the
+  model `content` only, and the extension was not a detected
+  client, so the result URLs stayed in the `structuredContent` the
+  model never sees. Pi is detected now and gets the `[meta]` fold:
+  the state, result URLs included, leads the text block the model
+  reads. The extension also stopped dropping that block when
+  parsing its own text and reads the folded state for its TUI
+  badges. (codequentoum, #329)
+- The update lock degraded silently on a filesystem that cannot
+  hold locks (some network mounts): the run proceeded unserialized
+  with nothing said. It now prints a loud warning naming the lock
+  and the cause before continuing. (Mart-Bogdan, #330)
+
 ## [4.4.1] - 2026-09-29
 
 ### Fixed
