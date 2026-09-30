@@ -1447,6 +1447,13 @@ impl Ghost {
         self.frozen
     }
 
+    /// True when the DevTools link has ended although the process
+    /// may still be running: a proxy reset, or a reply too large to
+    /// frame. Such a browser answers nothing and must be relaunched.
+    pub fn link_dead(&self) -> bool {
+        self.cdp.is_dead()
+    }
+
     /// Reap the browser entirely : the whole process tree,
     /// plus crashpad handlers on Unix (they daemonize into
     /// their own groups and escape the group kill; on Windows

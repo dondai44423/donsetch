@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A browser whose DevTools link had ended kept being served as a
+  warm slot: the link's reader task stopped on a closed socket or on
+  a reply over the websocket frame limit (16 MiB by default; a large
+  page's `outerHTML` reaches it, a page can make it on purpose), and
+  nothing recorded that, so every call in flight waited out its own
+  timeout and the pool, which only checked that the process was
+  alive, handed the same dead browser out again. The link marks
+  itself dead when its reader ends, fails the waiting calls at once,
+  refuses new ones, and the pool relaunches the slot; the frame
+  limit is raised to the 64 MiB message limit. (mnaza, #332)
 - Pi search results could be fetched but not cited: pi hands the
   model `content` only, and the extension was not a detected
   client, so the result URLs stayed in the `structuredContent` the

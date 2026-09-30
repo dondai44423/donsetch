@@ -17,13 +17,19 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Largest DevTools message the client accepts, and the frame limit
+/// with it: a full-page screenshot or a large document's outerHTML
+/// is tens of MB, well over tungstenite's 16 MiB default frame.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Cdp {
     write: Arc<Mutex<futures_util::stream::SplitSink<Ws, Message>>>,
@@ -34,6 +40,9 @@ pub struct Cdp {
     #[allow(dead_code)]
     events: broadcast::Sender<Value>,
     next_id: Arc<AtomicU64>,
+    /// Set once the demux reader has ended: the link is gone even
+    /// if the browser process is not.
+    dead: Arc<AtomicBool>,
 }
 
 impl Clone for Cdp {
@@ -43,6 +52,7 @@ impl Clone for Cdp {
             pending: Arc::clone(&self.pending),
             events: self.events.clone(),
             next_id: Arc::clone(&self.next_id),
+            dead: Arc::clone(&self.dead),
         }
     }
 }
@@ -51,22 +61,43 @@ impl Cdp {
     /// Connect to a browser-level ws endpoint and spawn the
     /// demux reader task.
     pub async fn connect(ws_url: &str) -> Result<Self, FetchError> {
+        Self::connect_with_limit(ws_url, MAX_MESSAGE_BYTES).await
+    }
+
+    /// `connect` with the message and frame limit as a parameter.
+    pub(crate) async fn connect_with_limit(
+        ws_url: &str,
+        max_bytes: usize,
+    ) -> Result<Self, FetchError> {
         // The only unguarded network primitive in the ghost stack :
         // a browser that accepts TCP but stalls the WS handshake
         // would hang the tool call forever.
-        let (ws, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(ws_url))
-                .await
-                .map_err(|_| FetchError::ghost("cdp connect: ws handshake timeout"))?
-                .map_err(|e| FetchError::ghost(format!("cdp connect: {e}")))?;
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(max_bytes);
+        ws_config.max_frame_size = Some(max_bytes);
+        let (ws, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_async_with_config(ws_url, Some(ws_config), false),
+        )
+        .await
+        .map_err(|_| FetchError::ghost("cdp connect: ws handshake timeout"))?
+        .map_err(|e| FetchError::ghost(format!("cdp connect: {e}")))?;
         let (write, mut read) = ws.split();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_task = Arc::clone(&pending);
         let (events_tx, _) = broadcast::channel(256);
         let events_task = events_tx.clone();
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_task = Arc::clone(&dead);
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = read.next().await {
+            loop {
+                let msg = match read.next().await {
+                    Some(Ok(msg)) => msg,
+                    // Closed by the peer, or a reply the client will
+                    // not frame: either way nothing more arrives here.
+                    Some(Err(_)) | None => break,
+                };
                 let Message::Text(text) = msg else {
                     continue;
                 };
@@ -82,13 +113,27 @@ impl Cdp {
                     let _ = events_task.send(v);
                 }
             }
+            // The link is gone while the browser process may not be.
+            // Fail every waiter now (dropping a sender ends its
+            // receiver) instead of at each call's own timeout, and
+            // let the holder see it before it serves another job.
+            dead_task.store(true, Ordering::Release);
+            pending_task.lock().await.clear();
         });
         Ok(Self {
             write: Arc::new(Mutex::new(write)),
             pending,
             events: events_tx,
             next_id: Arc::new(AtomicU64::new(1)),
+            dead,
         })
+    }
+
+    /// True once the DevTools link has ended (the browser exited,
+    /// the socket closed, or a reply broke the framing limits). A
+    /// dead link answers nothing; the holder relaunches.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     /// Call a method. `session` scopes it to an attached
@@ -114,6 +159,9 @@ impl Cdp {
         params: Value,
         timeout_secs: u64,
     ) -> Result<Value, FetchError> {
+        if self.is_dead() {
+            return Err(FetchError::ghost(format!("cdp link closed: {method}")));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(s) = session {
@@ -284,6 +332,99 @@ fn fetch_guard_step(res: Result<Value, broadcast::error::RecvError>) -> GuardSte
         Ok(ev) => GuardStep::Event(ev),
         Err(broadcast::error::RecvError::Lagged(_skipped)) => GuardStep::Skip,
         Err(broadcast::error::RecvError::Closed) => GuardStep::Stop,
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    // A DevTools endpoint stand-in: accepts one websocket and runs
+    // `serve` on it.
+    async fn endpoint<F, Fut>(serve: F) -> String
+    where
+        F: FnOnce(WebSocketStream<TcpStream>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = accept_async(stream).await.unwrap();
+            serve(ws).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    // The browser process can outlive its DevTools link (a proxy in
+    // between resets, a reply breaks the framing limits). Every call
+    // in flight has to fail when the link ends, not when its own
+    // timeout runs out, and the holder has to be able to see it.
+    #[tokio::test]
+    async fn a_closed_link_fails_every_pending_call_at_once() {
+        let url = endpoint(|mut ws| async move {
+            let _ = ws.next().await;
+            let _ = ws.next().await;
+            drop(ws);
+        })
+        .await;
+        let cdp = Cdp::connect(&url).await.unwrap();
+        let started = Instant::now();
+        let (a, b) = tokio::join!(
+            cdp.call_with_timeout(None, "Target.getTargets", json!({}), 6),
+            cdp.call_with_timeout(None, "Target.getTargets", json!({}), 6),
+        );
+        assert!(a.is_err() && b.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the waiters outlived the link by {:?}",
+            started.elapsed()
+        );
+        assert!(cdp.is_dead(), "a closed link is dead");
+        let started = Instant::now();
+        let later = cdp
+            .call_with_timeout(None, "Target.getTargets", json!({}), 6)
+            .await;
+        assert!(later.is_err() && started.elapsed() < Duration::from_secs(1));
+        assert!(
+            later.unwrap_err().to_string().contains("link closed"),
+            "a call on a dead link says so"
+        );
+    }
+
+    // A page can make its own DOM as large as it likes, and
+    // outer_html asks for all of it. A reply the client will not
+    // frame must fail that call, not silently end the reader with
+    // the browser still alive.
+    #[tokio::test]
+    async fn an_oversized_reply_fails_the_call_and_marks_the_link_dead() {
+        let url = endpoint(|mut ws| async move {
+            let Some(Ok(Message::Text(req))) = ws.next().await else {
+                return;
+            };
+            let id = serde_json::from_str::<Value>(&req).unwrap()["id"].clone();
+            let huge = "a".repeat((1 << 20) + 1024);
+            let reply = json!({ "id": id, "result": { "outerHTML": huge } }).to_string();
+            let _ = ws.send(Message::Text(reply.into())).await;
+            // Stay open: the browser is alive, only the reply was too big.
+            tokio::time::sleep(Duration::from_secs(8)).await;
+        })
+        .await;
+        let cdp = Cdp::connect_with_limit(&url, 1 << 20).await.unwrap();
+        let started = Instant::now();
+        let r = cdp
+            .call_with_timeout(None, "DOM.getOuterHTML", json!({}), 6)
+            .await;
+        assert!(r.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the call waited for its timeout ({:?}) instead of failing with the link",
+            started.elapsed()
+        );
+        assert!(cdp.is_dead());
     }
 }
 

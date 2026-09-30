@@ -353,9 +353,11 @@ impl GhostManager {
         guard.key = Some(key);
         guard.host = host.map(|h| h.to_string());
         guard.wire = Some(wire.clone());
+        // A live process with a dead DevTools link is not a warm
+        // browser: every call on it would only time out.
         let need_launch = match guard.ghost.as_mut() {
             None => true,
-            Some(g) => !g.thaw(),
+            Some(g) => !g.thaw() || g.link_dead(),
         };
         if need_launch {
             if crate::config::cfg().debug.ghost {
