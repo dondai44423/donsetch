@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `web_screenshot` timed out on macOS while every other ghost call
+  answered: the window is deliberately minimized for invisibility,
+  a minimized window presents no frames, and Chromium's classic
+  capture path waits for a presented frame, so the capture ran out
+  the whole CDP timeout. Captures now un-minimize the window for
+  their call and re-minimize after, and the browser launches with
+  `--enable-features=CDPScreenshotNewSurface` (Chromium's own
+  remedy for stalls on frames not being presented, off by default
+  and enabled by Playwright) plus
+  `--disable-backgrounding-occluded-windows` (an off-screen window
+  counts as occluded and would otherwise be backgrounded).
+  (warc0s, #331)
 - Pi search results could be fetched but not cited: pi hands the
   model `content` only, and the extension was not a detected
   client, so the result URLs stayed in the `structuredContent` the
