@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A browser whose DevTools link had ended kept being served as a
+  warm slot: the link's reader task stopped on a closed socket or on
+  a reply over the websocket frame limit (16 MiB by default; a large
+  page's `outerHTML` reaches it, a page can make it on purpose), and
+  nothing recorded that, so every call in flight waited out its own
+  timeout and the pool, which only checked that the process was
+  alive, handed the same dead browser out again. The link marks
+  itself dead when its reader ends, fails the waiting calls at once,
+  refuses new ones, and the pool relaunches the slot; the frame
+  limit is raised to the 64 MiB message limit. (mnaza, #332)
 - The HTTP transport checked neither `Origin` nor `Host`, so with
   auth off (the default) any web page open in a local browser could
   fire tool calls at it blind through a cross-site POST that no CORS
@@ -18,6 +28,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (which requires the token) is on, and a server bound to loopback
   refuses a `Host` that is not a loopback name on its own port.
   Native clients send no `Origin` and are unaffected. (mnaza, #333)
+- Over the HTTP transport, a tool call that sent more than 256
+  progress notifications (a crawl with a progress token running past
+  about eight minutes) finished but never answered: its progress
+  channel had no reader while the tool ran, the forwarder blocked on
+  the 257th line, and the call ended as a request timeout. The
+  channel is drained for the life of the call. (mnaza, #334)
+- `DONSETCH_NO_CONFIG_FILE` read any value that was not an off-word
+  as on, an empty export included (`DONSETCH_NO_CONFIG_FILE= donsetch`,
+  a blank value in a `.cargo/config.toml` `[env]` block), so it
+  silently dropped `donsetch.toml`, and with `DONSETCH_CONFIG` also
+  set it failed the load naming a `=1` the user never wrote. It reads
+  the same words as every other boolean now, and a value that is not
+  a boolean is reported once and keeps the file. (mnaza, #335)
+- `web_screenshot` timed out on macOS while every other ghost call
+  answered: the window is deliberately minimized for invisibility,
+  a minimized window presents no frames, and Chromium's classic
+  capture path waits for a presented frame, so the capture ran out
+  the whole CDP timeout. Captures now un-minimize the window for
+  their call and re-minimize after, and the browser launches with
+  `--enable-features=CDPScreenshotNewSurface` (Chromium's own
+  remedy for stalls on frames not being presented, off by default
+  and enabled by Playwright) plus
+  `--disable-backgrounding-occluded-windows` (an off-screen window
+  counts as occluded and would otherwise be backgrounded).
+  (warc0s, #331)
 - Pi search results could be fetched but not cited: pi hands the
   model `content` only, and the extension was not a detected
   client, so the result URLs stayed in the `structuredContent` the
