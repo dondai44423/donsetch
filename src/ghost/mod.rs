@@ -130,6 +130,12 @@ pub struct Ghost {
     /// `fetch::guards::ensure_url_safe` before it hits the network.
     /// Aborted in Drop so it cannot leak after Chrome is reaped.
     fetch_guard: Option<tokio::task::JoinHandle<()>>,
+    /// The browser window found at launch (None when no window was
+    /// found) and whether it is currently minimized. Captures
+    /// restore the window for their call and re-minimize after;
+    /// see `capture_screenshot_data`. Issue #331.
+    window_id: Option<i64>,
+    window_minimized: std::sync::atomic::AtomicBool,
 
     /// Windows profile-exclusion lockfile path (unix uses flock
     /// instead). Removed in Drop so the next daemon can take the
@@ -233,6 +239,20 @@ pub fn default_chrome_args_wire(
         "--disk-cache-size=1".into(),
         "--disable-gpu-shader-disk-cache".into(),
         "--disable-features=SiteEngagementService".into(),
+        // Captures must not wait for the window to present a frame.
+        // Chromium's default screenshot path does exactly that, and
+        // its own `CDPScreenshotNewSurface` feature (disabled by
+        // default; Playwright enables it) exists to "avoid a
+        // possible stall due to frames not being presented". The
+        // ghost window is deliberately off-screen and minimized,
+        // which is that stall: on macOS a capture ran out its whole
+        // CDP timeout while every other call answered (#331).
+        "--enable-features=CDPScreenshotNewSurface".into(),
+        // An off-screen window counts as occluded, and Chromium
+        // backgrounds occluded windows, halting their rendering.
+        // This window is the only one this tool has; keep it
+        // rendering. (Playwright ships the same switch.)
+        "--disable-backgrounding-occluded-windows".into(),
         // Software WebGL: a GPU-less box (Xvfb, VM, container)
         // must still expose a renderer string. WebGL=null is a
         // headless-only signature real desktops never produce;
@@ -1295,6 +1315,11 @@ impl Ghost {
         // window is both off-screen and minimized. Chrome still
         // renders normally (minimized ≠ background tab; the
         // active tab's visibilityState stays "visible").
+        // The state is kept: a capture un-minimizes the window for
+        // its call and re-minimizes after (a minimized window
+        // presents no frames, issue #331).
+        let mut window_id: Option<i64> = None;
+        let mut window_minimized = false;
         if let Ok(win) = cdp
             .call(
                 None,
@@ -1304,6 +1329,7 @@ impl Ghost {
             .await
             && let Some(id) = win.get("windowId").and_then(Value::as_i64)
         {
+            window_id = Some(id);
             let _ = cdp
                 .call(
                     None,
@@ -1314,6 +1340,7 @@ impl Ghost {
                     }),
                 )
                 .await;
+            window_minimized = true;
         }
 
         // The layout viewport is pinned whenever the renderer has no real
@@ -1397,6 +1424,8 @@ impl Ghost {
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
+            window_id,
+            window_minimized: std::sync::atomic::AtomicBool::new(window_minimized),
             #[cfg(windows)]
             winlock,
             #[cfg(windows)]
@@ -1772,6 +1801,77 @@ impl Ghost {
         }
     }
 
+    /// `Page.captureScreenshot` bytes (base64), with the window
+    /// restored around the call.
+    ///
+    /// A window that launched minimized presents no frames, and the
+    /// classic capture path waits for a presented frame: on macOS
+    /// that wait ran out the whole CDP timeout while every other
+    /// ghost call answered (issue #331). The window is off-screen
+    /// either way, so the capture un-minimizes it for its call and
+    /// puts it back after; the invisibility the minimize bought is
+    /// unchanged.
+    async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
+        self.unminimize_for_capture().await;
+        let result = self
+            .cdp
+            .call(Some(&self.session), "Page.captureScreenshot", params)
+            .await;
+        self.reminimize_after_capture().await;
+        result?
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| FetchError::ghost("no screenshot data"))
+    }
+
+    /// Un-minimize a window we minimized at launch, best-effort.
+    /// A window this Ghost never minimized is left alone.
+    async fn unminimize_for_capture(&self) {
+        if !self
+            .window_minimized
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let Some(id) = self.window_id else {
+            return;
+        };
+        let _ = self
+            .cdp
+            .call(
+                None,
+                "Browser.setWindowBounds",
+                json!({ "windowId": id, "bounds": { "windowState": "normal" } }),
+            )
+            .await;
+    }
+
+    /// Put the window back the way launch left it: off every screen
+    /// and minimized, invisible in macOS's Dock and Windows's
+    /// taskbar (the launch block that minimized it first).
+    async fn reminimize_after_capture(&self) {
+        use std::sync::atomic::Ordering;
+        if self.window_minimized.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(id) = self.window_id else {
+            return;
+        };
+        if self
+            .cdp
+            .call(
+                None,
+                "Browser.setWindowBounds",
+                json!({ "windowId": id, "bounds": { "windowState": "minimized" } }),
+            )
+            .await
+            .is_ok()
+        {
+            self.window_minimized.store(true, Ordering::Release);
+        }
+    }
+
     /// PNG screenshot → path (D16 byproduct).
     /// Destination is validated through the centralized
     /// `paths::resolve_screenshot_path` helper BEFORE any CDP capture,
@@ -1780,17 +1880,8 @@ impl Ghost {
         let dest = crate::paths::resolve_screenshot_path(path)
             .map_err(|e| FetchError::ghost(format!("screenshot path rejected: {e}")))?;
         let data = self
-            .cdp
-            .call(
-                Some(&self.session),
-                "Page.captureScreenshot",
-                json!({ "format": "png" }),
-            )
-            .await?
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no screenshot data"))?
-            .to_string();
+            .capture_screenshot_data(json!({ "format": "png" }))
+            .await?;
         let bytes = decode_screenshot_data(&data)?;
         save_screenshot(&dest, &bytes)
     }
@@ -1800,17 +1891,8 @@ impl Ghost {
     /// everything else is the same capture as [`Self::screenshot`].
     pub async fn screenshot_bytes(&self, full_page: bool) -> Result<Vec<u8>, FetchError> {
         let data = self
-            .cdp
-            .call(
-                Some(&self.session),
-                "Page.captureScreenshot",
-                json!({ "format": "png", "captureBeyondViewport": full_page }),
-            )
-            .await?
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no screenshot data"))?
-            .to_string();
+            .capture_screenshot_data(json!({ "format": "png", "captureBeyondViewport": full_page }))
+            .await?;
         decode_screenshot_data(&data)
     }
 
@@ -2445,6 +2527,28 @@ mod sandbox_tests {
         assert!(
             !args.iter().any(|a| a == "--disable-setuid-sandbox"),
             "default args must not contain --disable-setuid-sandbox"
+        );
+    }
+
+    // A minimized window presents no frames, and the classic capture
+    // path waits for a presented frame; on macOS that ran out the
+    // whole CDP timeout while every other call answered (#331).
+    // These two flags kill that stall at the source, and the capture
+    // path un-minimizes around its call.
+    #[test]
+    fn default_args_keep_captures_off_frame_presentation() {
+        let dir = std::path::PathBuf::from("/tmp/test-profile");
+        let profile = BrowserProfile::host_default();
+        let args = default_chrome_args(&dir, &profile);
+        assert!(
+            args.iter()
+                .any(|a| a == "--enable-features=CDPScreenshotNewSurface"),
+            "captures must not wait for presented frames: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--disable-backgrounding-occluded-windows"),
+            "the off-screen window must keep rendering: {args:?}"
         );
     }
 
