@@ -861,6 +861,28 @@ fn is_executable(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
+/// What `unminimize_for_capture` did with the launch-minimized
+/// window, so the caller knows whether a capture must first wait for
+/// a presented compositor surface.
+enum WindowRestore {
+    /// The Ghost never minimized this window: nothing to wait for.
+    NotMinimized,
+    /// The window was minimized and is back to `normal`.
+    Restored,
+    /// The window was minimized but the restore call failed. It is
+    /// still not presenting frames, so it needs the same wait.
+    Failed,
+}
+
+impl WindowRestore {
+    /// Only a window that was never minimized can skip the wait: a
+    /// failed restore leaves the window un-presented too, and a
+    /// capture against it fails the same instant way.
+    fn needs_surface_wait(self) -> bool {
+        !matches!(self, Self::NotMinimized)
+    }
+}
+
 impl Ghost {
     /// Launch cold. Headful Chrome on Xvfb (Linux) : the real
     /// stealth mode. Headful has real WebGL, real window.chrome,
@@ -1819,8 +1841,8 @@ impl Ghost {
     /// puts it back after; the invisibility the minimize bought is
     /// unchanged.
     async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
-        let restored = self.unminimize_for_capture().await;
-        if restored {
+        let restore = self.unminimize_for_capture().await;
+        if restore.needs_surface_wait() {
             self.wait_for_capture_surface().await;
         }
         let mut result = self
@@ -1854,20 +1876,22 @@ impl Ghost {
     }
 
     /// Un-minimize a window we minimized at launch, best-effort.
-    /// A window this Ghost never minimized is left alone. Returns
-    /// whether the window was actually asked to restore, so the
-    /// caller knows whether it must wait for the compositor surface.
-    async fn unminimize_for_capture(&self) -> bool {
+    /// A window this Ghost never minimized is left alone. The state
+    /// it reports lets the caller wait for the compositor surface
+    /// even when the restore call itself failed: a window that was
+    /// minimized is not presenting frames either way.
+    async fn unminimize_for_capture(&self) -> WindowRestore {
         if !self
             .window_minimized
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            return false;
+            return WindowRestore::NotMinimized;
         }
         let Some(id) = self.window_id else {
-            return false;
+            return WindowRestore::Failed;
         };
-        self.cdp
+        if self
+            .cdp
             .call(
                 None,
                 "Browser.setWindowBounds",
@@ -1875,6 +1899,11 @@ impl Ghost {
             )
             .await
             .is_ok()
+        {
+            WindowRestore::Restored
+        } else {
+            WindowRestore::Failed
+        }
     }
 
     /// Wait until a restored window can serve a capture.
@@ -1910,10 +1939,11 @@ impl Ghost {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        // The state can read "normal" before the first frame lands
-        // (measured: ~150 ms un-minimize→present on macOS). This is
-        // the settle the fixed-wait fix used, kept as the floor of
-        // the poll above, not the whole wait.
+        // The state flips to "normal" before the first frame lands
+        // (measured: ~150 ms from un-minimize to a presented surface
+        // on macOS), so the check above can pass while the surface is
+        // still missing. Give the compositor this short settle before
+        // the first capture attempt.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 
@@ -2973,5 +3003,16 @@ mod screenshot_data_tests {
         assert!(!Ghost::is_capture_surface_failure(&FetchError::ghost(
             "no screenshot data"
         )));
+    }
+
+    // A window that was minimized still needs the surface wait when
+    // the restore call itself failed: it is not presenting frames
+    // either way, and only a window that was never minimized can
+    // skip the wait.
+    #[test]
+    fn a_failed_restore_still_waits_for_the_surface() {
+        assert!(WindowRestore::Restored.needs_surface_wait());
+        assert!(WindowRestore::Failed.needs_surface_wait());
+        assert!(!WindowRestore::NotMinimized.needs_surface_wait());
     }
 }
