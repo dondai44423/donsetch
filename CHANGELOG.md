@@ -5,6 +5,20 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The macOS screenshot fix kept failing most captures: un-minimizing
+  the window returns as soon as the state flips, but macOS gives the
+  window a presented compositor surface a little later, and with
+  `CDPScreenshotNewSurface` active a capture taken in that gap fails
+  instantly (`-32000`, "Unable to capture screenshot") instead of
+  waiting for the frame. A capture now waits for the window to report
+  `normal` (bounded, plus a short compositor settle), retries the
+  capture once on that specific failure, and keeps waiting even when
+  the restore call itself reports an error. (warc0s, #331)
+
 ## [4.4.2] - 2026-10-01
 
 ### Fixed
