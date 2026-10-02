@@ -660,7 +660,7 @@ impl Crawler {
                 if let Ok(u) = Url::parse(&e.loc)
                     && host_ok(&u)
                     && scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths)
-                    && (!opts.respect_robots || robots.allowed(u.path()))
+                    && (!opts.respect_robots || robots.allows_url(&u))
                 {
                     // Focus gate: skip sitemap entries that don't
                     // match the focus query (if set).
@@ -887,7 +887,7 @@ impl Crawler {
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
-                    if opts_worker.respect_robots && !robots.allowed(parsed.path()) {
+                    if opts_worker.respect_robots && !robots.allows_url(&parsed) {
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
@@ -1067,7 +1067,7 @@ impl Crawler {
                             &opts_worker.exclude_paths,
                         );
                         let robots_ok_final =
-                            !opts_worker.respect_robots || robots.allowed(final_parsed.path());
+                            !opts_worker.respect_robots || robots.allows_url(&final_parsed);
                         if !host_ok_final || !scope_ok_final || !robots_ok_final {
                             skipped
                                 .lock()
@@ -1406,7 +1406,7 @@ impl Crawler {
                                     ) {
                                         continue;
                                     }
-                                    if opts_worker.respect_robots && !robots.allowed(nu.path()) {
+                                    if opts_worker.respect_robots && !robots.allows_url(&nu) {
                                         continue;
                                     }
                                     // Focus gate for pagination: hard filter
@@ -1509,7 +1509,7 @@ impl Crawler {
                                         ) {
                                             continue;
                                         }
-                                        if opts_worker.respect_robots && !robots.allowed(u.path()) {
+                                        if opts_worker.respect_robots && !robots.allows_url(&u) {
                                             continue;
                                         }
                                         let lcanon = frontier::locale_canonical(u.path());
@@ -1582,7 +1582,7 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    if opts_worker.respect_robots && !robots.allowed(cu.path()) {
+                                    if opts_worker.respect_robots && !robots.allows_url(&cu) {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }

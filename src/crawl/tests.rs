@@ -656,6 +656,46 @@ async fn crawl_robots_disallow_respected() {
     assert!(!hits.iter().any(|h| h.contains("/private")));
 }
 
+// The most common query-shaped rule, `Disallow: /*?`, never applied:
+// every robots check in the crawl asked about the path alone, and a
+// path has no `?`. The parser matched queries all along (its own
+// test pins `/search?q=1`), the crawl just never showed it one.
+#[tokio::test]
+async fn crawl_robots_rules_see_the_query_string() {
+    let robots = "User-agent: *\nDisallow: /*?\nDisallow: /w/index.php?\n";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/search?q=1\">s</a><a href=\"/w/index.php?title=X&action=edit\">e</a><a href=\"/w/index.php\">w</a><a href=\"/ok\">ok</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, robots)
+        .page("https://ex.com/", 200, seed)
+        .page("https://ex.com/search?q=1", 200, &html("S", "search"))
+        .page(
+            "https://ex.com/w/index.php?title=X&action=edit",
+            200,
+            &html("E", "edit"),
+        )
+        .page("https://ex.com/w/index.php", 200, &html("W", "wiki"))
+        .page("https://ex.com/ok", 200, &html("Ok", "ok"));
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    o.respect_robots = true;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert!(r.pages.iter().any(|p| p.url.ends_with("/ok")));
+    assert!(
+        r.pages.iter().any(|p| p.url.ends_with("/w/index.php")),
+        "the rule ends in `?`: the bare path is allowed"
+    );
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        !hits.iter().any(|h| h.contains('?')),
+        "a query-shaped Disallow must keep every query URL unfetched; fetched: {hits:?}"
+    );
+}
+
 // `Crawl-delay` was parsed with a bare `f64` parse and fed straight
 // to `Duration::from_secs_f64`, which panics on `inf`/huge values:
 // one hostile (or sloppy) robots.txt aborted the crawl worker, and

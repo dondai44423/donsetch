@@ -5,6 +5,18 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Query-shaped robots rules never applied to a crawl: every check
+  asked whether the path was allowed, and a path has no `?`, so
+  `Disallow: /*?`, `Disallow: /search?` and Wikipedia's
+  `Disallow: /w/index.php?` kept nothing out while the parser itself
+  matched them. The crawl now asks about the path with its query, at
+  the seed, the sitemap, the pop, the redirect target and every
+  harvested link. (mnaza, #341)
+
 ## [4.4.2] - 2026-10-01
 
 ### Fixed
