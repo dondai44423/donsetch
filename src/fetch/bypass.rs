@@ -110,8 +110,10 @@ pub fn parse_key(raw: &str, default_zone: &str) -> Result<(String, String), Bypa
             ));
         }
         if zone.trim().is_empty() {
+            // Names the shape, never the token: this string reaches
+            // the fetch trace the model sees and the doctor line.
             return Err(BypassFail::Config(format!(
-                "unlocker key `{token}::` has an empty zone : use `{token}::{default_zone}` or drop the `::` suffix"
+                "unlocker key has an empty zone after `::` : use `<token>::{default_zone}` or drop the `::` suffix"
             )));
         }
         return Ok((token.to_string(), zone.to_string()));
@@ -157,21 +159,32 @@ pub fn bypass_count_path(cache_dir: &Path) -> PathBuf {
 /// are pruned: they are single integers, but a long-lived machine
 /// needs no permanent litter.
 pub fn check_and_bump_daily(path: &Path, max: u32) -> bool {
-    let count = if path.exists() {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-    } else {
-        0
+    use std::io::{Read as _, Seek as _, Write as _};
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let _ = std::fs::create_dir_all(dir);
+    // Read, compare and write under one exclusive lock: parallel
+    // walled fetches of different URLs reached the cap together and
+    // each read the same count, so each went through and paid.
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+    else {
+        return false;
     };
+    let _ = f.lock();
+    let mut raw = String::new();
+    let _ = f.read_to_string(&mut raw);
+    let count = raw.trim().parse::<u32>().unwrap_or(0);
     if count >= max {
         return false;
     }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let _ = std::fs::create_dir_all(dir);
     prune_stale_counters(dir);
-    let _ = std::fs::write(path, (count + 1).to_string());
+    let _ = f.set_len(0);
+    let _ = f.rewind();
+    let _ = write!(f, "{}", count + 1);
     true
 }
 
@@ -493,9 +506,17 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-fn cache_key(url: &str) -> String {
-    let digest = Sha256::digest(url.as_bytes());
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+/// One entry per (url, render): the unlocker's answer for a page
+/// differs with `render`, so a hit for one must not serve the other.
+fn cache_key(url: &str, render: bool) -> String {
+    let mut h = Sha256::new();
+    h.update(url.as_bytes());
+    h.update(if render {
+        &b"\0render"[..]
+    } else {
+        &b"\0plain"[..]
+    });
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn bypass_cache_dir(cache_dir: &Path) -> PathBuf {
@@ -517,11 +538,11 @@ struct CacheEntry {
 
 const CACHE_VERSION: u32 = 2;
 
-fn cache_get(cache_dir: &Path, url: &str, ttl_secs: u64) -> Option<BypassOutcome> {
+fn cache_get(cache_dir: &Path, url: &str, render: bool, ttl_secs: u64) -> Option<BypassOutcome> {
     if ttl_secs == 0 {
         return None;
     }
-    let path = bypass_cache_dir(cache_dir).join(format!("{}.json", cache_key(url)));
+    let path = bypass_cache_dir(cache_dir).join(format!("{}.json", cache_key(url, render)));
     let raw = std::fs::read_to_string(&path).ok()?;
     let entry: CacheEntry = serde_json::from_str(&raw).ok()?;
     if entry.v != CACHE_VERSION || entry.url != url {
@@ -543,8 +564,8 @@ fn cache_get(cache_dir: &Path, url: &str, ttl_secs: u64) -> Option<BypassOutcome
 }
 
 /// Refresh the timestamp on a hit (sliding TTL: hot entries survive).
-fn cache_touch(cache_dir: &Path, url: &str) {
-    let path = bypass_cache_dir(cache_dir).join(format!("{}.json", cache_key(url)));
+fn cache_touch(cache_dir: &Path, url: &str, render: bool) {
+    let path = bypass_cache_dir(cache_dir).join(format!("{}.json", cache_key(url, render)));
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return;
     };
@@ -559,12 +580,12 @@ fn cache_touch(cache_dir: &Path, url: &str) {
     }
 }
 
-fn cache_put(cache_dir: &Path, url: &str, outcome: &BypassOutcome, max_entries: u32) {
+fn cache_put(cache_dir: &Path, url: &str, render: bool, outcome: &BypassOutcome, max_entries: u32) {
     let dir = bypass_cache_dir(cache_dir);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let key = cache_key(url);
+    let key = cache_key(url, render);
     let entry = CacheEntry {
         v: CACHE_VERSION,
         url: url.to_string(),
@@ -618,7 +639,7 @@ fn cache_prune(dir: &Path, max_entries: u32) {
 /// paid unlock. The gate map is pruned past a cap so a daemon
 /// that sees a stream of unique walled URLs does not leak one
 /// mutex per URL for its whole lifetime.
-fn in_flight_lock(url: &str) -> Arc<tokio::sync::Mutex<()>> {
+fn in_flight_lock(url: &str, render: bool) -> Arc<tokio::sync::Mutex<()>> {
     const GATE_CAP: usize = 512;
     static MAP: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
@@ -629,7 +650,7 @@ fn in_flight_lock(url: &str) -> Arc<tokio::sync::Mutex<()>> {
         guard.retain(|_, v| Arc::strong_count(v) > 1);
     }
     guard
-        .entry(cache_key(url))
+        .entry(cache_key(url, render))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
@@ -646,14 +667,14 @@ pub async fn unlock(
     cache_dir: &Path,
 ) -> Result<BypassOutcome, BypassFail> {
     let ttl = cfg.cache_ttl.as_secs();
-    if let Some(outcome) = cache_get(cache_dir, url, ttl) {
-        cache_touch(cache_dir, url);
+    if let Some(outcome) = cache_get(cache_dir, url, cfg.render, ttl) {
+        cache_touch(cache_dir, url, cfg.render);
         return Ok(outcome);
     }
-    let gate = in_flight_lock(url);
+    let gate = in_flight_lock(url, cfg.render);
     let _guard = gate.lock().await;
-    if let Some(outcome) = cache_get(cache_dir, url, ttl) {
-        cache_touch(cache_dir, url);
+    if let Some(outcome) = cache_get(cache_dir, url, cfg.render, ttl) {
+        cache_touch(cache_dir, url, cfg.render);
         return Ok(outcome);
     }
     let count_path = bypass_count_path(cache_dir);
@@ -741,7 +762,7 @@ pub async fn unlock(
         cached: false,
     })?;
     if ttl > 0 {
-        cache_put(cache_dir, url, &outcome, cfg.cache_max);
+        cache_put(cache_dir, url, cfg.render, &outcome, cfg.cache_max);
     }
     Ok(outcome)
 }
@@ -763,7 +784,7 @@ mod tests {
             body: b"<html>page</html>".to_vec(),
             cached: false,
         };
-        cache_put(&dir, "https://example.com/a", &outcome, 8);
+        cache_put(&dir, "https://example.com/a", false, &outcome, 8);
         let entries: Vec<_> = std::fs::read_dir(bypass_cache_dir(&dir))
             .unwrap()
             .flatten()
@@ -810,6 +831,59 @@ mod tests {
             parse_key("::zone", "web_unlocker1"),
             Err(BypassFail::Config(_))
         ));
+    }
+
+    // The empty-zone error reaches the fetch trace the model sees and
+    // the doctor line; it names the shape, never the token.
+    #[test]
+    fn parse_key_errors_never_echo_the_token() {
+        let err = parse_key("sk-live-abc123::", "zone1")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("abc123"), "{err}");
+        assert!(err.contains("empty zone"), "{err}");
+        assert!(err.contains("zone1"), "{err}");
+    }
+
+    // Parallel walled fetches of different URLs reach the cap together.
+    #[test]
+    fn daily_cap_holds_under_parallel_bumps() {
+        let dir = std::env::temp_dir().join(format!("donsetch-bypass-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counter");
+        let hits: Vec<bool> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| s.spawn(|| check_and_bump_daily(&path, 3)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let allowed = hits.iter().filter(|b| **b).count();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(allowed, 3, "exactly the cap may pass, got {allowed}");
+        assert_eq!(on_disk.trim(), "3");
+    }
+
+    // The unlocker's answer differs with `render`; a hit for one mode
+    // must not serve the other.
+    #[test]
+    fn cache_is_keyed_by_render_mode() {
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-bypass-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let url = "https://example.com/page";
+        let outcome = BypassOutcome {
+            status: 200,
+            content_type: "text/html".into(),
+            body: b"<html>plain</html>".to_vec(),
+            cached: false,
+        };
+        cache_put(&dir, url, false, &outcome, 8);
+        assert!(cache_get(&dir, url, false, 3600).is_some());
+        let rendered = cache_get(&dir, url, true, 3600);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(rendered.is_none(), "a plain answer served a render request");
     }
 
     #[test]
@@ -1056,15 +1130,15 @@ mod tests {
             body: b"<html>solved</html>".to_vec(),
             cached: false,
         };
-        cache_put(&dir, url, &outcome, 10);
-        let got = cache_get(&dir, url, 3600).unwrap();
+        cache_put(&dir, url, false, &outcome, 10);
+        let got = cache_get(&dir, url, false, 3600).unwrap();
         assert_eq!(got.body, outcome.body);
         assert_eq!(got.status, 200);
         assert!(got.cached);
         // ttl 0 = cache disabled, never hits
-        assert!(cache_get(&dir, url, 0).is_none());
+        assert!(cache_get(&dir, url, false, 0).is_none());
         // different URL misses
-        assert!(cache_get(&dir, "https://example.com/y", 3600).is_none());
+        assert!(cache_get(&dir, "https://example.com/y", false, 3600).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1085,8 +1159,8 @@ mod tests {
             body: body.clone(),
             cached: false,
         };
-        cache_put(&dir, url, &outcome, 10);
-        let got = cache_get(&dir, url, 3600).unwrap();
+        cache_put(&dir, url, false, &outcome, 10);
+        let got = cache_get(&dir, url, false, 3600).unwrap();
         assert_eq!(got.body, body);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1104,7 +1178,7 @@ mod tests {
                 body: format!("body{i}").into_bytes(),
                 cached: false,
             };
-            cache_put(&dir, &url, &outcome, 2);
+            cache_put(&dir, &url, false, &outcome, 2);
         }
         let dir2 = bypass_cache_dir(&dir);
         let n = std::fs::read_dir(&dir2)
@@ -1121,9 +1195,9 @@ mod tests {
 
     #[test]
     fn inflight_lock_shares_gate_per_url() {
-        let a = in_flight_lock("https://example.com/z");
-        let b = in_flight_lock("https://example.com/z");
-        let c = in_flight_lock("https://example.com/w");
+        let a = in_flight_lock("https://example.com/z", false);
+        let b = in_flight_lock("https://example.com/z", false);
+        let c = in_flight_lock("https://example.com/w", false);
         assert!(Arc::ptr_eq(&a, &b));
         assert!(!Arc::ptr_eq(&a, &c));
     }
