@@ -14,10 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window a presented compositor surface a little later, and with
   `CDPScreenshotNewSurface` active a capture taken in that gap fails
   instantly (`-32000`, "Unable to capture screenshot") instead of
-  waiting for the frame. A capture now waits for the window to report
-  `normal` (bounded, plus a short compositor settle), retries the
-  capture once on that specific failure, and keeps waiting even when
-  the restore call itself reports an error. (warc0s, #331)
+  waiting for the frame. On macOS, a capture now waits for the window to
+  report `normal` (bounded, plus a short compositor settle) and keeps
+  waiting even when the restore call itself reports an error; the single
+  retry on that failure applies on every platform. (warc0s, #336)
 
 ## [4.4.2] - 2026-10-01
 
