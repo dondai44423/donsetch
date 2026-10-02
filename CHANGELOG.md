@@ -5,6 +5,19 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A supervised MCP server lost the client's compatibility mode at
+  its first restart: the client's `initialize` was answered by the
+  first child and so never replayed, and every replacement started
+  in the default split shape, so after one crash Claude Code, VS
+  Code, OpenCode and pi saw tool metadata without page text for the
+  rest of the session. The supervisor now hands the client's name to
+  each replacement, which starts in the mode the handshake chose.
+  (mnaza, #340)
+
 ## [4.4.2] - 2026-10-01
 
 ### Fixed

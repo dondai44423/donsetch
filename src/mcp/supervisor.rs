@@ -20,7 +20,9 @@
 //! second time (issue #281: byte-level replay re-ran whole
 //! finished sessions). The MCP surface is stateless here (the
 //! daemon answers requests without gating on `initialize`), so a
-//! restarted child resumes the session as-is.
+//! restarted child resumes the session as-is; the one thing the
+//! handshake decided, the client's compat mode, reaches each
+//! replacement as the client's name in `CLIENT_NAME_ENV`.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -42,6 +44,13 @@ const RAPID_WINDOW: Duration = Duration::from_secs(60);
 /// answer its in-flight requests and shut down cleanly before
 /// it is killed.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The client's `clientInfo.name` from its `initialize`, handed to
+/// every replacement child. The first child answered the handshake,
+/// so the replay window no longer holds it, and a child that never
+/// sees it would answer in the default shape for the rest of the
+/// session (the #27 fold is chosen by that name).
+pub(crate) const CLIENT_NAME_ENV: &str = "DONSETCH_MCP_CLIENT_NAME";
 
 enum In {
     Data(Vec<u8>),
@@ -129,7 +138,15 @@ where
                     pending.len()
                 );
             }
-            let mut c = child_cmd()
+            let mut cmd = child_cmd();
+            if let Some(name) = replay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .client_name()
+            {
+                cmd.env(CLIENT_NAME_ENV, name);
+            }
+            let mut c = cmd
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -336,6 +353,9 @@ struct ReplayState {
     partial: Vec<u8>,
     /// held bytes + partial bytes, maintained incrementally.
     total: usize,
+    /// `clientInfo.name` from the client's `initialize`, for the
+    /// children spawned after the one that answered it.
+    client_name: Option<String>,
 }
 
 impl ReplayState {
@@ -380,6 +400,19 @@ impl ReplayState {
                         None
                     }
                     // A client request: held until its response.
+                    (Some("initialize"), Some(id)) if !id.is_null() => {
+                        if let Some(name) = obj
+                            .get("params")
+                            .and_then(|p| p.get("clientInfo"))
+                            .and_then(|c| c.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::trim)
+                            .filter(|n| !n.is_empty())
+                        {
+                            self.client_name = Some(name.to_string());
+                        }
+                        Some(Some(id.to_string()))
+                    }
                     (Some(_), Some(id)) if !id.is_null() => Some(Some(id.to_string())),
                     // A notification (no id): nothing will ever
                     // answer it, so it is not part of the replay
@@ -413,6 +446,11 @@ impl ReplayState {
             }
         });
         self.total -= removed;
+    }
+
+    /// The client's name from its `initialize`, once seen.
+    fn client_name(&self) -> Option<String> {
+        self.client_name.clone()
     }
 
     /// Everything still open, as one replay buffer: held lines in
@@ -782,6 +820,88 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             Ok(0) // EOF: the supervisor drains the replacement and returns
         }
+    }
+
+    // A replacement child never sees the client's `initialize` (the
+    // first child answered it, so it retired from the replay window),
+    // and its mode cell starts at Default: after one crash every
+    // response to Claude Code, VS Code, OpenCode or pi came back in
+    // the split shape for the rest of the session. The supervisor
+    // passes the client's name to each replacement.
+    #[cfg(unix)]
+    struct InitThenRequestAfterRestart {
+        sink: Arc<Mutex<Vec<u8>>>,
+        spawns: Arc<Mutex<u32>>,
+        step: u8,
+    }
+
+    #[cfg(unix)]
+    impl Read for InitThenRequestAfterRestart {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.step {
+                0 => {
+                    self.step = 1;
+                    let payload = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1.0\"}}}\n";
+                    buf[..payload.len()].copy_from_slice(payload);
+                    Ok(payload.len())
+                }
+                1 => {
+                    self.step = 2;
+                    // The first child's answer, then its replacement.
+                    wait_for_marker(&self.sink, b"\"result\":{}");
+                    let deadline = Instant::now() + Duration::from_secs(8);
+                    while *self.spawns.lock().unwrap() < 2 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let payload = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+                    buf[..payload.len()].copy_from_slice(payload);
+                    Ok(payload.len())
+                }
+                _ => {
+                    wait_for_marker(&self.sink, b"client=");
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restarted_child_is_told_the_clients_name() {
+        let sink = Sink::default();
+        let spawns = Arc::new(Mutex::new(0u32));
+        let spawns2 = Arc::clone(&spawns);
+        run_with(
+            move || {
+                let mut n = spawns2.lock().unwrap();
+                *n += 1;
+                let mut c = Command::new("sh");
+                c.args([
+                    "-c",
+                    if *n == 1 {
+                        // Answers initialize, then dies.
+                        "read l; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}'; sleep 0.3; exit 0"
+                    } else {
+                        // Reports what the supervisor told it.
+                        "read l; printf 'client=%s\\n' \"$DONSETCH_MCP_CLIENT_NAME\""
+                    },
+                ]);
+                c
+            },
+            InitThenRequestAfterRestart {
+                sink: Arc::clone(&sink.0),
+                spawns: Arc::clone(&spawns),
+                step: 0,
+            },
+            sink.clone(),
+        )
+        .unwrap();
+        let got = String::from_utf8_lossy(&sink.0.lock().unwrap().clone()).to_string();
+        assert!(
+            got.contains("client=claude-code\n"),
+            "the replacement must learn the client's name; sink: {got:?}"
+        );
     }
 
     #[cfg(unix)]

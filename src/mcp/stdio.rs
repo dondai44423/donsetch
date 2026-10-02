@@ -141,6 +141,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Issue #27 compat mode: one session per process; the initialize
     // handshake records what the client renders.
     let mode = Arc::new(ModeCell::new());
+    if let Some(seeded) = seeded_mode(
+        std::env::var(crate::mcp::supervisor::CLIENT_NAME_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        mode.set(seeded);
+    }
 
     let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
@@ -188,9 +195,38 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The mode a child spawned by the supervisor starts in: the one the
+/// client's `initialize` would have chosen, from the name the
+/// supervisor passed along. `None` when there is no name, so a
+/// process that will see the handshake itself starts at Default.
+fn seeded_mode(client_name: Option<&str>) -> Option<crate::mcp::compat::ClientMode> {
+    let name = client_name?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(crate::mcp::compat::mode_from_params(&serde_json::json!({
+        "clientInfo": { "name": name }
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // What a supervisor-spawned child starts with: the client's
+    // handshake choice, or nothing when no name was passed.
+    #[test]
+    fn a_passed_client_name_seeds_the_handshake_mode() {
+        use crate::mcp::compat::ClientMode;
+        assert_eq!(seeded_mode(Some("claude-code")), Some(ClientMode::TextOnly));
+        assert_eq!(
+            seeded_mode(Some(" pi-donsetch ")),
+            Some(ClientMode::TextOnly)
+        );
+        assert_eq!(seeded_mode(Some("cursor")), Some(ClientMode::Default));
+        assert_eq!(seeded_mode(Some("")), None);
+        assert_eq!(seeded_mode(None), None);
+    }
 
     // `Lines::next_line` yields Err(InvalidData) for a line that
     // isn't UTF-8. The loop used to treat any Err as EOF, so one

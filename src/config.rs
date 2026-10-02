@@ -1926,6 +1926,7 @@ const RESERVED_VARS: &[&str] = &[
     "DONSETCH_CACHE_DIR",
     "DONSETCH_CONFIG",
     "DONSETCH_NO_CONFIG_FILE",
+    "DONSETCH_MCP_CLIENT_NAME", // supervisor → child, see mcp::supervisor
     "DONSETCH_PLUGIN",
     "DONSETCH_DEBUG",
     "DONSETCH_NO_UPDATE_CHECK",
