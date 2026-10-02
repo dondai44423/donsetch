@@ -1842,7 +1842,9 @@ impl Ghost {
     /// unchanged.
     async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
         let restore = self.unminimize_for_capture().await;
-        if restore.needs_surface_wait() {
+        // macOS only: the measured state-flip/surface race lives there; other
+        // platforms keep their pre-wait behavior and lean on the single retry.
+        if restore.needs_surface_wait() && cfg!(target_os = "macos") {
             self.wait_for_capture_surface().await;
         }
         let mut result = self
@@ -1856,8 +1858,11 @@ impl Ghost {
         // One retry, no loop: restoring the window and the compositor
         // actually presenting its first frame are not the same instant,
         // so a capture can still race the surface by a few milliseconds.
-        // The failure is specific and instant (-32000), which is cheap to
-        // retry once; anything else surfaces as-is.
+        // The retry matches, by text, the empty-image capture failure
+        // that race produces (not exclusive to it). It lands ~250 ms
+        // after state=normal on macOS (settle included), ~100 ms after
+        // the restore elsewhere; a longer gap is not covered and the
+        // capture error surfaces as-is.
         if let Err(e) = &result
             && Self::is_capture_surface_failure(e)
         {
@@ -1906,14 +1911,14 @@ impl Ghost {
         }
     }
 
-    /// Wait until a restored window can serve a capture.
+    /// Wait for a restored window to report `normal` and settle
+    /// briefly before the first capture.
     ///
     /// `Browser.setWindowBounds {windowState:"normal"}` returns as
     /// soon as the state flips, but macOS only gives the window a
     /// presented compositor surface a little later. With
     /// `CDPScreenshotNewSurface` active a capture taken in that gap
-    /// fails instantly (-32000 "Unable to capture screenshot"). That is the
-    /// fast-fail measured on macOS, not the #331 stall. Poll the
+    /// fails instantly ("Unable to capture screenshot"). Poll the
     /// reported state (bounded, so a window that never comes back
     /// cannot hang the call) and then let the compositor settle
     /// before the first capture.
@@ -1925,7 +1930,12 @@ impl Ghost {
         while std::time::Instant::now() < deadline {
             let state = self
                 .cdp
-                .call(None, "Browser.getWindowBounds", json!({ "windowId": id }))
+                .call_with_timeout(
+                    None,
+                    "Browser.getWindowBounds",
+                    json!({ "windowId": id }),
+                    2,
+                )
                 .await
                 .ok()
                 .and_then(|v| {
@@ -1943,14 +1953,16 @@ impl Ghost {
         // (measured: ~150 ms from un-minimize to a presented surface
         // on macOS), so the check above can pass while the surface is
         // still missing. Give the compositor this short settle before
-        // the first capture attempt.
+        // the first capture attempt (this gap is the fast-fail seen on
+        // macOS, not the #331 stall).
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 
-    /// True for the instant, compositor-surface-specific failure of
-    /// `Page.captureScreenshot` (CDP -32000 "Unable to capture
-    /// screenshot"). Narrow on purpose: a retry must never mask a
-    /// real capture error.
+    /// True for the empty-image capture failure ("Unable to capture
+    /// screenshot"), which the missing-surface race produces though not
+    /// exclusively. Matched by text on purpose: the client keeps only
+    /// the message, and -32000 is the generic CDP server error. A false
+    /// positive costs one attempt; a second failure surfaces as-is.
     fn is_capture_surface_failure(err: &FetchError) -> bool {
         matches!(err, FetchError::Ghost(msg) if msg.contains("Unable to capture screenshot"))
     }
@@ -2993,7 +3005,7 @@ mod screenshot_data_tests {
     // lands recovers it. The predicate has to be that narrow, or a
     // retry would silently paper over a real capture error.
     #[test]
-    fn only_the_surface_capture_failure_triggers_the_retry() {
+    fn the_predicate_only_matches_the_surface_capture_failure() {
         let surface = FetchError::ghost("cdp Page.captureScreenshot: Unable to capture screenshot");
         assert!(Ghost::is_capture_surface_failure(&surface));
         assert!(!Ghost::is_capture_surface_failure(&FetchError::ghost(
@@ -3010,7 +3022,7 @@ mod screenshot_data_tests {
     // either way, and only a window that was never minimized can
     // skip the wait.
     #[test]
-    fn a_failed_restore_still_waits_for_the_surface() {
+    fn a_failed_restore_still_needs_the_surface_wait() {
         assert!(WindowRestore::Restored.needs_surface_wait());
         assert!(WindowRestore::Failed.needs_surface_wait());
         assert!(!WindowRestore::NotMinimized.needs_surface_wait());
