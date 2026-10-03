@@ -9,14 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A supervised MCP server lost the client's compatibility mode at
-  its first restart: the client's `initialize` was answered by the
-  first child and so never replayed, and every replacement started
-  in the default split shape, so after one crash Claude Code, VS
-  Code, OpenCode and pi saw tool metadata without page text for the
-  rest of the session. The supervisor now hands the client's name to
-  each replacement, which starts in the mode the handshake chose.
+- A supervised MCP server lost the client's compatibility mode at its
+  first restart: the client's `initialize` was answered by the first
+  child, so it never replayed, and every replacement started in the
+  default split shape; after one crash Claude Code, VS Code, OpenCode
+  and pi saw tool metadata without page text for the rest of the
+  session. The supervisor now hands the client's name to each
+  replacement, which starts in the mode the handshake chose.
   (mnaza, #340)
+- Query-shaped robots rules never applied to a crawl: every check
+  asked whether the path was allowed, and a path has no `?`, so
+  `Disallow: /*?`, `Disallow: /search?` and Wikipedia's
+  `Disallow: /w/index.php?` kept nothing out while the parser itself
+  matched them. The crawl now asks about the path with its query, at
+  the seed, the sitemap, the pop, the redirect target and every
+  harvested link. (mnaza, #341)
+- Three unlocker edges. A key of the shape `token::` was reported
+  with the token itself twice in the error, and that string reaches
+  the fetch trace the model sees and the `doctor` line; it names the
+  shape now. The daily cap was a read-then-write with no lock, so
+  parallel walled fetches at the cap each read the same count and
+  each went through and paid; the counter is updated under a file
+  lock. The solve cache was keyed by URL alone, so after toggling
+  `bypass.render` the other mode's body was served for the TTL; the
+  key carries the mode. (mnaza, #342)
+- The macOS screenshot fix kept failing most captures: un-minimizing
+  the window returns as soon as the state flips, but macOS gives the
+  window a presented compositor surface a little later, and with
+  `CDPScreenshotNewSurface` active a capture taken in that gap fails
+  instantly (`-32000`, "Unable to capture screenshot") instead of
+  waiting for the frame. On macOS, a capture now waits for the window
+  to report `normal` (bounded, plus a short compositor settle) and
+  keeps waiting even when the restore call itself reports an error;
+  the single retry on that failure applies on every platform.
+  (warc0s, #336)
 
 ## [4.4.2] - 2026-10-01
 
