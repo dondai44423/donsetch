@@ -861,6 +861,28 @@ fn is_executable(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
+/// What `unminimize_for_capture` did with the launch-minimized
+/// window, so the caller knows whether a capture must first wait for
+/// a presented compositor surface.
+enum WindowRestore {
+    /// The Ghost never minimized this window: nothing to wait for.
+    NotMinimized,
+    /// The window was minimized and is back to `normal`.
+    Restored,
+    /// The window was minimized but the restore call failed. It is
+    /// still not presenting frames, so it needs the same wait.
+    Failed,
+}
+
+impl WindowRestore {
+    /// Only a window that was never minimized can skip the wait: a
+    /// failed restore leaves the window un-presented too, and a
+    /// capture against it fails the same instant way.
+    fn needs_surface_wait(self) -> bool {
+        !matches!(self, Self::NotMinimized)
+    }
+}
+
 impl Ghost {
     /// Launch cold. Headful Chrome on Xvfb (Linux) : the real
     /// stealth mode. Headful has real WebGL, real window.chrome,
@@ -1819,11 +1841,37 @@ impl Ghost {
     /// puts it back after; the invisibility the minimize bought is
     /// unchanged.
     async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
-        self.unminimize_for_capture().await;
-        let result = self
+        let restore = self.unminimize_for_capture().await;
+        // macOS only: the measured state-flip/surface race lives there; other
+        // platforms keep their pre-wait behavior and lean on the single retry.
+        if restore.needs_surface_wait() && cfg!(target_os = "macos") {
+            self.wait_for_capture_surface().await;
+        }
+        let mut result = self
             .cdp
-            .call(Some(&self.session), "Page.captureScreenshot", params)
+            .call(
+                Some(&self.session),
+                "Page.captureScreenshot",
+                params.clone(),
+            )
             .await;
+        // One retry, no loop: restoring the window and the compositor
+        // actually presenting its first frame are not the same instant,
+        // so a capture can still race the surface by a few milliseconds.
+        // The retry matches, by text, the empty-image capture failure
+        // that race produces (not exclusive to it). It lands ~250 ms
+        // after state=normal on macOS (settle included), ~100 ms after
+        // the restore elsewhere; a longer gap is not covered and the
+        // capture error surfaces as-is.
+        if let Err(e) = &result
+            && Self::is_capture_surface_failure(e)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            result = self
+                .cdp
+                .call(Some(&self.session), "Page.captureScreenshot", params)
+                .await;
+        }
         self.reminimize_after_capture().await;
         result?
             .get("data")
@@ -1833,25 +1881,90 @@ impl Ghost {
     }
 
     /// Un-minimize a window we minimized at launch, best-effort.
-    /// A window this Ghost never minimized is left alone.
-    async fn unminimize_for_capture(&self) {
+    /// A window this Ghost never minimized is left alone. The state
+    /// it reports lets the caller wait for the compositor surface
+    /// even when the restore call itself failed: a window that was
+    /// minimized is not presenting frames either way.
+    async fn unminimize_for_capture(&self) -> WindowRestore {
         if !self
             .window_minimized
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            return;
+            return WindowRestore::NotMinimized;
         }
         let Some(id) = self.window_id else {
-            return;
+            return WindowRestore::Failed;
         };
-        let _ = self
+        if self
             .cdp
             .call(
                 None,
                 "Browser.setWindowBounds",
                 json!({ "windowId": id, "bounds": { "windowState": "normal" } }),
             )
-            .await;
+            .await
+            .is_ok()
+        {
+            WindowRestore::Restored
+        } else {
+            WindowRestore::Failed
+        }
+    }
+
+    /// Wait for a restored window to report `normal` and settle
+    /// briefly before the first capture.
+    ///
+    /// `Browser.setWindowBounds {windowState:"normal"}` returns as
+    /// soon as the state flips, but macOS only gives the window a
+    /// presented compositor surface a little later. With
+    /// `CDPScreenshotNewSurface` active a capture taken in that gap
+    /// fails instantly ("Unable to capture screenshot"). Poll the
+    /// reported state (bounded, so a window that never comes back
+    /// cannot hang the call) and then let the compositor settle
+    /// before the first capture.
+    async fn wait_for_capture_surface(&self) {
+        let Some(id) = self.window_id else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        while std::time::Instant::now() < deadline {
+            let state = self
+                .cdp
+                .call_with_timeout(
+                    None,
+                    "Browser.getWindowBounds",
+                    json!({ "windowId": id }),
+                    2,
+                )
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("bounds")
+                        .and_then(|b| b.get("windowState"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            if state.as_deref() == Some("normal") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // The state flips to "normal" before the first frame lands
+        // (measured: ~150 ms from un-minimize to a presented surface
+        // on macOS), so the check above can pass while the surface is
+        // still missing. Give the compositor this short settle before
+        // the first capture attempt (this gap is the fast-fail seen on
+        // macOS, not the #331 stall).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    /// True for the empty-image capture failure ("Unable to capture
+    /// screenshot"), which the missing-surface race produces though not
+    /// exclusively. Matched by text on purpose: the client keeps only
+    /// the message, and -32000 is the generic CDP server error. A false
+    /// positive costs one attempt; a second failure surfaces as-is.
+    fn is_capture_surface_failure(err: &FetchError) -> bool {
+        matches!(err, FetchError::Ghost(msg) if msg.contains("Unable to capture screenshot"))
     }
 
     /// Put the window back the way launch left it: off every screen
@@ -2884,5 +2997,34 @@ mod screenshot_data_tests {
         assert!(decode_screenshot_data("Zm9v!!!!").is_err());
         assert!(decode_screenshot_data("Zm9vYg").is_err(), "missing padding");
         assert!(decode_screenshot_data("Zm9v\nYmFy").is_err(), "line break");
+    }
+
+    // The macOS capture retry exists for exactly one failure: a
+    // restored window that has not presented a compositor surface yet
+    // answers -32000 instantly, and one repeat after the surface
+    // lands recovers it. The predicate has to be that narrow, or a
+    // retry would silently paper over a real capture error.
+    #[test]
+    fn the_predicate_only_matches_the_surface_capture_failure() {
+        let surface = FetchError::ghost("cdp Page.captureScreenshot: Unable to capture screenshot");
+        assert!(Ghost::is_capture_surface_failure(&surface));
+        assert!(!Ghost::is_capture_surface_failure(&FetchError::ghost(
+            "cdp timeout: Page.captureScreenshot"
+        )));
+        assert!(!Ghost::is_capture_surface_failure(&FetchError::Timeout));
+        assert!(!Ghost::is_capture_surface_failure(&FetchError::ghost(
+            "no screenshot data"
+        )));
+    }
+
+    // A window that was minimized still needs the surface wait when
+    // the restore call itself failed: it is not presenting frames
+    // either way, and only a window that was never minimized can
+    // skip the wait.
+    #[test]
+    fn a_failed_restore_still_needs_the_surface_wait() {
+        assert!(WindowRestore::Restored.needs_surface_wait());
+        assert!(WindowRestore::Failed.needs_surface_wait());
+        assert!(!WindowRestore::NotMinimized.needs_surface_wait());
     }
 }
