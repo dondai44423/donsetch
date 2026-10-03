@@ -342,13 +342,38 @@ fn main() {
     println!("cargo:rustc-env=DONSETCH_TARGET={triple}");
 
     // Enabled feature flags.
-    let mut feats = Vec::new();
-    if env::var_os("CARGO_FEATURE_OCR").is_some() {
-        feats.push("ocr");
-    }
-    if env::var_os("CARGO_FEATURE_RERANK").is_some() {
-        feats.push("rerank");
-    }
+    //
+    // Read from the environment rather than a hand-written list: Cargo sets
+    // CARGO_FEATURE_<NAME> for every enabled feature of this package, so a
+    // feature added to Cargo.toml shows up in `--version` without touching
+    // this code. The old hardcoded pair is why `http` was never reported.
+    //
+    // The name is recovered by lowercasing, which cannot distinguish a
+    // feature spelled with `-` from one spelled with `_` (Cargo maps both to
+    // `_`). Every feature here is a single word; a hyphenated one would be
+    // displayed with an underscore.
+    //
+    // Names are restricted to the characters Cargo can produce here. The value
+    // of a `cargo:rustc-env=` line runs to the end of the line and has no
+    // escape syntax, so a name carrying a newline would inject a second
+    // directive; `vars_os` is used because `vars` panics on an environment
+    // holding any non-UTF-8 entry, feature-related or not.
+    let mut feats: Vec<String> = env::vars_os()
+        .filter_map(|(k, _)| {
+            let name = k.to_str()?.strip_prefix("CARGO_FEATURE_")?;
+            // `default` is a feature like any other and Cargo exports it, but
+            // it is empty here: it would only report whether
+            // --no-default-features was passed. Any member it ever gains is
+            // listed on its own.
+            if name == "DEFAULT" {
+                return None;
+            }
+            (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+                .then(|| name.to_ascii_lowercase())
+        })
+        .collect();
+    // Deterministic order: env iteration order is not guaranteed.
+    feats.sort();
     let feats_display = if feats.is_empty() {
         "(none)".to_string()
     } else {

@@ -5,6 +5,19 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `--version` under-reported the build: the features line was assembled
+  from a hardcoded pair of checks for `ocr` and `rerank`, so an `http`
+  build — the one that carries the MCP HTTP transport — was
+  indistinguishable from one without it, and any feature added later
+  would have been invisible too. The line is now built from the
+  `CARGO_FEATURE_*` variables Cargo exports for the features actually
+  enabled, so a new feature needs no code change to be reported.
+  (Mart-Bogdan, #343)
+
 ## [4.4.3] - 2026-10-03
 
 ### Fixed
