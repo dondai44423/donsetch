@@ -93,8 +93,18 @@ impl Robots {
         r
     }
 
-    /// Longest-match rule evaluation. Allow beats Disallow at
-    /// equal length (RFC 9309).
+    /// `allowed` for a parsed URL: the rules see the path and, when
+    /// there is one, `?` and the query, which is what a rule such as
+    /// `Disallow: /*?` is written against.
+    pub fn allows_url(&self, url: &url::Url) -> bool {
+        match url.query() {
+            Some(q) => self.allowed(&format!("{}?{q}", url.path())),
+            None => self.allowed(url.path()),
+        }
+    }
+
+    /// Longest-match rule evaluation over a path, or a path with its
+    /// `?query`. Allow beats Disallow at equal length (RFC 9309).
     pub fn allowed(&self, path: &str) -> bool {
         let mut best_dis = 0usize;
         let mut best_allow = 0usize;
