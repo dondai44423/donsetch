@@ -5,6 +5,26 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- An enum argument outside its listed values was accepted over MCP.
+  An unknown `archive`, search `intent` or crawl `mode` silently ran
+  as the default. An unknown `tier` (`"3"`, `"two"`) did worse: it
+  routed like `auto` but switched off every escalation that checks
+  for `auto` (thin page, JS shell, challenge or chrome-only text), so
+  a misspelled tier got neither the mode it asked for nor `auto`,
+  and nothing said so. The CLI already refused these through clap,
+  but MCP clients do not enforce the schema's `enum` (Claude Code
+  forwarded `tier: "3"` as is). Every tool call is now checked
+  against the spec table before dispatch, and an off-list value is a
+  tool error naming the parameter, the accepted values and the value
+  received, with code `fetch.invalid`, `search.invalid` or
+  `crawl.invalid` (`fetch.invalid` previously meant only an unusable
+  URL). An absent or `null` argument still gets the default.
+  (Mart-Bogdan, #346)
+
 ## [4.4.3] - 2026-10-03
 
 ### Fixed

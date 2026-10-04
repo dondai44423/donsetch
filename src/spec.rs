@@ -615,6 +615,35 @@ pub fn by_cli_cmd(cmd: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|t| t.cli_cmd == cmd)
 }
 
+// ── Argument validation ──────────────────────────────────────
+
+/// Check every enum argument in `args` against the variants its spec
+/// lists. An absent or `null` argument passes, so the tool's own
+/// default applies. On failure the message names the first offending
+/// parameter, the accepted values, and the value received.
+pub fn check_enum_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
+    for p in tool.params {
+        let ParamKind::Enum(variants) = p.kind else {
+            continue;
+        };
+        // `null` passes because the handlers already read it as unset.
+        let value = match args.get(p.name) {
+            None | Some(Value::Null) => continue,
+            Some(v) => v,
+        };
+        if value.as_str().is_some_and(|s| variants.contains(&s)) {
+            continue;
+        }
+        let allowed = variants
+            .iter()
+            .map(|v| format!("\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("{} must be one of {allowed}; got {value}", p.name));
+    }
+    Ok(())
+}
+
 // ── MCP schema generation ────────────────────────────────────
 
 /// Build the tools/list entry for one tool. Output is identical
@@ -956,6 +985,81 @@ mod tests {
         assert!(long_search.contains("handle"), "{long_search}");
         let long_crawl = cli_command(crawl_tool()).render_long_help().to_string();
         assert!(long_crawl.contains("--resume"), "{long_crawl}");
+    }
+
+    #[test]
+    fn enum_args_outside_the_spec_are_refused() {
+        let fetch = fetch_tool();
+        let bad_values = [
+            json!("3"),
+            json!("asdf"),
+            json!("browser"),
+            json!(""),
+            json!("AUTO"),
+            json!(" auto"),
+            json!(2),
+            json!(true),
+            json!(["auto"]),
+            json!({ "tier": "auto" }),
+        ];
+        for bad in &bad_values {
+            let args = json!({ "url": "https://example.com", "tier": bad });
+            let err = check_enum_args(fetch, &args).expect_err("off-list tier accepted");
+            assert!(
+                err.contains(r#"tier must be one of "auto", "1", "2""#),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            check_enum_args(fetch, &json!({ "tier": "3" })),
+            Err(r#"tier must be one of "auto", "1", "2"; got "3""#.to_string())
+        );
+        for bad in ["asdf", "bogus", "Off"] {
+            assert!(
+                check_enum_args(fetch, &json!({ "archive": bad })).is_err(),
+                "{bad}"
+            );
+        }
+        for bad in ["asdf", "images", "Code"] {
+            let args = json!({ "intent": bad });
+            assert!(check_enum_args(search_tool(), &args).is_err(), "{bad}");
+        }
+        for bad in ["asdf", "deep", "MAP"] {
+            let args = json!({ "mode": bad });
+            assert!(check_enum_args(crawl_tool(), &args).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn listed_absent_and_null_enum_args_pass() {
+        for tool in TOOLS {
+            assert_eq!(check_enum_args(tool, &json!({})), Ok(()), "{}", tool.name);
+            for p in tool.params {
+                let ParamKind::Enum(variants) = p.kind else {
+                    continue;
+                };
+                for v in variants {
+                    let mut args = json!({});
+                    args[p.name] = json!(v);
+                    assert_eq!(
+                        check_enum_args(tool, &args),
+                        Ok(()),
+                        "{}.{} = {v}",
+                        tool.name,
+                        p.name
+                    );
+                }
+                let mut args = json!({});
+                args[p.name] = Value::Null;
+                assert_eq!(
+                    check_enum_args(tool, &args),
+                    Ok(()),
+                    "{}.{}",
+                    tool.name,
+                    p.name
+                );
+            }
+        }
     }
 
     #[test]

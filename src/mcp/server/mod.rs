@@ -493,6 +493,12 @@ pub(crate) async fn call_tool_ctx(
 ) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // The schema's enums bind nothing on the wire: a client may forward
+    // an off-list value unchecked, and every handler would read it as
+    // its default. Refuse it here, once, from the spec table.
+    if let Some(rejected) = invalid_args_error(name, &args) {
+        return Ok(rejected);
+    }
     match name {
         "web_fetch" => Ok(fetch_tool::fetch_tool(daemon, &args, ctx).await),
         "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
