@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Robots and sitemap discovery run against the seed's own origin now
+  (scheme + host + port): the crawler built `https://<host>/` from the
+  bare hostname, so an `http://` seed or one on a private port never
+  had its robots.txt read and its sitemap was probed on the wrong
+  origin. Root-relative `Sitemap:` directives resolve against the
+  origin the file came from too. (#345)
+- A crawl that follows links onto other hosts (`--any-host`) reads
+  each origin's own robots.txt before its first request there, and
+  applies that origin's Disallow rules and Crawl-delay. Every URL on
+  every host used to be checked against the seed's single robots file,
+  so another host's rules were ignored while the seed's rules leaked
+  onto hosts they do not govern. (#344)
 - An enum argument outside its listed values was accepted over MCP.
   An unknown `archive`, search `intent` or crawl `mode` silently ran
   as the default. An unknown `tier` (`"3"`, `"two"`) did worse: it
@@ -24,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crawl.invalid` (`fetch.invalid` previously meant only an unusable
   URL). An absent or `null` argument still gets the default.
   (Mart-Bogdan, #346)
+- `--version` under-reported the build: the features line was assembled
+  from a hardcoded pair of checks for `ocr` and `rerank`, so an `http`
+  build, the one that carries the MCP HTTP transport, was
+  indistinguishable from one without it, and any feature added later
+  would have been invisible too. The line is now built from the
+  `CARGO_FEATURE_*` variables Cargo exports for the features actually
+  enabled, so a new feature needs no code change to be reported.
+  (Mart-Bogdan, #343)
 
 ## [4.4.3] - 2026-10-03
 

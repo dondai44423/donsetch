@@ -7,6 +7,7 @@
 //! malformed XML sitemaps actually ship.
 
 use super::PageFetcher;
+use std::sync::Arc;
 
 /// robots.txt: sitemap directives + `*` Disallow rules.
 /// We obey robots by default : it is both polite AND the
@@ -31,7 +32,7 @@ pub struct Robots {
 pub const MAX_CRAWL_DELAY_SECS: f64 = 60.0;
 
 impl Robots {
-    pub fn parse(body: &str, base_host: &str) -> Self {
+    pub fn parse(body: &str, base_origin: &str) -> Self {
         let mut r = Robots::default();
         let mut in_star_group = false;
         let mut seen_any_group = false;
@@ -67,11 +68,14 @@ impl Robots {
                         .map(|d| d.min(MAX_CRAWL_DELAY_SECS));
                 }
                 "sitemap" => {
-                    // Sitemap directives apply outside groups.
+                    // Sitemap directives apply outside groups. A
+                    // root-relative one resolves against the origin
+                    // the robots.txt itself came from, scheme and
+                    // port included.
                     if v.starts_with("http") {
                         r.sitemaps.push(v.to_string());
                     } else if v.starts_with('/') {
-                        r.sitemaps.push(format!("https://{base_host}{v}"));
+                        r.sitemaps.push(format!("{base_origin}{v}"));
                     }
                 }
                 _ => {}
@@ -358,17 +362,106 @@ pub fn maybe_gunzip(body: &[u8]) -> Vec<u8> {
     body.to_vec()
 }
 
-/// Sitemap discovery: robots.txt first for directives, then
-/// the conventional /sitemap.xml fallback. Returns parsed
-/// entries (map phase) and the robots rules. Runs through the
-/// injected PageFetcher (real or mock).
-pub async fn discover(fetch: &PageFetcher, host: &str, cap: usize) -> (Robots, Vec<SitemapEntry>) {
-    let robots_url = format!("https://{host}/robots.txt");
-    let mut robots = Robots::default();
+/// The origin key for robots lookups: `scheme://host[:port]`
+/// (RFC 9309 §2.3 puts a URL's rules at its own service's origin).
+/// Default ports are already elided by the URL parser, so the key
+/// matches the canonical form of the seed's own origin.
+pub fn origin_of(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or("");
+    match url.port() {
+        Some(p) => format!("{}://{}:{}", url.scheme(), host, p),
+        None => format!("{}://{}", url.scheme(), host),
+    }
+}
+
+/// Fetch and parse one origin's robots.txt through the injected
+/// PageFetcher. A non-200 (including a network failure) is the RFC
+/// 9309 "unavailable" case: allow, and let the caller cache the empty
+/// rules so an origin costs one attempt per crawl.
+pub async fn fetch_robots(fetch: &PageFetcher, origin: &str) -> Robots {
+    let robots_url = format!("{origin}/robots.txt");
     let page = fetch(robots_url, "direct".to_string(), None).await;
     if page.status == 200 {
-        robots = Robots::parse(&String::from_utf8_lossy(&maybe_gunzip(&page.body)), host);
+        Robots::parse(&String::from_utf8_lossy(&maybe_gunzip(&page.body)), origin)
+    } else {
+        Robots::default()
     }
+}
+
+/// Per-origin robots cache for one crawl. The rules for a URL live at
+/// that URL's own origin (RFC 9309 §2.3), so a crawl that leaves the
+/// seed host reads each origin's own file before its first request
+/// there, and each origin's `Crawl-delay` paces that origin. The seed
+/// origin is seeded from the phase-1 discovery; other origins load on
+/// first contact (a metadata probe, not a page fetch).
+#[derive(Default)]
+pub struct RobotsCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, Arc<Robots>>>,
+}
+
+impl RobotsCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed an origin's rules without a fetch (phase-1 discovery
+    /// already read the seed origin's file).
+    pub fn insert(&self, origin: String, robots: Arc<Robots>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(origin, robots);
+    }
+
+    pub fn get(&self, origin: &str) -> Option<Arc<Robots>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(origin)
+            .cloned()
+    }
+
+    /// The rules for `url`'s origin, fetched once per origin. The bool
+    /// is true when THIS call did the fetch, so the caller applies the
+    /// origin's `Crawl-delay` exactly once. Two workers racing the
+    /// first contact with one origin may both fetch it; the rules are
+    /// identical and both inserts carry them.
+    pub async fn ensure(&self, fetch: &PageFetcher, url: &url::Url) -> (Arc<Robots>, bool) {
+        let origin = origin_of(url);
+        if let Some(r) = self.get(&origin) {
+            return (r, false);
+        }
+        let r = Arc::new(fetch_robots(fetch, &origin).await);
+        self.insert(origin, Arc::clone(&r));
+        (r, true)
+    }
+
+    /// Sync check for the candidate gates that run before the
+    /// fetch-time gate: a known origin is judged by its own rules; an
+    /// unknown origin passes here and is decided by the fetch-time
+    /// gate, so no link is dropped or fetched before its origin's
+    /// robots.txt has been read.
+    pub fn peek_allows(&self, url: &url::Url) -> bool {
+        match self.get(&origin_of(url)) {
+            Some(r) => r.allows_url(url),
+            None => true,
+        }
+    }
+}
+
+/// Sitemap discovery: robots.txt first for directives, then
+/// the conventional /sitemap.xml fallback. `origin` is the seed's
+/// `scheme://host[:port]`: robots.txt and the fallback sitemap
+/// locations live on the seed's own origin, never a hardcoded https
+/// site (a ported or http seed must read its own file and probe its
+/// own map locations). Runs through the injected PageFetcher (real or
+/// mock).
+pub async fn discover(
+    fetch: &PageFetcher,
+    origin: &str,
+    cap: usize,
+) -> (Robots, Vec<SitemapEntry>) {
+    let robots = fetch_robots(fetch, origin).await;
 
     // Sitemap candidates: robots directives first.
     let mut queue: Vec<String> = robots.sitemaps.clone();
@@ -376,12 +469,12 @@ pub async fn discover(fetch: &PageFetcher, host: &str, cap: usize) -> (Robots, V
         // Multiple conventional locations : many sites use non-standard
         // sitemap paths (WordPress /wp-sitemap.xml, Yoast /sitemap_index.xml).
         queue.extend([
-            format!("https://{host}/sitemap.xml"),
-            format!("https://{host}/sitemap_index.xml"),
-            format!("https://{host}/sitemap-index.xml"),
-            format!("https://{host}/wp-sitemap.xml"),
-            format!("https://{host}/sitemaps.xml"),
-            format!("https://{host}/sitemap.txt"),
+            format!("{origin}/sitemap.xml"),
+            format!("{origin}/sitemap_index.xml"),
+            format!("{origin}/sitemap-index.xml"),
+            format!("{origin}/wp-sitemap.xml"),
+            format!("{origin}/sitemaps.xml"),
+            format!("{origin}/sitemap.txt"),
         ]);
     }
 
@@ -473,6 +566,7 @@ fn absorb(text: String, queue: &mut Vec<String>, entries: &mut Vec<SitemapEntry>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
 
     #[test]
     fn robots_star_group_disallow_sitemap() {
@@ -534,6 +628,154 @@ mod tests {
         let r = Robots::parse(body, "ex.com");
         assert!(r.allowed("/a/b/c"));
         assert!(!r.allowed("/a/x"));
+    }
+
+    /// A PageFetcher over a fixed url → (status, body) table that
+    /// records every requested URL. Missing URLs answer 404.
+    fn recording_fetcher(
+        pages: Vec<(&'static str, u16, &'static str)>,
+    ) -> (
+        crate::crawl::PageFetcher,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let hits: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let h = Arc::clone(&hits);
+        let table: std::collections::HashMap<String, (u16, String)> = pages
+            .into_iter()
+            .map(|(u, s, b)| (u.to_string(), (s, b.to_string())))
+            .collect();
+        let fetch: crate::crawl::PageFetcher = Arc::new(
+            move |url: String, _lane: String, _referer: Option<String>| {
+                let h = Arc::clone(&h);
+                let entry = table.get(&url).cloned();
+                async move {
+                    h.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(url.clone());
+                    let (status, body) = entry.unwrap_or((404, "not found".to_string()));
+                    crate::crawl::FetchedPage {
+                        url,
+                        status,
+                        headers: vec![],
+                        body: body.into_bytes(),
+                        verdict: crate::detect::walls::Verdict::ContentOk,
+                        latency: std::time::Duration::from_millis(1),
+                        cached: false,
+                        error_hint: None,
+                    }
+                }
+                .boxed()
+            },
+        );
+        (fetch, hits)
+    }
+
+    #[test]
+    fn origin_of_keeps_scheme_and_nondefault_port() {
+        let u: url::Url = "http://h.localhost:8001/a?q=1".parse().unwrap();
+        assert_eq!(origin_of(&u), "http://h.localhost:8001");
+        let u: url::Url = "https://ex.com/".parse().unwrap();
+        assert_eq!(origin_of(&u), "https://ex.com");
+        let u: url::Url = "https://ex.com:443/".parse().unwrap();
+        assert_eq!(origin_of(&u), "https://ex.com", "a default port is elided");
+    }
+
+    #[test]
+    fn robots_relative_sitemap_resolves_against_the_origin() {
+        let body = "User-agent: *\nSitemap: /sitemap.xml\n";
+        assert_eq!(
+            Robots::parse(body, "http://seed.localhost:8001").sitemaps,
+            vec!["http://seed.localhost:8001/sitemap.xml"]
+        );
+        assert_eq!(
+            Robots::parse(body, "https://ex.com").sitemaps,
+            vec!["https://ex.com/sitemap.xml"]
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_reads_robots_and_sitemaps_from_the_seed_origin() {
+        let (fetch, hits) = recording_fetcher(vec![]);
+        let (robots, entries) = discover(&fetch, "http://seed.localhost:8001", 10).await;
+        assert_eq!(robots.crawl_delay, None);
+        assert!(entries.is_empty());
+        let hits = hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hits.iter()
+                .any(|u| u == "http://seed.localhost:8001/robots.txt"),
+            "robots.txt must be read from the seed's own origin; requested: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|u| u == "http://seed.localhost:8001/sitemap.xml"),
+            "sitemap fallbacks must sit on the seed's own origin; requested: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .all(|u| u.starts_with("http://seed.localhost:8001/")),
+            "nothing may be probed outside the seed origin; requested: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn robots_cache_reads_each_origin_once_and_keeps_its_own_rules() {
+        let (fetch, hits) = recording_fetcher(vec![
+            (
+                "http://a.test/robots.txt",
+                200,
+                "User-agent: *\nDisallow: /alpha/\n",
+            ),
+            (
+                "http://b.test:8080/robots.txt",
+                200,
+                "User-agent: *\nDisallow: /beta/\n",
+            ),
+        ]);
+        let cache = RobotsCache::new();
+        let a_alpha: url::Url = "http://a.test/alpha/x".parse().unwrap();
+        let a_ok: url::Url = "http://a.test/ok".parse().unwrap();
+        let b_beta: url::Url = "http://b.test:8080/beta/x".parse().unwrap();
+        let b_alpha: url::Url = "http://b.test:8080/alpha/x".parse().unwrap();
+
+        let (rules, fresh) = cache.ensure(&fetch, &a_alpha).await;
+        assert!(fresh, "first contact fetches");
+        assert!(!rules.allows_url(&a_alpha));
+        assert!(rules.allows_url(&a_ok));
+        let (_, fresh) = cache.ensure(&fetch, &a_ok).await;
+        assert!(!fresh, "second contact is a cache hit");
+
+        let (rules, fresh) = cache.ensure(&fetch, &b_beta).await;
+        assert!(fresh, "a different origin fetches its own file");
+        assert!(!rules.allows_url(&b_beta), "B's own rules decide B");
+        assert!(
+            rules.allows_url(&b_alpha),
+            "the first origin's rules must not leak onto another origin"
+        );
+
+        let hits = hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(hits.len(), 2, "one robots fetch per origin: {hits:?}");
+    }
+
+    #[test]
+    fn robots_cache_peek_defers_unknown_origins() {
+        let cache = RobotsCache::new();
+        let u: url::Url = "http://never.test/x".parse().unwrap();
+        assert!(
+            cache.peek_allows(&u),
+            "an unread origin defers to the fetch-time gate, never drops"
+        );
+        cache.insert(
+            "http://never.test".to_string(),
+            Arc::new(Robots::parse(
+                "User-agent: *\nDisallow: /\n",
+                "http://never.test",
+            )),
+        );
+        assert!(!cache.peek_allows(&u));
     }
 
     #[test]
