@@ -1986,10 +1986,8 @@ async fn robots_allows(
     url: &Url,
 ) -> bool {
     let (rules, fresh) = cache.ensure(fetch, url).await;
-    if fresh {
-        if let Some(host) = url.host_str() {
-            governor.set_host_crawl_delay(host, rules.crawl_delay);
-        }
+    if fresh && let Some(host) = url.host_str() {
+        governor.set_host_crawl_delay(host, rules.crawl_delay);
     }
     rules.allows_url(url)
 }
