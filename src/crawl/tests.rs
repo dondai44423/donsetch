@@ -696,6 +696,119 @@ async fn crawl_robots_rules_see_the_query_string() {
     );
 }
 
+// A seed on a non-default port (or plain http) must read ITS OWN
+// robots.txt: discovery used to build `https://<host>/robots.txt`
+// from the bare hostname, so a ported seed's rules were never seen
+// and its Disallow was never applied (#345).
+#[tokio::test]
+async fn crawl_reads_robots_from_the_seed_origin() {
+    let robots = "User-agent: *\nDisallow: /alpha/\n";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/alpha/page.html\">a</a><a href=\"/ok\">ok</a></article></body></html>";
+    let site = MockSite::new()
+        .page("http://seed.localhost:8001/robots.txt", 200, robots)
+        .page("http://seed.localhost:8001/", 200, seed)
+        .page(
+            "http://seed.localhost:8001/alpha/page.html",
+            200,
+            &html("A", "alpha"),
+        )
+        .page("http://seed.localhost:8001/ok", 200, &html("Ok", "ok"));
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    o.respect_robots = true;
+    let r = crawler
+        .crawl("http://seed.localhost:8001/", o, None)
+        .await
+        .unwrap();
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        hits.iter()
+            .any(|h| h == "http://seed.localhost:8001/robots.txt"),
+        "robots must be read from the seed's own origin; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.contains("/alpha/")),
+        "the seed origin's Disallow must hold; hits: {hits:?}"
+    );
+    assert!(r.pages.iter().any(|p| p.url.ends_with("/ok")));
+}
+
+// With --any-host (same_host false), another host's pages must be
+// checked against THAT host's robots.txt: every robots check used to
+// read the seed's one file, so a foreign Disallow was ignored while
+// the seed's Disallow leaked onto other hosts (#344).
+#[tokio::test]
+async fn crawl_any_host_reads_each_origins_own_robots() {
+    let robots_a = "User-agent: *\nDisallow: /alpha/\n";
+    let robots_b = "User-agent: *\nDisallow: /beta/\n";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/alpha/a.html\">a</a><a href=\"/ok\">ok</a><a href=\"http://b.localhost:8002/ok/page.html\">b-ok</a><a href=\"http://b.localhost:8002/alpha/page.html\">b-alpha</a><a href=\"http://b.localhost:8002/beta/page.html\">b-beta</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://a.localhost/robots.txt", 200, robots_a)
+        .page("https://a.localhost/", 200, seed)
+        .page("https://a.localhost/ok", 200, &html("Ok", "ok"))
+        .page("http://b.localhost:8002/robots.txt", 200, robots_b)
+        .page(
+            "http://b.localhost:8002/ok/page.html",
+            200,
+            &html("B1", "ok page"),
+        )
+        .page(
+            "http://b.localhost:8002/alpha/page.html",
+            200,
+            &html("B2", "alpha page"),
+        )
+        .page(
+            "http://b.localhost:8002/beta/page.html",
+            200,
+            &html("B3", "beta page"),
+        );
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 20;
+    o.respect_robots = true;
+    o.same_host = false;
+    let r = crawler
+        .crawl("https://a.localhost/", o, None)
+        .await
+        .unwrap();
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let i_b_robots = hits
+        .iter()
+        .position(|h| h == "http://b.localhost:8002/robots.txt")
+        .expect("the other host's robots.txt must be fetched before its pages");
+    let i_first_b_page = hits
+        .iter()
+        .position(|h| h.starts_with("http://b.localhost:8002/") && !h.ends_with("/robots.txt"))
+        .expect("B pages must be fetched");
+    assert!(
+        i_b_robots < i_first_b_page,
+        "robots before the first request to the host; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.contains("b.localhost:8002/beta/")),
+        "B's own Disallow must hold on B; hits: {hits:?}"
+    );
+    assert!(
+        r.pages
+            .iter()
+            .any(|p| p.url.contains("b.localhost:8002/alpha/")),
+        "the seed host's Disallow must not leak onto B; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h == "https://a.localhost/alpha/a.html"),
+        "A's Disallow must still hold on A; hits: {hits:?}"
+    );
+}
+
 // `Crawl-delay` was parsed with a bare `f64` parse and fed straight
 // to `Duration::from_secs_f64`, which panics on `inf`/huge values:
 // one hostile (or sloppy) robots.txt aborted the crawl worker, and
@@ -704,13 +817,19 @@ async fn crawl_robots_rules_see_the_query_string() {
 fn robots_crawl_delay_is_finite_and_clamped() {
     use super::sitemap::Robots;
     for bad in ["inf", "-inf", "nan", "-5", "abc"] {
-        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {bad}\n"), "ex.com");
+        let r = Robots::parse(
+            &format!("User-agent: *\nCrawl-delay: {bad}\n"),
+            "https://ex.com",
+        );
         assert_eq!(r.crawl_delay, None, "{bad}");
     }
-    let r = Robots::parse("User-agent: *\nCrawl-delay: 2.5\n", "ex.com");
+    let r = Robots::parse("User-agent: *\nCrawl-delay: 2.5\n", "https://ex.com");
     assert_eq!(r.crawl_delay, Some(2.5));
     for huge in ["86400", "1e300"] {
-        let r = Robots::parse(&format!("User-agent: *\nCrawl-delay: {huge}\n"), "ex.com");
+        let r = Robots::parse(
+            &format!("User-agent: *\nCrawl-delay: {huge}\n"),
+            "https://ex.com",
+        );
         assert_eq!(
             r.crawl_delay,
             Some(super::sitemap::MAX_CRAWL_DELAY_SECS),
