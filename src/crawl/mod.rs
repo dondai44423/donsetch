@@ -528,12 +528,17 @@ impl Crawler {
         opts.exclude_paths = frontier::effective_excludes(&opts.exclude_paths);
 
         // ── Phase 1: the map ───────────────────────────────
+        // Robots and sitemap discovery run against the seed's own
+        // ORIGIN (scheme + host + port), not a bare hostname: an
+        // `http://` seed or one on a non-default port must read its
+        // own robots.txt and probe its own sitemap locations (#345).
+        let seed_origin = sitemap::origin_of(&seed_url);
         let mut map: Vec<String> = Vec::new();
         let mut sitemap_entries: Vec<SitemapEntry> = Vec::new();
         let mut robots = sitemap::Robots::default();
         if opts.mode != CrawlMode::Content {
             let (mut r, mut entries) =
-                sitemap::discover(&self.fetch, &seed_host, opts.map_cap * 4).await;
+                sitemap::discover(&self.fetch, &seed_origin, opts.map_cap * 4).await;
             robots = sitemap::Robots::default();
             std::mem::swap(&mut robots, &mut r);
             // Newest first: lastmod-sorted sitemaps put fresh
@@ -570,13 +575,18 @@ impl Crawler {
             // Content-only still reads robots for Disallow
             // rules when respect_robots is on.
             if opts.respect_robots {
-                let (r, _) = sitemap::discover(&self.fetch, &seed_host, 0).await;
+                let (r, _) = sitemap::discover(&self.fetch, &seed_origin, 0).await;
                 robots = r;
             }
         }
+        // Per-origin robots for the page loop: the seed's rules come
+        // from the phase-1 discovery; every other origin the frontier
+        // reaches gets its own fetch at first contact (#344).
+        let robots_cache = Arc::new(sitemap::RobotsCache::new());
         if opts.respect_robots {
             self.governor
                 .set_host_crawl_delay(&seed_host, robots.crawl_delay);
+            robots_cache.insert(seed_origin.clone(), Arc::new(robots.clone()));
         }
         if opts.mode == CrawlMode::Map {
             // Map-only crawl: cheap exit. Guide the agent when no
@@ -657,30 +667,37 @@ impl Crawler {
                 )));
             }
             for e in &sitemap_entries {
-                if let Ok(u) = Url::parse(&e.loc)
-                    && host_ok(&u)
-                    && scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths)
-                    && (!opts.respect_robots || robots.allows_url(&u))
+                let Ok(u) = Url::parse(&e.loc) else {
+                    continue;
+                };
+                if !host_ok(&u)
+                    || !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths)
                 {
-                    // Focus gate: skip sitemap entries that don't
-                    // match the focus query (if set).
-                    if let Some(q) = &opts.focus
-                        && !score::focus_match("", u.path(), q)
-                    {
-                        continue;
-                    }
-                    let lcanon = frontier::locale_canonical(u.path());
-                    if !seeded_locales.insert(lcanon) {
-                        continue; // Another variant already queued
-                    }
-                    let s = score::score_candidate_with_idf(
-                        "",
-                        u.path(),
-                        opts.focus.as_deref(),
-                        focus_idf.as_deref(),
-                    ) + e.priority.unwrap_or(0.0) as f64 * 2.0;
-                    queue.push(u, s, 1);
+                    continue;
                 }
+                if opts.respect_robots
+                    && !robots_allows(&self.fetch, &self.governor, &robots_cache, &u).await
+                {
+                    continue;
+                }
+                // Focus gate: skip sitemap entries that don't
+                // match the focus query (if set).
+                if let Some(q) = &opts.focus
+                    && !score::focus_match("", u.path(), q)
+                {
+                    continue;
+                }
+                let lcanon = frontier::locale_canonical(u.path());
+                if !seeded_locales.insert(lcanon) {
+                    continue; // Another variant already queued
+                }
+                let s = score::score_candidate_with_idf(
+                    "",
+                    u.path(),
+                    opts.focus.as_deref(),
+                    focus_idf.as_deref(),
+                ) + e.priority.unwrap_or(0.0) as f64 * 2.0;
+                queue.push(u, s, 1);
             }
         }
 
@@ -742,7 +759,7 @@ impl Crawler {
             let opts_worker = opts.clone();
             let seed_host2 = seed_host.clone();
             let seed_norm_w = seed_norm.clone();
-            let robots = robots.clone();
+            let robots_cache = Arc::clone(&robots_cache);
             // The redirect recheck consults the host gate inside the
             // worker: each iteration needs its own clone.
             let host_ok = host_ok.clone();
@@ -887,7 +904,9 @@ impl Crawler {
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
-                    if opts_worker.respect_robots && !robots.allows_url(&parsed) {
+                    if opts_worker.respect_robots
+                        && !robots_allows(&fetch, &governor, &robots_cache, &parsed).await
+                    {
                         filtered_out.fetch_add(1, Ordering::Relaxed);
                         continue 'work;
                     }
@@ -1066,8 +1085,8 @@ impl Crawler {
                             &opts_worker.include_paths,
                             &opts_worker.exclude_paths,
                         );
-                        let robots_ok_final =
-                            !opts_worker.respect_robots || robots.allows_url(&final_parsed);
+                        let robots_ok_final = !opts_worker.respect_robots
+                            || robots_allows(&fetch, &governor, &robots_cache, &final_parsed).await;
                         if !host_ok_final || !scope_ok_final || !robots_ok_final {
                             skipped
                                 .lock()
@@ -1406,7 +1425,8 @@ impl Crawler {
                                     ) {
                                         continue;
                                     }
-                                    if opts_worker.respect_robots && !robots.allows_url(&nu) {
+                                    if opts_worker.respect_robots && !robots_cache.peek_allows(&nu)
+                                    {
                                         continue;
                                     }
                                     // Focus gate for pagination: hard filter
@@ -1509,7 +1529,9 @@ impl Crawler {
                                         ) {
                                             continue;
                                         }
-                                        if opts_worker.respect_robots && !robots.allows_url(&u) {
+                                        if opts_worker.respect_robots
+                                            && !robots_cache.peek_allows(&u)
+                                        {
                                             continue;
                                         }
                                         let lcanon = frontier::locale_canonical(u.path());
@@ -1582,7 +1604,8 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    if opts_worker.respect_robots && !robots.allows_url(&cu) {
+                                    if opts_worker.respect_robots && !robots_cache.peek_allows(&cu)
+                                    {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
@@ -1948,6 +1971,27 @@ fn host_matches(a: &str, b: &str) -> bool {
     let a = a.strip_prefix("www.").unwrap_or(a);
     let b = b.strip_prefix("www.").unwrap_or(b);
     a.eq_ignore_ascii_case(b)
+}
+
+/// The per-origin robots gate used at fetch time (and the redirect
+/// recheck): ensure the URL's own origin's robots.txt has been read
+/// (fetching it on first contact), apply that origin's declared
+/// `Crawl-delay` to the governor once, and decide the URL against
+/// its own origin's rules. Every fetched URL passes this gate, so no
+/// request to an origin can precede its robots.txt.
+async fn robots_allows(
+    fetch: &PageFetcher,
+    governor: &Governor,
+    cache: &sitemap::RobotsCache,
+    url: &Url,
+) -> bool {
+    let (rules, fresh) = cache.ensure(fetch, url).await;
+    if fresh {
+        if let Some(host) = url.host_str() {
+            governor.set_host_crawl_delay(host, rules.crawl_delay);
+        }
+    }
+    rules.allows_url(url)
 }
 
 #[cfg(test)]
