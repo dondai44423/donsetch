@@ -227,7 +227,7 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
 /// | parse.encoding | charset-level failure |
 /// | archive.stale | served an old snapshot |
 /// | deadline.hit | time budget exhausted |
-/// | crawl.seed / crawl.resume / fetch.invalid | input errors |
+/// | crawl.seed / crawl.resume / fetch.invalid / search.invalid / crawl.invalid | input errors |
 pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, str> {
     // A producer that knows its own failure type outranks the text
     // classifier. The guard KNOWS a name it could not resolve is a name
@@ -310,6 +310,23 @@ pub(super) fn tool_error_structured(
         v["structuredContent"] = s;
     }
     v
+}
+
+/// The tool error for a call whose enum arguments fall outside the
+/// spec, with code `<cli_cmd>.invalid` (`fetch.invalid`, …). `None`
+/// when the arguments pass or the spec does not list the tool.
+pub(super) fn invalid_args_error(name: &str, args: &Value) -> Option<Value> {
+    let tool = crate::spec::TOOLS.iter().find(|t| t.name == name)?;
+    let problem = crate::spec::check_enum_args(tool, args).err()?;
+    let cmd = tool.cli_cmd;
+    Some(tool_error_structured(
+        format!("{cmd}: {problem}"),
+        "permanent",
+        Some(json!({
+            "code": format!("{cmd}.invalid"),
+            "next_action": "retry with one of the listed values, or omit the parameter for its default",
+        })),
+    ))
 }
 
 /// What should the agent DO next, given this failure? One line,
@@ -651,6 +668,43 @@ mod error_code_tests {
             "crawl.resume"
         );
         assert_eq!(error_code("fetch: invalid URL", None), "fetch.invalid");
+    }
+
+    #[test]
+    pub(super) fn off_list_enum_args_are_a_tool_error() {
+        let args = json!({ "url": "https://example.com", "tier": "3" });
+        let v = invalid_args_error("web_fetch", &args).expect("tier=3 must be refused");
+        assert_eq!(v["isError"], true);
+        assert_eq!(v["errorKind"], "permanent");
+        assert_eq!(v["code"], "fetch.invalid");
+        assert_eq!(v["structuredContent"]["code"], "fetch.invalid");
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(r#"fetch: tier must be one of "auto", "1", "2"; got "3""#),
+            "{text}"
+        );
+        assert!(text.contains("Next action:"), "{text}");
+
+        let args = json!({ "url": "https://example.com", "archive": "asdf" });
+        let v = invalid_args_error("web_fetch", &args).expect("archive=asdf must be refused");
+        assert_eq!(v["code"], "fetch.invalid");
+        let args = json!({ "query": "q", "intent": "asdf" });
+        let v = invalid_args_error("web_search", &args).expect("intent=asdf must be refused");
+        assert_eq!(v["code"], "search.invalid");
+        let args = json!({ "url": "https://example.com", "mode": "asdf" });
+        let v = invalid_args_error("web_crawl", &args).expect("mode=asdf must be refused");
+        assert_eq!(v["code"], "crawl.invalid");
+    }
+
+    #[test]
+    pub(super) fn listed_enum_args_and_unknown_tools_pass_through() {
+        let args = json!({ "url": "https://example.com", "tier": "2", "archive": "off" });
+        assert!(invalid_args_error("web_fetch", &args).is_none());
+        assert!(
+            invalid_args_error("web_fetch", &json!({ "url": "https://example.com" })).is_none()
+        );
+        // An unknown tool is the dispatcher's protocol error, not this one.
+        assert!(invalid_args_error("web_nope", &json!({ "tier": "3" })).is_none());
     }
 
     // #248: a host that does not resolve is a NAME failure, and a
