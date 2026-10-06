@@ -261,6 +261,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title,
         byline: None,
@@ -270,7 +271,6 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: kept.len(),
         blocks_shown: kept.len(),
-        tokens_est: total / 4,
         thin: total < 800,
         content_kind: ContentKind::Page,
         lang: guess_lang(&md),
@@ -279,6 +279,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 

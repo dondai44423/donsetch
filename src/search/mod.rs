@@ -50,6 +50,24 @@ use rank::Merged;
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 const RETRY_TIMEOUT: Duration = Duration::from_secs(3);
 
+tokio::task_local! {
+    pub(crate) static SEARCH_DEADLINE: Option<tokio::time::Instant>;
+}
+
+fn stage_budget(cap: Duration, reserve: Duration) -> Duration {
+    SEARCH_DEADLINE
+        .try_with(|deadline| {
+            deadline.map_or(cap, |deadline| {
+                cap.min(
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .saturating_sub(reserve),
+                )
+            })
+        })
+        .unwrap_or(cap)
+}
+
 /// Chronic-failure bench time. A walled engine stops wasting a
 /// fan-out slot for this long after 3 consecutive strikes.
 const QUARANTINE_TTL: Duration = Duration::from_secs(600);
@@ -151,6 +169,7 @@ fn is_engine_fault(status: &str) -> bool {
         && status != "no-results"
         && status != "invalid-config"
         && status != "pacing-timeout"
+        && status != "budget-skipped"
 }
 
 /// C1 roster hygiene: Mojeek answers blocked traffic with HTTP 200
@@ -719,6 +738,21 @@ impl Searcher {
                 assignments.push((e.to_string(), queries[1].clone()));
             }
         }
+        // Authority cannot lift a source absent from the candidate pool.
+        // Two scoped recalls join the initial wave, on an engine that honors
+        // site:, only while the pool is healthy. Results still need ranking.
+        if matches!(intent, Intent::Web | Intent::Code) && self.pool.stress() < 0.15 {
+            let engine = live
+                .iter()
+                .find(|e| matches!(**e, "bing" | "ddg_html"))
+                .copied()
+                .or_else(|| live.contains(&"ddg").then_some("ddg_html"));
+            if let Some(engine) = engine {
+                for q in authority::official_queries(&compiled) {
+                    assignments.push((engine.to_string(), q));
+                }
+            }
+        }
 
         // ── Egress assignment ──
         //
@@ -835,7 +869,7 @@ impl Searcher {
                     engine.clone(),
                     eg.id,
                     false,
-                    RETRY_TIMEOUT,
+                    stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
                 )));
                 continue;
             }
@@ -859,7 +893,7 @@ impl Searcher {
                 eg.id,
                 eg.proxy,
                 context,
-                RETRY_TIMEOUT,
+                stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
                 previous,
             )));
         }
@@ -891,12 +925,20 @@ impl Searcher {
         {
             let hook = self.ghost.as_ref().unwrap().clone();
             let task = ghost_engine_task("google_ghost".to_string(), query.to_string(), hook);
-            match tokio::time::timeout(Duration::from_secs(30), task).await {
-                Ok(outcome) => vec![outcome],
-                Err(_) => vec![(
+            let budget = stage_budget(Duration::from_secs(30), Duration::from_secs(2));
+            if budget.is_zero() {
+                vec![(
                     "google_ghost".to_string(),
-                    Err(("ghost-timeout".into(), "ghost".into(), true)),
-                )],
+                    Err(("budget-skipped".into(), "ghost".into(), true)),
+                )]
+            } else {
+                match tokio::time::timeout(budget, task).await {
+                    Ok(outcome) => vec![outcome],
+                    Err(_) => vec![(
+                        "google_ghost".to_string(),
+                        Err(("ghost-timeout".into(), "ghost".into(), true)),
+                    )],
+                }
             }
         } else {
             Vec::new()
@@ -1057,7 +1099,11 @@ impl Searcher {
         // The genius feature: results carry the page's own title
         // and description, not the SERP's truncated version.
         let enrich_t = std::time::Instant::now();
-        self.enrich_results(&mut results).await;
+        let _ = tokio::time::timeout(
+            stage_budget(Duration::from_secs(4), Duration::from_millis(500)),
+            self.enrich_results(&mut results),
+        )
+        .await;
         let enrich_ms = enrich_t.elapsed().as_millis();
 
         // ── site:/intitle:/filetype: post-merge enforcement:
@@ -1076,7 +1122,9 @@ impl Searcher {
         // DONSEEK_NO_TOPUP is the A/B kill switch for benching.
         #[cfg(feature = "rerank")]
         let topup_ms: u128 = {
-            if crate::config::cfg().search.rerank_topup {
+            if crate::config::cfg().search.rerank_topup
+                && !stage_budget(Duration::from_secs(1), Duration::from_millis(500)).is_zero()
+            {
                 let t = std::time::Instant::now();
                 let q = query.to_string();
                 let mut owned = std::mem::take(&mut results);
@@ -1084,9 +1132,8 @@ impl Searcher {
                     crate::search::rerank::topup(&q, &mut owned, 8);
                     owned
                 });
-                let ms = t.elapsed().as_millis();
                 results = r.await?;
-                ms
+                t.elapsed().as_millis()
             } else {
                 0
             }
@@ -1496,6 +1543,38 @@ mod tests {
     // (cached: true, provider preserved), never re-billing the
     // provider. The store/serve roundtrip is the mechanism the wiring
     // in search_tool relies on.
+    #[tokio::test]
+    async fn wave450_optional_search_stages_preserve_time_for_results() {
+        let cap = Duration::from_secs(30);
+        let reserve = Duration::from_secs(5);
+        assert_eq!(stage_budget(cap, reserve), cap);
+        SEARCH_DEADLINE
+            .scope(
+                Some(tokio::time::Instant::now() + Duration::from_millis(200)),
+                async {
+                    assert_eq!(stage_budget(cap, reserve), Duration::ZERO);
+                },
+            )
+            .await;
+        SEARCH_DEADLINE
+            .scope(
+                Some(tokio::time::Instant::now() + Duration::from_secs(8)),
+                async {
+                    let budget = stage_budget(cap, reserve);
+                    assert!(
+                        budget > Duration::from_secs(2) && budget <= Duration::from_secs(3),
+                        "{budget:?}"
+                    );
+                },
+            )
+            .await;
+        assert_eq!(
+            stage_budget(cap, reserve),
+            cap,
+            "deadline must not escape the call"
+        );
+    }
+
     #[test]
     fn byok_results_roundtrip_the_cache_with_provider_and_cached_flag() {
         let s = test_searcher();

@@ -96,6 +96,15 @@
             "description": "Include image alt text and source URLs. Use image_text instead when words inside an image must be read.",
             "type": "boolean"
           },
+          "mode": {
+            "description": "Output budget preset: scan=800, read=4000, deep=16000. Explicit max_chars wins; omission keeps the 16000 default. All presets return next_offset when truncated.",
+            "enum": [
+              "scan",
+              "read",
+              "deep"
+            ],
+            "type": "string"
+          },
           "must_contain": {
             "description": "Case-insensitive string or /regex/ presence check. Returns MATCH/NO-MATCH and up to 3 excerpts instead of the full page; use for verification, not general reading.",
             "type": "string"
@@ -121,7 +130,7 @@
             "type": "boolean"
           },
           "stitch": {
-            "description": "Read all parts of a paginated article in one call (up to 6 parts / 48000 chars). Enable only when the requested source spans article pages.",
+            "description": "Read up to 6 parts of a paginated article. Output obeys max_chars; next_offset resumes collected text and next_part identifies uncollected content. Enable only when the requested source spans article pages.",
             "type": "boolean"
           },
           "tier": {
@@ -204,7 +213,7 @@
       "name": "web_search"
     },
     {
-      "description": "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty means complete; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs. dataset=true returns JSONL (one object per page).",
+      "description": "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty is complete only when the requested evidence was obtained without failed or excluded pages; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs. dataset=true returns JSONL (one object per page).",
       "inputSchema": {
         "properties": {
           "dataset": {

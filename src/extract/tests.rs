@@ -9,6 +9,103 @@ use super::metadata;
 use super::*;
 use scraper::Html;
 
+#[test]
+fn wave450_wall_cannot_be_laundered_by_reading_modes() {
+    let html = "<html><head><title>Blocked</title></head><body><main><h1>You've been blocked by network security.</h1><p>To continue, log in to your Reddit account or use your developer token.</p></main></body></html>";
+    for opts in [
+        ExtractOptions::default(),
+        ExtractOptions {
+            must_contain: Some("pts".into()),
+            ..Default::default()
+        },
+        ExtractOptions {
+            toc: true,
+            ..Default::default()
+        },
+        ExtractOptions {
+            max_chars: Some(200),
+            offset: 150,
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            extract(
+                html.as_bytes(),
+                "text/html",
+                "https://old.reddit.com/r/rust/",
+                &opts
+            )
+            .is_err(),
+            "a wall must fail before probe, outline or pagination"
+        );
+    }
+    let article = format!("<article><h1>Network security guide</h1>{}<p>The phrase You've been blocked by network security appears on Reddit's block screen.</p></article>", "<p>This guide explains secure connections, authentication and debugging with real application examples.</p>".repeat(25));
+    assert!(
+        extract(
+            article.as_bytes(),
+            "text/html",
+            "https://example.com",
+            &ExtractOptions::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn wave450_section_does_not_change_page_identity() {
+    let html = "<article><h1>Guide</h1><h2>Alpha</h2><p>Alpha is the first topic and has detailed instructions.</p><h2>Beta</h2><p>Beta is another topic with completely different instructions.</p></article>";
+    let full = extract_html(html);
+    let section = extract_html_opts(
+        html,
+        &ExtractOptions {
+            section: Some("Beta".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(full.fingerprint, section.fingerprint);
+    assert!(!section.markdown.contains("Alpha is"));
+}
+
+#[test]
+fn wave450_sitemap_is_an_inventory_not_an_app_shell() {
+    let xml = b"<?xml version='1.0'?><urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'><url><loc>https://example.com/a?q=1&amp;p=2</loc></url><url><loc>https://example.com/b</loc></url></urlset>";
+    let ex = extract(
+        xml,
+        "application/xml",
+        "https://example.com/sitemap.xml",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(ex.markdown.contains("https://example.com/a?q=1&p=2"));
+    assert!(!ex.markdown.contains("<urlset"));
+    assert!(!ex.thin);
+}
+
+#[test]
+fn wave450_focus_miss_keeps_its_warning() {
+    let html = "<article><h1>Guide</h1><p>Reliable storage records each write before acknowledging the operation and safely restores interrupted transactions after a power failure.</p></article>";
+    let ex = extract_html_opts(
+        html,
+        &ExtractOptions {
+            focus: Some("quasarzzzz".into()),
+            ..Default::default()
+        },
+    );
+    assert!(ex.markdown.contains("no matches"));
+    assert!(ex.markdown.contains("Reliable storage"));
+}
+
+#[test]
+fn wave450_pagination_never_skips_the_end_of_a_long_paragraph() {
+    let text = format!("{}END-OF-PARAGRAPH\n\nNext paragraph.", "a".repeat(210));
+    let (_, next) = paginate_public(&text, 0, 200);
+    let (second, _) = paginate_public(&text, next.unwrap(), 200);
+    assert!(
+        second.contains("END-OF-PARAGRAPH"),
+        "resumption skipped evidence: {second}"
+    );
+}
+
 // ── Helpers ───────────────────────────────────────────────
 
 fn extract_html(html: &str) -> Extracted {
@@ -348,7 +445,7 @@ fn focus_english_stemming() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("running") || r.markdown.contains("runner"));
 }
 
@@ -366,7 +463,7 @@ fn focus_chinese_bigram() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("机器学习"));
 }
 
@@ -384,7 +481,7 @@ fn focus_japanese() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("機械学習"));
 }
 
@@ -401,7 +498,7 @@ fn focus_accent_folding() {
             ..Default::default()
         },
     );
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
 }
 
 #[test]
@@ -418,7 +515,7 @@ fn focus_german_umlaut() {
         },
     );
     // Should find the content regardless of umlaut folding.
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
 }
 
 #[test]
@@ -1678,7 +1775,7 @@ fn mixed_language_focus_cjk() {
         },
     );
     // "React" is Latin mixed into CJK : should still match.
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
     assert!(r.markdown.contains("React") || r.markdown.contains("Facebook"));
 }
 
@@ -1783,7 +1880,7 @@ fn focus_french_stemming() {
         },
     );
     // "ordinateurs" → stem "ordinateur" should match query.
-    assert!(!r.markdown.contains("*[focus"));
+    assert!(!r.markdown.contains("no matches"), "{}", r.markdown);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -2612,4 +2709,45 @@ async fn extract_off_worker_parses_pdf_off_the_runtime_and_html_inline() {
     // Either a typed failure or, on a lenient pdfium, an empty doc;
     // never a panic.
     let _ = err;
+}
+
+#[test]
+fn wave450_outline_respects_the_output_budget() {
+    let headings = (0..100)
+        .map(|n| {
+            format!("<h2>Section number {n}</h2><p>Some actual section content for readers.</p>")
+        })
+        .collect::<String>();
+    let html = format!("<html><title>Outline test</title><main>{headings}</main></html>");
+    let opts = ExtractOptions {
+        toc: true,
+        max_chars: Some(300),
+        ..Default::default()
+    };
+    let ex = super::extract(html.as_bytes(), "text/html", "https://example.org/", &opts).unwrap();
+    assert!(
+        ex.markdown.len() < 450,
+        "outline leaked {} chars",
+        ex.markdown.len()
+    );
+    assert!(ex.next_offset.is_some());
+}
+
+#[test]
+fn wave450_adapter_token_estimate_measures_the_returned_slice() {
+    let body = "real post body with details. ".repeat(100);
+    let html = format!(
+        "<html><body><div class='thing link' data-author='a' data-score='5'><a class='title'>A real post</a><div class='usertext-body'><div class='md'><p>{body}</p></div></div></div></body></html>"
+    );
+    let ex = super::reddit::extract(
+        &html,
+        "https://old.reddit.com/r/rust/",
+        &ExtractOptions {
+            max_chars: Some(200),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(ex.next_offset.is_some());
+    assert_eq!(ex.tokens_est, ex.markdown.len() / 4);
 }

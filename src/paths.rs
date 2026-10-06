@@ -52,6 +52,15 @@ fn platform_cache_dir() -> PathBuf {
         .join("donsetch")
 }
 
+/// The user's own cache root even inside `#[cfg(test)]` builds
+/// (`cache_dir()` redirects tests to a per-process sandbox). For
+/// REUSING an already-downloaded immutable artifact, never for tests
+/// to write user state.
+#[cfg(test)]
+pub fn user_cache_dir() -> PathBuf {
+    default_cache_dir()
+}
+
 /// One temp root per test process, created on first use and removed
 /// at exit. nextest runs each test in its own process, so this is per
 /// test; under plain `cargo test` it is per binary, which is still

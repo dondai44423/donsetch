@@ -41,6 +41,9 @@ use super::rank::{Merged, host_of};
 /// combined (next + js, spring + boot, go + concurrency) are
 /// encoded as multi-token entries so they can't fire alone.
 const OFFICIAL: &[(&[&str], &[&str])] = &[
+    // Product names require context: "uplift" alone is ordinary prose.
+    (&["uplift", "desk"], &["upliftdesk.com"]),
+    (&["vari", "desk"], &["vari.com"]),
     // ── Languages & runtimes ──
     (
         &["rust"],
@@ -355,6 +358,31 @@ pub fn official_domains(query: &str) -> Vec<&'static str> {
     out
 }
 
+/// Bounded operator-only recall: preserve the caller's words and retrieve
+/// actual engine hits from matching primary sources. Explicit site wins.
+pub(super) fn official_queries(compiled: &super::query::CompiledQuery) -> Vec<String> {
+    if compiled.has_operators() {
+        return Vec::new();
+    }
+    let mut domains: Vec<&str> = Vec::new();
+    for domain in official_domains(&compiled.text) {
+        if domains
+            .iter()
+            .any(|parent| domain == *parent || domain.ends_with(&format!(".{parent}")))
+        {
+            continue;
+        }
+        domains.push(domain);
+        if domains.len() == 2 {
+            break;
+        }
+    }
+    domains
+        .into_iter()
+        .map(|domain| format!("{} site:{domain}", compiled.text))
+        .collect()
+}
+
 fn docs_seeking(query: &str) -> bool {
     let q = query.to_lowercase();
     DOCS_WORDS.iter().any(|w| q.contains(w))
@@ -486,6 +514,17 @@ pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
     let official = official_domains(query);
     let docs_seek = docs_seeking(query);
     let paper_seek = paper_seeking(query);
+    let query_words: Vec<_> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .collect();
+    let wants_benchmark = intent == Intent::Paper
+        && query_words
+            .iter()
+            .any(|w| matches!(w.as_str(), "benchmark" | "benchmarks"))
+        && !query_words
+            .iter()
+            .any(|w| matches!(w.as_str(), "survey" | "surveys" | "review" | "reviews"));
     for r in results.iter_mut() {
         let host = host_of(&r.url);
         let mut m = 1.0;
@@ -525,6 +564,17 @@ pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
             m *= freshness_mult(&r.published);
         }
 
+        // A survey about benchmarks is useful background, but does not
+        // replace the evaluation the caller asked for. Explicit survey
+        // queries retain their normal ranking; no domain is blacklisted.
+        if wants_benchmark
+            && r.title
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w.eq_ignore_ascii_case("survey") || w.eq_ignore_ascii_case("review"))
+        {
+            m *= 0.65;
+        }
+
         r.score *= m;
     }
 }
@@ -537,6 +587,39 @@ mod tests {
     // its year token verbatim. i64::MAX as a year overflowed
     // days_from_civil's era * 146_097 (panic under overflow checks,
     // a wrapped garbage age in release).
+    #[test]
+    fn wave450_official_recall_is_bounded_and_respects_explicit_operators() {
+        let queries = official_queries(&super::super::query::compile(
+            "best standing desk 2026 Uplift vs Vari",
+        ));
+        assert_eq!(queries.len(), 2);
+        assert!(queries.iter().any(|q| q.ends_with("site:upliftdesk.com")));
+        assert!(queries.iter().any(|q| q.ends_with("site:vari.com")));
+        assert!(
+            queries
+                .iter()
+                .all(|q| q.starts_with("best standing desk 2026 Uplift vs Vari "))
+        );
+        assert!(
+            official_queries(&super::super::query::compile(
+                "uplift in economic productivity"
+            ))
+            .is_empty()
+        );
+        assert!(
+            official_queries(&super::super::query::compile(
+                "rust ownership site:example.com"
+            ))
+            .is_empty()
+        );
+        let queries = official_queries(&super::super::query::compile("rust tokio documentation"));
+        assert_eq!(queries.len(), 2);
+        assert!(
+            !queries.iter().any(|q| q.contains("site:doc.rust-lang.org")),
+            "a parent-domain query already covers the subdomain"
+        );
+    }
+
     #[test]
     fn an_absurd_year_is_not_a_date_and_does_not_overflow() {
         assert_eq!(iso_days_ago("9223372036854775807-01-01"), None);
@@ -598,6 +681,40 @@ mod tests {
             score,
             published: None,
         }
+    }
+
+    #[test]
+    fn wave450_benchmark_queries_prefer_evaluations_but_keep_requested_surveys() {
+        let mut rs = vec![
+            merged("RAG benchmarks survey", "https://arxiv.org/abs/one", 0.8),
+            merged(
+                "RAG benchmarks evaluation",
+                "https://arxiv.org/abs/two",
+                0.7,
+            ),
+        ];
+        apply("RAG benchmarks", Intent::Paper, &mut rs);
+        assert!(
+            rs[1].score > rs[0].score,
+            "benchmark evidence must beat a similarly relevant survey"
+        );
+        let mut rs = vec![
+            merged("RAG benchmarks survey", "https://arxiv.org/abs/one", 0.8),
+            merged(
+                "RAG benchmarks evaluation",
+                "https://arxiv.org/abs/two",
+                0.7,
+            ),
+        ];
+        apply("RAG benchmarks survey", Intent::Paper, &mut rs);
+        assert!(rs[0].score > rs[1].score);
+    }
+
+    #[test]
+    fn wave450_desk_vendor_sources_require_product_context() {
+        assert!(official_domains("Uplift vs Vari standing desk").contains(&"upliftdesk.com"));
+        assert!(official_domains("Uplift vs Vari standing desk").contains(&"vari.com"));
+        assert!(official_domains("uplift in economic productivity").is_empty());
     }
 
     #[test]

@@ -118,6 +118,10 @@ pub struct DomainProfile {
     /// Unix seconds of the most recent wall-persisted ghost pass.
     #[serde(default)]
     pub last_wall_fail: u64,
+    /// Network class on which the persistent wall was observed. Separate
+    /// from the cookie vault's class: a failed solve must not relabel cookies.
+    #[serde(default)]
+    pub wall_egress_class: Option<String>,
 
     // === v4 route memory (phase 0) ===
     /// EWMA of cold (tier-1) success: 1.0 = clean history, 0.0 =
@@ -1370,7 +1374,11 @@ impl GhostState {
         // 2 hours, so a permanently-walled domain costs an honest
         // sub-second error instead of a 20-40s browser cycle per
         // fetch.
-        if profile.wall_fail_streak >= 2 {
+        let wall_class = profile
+            .wall_egress_class
+            .as_ref()
+            .or(profile.egress_class.as_ref());
+        if profile.wall_fail_streak >= 2 && wall_class.is_none_or(|c| c == class) {
             let cooldown = solve_cooldown_secs(profile.wall_fail_streak);
             if profile.last_wall_fail > 0 && n.saturating_sub(profile.last_wall_fail) < cooldown {
                 return RouteDecision::SolveCooldown(
@@ -1446,6 +1454,24 @@ impl GhostState {
             p.failures.pop_front();
         }
         self.save();
+    }
+
+    /// Recent transport failures are diagnostic evidence, never a wall route.
+    pub fn recent_network_failures(&self, host: &str) -> usize {
+        let n = now();
+        self.profiles.get(host).map_or(0, |p| {
+            p.failures
+                .iter()
+                .filter(|(at, class)| *class == FailClass::Network && n.saturating_sub(*at) < 600)
+                .count()
+        })
+    }
+
+    /// The same intermittent wall signal counted by the status dashboard.
+    pub fn is_flaky(&self, host: &str) -> bool {
+        self.profiles.get(host).is_some_and(|p| {
+            !p.needs_tier2 && p.t1_samples >= EWMA_MIN_SAMPLES && p.t1_ewma < EWMA_BLOCK_THRESHOLD
+        })
     }
 
     /// Tier 1 cold succeeded. If the domain was previously known
@@ -1620,7 +1646,12 @@ impl GhostState {
             return;
         }
         let n = now();
+        let class = current_egress_class(host).to_string();
         let p = self.profiles.entry(host.to_string()).or_default();
+        if p.wall_egress_class.as_ref().is_some_and(|c| c != &class) {
+            p.wall_fail_streak = 0;
+        }
+        p.wall_egress_class = Some(class);
         p.ghost_ewma = ewma_update(p.ghost_ewma, p.ghost_samples, false);
         p.ghost_samples = p.ghost_samples.saturating_add(1);
         p.wall_fail_streak = p.wall_fail_streak.saturating_add(1);
@@ -1704,6 +1735,38 @@ mod tests {
     // save: the helper stamped a newer epoch, so save() must NOT
     // adopt disk here (memory IS the newer writer) and the harvest
     // stands.
+    #[test]
+    fn wave450_network_diagnostics_never_become_wall_routes() {
+        let mut state = GhostState::default();
+        let n = now();
+        let profile = state.profiles.entry("offline.example".into()).or_default();
+        profile.failures = [
+            (n - 601, FailClass::Network),
+            (n, FailClass::Block),
+            (n, FailClass::Network),
+            (n, FailClass::Network),
+            (n, FailClass::Network),
+        ]
+        .into();
+        assert_eq!(state.recent_network_failures("offline.example"), 3);
+        assert_eq!(state.recent_network_failures("other.example"), 0);
+        assert!(matches!(
+            state.route_for_class("offline.example", "direct"),
+            RouteDecision::Cold
+        ));
+        assert!(!state.is_flaky("offline.example"));
+        let p = state.profiles.get_mut("offline.example").unwrap();
+        p.t1_samples = EWMA_MIN_SAMPLES;
+        p.t1_ewma = 0.1;
+        assert!(state.is_flaky("offline.example"));
+        state
+            .profiles
+            .get_mut("offline.example")
+            .unwrap()
+            .needs_tier2 = true;
+        assert!(!state.is_flaky("offline.example"));
+    }
+
     #[test]
     fn newer_snapshot_keeps_its_vault() {
         let mut mine = GhostState::default();
@@ -2693,6 +2756,28 @@ mod tests {
             !matches!(s.route_for("once.com"), RouteDecision::SolveCooldown(_)),
             "a single failure must not gate the domain"
         );
+    }
+
+    #[test]
+    fn wave450_cooldown_does_not_cross_egress_classes() {
+        let mut s = GhostState::default();
+        s.profiles.insert(
+            "wall.example".into(),
+            DomainProfile {
+                egress_class: Some("direct".into()),
+                wall_fail_streak: 2,
+                last_wall_fail: now(),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            s.route_for_class("wall.example", "direct"),
+            RouteDecision::SolveCooldown(_)
+        ));
+        assert!(matches!(
+            s.route_for_class("wall.example", "proxy"),
+            RouteDecision::Cold
+        ));
     }
 
     #[test]

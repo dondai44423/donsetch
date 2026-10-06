@@ -2,7 +2,7 @@
 //!
 //! Checks, each with a clean pass/warn/fail icon and a dim
 //! detail string. Auto-fixes what it can (creates missing dirs,
-//! removes stale lock files). Prints instructions for issues that
+//! backs up corrupt state). Prints instructions for issues that
 //! need manual intervention.
 //!
 //! The browser path must be BORING to install (50-case report):
@@ -27,6 +27,206 @@ enum CheckResult {
     Warn(String),
     Fail(String, String), // (detail, instructions)
     Fixed(String),
+}
+
+fn check_counts(checks: &[(String, String, String, String)]) -> (u32, u32, u32) {
+    checks
+        .iter()
+        .fold((0, 0, 0), |(p, w, f), (_, status, _, _)| {
+            match status.as_str() {
+                "pass" | "fixed" => (p + 1, w, f),
+                "warn" => (p, w + 1, f),
+                _ => (p, w, f + 1),
+            }
+        })
+}
+
+fn render_checks(checks: &[(String, String, String, String)]) {
+    cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|w| w.parse::<usize>().ok())
+        .unwrap_or(96)
+        .clamp(60, 140);
+    let (passed, warnings, failed) = check_counts(checks);
+    println!("  {passed} passed   {warnings} warnings   {failed} failed");
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "Runtime & browser",
+            &[
+                "Binary integrity",
+                "Installation",
+                "Chrome/Chromium",
+                "Xvfb",
+                "Browser launch",
+                "Ghost profile",
+                "ONNX Runtime",
+                "PDFium",
+                "OCR models",
+                "Rerank model",
+            ],
+        ),
+        (
+            "Network & search",
+            &[
+                "Fetcher init",
+                "Network",
+                "TLS fingerprint",
+                "Fetch egress",
+                "Proxy pool",
+                "Egress lanes",
+                "DNS",
+                "Captive portal",
+                "Bright Data SERP",
+                "Bypass unlocker",
+                "Search plugins",
+                "Search health",
+            ],
+        ),
+        (
+            "Configuration & state",
+            &[
+                "Cache directory",
+                "Auth sessions",
+                "State permissions",
+                "Ghost state",
+                "Config posture",
+                "Clearance stores",
+                "Crawl stores",
+                "Legacy env vars",
+            ],
+        ),
+    ];
+    for (label, names) in groups {
+        println!("\n  {}", cli::bold(label));
+        // Put failures and warnings first within each stable group.
+        for severity in ["fail", "warn", "fixed", "pass"] {
+            for (name, status, detail, hint) in checks
+                .iter()
+                .filter(|(name, status, _, _)| names.contains(&name.as_str()) && status == severity)
+            {
+                let icon = match status.as_str() {
+                    "pass" | "fixed" => cli::icon_pass(),
+                    "warn" => cli::icon_warn(),
+                    _ => cli::icon_fail(),
+                };
+                let detail = if status == "fixed" {
+                    format!("fixed: {detail}")
+                } else {
+                    detail.clone()
+                };
+                let lines = wrap_detail(&detail, width - 30);
+                println!(
+                    "  {icon} {name:<24}  {}",
+                    cli::dim(lines.first().map(String::as_str).unwrap_or(""))
+                );
+                for line in lines.iter().skip(1) {
+                    println!("{:30}{}", "", cli::dim(line));
+                }
+                if status == "fail" && !hint.is_empty() {
+                    for line in wrap_detail(hint, width - 6) {
+                        println!("      {}", cli::yellow(&line));
+                    }
+                }
+            }
+        }
+    }
+    if checks.iter().any(|(_, s, _, _)| s == "fail") {
+        println!(
+            "\n  {}",
+            cli::bold(
+                "Next: donsetch doctor --fix (safe repairs), then follow any remaining instructions."
+            )
+        );
+    }
+    println!(
+        "\n  {}",
+        cli::dim("More: --deep for live probes · --mcp for client setup · --json for agents")
+    );
+}
+
+fn wrap_detail(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut cells = 0;
+    for word in text.split_whitespace() {
+        let word_cells: usize = word
+            .chars()
+            .filter(|c| !c.is_control())
+            .map(|c| if c.is_ascii() { 1 } else { 2 })
+            .sum();
+        if !line.is_empty() && cells + 1 + word_cells > width {
+            lines.push(std::mem::take(&mut line));
+            cells = 0;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+            cells += 1;
+        }
+        for ch in word.chars().filter(|c| !c.is_control()) {
+            let size = if ch.is_ascii() { 1 } else { 2 };
+            if cells + size > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                cells = 0;
+            }
+            line.push(ch);
+            cells += size;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn installation_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let path = dir.join(if cfg!(windows) {
+            "donsetch.exe"
+        } else {
+            "donsetch"
+        });
+        if path.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if path
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o111 == 0)
+                {
+                    continue;
+                }
+            }
+            let canonical = path.canonicalize().unwrap_or(path);
+            if !paths.contains(&canonical) {
+                paths.push(canonical);
+            }
+        }
+    }
+    paths
+}
+
+fn check_installation() -> CheckResult {
+    let current = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| e.to_string());
+    let mut paths = installation_paths();
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = exe.canonicalize().unwrap_or(exe);
+        if !paths.contains(&exe) {
+            paths.push(exe);
+        }
+    }
+    if paths.len() > 1 {
+        CheckResult::Warn(format!(
+            "{} distinct PATH installs; running {} at {current}. Pin this absolute path in MCP config (--mcp).",
+            paths.len(),
+            env!("CARGO_PKG_VERSION")
+        ))
+    } else {
+        CheckResult::Pass(format!("{} at {current}", env!("CARGO_PKG_VERSION")))
+    }
 }
 
 pub async fn run() {
@@ -62,12 +262,6 @@ pub async fn run() {
         std::process::exit(code);
     }
 
-    cli::print_title(&format!("{DISPLAY_NAME} Doctor"));
-    println!();
-
-    let mut p = 0u32; // passed
-    let mut w = 0u32; // warnings
-    let mut f = 0u32; // failed
     // (name, status, detail, hint) collected for --json and --fix.
     let mut collected: Vec<(String, String, String, String)> = Vec::new();
 
@@ -76,23 +270,15 @@ pub async fn run() {
             match $r {
                 CheckResult::Pass(d) => {
                     collected.push(($name.to_string(), "pass".into(), d.clone(), String::new()));
-                    cli::check_pass($name, &d);
-                    p += 1;
                 }
                 CheckResult::Warn(d) => {
                     collected.push(($name.to_string(), "warn".into(), d.clone(), String::new()));
-                    cli::check_warn($name, &d);
-                    w += 1;
                 }
                 CheckResult::Fail(d, i) => {
                     collected.push(($name.to_string(), "fail".into(), d.clone(), i.clone()));
-                    cli::check_fail($name, &d, &i);
-                    f += 1;
                 }
                 CheckResult::Fixed(d) => {
                     collected.push(($name.to_string(), "fixed".into(), d.clone(), String::new()));
-                    cli::check_fixed($name, &d);
-                    p += 1;
                 }
             }
         };
@@ -100,17 +286,12 @@ pub async fn run() {
 
     // 1. Binary integrity.
     report!("Binary integrity", check_binary());
+    report!("Installation", check_installation());
 
     // Create fetcher for network and TLS checks.
     let fetcher = match Fetcher::new(BrowserProfile::host_default()) {
         Ok(fm) => Some(fm),
         Err(e) => {
-            cli::check_fail(
-                "Fetcher init",
-                &e.to_string(),
-                "TLS initialization failed : check system CA certificates",
-            );
-            f += 1;
             collected.push((
                 "Fetcher init".into(),
                 "fail".into(),
@@ -155,10 +336,10 @@ pub async fn run() {
     // 6. Ghost profile.
     report!("Ghost profile", check_ghost_profile());
 
-    // 7. Browser launch: the only heavyweight probe. Fast mode
-    // (default) skips the seconds-long live launch; --deep runs it.
+    // Browser availability means a real launch and selftest, including in
+    // default mode. Deep adds network/provider probes.
+    report!("Browser launch", check_browser_launch().await);
     if deep {
-        report!("Browser launch", check_browser_launch().await);
         // Captive portal: generate_204 must stay 204. A hotel/airport
         // login page answering 200/302 is the classic "TLS works but
         // every fetch is a login form" failure.
@@ -166,9 +347,6 @@ pub async fn run() {
             "Captive portal",
             check_captive_portal(fetcher.as_ref()).await
         );
-    } else {
-        cli::check_dim("Browser launch", "skipped (--deep to run)");
-        cli::check_dim("Captive portal", "skipped (--deep to run)");
     }
 
     // 8. Cache directory.
@@ -222,7 +400,9 @@ pub async fn run() {
     report!("DNS", check_dns());
 
     // 21. MCP client registration (detect + print blocks).
-    print_mcp_section();
+    if only_mcp {
+        print_mcp_section();
+    }
 
     // 22. Legacy env vars (the pre-v4 names): still honored, but
     // each one active in this shell gets ONE warning naming its
@@ -247,11 +427,15 @@ pub async fn run() {
     // ── Self-healing pass (--fix) ───────────────────────────
     if fix {
         println!();
-        let _ = apply_fixes(&mut collected).await;
+        apply_fixes(&mut collected);
     }
 
     // ── Summary ──────────────────────────────────────────────
     println!();
+    let (p, w, f) = check_counts(&collected);
+    if !json {
+        render_checks(&collected);
+    }
     let total = p + w + f;
     println!("  {p}/{total} passed, {w} warning(s), {f} failed");
     cli::print_footer();
@@ -742,22 +926,13 @@ fn check_xvfb() -> CheckResult {
 /// the 50-case report's "a feature that works only when the
 /// user guesses the hidden prerequisite is not finished".
 async fn check_browser_launch() -> CheckResult {
+    let manager = crate::ghost::manager::GhostManager::new().await;
     let inner = async {
-        // Same Xvfb handling as GhostManager: start/reuse :99.
-        let xvfb = if crate::ghost::cloak::headless_mode_requested() {
-            None
-        } else {
-            crate::ghost::xvfb::Xvfb::start().await.ok()
-        };
-        let display = xvfb.as_ref().map(|x| x.display_env());
         let profile = BrowserProfile::host_default();
         let t0 = std::time::Instant::now();
-        let mut ghost = match crate::ghost::Ghost::launch(&profile, display.as_deref()).await {
+        let mut ghost = match manager.acquire(&profile).await {
             Ok(g) => g,
             Err(e) => {
-                if let Some(x) = xvfb {
-                    x.kill().await;
-                }
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
                     "Tier 2 browser fallback will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
@@ -767,10 +942,7 @@ async fn check_browser_launch() -> CheckResult {
         let launch_ms = t0.elapsed().as_millis();
 
         let fp = crate::ghost::ops::selftest(&mut ghost).await;
-        ghost.kill().await;
-        if let Some(x) = xvfb {
-            x.kill().await;
-        }
+        drop(ghost);
         match fp {
             Ok(json_str) => {
                 let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
@@ -837,17 +1009,15 @@ async fn check_browser_launch() -> CheckResult {
         }
     };
     // Hard bound: a wedged browser here must not hang doctor.
-    match tokio::time::timeout(std::time::Duration::from_secs(40), inner).await {
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(40), inner).await {
         Ok(r) => r,
         Err(_) => CheckResult::Fail(
             "launch timed out after 40s".into(),
-            if cfg!(target_os = "linux") {
-                "A stale Chromium or Xvfb may be wedged: pkill -f chromium; rm -f /tmp/.X99-lock /tmp/.X11-unix/X99".into()
-            } else {
-                "A stale Chromium may be wedged: close all browser windows / kill all chrome processes, then retry".into()
-            },
+            "Run doctor --fix and inspect the browser/display checks. Close only a confirmed stale DonGhost process; preserve other browser sessions and live display sockets.".into(),
         ),
-    }
+    };
+    manager.shutdown().await;
+    result
 }
 
 /// Sets every regular file under `root` that others can read to
@@ -1052,30 +1222,30 @@ fn check_ghost_profile() -> CheckResult {
         };
     }
 
-    // Check writable.
-    let test = dir.join(".doctor-write-test");
-    match std::fs::write(&test, b"test") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&test);
-
-            // Check for stale singleton lock files.
-            let mut stale = 0;
-            for f in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-                let p = dir.join(f);
-                if p.exists() {
-                    let _ = std::fs::remove_file(&p);
-                    stale += 1;
-                }
-            }
-
-            if stale > 0 {
-                CheckResult::Fixed(format!("removed {stale} stale lock(s)"))
-            } else {
-                CheckResult::Pass("writable, no stale locks".into())
-            }
-        }
+    match probe_writable(&dir) {
+        Ok(()) => CheckResult::Pass("writable; profile locks preserved".into()),
         Err(e) => CheckResult::Fail("not writable".into(), format!("Check permissions: {e}")),
     }
+}
+
+// Probe only a newly created file owned by this check. A fixed filename can
+// overwrite a user's file or follow a symlink; Chromium owns its own locks.
+fn probe_writable(dir: &Path) -> std::io::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = dir.join(format!(".doctor-write-{}-{nonce}", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    drop(file);
+    std::fs::remove_file(path)
 }
 
 fn check_auth_sessions() -> CheckResult {
@@ -1120,10 +1290,8 @@ fn check_cache_dir() -> CheckResult {
         };
     }
 
-    let test = dir.join(".doctor-write-test");
-    match std::fs::write(&test, b"test") {
+    match probe_writable(&dir) {
         Ok(()) => {
-            let _ = std::fs::remove_file(&test);
             let total = dir_size(&dir);
 
             // Breakdown by component : helps users understand what's
@@ -1315,6 +1483,22 @@ fn check_onnx() -> CheckResult {
 }
 
 fn check_ghost_state() -> CheckResult {
+    let path = paths::cache_dir().join("ghost-state.json");
+    if path.exists() {
+        match std::fs::read(&path) {
+            Ok(body) => {
+                if let Err(e) = serde_json::from_slice::<crate::ghost::cache::GhostState>(&body) {
+                    return CheckResult::Fail(format!("invalid state: {e}"), "Run `donsetch doctor --fix` to preserve the corrupt file as a backup and rebuild route memory.".into());
+                }
+            }
+            Err(e) => {
+                return CheckResult::Fail(
+                    format!("cannot read state: {e}"),
+                    "Check cache directory permissions.".into(),
+                );
+            }
+        }
+    }
     let state = crate::ghost::cache::GhostState::load();
     let domains = state.profiles.len();
     let renders = state.renders.len();
@@ -1987,7 +2171,7 @@ fn print_mcp_section() {
         .unwrap_or_else(|_| "donsetch".to_string());
     let npm_install =
         exe.contains("node_modules/donsetch/") || exe.contains("node_modules\\donsetch\\");
-    let command = if npm_install { "donsetch" } else { &exe };
+    let command = &exe;
     let found = detect_mcp_clients();
     if found.is_empty() {
         cli::check_dim("MCP clients", "none detected; generic stdio block below");
@@ -2045,6 +2229,7 @@ fn detect_mcp_clients() -> Vec<(String, std::path::PathBuf)> {
             h.join("AppData/Roaming/Claude/claude_desktop_config.json"),
         );
         add("OpenCode", h.join(".config/opencode/opencode.json"));
+        add("OpenCode", h.join(".config/opencode/opencode.jsonc"));
         add("Hermes", h.join(".hermes/config.yaml"));
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -2061,56 +2246,59 @@ fn detect_mcp_clients() -> Vec<(String, std::path::PathBuf)> {
 /// deletion, key removal) is deliberately out of scope: repair
 /// only what cannot hurt. Re-run repaired checks once to report
 /// the true post-repair state.
-async fn apply_fixes(collected: &mut [(String, String, String, String)]) -> Result<(), String> {
-    let failed: Vec<String> = collected
-        .iter()
-        .filter(|(_, status, _, _)| status == "fail")
-        .map(|(n, _, _, _)| n.clone())
-        .collect();
-    if failed.is_empty() {
-        println!("  {}: nothing to repair", cli::green("--fix"));
-        return Ok(());
-    }
-
-    for name in &failed {
-        match name.as_str() {
-            "Cache directory" => {
-                let dir = crate::paths::cache_dir();
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    cli::check_fixed("Cache directory", &format!("created {}", dir.display()));
-                }
-            }
+fn apply_fixes(collected: &mut [(String, String, String, String)]) {
+    for (name, status, detail, hint) in collected.iter_mut() {
+        if status != "fail" {
+            continue;
+        }
+        let repaired = match name.as_str() {
+            "Cache directory" => std::fs::create_dir_all(crate::paths::cache_dir())
+                .map(|_| check_cache_dir())
+                .map_err(|e| e.to_string()),
             "Ghost state" => {
-                // state file is designed to be resettable; the lock
-                // file is stale-safe. Remove both.
-                let dir = crate::paths::cache_dir();
-                let _ = std::fs::remove_file(dir.join("ghost-state.json"));
-                if let Ok(cwd) = std::env::current_dir() {
-                    let _ = std::fs::remove_file(cwd.join(".donsetch-ghost.lock"));
-                }
-                cli::check_fixed("Ghost state", "reset state; browser profile untouched");
-            }
-            "OCR models" | "Rerank model" => {
-                // Corrupt/missing models re-download automatically on
-                // first use; nothing to do here except confirm that.
-                if let Ok(dir) = std::fs::read_dir(crate::paths::cache_dir().join("ocr")) {
-                    for e in dir.flatten() {
-                        if e.path().is_file() && e.path().extension().is_none_or(|x| x != "json") {
-                            let _ = std::fs::remove_file(e.path());
+                let path = crate::paths::cache_dir().join("ghost-state.json");
+                let corrupt = std::fs::read(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| {
+                        if serde_json::from_slice::<crate::ghost::cache::GhostState>(&bytes).is_ok()
+                        {
+                            Err("state is valid; repair its access permissions manually".into())
+                        } else {
+                            Ok(())
                         }
-                    }
-                }
-                cli::check_fixed(name, "corrupt models will re-download on next use");
+                    });
+                let backup = path.with_extension(format!(
+                    "json.{}.bak",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ));
+                corrupt
+                    .and_then(|_| std::fs::rename(&path, &backup).map_err(|e| e.to_string()))
+                    .map(|_| check_ghost_state())
             }
-            _ => {}
+            _ => continue,
+        };
+        match repaired {
+            Ok(CheckResult::Pass(d) | CheckResult::Fixed(d)) => {
+                *status = "fixed".into();
+                *detail = d;
+                hint.clear();
+            }
+            Ok(CheckResult::Warn(d)) => {
+                *status = "warn".into();
+                *detail = d;
+            }
+            Ok(CheckResult::Fail(d, h)) => {
+                *detail = d;
+                *hint = h;
+            }
+            Err(e) => {
+                *detail = format!("repair failed: {e}");
+            }
         }
     }
-    println!();
-    println!(
-        "  {}: re-run `donsetch doctor` to confirm",
-        cli::bold("done")
-    );
-    Ok(())
 }
 
 /// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
@@ -2273,6 +2461,90 @@ mod doctor_ultra_tests {
         let _ = std::fs::create_dir_all(&dir);
         unsafe { std::env::set_var("DONSETCH_CACHE_DIR", &dir) };
         tempfile_dir::TempDir { dir }
+    }
+
+    #[test]
+    fn wave450_doctor_fix_preserves_corrupt_state_and_recounts() {
+        // Nextest: each test owns its environment and a disposable cache.
+        let cache = isolated_cache();
+        let corrupt = b"{not json";
+        std::fs::write(cache.dir.join("ghost-state.json"), corrupt).unwrap();
+        std::fs::write(cache.dir.join("keep-model.bin"), b"valid unrelated model").unwrap();
+        assert!(matches!(check_ghost_state(), CheckResult::Fail(_, _)));
+        let mut checks = vec![(
+            "Ghost state".into(),
+            "fail".into(),
+            "corrupt".into(),
+            "repair".into(),
+        )];
+        assert_eq!(check_counts(&checks), (0, 0, 1));
+        apply_fixes(&mut checks);
+        assert_eq!(check_counts(&checks), (1, 0, 0));
+        assert_eq!(checks[0].1, "fixed");
+        assert_eq!(
+            std::fs::read(cache.dir.join("keep-model.bin")).unwrap(),
+            b"valid unrelated model"
+        );
+        let backups: Vec<_> = std::fs::read_dir(&cache.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "bak"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), corrupt);
+        assert!(matches!(
+            check_ghost_state(),
+            CheckResult::Pass(_) | CheckResult::Warn(_)
+        ));
+        apply_fixes(&mut checks);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn wave450_doctor_wraps_long_paths_without_losing_information() {
+        let text = format!(
+            "Install browser at /{} then retry.",
+            "long-directory/".repeat(12)
+        );
+        let lines = wrap_detail(&text, 40);
+        assert!(lines.len() > 2);
+        assert!(lines.iter().all(|l| l.len() <= 40));
+        assert_eq!(lines.concat().replace(' ', ""), text.replace(' ', ""));
+        assert!(
+            !wrap_detail("path\u{1b}[31m", 40)
+                .join("")
+                .contains('\u{1b}')
+        );
+    }
+
+    #[test]
+    fn wave450_doctor_preserves_profile_locks_and_existing_probe_file() {
+        let _cache = isolated_cache();
+        let profile = crate::ghost::profile_dir();
+        std::fs::create_dir_all(&profile).unwrap();
+        for name in [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            ".doctor-write-test",
+        ] {
+            std::fs::write(profile.join(name), b"owned by another process").unwrap();
+        }
+        assert!(matches!(
+            check_ghost_profile(),
+            CheckResult::Pass(_) | CheckResult::Warn(_)
+        ));
+        for name in [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            ".doctor-write-test",
+        ] {
+            assert_eq!(
+                std::fs::read(profile.join(name)).unwrap(),
+                b"owned by another process"
+            );
+        }
     }
 
     mod tempfile_dir {

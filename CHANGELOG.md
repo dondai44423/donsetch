@@ -5,6 +5,71 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] - 2026-10-06
+
+### Added
+
+- Fetch output presets: `mode=scan` (800 chars), `read` (4000), and
+  `deep` (16000). Explicit `max_chars` wins; the default stays 16000.
+- Agent state distinguishes content, partial reads, probes and failures.
+  Reddit server-rendered subsets expose partiality and known item counts.
+  Search exposes its provider and degraded retrieval instead of allowing
+  an empty result set to imply that no sources exist.
+- Doctor groups runtime/browser, network/search and configuration/state
+  checks, puts problems first, wraps long details and names safe repairs.
+  The default check launches and self-tests the actual browser. Multiple
+  executable installations are reported; MCP setup uses the running binary's
+  absolute path, and startup logs identify its version and path.
+
+### Fixed
+
+- Block/login pages cannot become successful content through probe, outline,
+  section, focus, pagination or browser text fallback. Wall headings remain
+  detectable inside nested tags even when the document title is generic.
+  Short troubleshooting articles quoting wall prompts and captcha-enabled
+  contact forms stay readable. Final pagination slices preserve full history.
+- Crawl resolves the initial seed before deriving host/path scope, reuses
+  its response and reports the requested/resolved seed. Sitemap XML is a
+  URL inventory rather than a JavaScript shell. Map results expose URLs as
+  model state; empty or failed crawls no longer claim completion or invent
+  a seed 404. Discovery, fetching and rendering share the crawl deadline.
+  Sitemap cycles are deduplicated, invalid requests preserve resume tokens,
+  and seed preflight respects the governor lane.
+- Stitched articles obey output budgets and offsets, detect pagination
+  cycles, and reject redirected parts on other hosts. Collection is bounded
+  to six parts and 1 MiB; continuation distinguishes collected text from an
+  unfinished source part. Browser stitching uses its actual rendered DOM.
+- Lexical focus avoids cross-encoder work on matching documents. Semantic
+  rescue is limited to small documents with an already cached model.
+  A low-savings result returns full content with a notice. Outlines obey
+  output limits, continuation never skips paragraph tails, and adapter
+  token estimates measure the returned slice.
+- Filtered or truncated reads cannot replace full page-history snapshots.
+  Matching partial reads preserve a valid full snapshot; changed partial
+  reads discard the invalid baseline instead of fabricating a rewrite diff.
+- Browser retries are isolated between concurrent and cancelled calls.
+  Direct retries actually bypass configured/environment proxies and pooled
+  proxy browsers; direct clearance is not learned as proxy-bound state.
+  Concurrent browser slots own distinct temporary profiles, preventing
+  Chromium launch collisions and cleanup of another live slot.
+  Precise navigation/network failures avoid blind warm retries and cannot
+  poison wall cooldown. Browser pass limits include navigation and CDP work.
+  Human captcha walls return promptly; solvable challenge passes remain.
+- Deadline errors retain observed escalation steps. Batch results preserve
+  partial/probe state and do not advertise continuation offsets that skip
+  newly budget-sliced evidence. Retry guidance distinguishes access failures
+  from transient errors; browser-cost hints no longer invent a fixed delay.
+- Benchmark queries demote survey/review titles unless those are requested.
+  Named standing-desk vendors get official-domain boosts only in product
+  context, avoiding false matches on ordinary words. Up to two official-site
+  queries join a healthy keyless wave; candidates come from actual engine
+  hits and obey host scope. Optional search stages leave response time before
+  the caller deadline. Repeated transport failures change recovery advice
+  without marking the host walled; existing flaky-wall state reaches agents.
+- Doctor preserves browser profile locks and existing probe files. Safe
+  repairs back up corrupt state, leave unrelated models intact and recompute
+  checks, counts and exit status after repair.
+
 ## [4.4.5] - 2026-10-06
 
 ### Fixed

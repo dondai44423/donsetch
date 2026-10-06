@@ -164,6 +164,8 @@ pub fn detect_dom_smart(body: &[u8]) -> Verdict {
 /// `<title>` / `<h1>`. Real pages virtually never title themselves
 /// these : a page ABOUT Cloudflare has its own title.
 const INTERSTITIAL_TITLES: &[&str] = &[
+    "you've been blocked by network security",
+    "you are blocked by network security",
     "just a moment",
     "performing security verification",
     "checking your browser",
@@ -203,10 +205,7 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let text = String::from_utf8_lossy(scan).to_lowercase();
 
     // Title/H1 route: strongest signal, immune to visible-text counts.
-    let title = extract_title_or_h1(&text);
-    if let Some(t) = title
-        && INTERSTITIAL_TITLES.iter().any(|m| t.contains(m))
-    {
+    if interstitial_heading(&text) {
         return Some(vendor_from_markers(&text).unwrap_or(Vendor::Generic));
     }
 
@@ -254,6 +253,24 @@ pub fn interactive_captcha(body: &[u8]) -> bool {
     .any(|m| text.contains(m))
 }
 
+/// A widget requiring an interactive human answer, rather than a challenge
+/// the browser can clear with its own first-party state. Call only after the
+/// page was classified as a captcha, never on ordinary embedded widgets.
+pub fn human_captcha(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]).to_lowercase();
+    [
+        "hcaptcha",
+        "recaptcha",
+        "px-captcha",
+        "captcha-delivery",
+        "geetest",
+        "arkoselabs",
+        "funcaptcha",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
 /// Extracted-text challenge test: the TEXT an extractor produced is
 /// an unsolved interstitial, not content.
 ///
@@ -269,36 +286,74 @@ pub fn challenge_text(text: &str) -> bool {
         return false;
     }
     let lower = text.to_lowercase();
-    INTERSTITIAL_TITLES.iter().any(|m| lower.contains(m))
-        || lower.contains("complete the challenge below")
-        || lower.contains("enable javascript and cookies to continue")
+    lower.lines().any(|line| {
+        let line = line.trim().trim_start_matches('#').trim();
+        INTERSTITIAL_TITLES.iter().any(|m| line.starts_with(m))
+            || line.starts_with("complete the challenge below")
+            || line.starts_with("enable javascript and cookies to continue")
+    })
 }
 
-/// Best-effort `<title>` (head) or first `<h1>` text, lowercased.
-fn extract_title_or_h1(lower_text: &str) -> Option<String> {
+/// Short access screens, not articles quoting a login or block message.
+pub fn text_wall(text: &str) -> Option<Verdict> {
+    if text.chars().count() > 1200 {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    if lower.contains("blocked by network security")
+        && (lower.contains("reddit account") || lower.contains("developer token"))
+    {
+        return Some(Verdict::Blocked);
+    }
+    if lower.lines().any(|line| {
+        let heading = line.trim().trim_start_matches('#').trim();
+        [
+            "log in to continue",
+            "login to continue",
+            "sign in to continue",
+        ]
+        .iter()
+        .any(|phrase| heading.starts_with(phrase))
+    }) && text.chars().count() < 600
+    {
+        return Some(Verdict::AuthWall);
+    }
+    challenge_text(text).then_some(Verdict::Challenge(Vendor::Generic))
+}
+
+/// Inspect both the title and first H1, including text inside nested tags.
+fn interstitial_heading(lower_text: &str) -> bool {
     for (open, close) in [("<title", "</title>"), ("<h1", "</h1>")] {
-        let start = lower_text.find(open)?;
+        let Some(start) = lower_text.find(open) else {
+            continue;
+        };
         if let Some(content_start) = lower_text[start..].find('>') {
             let from = start + content_start + 1;
             if let Some(end) = lower_text[from..].find(close) {
                 let t = &lower_text[from..from + end];
                 // Strip nested tags inside the title (h1 can wrap spans).
+                let mut inside_tag = false;
                 let cleaned: String = t
                     .chars()
-                    .filter(|c| *c != '<')
-                    .collect::<String>()
-                    .split('<')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let cleaned = cleaned.trim();
-                if !cleaned.is_empty() {
-                    return Some(cleaned.to_string());
+                    .filter(|c| match c {
+                        '<' => {
+                            inside_tag = true;
+                            false
+                        }
+                        '>' => {
+                            inside_tag = false;
+                            false
+                        }
+                        _ => !inside_tag,
+                    })
+                    .collect();
+                if INTERSTITIAL_TITLES.iter().any(|m| cleaned.contains(m)) {
+                    return true;
                 }
             }
         }
     }
-    None
+    false
 }
 
 fn vendor_from_markers(lower_text: &str) -> Option<Vendor> {
@@ -581,9 +636,10 @@ fn classify_wall(
         return Verdict::Challenge(Vendor::Generic);
     }
     // Reddit-style interstitials (often served as 200).
-    if text.contains("prove your humanity")
+    if (text.contains("prove your humanity")
         || text.contains("not for bots")
-        || text.contains("please wait for verification")
+        || text.contains("please wait for verification"))
+        && (interstitial_heading(text) || visible_text_count(text.as_bytes()) < 120)
     {
         return Verdict::Challenge(Vendor::Generic);
     }
@@ -634,6 +690,43 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave450_short_quoted_challenge_article_is_content_at_both_layers() {
+        let text = "# Browser troubleshooting\n\nThe message prove your humanity asks a reader to authenticate. Here is how to diagnose that prompt without mistaking a troubleshooting article for the prompt itself.";
+        assert!(!challenge_text(text));
+        assert_eq!(text_wall(text), None);
+        let html = format!(
+            "<html><title>Browser troubleshooting</title><article><h1>Browser troubleshooting</h1><p>{text}</p></article></html>"
+        );
+        assert_eq!(detect(200, &[], html.as_bytes()), Verdict::ContentOk);
+        assert_eq!(detect_dom_smart(html.as_bytes()), Verdict::ContentOk);
+        assert!(challenge_text(
+            "# Prove your humanity\nComplete the challenge below."
+        ));
+    }
+
+    #[test]
+    fn wave450_wall_heading_survives_generic_title_and_nested_tags() {
+        let html = b"<html><title>Reddit</title><body><h1><span>Prove your humanity</span></h1><form><p>We are committed to safety and security. Complete the challenge below before continuing to the community discussion.</p><div class='g-recaptcha'></div></form></body></html>";
+        assert!(matches!(detect_dom_smart(html), Verdict::Challenge(_)));
+        let article = b"<html><title>Contact us</title><h1>Contact</h1><form><p>Please use this form to contact our team about product documentation and installation instructions.</p><div class='g-recaptcha'></div></form></html>";
+        assert_eq!(detect_dom_smart(article), Verdict::ContentOk);
+    }
+
+    #[test]
+    fn wave450_short_authentication_article_is_not_a_login_wall() {
+        assert_eq!(
+            text_wall(
+                "# Authentication guide\n\nThe message log in to continue prompts readers to authenticate. Here is how to configure login for your application."
+            ),
+            None
+        );
+        assert_eq!(
+            text_wall("# Log in to continue\n\nEnter your account credentials."),
+            Some(Verdict::AuthWall)
+        );
+    }
 
     // #282: the two content-quality failures keep their own codes so
     // an agent can tell "the page is a shell/login wall" from "the

@@ -12,11 +12,10 @@ use super::language::{self, LanguageInfo};
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
-/// Max blocks for semantic scoring. Pages with more blocks
-/// fall back to BM25-only : large pages are usually reference
-/// docs where keyword matching works well, and the latency
-/// of cross-encoder on 100+ blocks isn't worth it.
-const SEMANTIC_MAX_BLOCKS: usize = 80;
+/// Max blocks for semantic rescue when the lexical query has no hits.
+/// Larger pages keep the honest full-content fallback instead of paying
+/// cross-encoder inference over a reference manual.
+const SEMANTIC_MAX_BLOCKS: usize = 8;
 
 /// Cross-encoder relevance threshold (sigmoid output [0,1]).
 /// Blocks scoring above this are kept even if BM25 missed them.
@@ -1083,58 +1082,7 @@ pub fn filter_semantic<'a>(
 
     let mut kept_set: HashSet<usize> = kept.iter().copied().collect();
 
-    // Phase 3: Cross-encoder augmentation.
-    // For sections not selected by BM25, check if the cross-encoder
-    // finds them relevant. Catches semantic matches BM25 missed
-    // (different vocabulary, synonyms, paraphrase).
-    if blocks.len() <= SEMANTIC_MAX_BLOCKS && crate::search::rerank::is_model_cached() {
-        let docs: Vec<(String, String)> =
-            blocks.iter().map(|b| (b.text(), String::new())).collect();
-        if let Some(xenc_scores) = xenc_scores(query, docs) {
-            let sections = build_sections(blocks);
-            for s in &sections {
-                let already = s
-                    .heading_idx
-                    .map(|h| kept_set.contains(&h))
-                    .unwrap_or(false)
-                    || s.body_idx.iter().any(|b| kept_set.contains(b));
-                if already {
-                    continue;
-                }
-                let heading_xenc = s.heading_idx.map(|h| xenc_scores[h]).unwrap_or(0.0);
-                let body_xenc_max = s
-                    .body_idx
-                    .iter()
-                    .map(|&b| xenc_scores[b])
-                    .fold(0.0f64, f64::max);
-                if heading_xenc >= XENC_THRESHOLD {
-                    if let Some(hi) = s.heading_idx
-                        && kept_set.insert(hi)
-                    {
-                        kept.push(hi);
-                    }
-                    for &bi in &s.body_idx {
-                        if kept_set.insert(bi) {
-                            kept.push(bi);
-                        }
-                    }
-                } else if body_xenc_max >= XENC_THRESHOLD {
-                    if let Some(hi) = s.heading_idx
-                        && kept_set.insert(hi)
-                    {
-                        kept.push(hi);
-                    }
-                    for &bi in &s.body_idx {
-                        if xenc_scores[bi] >= XENC_THRESHOLD && kept_set.insert(bi) {
-                            kept.push(bi);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Phase 4: Breadcrumb expansion.
+    // Phase 3: Breadcrumb expansion.
     expand_breadcrumbs(blocks, &mut kept, &mut kept_set);
 
     // Sort by index to preserve document order.

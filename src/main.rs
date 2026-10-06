@@ -168,6 +168,13 @@ async fn run() {
             config_cli(&args);
         }
         "mcp" => {
+            eprintln!(
+                "[mcp] donsetch {} · {}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| e.to_string())
+            );
             // Transport selection: the --http flag wins, then the
             // layered config ([transport] kind via TOML or env) for
             // launchers that can't pass flags, then stdio. Host/port:

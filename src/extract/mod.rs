@@ -88,6 +88,12 @@ impl ExtractOptions {
     }
 }
 
+pub struct PartialContent {
+    pub reason: &'static str,
+    pub items_found: usize,
+    pub items_total: Option<usize>,
+}
+
 pub struct Extracted {
     pub markdown: String,
     pub title: Option<String>,
@@ -137,6 +143,8 @@ pub struct Extracted {
     /// (v3): the honest `via=adapter:...` label. `None` = the
     /// generic DonSift pipeline.
     pub via: Option<&'static str>,
+    /// Source-side omission, independent of output pagination or read filters.
+    pub partial: Option<PartialContent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +159,7 @@ pub enum ContentKind {
 
 #[derive(Debug)]
 pub enum ExtractError {
+    Wall(crate::detect::walls::Verdict),
     BadSelector(String),
     /// The body was refused (nesting gate) or the parse did not finish off the worker (budget, or the task died).
     Failed(String),
@@ -159,6 +168,7 @@ pub enum ExtractError {
 impl std::fmt::Display for ExtractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ExtractError::Wall(v) => write!(f, "access wall: {v:?}"),
             ExtractError::BadSelector(s) => write!(f, "invalid CSS selector: {s}"),
             ExtractError::Failed(s) => write!(f, "{s}"),
         }
@@ -368,6 +378,31 @@ pub fn extract(
     let ct = content_type.to_lowercase();
     let is_pdf = body.len() >= 5 && body.starts_with(b"%PDF-") || ct.contains("pdf");
 
+    if !is_pdf
+        && body_starts_with_html(body)
+        && let Some(vendor) = crate::detect::walls::detect_interstitial(body)
+    {
+        return Err(ExtractError::Wall(
+            crate::detect::walls::Verdict::Challenge(vendor),
+        ));
+    }
+
+    if !is_pdf && (ct.contains("xml") || body.starts_with(b"<?xml")) {
+        let text = charset::decode(body, content_type);
+        let mut entries = Vec::new();
+        crate::crawl::sitemap::parse_sitemap(&text, &mut entries, 10_000);
+        if !entries.is_empty() {
+            let inventory = entries
+                .iter()
+                .map(|e| format!("- {}\n", e.loc))
+                .collect::<String>();
+            let mut ex = extract(inventory.as_bytes(), "text/plain; charset=utf-8", url, opts)?;
+            ex.via = Some("format:sitemap");
+            ex.content_kind = ContentKind::Listing;
+            return Ok(ex);
+        }
+    }
+
     // Feeds (RSS/Atom/JSON Feed): structured rendering, never a
     // raw XML blob. Checked BEFORE passthrough : feed content
     // types (text/xml, application/rss+xml…) never say "html".
@@ -397,6 +432,9 @@ pub fn extract(
         // text/plain or json/xml response returns MATCH/NO-MATCH plus
         // excerpts like the HTML path, never the full document.
         let text = String::from_utf8_lossy(body);
+        if let Some(v) = crate::detect::walls::text_wall(&text) {
+            return Err(ExtractError::Wall(v));
+        }
         if let Some(pattern) = &opts.must_contain
             && !pattern.trim().is_empty()
         {
@@ -419,7 +457,8 @@ pub fn extract(
                 pdf_pages: None,
                 images: vec![],
                 fingerprint: None,
-                via: None,
+                via: Some("format:text"),
+                partial: None,
             });
         }
         let (slice, next) = paginate(&text, opts.offset, max_chars);
@@ -433,8 +472,8 @@ pub fn extract(
             published: None,
             site: None,
             next_offset: next,
-            blocks_total: 0,
-            blocks_shown: 0,
+            blocks_total: 1,
+            blocks_shown: 1,
             thin: false,
             content_kind: ContentKind::Page,
             lang: "unknown".to_string(),
@@ -442,7 +481,8 @@ pub fn extract(
             pdf_pages: None,
             images: Vec::new(),
             fingerprint: None,
-            via: None,
+            via: Some("format:text"),
+            partial: None,
         });
     }
 
@@ -674,6 +714,7 @@ fn empty_pdf(url: &str, reason: &str) -> Extracted {
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     }
 }
 
@@ -699,6 +740,17 @@ fn downstream(
     opts: &ExtractOptions,
     max_chars: usize,
 ) -> Result<Extracted, ExtractError> {
+    let identity = render::render(
+        meta,
+        url,
+        &all_blocks.iter().collect::<Vec<_>>(),
+        &ExtractOptions::default(),
+    );
+    if pdf_pages.is_none()
+        && let Some(v) = crate::detect::walls::text_wall(&identity)
+    {
+        return Err(ExtractError::Wall(v));
+    }
     // TOC mode: heading tree only, with stable section IDs and
     // per-section size labels so the agent can target and budget
     // before reading anything.
@@ -727,15 +779,17 @@ fn downstream(
         } else {
             md.push_str("\n*fetch with section=\"sN\" (or a heading name) to read that part*\n");
         }
+        let total_chars = md.len();
+        let (slice, next) = paginate_public(&md, opts.offset, max_chars);
         return Ok(Extracted {
-            tokens_est: md.len() / 4,
-            total_chars: md.len(),
-            markdown: md,
+            tokens_est: slice.len() / 4,
+            total_chars,
+            markdown: slice,
             title: meta.title.clone(),
             byline: meta.byline.clone(),
             published: meta.published.clone(),
             site: meta.site.clone(),
-            next_offset: None,
+            next_offset: next,
             blocks_total: all_blocks.len(),
             blocks_shown: shown,
             thin: false,
@@ -746,6 +800,7 @@ fn downstream(
             images: Vec::new(),
             fingerprint: None,
             via: None,
+            partial: None,
         });
     }
 
@@ -828,7 +883,7 @@ fn downstream(
         Some(q) => focus::filter_semantic(&all_blocks, q, &lang_info),
         None => (all_blocks.iter().collect(), false),
     };
-    let blocks_shown = kept.len();
+    let mut blocks_shown = kept.len();
 
     // Dropped-content manifest (v3): when focus removed blocks,
     // one accounting line so omission is audited, never silent.
@@ -842,19 +897,6 @@ fn downstream(
 
     // Render markdown (frontmatter + blocks) then paginate.
     let mut full = render::render(meta, url, &kept, opts);
-
-    // Page identity, independent of this request: ALL blocks, neutral
-    // display options, none of the request-specific notices below. The
-    // history fingerprint is taken over this, because fingerprinting the
-    // answer rather than the page made two reads of one unchanged URL with
-    // different reading parameters look like a content change, and let one
-    // call's parameters become the baseline for the next.
-    let identity = render::render(
-        meta,
-        url,
-        &all_blocks.iter().collect::<Vec<_>>(),
-        &ExtractOptions::default(),
-    );
 
     // Engine notes first (PDF scan flags etc.) : they frame any
     // other trust signal that follows.
@@ -887,6 +929,37 @@ fn downstream(
         full = format!("*[{m}]*\n\n{full}");
     }
 
+    // Broad matches can cost more than a plain read once context and the
+    // omission manifest are included. Preserve explicit miss/engine notes.
+    let neutral = ExtractOptions {
+        include_links: opts.include_links,
+        include_media: opts.include_media,
+        ..Default::default()
+    };
+    let unfocused = if opts.focus.is_some() && (opts.include_links || opts.include_media) {
+        std::borrow::Cow::Owned(render::render(
+            meta,
+            url,
+            &all_blocks.iter().collect::<Vec<_>>(),
+            &neutral,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(identity.as_str())
+    };
+    if opts.focus.is_some()
+        && !focus_fell_back
+        && !section_missed
+        && !section_hit
+        && selector_missed.is_none()
+        && notes.is_empty()
+        && full.len().saturating_mul(5) > unfocused.len().saturating_mul(4)
+    {
+        full = format!(
+            "*[focus: less than 20% saving : showing full content]*\n\n{}",
+            unfocused
+        );
+        blocks_shown = blocks_total;
+    }
     // JS-shell warning: agent must know the content
     // below is likely incomplete. On tier=auto the MCP
     // fetch escalates to the browser itself : this note
@@ -966,6 +1039,7 @@ fn downstream(
             images,
             fingerprint: None,
             via: None,
+            partial: None,
         });
     }
 
@@ -988,6 +1062,7 @@ fn downstream(
         images,
         fingerprint: Some(crate::pages::history::PageHistory::fingerprint(&identity)),
         via: None,
+        partial: None,
     })
 }
 
@@ -1203,22 +1278,9 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
     if offset >= text.len() {
         return (String::new(), None);
     }
-    let mut start = ceil_char_boundary(text, offset);
-    // Seek forward to the next block boundary ("\n\n") when
-    // resuming. Agents who resume at offset=N should start at a
-    // clean paragraph/heading boundary, not mid-sentence.
-    if offset > 0 {
-        // Floor the window end to a char boundary : a mid-char
-        // offset into CJK text makes start+500 mid-character and
-        // the slice below would panic.
-        let mut search_end = start.saturating_add(500).min(text.len());
-        while !text.is_char_boundary(search_end) {
-            search_end -= 1;
-        }
-        if let Some(pos) = text[start..search_end].find("\n\n") {
-            start = start + pos + 2; // skip past the "\n\n"
-        }
-    }
+    // Resume exactly where the previous slice ended. Seeking forward to a
+    // paragraph boundary silently discarded the remainder of long blocks.
+    let start = ceil_char_boundary(text, offset);
     // saturating: max_chars comes from tool args; a hostile/huge
     // value must not wrap end below start (slice panic).
     let mut end = start.saturating_add(max_chars).min(text.len());

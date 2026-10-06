@@ -83,6 +83,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         (ContentKind::Article, 1)
     };
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: title_of(&v, url),
         byline: None,
@@ -92,7 +93,6 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         next_offset: next,
         blocks_total: blocks,
         blocks_shown: blocks,
-        tokens_est: total / 4,
         thin: false,
         content_kind: kind,
         lang: "en".to_string(),
@@ -101,6 +101,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         images: Vec::new(),
         fingerprint: None,
         via: Some("adapter:reddit-json"),
+        partial: None,
     })
 }
 

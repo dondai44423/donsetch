@@ -17,7 +17,7 @@ use scraper::{ElementRef, Html, Selector};
 use super::reddit_json::{
     MAX_COMMENTS, MAX_DEPTH, comment_head, epoch_from_iso, listing_line, thread_head,
 };
-use crate::extract::{ContentKind, ExtractOptions, Extracted, inline};
+use crate::extract::{ContentKind, ExtractOptions, Extracted, PartialContent, inline};
 
 const MAX_ITEMS: usize = 40;
 
@@ -39,11 +39,12 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let doc = Html::parse_document(html);
 
     let rendered = if segs.contains(&"comments") {
-        render_thread(&doc, &segs).map(|(md, title, n)| (md, title, ContentKind::Forum, n))
+        render_thread(&doc, &segs)
+            .map(|(md, title, n, partial)| (md, title, ContentKind::Forum, n, partial))
     } else if segs.len() >= 3 && segs[0] == "r" && segs[2] == "wiki" {
-        render_wiki(&doc).map(|(md, title)| (md, title, ContentKind::Article, 1))
+        render_wiki(&doc).map(|(md, title)| (md, title, ContentKind::Article, 1, None))
     } else if segs.len() == 3 && segs[0] == "r" && segs[2] == "about" {
-        render_about(&doc).map(|(md, title, n)| (md, title, ContentKind::Article, n))
+        render_about(&doc).map(|(md, title, n)| (md, title, ContentKind::Article, n, None))
     } else {
         // Listings, and any other page carrying posts (search
         // results, a ghost-rendered profile feed). Profile pages
@@ -56,15 +57,27 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
             {
                 title = format!("u/{name}");
             }
-            (md, title, ContentKind::Listing, n)
+            (
+                md,
+                title,
+                ContentKind::Listing,
+                n,
+                html.contains("/svc/shreddit/community-more-posts")
+                    .then_some(PartialContent {
+                        reason: "additional posts require client-side loading",
+                        items_found: n,
+                        items_total: None,
+                    }),
+            )
         })
     };
-    let (md, title, kind, blocks) = rendered?;
+    let (md, title, kind, blocks, partial) = rendered?;
 
     let total = md.len();
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(title),
         byline: None,
@@ -74,7 +87,6 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: blocks,
         blocks_shown: blocks,
-        tokens_est: total / 4,
         thin: false,
         content_kind: kind,
         lang: "en".to_string(),
@@ -83,12 +95,16 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         images: Vec::new(),
         fingerprint: None,
         via: Some("adapter:reddit-html"),
+        partial,
     })
 }
 
 // ── Thread ────────────────────────────────────────────────────
 
-fn render_thread(doc: &Html, segs: &[&str]) -> Option<(String, String, usize)> {
+fn render_thread(
+    doc: &Html,
+    segs: &[&str],
+) -> Option<(String, String, usize, Option<PartialContent>)> {
     let post_sel = Selector::parse("shreddit-post").ok()?;
     // Prefer the post the URL names (a thread page can carry
     // sidebar/related posts too).
@@ -182,7 +198,13 @@ fn render_thread(doc: &Html, segs: &[&str]) -> Option<(String, String, usize)> {
             "*(showing {rendered} of {comments_n} comments)*\n"
         ));
     }
-    Some((md, title, rendered))
+    let total = usize::try_from(comments_n).ok();
+    let partial = total.filter(|n| rendered < *n).map(|n| PartialContent {
+        reason: "additional comments require client-side loading",
+        items_found: rendered,
+        items_total: Some(n),
+    });
+    Some((md, title, rendered, partial))
 }
 
 fn render_comment(el: ElementRef, depth: usize, md: &mut String, rendered: &mut usize) {

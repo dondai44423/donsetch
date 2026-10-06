@@ -32,25 +32,29 @@ pub(super) async fn search_tool(
         _ => None,
     };
 
-    if queries.len() == 1 {
-        let query = &queries[0];
-        run_with_budget(
-            search_inner(daemon, query, max, intent),
-            deadline,
-            ctx.as_mut(),
-            || search_deadline_error(query),
-        )
+    search::SEARCH_DEADLINE
+        .scope(deadline.map(|d| tokio::time::Instant::now() + d), async {
+            if queries.len() == 1 {
+                let query = &queries[0];
+                run_with_budget(
+                    search_inner(daemon, query, max, intent),
+                    deadline,
+                    ctx.as_mut(),
+                    || search_deadline_error(query),
+                )
+                .await
+            } else {
+                let deadline_queries = queries.clone();
+                run_with_budget(
+                    search_batch_inner(daemon, &queries, max, intent),
+                    deadline,
+                    ctx.as_mut(),
+                    move || search_batch_deadline_error(&deadline_queries),
+                )
+                .await
+            }
+        })
         .await
-    } else {
-        let deadline_queries = queries.clone();
-        run_with_budget(
-            search_batch_inner(daemon, &queries, max, intent),
-            deadline,
-            ctx.as_mut(),
-            move || search_batch_deadline_error(&deadline_queries),
-        )
-        .await
-    }
 }
 
 /// Parse the required base query and at most two explicit alternate
@@ -238,7 +242,22 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
     let mut item = json!({
         "weak": out.weak,
         "results": results,
+        "provider": out.provider.as_deref().unwrap_or("keyless"),
     });
+    let failed = out
+        .report
+        .iter()
+        .filter(|r| !matches!(r.status.as_str(), "ok" | "cached"))
+        .count();
+    if failed > 0 {
+        item["degraded"] = json!(true);
+        item["failed_engines"] = json!(failed);
+        if out.results.is_empty() {
+            item["next_action"] = json!(
+                "retrieval was incomplete; check provider/engine health with doctor --deep or retry another source before concluding that no answer exists"
+            );
+        }
+    }
     // Instant answers are decision aids, not ranked evidence: they
     // ride structuredContent (not the organic list) with their source.
     if let Some(ans) = &out.instant {

@@ -96,6 +96,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&full, opts.offset, max);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: doc
             .select(&Selector::parse("h1.firstHeading").unwrap())
@@ -108,7 +109,6 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: fields.len(),
         blocks_shown: fields.len(),
-        tokens_est: total / 4,
         thin: false,
         content_kind: ContentKind::Article,
         lang: "en".to_string(),
@@ -117,6 +117,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         images: Vec::new(),
         fingerprint: None,
         via: Some("adapter:wikipedia-infobox"),
+        partial: None,
     })
 }
 

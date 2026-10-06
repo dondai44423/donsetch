@@ -92,6 +92,7 @@ pub fn text_fallback(
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 

@@ -266,7 +266,8 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         _ if m.contains("navigation and login chrome") => "wall.empty_shell",
         _ if m.contains("captcha") => "wall.captcha",
         _ if m.contains("archived copy") || m.contains("snapshot") => "archive.stale",
-        _ if v == "Challenge" => "wall.challenge",
+        _ if v.starts_with("Challenge") => "wall.challenge",
+        _ if v == "Blocked" => "wall.blocked",
         _ if v == "Paywall" => "wall.paywall",
         _ if v == "AuthWall" => "wall.auth",
         _ if v == "SoftNotFound" => "content.notfound",
@@ -307,6 +308,20 @@ pub(super) fn tool_error_structured(
     if let Some(mut s) = structured {
         // The stable code lives where agents read it.
         s["code"] = json!(code);
+        if s.get("url").is_some() {
+            s["content_ok"] = json!(false);
+            s["read_status"] = json!(if kind == "walled" {
+                "walled"
+            } else if code == "content.notfound" {
+                "notfound"
+            } else {
+                "error"
+            });
+            s["content_complete"] = json!(false);
+            if code == "content.notfound" {
+                s["suggested_query"] = s["url"].clone();
+            }
+        }
         v["structuredContent"] = s;
     }
     v
@@ -355,7 +370,7 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
             _ => "server rejected the request : retrying later sometimes works".into(),
         },
         _ if kind == "transient" => {
-            "transient network failure : safe to retry immediately".into()
+            "network failure : a retry may work; if repeated, check this host from another network or choose another source".into()
         }
         _ if kind == "walled" => {
             "no extractable content behind the wall : use an interactive agent browser for this site".into()
@@ -379,14 +394,28 @@ pub(super) struct Trace {
     steps: Vec<Value>,
 }
 
+tokio::task_local! {
+    /// A per-call witness survives cancellation of the fetch future. Ordinary
+    /// traces keep their own ordered steps; recursive adapters cannot replace
+    /// the evidence already observed by a deadline-bound caller.
+    pub(super) static FETCH_TRACE: std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+}
+
 impl Trace {
     pub(super) fn step(&mut self, tier: &str, action: &str, outcome: &str, ms: u128) {
-        self.steps.push(json!({
+        let step = json!({
             "tier": tier,
             "action": action,
             "outcome": outcome,
             "ms": ms,
-        }));
+        });
+        let _ = FETCH_TRACE.try_with(|witness| {
+            witness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(step.clone());
+        });
+        self.steps.push(step);
     }
 
     pub(super) fn value(&self) -> Value {
@@ -437,6 +466,17 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
         FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => "tls.verify",
         _ => "permanent",
     }
+}
+
+/// Wire-level evidence for the per-host repeated-failure advice
+/// (`recent_network_failures`). The retryable kinds qualify outright;
+/// the `Http` protocol variant is the pipe itself dying mid-exchange
+/// (headers never arrived, message truncated), the same story for the
+/// caller. Policy (`Ssrf`, `InvalidUrl`), name (`Dns`) and site
+/// (`TooManyRedirects`) failures never count: the wire delivered an
+/// answer, the answer was "no".
+pub(super) fn transport_failure_evidence(e: &FetchError) -> bool {
+    fetch_error_kind(e) == "transient" || matches!(e, FetchError::Http(_))
 }
 
 /// The stable machine code for a transport failure, taken from the
@@ -543,6 +583,34 @@ mod stitch_tests {
             fetch_error_kind(&classified("some exotic library error")),
             "permanent"
         );
+    }
+
+    // The repeated-failure advice counts wire evidence, not only the
+    // retryable kinds: a connection that dies mid-exchange is `Http`
+    // (the live broken-wire fixture), while policy and name failures
+    // are answers from the wire, not evidence about it (#248 family).
+    #[test]
+    pub(super) fn wire_failures_feed_the_repeated_failure_advice() {
+        assert!(transport_failure_evidence(&FetchError::Http(
+            "eof before headers".into()
+        )));
+        assert!(transport_failure_evidence(&FetchError::Timeout));
+        assert!(transport_failure_evidence(&FetchError::DnsTimeout(
+            "the resolver did not answer".into()
+        )));
+        assert!(transport_failure_evidence(&FetchError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer")
+        )));
+        assert!(!transport_failure_evidence(&FetchError::Ssrf(
+            "10.0.0.1 is a private/loopback address".into()
+        )));
+        assert!(!transport_failure_evidence(&FetchError::Dns(
+            "no such host".into()
+        )));
+        assert!(!transport_failure_evidence(&FetchError::InvalidUrl(
+            "not a url".into()
+        )));
+        assert!(!transport_failure_evidence(&FetchError::TooManyRedirects));
     }
 
     // search_error used to hardcode errorKind: "transient" for every

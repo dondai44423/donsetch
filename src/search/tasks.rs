@@ -168,8 +168,18 @@ pub(super) async fn engine_task_with_budget(
             Err((format!("blocked:{}", out.status), egress_id, true)),
         );
     }
-    let (hits, instant) = engines::parse_with_instant(&engine, &html);
-    if hits.len() < 3 {
+    let (mut hits, instant) = engines::parse_with_instant(&engine, &html);
+    let scoped = super::query::compile(&query).site;
+    if let Some(site) = &scoped {
+        let site = site.trim_start_matches("www.");
+        hits.retain(|hit| {
+            url::Url::parse(&hit.url).ok().is_some_and(|u| {
+                u.host_str()
+                    .is_some_and(|host| host == site || host.ends_with(&format!(".{site}")))
+            })
+        });
+    }
+    if hits.len() < if scoped.is_some() { 1 } else { 3 } {
         // Honest "no results" is NOT an engine failure :
         // don't burn trust/lanes for a dry query.
         let lower = html.to_lowercase();
@@ -177,7 +187,11 @@ pub(super) async fn engine_task_with_budget(
             || lower.contains("did not match any")
             || lower.contains("no good results")
             || lower.contains("nothing found");
-        let status = if dry { "no-results" } else { "empty-parse" };
+        let status = if dry || scoped.is_some() {
+            "no-results"
+        } else {
+            "empty-parse"
+        };
         return (label, Err((status.into(), egress_id, true)));
     }
     if let Some(lease) = &lease {

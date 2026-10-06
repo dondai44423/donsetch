@@ -68,42 +68,98 @@ pub const WINLOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_s
 #[cfg(windows)]
 pub const WINLOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Set when the LAST ghost render returned Chrome's own network
-/// error page (a dead/broken egress lane renders as a stable,
-/// tiny-text DOM extraction cannot use: the old path scored it
-/// "rendered a 180KB DOM, no content" and failed the fetch).
-/// The fetch escalation reads it for one direct retry; per
-/// attempt, never sticky.
-static LAST_GHOST_CHROME_ERROR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+tokio::task_local! {
+    /// (direct retry, Chrome network error). Each fetch owns its flags;
+    /// cancelling the future drops them instead of changing a sibling call.
+    pub(crate) static GHOST_CALL: std::cell::Cell<(bool, bool)>;
+}
 
-/// Launch override: skip proxy lanes entirely (direct). Set for
-/// one ghost escalation retry when the previous render hit a
-/// Chrome error page.
-static GHOST_DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Chrome's own error pages (ERR_* rendered as HTML). A content
-/// page never contains these strings; an error page never
-/// contains real content.
+/// Chrome's network error document. Require its DOM structure as well as
+/// an error code, so troubleshooting articles remain readable.
 pub fn is_chrome_error_html(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
-    lower.contains("err_socks_connection_failed")
-        || lower.contains("err_proxy_connection_failed")
-        || lower.contains("err_tunnel_connection_failed")
-        || lower.contains("this site can't be reached")
-        || lower.contains("the proxy server is refusing connections")
+    lower.contains("main-frame-error") && lower.contains("error-code") && lower.contains("err_")
 }
 
 pub fn note_last_ghost_chrome_error(on: bool) {
-    LAST_GHOST_CHROME_ERROR.store(on, std::sync::atomic::Ordering::SeqCst);
+    let _ = GHOST_CALL.try_with(|flags| flags.set((flags.get().0, on)));
 }
 
 pub fn last_ghost_chrome_error() -> bool {
-    LAST_GHOST_CHROME_ERROR.load(std::sync::atomic::Ordering::SeqCst)
+    GHOST_CALL.try_with(|flags| flags.get().1).unwrap_or(false)
 }
 
 pub fn set_ghost_direct(on: bool) {
-    GHOST_DIRECT.store(on, std::sync::atomic::Ordering::SeqCst);
+    let _ = GHOST_CALL.try_with(|flags| flags.set((on, flags.get().1)));
+}
+
+pub(super) fn ghost_direct() -> bool {
+    GHOST_CALL.try_with(|flags| flags.get().0).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod wave450_retry_tests {
+
+    #[test]
+    fn wave450_each_browser_slot_owns_a_unique_temporary_profile() {
+        let paths: Vec<_> = (0..16).map(|_| temporary_profile_dir()).collect();
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            16
+        );
+    }
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn wave450_browser_retry_flags_are_isolated_and_cancel_safe() {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first = GHOST_CALL.scope(std::cell::Cell::new((false, false)), async {
+            set_ghost_direct(true);
+            note_last_ghost_chrome_error(true);
+            ready_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            assert!(ghost_direct());
+            assert!(last_ghost_chrome_error());
+        });
+        let second = GHOST_CALL.scope(std::cell::Cell::new((false, false)), async {
+            ready_rx.await.unwrap();
+            assert!(!ghost_direct());
+            assert!(!last_ghost_chrome_error());
+            release_tx.send(()).unwrap();
+        });
+        tokio::join!(first, second);
+        let work = GHOST_CALL.scope(std::cell::Cell::new((false, false)), async {
+            set_ghost_direct(true);
+            note_last_ghost_chrome_error(true);
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), work)
+                .await
+                .is_err()
+        );
+        assert!(!ghost_direct());
+        assert!(!last_ghost_chrome_error());
+        assert_ne!(
+            GhostWire::default(),
+            GhostWire {
+                direct: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn wave450_network_error_quotation_is_not_a_browser_error_page() {
+        assert!(!is_chrome_error_html(
+            "<article><h1>Network troubleshooting</h1><p>The message this site can't be reached or ERR_PROXY_CONNECTION_FAILED can occur when a proxy is offline.</p></article>"
+        ));
+        assert!(is_chrome_error_html(
+            "<div id='main-frame-error'><p class='error-code'>ERR_PROXY_CONNECTION_FAILED</p></div>"
+        ));
+    }
 }
 
 pub struct Ghost {
@@ -165,6 +221,8 @@ pub struct Ghost {
 pub struct GhostWire {
     pub viewport: (u32, u32),
     pub locale: String,
+    /// Direct retry changes browser routing and therefore pool identity.
+    pub direct: bool,
 }
 
 impl Default for GhostWire {
@@ -172,6 +230,7 @@ impl Default for GhostWire {
         Self {
             viewport: (1920, 1080),
             locale: "en-US".into(),
+            direct: false,
         }
     }
 }
@@ -189,6 +248,7 @@ impl GhostWire {
         Self {
             viewport: (w, h),
             locale,
+            direct: false,
         }
     }
 }
@@ -197,6 +257,19 @@ impl GhostWire {
 /// easier, and clearance cookies survive daemon restarts.
 pub fn profile_dir() -> PathBuf {
     crate::paths::cache_dir().join("ghost-profile")
+}
+
+fn temporary_profile_dir() -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "donsetch-ghost-{}-{nonce}-{sequence}",
+        std::process::id()
+    ))
 }
 
 /// Default Chrome launch args (without sandbox flags).
@@ -948,8 +1021,7 @@ impl Ghost {
                         if got == 0 {
                             (profile_dir(), None, None::<std::path::PathBuf>)
                         } else {
-                            let t = std::env::temp_dir()
-                                .join(format!("donsetch-ghost-{}", std::process::id()));
+                            let t = temporary_profile_dir();
                             (t.clone(), Some(t), None::<std::path::PathBuf>)
                         }
                     }
@@ -998,13 +1070,11 @@ impl Ghost {
                                     if take_lock(&lock_path).is_ok() {
                                         (profile_dir(), None, Some(lock_path))
                                     } else {
-                                        let t = std::env::temp_dir()
-                                            .join(format!("donsetch-ghost-{}", std::process::id()));
+                                        let t = temporary_profile_dir();
                                         (t.clone(), Some(t), None::<std::path::PathBuf>)
                                     }
                                 } else {
-                                    let t = std::env::temp_dir()
-                                        .join(format!("donsetch-ghost-{}", std::process::id()));
+                                    let t = temporary_profile_dir();
                                     (t.clone(), Some(t), None::<std::path::PathBuf>)
                                 }
                             }
@@ -1017,8 +1087,7 @@ impl Ghost {
                     }
                 }
                 None => {
-                    let t =
-                        std::env::temp_dir().join(format!("donsetch-ghost-{}", std::process::id()));
+                    let t = temporary_profile_dir();
                     (t.clone(), Some(t), None::<std::path::PathBuf>)
                 }
             };
@@ -1103,7 +1172,7 @@ impl Ghost {
         // to 127.0.0.1, the relay performs the upstream handshake
         // with the lane's own credentials (exactly what the tier-1
         // client does) and pipes bytes.
-        let pool_proxy = if GHOST_DIRECT.load(std::sync::atomic::Ordering::SeqCst) {
+        let pool_proxy = if wire.direct {
             // Direct retry after a Chrome error page: no lanes at
             // all, direct is the only chance left.
             None
@@ -1116,9 +1185,11 @@ impl Ghost {
             })
         };
         let mut relay: Option<relay::Relay> = None;
-        if let Some(p) =
+        if let Some(p) = if wire.direct {
+            None
+        } else {
             pool_proxy.or_else(|| crate::transport::proxy::from_env_for("https://ghost.local/"))
-        {
+        } {
             let authed = !p.user.is_empty() || !p.pass.is_empty();
             let arg = if authed {
                 match relay::Relay::spawn(std::sync::Arc::new(p.clone())).await {
@@ -1578,8 +1649,8 @@ impl Ghost {
     /// commits normally. Waiting on that response therefore hangs
     /// until the generic 20s CDP timeout, blocking tier-2 entirely.
     ///
-    /// Fix: dispatch `Page.navigate` but do NOT block on its
-    /// response. Poll `current_url()` instead : it uses the
+    /// Bound the `Page.navigate` response wait, retaining any errorText.
+    /// Poll `current_url()` after a settle-window timeout : it uses the
     /// browser-level `Target.getTargetInfo`, which is routed
     /// separately from the page session and still returns the
     /// advancing URL. This succeeds on both healthy Chrome (fast
@@ -1629,11 +1700,20 @@ impl Ghost {
             )
             .await
         {
+            Ok(reply) => reply
+                .get("errorText")
+                .and_then(Value::as_str)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned),
             Err(e) if !e.to_string().contains("cdp timeout") => Some(e.to_string()),
             // Settle-window timeouts are the documented queue
             // behavior above; the poll loop is the real referee.
             _ => None,
         };
+
+        if let Some(why) = nav_err.as_ref() {
+            return Err(FetchError::ghost(format!("navigate failed: {why}")));
+        }
 
         // Poll the target URL until it advances off the initial
         // blank page (about:blank is what createTarget starts at).
@@ -1642,6 +1722,9 @@ impl Ghost {
             let cur = self.current_url().await.unwrap_or_default();
             let advanced = !cur.is_empty() && !cur.starts_with("about:blank");
             if advanced {
+                if cur.starts_with("chrome-error:") {
+                    return Err(FetchError::ghost("navigate failed: Chrome network error"));
+                }
                 // Re-check redirect target: Chrome follows redirects
                 // automatically; a public URL that redirects to a
                 // private/loopback address must be blocked even if the

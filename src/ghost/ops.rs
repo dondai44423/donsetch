@@ -146,7 +146,9 @@ pub async fn solve(
     timeout: Duration,
 ) -> Result<SolveOutcome, FetchError> {
     let start = Instant::now();
-    ghost.navigate(url).await?;
+    tokio::time::timeout(timeout, ghost.navigate(url))
+        .await
+        .map_err(|_| FetchError::ghost("browser navigation deadline exceeded"))??;
     // No resource blocking : challenges need resources to load.
     let _ = ghost
         .cdp
@@ -244,6 +246,7 @@ pub async fn solve(
         // Captcha walls: honest dead end.
         let lower = html.to_lowercase();
         if small
+            && challenged
             && (lower.contains("hcaptcha.com")
                 || lower.contains("g-recaptcha")
                 || lower.contains("www.google.com/recaptcha")
@@ -264,6 +267,7 @@ pub async fn solve(
         // trying before the thing it was aiming at existed. A fallback is a
         // fixed-point guess, so it is allowed once, as a last resort.
         if small
+            && challenged
             && (lower.contains("challenges.cloudflare.com")
                 || lower.contains("turnstile")
                 || lower.contains("verify you are human"))
@@ -355,8 +359,20 @@ pub async fn ghost_fetch(
     url: &str,
     timeout: Duration,
 ) -> Result<GhostPage, FetchError> {
+    tokio::time::timeout(timeout, ghost_fetch_inner(ghost, url, timeout))
+        .await
+        .map_err(|_| FetchError::ghost("browser pass deadline exceeded before usable content"))?
+}
+
+async fn ghost_fetch_inner(
+    ghost: &mut Ghost,
+    url: &str,
+    timeout: Duration,
+) -> Result<GhostPage, FetchError> {
     let start = Instant::now();
-    ghost.navigate(url).await?;
+    tokio::time::timeout(timeout, ghost.navigate(url))
+        .await
+        .map_err(|_| FetchError::ghost("browser navigation deadline exceeded"))??;
     // No resource blocking : challenges verify that resources
     // (images, fonts) load. Blocking them breaks Cloudflare
     // and DataDome challenge solving. The speed cost is small
@@ -403,6 +419,10 @@ pub async fn ghost_fetch(
 
         // Interactive captcha: honest dead end.
         if cur_len < 30_000
+            && matches!(
+                walls::detect_dom_smart(html.as_bytes()),
+                Verdict::Challenge(_) | Verdict::Blocked
+            )
             && (lower.contains("hcaptcha.com")
                 || lower.contains("g-recaptcha")
                 || lower.contains("www.google.com/recaptcha")
@@ -727,7 +747,9 @@ fn find_ci(b: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 /// robust for SPAs, no Network domain needed.
 pub async fn render(ghost: &mut Ghost, url: &str, timeout: Duration) -> Result<String, FetchError> {
     let start = Instant::now();
-    ghost.navigate(url).await?;
+    tokio::time::timeout(timeout, ghost.navigate(url))
+        .await
+        .map_err(|_| FetchError::ghost("browser navigation deadline exceeded"))??;
     let mut prev_len = 0usize;
     let mut stable = 0u8;
     let mut html = String::new();

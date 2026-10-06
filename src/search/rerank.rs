@@ -217,6 +217,28 @@ mod inner {
             .map_err(|_| "download thread panicked".to_string())?
     }
 
+    /// Test-only: the user's real cache may already hold the pinned
+    /// model. Copy it into this process's sandbox instead of
+    /// re-downloading 23MB: nextest gives every test process a fresh
+    /// cache root, so without this each rank test re-fetched the model
+    /// and a loaded box pushed them past the local 60s slow-timeout.
+    /// The copy is sha-verified; a mismatch falls back to the download
+    /// (which verifies again). CI has no user cache and downloads.
+    #[cfg(test)]
+    fn seed_from_user_cache(dest: &Path, file: &str, expected: &str) {
+        let src = crate::paths::user_cache_dir().join("rerank").join(file);
+        let Ok(body) = std::fs::read(&src) else {
+            return;
+        };
+        let got = Sha256::digest(&body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        if got == expected {
+            let _ = std::fs::write(dest, &body);
+        }
+    }
+
     /// Ensures model + tokenizer files are on disk, returns their paths.
     fn ensure_files() -> Result<(PathBuf, PathBuf), String> {
         let dir = cache_dir();
@@ -224,14 +246,22 @@ mod inner {
         let tok_path = dir.join("tokenizer.json");
 
         if !model_path.exists() {
-            eprintln!("[rerank] downloading model (23MB, first use only)...");
-            download(MODEL_URL, &model_path, MODEL_SHA256)?;
-            eprintln!("[rerank] model cached.");
+            #[cfg(test)]
+            seed_from_user_cache(&model_path, "model_quantized.onnx", MODEL_SHA256);
+            if !model_path.exists() {
+                eprintln!("[rerank] downloading model (23MB, first use only)...");
+                download(MODEL_URL, &model_path, MODEL_SHA256)?;
+                eprintln!("[rerank] model cached.");
+            }
         }
         if !tok_path.exists() {
-            eprintln!("[rerank] downloading tokenizer (695KB)...");
-            download(TOKENIZER_URL, &tok_path, TOKENIZER_SHA256)?;
-            eprintln!("[rerank] tokenizer cached.");
+            #[cfg(test)]
+            seed_from_user_cache(&tok_path, "tokenizer.json", TOKENIZER_SHA256);
+            if !tok_path.exists() {
+                eprintln!("[rerank] downloading tokenizer (695KB)...");
+                download(TOKENIZER_URL, &tok_path, TOKENIZER_SHA256)?;
+                eprintln!("[rerank] tokenizer cached.");
+            }
         }
         Ok((model_path, tok_path))
     }

@@ -40,6 +40,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     let deps_n = card.deps.len();
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(format!("{} {}", card.name, card.version)),
         byline: None,
@@ -49,7 +50,6 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         next_offset: next,
         blocks_total: deps_n,
         blocks_shown: deps_n,
-        tokens_est: total / 4,
         thin: false,
         content_kind: ContentKind::Listing,
         lang: "en".to_string(),
@@ -58,6 +58,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         images: Vec::new(),
         fingerprint: None,
         via: Some(via),
+        partial: None,
     })
 }
 

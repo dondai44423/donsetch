@@ -269,6 +269,7 @@ fn finish(
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 

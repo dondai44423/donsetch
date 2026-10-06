@@ -480,8 +480,13 @@ pub async fn discover(
 
     let mut entries = Vec::new();
     let mut fetched = 0usize;
+    let mut visited = std::collections::HashSet::new();
     let mut first = true;
     while !queue.is_empty() && entries.len() < cap && fetched < 32 {
+        queue.retain(|loc| !visited.contains(loc));
+        if queue.is_empty() {
+            break;
+        }
         if first {
             // Wave 1: the highest-confidence candidate alone.
             // Robots-declared sitemaps and /sitemap.xml cover the
@@ -489,6 +494,7 @@ pub async fn discover(
             // the serial v1 loop's best case.
             first = false;
             let loc = queue.remove(0);
+            visited.insert(loc.clone());
             fetched += 1;
             if let Some(text) = fetch_sitemap_text(fetch, &loc).await {
                 absorb(text, &mut queue, &mut entries);
@@ -502,7 +508,10 @@ pub async fn discover(
         // indexes discovered later are also waved : they are
         // metadata probes, not page fetches, and the governor's
         // page-fetch pacing is untouched.
-        let wave: Vec<String> = queue.drain(..queue.len().min(8)).collect();
+        let wave: Vec<String> = queue
+            .drain(..queue.len().min(8).min(32 - fetched))
+            .filter(|loc| visited.insert(loc.clone()))
+            .collect();
         fetched += wave.len();
         let futs = wave.iter().map(|loc| fetch_sitemap_text(fetch, loc));
         let texts = futures_util::future::join_all(futs).await;
@@ -565,6 +574,31 @@ fn absorb(text: String, queue: &mut Vec<String>, entries: &mut Vec<SitemapEntry>
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn wave450_sitemap_cycle_fetches_each_index_once() {
+        let (fetch, hits) = recording_fetcher(vec![
+            (
+                "https://ex.com/robots.txt",
+                200,
+                "User-agent: *\nSitemap: https://ex.com/sitemap.xml\n",
+            ),
+            (
+                "https://ex.com/sitemap.xml",
+                200,
+                "<sitemapindex><sitemap><loc>https://ex.com/sitemap.xml</loc></sitemap></sitemapindex>",
+            ),
+        ]);
+        let (_, entries) = discover(&fetch, "https://ex.com", 10).await;
+        assert!(entries.is_empty());
+        let hits = hits.lock().unwrap();
+        assert_eq!(
+            hits.iter()
+                .filter(|url| url.ends_with("/sitemap.xml"))
+                .count(),
+            1
+        );
+    }
     use super::*;
     use futures_util::FutureExt;
 

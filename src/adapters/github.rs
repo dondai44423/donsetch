@@ -44,6 +44,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: doc_title(&doc),
         byline: None,
@@ -53,7 +54,6 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         next_offset: next,
         blocks_total: 0,
         blocks_shown: 0,
-        tokens_est: total / 4,
         thin: false,
         content_kind: ContentKind::Forum,
         lang: "en".to_string(),
@@ -62,6 +62,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         images: Vec::new(),
         fingerprint: None,
         via: Some("adapter:github-html"),
+        partial: None,
     })
 }
 

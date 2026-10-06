@@ -134,10 +134,11 @@ Homebrew and dsh auto-track published releases.
 **Verify the install:**
 
 ```bash
-donsetch doctor          # fast local sweep, ~1 second
-donsetch doctor --deep   # adds live browser + egress probes
+donsetch doctor          # grouped health checks, including a real browser launch
+donsetch doctor --deep   # adds live egress, provider and captive-portal probes
 donsetch doctor --fix    # repairs mechanical problems automatically
-donsetch doctor --json   # machine-readable, also prints MCP registration blocks for your client
+donsetch doctor --json   # appends machine-readable check results
+donsetch doctor --mcp    # detects clients and prints absolute-path registration blocks
 ```
 
 <details>
@@ -272,14 +273,15 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 
 **DonSift extraction**: HTML bytes in, agent-native markdown out. Typed blocks (heading, paragraph, list, table, code, quote, media) with heading breadcrumbs.
 
-- **`focus`**: BM25-relevant blocks only, which cuts context by 80%+ on long pages. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
+- **`focus`**: BM25-relevant passages with section context. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
 - **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
 - **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
 - **Classification**: `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page`, a 0-1 quality score, and inline trust signals (focus-miss, JS-shell warning, empty content).
 - **Page memory**: every fetch is fingerprinted, so a re-fetch reports `changed` with section-level diffs, and `since_last=true` collapses a re-check to one line (~30 tokens).
 - **`must_contain`**: verifies a claim against the full page but returns MATCH/NO-MATCH plus up to 3 excerpts (~60 tokens instead of 4k).
 - **`archive=auto`**: a dead link serves the nearest Wayback snapshot, honestly labeled with its age.
-- **`stitch=true`**: walks `rel=next` into one call with part markers.
+- **`stitch=true`**: collects up to six same-host parts within 1 MiB. Output obeys `max_chars`; `next_offset` resumes collected text and `next_part` identifies an unfinished part.
+- **Read budgets**: `mode=scan` / `read` / `deep` set 800 / 4000 / 16000 chars; explicit `max_chars` wins. `read_status` and `content_complete` distinguish partial output from a complete read. Reddit subsets expose `partial` and known item counts.
 - **`deadline_ms` everywhere**: real MCP cancellation, progress notifications, ms cost footer. Nothing can silently hang.
 - **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites get restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable.
 - **Anti-cloak check**: on decoy-prone domains, tier-1 responses are equivalence-checked against a headless render, so `decoy suspected` is stamped instead of silently passing as content.

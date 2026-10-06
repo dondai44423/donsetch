@@ -314,8 +314,9 @@ impl GhostManager {
         &self,
         profile: &BrowserProfile,
         host: Option<&str>,
-        wire: crate::ghost::GhostWire,
+        mut wire: crate::ghost::GhostWire,
     ) -> Result<GhostGuard, FetchError> {
+        wire.direct |= super::ghost_direct();
         let key = persona_key(profile);
         let idx = {
             let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());

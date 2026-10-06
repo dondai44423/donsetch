@@ -184,7 +184,7 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
             } else {
                 (
                     "transient",
-                    "safe to retry immediately; if repeated, lower max_pages or widen deadline_s",
+                    "retry may work; if repeated, check network/access or use another source",
                 )
             };
             let mut trace = Trace::default();
@@ -201,7 +201,12 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         }
     };
 
-    render_crawl_result(&result, requested_mode, dataset)
+    let mut rendered = render_crawl_result(&result, requested_mode, dataset);
+    if !url.is_empty() && result.seed != url {
+        rendered["structuredContent"]["requested_seed"] = json!(url);
+        rendered["structuredContent"]["resolved_seed"] = json!(result.seed);
+    }
+    rendered
 }
 
 pub(super) fn render_crawl_result(
@@ -270,13 +275,16 @@ pub(super) fn render_crawl_result(
     let next_action = compute_crawl_next_action(result);
     let mut structured = json!({
         "seed": result.seed,
-        "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
+        "complete": crawl_complete(result, requested_mode),
         "pages": result.pages.iter().filter(|p| !p.duplicate).map(|p| json!({
             "url": p.url,
             "lastmod": p.lastmod,
         })).collect::<Vec<_>>(),
         "stop": format!("{:?}", result.stop),
     });
+    if requested_mode != CrawlMode::Content {
+        structured["map"] = json!(result.map);
+    }
     if let Some(resume) = &result.resume {
         structured["resume"] = json!(resume);
     }
@@ -364,10 +372,10 @@ pub(super) fn render_crawl_dataset(
             .iter()
             .filter_map(|r| r.get("chars").and_then(|c| c.as_u64()))
             .sum::<u64>(),
-        "complete": matches!(result.stop, crate::crawl::StopReason::FrontierEmpty),
+        "complete": crawl_complete(result, requested_mode),
         "stop": format!("{:?}", result.stop),
     });
-    if requested_mode == CrawlMode::Map {
+    if requested_mode != CrawlMode::Content {
         structured["map"] = json!(result.map);
     }
     if let Some(resume) = &result.resume {
@@ -411,32 +419,35 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
     }
 
     // 0 pages : diagnose why.
-    if result.pages.is_empty() {
+    if result.pages.is_empty() && result.map.is_empty() {
         let skip_reasons: Vec<&str> = result.skipped.iter().map(|(_, w)| w.as_str()).collect();
-        let all_scope = skip_reasons
-            .iter()
-            .all(|r| r.contains("out of scope") || r.contains("filtered"));
-        let all_blocked = skip_reasons
-            .iter()
-            .all(|r| r.contains("Challenge") || r.contains("Blocked") || r.contains("wall"));
-        let all_404 = skip_reasons
-            .iter()
-            .all(|r| r.contains("404") || r.contains("NotFound"));
+        let all_scope = !skip_reasons.is_empty()
+            && skip_reasons
+                .iter()
+                .all(|r| r.contains("out of scope") || r.contains("filtered"));
+        let all_blocked = !skip_reasons.is_empty()
+            && skip_reasons
+                .iter()
+                .all(|r| r.contains("Challenge") || r.contains("Blocked") || r.contains("wall"));
+        let all_404 = !skip_reasons.is_empty()
+            && skip_reasons
+                .iter()
+                .all(|r| r.contains("404") || r.contains("NotFound"));
         let has_sitemap = !result.map.is_empty();
 
         if all_404 {
             return "seed URL returned 404 : check the URL is correct.".into();
         }
         if all_blocked {
-            return "the site blocked the crawler. Try respect_robots=false, or fetch the seed URL directly first to check access.".into();
+            return "the site blocked the crawler. Fetch the seed URL directly to check access, or retry from another permitted network.".into();
         }
         if all_scope && result.filtered_out > 0 {
-            return "all discovered URLs were outside the seed's path scope. Try broader include_paths, or same_host=false to crawl the whole host.".into();
+            return "all discovered URLs were outside the seed's path scope. Try broader include_paths; same_host=false permits other hosts.".into();
         }
         if !has_sitemap && result.map.is_empty() && result.filtered_out == 0 {
-            return "no sitemap found and no links discovered. Try mode=content to BFS from the seed, or check the seed URL is accessible.".into();
+            return "no URL inventory or readable pages were found. Check seed accessibility and scope; verify that the seed exposes readable links, or broaden include_paths.".into();
         }
-        return "crawl returned 0 pages. Try mode=content, broader include_paths, or a different seed URL.".into();
+        return "crawl returned 0 readable pages. Check seed access, broaden include_paths, or use a different seed URL.".into();
     }
 
     // Pages found but stopped early.
@@ -464,6 +475,18 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
     }
 }
 
+fn crawl_complete(result: &crate::crawl::CrawlResult, mode: CrawlMode) -> bool {
+    matches!(result.stop, crate::crawl::StopReason::FrontierEmpty)
+        && if mode == CrawlMode::Map {
+            !result.map.is_empty()
+        } else {
+            (!result.pages.is_empty() || !result.skipped.is_empty())
+                && result.skipped.iter().all(|(_, why)| {
+                    why == "unchanged since last crawl" || why.contains("duplicate")
+                })
+        }
+}
+
 #[cfg(test)]
 mod crawl_output_contract_tests {
     use super::render_crawl_result;
@@ -471,6 +494,34 @@ mod crawl_output_contract_tests {
     use crate::extract::ContentKind;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn wave450_map_inventory_is_model_state_without_false_404() {
+        let mut result = CrawlResult {
+            seed: "https://example.com/docs/".into(),
+            pages: vec![],
+            queued: vec![],
+            filtered_out: 0,
+            skipped: vec![],
+            stop: StopReason::FrontierEmpty,
+            elapsed: Duration::ZERO,
+            map: vec!["https://example.com/docs/a".into()],
+            crawl_delay: None,
+            resume: None,
+        };
+        let rendered = render_crawl_result(&result, CrawlMode::Map, false);
+        assert_eq!(rendered["structuredContent"]["map"], json!(result.map));
+        assert!(rendered["structuredContent"].get("next_action").is_none());
+        result.map.clear();
+        let empty = render_crawl_result(&result, CrawlMode::Content, false);
+        assert_eq!(empty["structuredContent"]["complete"], false);
+        assert!(
+            !empty["structuredContent"]["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("404")
+        );
+    }
 
     #[test]
     pub(super) fn crawl_renders_page_identity_once_and_keeps_resume_as_state() {
@@ -582,7 +633,7 @@ mod crawl_output_contract_tests {
         assert_eq!(out["structuredContent"]["rows"], 2);
         assert_eq!(out["structuredContent"]["dataset"], true);
         assert_eq!(out["structuredContent"]["dataset_version"], 1);
-        assert_eq!(out["structuredContent"]["complete"], true);
+        assert_eq!(out["structuredContent"]["complete"], false);
         // Skipped pages surface in debug, never as rows.
         assert_eq!(
             out["_meta"]["com.donsetch/crawl-debug"]["skipped"][0]["reason"],

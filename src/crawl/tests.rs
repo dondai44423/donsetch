@@ -227,6 +227,154 @@ fn html(title: &str, body: &str) -> String {
     )
 }
 
+#[tokio::test]
+async fn wave450_seed_preflight_uses_an_available_governor_lane() {
+    let (inner, _) = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &html(
+                "Proxy source",
+                "Research evidence on the only configured lane.",
+            ),
+        )
+        .fetcher();
+    let lanes = Arc::new(Mutex::new(Vec::new()));
+    let recorded = lanes.clone();
+    let fetch: PageFetcher = Arc::new(move |url, lane, referer| {
+        recorded.lock().unwrap().push(lane.clone());
+        inner(url, lane, referer)
+    });
+    let governor = Arc::new(Governor::new(vec![Lane {
+        id: "proxy-only".into(),
+        kind: LaneKind::Proxy,
+    }]));
+    let result = Crawler::new(fetch, governor)
+        .crawl(
+            "https://ex.com/",
+            CrawlOptions {
+                mode: CrawlMode::Content,
+                respect_robots: false,
+                ..opts()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!result.pages.is_empty());
+    assert!(
+        lanes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|lane| lane == "proxy-only"),
+        "{:?}",
+        lanes.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn wave450_seed_redirect_relocates_scope_and_reuses_response() {
+    let seed = "https://old.example/docs/";
+    let resolved = "https://new.example/guide/";
+    let (inner, hits) = MockSite::new()
+        .page(
+            seed,
+            200,
+            &html("Relocated guide", "The guide now lives at its new address."),
+        )
+        .page(
+            "https://new.example/guide/chapter",
+            200,
+            &html(
+                "Chapter",
+                "A distinct chapter with detailed examples and installation instructions.",
+            ),
+        )
+        .fetcher();
+    let fetch: PageFetcher = Arc::new(move |u, lane, referer| {
+        let inner = inner.clone();
+        async move {
+            let mut p = inner(u.clone(), lane, referer).await;
+            if u == seed {
+                p.url = resolved.into();
+                p.body
+                    .extend_from_slice(b"<a href='/guide/chapter'>Chapter</a>");
+            }
+            p
+        }
+        .boxed()
+    });
+    let out = Crawler::new(fetch, gov())
+        .crawl(
+            seed,
+            CrawlOptions {
+                mode: CrawlMode::Content,
+                respect_robots: false,
+                ..opts()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.seed, resolved);
+    assert!(out.pages.iter().any(|p| p.url == resolved));
+    assert!(out.pages.iter().any(|p| p.url.ends_with("/guide/chapter")));
+    assert_eq!(
+        hits.lock()
+            .unwrap()
+            .iter()
+            .filter(|u| u.as_str() == seed)
+            .count(),
+        1
+    );
+    assert!(
+        !hits.lock().unwrap().iter().any(|u| u == resolved),
+        "reuse the resolved seed response"
+    );
+}
+
+#[tokio::test]
+async fn wave450_deadline_bounds_discovery_and_page_io() {
+    let called = Arc::new(AtomicUsize::new(0));
+    let counts = called.clone();
+    let fetch: PageFetcher = Arc::new(move |url, _, _| {
+        let called = counts.clone();
+        async move {
+            called.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            FetchedPage {
+                url,
+                status: 200,
+                headers: vec![],
+                body: b"slow".to_vec(),
+                verdict: Verdict::ContentOk,
+                latency: Duration::from_secs(2),
+                cached: false,
+                error_hint: None,
+            }
+        }
+        .boxed()
+    });
+    let started = std::time::Instant::now();
+    let out = Crawler::new(fetch, gov())
+        .crawl(
+            "https://slow.example/",
+            CrawlOptions {
+                mode: CrawlMode::Map,
+                deadline: Duration::from_millis(80),
+                ..opts()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(called.load(Ordering::SeqCst) > 0);
+    assert_eq!(out.stop, StopReason::Deadline);
+    assert!(started.elapsed() < Duration::from_millis(600));
+    assert!(out.pages.is_empty());
+}
+
 // ── Hub seeds (issue #249) ────────────────────────────────
 
 /// A hub page: a dozen links and almost no prose, padded to the
@@ -705,14 +853,14 @@ async fn crawl_reads_robots_from_the_seed_origin() {
     let robots = "User-agent: *\nDisallow: /alpha/\n";
     let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/alpha/page.html\">a</a><a href=\"/ok\">ok</a></article></body></html>";
     let site = MockSite::new()
-        .page("http://seed.localhost:8001/robots.txt", 200, robots)
-        .page("http://seed.localhost:8001/", 200, seed)
+        .page("http://seed.example:8001/robots.txt", 200, robots)
+        .page("http://seed.example:8001/", 200, seed)
         .page(
-            "http://seed.localhost:8001/alpha/page.html",
+            "http://seed.example:8001/alpha/page.html",
             200,
             &html("A", "alpha"),
         )
-        .page("http://seed.localhost:8001/ok", 200, &html("Ok", "ok"));
+        .page("http://seed.example:8001/ok", 200, &html("Ok", "ok"));
     let (fetch, hits) = site.fetcher();
     let crawler = Crawler::new(fetch, gov());
     let mut o = opts();
@@ -720,7 +868,7 @@ async fn crawl_reads_robots_from_the_seed_origin() {
     o.max_pages = 10;
     o.respect_robots = true;
     let r = crawler
-        .crawl("http://seed.localhost:8001/", o, None)
+        .crawl("http://seed.example:8001/", o, None)
         .await
         .unwrap();
     let hits = hits
@@ -728,7 +876,7 @@ async fn crawl_reads_robots_from_the_seed_origin() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(
         hits.iter()
-            .any(|h| h == "http://seed.localhost:8001/robots.txt"),
+            .any(|h| h == "http://seed.example:8001/robots.txt"),
         "robots must be read from the seed's own origin; hits: {hits:?}"
     );
     assert!(
@@ -746,24 +894,24 @@ async fn crawl_reads_robots_from_the_seed_origin() {
 async fn crawl_any_host_reads_each_origins_own_robots() {
     let robots_a = "User-agent: *\nDisallow: /alpha/\n";
     let robots_b = "User-agent: *\nDisallow: /beta/\n";
-    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/alpha/a.html\">a</a><a href=\"/ok\">ok</a><a href=\"http://b.localhost:8002/ok/page.html\">b-ok</a><a href=\"http://b.localhost:8002/alpha/page.html\">b-alpha</a><a href=\"http://b.localhost:8002/beta/page.html\">b-beta</a></article></body></html>";
+    let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/alpha/a.html\">a</a><a href=\"/ok\">ok</a><a href=\"http://b.example:8002/ok/page.html\">b-ok</a><a href=\"http://b.example:8002/alpha/page.html\">b-alpha</a><a href=\"http://b.example:8002/beta/page.html\">b-beta</a></article></body></html>";
     let site = MockSite::new()
-        .page("https://a.localhost/robots.txt", 200, robots_a)
-        .page("https://a.localhost/", 200, seed)
-        .page("https://a.localhost/ok", 200, &html("Ok", "ok"))
-        .page("http://b.localhost:8002/robots.txt", 200, robots_b)
+        .page("https://a.example/robots.txt", 200, robots_a)
+        .page("https://a.example/", 200, seed)
+        .page("https://a.example/ok", 200, &html("Ok", "ok"))
+        .page("http://b.example:8002/robots.txt", 200, robots_b)
         .page(
-            "http://b.localhost:8002/ok/page.html",
+            "http://b.example:8002/ok/page.html",
             200,
             &html("B1", "ok page"),
         )
         .page(
-            "http://b.localhost:8002/alpha/page.html",
+            "http://b.example:8002/alpha/page.html",
             200,
             &html("B2", "alpha page"),
         )
         .page(
-            "http://b.localhost:8002/beta/page.html",
+            "http://b.example:8002/beta/page.html",
             200,
             &html("B3", "beta page"),
         );
@@ -774,37 +922,34 @@ async fn crawl_any_host_reads_each_origins_own_robots() {
     o.max_pages = 20;
     o.respect_robots = true;
     o.same_host = false;
-    let r = crawler
-        .crawl("https://a.localhost/", o, None)
-        .await
-        .unwrap();
+    let r = crawler.crawl("https://a.example/", o, None).await.unwrap();
     let hits = hits
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let i_b_robots = hits
         .iter()
-        .position(|h| h == "http://b.localhost:8002/robots.txt")
+        .position(|h| h == "http://b.example:8002/robots.txt")
         .expect("the other host's robots.txt must be fetched before its pages");
     let i_first_b_page = hits
         .iter()
-        .position(|h| h.starts_with("http://b.localhost:8002/") && !h.ends_with("/robots.txt"))
+        .position(|h| h.starts_with("http://b.example:8002/") && !h.ends_with("/robots.txt"))
         .expect("B pages must be fetched");
     assert!(
         i_b_robots < i_first_b_page,
         "robots before the first request to the host; hits: {hits:?}"
     );
     assert!(
-        !hits.iter().any(|h| h.contains("b.localhost:8002/beta/")),
+        !hits.iter().any(|h| h.contains("b.example:8002/beta/")),
         "B's own Disallow must hold on B; hits: {hits:?}"
     );
     assert!(
         r.pages
             .iter()
-            .any(|p| p.url.contains("b.localhost:8002/alpha/")),
+            .any(|p| p.url.contains("b.example:8002/alpha/")),
         "the seed host's Disallow must not leak onto B; hits: {hits:?}"
     );
     assert!(
-        !hits.iter().any(|h| h == "https://a.localhost/alpha/a.html"),
+        !hits.iter().any(|h| h == "https://a.example/alpha/a.html"),
         "A's Disallow must still hold on A; hits: {hits:?}"
     );
 }
@@ -1674,4 +1819,30 @@ fn resume_token_traversal_is_refused() {
         "a traversal token must not delete an outside file"
     );
     let _ = std::fs::remove_dir_all(&iso);
+}
+
+#[tokio::test]
+async fn wave450_invalid_seed_does_not_consume_a_resume_token() {
+    let token = "c450badseed";
+    let state = super::ResumeState {
+        seed: "https://ex.com/docs/".into(),
+        queue: Vec::new(),
+        seen: Vec::new(),
+    };
+    super::resume_store_issue(token, &state);
+    let site = MockSite::new();
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    assert!(
+        crawler
+            .crawl("this is not a URL", CrawlOptions::default(), Some(token))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        super::resume_store_take(token)
+            .expect("invalid input must preserve the token")
+            .seed,
+        state.seed
+    );
 }

@@ -479,6 +479,58 @@ impl Crawler {
         resume_token: Option<&str>,
     ) -> Result<CrawlResult, String> {
         let started = Instant::now();
+        let deadline_at = started + opts.deadline;
+        // One clock covers discovery, robots, redirects and page I/O. Keep the
+        // resolved seed response so following its redirect costs no second GET.
+        let buffered = Arc::new(Mutex::new(
+            std::collections::HashMap::<String, FetchedPage>::new(),
+        ));
+        let fetch: PageFetcher = {
+            let inner = self.fetch.clone();
+            let buffered = buffered.clone();
+            Arc::new(move |url, lane, referer| {
+                let inner = inner.clone();
+                let buffered = buffered.clone();
+                Box::pin(async move {
+                    let saved = buffered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&url);
+                    if let Some(page) = saved {
+                        return page;
+                    }
+                    match tokio::time::timeout_at(
+                        deadline_at.into(),
+                        inner(url.clone(), lane, referer),
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(_) => FetchedPage {
+                            url,
+                            status: 0,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                            verdict: Verdict::Blocked,
+                            latency: Duration::ZERO,
+                            cached: false,
+                            error_hint: Some("crawl deadline exceeded".into()),
+                        },
+                    }
+                })
+            })
+        };
+
+        // Invalid caller input must not consume a valid resume token.
+        let explicit_seed = if seed.is_empty() {
+            None
+        } else {
+            crate::fetch::guards::validate_url_basic(seed)
+                .map_err(|e| format!("bad seed url: {e}"))?;
+            let u = Url::parse(seed).map_err(|_| format!("bad seed url: {seed}"))?;
+            let h = u.host_str().ok_or("seed must have a host")?.to_string();
+            Some((seed.to_string(), u, h))
+        };
 
         // Resume state is taken from the store EXACTLY ONCE, up
         // front: resume_store_take deletes the token file, and the
@@ -492,7 +544,9 @@ impl Crawler {
         };
 
         // Resume without url: load the seed from the resume state.
-        let (seed, seed_url, seed_host) = if seed.is_empty() {
+        let (mut seed, mut seed_url, mut seed_host) = if let Some(parsed) = explicit_seed {
+            parsed
+        } else {
             let state = resumed_state
                 .as_ref()
                 .ok_or("resume token required when url is empty")?;
@@ -500,11 +554,68 @@ impl Crawler {
                 .map_err(|_| format!("bad seed in resume state: {}", state.seed))?;
             let h = u.host_str().ok_or("seed must have a host")?.to_string();
             (state.seed.clone(), u, h)
-        } else {
-            let u = Url::parse(seed).map_err(|_| format!("bad seed url: {seed}"))?;
-            let h = u.host_str().ok_or("seed must have a host")?.to_string();
-            (seed.to_string(), u, h)
         };
+
+        if resumed_state.is_none() {
+            let origin = sitemap::origin_of(&seed_url);
+            let seed_lane = self
+                .governor
+                .best_lane(&seed_host)
+                .map(|lane| lane.id.clone());
+            let allowed = if opts.respect_robots {
+                let robots_url = format!("{origin}/robots.txt");
+                let page = fetch(
+                    robots_url.clone(),
+                    seed_lane.clone().unwrap_or_else(|| "direct".into()),
+                    None,
+                )
+                .await;
+                let robots = if page.status == 200 {
+                    sitemap::Robots::parse(
+                        &String::from_utf8_lossy(&sitemap::maybe_gunzip(&page.body)),
+                        &origin,
+                    )
+                } else {
+                    sitemap::Robots::default()
+                };
+                self.governor
+                    .set_host_crawl_delay(&seed_host, robots.crawl_delay);
+                buffered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(robots_url, page);
+                robots.allows_url(&seed_url)
+            } else {
+                true
+            };
+            if allowed
+                && Instant::now() < deadline_at
+                && let Some(lane) = seed_lane
+            {
+                let wait = self
+                    .governor
+                    .wait_for(&seed_host, &lane, 0)
+                    .min(deadline_at.saturating_duration_since(Instant::now()));
+                tokio::time::sleep(wait).await;
+                let page = fetch(seed.clone(), lane, None).await;
+                if matches!(page.verdict, Verdict::ContentOk)
+                    && (200..300).contains(&page.status)
+                    && let Ok(resolved) = Url::parse(&page.url)
+                    && crate::fetch::guards::validate_url_basic(&page.url).is_ok()
+                {
+                    seed_host = resolved
+                        .host_str()
+                        .ok_or("seed must have a host")?
+                        .to_string();
+                    seed = resolved.to_string();
+                    seed_url = resolved;
+                }
+                buffered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(frontier::normalize(&seed_url), page);
+            }
+        }
 
         let host_ok = {
             let sh = seed_host.clone();
@@ -538,7 +649,7 @@ impl Crawler {
         let mut robots = sitemap::Robots::default();
         if opts.mode != CrawlMode::Content {
             let (mut r, mut entries) =
-                sitemap::discover(&self.fetch, &seed_origin, opts.map_cap * 4).await;
+                sitemap::discover(&fetch, &seed_origin, opts.map_cap.saturating_mul(4)).await;
             robots = sitemap::Robots::default();
             std::mem::swap(&mut robots, &mut r);
             // Newest first: lastmod-sorted sitemaps put fresh
@@ -558,6 +669,9 @@ impl Crawler {
                     if !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths) {
                         continue;
                     }
+                    if opts.respect_robots && !robots.allows_url(&u) {
+                        continue;
+                    }
                     if let Some(q) = &opts.focus
                         && !score::focus_match("", u.path(), q)
                     {
@@ -575,7 +689,7 @@ impl Crawler {
             // Content-only still reads robots for Disallow
             // rules when respect_robots is on.
             if opts.respect_robots {
-                let (r, _) = sitemap::discover(&self.fetch, &seed_origin, 0).await;
+                let (r, _) = sitemap::discover(&fetch, &seed_origin, 0).await;
                 robots = r;
             }
         }
@@ -607,7 +721,11 @@ impl Crawler {
                 queued: Vec::new(),
                 filtered_out: 0,
                 skipped,
-                stop: StopReason::FrontierEmpty,
+                stop: if Instant::now() >= deadline_at {
+                    StopReason::Deadline
+                } else {
+                    StopReason::FrontierEmpty
+                },
                 elapsed: started.elapsed(),
                 map,
                 resume: None,
@@ -676,7 +794,7 @@ impl Crawler {
                     continue;
                 }
                 if opts.respect_robots
-                    && !robots_allows(&self.fetch, &self.governor, &robots_cache, &u).await
+                    && !robots_allows(&fetch, &self.governor, &robots_cache, &u).await
                 {
                     continue;
                 }
@@ -733,7 +851,6 @@ impl Crawler {
         // against the quality budget.
         let total_fetched = Arc::new(AtomicUsize::new(0));
         let stop_flag: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
-        let deadline_at = started + opts.deadline;
         let focus = Arc::new(opts.focus.clone());
 
         let workers = opts.concurrency.max(1);
@@ -752,7 +869,8 @@ impl Crawler {
             let stop_flag = Arc::clone(&stop_flag);
             let focus = Arc::clone(&focus);
             let focus_idf = focus_idf.clone();
-            let fetch = self.fetch.clone();
+            let fetch = fetch.clone();
+            let buffered = buffered.clone();
             let governor = Arc::clone(&self.governor);
             let ghost_hook = self.ghost.clone();
             let ghost_budget = Arc::clone(&ghost_budget);
@@ -965,7 +1083,15 @@ impl Crawler {
                         continue 'work;
                     };
                     seq += 1;
-                    let wait = governor.wait_for(host, &lane.id, seq);
+                    let has_buffered = buffered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains_key(&item.url);
+                    let wait = if has_buffered {
+                        Duration::ZERO
+                    } else {
+                        governor.wait_for(host, &lane.id, seq)
+                    };
                     // Cap wait inside remaining deadline.
                     let remain = deadline_at.saturating_duration_since(Instant::now());
                     let wait = wait.min(remain);
@@ -1023,7 +1149,13 @@ impl Crawler {
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
                         if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
-                            match ghost_hook(item.url.clone()).await {
+                            match tokio::time::timeout_at(
+                                deadline_at.into(),
+                                ghost_hook(item.url.clone()),
+                            )
+                            .await
+                            .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                            {
                                 Ok(gp) => ghost_html = Some(gp.html),
                                 Err(why) => {
                                     skipped
@@ -1194,7 +1326,13 @@ impl Crawler {
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
                         if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
-                            match ghost_hook(item.url.clone()).await {
+                            match tokio::time::timeout_at(
+                                deadline_at.into(),
+                                ghost_hook(item.url.clone()),
+                            )
+                            .await
+                            .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                            {
                                 Ok(gp) => {
                                     if let Ok(r2) = extract::extract(
                                         gp.html.as_bytes(),

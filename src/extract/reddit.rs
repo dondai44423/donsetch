@@ -22,7 +22,12 @@ const MAX_DEPTH: usize = 100;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
     // Respect explicit selectors and TOC : let DonSift handle.
-    if opts.selector.is_some() || opts.toc {
+    if opts.selector.is_some()
+        || opts.toc
+        || opts.focus.is_some()
+        || opts.section.is_some()
+        || opts.must_contain.is_some()
+    {
         return None;
     }
 
@@ -155,6 +160,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(format!("r/{subreddit}")),
         byline: None,
@@ -164,7 +170,6 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
         next_offset: next,
         blocks_total: count,
         blocks_shown: count,
-        tokens_est: total / 4,
         thin: false,
         content_kind: ContentKind::Listing,
         lang: "en".to_string(),
@@ -173,6 +178,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 
@@ -243,6 +249,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(title),
         byline: Some(format!("u/{author}")),
@@ -252,7 +259,6 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
         next_offset: next,
         blocks_total: comment_count,
         blocks_shown: comment_count,
-        tokens_est: total / 4,
         thin: false,
         content_kind: ContentKind::Forum,
         lang: "en".to_string(),
@@ -261,6 +267,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
         images: Vec::new(),
         fingerprint: None,
         via: None,
+        partial: None,
     })
 }
 

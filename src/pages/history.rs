@@ -92,6 +92,15 @@ impl PageHistory {
         markdown: &str,
     ) -> Option<PageRecord> {
         let prev = self.entries.get(url).cloned();
+        // An incomplete read supplies no baseline text. Preserve a complete
+        // snapshot only when its neutral page fingerprint still matches.
+        let text = if markdown.is_empty() {
+            prev.as_ref()
+                .filter(|p| p.fingerprint == fingerprint)
+                .and_then(|p| p.text.clone())
+        } else {
+            Some(markdown.chars().take(PER_TEXT_CAP).collect())
+        };
         self.entries.insert(
             url.to_string(),
             PageRecord {
@@ -99,7 +108,7 @@ impl PageHistory {
                 at: now(),
                 total_chars,
                 title: title.map(String::from),
-                text: Some(markdown.chars().take(PER_TEXT_CAP).collect()),
+                text,
             },
         );
         self.enforce_budget();
@@ -436,5 +445,22 @@ mod tests {
         assert!(h.matches_fingerprint("http://r/alpha/p2", "731605c1f239"));
         assert!(!h.matches_fingerprint("http://r/alpha/p3", "2e73125a552c"));
         assert!(!h.matches_fingerprint("http://r/alpha/p1", ""));
+    }
+
+    #[test]
+    fn wave450_partial_reads_preserve_only_matching_full_snapshots() {
+        let mut h = PageHistory::default();
+        let url = "https://example.com/guide";
+        h.record(url, "one", 20, None, "the full first page");
+        h.record(url, "one", 4, None, "");
+        let prior = h.record(url, "two", 4, None, "").unwrap();
+        assert_eq!(prior.text.as_deref(), Some("the full first page"));
+        let prior = h
+            .record(url, "two", 25, None, "the changed complete page")
+            .unwrap();
+        assert!(
+            prior.text.is_none(),
+            "a changed partial read must not retain stale full text"
+        );
     }
 }
