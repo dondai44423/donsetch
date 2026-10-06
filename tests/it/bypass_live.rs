@@ -175,12 +175,8 @@ async fn unlock_transient_solve_failure_retries_once_then_succeeds() {
     let (outcome, counter_after) = run_one(&ep, "https://walled.example/d", &dir).await;
     assert_eq!(outcome.body, b"second try");
     assert_eq!(hits.load(Ordering::SeqCst), 2, "one retry for reject_block");
-    // The retry must not re-bill the daily counter: one unlock()
-    // call = one cap unit even when the network retry doubles up.
-    assert_eq!(
-        counter_after, 1,
-        "one unlock call consumes exactly one cap unit"
-    );
+    // Every dispatched attempt consumes a cap unit, including retries.
+    assert_eq!(counter_after, 2, "both API attempts consume cap units");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -216,4 +212,98 @@ async fn solve_cache_second_hit_never_calls_api() {
 async fn run_one_err(ep: &str, url: &str, dir: &std::path::Path) -> BypassFail {
     let cfg = cfg_with_endpoint(ep);
     unlock("test-tok", url, &cfg, dir).await.unwrap_err()
+}
+
+#[tokio::test]
+async fn timeout_never_replays_a_paid_post() {
+    let dir = crate::sandbox().join("timeout-unlock");
+    let (ep, hits) = spin(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        "200\n\n{\"status_code\":200,\"body\":\"done\"}".into()
+    });
+    let mut cfg = cfg_with_endpoint(&ep);
+    cfg.timeout = std::time::Duration::from_millis(40);
+    let err = unlock("test-tok", "https://example.com/slow", &cfg, &dir)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BypassFail::Network(_)), "{err}");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a dispatched POST cannot be blindly replayed"
+    );
+}
+
+#[tokio::test]
+async fn retry_cannot_cross_the_daily_cap() {
+    let dir = crate::sandbox().join("retry-cap");
+    let (ep, hits) =
+        spin(|_| "200\nx-brd-status-code: 502\nx-brd-error-code: reject_block\n\n".into());
+    let mut cfg = cfg_with_endpoint(&ep);
+    cfg.max_daily = 1;
+    let err = unlock("test-tok", "https://example.com/retry", &cfg, &dir)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BypassFail::Config(_)), "{err}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn parallel_unlocks_share_one_dispatch_and_walls_never_cache() {
+    let dir = crate::sandbox().join("parallel-unlock");
+    let (ep, hits) =
+        spin(|_| "200\n\n{\"status_code\":200,\"body\":\"<html>solved</html>\"}".into());
+    let cfg = cfg_with_endpoint(&ep);
+    let (a, b) = tokio::join!(
+        unlock("test-tok", "https://example.com/parallel", &cfg, &dir),
+        unlock("test-tok", "https://example.com/parallel", &cfg, &dir)
+    );
+    assert_eq!(a.unwrap().body, b.unwrap().body);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (ep, hits) = spin(|_| {
+        "200\n\n{\"status_code\":200,\"body\":\"<title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/test'></script>\"}".into()
+    });
+    let cfg = cfg_with_endpoint(&ep);
+    for _ in 0..2 {
+        assert!(matches!(
+            unlock("test-tok", "https://example.com/wall", &cfg, &dir).await,
+            Err(BypassFail::Solve(_))
+        ));
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a wall must not be cached as an unlock"
+    );
+}
+
+#[tokio::test]
+async fn disabled_or_invalid_unlocks_never_spend_and_error_echoes_are_redacted() {
+    let dir = crate::sandbox().join("boundaries-unlock");
+    let (ep, hits) = spin(|_| "400\n\n{\"error\":\"bad test-tok zone\"}".into());
+    let mut cfg = cfg_with_endpoint(&ep);
+    cfg.enabled = false;
+    assert!(
+        unlock("test-tok", "https://example.com", &cfg, &dir)
+            .await
+            .is_err()
+    );
+    cfg.enabled = true;
+    assert!(
+        unlock("test-tok::", "https://example.com", &cfg, &dir)
+            .await
+            .is_err()
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(!donsetch::fetch::bypass::bypass_count_path(&dir).exists());
+    let err = unlock("test-tok", "https://example.com", &cfg, &dir)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("test-tok"), "{err}");
+    assert!(
+        err.contains("[redacted]"),
+        "the upstream message must still be diagnostic: {err}"
+    );
 }

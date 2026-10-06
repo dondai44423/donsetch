@@ -21,7 +21,7 @@ use crate::cli;
 /// the key auto-recovers to active on next pick. Plugins share
 /// it, so a throttled plugin and a throttled native key wait the
 /// same amount of time.
-pub(super) const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+pub(crate) const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Valid provider names (checked at CLI boundary).
 pub const PROVIDERS: &[&str] = &[

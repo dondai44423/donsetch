@@ -15,7 +15,7 @@
 //! Env:
 //!   DONSETCH_BYPASS=0                      disable bypass entirely
 //!   DONSETCH_BYPASS_MAX_DAILY=<n>           max unlock calls per day (default 50)
-//!   DONSETCH_BYPASS_TIMEOUT_SECS=<n>        per-request timeout (default 90)
+//!   DONSETCH_BYPASS_TIMEOUT_SECS=<n>        per-request timeout (default 120)
 //!   DONSETCH_BYPASS_RENDER=1               force JS render via unlocker browser
 //!   DONSETCH_UNLOCKER_ZONE=<zone>           default zone when key has no ::zone
 //!   DONSETCH_BYPASS_ENDPOINT=<url>          test hook: override API endpoint
@@ -75,7 +75,7 @@ impl BypassConfig {
         Self {
             enabled: b.enabled,
             max_daily: b.max_daily.clamp(1, 10_000),
-            timeout: Duration::from_secs(b.timeout_secs.clamp(5, 600)),
+            timeout: Duration::from_secs(b.timeout_secs),
             render: b.render,
             endpoint: if b.endpoint.trim().is_empty() {
                 PROD_ENDPOINT.to_string()
@@ -98,12 +98,14 @@ impl BypassConfig {
 /// error, not a network call : it would only cost the user a
 /// confusing API rejection.
 pub fn parse_key(raw: &str, default_zone: &str) -> Result<(String, String), BypassFail> {
+    let raw = raw.trim();
     if raw.trim().is_empty() {
         return Err(BypassFail::Config(
             "unlocker key is empty : run `donsetch keys add unlocker <token>[::zone]`".to_string(),
         ));
     }
     if let Some((token, zone)) = raw.split_once("::") {
+        let (token, zone) = (token.trim(), zone.trim());
         if token.trim().is_empty() {
             return Err(BypassFail::Config(
                 "unlocker key has an empty token before `::` : re-add the key".to_string(),
@@ -116,6 +118,17 @@ pub fn parse_key(raw: &str, default_zone: &str) -> Result<(String, String), Bypa
                 "unlocker key has an empty zone after `::` : use `<token>::{default_zone}` or drop the `::` suffix"
             )));
         }
+        if token.chars().any(char::is_whitespace)
+            || zone
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == ':')
+            || token.chars().any(char::is_control)
+        {
+            return Err(BypassFail::Config(
+                "invalid token/zone shape: whitespace, control characters or an extra `::` suffix"
+                    .into(),
+            ));
+        }
         return Ok((token.to_string(), zone.to_string()));
     }
     let zone = {
@@ -126,7 +139,16 @@ pub fn parse_key(raw: &str, default_zone: &str) -> Result<(String, String), Bypa
             configured
         }
     };
-    Ok((raw.trim().to_string(), zone))
+    if raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        || zone
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ':')
+    {
+        return Err(BypassFail::Config(
+            "invalid token/zone shape: whitespace or control characters".into(),
+        ));
+    }
+    Ok((raw.to_string(), zone))
 }
 
 /// UTC YYYYMMDD, civil-from-days (no date dep).
@@ -158,34 +180,81 @@ pub fn bypass_count_path(cache_dir: &Path) -> PathBuf {
 /// the cap is already exhausted. Counter files older than 31 days
 /// are pruned: they are single integers, but a long-lived machine
 /// needs no permanent litter.
-pub fn check_and_bump_daily(path: &Path, max: u32) -> bool {
+pub fn check_and_bump_daily(path: &Path, max: u32) -> Result<bool, BypassFail> {
     use std::io::{Read as _, Seek as _, Write as _};
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let _ = std::fs::create_dir_all(dir);
+    let counter_error = |e: std::io::Error| {
+        BypassFail::Config(format!(
+            "cannot reserve an unlock attempt in {}: {e}; fix the cache directory before spending",
+            path.display()
+        ))
+    };
+    std::fs::create_dir_all(dir).map_err(counter_error)?;
     // Read, compare and write under one exclusive lock: parallel
     // walled fetches of different URLs reached the cap together and
     // each read the same count, so each went through and paid.
-    let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
-    else {
-        return false;
-    };
-    let _ = f.lock();
+        .map_err(counter_error)?;
+    let started = std::time::Instant::now();
+    loop {
+        match f.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock)
+                if started.elapsed() < Duration::from_millis(250) =>
+            {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) => {
+                return Err(BypassFail::Config(format!(
+                    "unlock counter lock unavailable at {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if f.metadata().map_err(counter_error)?.len() > 32 {
+        return Err(BypassFail::Config(
+            "unlock counter exceeds its size limit; repair it before spending".into(),
+        ));
+    }
     let mut raw = String::new();
-    let _ = f.read_to_string(&mut raw);
-    let count = raw.trim().parse::<u32>().unwrap_or(0);
+    // A counter is one integer, never an unbounded file read.
+    std::io::Read::by_ref(&mut f)
+        .take(32)
+        .read_to_string(&mut raw)
+        .map_err(counter_error)?;
+    let count = if raw.is_empty() {
+        0
+    } else {
+        raw.trim().parse::<u32>().map_err(|_| {
+            BypassFail::Config(format!(
+                "invalid unlock counter at {}; repair it before spending",
+                path.display()
+            ))
+        })?
+    };
     if count >= max {
-        return false;
+        return Ok(false);
     }
     prune_stale_counters(dir);
-    let _ = f.set_len(0);
-    let _ = f.rewind();
-    let _ = write!(f, "{}", count + 1);
-    true
+    f.rewind().map_err(counter_error)?;
+    write!(f, "{}", count + 1).map_err(counter_error)?;
+    f.set_len((count + 1).to_string().len() as u64)
+        .map_err(counter_error)?;
+    f.sync_data().map_err(counter_error)?;
+    Ok(true)
+}
+
+async fn reserve_daily(path: &Path, max: u32) -> Result<bool, BypassFail> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || check_and_bump_daily(&path, max))
+        .await
+        .map_err(|e| BypassFail::Internal(format!("unlock counter task failed: {e}")))?
 }
 
 /// Delete `bypass-*.count` files last modified over 31 days ago.
@@ -234,7 +303,7 @@ pub struct BypassOutcome {
 pub enum BypassFail {
     /// The API itself rejected the call (auth, billing, rate).
     Api { status: u16, detail: String },
-    /// Transport-level failure : nothing billed, likely local net.
+    /// Transport-level failure; a timed-out dispatch may still be billed.
     Network(String),
     /// Local configuration error : key shape, zone, caps. Free.
     Config(String),
@@ -310,7 +379,7 @@ impl BypassFail {
             }
             Self::Api { .. } => "check the status code in the Bright Data dashboard and retry",
             Self::Network(_) => {
-                "network could not reach the Bright Data API: check connectivity and any local proxy, then retry (nothing was billed)"
+                "check connectivity and the Bright Data request log before retrying: a timed-out request may have reached the API"
             }
             Self::Config(_) => {
                 "fix the unlocker key configuration: `donsetch keys add unlocker <token>[::zone]` and match the zone name in the Bright Data dashboard"
@@ -338,7 +407,6 @@ impl BypassFail {
 ///   details ride x-brd-error / x-brd-error-code (or the legacy
 ///   JSON `status`/`status_code` wrapper fields).
 ///
-/// Returns (target_status, content_type, body) on success.
 /// The unlocker answers with the target page inside a JSON string,
 /// so its body is the page plus quoting. Every other transport stops
 /// at `transport::MAX_BODY`; reqwest's `bytes()` has no cap, and a
@@ -363,6 +431,7 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, BypassFail>
     Ok(out)
 }
 
+/// Returns (target_status, content_type, body) on success.
 pub fn parse_response(
     api_status: u16,
     headers: &reqwest::header::HeaderMap,
@@ -413,8 +482,9 @@ pub fn parse_response(
         .as_ref()
         .and_then(|j| j.get("status").or_else(|| j.get("status_code")))
         .and_then(|x| x.as_u64());
-    let target_status: Option<u64> =
-        legacy_status.or_else(|| header("x-brd-status-code").and_then(|h| h.parse::<u64>().ok()));
+    let target_status: Option<u64> = header("x-brd-status-code")
+        .and_then(|h| h.parse::<u64>().ok())
+        .or(legacy_status);
     let status: u16 = match target_status.and_then(|n| u16::try_from(n).ok()) {
         Some(s) => s,
         None => {
@@ -464,6 +534,23 @@ pub fn parse_response(
             "unlocker returned an empty body".to_string(),
         ));
     }
+    let target_headers: Vec<(String, String)> = v
+        .as_ref()
+        .and_then(|j| j.get("headers"))
+        .and_then(Value::as_object)
+        .map(|h| {
+            h.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if crate::detect::walls::detect(status, &target_headers, &body)
+        != crate::detect::walls::Verdict::ContentOk
+    {
+        return Err(BypassFail::Solve(
+            "target still returned a wall instead of content".into(),
+        ));
+    }
     Ok((status, ct, body))
 }
 
@@ -475,7 +562,12 @@ pub fn active_unlocker_key(cfg: &ByokConfig) -> Option<String> {
         .and_then(|p| {
             p.keys
                 .iter()
-                .find(|k| k.state == KeyState::Active)
+                .find(|k| {
+                    k.state == KeyState::Active
+                        || (k.state == KeyState::RateLimited
+                            && Duration::from_secs(now_ts().saturating_sub(k.ts))
+                                >= crate::search::byok::store::RATE_LIMIT_COOLDOWN)
+                })
                 .map(|k| k.key.clone())
         })
 }
@@ -537,6 +629,12 @@ struct CacheEntry {
 }
 
 const CACHE_VERSION: u32 = 2;
+
+pub fn invalidate_cached(cache_dir: &Path, url: &str, render: bool) {
+    let _ = std::fs::remove_file(
+        bypass_cache_dir(cache_dir).join(format!("{}.json", cache_key(url, render))),
+    );
+}
 
 fn cache_get(cache_dir: &Path, url: &str, render: bool, ttl_secs: u64) -> Option<BypassOutcome> {
     if ttl_secs == 0 {
@@ -666,6 +764,25 @@ pub async fn unlock(
     cfg: &BypassConfig,
     cache_dir: &Path,
 ) -> Result<BypassOutcome, BypassFail> {
+    tokio::time::timeout(cfg.timeout, unlock_inner(key, url, cfg, cache_dir))
+        .await
+        .map_err(|_| {
+            BypassFail::Network(
+                "unlocker deadline reached; billing outcome unknown, request not replayed".into(),
+            )
+        })?
+}
+
+async fn unlock_inner(
+    key: &str,
+    url: &str,
+    cfg: &BypassConfig,
+    cache_dir: &Path,
+) -> Result<BypassOutcome, BypassFail> {
+    if !cfg.enabled {
+        return Err(BypassFail::Config("unlocker is disabled".into()));
+    }
+    let (token, zone) = parse_key(key, DEFAULT_ZONE)?;
     let ttl = cfg.cache_ttl.as_secs();
     if let Some(outcome) = cache_get(cache_dir, url, cfg.render, ttl) {
         cache_touch(cache_dir, url, cfg.render);
@@ -678,13 +795,12 @@ pub async fn unlock(
         return Ok(outcome);
     }
     let count_path = bypass_count_path(cache_dir);
-    if !check_and_bump_daily(&count_path, cfg.max_daily) {
+    if !reserve_daily(&count_path, cfg.max_daily).await? {
         return Err(BypassFail::Config(format!(
             "daily unlock cap of {} reached : raise DONSETCH_BYPASS_MAX_DAILY or wait for the UTC-day reset",
             cfg.max_daily
         )));
     }
-    let (token, zone) = parse_key(key, DEFAULT_ZONE)?;
     let client = reqwest::Client::builder()
         .timeout(cfg.timeout)
         .no_gzip()
@@ -698,7 +814,7 @@ pub async fn unlock(
         "format": "json",
     });
     if cfg.render {
-        payload["render"] = serde_json::json!(true);
+        payload["render"] = serde_json::json!("true");
     }
     let request = || {
         let client = &client;
@@ -717,12 +833,16 @@ pub async fn unlock(
     };
     let resp = match request().await {
         Ok(r) => r,
-        Err(e) if e.is_timeout() || e.is_connect() => {
+        Err(e) if e.is_connect() => {
             // One retry on transient transport failures: a paid
-            // tier deserves it, and a timeout/connect reset costs
-            // nothing (the API never saw the request, or the
-            // request never completed billing).
+            // tier deserves it. A connect failure precedes dispatch;
+            // a timeout does not prove the paid POST was unprocessed.
             tokio::time::sleep(Duration::from_millis(800)).await;
+            if !reserve_daily(&count_path, cfg.max_daily).await? {
+                return Err(BypassFail::Config(
+                    "daily unlock cap reached before retry".into(),
+                ));
+            }
             request()
                 .await
                 .map_err(|e| BypassFail::Network(format!("bypass request failed twice: {e}")))?
@@ -734,20 +854,25 @@ pub async fn unlock(
     let bytes = read_capped(resp).await?;
     let mut result = parse_response(api_status, &headers, &bytes);
     // One retry for the transient solve classes Bright Data names
-    // as retry-friendly: a different unlocker peer frequently
-    // succeeds where the first one failed, and a failed unlock is
-    // not billed, so no double spend is possible.
+    // as retry-friendly. The retry still reserves a cap unit;
+    // actual billing depends on the account's zone pricing.
     if let Err(e) = &result
         && let BypassFail::Solve(d) = e
         && is_superficial_solve_failure(d)
     {
         tokio::time::sleep(Duration::from_millis(800)).await;
+        if !reserve_daily(&count_path, cfg.max_daily).await? {
+            return Err(BypassFail::Config(
+                "daily unlock cap reached before retry".into(),
+            ));
+        }
         let resp = match request().await {
             Ok(r) => r,
-            Err(_) => {
-                return Err(BypassFail::Internal(
-                    "retry request failed after transient unlock failure".to_string(),
-                ));
+            Err(e) => {
+                return Err(BypassFail::Network(format!(
+                    "retry request failed: {}",
+                    e.without_url()
+                )));
             }
         };
         let api_status = resp.status().as_u16();
@@ -755,12 +880,28 @@ pub async fn unlock(
         let bytes = read_capped(resp).await?;
         result = parse_response(api_status, &headers, &bytes);
     }
-    let outcome = result.map(|(status, content_type, body)| BypassOutcome {
-        status,
-        content_type,
-        body,
-        cached: false,
-    })?;
+    let outcome = result
+        .map_err(|mut e| {
+            let detail = match &mut e {
+                BypassFail::Api { detail, .. }
+                | BypassFail::Config(detail)
+                | BypassFail::Solve(detail)
+                | BypassFail::Network(detail)
+                | BypassFail::Internal(detail) => detail,
+            };
+            *detail = detail
+                .replace(&token, "[redacted]")
+                .chars()
+                .take(600)
+                .collect();
+            e
+        })
+        .map(|(status, content_type, body)| BypassOutcome {
+            status,
+            content_type,
+            body,
+            cached: false,
+        })?;
     if ttl > 0 {
         cache_put(cache_dir, url, cfg.render, &outcome, cfg.cache_max);
     }
@@ -771,6 +912,81 @@ pub async fn unlock(
 mod tests {
     use super::*;
     use crate::search::byok::store::{KeyEntry, ProviderConfig};
+
+    #[test]
+    fn paid_key_parts_are_trimmed_and_controls_rejected() {
+        assert_eq!(
+            parse_key(" token :: zone ", DEFAULT_ZONE).unwrap(),
+            ("token".into(), "zone".into())
+        );
+        assert!(parse_key("tok\n en::zone", DEFAULT_ZONE).is_err());
+        assert!(parse_key("token::zone::extra", DEFAULT_ZONE).is_err());
+    }
+
+    #[test]
+    fn a_corrupt_spend_counter_never_authorizes_a_call() {
+        let dir = std::env::temp_dir().join(format!("donsetch-corrupt-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counter");
+        std::fs::write(&path, "corrupted").unwrap();
+        let allowed = check_and_bump_daily(&path, 50);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupted");
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(allowed.is_err());
+    }
+
+    #[test]
+    fn a_held_counter_lock_fails_without_spending() {
+        let dir = std::env::temp_dir().join(format!("donsetch-held-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counter");
+        std::fs::write(&path, "1").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert!(check_and_bump_daily(&path, 50).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(holder);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unlocker_429_recovers_after_the_shared_cooldown() {
+        let cfg = ByokConfig {
+            default: String::new(),
+            providers: vec![ProviderConfig {
+                name: "unlocker".into(),
+                keys: vec![KeyEntry {
+                    key: "recoverable".into(),
+                    state: KeyState::RateLimited,
+                    ts: now_ts() - 61,
+                }],
+            }],
+        };
+        assert_eq!(active_unlocker_key(&cfg), Some("recoverable".into()));
+        let mut cooling = cfg;
+        cooling.providers[0].keys[0].ts = now_ts();
+        assert_eq!(active_unlocker_key(&cooling), None);
+    }
+
+    #[test]
+    fn a_success_status_cannot_hide_an_unlocker_challenge() {
+        let response = serde_json::json!({"status_code":200,"headers":{},
+            "body":"<html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/test'></script></html>"});
+        assert!(matches!(
+            parse_response(
+                200,
+                &reqwest::header::HeaderMap::new(),
+                response.to_string().as_bytes()
+            ),
+            Err(BypassFail::Solve(_))
+        ));
+    }
 
     // A cache entry is a page body the unlocker returned.
     #[cfg(unix)]
@@ -854,7 +1070,7 @@ mod tests {
         let path = dir.join("counter");
         let hits: Vec<bool> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..16)
-                .map(|_| s.spawn(|| check_and_bump_daily(&path, 3)))
+                .map(|_| s.spawn(|| check_and_bump_daily(&path, 3).unwrap()))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
@@ -902,10 +1118,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("donsetch-bypass-test-{}", std::process::id()));
         let path = dir.join("bypass-test.count");
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(check_and_bump_daily(&path, 3));
-        assert!(check_and_bump_daily(&path, 3));
-        assert!(check_and_bump_daily(&path, 3));
-        assert!(!check_and_bump_daily(&path, 3));
+        assert!(check_and_bump_daily(&path, 3).unwrap());
+        assert!(check_and_bump_daily(&path, 3).unwrap());
+        assert!(check_and_bump_daily(&path, 3).unwrap());
+        assert!(!check_and_bump_daily(&path, 3).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

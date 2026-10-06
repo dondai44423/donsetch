@@ -5,6 +5,39 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.5] - 2026-10-06
+
+### Fixed
+
+- Bright Data setup now names the exact dashboard zone and product in
+  `keys add`; `doctor --deep` checks token access, zone existence and
+  SERP/Unlocker product type through the free account API. Malformed
+  keys fail locally; whitespace around token and zone is trimmed.
+  A parked unlocker key is reported as unavailable rather than absent.
+- Bright Data news results are read from `news`, with rank/global-rank
+  handling and valid HTTP links selected before the result limit. Bad
+  response shapes and zone/permission errors stay visible; a policy 403
+  does not permanently disable an otherwise valid SERP token.
+- Unlocker rejects HTTP-200 challenge pages and empty extracted shells;
+  rejected shells are evicted from the solve-cache. Rate-limited
+  unlocker keys recover after
+  the shared 60-second cooldown.
+- Unlocker spend limits fail closed on counter lock/read/write errors
+  and corrupt counters. Every retry reserves its own daily cap unit.
+  The full unlock operation shares one deadline; a timed-out paid POST
+  is not blindly replayed. Reflected API tokens are redacted from errors.
+- Cancelled browser CDP calls retire their pending slots immediately.
+  The call timeout now includes waiting for the writer and sending the
+  command, so a stalled writer cannot hold subsequent calls indefinitely.
+- npm's platform table now reflects OCR/rerank support on Intel Macs
+  and the macOS 13.4 minimum on both Mac architectures.
+
+### Added
+
+- [Bright Data setup guide](docs/brightdata.md): API token, separate
+  SERP and Web Unlocker zones, HTML/JSON choice, verification, costs
+  and troubleshooting. Linked from both READMEs. (#347)
+
 ## [4.4.4] - 2026-10-05
 
 ### Fixed

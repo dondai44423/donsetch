@@ -198,8 +198,8 @@ pub async fn run() {
     // 15. Bright Data account keys (SERP + unlocker): the paid
     // layer gets more than a y/n. Default mode validates locally
     // (presence, shape, cap + cache state, kill switches); --deep
-    // adds a free live zone probe (route_ips costs nothing).
-    report!("Bright Data SERP", check_brightdata());
+    // adds a free account-zone check (no target request).
+    report!("Bright Data SERP", check_brightdata(deep));
     report!("Bypass unlocker", check_bypass(deep));
 
     // 15.5 BYOK plugins (user-registered executable adapters).
@@ -1626,23 +1626,35 @@ fn mask_key(k: &str) -> String {
 }
 
 /// Bright Data SERP key: local validation + a free live zone probe
-/// in --deep mode (route_ips costs nothing, so the check can
-/// confirm token + zone without spending a cent).
-fn check_brightdata() -> CheckResult {
+/// in --deep mode (account zone metadata confirms token access,
+/// zone existence and product type without a paid target request).
+fn check_brightdata(deep: bool) -> CheckResult {
     let cfg = crate::search::byok::store::ByokConfig::load();
     let Some(entry) = cfg
         .providers
         .iter()
         .find(|p| p.name == "brightdata")
-        .and_then(|p| p.keys.first())
+        .and_then(|p| {
+            p.keys
+                .iter()
+                .find(|k| k.state == crate::search::byok::store::KeyState::Active)
+                .or_else(|| p.keys.first())
+        })
     else {
         return CheckResult::Warn(
-            "not configured : keyless search still works, but SERP costs nothing to add via `donsetch keys add brightdata <token>[::zone]`"
+            "not configured (optional, paid search: donsetch keys add brightdata <token>::<SERP zone>)"
                 .to_string(),
         );
     };
-    let (_, zone) = crate::search::byok::brightdata_key_parts(&entry.key)
-        .unwrap_or_else(|_| (String::new(), String::new()));
+    let (token, zone) = match crate::search::byok::brightdata_key_parts(&entry.key) {
+        Ok(parts) => parts,
+        Err(e) => {
+            return CheckResult::Fail(
+                e,
+                "re-add the API token with the exact SERP zone name; see docs/brightdata.md".into(),
+            );
+        }
+    };
     let masked = mask_key(&entry.key);
     let state = match entry.state {
         crate::search::byok::store::KeyState::Active => "active",
@@ -1656,7 +1668,12 @@ fn check_brightdata() -> CheckResult {
             "`donsetch keys reset brightdata` re-activates the key after you fix the problem on Bright Data's side.".to_string(),
         );
     }
-    CheckResult::Pass(format!("{masked} on zone {zone}, {state}"))
+    let base = format!("{masked} on zone {zone}, {state}");
+    if deep {
+        check_zone_probe(base, token, zone, "serp")
+    } else {
+        CheckResult::Pass(base)
+    }
 }
 
 fn check_bypass(deep: bool) -> CheckResult {
@@ -1668,14 +1685,26 @@ fn check_bypass(deep: bool) -> CheckResult {
                 .to_string(),
         );
     }
-    let Some(key) = crate::fetch::bypass::active_unlocker_key(&cfg) else {
+    let usable = crate::fetch::bypass::active_unlocker_key(&cfg);
+    let stored = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == "unlocker")
+        .and_then(|p| p.keys.first());
+    let Some(key) = usable.clone().or_else(|| stored.map(|k| k.key.clone())) else {
         return CheckResult::Warn(
             "not configured (optional, opt-in: donsetch keys add unlocker <key>[::zone])"
                 .to_string(),
         );
     };
+    if usable.is_none() {
+        return CheckResult::Fail(
+            format!("unlocker configured but unavailable: {}", stored.expect("stored key selected").state.label()),
+            "wait for a rate-limit cooldown; after fixing token/balance, run `donsetch keys reset unlocker`".into(),
+        );
+    }
     let parsed = crate::fetch::bypass::parse_key(&key, crate::fetch::bypass::DEFAULT_ZONE);
-    let (_, zone) = match &parsed {
+    let (token, zone) = match &parsed {
         Ok((t, z)) => (t.clone(), z.clone()),
         Err(_) => (String::new(), String::new()),
     };
@@ -1716,109 +1745,55 @@ fn check_bypass(deep: bool) -> CheckResult {
         "{masked} on zone {zone}{cap_note}{cache_note}, render-on-solve {}",
         if bc.render { "on" } else { "off" }
     );
-    // --deep: live, free zone validation (route_ips endpoint).
+    // --deep: free account-zone validation.
     if deep {
-        let zone_for_probe = zone.clone();
-        let token_for_probe = key
-            .split_once("::")
-            .map(|(t, _)| t.to_string())
-            .unwrap_or_else(|| key.clone());
-        match std::thread::Builder::new()
-            .name("bd-probe".into())
-            .spawn(move || bright_zone_probe(&token_for_probe, &zone_for_probe))
-        {
-            Ok(handle) => match handle.join() {
-                Ok(ZoneProbeOut::Routed(n)) => {
-                    CheckResult::Pass(format!("{base} ; live zone probe OK ({n} IPs routed)"))
-                }
-                Ok(ZoneProbeOut::Skipped { reason }) => CheckResult::Pass(format!(
-                    "{base} ; live zone probe skipped: {reason} (no credits spent, nothing billed)"
-                )),
-                Ok(ZoneProbeOut::Failed { reason }) => CheckResult::Warn(format!(
-                    "{base} ; live zone probe failed: {reason} (free check, nothing billed)"
-                )),
-                Err(_) => CheckResult::Pass(base),
-            },
-            Err(_) => CheckResult::Pass(base),
-        }
+        check_zone_probe(base, token, zone, "unblocker")
     } else {
         CheckResult::Pass(base)
     }
 }
 
-/// The result of the free Bright Data zone probe.
+fn check_zone_probe(
+    base: String,
+    token: String,
+    zone: String,
+    product: &'static str,
+) -> CheckResult {
+    match std::thread::Builder::new()
+        .name("bd-probe".into())
+        .spawn(move || bright_zone_probe(&token, &zone, product))
+    {
+        Ok(handle) => match handle.join() {
+            Ok(ZoneProbeOut::Validated) => CheckResult::Pass(format!(
+                "{base} ; token, zone and product verified (free account check)"
+            )),
+            Ok(ZoneProbeOut::Skipped { reason }) => CheckResult::Warn(format!(
+                "{base} ; live zone probe skipped: {reason} (token and zone remain unverified)"
+            )),
+            Ok(ZoneProbeOut::Failed { reason }) => CheckResult::Warn(format!(
+                "{base} ; live zone probe failed: {reason} (free check, nothing billed)"
+            )),
+            Err(_) => CheckResult::Warn(format!("{base} ; live zone probe thread failed")),
+        },
+        Err(e) => CheckResult::Warn(format!("{base} ; live zone probe could not start: {e}")),
+    }
+}
+
+/// Result of the free account-zone check; no target request is made.
 #[derive(Debug, PartialEq, Eq)]
 enum ZoneProbeOut {
-    /// The zone answered with its IP count.
-    Routed(usize),
-    /// The zone is valid-shaped but has no static pool to list
-    /// (Web Access API and other dynamic-IP zones): Bright Data
-    /// answers 403 "Static routes not found". Not a failure; the
-    /// token simply cannot be exercised without spending a credit.
-    Skipped {
-        reason: String,
-    },
-    Failed {
-        reason: String,
-    },
+    Validated,
+    Skipped { reason: String },
+    Failed { reason: String },
 }
 
-/// Classify the route_ips HTTP answer before any JSON parsing.
-/// The distinction that matters: a 401 is a bad token, a 403 that
-/// says the zone has no static pool is a skip (never a failure),
-/// and every other non-200 stays a plain failure.
-fn classify_route_ips(status: u16, body: &str) -> ZoneProbeOut {
-    if status == 200 {
-        return ZoneProbeOut::Routed(0); // count parsed by the caller
-    }
-    if status == 401 {
-        return ZoneProbeOut::Failed {
-            reason: "the token was rejected (401) : check it in the Bright Data dashboard"
-                .to_string(),
-        };
-    }
-    if status == 403 {
-        let lower = body.to_ascii_lowercase();
-        if lower.contains("static routes") && lower.contains("not found") {
-            return ZoneProbeOut::Skipped {
-                reason: "the zone type has no static route pool (Bright Data: Static routes not found) : dynamic zones such as Web Access API cannot be pre-checked without spending a credit"
-                    .to_string(),
-            };
-        }
-        return ZoneProbeOut::Failed {
-            reason: "the zone name or access was refused (403) : check the zone spelling in the dashboard"
-                .to_string(),
-        };
-    }
-    ZoneProbeOut::Failed {
-        reason: format!("HTTP {status}"),
-    }
-}
-
-/// Bright Data API root. The route_ips endpoint is appended by
-/// `route_ips_url`; `bright_zone_probe_at` takes this root (the
-/// production value here, a local rig root in tests) and never the
-/// full endpoint, or the appended path would double.
 const BRIGHT_API_BASE: &str = "https://api.brightdata.com";
 
-/// The zone route_ips URL for a base. Kept separate so the ship
-/// path and the test rig build the URL the same way: pass the API
-/// ROOT, the endpoint path is appended exactly once.
-fn route_ips_url(base: &str, zone: &str) -> String {
-    format!("{base}/zone/route_ips?zone={zone}")
+fn bright_zone_probe(token: &str, zone: &str, product: &str) -> ZoneProbeOut {
+    bright_zone_probe_at(BRIGHT_API_BASE, token, zone, product)
 }
 
-/// Free Bright Data validation: the zone route_ips endpoint lists
-/// the zone's IP pool without making a request, so a dead token or
-/// wrong zone name shows up here before the first paid unlock.
-fn bright_zone_probe(token: &str, zone: &str) -> ZoneProbeOut {
-    bright_zone_probe_at(BRIGHT_API_BASE, token, zone)
-}
-
-/// The probe against an API base (the production root in the ship
-/// path, a local rig root in tests); the route_ips endpoint is
-/// appended by `route_ips_url`.
-fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+fn bright_zone_probe_at(base: &str, token: &str, zone: &str, product: &str) -> ZoneProbeOut {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1830,10 +1805,55 @@ fn bright_zone_probe_at(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
             };
         }
     };
-    rt.block_on(bright_zone_probe_async(base, token, zone))
+    rt.block_on(bright_zone_probe_async(base, token, zone, product))
 }
 
-async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZoneProbeOut {
+fn classify_zones(status: u16, body: &[u8], zone: &str, product: &str) -> ZoneProbeOut {
+    if status == 403 {
+        return ZoneProbeOut::Skipped {
+            reason: "token cannot list account zones (403); check its permissions in the dashboard"
+                .into(),
+        };
+    }
+    if status != 200 {
+        return ZoneProbeOut::Failed {
+            reason: format!(
+                "account-zone check returned HTTP {status}; check token and account access"
+            ),
+        };
+    }
+    let zones: Vec<serde_json::Value> = match serde_json::from_slice(body) {
+        Ok(zones) => zones,
+        Err(e) => {
+            return ZoneProbeOut::Failed {
+                reason: format!("invalid account-zone response: {e}"),
+            };
+        }
+    };
+    let Some(found) = zones
+        .iter()
+        .find(|z| z.get("name").and_then(|v| v.as_str()) == Some(zone))
+    else {
+        return ZoneProbeOut::Failed {
+            reason: format!("zone {zone:?} not found; use the exact dashboard name after ::"),
+        };
+    };
+    if found.get("type").and_then(|v| v.as_str()) != Some(product) {
+        return ZoneProbeOut::Failed {
+            reason: format!(
+                "zone {zone:?} is not a {product} zone; use separate SERP API and Web Unlocker zones (docs/brightdata.md)"
+            ),
+        };
+    }
+    ZoneProbeOut::Validated
+}
+
+async fn bright_zone_probe_async(
+    base: &str,
+    token: &str,
+    zone: &str,
+    product: &str,
+) -> ZoneProbeOut {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1845,37 +1865,40 @@ async fn bright_zone_probe_async(base: &str, token: &str, zone: &str) -> ZonePro
             };
         }
     };
-    let url = route_ips_url(base, zone);
-    let resp = match client.get(url).bearer_auth(token).send().await {
+    let mut resp = match client
+        .get(format!("{base}/zone/get_active_zones"))
+        .bearer_auth(token)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             return ZoneProbeOut::Failed {
-                reason: format!("request: {e}"),
+                reason: format!("request: {}", e.without_url()),
             };
         }
     };
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    let mut out = classify_route_ips(status, &body);
-    if let ZoneProbeOut::Routed(ref mut n) = out {
-        *n = match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => {
-                if let Some(count) = v.get("ip_count").and_then(|x| x.as_u64()) {
-                    count as usize
-                } else if let Some(ips) = v.get("ips").and_then(|x| x.as_array()) {
-                    ips.len()
-                } else {
-                    0
-                }
+    let mut body = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= 1024 * 1024 => {
+                body.extend_from_slice(&chunk)
             }
-            Err(e) => {
+            Ok(Some(_)) => {
                 return ZoneProbeOut::Failed {
-                    reason: format!("parse: {e}"),
+                    reason: "account-zone response exceeds 1 MiB".into(),
                 };
             }
-        };
+            Ok(None) => break,
+            Err(e) => {
+                return ZoneProbeOut::Failed {
+                    reason: format!("response read failed: {}", e.without_url()),
+                };
+            }
+        }
     }
-    out
+    classify_zones(status, &body, zone, product)
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -2566,196 +2589,89 @@ mod mask_tests {
 
 #[cfg(test)]
 mod bright_probe_tests {
-    use super::{
-        BRIGHT_API_BASE, ZoneProbeOut, bright_zone_probe_at, classify_route_ips, json_escape,
-        route_ips_url,
-    };
+    use super::{ZoneProbeOut, bright_zone_probe_at, classify_zones, json_escape};
     use std::io::{Read, Write};
 
-    /// A one-request HTTP rig: serves `status` + `body`, records the
-    /// request head so the test can assert the auth and path shape.
-    fn serve_once(
-        status: u16,
-        reason: &str,
-        body: &str,
-    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+    #[test]
+    fn account_zones_require_the_exact_name_and_product() {
+        let body = br#"[{"name":"custom-serp","type":"serp"},{"name":"custom-unlocker","type":"unblocker"}]"#;
+        assert_eq!(
+            classify_zones(200, body, "custom-serp", "serp"),
+            ZoneProbeOut::Validated
+        );
+        assert_eq!(
+            classify_zones(200, body, "custom-unlocker", "unblocker"),
+            ZoneProbeOut::Validated
+        );
+        for (zone, kind) in [
+            ("serp_api1", "serp"),
+            ("custom-serp", "unblocker"),
+            ("custom-unlocker", "serp"),
+        ] {
+            assert!(matches!(
+                classify_zones(200, body, zone, kind),
+                ZoneProbeOut::Failed { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_zones(401, b"unauthorized", "any", "serp"),
+            ZoneProbeOut::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_zones(403, b"forbidden", "any", "serp"),
+            ZoneProbeOut::Skipped { .. }
+        ));
+        assert!(matches!(
+            classify_zones(200, b"{}", "any", "serp"),
+            ZoneProbeOut::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_zones(200, br#"[{"name":"any"}]"#, "any", "serp"),
+            ZoneProbeOut::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn wire_account_zone_check_is_authenticated_and_free() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base = format!("http://{addr}");
-        let reason = reason.to_string();
-        let body = body.to_string();
+        let base = format!("http://{}", listener.local_addr().unwrap());
         let handle = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             let mut head = Vec::new();
             let mut chunk = [0u8; 256];
             loop {
                 let n = sock.read(&mut chunk).unwrap();
-                if n == 0 {
-                    break;
-                }
+                assert!(n > 0);
                 head.extend_from_slice(&chunk[..n]);
                 if head.windows(4).any(|w| w == b"\r\n\r\n") {
                     break;
                 }
             }
-            let resp = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            let body = r#"[{"name":"zone-a","type":"unblocker"}]"#;
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            );
-            sock.write_all(resp.as_bytes()).unwrap();
-            head
+            )
+            .unwrap();
+            String::from_utf8(head).unwrap().to_ascii_lowercase()
         });
-        (base, handle)
-    }
-
-    #[test]
-    fn classify_static_routes_403_is_a_skip_not_a_failure() {
-        // The bug class: a valid dynamic zone (Web Access API) gets
-        // 403 "Static routes not found". Pre-fix this was a blanket
-        // 401/403 == token-rejected failure.
-        let cases: Vec<(u16, &str, ZoneProbeOut)> = vec![
-            (
-                403,
-                r#"{"message":"Static routes not found"}"#,
-                ZoneProbeOut::Skipped {
-                    reason: String::new(),
-                },
-            ),
-            (
-                403,
-                r#"{"error":{"code":"static_routes_not_found","message":"STATIC ROUTES NOT FOUND"}}"#,
-                ZoneProbeOut::Skipped {
-                    reason: String::new(),
-                },
-            ),
-            (
-                401,
-                r#"{"message":"unauthorized"}"#,
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                403,
-                r#"{"message":"Zone name is invalid"}"#,
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                403,
-                "",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                404,
-                "nope",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                429,
-                "slow down",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-            (
-                500,
-                "boom",
-                ZoneProbeOut::Failed {
-                    reason: String::new(),
-                },
-            ),
-        ];
-        for (status, body, expected) in cases {
-            assert_eq!(
-                std::mem::discriminant(&classify_route_ips(status, body)),
-                std::mem::discriminant(&expected),
-                "status {status} body {body:?}"
-            );
-        }
-        // The skip reason carries the diagnosis, not a generic one.
-        match classify_route_ips(403, r#"{"message":"Static routes not found"}"#) {
-            ZoneProbeOut::Skipped { reason } => {
-                assert!(reason.contains("no static route pool"), "{reason}");
-            }
-            other => panic!("expected Skipped, got {other:?}"),
-        }
-        // 200 parse happens in the caller; the classifier only tags it.
-        assert_eq!(classify_route_ips(200, "{}"), ZoneProbeOut::Routed(0));
-    }
-
-    // The production probe must hit .../zone/route_ips exactly once.
-    // The ship base used to be the full endpoint while route_ips_url
-    // appends the endpoint again, so the real request went to
-    // /zone/route_ips/zone/route_ips (a 404) and every configured
-    // Bright Data zone read as a failed probe. The wire tests missed
-    // it because they pass a bare-root rig base. Pin the ship URL.
-    #[test]
-    fn production_route_ips_url_has_a_single_endpoint_path() {
-        let url = route_ips_url(BRIGHT_API_BASE, "web-access");
         assert_eq!(
-            url,
-            "https://api.brightdata.com/zone/route_ips?zone=web-access"
+            bright_zone_probe_at(&base, "test-token", "zone-a", "unblocker"),
+            ZoneProbeOut::Validated
         );
-        assert_eq!(
-            url.matches("/zone/route_ips").count(),
-            1,
-            "the endpoint path must not be doubled: {url}"
-        );
-    }
-
-    #[test]
-    fn wire_dynamic_zone_403_reports_skipped_not_failed() {
-        let (base, handle) = serve_once(
-            403,
-            "Forbidden",
-            r#"{"status":403,"message":"Static routes not found"}"#,
-        );
-        let out = bright_zone_probe_at(&base, "tok", "web-access");
-        match &out {
-            ZoneProbeOut::Skipped { reason } => {
-                assert!(reason.contains("no static route pool"), "{reason}");
-                assert!(!reason.contains("rejected"), "{reason}");
-            }
-            other => panic!("expected Skipped, got {other:?}"),
-        }
-        // The wire path really hit OUR rig with the right auth + path.
-        let head = String::from_utf8_lossy(&handle.join().unwrap()).into_owned();
-        let head_l = head.to_ascii_lowercase();
+        let head = handle.join().unwrap();
         assert!(
-            head_l.contains("get /zone/route_ips?zone=web-access http/1.1"),
+            head.starts_with("get /zone/get_active_zones http/1.1\r\n"),
             "{head}"
         );
-        assert!(head_l.contains("authorization: bearer tok"), "{head}");
-    }
-
-    #[test]
-    fn wire_200_returns_the_ip_count() {
-        let (base, handle) =
-            serve_once(200, "OK", r#"{"ips":[{"ip":"1.2.3.4"},{"ip":"5.6.7.8"}]}"#);
-        let out = bright_zone_probe_at(&base, "tok", "static-zone");
-        assert_eq!(out, ZoneProbeOut::Routed(2));
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn wire_401_stays_a_failure() {
-        let (base, handle) = serve_once(401, "Unauthorized", r#"{"message":"bad token"}"#);
-        match bright_zone_probe_at(&base, "dead-token", "any-zone") {
-            ZoneProbeOut::Failed { reason } => assert!(reason.contains("401"), "{reason}"),
-            other => panic!("expected Failed, got {other:?}"),
-        }
-        handle.join().unwrap();
+        assert!(head.contains("authorization: bearer test-token"), "{head}");
+        assert!(!head.contains("/request"));
     }
 
     #[test]
     fn json_escape_handles_windows_paths() {
         let path = r#"C:\Users\A "B"\donsetch.exe"#;
-        assert_eq!(json_escape(path), r#""C:\\Users\\A \"B\"\\donsetch.exe""#);
+        assert_eq!(json_escape(path), serde_json::to_string(path).unwrap());
     }
 }

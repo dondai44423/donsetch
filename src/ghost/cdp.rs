@@ -25,6 +25,23 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Pending = std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>;
+
+// No await happens under this short map lock. Synchronous removal lets
+// cancellation retire a request immediately, including during a send.
+struct PendingCall<'a> {
+    pending: &'a Pending,
+    id: u64,
+}
+
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
 
 /// Largest DevTools message the client accepts, and the frame limit
 /// with it: a full-page screenshot or a large document's outerHTML
@@ -33,7 +50,7 @@ pub(crate) const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Cdp {
     write: Arc<Mutex<futures_util::stream::SplitSink<Ws, Message>>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    pending: Arc<Pending>,
     /// Event stream (targetInfoChanged = title/url
     /// changes : challenge progression without Runtime).
     /// Consumed by the daemon's smarter wait loop.
@@ -83,8 +100,7 @@ impl Cdp {
         .map_err(|_| FetchError::ghost("cdp connect: ws handshake timeout"))?
         .map_err(|e| FetchError::ghost(format!("cdp connect: {e}")))?;
         let (write, mut read) = ws.split();
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Pending::new(HashMap::new()));
         let pending_task = Arc::clone(&pending);
         let (events_tx, _) = broadcast::channel(256);
         let events_task = events_tx.clone();
@@ -105,7 +121,7 @@ impl Cdp {
                     continue;
                 };
                 if let Some(id) = v.get("id").and_then(Value::as_u64) {
-                    let mut map = pending_task.lock().await;
+                    let mut map = pending_task.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(tx) = map.remove(&id) {
                         let _ = tx.send(v);
                     }
@@ -118,7 +134,10 @@ impl Cdp {
             // receiver) instead of at each call's own timeout, and
             // let the holder see it before it serves another job.
             dead_task.store(true, Ordering::Release);
-            pending_task.lock().await.clear();
+            pending_task
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
         });
         Ok(Self {
             write: Arc::new(Mutex::new(write)),
@@ -168,27 +187,29 @@ impl Cdp {
             msg["sessionId"] = json!(s);
         }
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-        let send_res = async {
-            let mut w = self.write.lock().await;
-            w.send(Message::Text(msg.to_string().into())).await
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if self.is_dead() {
+                return Err(FetchError::ghost(format!("cdp link closed: {method}")));
+            }
+            pending.insert(id, tx);
         }
-        .await;
-        if let Err(e) = send_res {
-            self.pending.lock().await.remove(&id);
-            return Err(FetchError::ghost(format!("cdp send: {e}")));
-        }
-        let resp =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-                Ok(r) => r.map_err(|_| FetchError::ghost(format!("cdp dropped: {method}")))?,
-                Err(_) => {
-                    // Drop our entry: a tab that accepts commands but
-                    // never answers used to leak one pending sender per
-                    // call for the life of the warm browser.
-                    self.pending.lock().await.remove(&id);
-                    return Err(FetchError::ghost(format!("cdp timeout: {method}")));
-                }
-            };
+        let _pending = PendingCall {
+            pending: &self.pending,
+            id,
+        };
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            {
+                let mut w = self.write.lock().await;
+                w.send(Message::Text(msg.to_string().into()))
+                    .await
+                    .map_err(|e| FetchError::ghost(format!("cdp send: {e}")))?;
+            }
+            rx.await
+                .map_err(|_| FetchError::ghost(format!("cdp dropped: {method}")))
+        })
+        .await
+        .map_err(|_| FetchError::ghost(format!("cdp timeout: {method}")))??;
         if let Some(err) = resp.get("error") {
             return Err(FetchError::ghost(format!(
                 "cdp {method}: {}",
@@ -363,6 +384,57 @@ mod link_tests {
     // between resets, a reply breaks the framing limits). Every call
     // in flight has to fail when the link ends, not when its own
     // timeout runs out, and the holder has to be able to see it.
+    #[tokio::test]
+    async fn a_cancelled_call_releases_its_pending_slot() {
+        let (sent, received) = oneshot::channel();
+        let url = endpoint(|mut ws| async move {
+            assert!(ws.next().await.is_some());
+            sent.send(()).unwrap();
+            let _ = ws.next().await;
+        })
+        .await;
+        let cdp = Cdp::connect(&url).await.unwrap();
+        let caller = cdp.clone();
+        let task =
+            tokio::spawn(async move { caller.call(None, "Target.getTargets", json!({})).await });
+        tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cdp.pending.lock().unwrap().len(),
+            1,
+            "the call really dispatched"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            cdp.pending.lock().unwrap().is_empty(),
+            "cancelled request leaked a sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_timeout_includes_waiting_for_the_writer() {
+        let url = endpoint(|mut ws| async move {
+            let _ = ws.next().await;
+        })
+        .await;
+        let cdp = Cdp::connect(&url).await.unwrap();
+        let _writer = cdp.write.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            cdp.call_with_timeout(None, "Target.getTargets", json!({}), 1),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "the call exceeded its deadline waiting for the writer"
+        );
+        assert!(result.unwrap().unwrap_err().to_string().contains("timeout"));
+        assert!(cdp.pending.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_closed_link_fails_every_pending_call_at_once() {
         let url = endpoint(|mut ws| async move {

@@ -36,6 +36,7 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 > **https://get.brightdata.com/ivqwoicrrlbr**
 > Bright Data plugs into the tool itself: the `bd` SERP provider, the Web
 > Unlocker tier-3 bypass and the `unlocker` key type.
+> [Bright Data setup guide](docs/brightdata.md): zones, API token, HTML/JSON and troubleshooting.
 
 ## ✨ Why it's different
 
@@ -283,7 +284,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 - **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites get restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable.
 - **Anti-cloak check**: on decoy-prone domains, tier-1 responses are equivalence-checked against a headless render, so `decoy suspected` is stamped instead of silently passing as content.
 
-**Tier 3 bypass (opt-in).** When the ghost itself hits a hard wall, fetch falls back to Bright Data Web Unlocker if a key is configured (`donsetch keys add unlocker <key>[::zone]`). The unlocker solves server-side, captchas included, and returns rendered HTML into the normal pipeline. Failures carry exact guidance (token rejected, zone not found, balance empty, rate limit, target still walled) on the escalation trace, and `donsetch doctor --deep` validates token and zone for free before the first paid call. Every successful unlock is cached locally (URL-hash keyed, sliding 6h TTL, 200 entries, parallel fetches share one paid call), so the same page inside the TTL costs nothing. All of it lives in the `[bypass]` config section: `donsetch config show`. DonSeTch works identically without it.
+**Tier 3 bypass (opt-in).** When the ghost itself hits a hard wall, fetch falls back to Bright Data Web Unlocker if a key is configured (`donsetch keys add unlocker "<token>::<Web Unlocker zone>"`). It returns HTML into the normal extraction pipeline; a challenge or empty shell remains a failed fetch. Failures carry recovery guidance on the escalation trace. `donsetch doctor --deep` checks token access, zone name and product type for free; tokens without account-zone read permission report an unverified check. Successful responses are cached locally (URL and render-mode keyed, sliding 6h TTL, 200 entries); concurrent calls within one daemon share the cache. The daily cap counts every API attempt, including retries, and the whole operation shares one timeout. A timed-out paid request is not replayed automatically. Settings live in `[bypass]`: `donsetch config show`. See the [setup guide](docs/brightdata.md). DonSeTch works without it.
 
 <details>
 <summary><b>Anti-bot results (headless tier)</b></summary>
@@ -353,8 +354,8 @@ donsetch keys add serpbase sb-...       # SerpBase Google SERP (100 free searche
 donsetch keys add bravesearch ...       # Brave Search API
 donsetch keys add tinyfish sk-...       # TinyFish (free tier)
 donsetch keys add parallel nKil3...     # Parallel AI (fast mode)
-donsetch keys add bd 576d013c...        # Bright Data SERP
-donsetch keys add unlocker <key>[::zone]  # Bright Data Web Unlocker
+donsetch keys add bd "<token>::<SERP zone>"           # Bright Data SERP
+donsetch keys add unlocker "<token>::<Unlocker zone>" # Bright Data Web Unlocker
 donsetch keys default local             # dispatch order: keyless first
 ```
 

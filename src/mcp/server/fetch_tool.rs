@@ -1864,6 +1864,16 @@ pub(super) async fn try_bypass(
                 return None;
             }
         };
+    let failure = if ex.blocks_total == 0 || ex.markdown.trim().is_empty() {
+        Some("unlocker returned no extracted content".to_string())
+    } else {
+        content_fail(&ex.markdown, url, outcome.status).map(|(msg, _, _)| msg)
+    };
+    if let Some(msg) = failure {
+        crate::fetch::bypass::invalidate_cached(&cache_dir, url, cfg.render);
+        trace.step("bypass", "unlocker", &msg, t0.elapsed().as_millis());
+        return None;
+    }
     trace.step(
         "bypass",
         "unlocker",
@@ -3771,6 +3781,98 @@ fn dump_ghost_dom(dir: &std::path::Path, host: &str, html: &str) -> std::path::P
     let p = dir.join(format!("dom-{safe}.html"));
     let _ = crate::config::write_private(&p, html.as_bytes());
     p
+}
+
+#[cfg(test)]
+mod bypass_content_tests {
+    use super::*;
+    use crate::search::byok::store::{ByokConfig, KeyEntry, KeyState, ProviderConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Nextest isolates the process-wide key store and daemon state.
+    #[tokio::test]
+    async fn tier_three_rejects_and_evicts_shells_but_returns_real_content() {
+        let cache = crate::paths::cache_dir();
+        ByokConfig {
+            default: "local".into(),
+            providers: vec![ProviderConfig {
+                name: "unlocker".into(),
+                keys: vec![KeyEntry {
+                    key: "fixture-token::fixture-zone".into(),
+                    state: KeyState::Active,
+                    ts: 0,
+                }],
+            }],
+        }
+        .save();
+        let daemon = Arc::new(Daemon::new().await.unwrap());
+        for (name, html, accepted) in [
+            (
+                "shell",
+                "<html><body><nav>Home Login Sign up Menu Privacy Terms</nav></body></html>",
+                false,
+            ),
+            (
+                "article",
+                "<html><body><article><h1>Reliable delivery</h1><p>A delivery system records each attempt before contacting the provider. Its deadline covers the complete operation and cancellation releases resources immediately. The next request can then continue without inheriting a stale pending operation.</p></article></body></html>",
+                true,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
+            let body =
+                json!({"status_code":200,"headers":{"content-type":"text/html"},"body":html})
+                    .to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let cfg = crate::fetch::bypass::BypassConfig {
+                endpoint,
+                ..Default::default()
+            };
+            let url = format!("https://fixture.example/{name}");
+            crate::fetch::bypass::unlock("fixture-token::fixture-zone", &url, &cfg, &cache)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert!(
+                crate::fetch::bypass::unlock("fixture-token::fixture-zone", &url, &cfg, &cache)
+                    .await
+                    .unwrap()
+                    .cached
+            );
+            let mut trace = Trace::default();
+            let result = try_bypass(&daemon, &url, &ExtractOptions::default(), &mut trace).await;
+            assert_eq!(
+                result.is_some(),
+                accepted,
+                "{name}: tier-three content contract: {result:?}"
+            );
+            if accepted {
+                assert!(
+                    result.unwrap()["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Reliable delivery")
+                );
+            } else {
+                // The fixture listener is gone: a stale cache would return Ok.
+                assert!(
+                    crate::fetch::bypass::unlock("fixture-token::fixture-zone", &url, &cfg, &cache)
+                        .await
+                        .is_err(),
+                    "rejected shell remained cached"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

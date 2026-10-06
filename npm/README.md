@@ -33,14 +33,23 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 npm install -g donsetch
 ```
 
+Optional Bright Data setup: [SERP API and Web Unlocker guide](https://github.com/dondai44423/donsetch/blob/master/docs/brightdata.md).
+Use separate zones and add the exact dashboard names:
+
+```sh
+donsetch keys add brightdata "<token>::<SERP zone>"
+donsetch keys add unlocker "<token>::<Web Unlocker zone>"
+donsetch doctor --deep
+```
+
 Downloads the prebuilt binary for your platform from [GitHub Releases](https://github.com/dondai44423/donsetch/releases) with SHA256 verification. No build tools needed.
 
 | Platform | Asset | OCR + rerank |
 |---|---|---|
 | Linux x86_64 (glibc >= 2.35) | `donsetch-linux-x64.tar.gz` | yes |
 | Linux ARM64 | `donsetch-linux-arm64.tar.gz` | no, and PDF is fragile (ONNX has no working aarch64 prebuilt) |
-| macOS Apple Silicon | `donsetch-darwin-arm64.tar.gz` | yes |
-| macOS Intel | `donsetch-darwin-x64.tar.gz` | no (ONNX has no working x64 prebuilt) |
+| macOS Apple Silicon (>= 13.4) | `donsetch-darwin-arm64.tar.gz` | yes |
+| macOS Intel (>= 13.4) | `donsetch-darwin-x64.tar.gz` | yes |
 | Windows x86_64 | `donsetch-win32-x64.tar.gz` | yes |
 | Windows ARM64 | same x64 asset, under emulation | yes |
 

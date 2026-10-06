@@ -31,15 +31,27 @@ const DEFAULT_ZONE: &str = "serp_api1";
 /// token/zone is rejected: the user typed something wrong and
 /// the API would bill nothing but return a confusing error.
 pub(crate) fn parse_key(key: &str) -> Result<(String, String), String> {
+    let key = key.trim();
     if key.trim().is_empty() {
         return Err("brightdata key is empty".to_string());
     }
     if let Some((token, zone)) = key.split_once("::") {
+        let (token, zone) = (token.trim(), zone.trim());
         if token.trim().is_empty() {
             return Err("empty token before `::`".to_string());
         }
         if zone.trim().is_empty() {
             return Err("empty zone after `::` (add a zone name or drop the suffix)".to_string());
+        }
+        if token.chars().any(|c| c.is_whitespace() || c.is_control())
+            || zone
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == ':')
+        {
+            return Err(
+                "invalid token/zone shape: whitespace, control characters or an extra `::` suffix"
+                    .into(),
+            );
         }
         return Ok((token.to_string(), zone.to_string()));
     }
@@ -53,7 +65,14 @@ pub(crate) fn parse_key(key: &str) -> Result<(String, String), String> {
     } else {
         configured
     };
-    Ok((key.trim().to_string(), zone))
+    if key.chars().any(|c| c.is_whitespace() || c.is_control())
+        || zone
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ':')
+    {
+        return Err("invalid token/zone shape: whitespace or control characters".into());
+    }
+    Ok((key.to_string(), zone))
 }
 
 /// Percent-encode the query exactly per RFC 3986 over its UTF-8
@@ -119,9 +138,45 @@ pub(crate) async fn search(
     let status = resp.status().as_u16();
     // A body-read failure is a transport error, not an empty body
     // (#286): keep what reqwest saw instead of mapping it to "".
-    let text = resp.text().await.map_err(KeyError::from_transport)?;
+    let text = read_serp_body(resp).await?;
 
-    if status == 401 || status == 403 {
+    let results = parse_results(status, &text, max, intent).map_err(|mut e| {
+        match &mut e {
+            KeyError::UnknownError(detail) | KeyError::ServerError(detail) => {
+                *detail = detail.replace(&token, "[redacted]")
+            }
+            _ => {}
+        }
+        e
+    })?;
+    Ok(ProviderOutcome {
+        hits: results,
+        ms: started.elapsed().as_millis() as u64,
+        degraded: false,
+    })
+}
+
+async fn read_serp_body(mut resp: reqwest::Response) -> Result<String, KeyError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(KeyError::from_transport)? {
+        if bytes.len() + chunk.len() > crate::transport::MAX_BODY {
+            return Err(KeyError::UnknownError(
+                "SERP response exceeded the body cap".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| KeyError::UnknownError("SERP response is not UTF-8".into()))
+}
+
+fn parse_results(
+    status: u16,
+    text: &str,
+    max: usize,
+    intent: &crate::search::intent::Intent,
+) -> Result<Vec<SearchHit>, KeyError> {
+    if status == 401 {
         return Err(KeyError::InvalidKey);
     }
     if status == 402 {
@@ -134,6 +189,12 @@ pub(crate) async fn search(
         return Err(KeyError::ServerError(format!("HTTP {status}")));
     }
     if status >= 400 {
+        if status == 403 {
+            return Err(KeyError::UnknownError(format!(
+                "HTTP 403: check SERP zone type and token permissions: {}",
+                super::err_body(text)
+            )));
+        }
         let lower = text.to_lowercase();
         if lower.contains("rate") || lower.contains("excessive") {
             return Err(KeyError::RateLimited);
@@ -141,70 +202,131 @@ pub(crate) async fn search(
         if lower.contains("credit") || lower.contains("quota") || lower.contains("billing") {
             return Err(KeyError::CreditDepleted);
         }
-        if lower.contains("invalid")
-            && (lower.contains("key") || lower.contains("token") || lower.contains("zone"))
-        {
+        if lower.contains("invalid") && (lower.contains("key") || lower.contains("token")) {
             return Err(KeyError::InvalidKey);
         }
         return Err(KeyError::UnknownError(format!(
-            "HTTP {status}: {}",
-            super::err_body(&text)
+            "HTTP {status}: {}{}",
+            super::err_body(text),
+            if lower.contains("zone") {
+                "; use <token>::<SERP zone name> from the Bright Data dashboard (docs/brightdata.md)"
+            } else {
+                ""
+            }
         )));
     }
 
     // Bright Data returns parsed JSON when brd_json=1 is in the URL.
     // The response has an `organic` array with rank, title, link, description.
-    let json: Value = super::parse_provider_json(status, &text)?;
+    let json: Value = super::parse_provider_json(status, text)?;
 
-    let results = json
-        .get("organic")
+    let field =
+        if matches!(intent, crate::search::intent::Intent::News) && json.get("news").is_some() {
+            "news"
+        } else {
+            "organic"
+        };
+    let arr = json.get(field)
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .take(max)
-                .filter_map(|r| {
-                    let title = r
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let url = r
-                        .get("link")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if url.is_empty() {
-                        return None;
-                    }
-                    let snippet = r
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let rank = r.get("rank").and_then(Value::as_u64).unwrap_or(1) as f32;
-                    let score = 1.0 / rank.max(1.0);
-                    Some(SearchHit {
-                        title,
-                        url,
-                        snippet,
-                        score,
-                    })
-                })
-                .collect()
+        .ok_or_else(|| KeyError::UnknownError(format!("SERP JSON missing {field} results; check the SERP zone and output format (docs/brightdata.md)")))?;
+    let results = arr
+        .iter()
+        .filter_map(|r| {
+            let title = r
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let url = r
+                .get("link")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if !url::Url::parse(&url)
+                .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+            {
+                return None;
+            }
+            let snippet = r
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let rank = r
+                .get("rank")
+                .or_else(|| r.get("global_rank"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as f32;
+            let score = 1.0 / rank.max(1.0);
+            Some(SearchHit {
+                title,
+                url,
+                snippet,
+                score,
+            })
         })
-        .unwrap_or_default();
-
-    let ms = started.elapsed().as_millis() as u64;
-    Ok(ProviderOutcome {
-        hits: results,
-        ms,
-        degraded: false,
-    })
+        .take(max)
+        .collect();
+    Ok(results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn news_results_and_global_ranks_survive_normalization() {
+        let data = r#"{"news":[{"link":"javascript:bad"},{"link":"https://example.com/news","title":"News","description":"Story","global_rank":4}],"organic":[]}"#;
+        let hits = parse_results(200, data, 1, &crate::search::intent::Intent::News).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "invalid links must not consume the result limit"
+        );
+        assert_eq!(hits[0].url, "https://example.com/news");
+        assert_eq!(hits[0].snippet, "Story");
+        assert_eq!(hits[0].score, 0.25);
+        assert!(
+            parse_results(
+                200,
+                r#"{"error":"wrong product"}"#,
+                5,
+                &crate::search::intent::Intent::Web
+            )
+            .is_err()
+        );
+        assert!(
+            parse_results(
+                200,
+                r#"{"organic":[]}"#,
+                5,
+                &crate::search::intent::Intent::Web
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            parse_results(
+                403,
+                "zone not allowed",
+                5,
+                &crate::search::intent::Intent::Web
+            )
+            .unwrap_err()
+            .to_key_state()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn paid_key_parts_are_trimmed_and_controls_rejected() {
+        assert_eq!(
+            parse_key(" token :: zone ").unwrap(),
+            ("token".into(), "zone".into())
+        );
+        assert!(parse_key("tok\n en::zone").is_err());
+        assert!(parse_key("token::zone::extra").is_err());
+    }
 
     #[test]
     fn parse_key_simple() {

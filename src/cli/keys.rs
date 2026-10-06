@@ -358,19 +358,33 @@ async fn cmd_add(args: &[String]) {
 
     // Unlocker keys: confirm the zone and point at the free
     // validation so the first wall hit does not surprise anyone.
-    if provider == "unlocker" {
-        let (_, zone) = crate::fetch::bypass::parse_key(&key, crate::fetch::bypass::DEFAULT_ZONE)
-            .expect("validated above");
+    if matches!(provider.as_str(), "unlocker" | "brightdata") {
+        let (_, zone) = if provider == "unlocker" {
+            crate::fetch::bypass::parse_key(&key, crate::fetch::bypass::DEFAULT_ZONE)
+                .expect("validated above")
+        } else {
+            crate::search::byok::brightdata_key_parts(&key).expect("validated above")
+        };
         println!();
         println!(
-            "  {} unlocker ready: zone {}, solve-cache on (repeat walls never bill twice)",
+            "  {} {} configured: zone {} (must match the dashboard's {} zone)",
             green("\u{2713}"),
-            bold(&zone)
+            provider,
+            bold(&zone),
+            if provider == "unlocker" {
+                "Web Unlocker"
+            } else {
+                "SERP API"
+            }
         );
         println!(
-            "  {} {} validates the token and zone for free before any paid unlock",
+            "  {} {} checks token access, zone name and product for free",
             dim("tip:"),
             green("donsetch doctor --deep")
+        );
+        println!(
+            "  {} setup: https://github.com/dondai44423/donsetch/blob/master/docs/brightdata.md",
+            dim("guide:")
         );
     }
 }
