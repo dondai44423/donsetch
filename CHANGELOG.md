@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replay into a fresh daemon failed because that daemon died before
   reading it was dropped on the next idle poll, leaving the client
   waiting for ever; it is held for the daemon after. (mnaza, #350)
+- The crawl frontier had no ceiling, and everything in it was copied
+  into every tool response and the resume token: one index page with
+  100 000 in-scope links put 100 000 entries in the queue, about 6 MB
+  of URLs into each `_meta` block and the same again into the token
+  file. The queue keeps its best 10 000 by score and counts the rest
+  as filtered out; the response's `queued` is a 100-entry preview
+  beside a `queued_total`. (mnaza, #349)
 
 ## [4.5.0] - 2026-10-06
 
@@ -83,6 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Doctor preserves browser profile locks and existing probe files. Safe
   repairs back up corrupt state, leave unrelated models intact and recompute
   checks, counts and exit status after repair.
+
 
 
 ## [4.4.5] - 2026-10-06

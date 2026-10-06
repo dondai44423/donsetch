@@ -209,6 +209,15 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
     rendered
 }
 
+/// Queued URLs shown in the debug block. The queue itself holds up to
+/// `crawl::frontier::MAX_QUEUE`; the response shows the head and says
+/// how many there are.
+pub(super) const QUEUED_PREVIEW: usize = 100;
+
+fn queued_preview(queued: &[String]) -> Value {
+    json!(queued.iter().take(QUEUED_PREVIEW).collect::<Vec<_>>())
+}
+
 pub(super) fn render_crawl_result(
     result: &crate::crawl::CrawlResult,
     requested_mode: CrawlMode,
@@ -294,7 +303,8 @@ pub(super) fn render_crawl_result(
     let debug = json!({
         "mode": format!("{:?}", requested_mode),
         "map": result.map,
-        "queued": result.queued,
+        "queued": queued_preview(&result.queued),
+        "queued_total": result.queued.len(),
         "filtered_out": result.filtered_out,
         "skipped": result.skipped.iter().map(|(u, w)| json!({"url": u, "reason": w})).collect::<Vec<_>>(),
         "pages": result.pages.iter().map(|p| json!({
@@ -387,7 +397,8 @@ pub(super) fn render_crawl_dataset(
     let debug = json!({
         "mode": format!("{:?}", requested_mode),
         "rows": rows.len(),
-        "queued": result.queued,
+        "queued": queued_preview(&result.queued),
+        "queued_total": result.queued.len(),
         "filtered_out": result.filtered_out,
         "skipped": result
             .skipped
@@ -566,6 +577,38 @@ mod crawl_output_contract_tests {
             output["_meta"]["com.donsetch/crawl-debug"]["pages"][0]["quality"],
             json!(0.93_f32)
         );
+    }
+
+    // The debug block carried every queued URL: a wide crawl put
+    // thousands of them into each response. It carries a preview and
+    // the count.
+    #[test]
+    fn the_queued_list_in_the_response_is_a_bounded_preview() {
+        let result = CrawlResult {
+            seed: "https://example.com/".into(),
+            pages: vec![],
+            queued: (0..5_000)
+                .map(|i| format!("https://example.com/p/{i}"))
+                .collect(),
+            filtered_out: 0,
+            skipped: vec![],
+            stop: StopReason::MaxPages,
+            elapsed: Duration::from_millis(1),
+            map: vec![],
+            crawl_delay: None,
+            resume: Some("tok".into()),
+        };
+        for dataset in [false, true] {
+            let output = render_crawl_result(&result, CrawlMode::Full, dataset);
+            let debug = &output["_meta"]["com.donsetch/crawl-debug"];
+            let shown = debug["queued"].as_array().unwrap().len();
+            assert!(
+                shown <= super::QUEUED_PREVIEW,
+                "dataset={dataset}: {shown} queued URLs in the response"
+            );
+            assert_eq!(debug["queued_total"], json!(5_000), "dataset={dataset}");
+            assert_eq!(debug["queued"][0], "https://example.com/p/0");
+        }
     }
 
     fn dataset_fixture() -> crate::crawl::CrawlResult {
