@@ -729,7 +729,7 @@ async fn check_egress_lanes(deep: bool) -> CheckResult {
     let summary = pool.lane_summary();
     if summary.is_empty() || (summary.len() == 1 && summary[0].is_direct) {
         return CheckResult::Pass(
-            "direct-only egress (no proxy pool; search/crawl/fetch share the home IP)".into(),
+            "direct-only egress (no proxy pool; every tool rides the home IP)".into(),
         );
     }
     let mut bits: Vec<String> = Vec::new();
@@ -755,6 +755,20 @@ async fn check_egress_lanes(deep: bool) -> CheckResult {
             }
         }
         bits.push(line);
+    }
+
+    // Fetch posture rides the summary: with the opt-in off (the
+    // default) a configured pool does not touch web_fetch at all.
+    bits.insert(
+        0,
+        if crate::config::cfg().proxy.fetch_rotate {
+            "fetch: pooled (proxy.fetch_rotate)".to_string()
+        } else {
+            "fetch: direct; `donsetch proxy fetch on` opts in".to_string()
+        },
+    );
+    if !crate::config::cfg().proxy.crawl_rotate {
+        bits.insert(1, "crawl: direct (proxy.crawl_rotate=false)".to_string());
     }
 
     if deep {

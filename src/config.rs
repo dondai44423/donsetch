@@ -79,10 +79,14 @@ section!(ProxySection {
     no_proxy: String = String::new(),
     pool: Vec<String> = Vec::new(),
     egress_persist: bool = true,
-    /// When a proxy pool exists, web_fetch sticks to one lane per
-    /// host and rotates on 429/407/dead/timeout. Kill: false /
-    /// DONSETCH_NO_FETCH_ROTATE (fetch falls back to env/slot only).
-    fetch_rotate: bool = true,
+    /// Opt-in (default false): web_fetch rides proxy-pool lanes,
+    /// sticky per host, rotating on 429/407/dead/timeout. Off, fetch
+    /// rides the home IP; search and crawl are the pool's default
+    /// users. Enable with `donsetch proxy fetch on`.
+    fetch_rotate: bool = false,
+    /// Crawl rides proxy-pool lanes by default. Off keeps every
+    /// crawl request on the home IP. `donsetch proxy crawl off`.
+    crawl_rotate: bool = true,
 });
 
 section!(TlsSection {
@@ -536,6 +540,108 @@ fn toml_path() -> Option<std::path::PathBuf> {
     let dir = dirs::config_dir()?;
     let path = dir.join("donsetch").join("donsetch.toml");
     path.is_file().then_some(path)
+}
+
+/// Persist one boolean knob into the TOML file layer: the machinery
+/// behind `donsetch proxy fetch|crawl on|off`. Resolution follows the
+/// loader (`DONSETCH_CONFIG` when set, else the default location);
+/// missing files and directories are created. The edit is line-level
+/// (comments and every other line survive byte-for-byte) and the
+/// write is atomic with owner-only permissions: the file can carry
+/// proxy credentials.
+pub fn set_file_bool(section: &str, key: &str, value: bool) -> Result<std::path::PathBuf, String> {
+    if legacy_flag("DONSETCH_NO_CONFIG_FILE") {
+        return Err(
+            "the file layer is disabled by DONSETCH_NO_CONFIG_FILE; unset it to persist settings"
+                .into(),
+        );
+    }
+    let path = match std::env::var_os("DONSETCH_CONFIG") {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => dirs::config_dir()
+            .ok_or("no config directory on this platform")?
+            .join("donsetch")
+            .join("donsetch.toml"),
+    };
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let updated = set_toml_bool(&existing, section, key, value);
+    let tmp = path.with_extension("toml.tmp");
+    write_private(&tmp, updated.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// The line-level TOML edit behind [`set_file_bool`]: replace the
+/// key inside its section when present, else insert under the section
+/// header, else append the section. Pure text in, text out; no TOML
+/// re-serialization, so user comments and layout survive.
+fn set_toml_bool(text: &str, section: &str, key: &str, value: bool) -> String {
+    let canonical = format!("{key} = {value}");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    // First `[section]` header wins; the key's line is only looked
+    // for while inside that section.
+    let mut header_at: Option<usize> = None;
+    let mut key_at: Option<usize> = None;
+    let mut in_target = false;
+    for (i, line) in lines.iter().enumerate() {
+        match section_in_header(line) {
+            Some(name) => {
+                in_target = name == section;
+                if in_target && header_at.is_none() {
+                    header_at = Some(i);
+                }
+            }
+            None => {
+                if in_target && key_at.is_none() && is_assignment(line, key) {
+                    key_at = Some(i);
+                }
+            }
+        }
+    }
+    match (key_at, header_at) {
+        (Some(k), _) => lines[k] = canonical,
+        (None, Some(h)) => lines.insert(h + 1, canonical),
+        (None, None) => {
+            if lines.iter().any(|l| !l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(format!("[{section}]"));
+            lines.push(canonical);
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// `[name]` header -> `Some(name)`; table-array headers `[[name]]`
+/// and non-headers -> `None`.
+fn section_in_header(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix('[')?;
+    let name = &rest[..rest.find(']')?];
+    if name.is_empty() || name.starts_with('[') {
+        return None;
+    }
+    Some(name)
+}
+
+/// True for a `key = ...` assignment line: never a comment, never a
+/// longer key that merely starts with `key`.
+fn is_assignment(line: &str, key: &str) -> bool {
+    let t = line.trim_start();
+    !t.starts_with('#')
+        && t.strip_prefix(key)
+            .map(|rest| rest.trim_start().starts_with('='))
+            .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,12 +1299,28 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "DONSETCH_NO_EGRESS_PERSIST",
         );
     }
+    if legacy_flag("DONSETCH_FETCH_ROTATE") {
+        put(
+            &mut m,
+            "proxy.fetch_rotate",
+            true.into(),
+            "DONSETCH_FETCH_ROTATE",
+        );
+    }
     if legacy_flag("DONSETCH_NO_FETCH_ROTATE") {
         put(
             &mut m,
             "proxy.fetch_rotate",
             false.into(),
             "DONSETCH_NO_FETCH_ROTATE",
+        );
+    }
+    if legacy_flag("DONSETCH_NO_CRAWL_ROTATE") {
+        put(
+            &mut m,
+            "proxy.crawl_rotate",
+            false.into(),
+            "DONSETCH_NO_CRAWL_ROTATE",
         );
     }
     if legacy_flag("DONSETCH_NO_QUALITY_PRIOR") {
@@ -1474,8 +1596,15 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "proxy",
             "fetch_rotate",
             FieldKind::Bool,
+            "false",
+            "opt-in: web_fetch rides proxy-pool lanes (sticky per host; rotate on 429/407/dead/timeout); off = home IP (`donsetch proxy fetch on`)",
+        ),
+        (
+            "proxy",
+            "crawl_rotate",
+            FieldKind::Bool,
             "true",
-            "sticky-per-host fetch lanes when a proxy pool exists; rotate on 429/407/dead/timeout",
+            "crawl rides proxy-pool lanes; off = crawl on the home IP (`donsetch proxy crawl off`)",
         ),
         // tls
         (
@@ -1968,7 +2097,9 @@ const LEGACY_VARS: &[&str] = &[
     "DONSETCH_NO_ENV_PROXY",
     "DONSEEK_PROXIES",
     "DONSETCH_NO_EGRESS_PERSIST",
+    "DONSETCH_FETCH_ROTATE",
     "DONSETCH_NO_FETCH_ROTATE",
+    "DONSETCH_NO_CRAWL_ROTATE",
     "DONSETCH_NO_ADAPTERS",
     "DONSETCH_ADAPTER_DUMP",
     "DONSETCH_NO_CRAWL_SHAPE",
@@ -2474,7 +2605,9 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSETCH_NO_ENV_PROXY" => ("proxy", "from_environment"),
         "DONSEEK_PROXIES" => ("proxy", "pool"),
         "DONSETCH_NO_EGRESS_PERSIST" => ("proxy", "egress_persist"),
+        "DONSETCH_FETCH_ROTATE" => ("proxy", "fetch_rotate"),
         "DONSETCH_NO_FETCH_ROTATE" => ("proxy", "fetch_rotate"),
+        "DONSETCH_NO_CRAWL_ROTATE" => ("proxy", "crawl_rotate"),
         "DONSETCH_NO_ADAPTERS" => ("fetch", "adapters"),
         "DONSETCH_ADAPTER_DUMP" => ("fetch", "adapter_dump_dir"),
         "DONSETCH_NO_CRAWL_SHAPE" => ("fetch", "crawl_shape"),
@@ -3473,24 +3606,110 @@ mod tests {
     }
 
     #[test]
-    fn fetch_rotate_defaults_on_and_honors_kill_switch() {
+    fn fetch_rotate_defaults_off_and_opts_in() {
         let guard = clean_env();
         set_env("DONSETCH_NO_CONFIG_FILE", "1");
         let loaded = load().expect("defaults");
         assert!(
+            !loaded.config.proxy.fetch_rotate,
+            "proxy.fetch_rotate must default false: fetch rides the home IP unless opted in"
+        );
+        set_env("DONSETCH_FETCH_ROTATE", "1");
+        let loaded = load().expect("opt-in");
+        assert!(
             loaded.config.proxy.fetch_rotate,
-            "proxy.fetch_rotate must default true"
+            "DONSETCH_FETCH_ROTATE must map to proxy.fetch_rotate=true"
         );
         set_env("DONSETCH_NO_FETCH_ROTATE", "1");
         let loaded = load().expect("kill switch");
         assert!(
             !loaded.config.proxy.fetch_rotate,
-            "DONSETCH_NO_FETCH_ROTATE must map to proxy.fetch_rotate=false"
+            "DONSETCH_NO_FETCH_ROTATE must force proxy.fetch_rotate=false over the opt-in"
+        );
+        assert_eq!(
+            legacy_target_of("DONSETCH_FETCH_ROTATE"),
+            ("proxy", "fetch_rotate")
         );
         assert_eq!(
             legacy_target_of("DONSETCH_NO_FETCH_ROTATE"),
             ("proxy", "fetch_rotate")
         );
+        drop(guard);
+    }
+
+    #[test]
+    fn crawl_rotate_defaults_on_and_honors_opt_out() {
+        let guard = clean_env();
+        set_env("DONSETCH_NO_CONFIG_FILE", "1");
+        let loaded = load().expect("defaults");
+        assert!(
+            loaded.config.proxy.crawl_rotate,
+            "proxy.crawl_rotate must default true: crawl is a pool consumer"
+        );
+        set_env("DONSETCH_NO_CRAWL_ROTATE", "1");
+        let loaded = load().expect("opt-out");
+        assert!(
+            !loaded.config.proxy.crawl_rotate,
+            "DONSETCH_NO_CRAWL_ROTATE must map to proxy.crawl_rotate=false"
+        );
+        assert_eq!(
+            legacy_target_of("DONSETCH_NO_CRAWL_ROTATE"),
+            ("proxy", "crawl_rotate")
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn set_toml_bool_edits_in_place_and_preserves_the_rest() {
+        let text = "# keep me\n[proxy]\nfrom_environment = true\nfetch_rotate = true # old\n\n[fetch]\nh3 = false\n";
+        let out = super::set_toml_bool(text, "proxy", "fetch_rotate", false);
+        assert!(out.contains("# keep me"));
+        assert!(out.contains("fetch_rotate = false"));
+        assert!(!out.contains("fetch_rotate = true"));
+        assert!(out.contains("[fetch]\nh3 = false"));
+
+        // Key absent from an existing section: inserted under the header.
+        let out = super::set_toml_bool(text, "proxy", "crawl_rotate", false);
+        assert!(
+            out.contains("[proxy]\ncrawl_rotate = false"),
+            "missing key must land right under its section header: {out}"
+        );
+
+        // Section absent: appended; a second identical call is a no-op.
+        let out = super::set_toml_bool("[fetch]\nh3 = false\n", "proxy", "crawl_rotate", true);
+        assert!(out.contains("[proxy]\ncrawl_rotate = true"));
+        let twice = super::set_toml_bool(&out, "proxy", "crawl_rotate", true);
+        assert_eq!(out, twice, "a second identical call must not duplicate");
+
+        // A longer key that merely starts with the name is untouched.
+        let out = super::set_toml_bool(
+            "[proxy]\nfetch_rotate_extra = 1\n",
+            "proxy",
+            "fetch_rotate",
+            false,
+        );
+        assert!(out.contains("fetch_rotate_extra = 1"));
+        assert!(out.contains("fetch_rotate = false"));
+    }
+
+    #[test]
+    fn set_file_bool_round_trips_through_the_loader() {
+        let guard = clean_env();
+        let dir =
+            std::env::temp_dir().join(format!("cfg-set-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("donsetch.toml");
+        set_env("DONSETCH_CONFIG", &path);
+        let written = super::set_file_bool("proxy", "fetch_rotate", true).expect("write on");
+        assert_eq!(written, path);
+        assert!(load().expect("load on").config.proxy.fetch_rotate);
+        super::set_file_bool("proxy", "fetch_rotate", false).expect("write off");
+        assert!(!load().expect("load off").config.proxy.fetch_rotate);
+        super::set_file_bool("proxy", "crawl_rotate", false).expect("write crawl off");
+        let loaded = load().expect("load crawl off");
+        assert!(!loaded.config.proxy.crawl_rotate);
+        assert!(loaded.file.is_some(), "the written file is the file layer");
+        let _ = std::fs::remove_dir_all(&dir);
         drop(guard);
     }
 

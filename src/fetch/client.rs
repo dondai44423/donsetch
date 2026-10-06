@@ -185,7 +185,7 @@ impl Fetcher {
     /// (a cached page is not evidence about the wall RIGHT NOW).
     /// Used only by the background route-memory prober.
     pub async fn fetch_cold_probe(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
-        self.fetch_via_jar_opts(url_str, None, false, None, true)
+        self.fetch_via_jar_opts(url_str, None, false, None, true, true)
             .await
     }
 
@@ -202,12 +202,14 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_via_jar_opts(url_str, proxy, use_jar, referer, false)
+        self.fetch_via_jar_opts(url_str, proxy, use_jar, referer, false, true)
             .await
     }
 
     /// Full-knobs variant: `skip_cache` bypasses the revalidation
     /// cache entirely (probe path only; everything else keeps it).
+    /// `pool_pick` gates the opt-in pool lane (`proxy.fetch_rotate`);
+    /// crawl passes `false` because it owns its lane choice.
     pub async fn fetch_via_jar_opts(
         &self,
         url_str: &str,
@@ -215,6 +217,7 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
         skip_cache: bool,
+        pool_pick: bool,
     ) -> Result<FetchOutcome, FetchError> {
         // Centralized URL safety gate (fetch tier). The synchronous
         // literal checks run here (scheme, credentials, localhost and
@@ -271,22 +274,28 @@ impl Fetcher {
         let mut redirects = 0u8;
         let mut first_request = true;
 
-        // v4 A2: pool-aware fetch lane. When no explicit proxy is
-        // passed and a pool exists, stick to one exit per host for
-        // the whole redirect chain (never mid-200-session) and rotate
-        // on 429 / 407 / connect-dead / timeout. Without a pool this
-        // stays the historical env/slot path: one request does not
+        // Pool-aware fetch lane, opt-in (`proxy.fetch_rotate`, off
+        // by default; `donsetch proxy fetch on` turns it on). When
+        // enabled, no explicit proxy is passed, and a pool exists,
+        // stick to one exit per host for the whole redirect chain
+        // (never mid-200-session) and rotate on 429 / 407 /
+        // connect-dead / timeout. Crawl passes `pool_pick=false`
+        // (it owns its lane choice), and with the opt-in off this is
+        // the historical env/slot path: one request does not
         // rate-limit, and proxies cost bandwidth + TLS fidelity.
         let fetch_host = url::Url::parse(url_str)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
             .unwrap_or_default();
-        let pool_lane = if proxy.is_none()
-            && crate::config::cfg().proxy.fetch_rotate
-            && let Some(pool) = &self.egress
-            && pool.has_proxies()
-        {
-            pool.pick_fetch(&fetch_host, true)
+        let pool_lane = if pool_pick_enabled(
+            proxy,
+            pool_pick,
+            crate::config::cfg().proxy.fetch_rotate,
+            self.egress.as_deref(),
+        ) {
+            self.egress
+                .as_ref()
+                .and_then(|pool| pool.pick_fetch(&fetch_host, true))
         } else {
             None
         };
@@ -576,25 +585,47 @@ impl Fetcher {
             url::Url::parse(url_str).map_err(|e| FetchError::Http(format!("bad url: {e}")))?;
         let mut conditional = conditional.to_vec();
         let mut hops = 0u8;
+        // Pool-aware lane, opt-in (`proxy.fetch_rotate`, off by
+        // default; `donsetch proxy fetch on`). Same contract as
+        // `fetch_via_jar_opts`: one sticky exit per host, pinned for
+        // the whole redirect chain, rotated on 429/407/dead/timeout.
+        let fetch_host = cur
+            .host_str()
+            .map(|h| h.to_ascii_lowercase())
+            .unwrap_or_default();
+        let pool_lane = if pool_pick_enabled(
+            proxy,
+            true,
+            crate::config::cfg().proxy.fetch_rotate,
+            self.egress.as_deref(),
+        ) {
+            self.egress
+                .as_ref()
+                .and_then(|pool| pool.pick_fetch(&fetch_host, true))
+        } else {
+            None
+        };
+        let pool_lane_id = pool_lane.as_ref().map(|e| e.id.clone());
+        // Only a real lane pins the request and mutes env proxies; a
+        // `direct` answer from the pool (every lane dead, or burned
+        // for this host) leaves the env-proxy path in charge (#302).
+        let use_pool_lane = pool_lane_is_proxy(pool_lane.as_ref());
+        let pinned_pool = pool_lane.as_ref().and_then(|e| e.proxy.as_ref());
         loop {
             // Ambient proxy, resolved for the CURRENT url and
             // re-resolved at every hop (curl parity, E15: a redirect
             // into a NO_PROXY-covered host dials direct instead of
             // riding the env proxy for the rest of the chain). An
-            // explicit lane stays pinned for the whole chain by design.
-            // Without this the tier-1 persona lane, which every MCP
-            // web_fetch and CLI fetch call rides, ignored
-            // HTTP_PROXY/HTTPS_PROXY entirely: on a host whose only
-            // route out is a forward proxy it died with "Network is
-            // unreachable" while doctor and the archive fallback, both
-            // on fetch_via_jar_opts, reported egress healthy.
-            let env_proxy = if proxy.is_none() {
+            // explicit lane or a pinned pool lane stays pinned for
+            // the whole chain by design.
+            let env_proxy = if proxy.is_none() && !use_pool_lane {
                 crate::transport::proxy::from_env_for(cur.as_str())
             } else {
                 None
             };
-            let effective = proxy.or(env_proxy.as_ref());
-            let out = self
+            let effective = proxy.or(pinned_pool).or(env_proxy.as_ref());
+            let hop_started = Instant::now();
+            let out = match self
                 .fetch_once_via_identity(
                     cur.as_str(),
                     &conditional,
@@ -603,7 +634,26 @@ impl Fetcher {
                     referer,
                     identity,
                 )
-                .await?;
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
+                        note_lane_outcome(pool, &fetch_host, id, &e);
+                    }
+                    return Err(e);
+                }
+            };
+            if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
+                match out.status {
+                    429 => pool.note_fetch_rate_limited(&fetch_host, id),
+                    200 | 304 => {
+                        pool.report_ok(&fetch_host, id);
+                        pool.observe_rtt(id, hop_started.elapsed());
+                    }
+                    _ => {}
+                }
+            }
             if !(300..400).contains(&out.status) {
                 return Ok(out);
             }
@@ -626,7 +676,8 @@ impl Fetcher {
 
     /// Tier-1 navigation-identity fetch (the daemon's Chrome-class
     /// hop). Follows redirects (bounded); cross-host hops are
-    /// re-gated per hop.
+    /// re-gated per hop. Honors the fetch pool opt-in like every
+    /// other fetch path (`proxy.fetch_rotate`).
     pub async fn fetch_persona(
         &self,
         url_str: &str,
@@ -1236,6 +1287,20 @@ fn pool_lane_is_proxy(lane: Option<&crate::search::egress::Egress>) -> bool {
     lane.is_some_and(|e| e.proxy.is_some())
 }
 
+/// Pool-pick gate for the fetch lanes. The fetch tool opts in via
+/// `proxy.fetch_rotate` (default off, `donsetch proxy fetch on`);
+/// crawl always passes `pool_pick=false` because it owns its lane
+/// choice; a caller-supplied lane mutes the pick; an empty pool is
+/// no pool. `explicit` is the lane the caller passed, if any.
+fn pool_pick_enabled(
+    explicit: Option<&proxy::Proxy>,
+    pool_pick: bool,
+    cfg_rotate: bool,
+    pool: Option<&crate::search::egress::EgressPool>,
+) -> bool {
+    explicit.is_none() && pool_pick && cfg_rotate && pool.is_some_and(|p| p.has_proxies())
+}
+
 /// Lane health from a transport failure, by variant rather than by
 /// prose.
 ///
@@ -1431,6 +1496,42 @@ mod transport_exit_tests {
 
     // The consequence, on a real pool: N fetches of hosts that do not
     // resolve must not retire the proxy lanes, because once every lane
+    #[test]
+    fn pool_pick_is_opt_in_and_never_for_crawl() {
+        use crate::search::egress::EgressPool;
+        use crate::transport::proxy::Proxy;
+        let dir = std::env::temp_dir().join(format!("donsetch-pool-pick-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // SAFETY: test-only mutation of the process env; nextest runs
+        // each test in its own process.
+        unsafe {
+            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
+        }
+        let pool = EgressPool::new(vec![Proxy::parse("http://127.0.0.1:24041").unwrap()]);
+        assert!(
+            pool_pick_enabled(None, true, true, Some(&pool)),
+            "the opted-in fetch picks a lane"
+        );
+        assert!(
+            !pool_pick_enabled(None, true, false, Some(&pool)),
+            "off by default: rotate=false means no pick"
+        );
+        assert!(
+            !pool_pick_enabled(None, false, true, Some(&pool)),
+            "crawl owns its lane choice: never re-picked"
+        );
+        let explicit = Proxy::parse("http://127.0.0.1:24042").unwrap();
+        assert!(
+            !pool_pick_enabled(Some(&explicit), true, true, Some(&pool)),
+            "an explicit lane mutes the pick"
+        );
+        assert!(
+            !pool_pick_enabled(None, true, true, None),
+            "no pool, no pick"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // is benched `pick_fetch(_, direct_ok=true)` hands back "direct"
     // and a rotation-configured fetch leaves on the real address.
     #[test]

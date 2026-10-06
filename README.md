@@ -588,7 +588,7 @@ Thin adapter over the same engine the MCP server uses.
 | `donsetch doctor` | Health check and auto-fix (`--deep`, `--json`, `--fix`) |
 | `donsetch status` | Version, keys, proxies, cache, health overview |
 | `donsetch keys` | BYOK providers and plugins (`add`, `list`, `default`, `export`) |
-| `donsetch proxy` | Proxy management (`add`, `list`, `check`, `remove`, `clear`) |
+| `donsetch proxy` | Proxy management (`add`, `list`, `check`, `remove`, `clear`, `fetch on\|off`, `crawl on\|off`) |
 | `donsetch login` | Authenticated sessions for walled sites (`--list`, `--status`, `--logout`, `--import`) |
 | `donsetch config` | `show`, `--markdown`, `--legacy` |
 | `donsetch tools` | Tool schemas as JSON, same as MCP `tools/list` |
@@ -604,13 +604,17 @@ Thin adapter over the same engine the MCP server uses.
 - `SSL_CERT_FILE` / `SSL_CERT_DIR` load into the trust store, which is the only way re-signed certificates verify in an intercepting network, exactly like curl.
 - `donsetch doctor` reports the whole posture: resolved env proxy, kill-switch state, system and environment trust stores, plus a live check that names the interception fix when it fails.
 
-**Search and crawl** rotate proxies across lanes, each with durable health: sticky per-host lanes, persona-exclusive exits, RTT-aware pacing, burned lanes remembered across restarts. A direct dial that fails is not a dead link, and a lane that dies does not silently take a domain with it.
+**The proxy pool is opt-in for fetch.** `donsetch proxy fetch on` lets `web_fetch` (and its browser escalation) ride the pool lanes, sticky per host, rotating on 429/407/dead/timeout; `donsetch proxy fetch off` puts it back on your own IP, which is the default. A one-shot read does not need a shared exit, and the pool's exit IPs are not better than yours for it.
+
+**Search and crawl** rotate proxies across lanes, each with durable health: sticky per-host lanes, persona-exclusive exits, RTT-aware pacing, burned lanes remembered across restarts. A direct dial that fails is not a dead link, and a lane that dies does not silently take a domain with it. Crawl rides the lanes by default; `donsetch proxy crawl off` leaves every crawl request on your IP.
 
 ```bash
 donsetch proxy add <url>            # rotate-able proxy entry
 DONSEEK_PROXIES="url1,url2"         # env form, comma separated
 donsetch proxy list                 # list, credentials masked
 donsetch proxy check                # live connectivity test
+donsetch proxy fetch on             # opt web_fetch into the pool (default: your IP)
+donsetch proxy crawl off            # keep crawl on your IP
 donsetch proxy remove <n> && donsetch proxy clear
 ```
 

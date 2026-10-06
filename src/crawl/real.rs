@@ -4,6 +4,12 @@
 //! plain socket, proxy ids ride the shared EgressPool (v4 A2).
 //! Dead lanes are skipped at fetch time; outcomes report back
 //! into the same health world search and fetch use.
+//!
+//! Pool use is crawl's own default (`proxy.crawl_rotate`, true):
+//! `donsetch proxy crawl off` drops the proxy lanes and every crawl
+//! request leaves on the home IP. The fetch lane pick stays out of
+//! this path entirely: crawl owns its lane choice (the fetch call
+//! passes `pool_pick=false`).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,23 +23,34 @@ use crate::search::egress::EgressPool;
 use super::governor::{Governor, Lane, LaneKind};
 use super::{Crawler, FetchedPage, PageFetcher};
 
+/// The crawl governor's lane list: `direct` always; the pool's proxy
+/// lanes only while crawl pool use is on (`proxy.crawl_rotate`,
+/// default true; `donsetch proxy crawl off` opts out, leaving every
+/// crawl request on the home IP).
+fn pool_lanes(proxies: &[crate::transport::proxy::Proxy], rotate: bool) -> Vec<Lane> {
+    let mut lanes = vec![Lane {
+        id: "direct".into(),
+        kind: LaneKind::Direct,
+    }];
+    if rotate {
+        for p in proxies {
+            lanes.push(Lane {
+                id: p.id(),
+                kind: LaneKind::Proxy,
+            });
+        }
+    }
+    lanes
+}
+
 /// Build the real crawl stack. `fetcher` is shared state (same
 /// jar/pool/cache as everything else in the process); `pool` is
 /// the process-wide egress fabric (health + dead benches shared
 /// with search and fetch).
 pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Governor>) {
     let proxies = Arc::new(pool.proxies());
-    let mut lanes = vec![Lane {
-        id: "direct".into(),
-        kind: LaneKind::Direct,
-    }];
-    for p in proxies.iter() {
-        lanes.push(Lane {
-            id: p.id(),
-            kind: LaneKind::Proxy,
-        });
-    }
-    let governor = Arc::new(Governor::new(lanes));
+    let rotate = crate::config::cfg().proxy.crawl_rotate;
+    let governor = Arc::new(Governor::new(pool_lanes(&proxies, rotate)));
 
     let fetch: PageFetcher = {
         let fetcher = Arc::clone(&fetcher);
@@ -99,6 +116,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                         use_jar,
                         referer.as_deref(),
                         true,
+                        false,
                     )
                     .await
                 {
@@ -161,4 +179,26 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
     };
 
     (Crawler::new(fetch, Arc::clone(&governor)), governor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::proxy::Proxy;
+
+    #[test]
+    fn crawl_leaves_the_pool_with_the_opt_out() {
+        let proxies = vec![
+            Proxy::parse("socks5://127.0.0.1:1080").unwrap(),
+            Proxy::parse("http://127.0.0.1:3128").unwrap(),
+        ];
+        let on = pool_lanes(&proxies, true);
+        assert_eq!(on.len(), 3, "direct plus both proxy lanes");
+        assert_eq!(on[0].kind, LaneKind::Direct);
+        assert!(on[1..].iter().all(|l| l.kind == LaneKind::Proxy));
+
+        let off = pool_lanes(&proxies, false);
+        assert_eq!(off.len(), 1, "the opt-out leaves only the direct lane");
+        assert_eq!(off[0].id, "direct");
+    }
 }

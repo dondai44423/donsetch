@@ -5,6 +5,35 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `web_fetch` rides your own IP by default: pool use is opt-in
+  (`proxy.fetch_rotate` defaults false). The README's proxy section has
+  always said fetch dials direct by default, but v4.0.0 wired pool
+  rotation into the fetch client: with a pool configured, the
+  fetch-adjacent paths (the ghost's post-solve retry, link following,
+  image and archive lookups, probes) left via shared exit IPs by
+  default from then on, while the main navigation was exempt only
+  because its persona lane never consulted the pool. Off is the default
+  now, and the opt-in covers every fetch path uniformly, the main
+  navigation included: `donsetch proxy fetch on` (also
+  `proxy.fetch_rotate = true` in donsetch.toml, or
+  `DONSETCH_FETCH_ROTATE=1`). The ghost rides the pool only when fetch
+  does.
+- Crawl keeps the pool by default and gained a one-command opt-out:
+  `donsetch proxy crawl off` (`proxy.crawl_rotate = false`,
+  `DONSETCH_NO_CRAWL_ROTATE=1`) leaves every crawl request on your IP.
+  Search is unchanged: the pool is its rate-limit solver.
+
+### Added
+
+- `donsetch proxy fetch on|off` and `donsetch proxy crawl on|off`: flip
+  one pool-use knob; the setting is written to the TOML file layer
+  (`~/.config/donsetch/donsetch.toml`, or `DONSETCH_CONFIG` when set),
+  leaving every other line and comment in the file untouched.
+
 ## [4.5.1] - 2026-10-06
 
 ### Fixed

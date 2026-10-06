@@ -1161,9 +1161,10 @@ impl Ghost {
             chrome_args.push("--disable-setuid-sandbox".into());
         }
         // ── HTTP proxy ──
-        // Prefer a sticky lane from the shared egress pool (v4 A2)
-        // so the browser exit matches the rest of the fabric. Fall
-        // back to env/slot. Chrome CANNOT authenticate a proxy
+        // Prefer a sticky lane from the shared egress pool when the
+        // fetch opt-in is on (`proxy.fetch_rotate`; off by default,
+        // so the browser rides the home IP like tier 1). Fall back
+        // to env/slot. Chrome CANNOT authenticate a proxy
         // itself: --proxy-server carries no credentials and no
         // dialog we can drive headless, so an authenticated lane
         // made Chrome render its own ERR_SOCKS_CONNECTION_FAILED

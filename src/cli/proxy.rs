@@ -9,6 +9,8 @@
 //!   test <url>                       Test a single proxy without adding
 //!   import <file>                    Import proxies from file (one URL per line)
 //!   export [file]                    Export to file (default: stdout)
+//!   fetch on|off                     web_fetch rides pool lanes (opt-in; default off)
+//!   crawl on|off                     crawl rides pool lanes (default on; off = home IP)
 //!
 //! Config: cache_dir/proxies.txt (one URL per line, # comments)
 //! Env: DONSEEK_PROXIES (comma-separated, overrides config for same host:port)
@@ -47,7 +49,75 @@ pub async fn run(args: &[String]) {
         "test" => cmd_test(&args[3..]).await,
         "import" => cmd_import(&args[3..]).await,
         "export" => cmd_export(&args[3..]).await,
+        "fetch" => cmd_pool_toggle(args, "fetch").await,
+        "crawl" => cmd_pool_toggle(args, "crawl").await,
         _ => print_help(),
+    }
+}
+
+/// `donsetch proxy fetch|crawl on|off` : flip one pool-use knob in
+/// the TOML file layer. Bare = print the current state.
+async fn cmd_pool_toggle(args: &[String], which: &str) {
+    let fetch = which == "fetch";
+    let key = if fetch {
+        "fetch_rotate"
+    } else {
+        "crawl_rotate"
+    };
+    let current = if fetch {
+        crate::config::cfg().proxy.fetch_rotate
+    } else {
+        crate::config::cfg().proxy.crawl_rotate
+    };
+    let (on_line, off_line) = if fetch {
+        (
+            "web_fetch rides the proxy pool lanes",
+            "web_fetch stays on your IP (the default)",
+        )
+    } else {
+        (
+            "crawl rides the proxy pool lanes (the default)",
+            "crawl stays on your IP",
+        )
+    };
+    let value = match args.get(3).map(|s| s.as_str()) {
+        Some("on") | Some("enable") => true,
+        Some("off") | Some("disable") => false,
+        None => {
+            cli::print_title(&format!("{DISPLAY_NAME} Proxy {which}"));
+            println!();
+            cli::print_kv(
+                which,
+                if current {
+                    "pool lanes (on)"
+                } else {
+                    "your IP (off)"
+                },
+            );
+            println!();
+            println!(
+                "  donsetch proxy {which} {}",
+                if current { "off" } else { "on" }
+            );
+            return;
+        }
+        _ => {
+            eprintln!("Usage: donsetch proxy {which} on|off");
+            std::process::exit(1);
+        }
+    };
+    match crate::config::set_file_bool("proxy", key, value) {
+        Ok(path) => {
+            cli::print_title(&format!("{DISPLAY_NAME} Proxy {which}"));
+            println!();
+            cli::check_pass(which, if value { on_line } else { off_line });
+            cli::print_kv("config", &path.display().to_string());
+            cli::print_kv("applies", "next donsetch run / MCP server restart");
+        }
+        Err(e) => {
+            eprintln!("{} {e}", cli::icon_fail());
+            std::process::exit(1);
+        }
     }
 }
 
@@ -737,6 +807,10 @@ fn print_help() {
     println!("  list                             Show all configured proxies");
     println!("  check                            Probe all proxies (connectivity + exit IP)");
     println!("  clear                            Remove all proxies");
+    println!("  fetch on|off                     web_fetch rides pool lanes (opt-in; default off)");
+    println!(
+        "  crawl on|off                     crawl rides pool lanes (default on; off = home IP)"
+    );
     println!("  test <url>                       Test a proxy without adding it");
     println!("  import <file>                    Import from file (one URL per line)");
     println!("  export [file]                    Export to file (default: stdout)");
@@ -755,7 +829,12 @@ fn print_help() {
     println!("  donsetch proxy remove 1          # remove first proxy from list");
     println!("  donsetch proxy remove 1.2.3.4:1080");
     println!("  donsetch proxy check");
+    println!("  donsetch proxy fetch on           # opt web_fetch into the pool");
+    println!("  donsetch proxy crawl off          # keep crawl on your IP");
     println!();
     println!("Config: cache_dir/proxies.txt (one URL per line, # comments)");
     println!("Env:   DONSEEK_PROXIES (comma-separated, overrides config for same host:port)");
+    println!();
+    println!("Pool use: search and crawl ride the lanes; fetch opts in (`fetch on`);");
+    println!("          `crawl off` leaves crawl on your IP. Written to donsetch.toml.");
 }
