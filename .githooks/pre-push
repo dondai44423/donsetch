@@ -10,6 +10,8 @@
 #     go public)
 #   - no version drift between the manifests (Cargo.toml vs
 #     npm/package.json must always agree)
+#   - target/ stays under its storage ceiling (scripts/guard.sh:
+#     incremental caches, retired profiles, clean review worktrees)
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -35,6 +37,10 @@ fi
 # bypassed, and the fast profile is the warm one every local recipe
 # uses. Both feature sets stay checked (the cfg-twin class is real and
 # cheap to keep): only this crate recompiles between them.
+# Storage ceiling (scripts/guard.sh): reclaims incremental caches,
+# retired profiles and CLEAN review worktrees when target/ is over; a
+# dirty worktree is kept and named. Still over after reclaim fails.
+sh scripts/guard.sh
 net cargo fmt --check >/dev/null
 net cargo check --locked -q --profile fast >/dev/null
 net cargo check --locked -q --profile fast --no-default-features >/dev/null
@@ -48,4 +54,4 @@ if [ "$crate" != "$npmpkg" ]; then
   echo "run: just ship <version> to keep both in step"
   exit 1
 fi
-echo "pre-push net ok (fmt, probes, dual-feature fast check, manifests in step)"
+echo "pre-push net ok (fmt, probes, dual-feature fast check, manifests in step, storage guard)"
