@@ -32,6 +32,17 @@ pub struct Robots {
 pub const MAX_CRAWL_DELAY_SECS: f64 = 60.0;
 
 impl Robots {
+    /// `Disallow: /` for every agent: what a reachable file that
+    /// closes the whole site would say. RFC 9309 §2.3.1.4: a
+    /// robots.txt that cannot be reached ("unreachable") means the
+    /// crawler must assume it may access no resource.
+    pub fn disallow_all() -> Self {
+        Self {
+            disallow: vec!["/".into()],
+            ..Self::default()
+        }
+    }
+
     pub fn parse(body: &str, base_origin: &str) -> Self {
         let mut r = Robots::default();
         let mut in_star_group = false;
@@ -374,17 +385,28 @@ pub fn origin_of(url: &url::Url) -> String {
     }
 }
 
-/// Fetch and parse one origin's robots.txt through the injected
-/// PageFetcher. A non-200 (including a network failure) is the RFC
-/// 9309 "unavailable" case: allow, and let the caller cache the empty
-/// rules so an origin costs one attempt per crawl.
+/// Fetch one origin's robots.txt through the injected PageFetcher;
+/// the caller caches the rules so an origin costs one attempt per
+/// crawl.
 pub async fn fetch_robots(fetch: &PageFetcher, origin: &str) -> Robots {
     let robots_url = format!("{origin}/robots.txt");
     let page = fetch(robots_url, "direct".to_string(), None).await;
-    if page.status == 200 {
-        Robots::parse(&String::from_utf8_lossy(&maybe_gunzip(&page.body)), origin)
-    } else {
+    robots_for_origin(page.status, &page.body, origin)
+}
+
+/// RFC 9309 §2.3.1.3/.4: a 4xx ("unavailable") may be read as
+/// allow-all; a 5xx or a transport failure ("unreachable") must be
+/// read as complete disallow. A 200 parses; anything else (an
+/// unfollowed redirect, a status-0 transport failure) errs toward the
+/// disallow side. The crawler used to fail open on every non-200
+/// (#351).
+pub fn robots_for_origin(status: u16, body: &[u8], origin: &str) -> Robots {
+    if status == 200 {
+        Robots::parse(&String::from_utf8_lossy(&maybe_gunzip(body)), origin)
+    } else if (400..500).contains(&status) {
         Robots::default()
+    } else {
+        Robots::disallow_all()
     }
 }
 
@@ -601,6 +623,29 @@ mod tests {
     }
     use super::*;
     use futures_util::FutureExt;
+
+    // RFC 9309 §2.3.1.3/.4: 4xx is "unavailable" (allow), 5xx and a
+    // transport failure are "unreachable" (complete disallow). The
+    // crawler used to fail open on every non-200 (#351).
+    #[test]
+    fn robots_unavailable_allows_and_unreachable_disallows() {
+        let origin = "https://ex.com";
+        let any = |p: &str| url::Url::parse(&format!("https://ex.com{p}")).unwrap();
+        assert!(
+            robots_for_origin(200, b"User-agent: *\nDisallow: /x\n", origin).allows_url(&any("/y")),
+            "a 200 parses"
+        );
+        assert!(
+            robots_for_origin(404, b"", origin).allows_url(&any("/x")),
+            "4xx: allow"
+        );
+        for status in [500u16, 503, 0] {
+            assert!(
+                !robots_for_origin(status, b"", origin).allows_url(&any("/x")),
+                "status {status} must disallow"
+            );
+        }
+    }
 
     #[test]
     fn robots_star_group_disallow_sitemap() {

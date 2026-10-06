@@ -570,14 +570,7 @@ impl Crawler {
                     None,
                 )
                 .await;
-                let robots = if page.status == 200 {
-                    sitemap::Robots::parse(
-                        &String::from_utf8_lossy(&sitemap::maybe_gunzip(&page.body)),
-                        &origin,
-                    )
-                } else {
-                    sitemap::Robots::default()
-                };
+                let robots = sitemap::robots_for_origin(page.status, &page.body, &origin);
                 self.governor
                     .set_host_crawl_delay(&seed_host, robots.crawl_delay);
                 buffered

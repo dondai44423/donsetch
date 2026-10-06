@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file. The queue keeps its best 10 000 by score and counts the rest
   as filtered out; the response's `queued` is a 100-entry preview
   beside a `queued_total`. (mnaza, #349)
+- robots.txt now follows RFC 9309 for both failure cases: a 4xx
+  ("unavailable") still allows, while a 5xx or a transport failure
+  ("unreachable") is read as complete disallow instead of failing
+  open, per origin. The mapping lives in one helper shared by
+  discovery, the per-origin cache and the seed preflight.
+  `respect_robots=false` remains the explicit bypass. (#351, reported
+  by mnaza)
 
 ## [4.5.0] - 2026-10-06
 

@@ -954,6 +954,46 @@ async fn crawl_any_host_reads_each_origins_own_robots() {
     );
 }
 
+// RFC 9309 §2.3.1.4: a robots.txt that answers 5xx is "unreachable",
+// and the crawler must assume it may not fetch anything from that
+// origin. It used to fail open on every non-200. A 4xx stays the
+// "unavailable" case: allow.
+#[tokio::test]
+async fn robots_unreachable_stops_the_crawl_but_4xx_does_not() {
+    for (robots_status, expect_seed) in [(503u16, false), (404u16, true)] {
+        let seed = "<html><body><article><p>content words for extractor acceptance threshold pass yes yes yes</p><a href=\"/a\">a</a></article></body></html>";
+        let site = MockSite::new()
+            .page("https://ex.com/robots.txt", robots_status, "no rules")
+            .page("https://ex.com/", 200, seed)
+            .page("https://ex.com/a", 200, &html("A", "a"));
+        let (fetch, hits) = site.fetcher();
+        let crawler = Crawler::new(fetch, gov());
+        let mut o = opts();
+        o.mode = CrawlMode::Content;
+        o.max_pages = 5;
+        o.respect_robots = true;
+        let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+        let hits = hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expect_seed {
+            assert!(
+                r.pages.iter().any(|p| p.url == "https://ex.com/"),
+                "a robots.txt 4xx is unavailable, not unreachable: the crawl continues; hits: {hits:?}"
+            );
+        } else {
+            assert!(
+                r.pages.is_empty(),
+                "a robots.txt 5xx must stop the crawl; hits: {hits:?}"
+            );
+            assert!(
+                hits.iter().all(|h| h.ends_with("/robots.txt")),
+                "nothing beyond robots.txt may be fetched under a 5xx; hits: {hits:?}"
+            );
+        }
+    }
+}
+
 // `Crawl-delay` was parsed with a bare `f64` parse and fed straight
 // to `Duration::from_secs_f64`, which panics on `inf`/huge values:
 // one hostile (or sloppy) robots.txt aborted the crawl worker, and
