@@ -1815,13 +1815,19 @@ impl Crawler {
                 .snapshot_entries();
             (p, s, q)
         };
+        // Links the queue let go at its ceiling were in scope and
+        // allowed; the model is told they were not followed.
+        let dropped_at_ceiling = sh_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dropped();
 
         let skipped_v = std::mem::take(
             &mut *skipped
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let filtered = filtered_out.load(Ordering::Relaxed);
+        let filtered = filtered_out.load(Ordering::Relaxed) + dropped_at_ceiling;
 
         // Lastmod lookup from sitemap entries + relevance-sorted
         // output (seed first, then by score desc).

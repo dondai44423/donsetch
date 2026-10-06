@@ -261,9 +261,21 @@ fn glob_at(p: &[u8], t: &[u8]) -> bool {
 }
 
 /// The crawl frontier: queued URLs with per-URL priority.
+/// Entries the queue keeps. One index page can carry 100 000 links,
+/// and the fetch body cap is 64 MiB; past this the lowest-scored
+/// entries go, and the crawl counts them as filtered out.
+pub const MAX_QUEUE: usize = 10_000;
+
+/// How far past the ceiling the heap may grow before one prune
+/// brings it back: a prune sorts the heap, so it must not run on
+/// every push.
+const PRUNE_SLACK: usize = MAX_QUEUE / 4;
+
 pub struct FrontierQueue {
     heap: BinaryHeap<Frontier>,
     seen: HashSet<String>,
+    /// Entries let go at the ceiling.
+    dropped: usize,
     /// v4 phase 3 crawl-shape: pop a reader-like jitter inside the
     /// head window instead of always the exact top, so repeated
     /// crawls of the same site do not replay an identical,
@@ -283,6 +295,7 @@ impl FrontierQueue {
         Self {
             heap: BinaryHeap::new(),
             seen: HashSet::new(),
+            dropped: 0,
             shaper: false,
             rng: 0x9e3779b97f4a7c15,
         }
@@ -296,6 +309,7 @@ impl FrontierQueue {
         Self {
             heap: BinaryHeap::new(),
             seen: HashSet::new(),
+            dropped: 0,
             shaper: shaper_enabled,
             rng: seed,
         }
@@ -325,7 +339,29 @@ impl FrontierQueue {
             retries: 0,
             parent,
         });
+        self.prune_over(MAX_QUEUE + PRUNE_SLACK);
         true
+    }
+
+    /// Entries let go at the ceiling since the queue was made.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Past `limit`, keep the best MAX_QUEUE. Pushes allow the slack
+    /// so this sorts rarely; a snapshot trims to the ceiling itself.
+    /// The dropped URLs stay in `seen`: a page that links to them
+    /// again does not get them back.
+    fn prune_over(&mut self, limit: usize) {
+        if self.heap.len() <= limit {
+            return;
+        }
+        let mut sorted = std::mem::take(&mut self.heap).into_sorted_vec();
+        // into_sorted_vec is ascending: the best are at the end.
+        let excess = sorted.len() - MAX_QUEUE;
+        sorted.drain(..excess);
+        self.dropped += excess;
+        self.heap = sorted.into_iter().collect();
     }
 
     /// Requeue a popped item (e.g. host boxed, try later).
@@ -408,7 +444,8 @@ impl FrontierQueue {
     /// Snapshot all queued entries (url, score, depth, retries,
     /// parent) for a resume token. Does not drain : the seen-set
     /// survives.
-    pub fn snapshot_entries(&self) -> Vec<(String, f64, u32, u8, Option<String>)> {
+    pub fn snapshot_entries(&mut self) -> Vec<(String, f64, u32, u8, Option<String>)> {
+        self.prune_over(MAX_QUEUE);
         self.heap
             .iter()
             .map(|f| (f.url.clone(), f.score, f.depth, f.retries, f.parent.clone()))
@@ -538,6 +575,35 @@ pub fn effective_excludes(user: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // One index page can carry 100 000 links; each became a heap
+    // entry, and the whole heap was copied into every tool response
+    // and the resume token. The queue keeps the best MAX_QUEUE and
+    // counts what it let go.
+    #[test]
+    fn the_queue_keeps_the_best_entries_past_its_ceiling() {
+        let mut q = FrontierQueue::new();
+        let n = MAX_QUEUE * 3;
+        for i in 0..n {
+            let url = Url::parse(&format!("https://ex.com/p/{i}")).unwrap();
+            // Score rises with i: the last MAX_QUEUE pushed are the best.
+            q.push(url, i as f64, 1);
+        }
+        let snapshot = q.snapshot_entries().len();
+        assert!(
+            snapshot <= MAX_QUEUE,
+            "the queue holds {snapshot} entries over its ceiling of {MAX_QUEUE}"
+        );
+        assert_eq!(q.dropped() + q.len(), n, "every push is kept or counted");
+        let mut lowest = f64::MAX;
+        while let Some(f) = q.pop() {
+            lowest = lowest.min(f.score);
+        }
+        assert!(
+            lowest >= (n - MAX_QUEUE) as f64,
+            "a kept entry scored {lowest}, below the best {MAX_QUEUE}"
+        );
+    }
 
     #[test]
     fn normalize_strips_tracking() {
