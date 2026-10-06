@@ -158,7 +158,7 @@ where
             let done = Arc::clone(&forwarder_done);
             let replay_fwd = Arc::clone(&replay);
             std::thread::spawn(move || {
-                let mut carry: Vec<u8> = Vec::new();
+                let mut carry = Carry::default();
                 let mut buf = [0u8; 16384];
                 loop {
                     match stdout.read(&mut buf) {
@@ -168,19 +168,7 @@ where
                             // object with an id and no method is a
                             // response, and the request it answers
                             // must never run a second time (#281).
-                            carry.extend_from_slice(&buf[..n]);
-                            while let Some(pos) = carry.iter().position(|b| *b == b'\n') {
-                                let line: Vec<u8> = carry.drain(..=pos).collect();
-                                if let Some(id) = response_id_of(&line) {
-                                    replay_fwd
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .retire(&id);
-                                }
-                            }
-                            if carry.len() > REPLAY_WINDOW {
-                                carry.clear(); // no id to match in a line this big
-                            }
+                            carry.retire_answered(&buf[..n], &replay_fwd);
                             let mut out = out
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -292,10 +280,13 @@ where
                     // snapshot, or the replacement runs it again.
                     await_forwarder(forwarder_done);
                     {
+                        // `pending` is non-empty here when the replay
+                        // write to this child failed (it died before
+                        // reading); that request is still owed.
                         let mut st = replay
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        pending = st.take_replay();
+                        pending.extend(st.take_replay());
                     }
                     if !pending.is_empty() {
                         eprintln!(
@@ -332,6 +323,68 @@ struct RunningChild {
 /// client (issue #281). Duplicate delivery of an OPEN request
 /// beats loss; an answered one is never delivered again.
 const REPLAY_WINDOW: usize = 1 << 20;
+
+/// The child's stdout between newlines, for retiring answered
+/// requests. A line over the replay window is not held whole: its
+/// head is, because the id is there (serde writes `id` before
+/// `result` in either key order) and a screenshot or a long crawl
+/// answers in several MB.
+#[derive(Default)]
+struct Carry {
+    buf: Vec<u8>,
+    /// The first bytes of a line that outgrew `buf`.
+    head: Option<Vec<u8>>,
+}
+
+/// How much of an oversized line is kept for its id.
+const CARRY_HEAD: usize = 4096;
+
+impl Carry {
+    fn retire_answered(&mut self, chunk: &[u8], replay: &Mutex<ReplayState>) {
+        self.buf.extend_from_slice(chunk);
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let id = match self.head.take() {
+                Some(head) => head_response_id(&head),
+                None => response_id_of(&line),
+            };
+            if let Some(id) = id {
+                replay
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retire(&id);
+            }
+        }
+        if self.buf.len() > REPLAY_WINDOW {
+            if self.head.is_none() {
+                self.head = Some(self.buf[..CARRY_HEAD.min(self.buf.len())].to_vec());
+            }
+            self.buf.clear();
+        }
+    }
+}
+
+/// The id at the head of a response line too long to hold: the
+/// first `"id":` value, as `Value::to_string` would print it, unless
+/// a `"method":` comes before it (a notification, not a response).
+fn head_response_id(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    let at = text.find("\"id\":")?;
+    if text[..at].contains("\"method\":") {
+        return None;
+    }
+    let rest = text[at + 5..].trim_start();
+    if let Some(q) = rest.strip_prefix('"') {
+        let end = q.find('"')?;
+        return Some(format!("\"{}\"", &q[..end]));
+    }
+    let end = rest.find([',', '}', ' ']).unwrap_or(rest.len());
+    let token = &rest[..end];
+    if token.is_empty() || token == "null" {
+        return None;
+    }
+    Some(token.to_string())
+}
 
 /// One held line: raw bytes plus the id whose response retires it
 /// (None for bytes this parser could not classify).
@@ -901,6 +954,151 @@ mod tests {
         assert!(
             got.contains("client=claude-code\n"),
             "the replacement must learn the client's name; sink: {got:?}"
+        );
+    }
+
+    // A response over the replay window (a screenshot's inline PNG,
+    // a long crawl) had its partial cleared before the newline, so
+    // the tail was not JSON, the request never retired, and every
+    // later death replayed it: the tool ran again and the client got
+    // a second response (#281's class).
+    #[test]
+    fn a_response_over_the_window_still_retires_its_request() {
+        let replay = Mutex::new(ReplayState::default());
+        replay
+            .lock()
+            .unwrap()
+            .feed(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\"}\n");
+        assert!(replay.lock().unwrap().bytes() > 0);
+        let mut line = format!(
+            "{{\"id\":7,\"jsonrpc\":\"2.0\",\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
+            "x".repeat(REPLAY_WINDOW + 64 * 1024)
+        )
+        .into_bytes();
+        let mut carry = Carry::default();
+        for chunk in line.chunks_mut(16384) {
+            carry.retire_answered(chunk, &replay);
+        }
+        assert_eq!(
+            replay.lock().unwrap().bytes(),
+            0,
+            "the answered request is still held for replay"
+        );
+        // A string id, and a notification whose params carry an id.
+        let replay = Mutex::new(ReplayState::default());
+        replay
+            .lock()
+            .unwrap()
+            .feed(b"{\"jsonrpc\":\"2.0\",\"id\":\"two\",\"method\":\"tools/call\"}\n");
+        let mut carry = Carry::default();
+        let note = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"id\":\"two\",\"pad\":\"{}\"}}}}\n",
+            "y".repeat(REPLAY_WINDOW + 64 * 1024)
+        );
+        carry.retire_answered(note.as_bytes(), &replay);
+        assert!(
+            replay.lock().unwrap().bytes() > 0,
+            "a notification retires nothing"
+        );
+        let resp = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"two\",\"result\":\"{}\"}}\n",
+            "z".repeat(REPLAY_WINDOW + 64 * 1024)
+        );
+        carry.retire_answered(resp.as_bytes(), &replay);
+        assert_eq!(replay.lock().unwrap().bytes(), 0, "a string id retires");
+    }
+
+    // Child 1 reads the whole request and dies without answering, so the client is idle and the idle poll
+    // holds the request for the replacement. The request outgrows the pipe buffer, so the
+    // replay write into child 2, which never reads, completes only
+    // when child 2 dies, with an error: the replay state is cleared
+    // while `pending` still holds the request. The next idle poll
+    // then saw child 2's death and overwrote `pending` with the
+    // empty replay: the request was gone, and the client waited on
+    // it for ever. Child 3 serves.
+    #[cfg(unix)]
+    struct BigRequestThenWaitsForService {
+        sink: Arc<Mutex<Vec<u8>>>,
+        payload: &'static [u8],
+        sent: bool,
+    }
+
+    #[cfg(unix)]
+    impl Read for BigRequestThenWaitsForService {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                let n = self.payload.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.payload[..n]);
+                self.payload = &self.payload[n..];
+                if !self.payload.is_empty() {
+                    self.sent = false;
+                }
+                return Ok(n);
+            }
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if self.sink.lock().unwrap().ends_with(b"END\"}}\n") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(0)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_request_survives_a_replacement_that_dies_before_reading_it() {
+        let payload: &'static [u8] = Box::leak(
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"pad\":\"{}END\"}}}}\n",
+                "p".repeat(256 * 1024)
+            )
+            .into_boxed_str()
+            .into_boxed_bytes(),
+        );
+        let sink = Sink::default();
+        let spawns = Arc::new(Mutex::new(0u32));
+        let spawns2 = Arc::clone(&spawns);
+        // Child 1 reads exactly the request (a background `cat` in a
+        // non-interactive sh would read /dev/null), idles, and dies.
+        let reads_it_all = format!("head -c {} >/dev/null; sleep 0.8; exit 0", payload.len());
+        run_with(
+            move || {
+                let mut n = spawns2.lock().unwrap();
+                *n += 1;
+                let mut c = Command::new("sh");
+                c.args([
+                    "-c",
+                    match *n {
+                        1 => reads_it_all.as_str(),
+                        2 => "sleep 0.3; exit 0",
+                        _ => "cat",
+                    },
+                ]);
+                c
+            },
+            BigRequestThenWaitsForService {
+                sink: Arc::clone(&sink.0),
+                payload,
+                sent: false,
+            },
+            sink.clone(),
+        )
+        .unwrap();
+        assert!(
+            *spawns.lock().unwrap() >= 3,
+            "two dead children must be replaced"
+        );
+        let got = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            payload.len(),
+            "the request must reach the child that serves ({} of {} bytes arrived)",
+            got.len(),
+            payload.len()
         );
     }
 

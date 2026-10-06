@@ -5,6 +5,20 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Two ways the supervisor's replay lost track of a request. A
+  response longer than the 1 MiB replay window (a screenshot's
+  inline image, a long crawl) never retired the request it answered,
+  so every later crash of the daemon ran that request again and the
+  client got a second response; the supervisor now keeps the head of
+  an oversized response line, where the id is. And a request whose
+  replay into a fresh daemon failed because that daemon died before
+  reading it was dropped on the next idle poll, leaving the client
+  waiting for ever; it is held for the daemon after. (mnaza, #350)
+
 ## [4.5.0] - 2026-10-06
 
 ### Added
@@ -69,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Doctor preserves browser profile locks and existing probe files. Safe
   repairs back up corrupt state, leave unrelated models intact and recompute
   checks, counts and exit status after repair.
+
 
 ## [4.4.5] - 2026-10-06
 
