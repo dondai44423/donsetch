@@ -824,6 +824,26 @@ fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) ->
     adapter_host && !no_adapter && !matches!(verdict, Verdict::ContentOk)
 }
 
+// An adapter refusal or newly initialized session earns an HTTP recheck.
+// Saved wall memory must not skip that recovery; this call can still escalate
+// from its observed response and explicit browser requests keep precedence.
+fn fetch_route(
+    state: &crate::ghost::cache::GhostState,
+    host: &str,
+    tier: &str,
+    is_pdf_url: bool,
+    adapter_host: bool,
+    retry_http: bool,
+) -> RouteDecision {
+    if tier == "2" && !is_pdf_url && !adapter_host {
+        RouteDecision::SkipToSolve
+    } else if tier == "1" || is_pdf_url || adapter_host || retry_http {
+        RouteDecision::Cold
+    } else {
+        state.route_for(host)
+    }
+}
+
 /// One legacy-host navigation to seed the reddit session (#291
 /// follow-through): any old.reddit.com response runs its login
 /// flow and seeds the cookies `www.reddit.com` needs before it
@@ -1168,13 +1188,16 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             _ => None,
         }
     };
-    let route = if tier == "2" && !is_pdf_url && !adapter_host {
-        RouteDecision::SkipToSolve
-    } else if tier == "1" || is_pdf_url || adapter_host {
-        RouteDecision::Cold
-    } else {
-        daemon.state.lock().await.route_for(&host)
-    };
+    let retry_http =
+        no_adapter || args.get("_reddit_session").and_then(Value::as_bool) == Some(true);
+    let route = fetch_route(
+        &*daemon.state.lock().await,
+        &host,
+        tier,
+        is_pdf_url,
+        adapter_host,
+        retry_http,
+    );
 
     let warm_cookies: Vec<CookieRecord> = match &route {
         RouteDecision::Warm(c) => c.clone(),
@@ -4930,6 +4953,61 @@ mod budget_tests {
 mod adapter_hop_tests {
     use super::*;
     use crate::detect::walls::Vendor;
+
+    #[test]
+    fn recovery_retries_recheck_http_despite_saved_wall_routes() {
+        use crate::ghost::cache::{DomainProfile, GhostState};
+        let host = "www.reddit.com";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut state = GhostState::default();
+        state.profiles.insert(
+            host.into(),
+            DomainProfile {
+                needs_tier2: true,
+                last_cold_check: now,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            fetch_route(&state, host, "auto", false, false, false),
+            RouteDecision::SkipToSolve
+        ));
+        assert!(matches!(
+            fetch_route(&state, host, "auto", false, false, true),
+            RouteDecision::Cold
+        ));
+        let profile = state.profiles.get_mut(host).unwrap();
+        profile.wall_fail_streak = 2;
+        profile.last_wall_fail = now;
+        assert!(matches!(
+            fetch_route(&state, host, "auto", false, false, false),
+            RouteDecision::SolveCooldown(_)
+        ));
+        assert!(matches!(
+            fetch_route(&state, host, "auto", false, false, true),
+            RouteDecision::Cold
+        ));
+        // Explicit browser requests and other remembered walls keep their route.
+        assert!(matches!(
+            fetch_route(&state, host, "2", false, false, true),
+            RouteDecision::SkipToSolve
+        ));
+        assert!(matches!(
+            fetch_route(&state, host, "1", false, false, false),
+            RouteDecision::Cold
+        ));
+        assert!(matches!(
+            fetch_route(&state, host, "2", true, false, false),
+            RouteDecision::Cold
+        ));
+        assert!(matches!(
+            fetch_route(&state, host, "auto", false, true, false),
+            RouteDecision::Cold
+        ));
+    }
 
     // #287: a challenge (or any non-content verdict) on an adapter
     // endpoint must retry the caller's URL. Before this, the

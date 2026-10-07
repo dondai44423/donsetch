@@ -282,7 +282,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 - **`must_contain`**: verifies a claim against the full page but returns MATCH/NO-MATCH plus up to 3 excerpts (~60 tokens instead of 4k).
 - **`archive=auto`**: a dead link serves the nearest Wayback snapshot, honestly labeled with its age.
 - **`stitch=true`**: collects up to six same-host parts within 1 MiB. Output obeys `max_chars`; `next_offset` resumes collected text and `next_part` identifies an unfinished part.
-- **Read budgets**: `mode=scan` / `read` / `deep` set 800 / 4000 / 16000 chars; explicit `max_chars` wins. `read_status` and `content_complete` distinguish partial output from a complete read. Reddit subsets expose `partial` and known item counts.
+- **Read budgets**: `mode=scan` / `read` / `deep` set 800 / 4000 / 16000 extracted bytes; explicit `max_chars` wins. The source title/URL header and structured metadata sit outside this body budget. `read_status` and `content_complete` distinguish partial output from a complete read. Reddit subsets expose `partial` and known item counts.
 - **`deadline_ms` everywhere**: real MCP cancellation, progress notifications, ms cost footer. Nothing can silently hang.
 - **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites get restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable.
 - **Anti-cloak check**: on decoy-prone domains, tier-1 responses are equivalence-checked against a headless render, so `decoy suspected` is stamped instead of silently passing as content.

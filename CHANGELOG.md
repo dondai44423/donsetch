@@ -7,13 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.5.3] - 2026-10-07
+## [4.5.4] - 2026-10-07
 
 ### Fixed
 
 - Reddit tier-one retrieval overlaps JSON and session requests while retaining
-  public HTML/session recovery. Stack Overflow public question URLs gain an API
-  path for question, answers, comments and selected sections, with website
+  public HTML/session recovery. Recovery retries recheck HTTP even when a saved
+  wall profile would skip it; explicit browser requests keep their route.
+  Stack Overflow public question URLs gain an API path for question, answers,
+  comments and selected sections, with website
   fallback on unavailable items, service errors or backoff.
 - CSS selectors fail closed across HTML, JSON, PDF and adapters. Invalid
   selectors fail before a request. Original URLs are checked before adapter
