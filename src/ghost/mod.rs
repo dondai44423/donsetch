@@ -1252,14 +1252,12 @@ impl Ghost {
         } {
             let authed = !p.user.is_empty() || !p.pass.is_empty();
             let arg = if authed {
-                match relay::Relay::spawn(std::sync::Arc::new(p.clone())).await {
-                    Some(r) => {
-                        let arg = r.chrome_arg();
-                        relay = Some(r);
-                        arg
-                    }
-                    None => p.chrome_proxy_arg(),
-                }
+                let r = relay::Relay::spawn(std::sync::Arc::new(p.clone()))
+                    .await
+                    .map_err(|e| FetchError::ghost(format!("proxy relay bind failed: {e}")))?;
+                let arg = r.chrome_arg();
+                relay = Some(r);
+                arg
             } else {
                 p.chrome_proxy_arg()
             };

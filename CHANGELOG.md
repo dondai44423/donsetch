@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Browser proxy relays bound their owned tunnels, close active connections on
+  retirement, and reject invalid SOCKS negotiation and target encodings.
+  An authenticated relay bind failure stops launch with an error.
 - Persona HTTP fetches use the shared revalidation cache with their actual
   language and request identity. Bodyless HTTP/1 304 and 204 responses finish
   at the headers, and cookie-warm retries reject unsolicited 304 responses.
