@@ -902,8 +902,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn reaper_shutdown_kills_and_reaps() {
-        let child = tokio::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
+        // Like Xvfb, the fixture is the owned executable, not a shell
+        // whose orphaned grandchild can keep the test's output pipes open.
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
             .spawn()
             .expect("spawn");
         let pid = child.id().expect("pid");
