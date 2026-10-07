@@ -84,6 +84,22 @@ async fn fetch_with_budget(
     let trace = witness
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A deadline or cancellation can interrupt an action before its result
+    // arrives. The side effect may still have happened; never advise replay.
+    if result["isError"] == true
+        && trace
+            .iter()
+            .any(|step| step["action"] == "action-execution" && step["outcome"] == "started")
+    {
+        let action = "inspect the result with a plain fetch without actions; earlier actions may have completed, so do not replay them automatically";
+        result["errorKind"] = json!("permanent");
+        result["structuredContent"]["retry_safe"] = json!(false);
+        result["structuredContent"]["next_action"] = json!(action);
+        if let Some(text) = result["content"][0]["text"].as_str() {
+            let message = text.split("\n\nNext action:").next().unwrap_or(text);
+            result["content"][0]["text"] = json!(format!("{message}\n\nNext action: {action}"));
+        }
+    }
     add_shot_receipt(args, &mut result, &trace);
     drop(trace);
     if args.get("links").and_then(Value::as_bool) == Some(true)
@@ -3147,6 +3163,7 @@ pub(super) async fn fetch_with_actions(
 
     // Run the script.
     let t2 = std::time::Instant::now();
+    trace.step("2", "action-execution", "started", 0);
     let outcomes = match crate::ghost::actions::run(&mut g, actions).await {
         Ok(o) => {
             trace.step(
@@ -3170,7 +3187,7 @@ pub(super) async fn fetch_with_actions(
                 .collect();
             return tool_error_structured(
                 format!(
-                    "actions[{step}] failed: {reason} : steps before it succeeded (see structuredContent.actions); fix the step and re-run"
+                    "actions[{step}] failed: {reason} : an action may already have completed (see structuredContent.actions)"
                 ),
                 "permanent",
                 Some(json!({
@@ -3290,7 +3307,7 @@ pub(super) async fn fetch_with_actions(
     let Some(ex) = best else {
         return tool_error_structured(
             format!(
-                "actions succeeded but the resulting page yielded no extractable content ({}KB DOM) : the site may still be loading; add a wait step and re-run",
+                "actions succeeded but the resulting page yielded no extractable content ({}KB DOM) : inspect the resulting page without repeating actions",
                 html.len() / 1024
             ),
             "transient",

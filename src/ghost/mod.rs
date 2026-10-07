@@ -1379,7 +1379,24 @@ impl Ghost {
             reader,
             stderr_tail.clone(),
         )));
-        let cdp = cdp::Cdp::connect(&ws_url).await?;
+        let mut setup_error = |error: FetchError| {
+            if crate::config::cfg().debug.ghost {
+                let exit = match child.try_wait() {
+                    Ok(Some(status)) => status.to_string(),
+                    Ok(None) => "not observed".into(),
+                    Err(error) => format!("wait error: {error}"),
+                };
+                let tail = stderr_tail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                eprintln!(
+                    "[ghost] setup CDP error: {error}; browser={exit}; stderr={}",
+                    launch_failure_detail(&tail)
+                );
+            }
+            error
+        };
+        let cdp = cdp::Cdp::connect(&ws_url).await.map_err(&mut setup_error)?;
         // Replant the session vault: login/session cookies harvested
         // from earlier browser runs. Best-effort by design: a walled
         // or hostile cookie shape can never fail a launch. Only the
@@ -1394,10 +1411,11 @@ impl Ghost {
         // One page target, attached flat.
         let target = cdp
             .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
-            .await?
+            .await
+            .map_err(&mut setup_error)?
             .get("targetId")
             .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no targetId"))?
+            .ok_or_else(|| setup_error(FetchError::ghost("no targetId")))?
             .to_string();
         let session = cdp
             .call(
@@ -1405,10 +1423,11 @@ impl Ghost {
                 "Target.attachToTarget",
                 json!({ "targetId": target, "flatten": true }),
             )
-            .await?
+            .await
+            .map_err(&mut setup_error)?
             .get("sessionId")
             .and_then(Value::as_str)
-            .ok_or_else(|| FetchError::ghost("no sessionId"))?
+            .ok_or_else(|| setup_error(FetchError::ghost("no sessionId")))?
             .to_string();
         // Focused browser network SSRF guard: intercept every request
         // at the CDP Fetch layer before it hits the network. This
@@ -1438,12 +1457,15 @@ impl Ghost {
             // The guard was started before enabling interception so no
             // request-paused event can be missed. Stop it on setup failure
             // so a partially initialized Ghost never leaves a task behind.
-            return Err(FetchError::ghost(format!("Fetch.enable: {e}")));
+            return Err(setup_error(FetchError::ghost(format!("Fetch.enable: {e}"))));
         }
         cdp.track_document(session.clone());
-        cdp.call(Some(&session), "Page.enable", json!({})).await?;
+        cdp.call(Some(&session), "Page.enable", json!({}))
+            .await
+            .map_err(&mut setup_error)?;
         cdp.call(Some(&session), "Network.enable", json!({}))
-            .await?;
+            .await
+            .map_err(&mut setup_error)?;
 
         // No script is injected before page scripts, deliberately.
         //
@@ -1547,7 +1569,8 @@ impl Ghost {
                         "screenHeight": vh
                     }),
                 )
-                .await?;
+                .await
+                .map_err(&mut setup_error)?;
             }
         }
 
@@ -1574,7 +1597,8 @@ impl Ghost {
                     json!({ "url": "https://example.com/" }),
                     35,
                 )
-                .await;
+                .await
+                .map_err(&mut setup_error);
         }
 
         Ok(Self {
@@ -1688,10 +1712,8 @@ impl Ghost {
         self.dirty.load(std::sync::atomic::Ordering::Acquire) || self.cdp.was_cancelled()
     }
 
-    /// Reap the browser entirely : the whole process tree,
-    /// plus crashpad handlers on Unix (they daemonize into
-    /// their own groups and escape the group kill; on Windows
-    /// the Job Object already owns them).
+    /// Reap the owned browser tree. Native crash handlers close with their
+    /// browser client connection; unrelated processes are never scanned.
     ///
     /// Graceful first, hard kill only as the fallback. Chromium
     /// checkpoints the cookie DB, Local Storage, session files and
@@ -1740,12 +1762,10 @@ impl Ghost {
             .await
             .is_ok()
         {
-            sweep_crashpad();
             return;
         }
         // Hard fallback: hung browser. Last-resort only.
         self.proc.kill_group();
-        sweep_crashpad();
         let _ = self.child.wait().await;
     }
 
@@ -2593,7 +2613,6 @@ impl Drop for Ghost {
         // dropped the Ghost, but without a Drop impl the tokio
         // Child was dropped without killing Chrome.
         self.proc.kill_group();
-        sweep_crashpad();
         // Stop refreshing the winlock's mtime before removing it :
         // same abort-then-cleanup order as fetch_guard above.
         #[cfg(windows)]
@@ -2705,36 +2724,6 @@ fn named_key(key: &str) -> Option<(&'static str, i64)> {
         _ => return None,
     })
 }
-
-/// Kill chrome_crashpad processes belonging to our
-/// ghost profile (they daemonize into their own
-/// process groups and escape group kills). Linux-only:
-/// uses /proc; macOS has no /proc and Windows's Job
-/// Object already owns the crashpad handlers.
-#[cfg(linux_like)]
-fn sweep_crashpad() {
-    let marker = profile_dir().to_string_lossy().into_owned();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
-            continue;
-        };
-        let Ok(cmdline) = std::fs::read_to_string(e.path().join("cmdline")) else {
-            continue;
-        };
-        if cmdline.contains("crashpad") && cmdline.contains(&marker) {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-#[cfg(not(linux_like))]
-fn sweep_crashpad() {}
 
 /// Writes a captured image to `dest`, readable by its owner only.
 pub(crate) fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {

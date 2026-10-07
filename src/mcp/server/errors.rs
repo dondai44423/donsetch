@@ -254,13 +254,16 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
             "guard.ssrf"
         }
         _ if m.contains("deadline") => "deadline.hit",
+        _ if m.contains("cdp timeout:") || m.contains("cdp connect: ws handshake timeout") => {
+            "browser.timeout"
+        }
         _ if m.contains("cdp link closed")
             || m.contains("cdp dropped:")
-            || m.contains("cdp send:") =>
+            || m.contains("cdp send:")
+            || m.contains("cdp connect:") =>
         {
             "browser.transport"
         }
-        _ if m.contains("cdp timeout:") => "browser.timeout",
         _ if m.contains("dns") => "network.dns",
         _ if m.contains("timeout") || m.contains("timed out") => "network.timeout",
         _ if m.contains("rate limit") || m.contains("429") => "network.ratelimit",
@@ -295,9 +298,26 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
 pub(super) fn tool_error_structured(
     message: impl Into<String>,
     kind: &str,
-    structured: Option<Value>,
+    mut structured: Option<Value>,
 ) -> Value {
     let mut text = message.into();
+    let code = error_code(&text, structured.as_ref());
+    let kind = if matches!(code.as_ref(), "browser.transport" | "browser.timeout") {
+        let state = structured.get_or_insert_with(|| json!({}));
+        if state["retry_safe"] == false {
+            state["next_action"] = json!(
+                "inspect the result with a plain fetch without actions; earlier actions may have completed, so do not replay them automatically"
+            );
+            "permanent"
+        } else {
+            state["next_action"] = json!(
+                "retry the read once; if it repeats, inspect browser diagnostics and available resources"
+            );
+            "transient"
+        }
+    } else {
+        kind
+    };
     // Fold next_action from structured into the text for clients
     // (Claude Code, VSCode) that drop text when structuredContent
     // is present. next_action is critical for agent recovery.
@@ -307,7 +327,6 @@ pub(super) fn tool_error_structured(
     {
         text.push_str(&format!("\n\nNext action: {action}"));
     }
-    let code = error_code(&text, structured.as_ref());
     let mut v = json!({
         "content": [{ "type": "text", "text": text }],
         "isError": true,
@@ -804,18 +823,32 @@ mod error_code_tests {
                 "browser navigation error: ghost: cdp timeout: Page.navigate",
                 "browser.timeout",
             ),
+            (
+                "browser launch failed: ghost: cdp connect: IO error: Connection refused",
+                "browser.transport",
+            ),
+            (
+                "browser launch failed: ghost: cdp connect: ws handshake timeout",
+                "browser.timeout",
+            ),
         ] {
             let result = tool_error_structured(
                 message,
-                "transient",
+                "permanent",
                 Some(
-                    json!({"url":"https://owned.test/", "status":null, "verdict":"Challenge(Cloudflare)"}),
+                    json!({"url":"https://owned.test/", "status":null, "verdict":"Challenge(Cloudflare)", "next_action":"check the URL; the site may be blocking"}),
                 ),
             );
             assert_eq!(result["code"], expected, "{message}");
             assert_eq!(result["structuredContent"]["code"], expected);
             assert_eq!(result["structuredContent"]["read_status"], "error");
             assert_eq!(result["structuredContent"]["content_ok"], false);
+            assert_eq!(result["errorKind"], "transient");
+            let action = result["structuredContent"]["next_action"].as_str().unwrap();
+            assert!(action.contains("browser"), "{action}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(action));
+            assert!(!text.contains("site may be blocking"));
         }
         assert_eq!(
             error_code("interactive captcha requires a human", None),
@@ -824,6 +857,19 @@ mod error_code_tests {
         assert_eq!(
             error_code("SSRF guard: private/loopback", None),
             "guard.ssrf"
+        );
+        let action_failure = tool_error_structured(
+            "actions[0] failed: ghost: cdp link closed",
+            "transient",
+            Some(json!({"url":"https://owned.test/", "retry_safe":false})),
+        );
+        assert_eq!(action_failure["errorKind"], "permanent");
+        assert_eq!(action_failure["structuredContent"]["retry_safe"], false);
+        assert!(
+            action_failure["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("do not replay")
         );
     }
 

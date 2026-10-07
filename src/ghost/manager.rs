@@ -765,6 +765,124 @@ mod pool_tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[ignore = "requires installed Chromium; retires only its own two private browsers"]
+    async fn stealth_v3_native_teardown_preserves_another_slots_zygotes() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.browser.backend = crate::config::BrowserBackend::Headless;
+        config.browser.cloak_auto_download = false;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let profile = BrowserProfile::chrome(151, crate::profile::Platform::Linux, false);
+        let first = Ghost::launch(&profile, None).await.unwrap();
+        let first_pid = first.pid().unwrap();
+        let file = crate::paths::cache_dir().join("owned-teardown.html");
+        std::fs::write(&file, "<h1>Owned surviving browser document</h1>").unwrap();
+        let url = url::Url::from_file_path(&file).unwrap().to_string();
+        first.navigate_raw(&url, false).await.unwrap();
+        assert!(
+            first
+                .outer_html()
+                .await
+                .unwrap()
+                .contains("Owned surviving")
+        );
+        let mut second = Ghost::launch(&profile, None).await.unwrap();
+        assert_ne!(second.pid(), first.pid());
+        assert!(first.temp_profile.is_none());
+        assert!(second.temp_profile.is_some());
+        // The native handler advertises its PID in this browser's own
+        // zygote argv. Never infer ownership from a shared crash database.
+        let handler_pid = |browser: u32| -> i32 {
+            for task in std::fs::read_dir(format!("/proc/{browser}/task"))
+                .unwrap()
+                .flatten()
+            {
+                let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+                    continue;
+                };
+                for child in children.split_whitespace() {
+                    let Ok(cmdline) = std::fs::read(format!("/proc/{child}/cmdline")) else {
+                        continue;
+                    };
+                    let command = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+                    if let Some(pid) = command.split_whitespace().find_map(|arg| {
+                        arg.strip_prefix("--crashpad-handler-pid=")?
+                            .parse::<i32>()
+                            .ok()
+                    }) {
+                        assert!(pid > 0);
+                        let executable = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+                        assert_eq!(executable.file_name().unwrap(), "chrome_crashpad_handler");
+                        return pid;
+                    }
+                }
+            }
+            panic!("native browser must expose its own crash handler PID");
+        };
+        let first_handler = handler_pid(first_pid);
+        let second_handler = handler_pid(second.pid().unwrap());
+        assert_ne!(first_handler, second_handler);
+        second.kill().await;
+        drop(second);
+        // Give native process death/events a chance to arrive; a response
+        // queued before teardown would not prove the renderer survived.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let live = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .is_ok_and(|status| !status.contains("State:\tZ"))
+        };
+        assert!(live(first_handler));
+        assert!(
+            !live(second_handler),
+            "native handler exits when its owned browser closes"
+        );
+        let next = crate::paths::cache_dir().join("owned-teardown-next.html");
+        std::fs::write(&next, "<h1>Owned new renderer after peer retirement</h1>").unwrap();
+        first
+            .navigate_raw(url::Url::from_file_path(next).unwrap().as_str(), false)
+            .await
+            .unwrap();
+        assert!(
+            first
+                .outer_html()
+                .await
+                .unwrap()
+                .contains("Owned new renderer")
+        );
+        first.navigate_raw(&url, false).await.unwrap();
+        assert!(
+            first
+                .outer_html()
+                .await
+                .unwrap()
+                .contains("Owned surviving")
+        );
+        assert_eq!(first.pid(), Some(first_pid));
+        assert!(!first.link_dead());
+        let third = Ghost::launch(&profile, None).await.unwrap();
+        let third_handler = handler_pid(third.pid().unwrap());
+        assert_ne!(first_handler, third_handler);
+        drop(third);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(live(first_handler));
+        assert!(
+            !live(third_handler),
+            "hard teardown also releases the native handler"
+        );
+        first.navigate_raw(&url, false).await.unwrap();
+        assert!(
+            first
+                .outer_html()
+                .await
+                .unwrap()
+                .contains("Owned surviving")
+        );
+        assert!(!first.link_dead());
+        drop(first);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires a native EGL-capable GPU; owns a fresh private browser"]
     async fn stealth_v3_native_headless_webgl_renders_actual_pixels() {
         native_webgl_pixels(crate::config::BrowserBackend::Headless).await;
@@ -1223,6 +1341,7 @@ mod pool_tests {
                                 "/owned" | "/during" => (201, format!("<html><body><article><h1>Owned recovered generation</h1><p>{}</p></article></body></html>",
                                     "This is useful owned research content with a real status from the new browser. ".repeat(30))),
                                 "/human" => (403, "<h1>Verify you are human</h1><form><div class='g-recaptcha'></div></form>".into()),
+                                "/human-article" => (403, format!("<title>It needs a human touch</title><h1>It needs a human touch</h1><article><div id='px-captcha'><iframe></iframe></div><p>{}</p></article>", "Complete the verification shown below before browsing. Here is additional help for displaying the verification widget. ".repeat(40))),
                                 "/favicon.ico" => (404, String::new()),
                                 _ => panic!("unexpected owned request {path}"),
                             };
@@ -1236,7 +1355,7 @@ mod pool_tests {
                         });
                     }
                     finished = handlers.join_next(), if !handlers.is_empty() => {
-                        if finished.unwrap().unwrap().as_deref() == Some("/human") {
+                        if finished.unwrap().unwrap().as_deref() == Some("/human-article") {
                             return seen.lock().unwrap().clone();
                         }
                     }
@@ -1327,10 +1446,37 @@ mod pool_tests {
             super::super::ops::BrowserOutcome::HumanRequired
         );
         assert_eq!(human.page.document.status, Some(403));
+        let started = Instant::now();
+        let human = manager
+            .read_document(
+                human.guard,
+                &profile,
+                &url.replace("/owned", "/human-article"),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "human help text must not satisfy content settling"
+        );
+        assert_eq!(human.guard.pid().unwrap(), current_pid);
+        assert!(human.recovery.is_none());
+        assert_eq!(
+            human.page.outcome,
+            super::super::ops::BrowserOutcome::HumanRequired
+        );
+        assert_eq!(human.page.document.status, Some(403));
         let seen = server.await.unwrap();
         assert_eq!(seen.iter().filter(|p| p.as_str() == "/owned").count(), 1);
         assert_eq!(seen.iter().filter(|p| p.as_str() == "/during").count(), 2);
         assert_eq!(seen.iter().filter(|p| p.as_str() == "/human").count(), 1);
+        assert_eq!(
+            seen.iter()
+                .filter(|p| p.as_str() == "/human-article")
+                .count(),
+            1
+        );
         let error = manager
             .read_document(
                 human.guard,

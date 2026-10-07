@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed HTTP replay cannot replace a valid browser document's status.
 - Headless and virtual-display windows stay normal so native mouse events and
   screenshots receive compositor acknowledgements promptly.
+- Browser teardown no longer scans and kills processes whose arguments contain
+  crashpad. That scan could kill another pool slot’s renderers, GPU and zygotes.
+  Native crash handlers follow their own browser connection lifetime.
 - Browser launch owns stderr readers and request guards before setup completes,
   drains bounded stderr continuously, and reports DevTools transport and browser
   exit diagnostics. A stale DOM root is reacquired once during a read.
@@ -44,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its original deadline, retaining viewport, locale and direct-routing settings. Fetch,
   pre-action reads, search, crawl and screenshot share this recovery; actions
   are never replayed. CDP failures report browser transport or timeout codes.
+- Human verification help articles with an active CAPTCHA remain terminal walls.
+  Browser startup failures retain diagnostic context, and failed or interrupted
+  action scripts explicitly warn against replaying possible side effects.
 - HTTP revalidation cache entries follow the selected proxy identity and exact request
   headers, including sent cookies and referrer. Login, logout and route changes
   cannot reuse another context's body. Invalid or wildcard Vary fields evict

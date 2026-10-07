@@ -161,6 +161,31 @@ mod stealth_v3_tests {
         );
         assert_eq!(detect_dom_smart(article.as_bytes()), Verdict::ContentOk);
     }
+
+    #[test]
+    fn stealth_v3_human_touch_gate_is_not_an_article_with_help_text() {
+        let help = "Complete the verification shown below to continue browsing. The following advice explains how the browser can display the verification widget. ".repeat(40);
+        let wall = format!(
+            "<title>It needs a human touch</title><h1>It needs a human touch</h1><article><div id='px-captcha'><iframe></iframe></div><p>{help}</p></article>"
+        );
+        assert!(matches!(
+            detect_dom_smart(wall.as_bytes()),
+            Verdict::Challenge(Vendor::PerimeterX)
+        ));
+        assert!(human_captcha(wall.as_bytes()));
+        let article = format!(
+            "<title>Design needs a human touch</title><article><h1>Design needs a human touch</h1><p>{help}</p><div id='px-captcha'></div></article>"
+        );
+        assert_eq!(detect_dom_smart(article.as_bytes()), Verdict::ContentOk);
+        let inactive = format!(
+            "<title>Ordinary research article</title><h1>Ordinary research article</h1><script>let inactive = '<h1>It needs a human touch</h1><div id=px-captcha></div>';</script><article><p>{help}</p></article>"
+        );
+        assert_eq!(detect_dom_smart(inactive.as_bytes()), Verdict::ContentOk);
+        let quoted = format!(
+            "<title>It needs a human touch</title><style>#px-captcha{{display:none}}</style><script>let template = '<div id=px-captcha></div>';</script><article><h1>Research notes</h1><p>{help}</p></article>"
+        );
+        assert_eq!(detect_dom_smart(quoted.as_bytes()), Verdict::ContentOk);
+    }
 }
 
 #[cfg(test)]
@@ -653,6 +678,17 @@ fn interstitial_heading(lower_text: &str) -> bool {
                         _ => !inside_tag,
                     })
                     .collect();
+                // A PX human gate can put thousands of translated help
+                // characters inside <article>. Require the observed gate
+                // heading and a real widget element, not an inactive script.
+                if cleaned.trim() == "it needs a human touch"
+                    && scraper::Html::parse_document(lower_text)
+                        .select(&scraper::Selector::parse("#px-captcha").unwrap())
+                        .next()
+                        .is_some()
+                {
+                    return true;
+                }
                 if INTERSTITIAL_TITLES.iter().any(|m| cleaned.contains(m)) {
                     return true;
                 }
