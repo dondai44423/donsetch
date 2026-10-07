@@ -18,6 +18,7 @@ pub mod cache;
 pub mod cdp;
 pub mod cloak;
 pub mod document;
+mod lifecycle;
 pub mod manager;
 pub mod ops;
 pub mod probe;
@@ -34,7 +35,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 #[cfg(linux_like)]
 use std::os::unix::process::CommandExt as _;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 
 use crate::error::FetchError;
@@ -215,7 +216,9 @@ pub struct Ghost {
     /// (including those triggered by browser actions) and enforces
     /// `fetch::guards::ensure_url_safe` before it hits the network.
     /// Aborted in Drop so it cannot leak after Chrome is reaped.
-    fetch_guard: Option<tokio::task::JoinHandle<()>>,
+    fetch_guard: Option<lifecycle::OwnedTask>,
+    stderr_reader: Option<lifecycle::OwnedTask>,
+    stderr_tail: lifecycle::StderrTail,
     /// The browser window found at launch (None when no window was
     /// found) and whether it is currently minimized. Captures
     /// restore the window for their call and re-minimize after;
@@ -233,7 +236,7 @@ pub struct Ghost {
     /// another daemon's staleness check (see WINLOCK_HEARTBEAT).
     /// Aborted in Drop, same as fetch_guard.
     #[cfg(windows)]
-    winlock_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    winlock_heartbeat: Option<lifecycle::OwnedTask>,
     /// Persona-coherent wire identity (v4 E2): viewport + locale used
     /// for launch args, CDP languages, and device metrics.
     wire: GhostWire,
@@ -343,7 +346,7 @@ pub fn default_chrome_args_wire(
     wire: &GhostWire,
 ) -> Vec<String> {
     let (vw, vh) = wire.viewport;
-    vec![
+    let mut args = vec![
         "--remote-debugging-port=0".into(),
         format!("--user-data-dir={}", dir.display()),
         format!("--user-agent={}", profile.user_agent),
@@ -379,15 +382,18 @@ pub fn default_chrome_args_wire(
         // This window is the only one this tool has; keep it
         // rendering. (Playwright ships the same switch.)
         "--disable-backgrounding-occluded-windows".into(),
-        // Software WebGL: a GPU-less box (Xvfb, VM, container)
-        // must still expose a renderer string. WebGL=null is a
-        // headless-only signature real desktops never produce;
-        // SwiftShader always initialises, so the page reads
-        // "Google SwiftShader" exactly like real Chrome on a
-        // machine without dedicated graphics.
-        "--use-gl=swiftshader".into(),
-        "--enable-unsafe-swiftshader".into(),
-    ]
+        // Headless Chromium otherwise suppresses hardware GPU support.
+        // This retains the browser's driver blocklist and sandbox.
+        "--enable-gpu".into(),
+    ];
+    if cfg!(target_os = "linux") {
+        // ANGLE's EGL backend can use the real render device without an
+        // X11 GPU surface. Owned headless/Xvfb draw/readback qualified it;
+        // unsupported drivers still report their native capability failure.
+        args.push("--use-gl=angle".into());
+        args.push("--use-angle=gl-egl".into());
+    }
+    args
 }
 
 /// Whether sandbox is disabled via explicit opt-in.
@@ -1155,7 +1161,7 @@ impl Ghost {
         // this can't just rely on WINLOCK_STALE_AFTER alone.
         #[cfg(windows)]
         let winlock_heartbeat = winlock.clone().map(|p| {
-            tokio::spawn(async move {
+            lifecycle::OwnedTask(tokio::spawn(async move {
                 use std::os::windows::fs::OpenOptionsExt;
                 loop {
                     tokio::time::sleep(WINLOCK_HEARTBEAT).await;
@@ -1169,7 +1175,7 @@ impl Ghost {
                         let _ = f.set_modified(std::time::SystemTime::now());
                     }
                 }
-            })
+            }))
         });
 
         std::fs::create_dir_all(&dir)
@@ -1269,9 +1275,8 @@ impl Ghost {
         //
         // macOS / Windows: no Xvfb, but headful Chrome with the
         //   window positioned at -32000,-32000 (far off-screen).
-        //   The window exists, has real GPU, real WebGL : but the
-        //   user never sees it. This is strictly better than
-        //   --headless=new, which uses SwiftShader (detectable).
+        //   The native window remains off-screen. GPU capability belongs
+        //   to the installed browser/driver, in headful and headless modes.
         //
         // Fallback (no display, no platform support): --headless=new.
 
@@ -1286,9 +1291,7 @@ impl Ghost {
             } else {
                 // No Xvfb available (Termux, headless server, WSL
                 // without X11). Fall back to headless mode.
-                // --headless=new is less stealthy than headful on
-                // Xvfb (SwiftShader WebGL, detectable), but it's
-                // the only option without a display.
+                // Native GPU support remains enabled when available.
                 chrome_args.push("--headless=new".into());
             }
         }
@@ -1371,6 +1374,11 @@ impl Ghost {
             ))
         })?;
 
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(stderr_tail));
+        let stderr_reader = lifecycle::OwnedTask(tokio::spawn(lifecycle::drain_stderr(
+            reader,
+            stderr_tail.clone(),
+        )));
         let cdp = cdp::Cdp::connect(&ws_url).await?;
         // Replant the session vault: login/session cookies harvested
         // from earlier browser runs. Best-effort by design: a walled
@@ -1418,7 +1426,7 @@ impl Ghost {
         // (reusing validated IPs for the connect) there is a residual
         // window. The transport layer re-validates at connect time,
         // but the browser's network stack does its own resolution.
-        let fetch_guard = cdp.spawn_fetch_guard(session.clone());
+        let fetch_guard = lifecycle::OwnedTask(cdp.spawn_fetch_guard(session.clone()));
         if let Err(e) = cdp
             .call(
                 Some(&session),
@@ -1430,7 +1438,6 @@ impl Ghost {
             // The guard was started before enabling interception so no
             // request-paused event can be missed. Stop it on setup failure
             // so a partially initialized Ghost never leaves a task behind.
-            fetch_guard.abort();
             return Err(FetchError::ghost(format!("Fetch.enable: {e}")));
         }
         cdp.track_document(session.clone());
@@ -1581,6 +1588,8 @@ impl Ghost {
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
+            stderr_reader: Some(stderr_reader),
+            stderr_tail,
             window_id,
             window_minimized: std::sync::atomic::AtomicBool::new(window_minimized),
             #[cfg(windows)]
@@ -1643,6 +1652,29 @@ impl Ghost {
 
     pub fn document(&self) -> document::Document {
         self.cdp.document()
+    }
+
+    pub(crate) fn link_error(&mut self, context: &str) -> FetchError {
+        let exit = match self.child.try_wait() {
+            Ok(Some(status)) => status.to_string(),
+            Ok(None) => "running".into(),
+            Err(_) => "unavailable".into(),
+        };
+        if crate::config::cfg().debug.ghost {
+            let tail = self.stderr_tail.lock().unwrap_or_else(|p| p.into_inner());
+            eprintln!(
+                "[ghost] transport={} exit={exit} generation={} frozen={} {}",
+                self.cdp.failure().unwrap_or("unavailable"),
+                self.document().generation,
+                self.frozen,
+                launch_failure_detail(&tail)
+            );
+        }
+        FetchError::ghost(format!(
+            "cdp link closed {context}: transport={}, browser={exit}, generation={}",
+            self.cdp.failure().unwrap_or("unavailable"),
+            self.document().generation
+        ))
     }
 
     pub(crate) fn operation(&self) -> Operation {
@@ -1842,33 +1874,13 @@ impl Ghost {
     /// Current document HTML. DOM domain only : no Runtime,
     /// no script execution.
     ///
-    /// Both calls are bounded to 3s per leg: session-scoped CDP
+    /// Calls are bounded to 3s for the root and 5s for its HTML: session-scoped CDP
     /// responses can queue for many seconds behind a settling
     /// navigation (Debian chromium 151). A bounded miss just costs
     /// one poll iteration; an unbounded one eats the whole render
     /// window and turns a recoverable stall into a hard failure.
     pub async fn outer_html(&self) -> Result<String, FetchError> {
-        let root = self
-            .cdp
-            .call_with_timeout(Some(&self.session), "DOM.getDocument", json!({}), 3)
-            .await?
-            .get("root")
-            .and_then(|r| r.get("nodeId"))
-            .and_then(Value::as_i64)
-            .ok_or_else(|| FetchError::ghost("no root node"))?;
-        Ok(self
-            .cdp
-            .call_with_timeout(
-                Some(&self.session),
-                "DOM.getOuterHTML",
-                json!({ "nodeId": root }),
-                5,
-            )
-            .await?
-            .get("outerHTML")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string())
+        read_document_html(&self.cdp, &self.session).await
     }
 
     /// Current page URL (targetInfo : no Runtime).
@@ -2566,9 +2578,8 @@ impl Drop for Ghost {
         // Abort the Fetch request guard so it cannot leak after
         // Chrome is reaped. The JoinHandle is cancellable; abort
         // is safe even if the task already completed.
-        if let Some(handle) = self.fetch_guard.take() {
-            handle.abort();
-        }
+        drop(self.fetch_guard.take());
+        drop(self.stderr_reader.take());
         // Safety net: kill_group sends SIGKILL to the whole
         // browser tree (process group on Unix, Job Object on
         // Windows). If kill().await was already called (reaper,
@@ -2584,9 +2595,7 @@ impl Drop for Ghost {
         // Stop refreshing the winlock's mtime before removing it :
         // same abort-then-cleanup order as fetch_guard above.
         #[cfg(windows)]
-        if let Some(handle) = self.winlock_heartbeat.take() {
-            handle.abort();
-        }
+        drop(self.winlock_heartbeat.take());
         // Release the Windows profile-exclusion lockfile (unix
         // flock releases itself when this handle closes).
         #[cfg(windows)]
@@ -2745,6 +2754,42 @@ fn decode_screenshot_data(data: &str) -> Result<Vec<u8>, FetchError> {
         .map_err(|e| FetchError::ghost(format!("screenshot data is not base64: {e}")))
 }
 
+// Navigation can invalidate the root between these two read-only calls.
+// Reacquire once only for Chromium's stale-node error; the fetch loop still
+// checks document generation before accepting the resulting HTML.
+async fn read_document_html(cdp: &cdp::Cdp, session: &str) -> Result<String, FetchError> {
+    for attempt in 0..2 {
+        let root = cdp
+            .call_with_timeout(Some(session), "DOM.getDocument", json!({}), 3)
+            .await?
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(Value::as_i64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| FetchError::ghost("no root node"))?;
+        let reply = cdp
+            .call_with_timeout(
+                Some(session),
+                "DOM.getOuterHTML",
+                json!({ "nodeId": root }),
+                5,
+            )
+            .await;
+        match reply {
+            Err(FetchError::Ghost(ref message))
+                if attempt == 0 && message.contains("Could not find node with given id") => {}
+            result => {
+                return result?
+                    .get("outerHTML")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| FetchError::ghost("DOM.getOuterHTML missing HTML"));
+            }
+        }
+    }
+    unreachable!("the second DOM read always returns")
+}
+
 /// Scan Chrome's stderr for the "DevTools listening on ws://…"
 /// endpoint line. Lossy per line : Chrome's pre-DevTools chatter
 /// can carry raw non-UTF-8 bytes (fontconfig/library paths on odd
@@ -2760,22 +2805,15 @@ async fn scan_for_ws_url<R: tokio::io::AsyncBufRead + Unpin>(
 ) -> Option<String> {
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
-            Ok(0) | Err(_) => return None,
-            Ok(_) => {}
+        match lifecycle::stderr_line(reader, &mut buf).await {
+            Ok(false) | Err(_) => return None,
+            Ok(true) => {}
         }
         let line = String::from_utf8_lossy(&buf);
         if let Some(i) = line.find("ws://") {
             return Some(line[i..].trim().to_string());
         }
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            tail.push(trimmed.chars().take(200).collect());
-            if tail.len() > 6 {
-                tail.remove(0);
-            }
-        }
+        lifecycle::retain_stderr(tail, &buf);
     }
 }
 
@@ -2797,6 +2835,95 @@ fn launch_failure_detail(tail: &[String]) -> String {
 mod sandbox_tests {
     use super::*;
     use crate::profile::BrowserProfile;
+
+    #[tokio::test]
+    async fn stealth_v3_dom_read_reacquires_only_a_stale_root_once() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (error, second_reply, expected_calls, expected_html) in [
+            (
+                Some("Could not find node with given id"),
+                json!({"result": {"outerHTML": "<html>new document</html>"}}),
+                4,
+                Some("<html>new document</html>"),
+            ),
+            (
+                Some("Could not find node with given id"),
+                json!({"error": {"message": "Could not find node with given id"}}),
+                4,
+                None,
+            ),
+            (
+                Some("Session with given id not found"),
+                json!({"result": {}}),
+                2,
+                None,
+            ),
+            (None, json!({"result": {}}), 2, None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut calls = Vec::new();
+                while calls.len() < expected_calls {
+                    let request: Value =
+                        serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                            .unwrap();
+                    let index = calls.len();
+                    assert_eq!(request["sessionId"], "owned");
+                    assert_eq!(
+                        request["method"],
+                        if index % 2 == 0 {
+                            "DOM.getDocument"
+                        } else {
+                            "DOM.getOuterHTML"
+                        }
+                    );
+                    let mut reply = if index % 2 == 0 {
+                        json!({"result": {"root": {"nodeId": index / 2 + 1}}})
+                    } else if index == 1 {
+                        error.map_or_else(
+                            || json!({"result": {}}),
+                            |message| json!({"error": {"message": message}}),
+                        )
+                    } else {
+                        second_reply.clone()
+                    };
+                    if index % 2 == 1 {
+                        assert_eq!(request["params"]["nodeId"], index / 2 + 1);
+                    }
+                    reply["id"] = request["id"].clone();
+                    ws.send(Message::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
+                    calls.push(request);
+                }
+                calls
+            });
+            let cdp = cdp::Cdp::connect(&format!("ws://{addr}")).await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_document_html(&cdp, "owned"),
+            )
+            .await
+            .unwrap();
+            let calls = server.await.unwrap();
+            assert_eq!(calls.len(), expected_calls);
+            match expected_html {
+                Some(html) => assert_eq!(result.unwrap(), html),
+                None => {
+                    let message = result.unwrap_err().to_string();
+                    assert!(
+                        message.contains(error.unwrap_or("missing HTML")),
+                        "{message}"
+                    );
+                }
+            }
+        }
+    }
 
     // Chrome's pre-DevTools stderr chatter can carry raw non-UTF-8
     // bytes (fontconfig/library paths on odd locales). Lines::

@@ -1,9 +1,8 @@
-//! Xvfb virtual display manager : the stealth foundation.
+//! Xvfb virtual display manager.
 //!
-//! Headless Chrome (`--headless=new`) is detectable: SwiftShader
-//! WebGL, missing `window.chrome`, screen dimension mismatches.
-//! Headful Chrome on a virtual X display is NOT : it has real
-//! GPU compositing, real window objects, real screen geometry.
+//! A virtual X display lets headful Chromium render without a visible
+//! desktop window. GPU capabilities depend on the installed browser,
+//! driver and launch policy in both headful and headless modes.
 //!
 //! This module starts one Xvfb at daemon init and keeps it warm.
 //! Ghost launches headful Chrome on this display. The display

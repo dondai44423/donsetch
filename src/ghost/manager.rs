@@ -668,6 +668,46 @@ mod pool_tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[ignore = "requires a native EGL-capable GPU; owns a fresh private browser"]
+    async fn stealth_v3_native_headless_webgl_renders_actual_pixels() {
+        native_webgl_pixels(crate::config::BrowserBackend::Headless).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires Xvfb and a native EGL-capable GPU; owns a private browser"]
+    async fn stealth_v3_native_xvfb_webgl_renders_actual_pixels() {
+        native_webgl_pixels(crate::config::BrowserBackend::Chromium).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn native_webgl_pixels(backend: crate::config::BrowserBackend) {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.browser.backend = backend;
+        config.browser.cloak_auto_download = false;
+        config.browser.pool_slots = 1;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let profile = BrowserProfile::chrome(151, crate::profile::Platform::Linux, false);
+        let mgr = GhostManager::new().await;
+        let g = mgr.acquire_for(&profile, Some("owned.test")).await.unwrap();
+        let results = g.eval_json("['webgl','webgl2'].map(kind=>{const c=document.createElement('canvas');c.width=c.height=16;const gl=c.getContext(kind);if(!gl)return {kind,available:false};gl.clearColor(18/255,52/255,86/255,1);gl.clear(gl.COLOR_BUFFER_BIT);const pixel=new Uint8Array(4);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);const e=gl.getExtension('WEBGL_debug_renderer_info');return {kind,available:true,pixel:[...pixel],error:gl.getError(),renderer:e?gl.getParameter(e.UNMASKED_RENDERER_WEBGL):null}})").await.unwrap();
+        assert_eq!(results.as_array().unwrap().len(), 2);
+        for result in results.as_array().unwrap() {
+            assert_eq!(
+                result["available"], true,
+                "native context unavailable: {result}"
+            );
+            assert_eq!(result["pixel"], serde_json::json!([18, 52, 86, 255]));
+            assert_eq!(result["error"], 0);
+            assert!(!result["renderer"].as_str().unwrap().is_empty());
+        }
+        drop(g);
+        mgr.shutdown().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires an installed Chromium; owns a local HTTP origin and private browser"]
     async fn stealth_v3_native_documents_reload_actions_and_terminal_tiny_walls() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1014,6 +1054,9 @@ mod pool_tests {
         .err()
         .unwrap();
         assert!(error.to_string().contains("cdp link closed"));
+        assert!(error.to_string().contains("transport="));
+        assert!(error.to_string().contains("browser="));
+        assert!(error.to_string().contains("generation="));
         assert!(failed_at.elapsed() < Duration::from_secs(1));
         drop(fresh);
         let mut replacement = mgr.acquire_for(&profile, Some("owned.test")).await.unwrap();

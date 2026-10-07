@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Failed HTTP replay cannot replace a valid browser document's status.
 - Headless and virtual-display windows stay normal so native mouse events and
   screenshots receive compositor acknowledgements promptly.
+- Browser launch owns stderr readers and request guards before setup completes,
+  drains bounded stderr continuously, and reports DevTools transport and browser
+  exit diagnostics. A stale DOM root is reacquired once during a read.
+- Linux Chromium uses ANGLE's EGL backend with native GPU support enabled,
+  replacing the nonworking legacy SwiftShader flags. WebGL availability still
+  depends on the installed browser and driver.
 
 ## [4.5.7] - 2026-10-07
 

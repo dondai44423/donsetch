@@ -387,7 +387,7 @@ pub async fn ghost_fetch(
     timeout: Duration,
 ) -> Result<GhostPage, FetchError> {
     if ghost.link_dead() {
-        return Err(FetchError::ghost("cdp link closed before browser pass"));
+        return Err(ghost.link_error("before browser pass"));
     }
     let mut operation = ghost.operation();
     let started = Instant::now();
@@ -477,7 +477,9 @@ async fn ghost_fetch_inner(
         let before = ghost.document();
         let observed_html = match ghost.outer_html().await {
             Ok(h) => h,
-            Err(e) if ghost.link_dead() => return Err(e),
+            Err(_) if ghost.link_dead() => {
+                return Err(ghost.link_error("while reading browser DOM"));
+            }
             Err(e) => {
                 if crate::config::cfg().debug.ghost {
                     eprintln!(

@@ -37,6 +37,7 @@ use windows_sys::Win32::System::Threading as thr;
 
 /// Owned platform handle to the browser process tree.
 pub struct Proc {
+    killed: std::sync::atomic::AtomicBool,
     #[cfg(unix)]
     pid: i32,
     #[cfg(windows)]
@@ -149,7 +150,10 @@ impl Proc {
             let pid = child.id().ok_or_else(|| {
                 FetchError::ghost("child has no pid (already reaped); refusing to own it")
             })? as i32;
-            Ok(Self { pid })
+            Ok(Self {
+                pid,
+                killed: std::sync::atomic::AtomicBool::new(false),
+            })
         }
         #[cfg(windows)]
         {
@@ -210,7 +214,11 @@ impl Proc {
                     "[ghost] AssignProcessToJobObject failed: {error} : browser tree will not be reaped on exit, leaving orphaned Chrome processes"
                 );
             }
-            Ok(Self { proc_handle, job })
+            Ok(Self {
+                proc_handle,
+                job,
+                killed: std::sync::atomic::AtomicBool::new(false),
+            })
         }
     }
 
@@ -258,6 +266,9 @@ impl Proc {
 
     /// Kill the whole tree.
     pub fn kill_group(&self) {
+        if self.killed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
         #[cfg(unix)]
         {
             if self.pid > 0 {
@@ -370,6 +381,7 @@ unsafe impl Sync for Proc {}
 
 impl Drop for Proc {
     fn drop(&mut self) {
+        self.kill_group();
         #[cfg(windows)]
         unsafe {
             fnd::CloseHandle(self.proc_handle);
@@ -416,5 +428,23 @@ mod tests {
         proc.kill_group();
         let status = child.wait().await.unwrap();
         assert!(!status.success(), "SIGKILLed child must not exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_dropping_launch_owner_reaps_child_without_completed_ghost() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        Proc::prepare_cmd(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let owned = Proc::from_child(&child).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        drop(owned);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
     }
 }

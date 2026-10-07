@@ -141,6 +141,15 @@ impl Cdp {
                     Some(Ok(msg)) => msg,
                     // Closed by the peer, or a reply the client will
                     // not frame: either way nothing more arrives here.
+                    Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(_))) => {
+                        break "websocket message/frame limit";
+                    }
+                    Some(Err(tokio_tungstenite::tungstenite::Error::Io(_))) => {
+                        break "websocket I/O error";
+                    }
+                    Some(Err(tokio_tungstenite::tungstenite::Error::Protocol(_))) => {
+                        break "websocket protocol error";
+                    }
                     Some(Err(_)) => break "websocket framing/read error",
                     None => break "websocket EOF",
                 };
@@ -215,6 +224,9 @@ impl Cdp {
                 .unwrap_or_else(|p| p.into_inner())
                 .get_or_insert(cause);
             dead_task.store(true, Ordering::Release);
+            // The guard clone also owns this sender. Remove it explicitly
+            // so EOF wakes an idle guard rather than leaving a task cycle.
+            *guard_task.lock().unwrap_or_else(|p| p.into_inner()) = None;
             pending_task
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -311,7 +323,10 @@ impl Cdp {
         {
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             if self.is_dead() {
-                return Err(FetchError::ghost(format!("cdp link closed: {method}")));
+                return Err(FetchError::ghost(format!(
+                    "cdp link closed: {method} ({})",
+                    self.failure().unwrap_or("unavailable")
+                )));
             }
             pending.insert(id, tx);
         }
@@ -329,8 +344,12 @@ impl Cdp {
                     .await
                     .map_err(|e| FetchError::ghost(format!("cdp send: {e}")))?;
             }
-            rx.await
-                .map_err(|_| FetchError::ghost(format!("cdp dropped: {method}")))
+            rx.await.map_err(|_| {
+                FetchError::ghost(format!(
+                    "cdp dropped: {method} ({})",
+                    self.failure().unwrap_or("unavailable")
+                ))
+            })
         })
         .await;
         if crate::config::cfg().debug.ghost && started.elapsed().as_millis() >= 1000 {
@@ -446,6 +465,27 @@ mod link_tests {
     use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn stealth_v3_idle_guard_exits_when_peer_closes_without_request_traffic() {
+        let (close, closed) = oneshot::channel();
+        let url = endpoint(|mut ws| async move {
+            closed.await.unwrap();
+            ws.close(None).await.unwrap();
+        })
+        .await;
+        let cdp = Cdp::connect(&url).await.unwrap();
+        let guard = cdp.spawn_fetch_guard("owned".into());
+        assert!(!guard.is_finished());
+        close.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), guard)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cdp.is_dead());
+        assert_eq!(cdp.failure(), Some("peer closed websocket"));
+        assert!(cdp.guard_queue.lock().unwrap().is_none());
+    }
 
     // A DevTools endpoint stand-in: accepts one websocket and runs
     // `serve` on it.
@@ -754,5 +794,6 @@ mod link_tests {
             started.elapsed()
         );
         assert!(cdp.is_dead());
+        assert_eq!(cdp.failure(), Some("websocket message/frame limit"));
     }
 }
