@@ -195,31 +195,18 @@ impl Proxy {
     ///   "user:pass@host:port"  (bare = HTTP CONNECT, backward compat)
     ///   "host:port"            (no auth, HTTP CONNECT)
     pub fn parse(s: &str) -> Result<Self, FetchError> {
-        // E5: an unsupported scheme ("socks4://host:1080") used to
-        // parse as HTTP with the scheme text inside the host, then
-        // fail at dial time with a confusing "bad addr" error. Reject
-        // any scheme:// line we don't serve, right here, where the
-        // user is looking.
-        if s.contains("://")
-            && let Some(scheme) = s.split("://").next()
-            && !scheme.is_empty()
-            && !matches!(
-                scheme.to_ascii_lowercase().as_str(),
-                "http" | "socks5" | "socks5h"
-            )
-        {
-            return Err(FetchError::Http(format!(
-                "proxy: unsupported scheme '{scheme}://' (supported: http://, socks5://, socks5h://)"
-            )));
-        }
-        let (scheme, rest) = if let Some(r) = s.strip_prefix("socks5://") {
-            (ProxyScheme::Socks5, r)
-        } else if let Some(r) = s.strip_prefix("socks5h://") {
-            (ProxyScheme::Socks5, r) // socks5h = remote DNS (same as our domain ATYP)
-        } else if let Some(r) = s.strip_prefix("http://") {
-            (ProxyScheme::Http, r)
-        } else {
-            (ProxyScheme::Http, s)
+        let (scheme, rest) = match s.split_once("://") {
+            Some((scheme, rest)) => match scheme.to_ascii_lowercase().as_str() {
+                "http" => (ProxyScheme::Http, rest),
+                "socks5" | "socks5h" => (ProxyScheme::Socks5, rest),
+                _ => {
+                    return Err(FetchError::Http(
+                        "proxy: unsupported scheme (supported: http://, socks5://, socks5h://)"
+                            .into(),
+                    ));
+                }
+            },
+            None => (ProxyScheme::Http, s),
         };
 
         // Split auth@addr : auth is optional. The address (host:port)
@@ -242,14 +229,31 @@ impl Proxy {
             .ok_or_else(|| FetchError::Http("proxy: bad address (expected host:port)".into()))?;
         // rsplit_once handles IPv6 brackets too: [::1]:1080 → ("[::1]", "1080")
         let port: u16 = port
-            .parse()
-            .map_err(|_| FetchError::Http("proxy: bad port (expected 1-65535)".into()))?;
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| FetchError::Http("proxy: bad port (expected 1-65535)".into()))?;
         // Strip IPv6 brackets if present.
-        let host = host
+        if host.is_empty()
+            || host
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(FetchError::Http("proxy: invalid host".into()));
+        }
+        let bare = host
             .strip_prefix('[')
             .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host)
-            .to_string();
+            .unwrap_or(host);
+        let host = if let Ok(address) = bare.parse::<std::net::Ipv6Addr>() {
+            address.to_string()
+        } else {
+            url::Host::parse(host)
+                .map_err(|_| FetchError::Http("proxy: invalid host".into()))?
+                .to_string()
+        };
 
         Ok(Self {
             host,
@@ -759,14 +763,22 @@ fn env_proxy_var(name: &str) -> Option<String> {
 /// via `ALL_PROXY=socks5://host:port` are also supported. An empty
 /// value counts as unset (curl parity): it does not starve the
 /// fallbacks after it.
-pub fn from_env_for(url: &str) -> Option<Proxy> {
-    let parsed = url::Url::parse(url).ok()?;
+pub fn from_env_for(url: &str) -> Result<Option<Proxy>, FetchError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| FetchError::Http("proxy resolution requires a valid HTTP(S) URL".into()))?;
     let scheme = parsed.scheme();
-    let host = parsed.host_str()?;
+    if !matches!(scheme, "http" | "https") {
+        return Err(FetchError::Http(
+            "proxy resolution requires an HTTP(S) URL".into(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| FetchError::Http("proxy resolution requires a host".into()))?;
 
     // NO_PROXY bypass.
     if no_proxy_match(host) {
-        return None;
+        return Ok(None);
     }
 
     // Resolution order: the explicit config slot ([proxy] https or
@@ -777,10 +789,6 @@ pub fn from_env_for(url: &str) -> Option<Proxy> {
     // This is what doctor reports ("from_env_for consults the config
     // layer first"); an earlier comment here described the reverse
     // order, which the code has never implemented.
-    // Note (Q2): non-http(s) schemes fall into the HTTP_PROXY arm. DonSeTch
-    // never dials non-http(s) URLs (the URL gate rejects them first), so
-    // curl's "ALL_PROXY covers unknown schemes" rule is dormant here; the
-    // ALL_PROXY fallback below already covers both http and https.
     let cfg = crate::config::cfg();
     let (cfg_slot, env_name) = if scheme == "https" {
         (&cfg.proxy.https, "HTTPS_PROXY")
@@ -800,17 +808,28 @@ pub fn from_env_for(url: &str) -> Option<Proxy> {
         // explicit [proxy] slots stay live even when the ambient
         // convention is disabled (the gate must never starve a TOML
         // proxy).
-        None if crate::config::cfg().proxy.from_environment => env_proxy_var(env_name)
-            .or_else(|| env_proxy_var(&env_name.to_lowercase()))
-            .or_else(|| env_proxy_var("ALL_PROXY"))
-            .or_else(|| env_proxy_var("all_proxy"))?,
-        None => return None,
+        None if cfg.proxy.from_environment => {
+            let Some(value) = env_proxy_var(env_name)
+                .or_else(|| env_proxy_var(&env_name.to_lowercase()))
+                .or_else(|| env_proxy_var("ALL_PROXY"))
+                .or_else(|| env_proxy_var("all_proxy"))
+            else {
+                return Ok(None);
+            };
+            value
+        }
+        None => return Ok(None),
     };
     let env_val = env_val.trim();
     if env_val.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Proxy::parse(env_val).ok()
+    Proxy::parse(env_val)
+        .map(Some)
+        .map_err(|error| match error {
+            FetchError::Http(message) => FetchError::ProxyConfig(message),
+            other => FetchError::ProxyConfig(other.to_string()),
+        })
 }
 
 /// Save proxies to the config file. Atomic write (temp + rename).
@@ -859,6 +878,43 @@ pub(crate) fn base64(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stealth_v3_proxy_endpoint_validation_rejects_invalid_hosts_and_zero_port() {
+        for raw in [
+            "http://:8080",
+            "http://proxy:0",
+            "http://proxy/path:8080",
+            "http://proxy\r\nInjected:8080",
+            "http://[not-ip]:8080",
+            "http://proxy:8080/",
+            "socks5://two words:1080",
+        ] {
+            assert!(
+                super::Proxy::parse(raw).is_err(),
+                "invalid proxy endpoint accepted: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stealth_v3_proxy_scheme_case_does_not_become_part_of_the_host() {
+        for (raw, expected) in [
+            ("HTTP://proxy:8080", super::ProxyScheme::Http),
+            ("SoCkS5H://[::1]:1080", super::ProxyScheme::Socks5),
+        ] {
+            let proxy = super::Proxy::parse(raw).unwrap();
+            assert_eq!(proxy.scheme, expected);
+            assert_eq!(
+                proxy.host,
+                if expected == super::ProxyScheme::Http {
+                    "proxy"
+                } else {
+                    "::1"
+                }
+            );
+        }
+    }
+
     #[test]
     fn stealth_v3_proxy_connection_identity_covers_protocol_and_each_credential_field() {
         let original = super::Proxy::parse("http://alice:owned-secret@proxy.example:8080").unwrap();
@@ -1197,7 +1253,9 @@ u:p@also_valid:8080
             std::env::remove_var("no_proxy");
             std::env::set_var("HTTPS_PROXY", "http://proxy:8080");
         }
-        let p = from_env_for("https://example.com/").expect("should detect proxy");
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
         assert_eq!(p.host, "proxy");
         assert_eq!(p.port, 8080);
         assert_eq!(p.scheme, ProxyScheme::Http);
@@ -1216,7 +1274,9 @@ u:p@also_valid:8080
             std::env::remove_var("no_proxy");
             std::env::set_var("HTTP_PROXY", "http://proxy:3128");
         }
-        let p = from_env_for("http://example.com/").expect("should detect proxy");
+        let p = from_env_for("http://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
         assert_eq!(p.host, "proxy");
         assert_eq!(p.port, 3128);
         unsafe {
@@ -1236,7 +1296,9 @@ u:p@also_valid:8080
             std::env::remove_var("http_proxy");
             std::env::set_var("ALL_PROXY", "socks5://proxy:1080");
         }
-        let p = from_env_for("https://example.com/").expect("should detect proxy");
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect proxy");
         assert_eq!(p.host, "proxy");
         assert_eq!(p.port, 1080);
         assert_eq!(p.scheme, ProxyScheme::Socks5);
@@ -1256,7 +1318,9 @@ u:p@also_valid:8080
             std::env::remove_var("HTTPS_PROXY");
             std::env::set_var("https_proxy", "http://proxy:8080");
         }
-        let p = from_env_for("https://example.com/").expect("should detect lowercase proxy");
+        let p = from_env_for("https://example.com/")
+            .unwrap()
+            .expect("should detect lowercase proxy");
         assert_eq!(p.host, "proxy");
         unsafe {
             std::env::remove_var("https_proxy");
@@ -1273,7 +1337,7 @@ u:p@also_valid:8080
             std::env::set_var("NO_PROXY", "example.com");
         }
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "NO_PROXY should bypass"
         );
         unsafe {
@@ -1292,7 +1356,7 @@ u:p@also_valid:8080
             std::env::set_var("NO_PROXY", "*");
         }
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "NO_PROXY=* should bypass all"
         );
         unsafe {
@@ -1311,15 +1375,15 @@ u:p@also_valid:8080
             std::env::set_var("NO_PROXY", ".example.com");
         }
         assert!(
-            from_env_for("https://foo.example.com/").is_none(),
+            from_env_for("https://foo.example.com/").unwrap().is_none(),
             "NO_PROXY=.example.com should match subdomain"
         );
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "NO_PROXY=.example.com should match root"
         );
         assert!(
-            from_env_for("https://other.com/").is_some(),
+            from_env_for("https://other.com/").unwrap().is_some(),
             "NO_PROXY should not match unrelated domain"
         );
         unsafe {
@@ -1342,7 +1406,7 @@ u:p@also_valid:8080
             std::env::remove_var("all_proxy");
         }
         assert!(
-            from_env_for("https://example.com/").is_none(),
+            from_env_for("https://example.com/").unwrap().is_none(),
             "no env vars = no proxy"
         );
     }
@@ -1664,6 +1728,7 @@ u:p@also_valid:8080
             std::env::set_var("ALL_PROXY", "socks5://proxy:1080");
         }
         let p = from_env_for("https://example.com/")
+            .unwrap()
             .expect("an empty HTTPS_PROXY must not starve ALL_PROXY");
         assert_eq!(p.scheme, ProxyScheme::Socks5);
         assert_eq!(p.host, "proxy");

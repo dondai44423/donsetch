@@ -105,7 +105,15 @@ pub(super) async fn engine_task_with_budget(
     // unreachable on any host whose only route out is a forward proxy.
     // Same convention as every other request path.
     let env_proxy = if proxy.is_none() {
-        crate::transport::proxy::from_env_for(&url)
+        match crate::transport::proxy::from_env_for(&url) {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                return (
+                    label,
+                    Err((format!("invalid-config: {error}"), egress_id, true)),
+                );
+            }
+        }
     } else {
         None
     };

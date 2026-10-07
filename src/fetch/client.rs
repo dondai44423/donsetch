@@ -288,7 +288,7 @@ impl Fetcher {
         // Resolve the actual route before lookup, and retain this exact
         // sent-header snapshot even if another response changes the jar.
         let initial_env = if proxy.is_none() && !use_pool_lane {
-            crate::transport::proxy::from_env_for(url_str)
+            crate::transport::proxy::from_env_for(url_str)?
         } else {
             None
         };
@@ -343,7 +343,7 @@ impl Fetcher {
             let env_proxy = if first_request {
                 initial_env.clone()
             } else if proxy.is_none() && !use_pool_lane {
-                crate::transport::proxy::from_env_for(&current)
+                crate::transport::proxy::from_env_for(&current)?
             } else {
                 None
             };

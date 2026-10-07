@@ -6,6 +6,8 @@ pub enum FetchError {
     Tls(String),
     Io(std::io::Error),
     Http(String),
+    /// Invalid local proxy settings, rather than an origin transport failure.
+    ProxyConfig(String),
     Ghost(String),
     Timeout,
     TooManyRedirects,
@@ -35,6 +37,7 @@ impl fmt::Display for FetchError {
             Self::Tls(e) => write!(f, "tls: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Http(e) => write!(f, "http: {e}"),
+            Self::ProxyConfig(e) => write!(f, "proxy configuration: {e}"),
             Self::Ghost(e) => write!(f, "ghost: {e}"),
             Self::Timeout => write!(f, "timeout"),
             Self::TooManyRedirects => write!(f, "too many redirects"),

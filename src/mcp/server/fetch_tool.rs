@@ -1378,7 +1378,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         let fetched = match response {
             Ok(o) => o,
             Err(e) => {
-                if adapter_host && !no_adapter {
+                if adapter_host && !no_adapter && !matches!(e, FetchError::ProxyConfig(_)) {
                     // Transport failure on the adapter endpoint :
                     // retry the caller's URL before giving up.
                     return adapter_fallback(

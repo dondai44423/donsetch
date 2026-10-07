@@ -168,6 +168,7 @@ fn is_engine_fault(status: &str) -> bool {
         && status != "auth-fail"
         && status != "no-results"
         && status != "invalid-config"
+        && !status.starts_with("invalid-config:")
         && status != "pacing-timeout"
         && status != "budget-skipped"
 }
@@ -1366,6 +1367,7 @@ fn engine_health_key(engine: &str) -> &str {
 
 fn retry_engine_failure(status: &str) -> bool {
     !matches!(status, "no-results" | "pacing-timeout" | "invalid-config")
+        && !status.starts_with("invalid-config:")
 }
 
 /// Vertical retries retain explicit timeout outcomes; engine tasks own their
@@ -1725,7 +1727,12 @@ mod tests {
                 assert!(is_engine_fault(status));
             }
         }
-        for status in ["invalid-config", "no-results", "pacing-timeout"] {
+        for status in [
+            "invalid-config",
+            "invalid-config: proxy: unsupported scheme",
+            "no-results",
+            "pacing-timeout",
+        ] {
             assert!(!retry_engine_failure(status));
             assert!(!is_engine_fault(status));
         }

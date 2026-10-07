@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Invalid selected proxy settings return an error instead of silently dialing
+  direct. Proxy endpoints reject empty or malformed hosts and zero ports;
+  supported proxy schemes are case-insensitive.
 - Browser proxy relays bound their owned tunnels, close active connections on
   retirement, and reject invalid SOCKS negotiation and target encodings.
   An authenticated relay bind failure stops launch with an error.

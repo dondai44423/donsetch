@@ -3382,7 +3382,7 @@ mod tests {
         assert!(!loaded.config.proxy.from_environment);
         assert_eq!(loaded.config.proxy.http, "http://unlocker.local:3128");
         // The resolver must see the slot even with the ambient gate off.
-        let picked = crate::transport::proxy::from_env_for("http://example.com");
+        let picked = crate::transport::proxy::from_env_for("http://example.com").unwrap();
         assert!(
             picked.is_some(),
             "an explicit TOML proxy must survive from_environment=false"

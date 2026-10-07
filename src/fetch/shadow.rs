@@ -187,12 +187,19 @@ async fn shadow_burst(
                     {
                         return;
                     }
+                    let proxy = match crate::transport::proxy::from_env_for(&asset_url) {
+                        Ok(proxy) => proxy,
+                        Err(_) => {
+                            failures.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    };
                     let out = tokio::time::timeout(
                         ASSET_DEADLINE,
                         fetcher.fetch_once_via_class(
                             &asset_url,
                             &[],
-                            crate::transport::proxy::from_env_for(&asset_url).as_ref(),
+                            proxy.as_ref(),
                             true,
                             Some(page_url),
                             class,

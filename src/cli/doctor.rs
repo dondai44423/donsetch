@@ -567,7 +567,15 @@ fn check_fetch_egress() -> CheckResult {
     // unconditionally so the doctor's view matches the daemon's
     // (a TOML proxy with from_environment = false used to be
     // reported as direct egress).
-    let resolved = crate::transport::proxy::from_env_for("https://example.com");
+    let resolved = match crate::transport::proxy::from_env_for("https://example.com") {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            return CheckResult::Fail(
+                error.to_string(),
+                "Correct the configured proxy endpoint or proxy environment variable.".into(),
+            );
+        }
+    };
     let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
     let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
 

@@ -61,6 +61,7 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
                 format!("HTTP protocol error: {e}")
             }
         }
+        FetchError::ProxyConfig(msg) => format!("proxy configuration error: {msg}"),
         FetchError::Ghost(msg) => format!("browser automation error: {msg}"),
         // A name failure is not a policy block: the DNS variants carry
         // the honest message, and the code the agent reads comes from
@@ -247,6 +248,9 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         .and_then(Value::as_str)
         .unwrap_or("");
     Cow::Borrowed(match () {
+        _ if m.contains("proxy configuration:") || m.starts_with("proxy configuration error:") => {
+            "proxy.config"
+        }
         _ if m.contains("ssrf")
             || m.contains("private/loopback")
             || m.contains("blocked by design") =>
@@ -315,6 +319,13 @@ pub(super) fn tool_error_structured(
             );
             "transient"
         }
+    } else if code == "proxy.config" {
+        let state = structured.get_or_insert_with(|| json!({}));
+        state["next_action"] = json!(
+            "correct the selected proxy in config or the proxy environment variable, then retry; run donsetch doctor to inspect proxy configuration"
+        );
+        state["retry_safe"] = json!(false);
+        "permanent"
     } else {
         kind
     };
@@ -554,6 +565,7 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<&'static str> {
         // signal (DnsTimeout is transient).
         FetchError::Dns(_) | FetchError::DnsTimeout(_) => Some("network.dns"),
         FetchError::Ssrf(_) => Some("guard.ssrf"),
+        FetchError::ProxyConfig(_) => Some("proxy.config"),
         _ => None,
     }
 }
@@ -572,6 +584,7 @@ pub(super) fn transport_class(e: &FetchError) -> &'static str {
         FetchError::InvalidUrl(_) => "invalid_url",
         FetchError::Ghost(_) => "ghost",
         FetchError::Http(_) => "protocol",
+        FetchError::ProxyConfig(_) => "configuration",
         FetchError::Tls(msg) => {
             let m = msg.to_lowercase();
             if m.contains("reset") || m.contains("eof") {
@@ -671,6 +684,52 @@ mod stitch_tests {
             "not a url".into()
         )));
         assert!(!transport_failure_evidence(&FetchError::TooManyRedirects));
+    }
+
+    #[test]
+    fn stealth_v3_invalid_proxy_is_configuration_not_network_evidence() {
+        // Nextest owns the process-global configuration for this test.
+        let directory =
+            std::env::temp_dir().join(format!("donsetch-proxy-errors-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let config = directory.join("config.toml");
+        std::fs::write(&config, "[proxy]\nfrom_environment=true\n").unwrap();
+        unsafe {
+            std::env::set_var("DONSETCH_CONFIG", config);
+            std::env::remove_var("DONSETCH_NO_ENV_PROXY");
+            std::env::set_var(
+                "HTTP_PROXY",
+                "socks4://alice:private-token@broken.invalid:1080",
+            );
+            std::env::set_var("NO_PROXY", "");
+            std::env::remove_var("no_proxy");
+        }
+        let error = crate::transport::proxy::from_env_for("http://example.com/").unwrap_err();
+        assert!(
+            !transport_failure_evidence(&error),
+            "a configuration error must not teach a network failure"
+        );
+        assert_eq!(fetch_error_code(&error), Some("proxy.config"));
+        let response = tool_error_structured(
+            friendly_fetch_error(&error),
+            fetch_error_kind(&error),
+            Some(json!({"url":"http://example.com/", "code":fetch_error_code(&error)})),
+        );
+        assert_eq!(response["errorKind"], "permanent");
+        assert_eq!(response["structuredContent"]["code"], "proxy.config");
+        assert_eq!(response["structuredContent"]["retry_safe"], false);
+        let action = response["structuredContent"]["next_action"]
+            .as_str()
+            .unwrap();
+        assert!(
+            action.contains("proxy") && action.contains("config"),
+            "{action}"
+        );
+        assert!(
+            !response.to_string().contains("private-token")
+                && !response.to_string().contains("alice")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     // search_error used to hardcode errorKind: "transient" for every

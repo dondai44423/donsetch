@@ -1248,7 +1248,10 @@ impl Ghost {
         if let Some(p) = if wire.direct {
             None
         } else {
-            pool_proxy.or_else(|| crate::transport::proxy::from_env_for("https://ghost.local/"))
+            match pool_proxy {
+                Some(proxy) => Some(proxy),
+                None => crate::transport::proxy::from_env_for("https://ghost.local/")?,
+            }
         } {
             let authed = !p.user.is_empty() || !p.pass.is_empty();
             let arg = if authed {

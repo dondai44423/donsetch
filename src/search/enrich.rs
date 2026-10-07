@@ -131,7 +131,11 @@ impl Searcher {
                 // route out, a direct dial here failed and the result was
                 // scored QualityObs::Dead: live search results got demoted
                 // as dead links because of the egress, not the page.
-                let env_proxy = crate::transport::proxy::from_env_for(&url);
+                let env_proxy = match crate::transport::proxy::from_env_for(&url) {
+                    Ok(proxy) => proxy,
+                    // An unusable client route is not evidence that the page died.
+                    Err(_) => return (i, None, Some(String::new()), QualityObs::Neutral),
+                };
                 let out = tokio::time::timeout(
                     ENRICH_TIMEOUT,
                     // v4 phase 2.1: enrichment rides the shared cookie
