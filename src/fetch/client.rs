@@ -284,7 +284,7 @@ impl Fetcher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .check(&cache_key)
         };
-        let conditional = match check {
+        let (conditional, validation) = match check {
             CacheCheck::Fresh(body, status, headers) => {
                 let verdict = walls::detect(status, &headers, &body);
                 return Ok(FetchOutcome {
@@ -300,8 +300,8 @@ impl Fetcher {
                     elapsed: started.elapsed(),
                 });
             }
-            CacheCheck::Revalidate(conditional) => conditional,
-            CacheCheck::None => Vec::new(),
+            CacheCheck::Revalidate(conditional, snapshot) => (conditional, Some(snapshot)),
+            CacheCheck::None => (Vec::new(), None),
         };
         let mut current = url_str.to_string();
         let mut redirects = 0u8;
@@ -371,22 +371,20 @@ impl Fetcher {
             // cookie-warm retry below can already ride cookies this
             // hop just set.
 
-            // 304: merge body from cache. A 304 whose entry is gone
-            // (evicted between the conditional check and the
-            // response) is UNUSABLE: falling through used to score
-            // the empty body as Blocked and record a wall that never
-            // existed. Fail honestly; the caller retries.
+            // Only this hop's validators authorize a 304 merge. Redirects
+            // and unsolicited 304s cannot inherit the original body's identity.
             if out.status == 304 {
-                let merged = self
+                let Some(snapshot) = validation.as_ref().filter(|_| first_request) else {
+                    return Err(FetchError::Http(
+                        "304 response without a matching request validator snapshot".into(),
+                    ));
+                };
+                let (body, status, headers) = self
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .stored(&cache_key);
-                let Some((body, status, headers)) = merged else {
-                    return Err(FetchError::Http(
-                        "304 revalidation with no stored entry (cache evicted mid-flight)".into(),
-                    ));
-                };
+                    .revalidated(&cache_key, snapshot, &out.headers, hop_started.elapsed())
+                    .map_err(FetchError::Http)?;
                 out.status = status;
                 out.headers = headers;
                 out.body = body;
@@ -402,6 +400,15 @@ impl Fetcher {
                 out.redirects = redirects;
                 return Ok(out);
             }
+
+            // A full response supersedes the old representation, even when
+            // it is a redirect, a wall or a deletion that we cannot cache.
+            // An older in-flight 304 may still finish from its own snapshot,
+            // but cannot resurrect that retired entry.
+            self.cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&hop_key);
 
             match out.status {
                 301 | 302 | 303 | 307 | 308 => {
@@ -452,7 +459,13 @@ impl Fetcher {
                             .cache
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        cache.store(&hop_key, out.status, &out.headers, &out.body);
+                        cache.store_with_delay(
+                            &hop_key,
+                            out.status,
+                            &out.headers,
+                            &out.body,
+                            hop_started.elapsed(),
+                        );
                     }
 
                     // One cookie-warm retry uses the newly stored cookie, and
@@ -466,17 +479,28 @@ impl Fetcher {
                             self.request_headers(&url, &[], use_jar, ref_arg, identity)?;
                         let retry_key =
                             Self::representation_key(&current, effective_proxy, use_jar, &headers);
+                        let retry_started = Instant::now();
                         if let Ok(mut retry) = self
                             .fetch_once_with_headers(&current, effective_proxy, use_jar, headers)
                             .await
                         {
                             retry.verdict =
                                 walls::detect(retry.status, &retry.headers, &retry.body);
+                            self.cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&retry_key);
                             if !skip_cache && matches!(retry.verdict, Verdict::ContentOk) {
                                 self.cache
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .store(&retry_key, retry.status, &retry.headers, &retry.body);
+                                    .store_with_delay(
+                                        &retry_key,
+                                        retry.status,
+                                        &retry.headers,
+                                        &retry.body,
+                                        retry_started.elapsed(),
+                                    );
                             }
                             out = retry;
                         }

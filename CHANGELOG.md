@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot reuse another context's body. Invalid or wildcard Vary fields evict
   the old entry; validation headers do not prevent a new response from warming
   its original request context.
+- HTTP 304 responses validate their request's immutable body snapshot and update
+  cache metadata without overwriting a concurrent newer response or resurrecting
+  deleted content. Cache freshness accounts for Date, Age and response time;
+  conflicting directives require validation, and uncacheable policies evict old
+  entries. Stored headers are bounded and exclude connection-specific fields.
 
 ## [4.5.7] - 2026-10-07
 

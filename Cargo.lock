@@ -1099,6 +1099,7 @@ dependencies = [
  "flate2",
  "foreign-types 0.5.0",
  "futures-util",
+ "httpdate",
  "image",
  "libc",
  "memchr",
