@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux Chromium uses ANGLE's EGL backend with native GPU support enabled,
   replacing the nonworking legacy SwiftShader flags. WebGL availability still
   depends on the installed browser and driver.
+- HTTP/2 validates frame sizes, continuation ordering, padding and response
+  lengths, handles informational headers and trailers, and counts padded bytes
+  toward flow control. Request compression reuses its dynamic table, honors
+  peer table limits, keeps credentials never-indexed and fragments large fields.
 
 ## [4.5.7] - 2026-10-07
 

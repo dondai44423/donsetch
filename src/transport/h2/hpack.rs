@@ -42,7 +42,9 @@ fn decode_int(buf: &[u8], pos: &mut usize, prefix_bits: u8) -> Result<u64, Fetch
         }
         let b = buf[*pos];
         *pos += 1;
-        value += ((b & 0x7f) as u64) << shift;
+        value = value
+            .checked_add(((b & 0x7f) as u64) << shift)
+            .ok_or_else(|| FetchError::Http("hpack: int overflow".into()))?;
         shift += 7;
         if b & 0x80 == 0 {
             return Ok(value);
@@ -142,12 +144,14 @@ fn decode_string(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>, FetchError> {
         return Err(FetchError::Http("hpack: truncated string".into()));
     }
     let huff = buf[*pos] & 0x80 != 0;
-    let len = decode_int(buf, pos, 7)? as usize;
-    if *pos + len > buf.len() {
-        return Err(FetchError::Http("hpack: truncated string data".into()));
-    }
-    let raw = &buf[*pos..*pos + len];
-    *pos += len;
+    let len = usize::try_from(decode_int(buf, pos, 7)?)
+        .map_err(|_| FetchError::Http("hpack: string size overflow".into()))?;
+    let end = pos
+        .checked_add(len)
+        .filter(|end| *end <= buf.len())
+        .ok_or_else(|| FetchError::Http("hpack: truncated string data".into()))?;
+    let raw = &buf[*pos..end];
+    *pos = end;
     if huff {
         huffman_decode(raw)
     } else {
@@ -180,6 +184,41 @@ impl DynTable {
             self.size -= n.len() + v.len() + 32;
         }
     }
+    fn set_max(&mut self, max: usize) {
+        self.max = max;
+        while self.size > max && !self.entries.is_empty() {
+            let (name, value) = self.entries.remove(0);
+            self.size -= name.len() + value.len() + 32;
+        }
+    }
+
+    fn exact(&self, name: &str, value: &str) -> Option<usize> {
+        STATIC_TABLE
+            .iter()
+            .position(|(n, v)| *n == name && *v == value)
+            .map(|i| i + 1)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .rev()
+                    .position(|(n, v)| n == name.as_bytes() && v == value.as_bytes())
+                    .map(|i| STATIC_TABLE.len() + 1 + i)
+            })
+    }
+
+    fn name(&self, name: &str) -> Option<usize> {
+        STATIC_TABLE
+            .iter()
+            .position(|(n, _)| *n == name)
+            .map(|i| i + 1)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .rev()
+                    .position(|(n, _)| n == name.as_bytes())
+                    .map(|i| STATIC_TABLE.len() + 1 + i)
+            })
+    }
     /// Absolute index: 1..=61 static, 62.. dynamic (newest first).
     fn get(&self, idx: usize) -> Option<(Vec<u8>, Vec<u8>)> {
         if idx >= 1 && idx <= STATIC_TABLE.len() {
@@ -200,6 +239,7 @@ impl DynTable {
 
 pub struct Encoder {
     dyn_table: DynTable,
+    pending_max: Option<(usize, usize)>,
 }
 
 impl Default for Encoder {
@@ -211,37 +251,51 @@ impl Default for Encoder {
 impl Encoder {
     pub fn new() -> Self {
         Self {
-            dyn_table: DynTable::new(DYNAMIC_MAX),
+            // Our advertised table size governs the response decoder.
+            // Request encoding starts at the peer's RFC default until SETTINGS.
+            dyn_table: DynTable::new(4096),
+            pending_max: None,
         }
     }
 
-    /// Encode a header list in order. Indexed for exact static matches,
+    pub fn set_max(&mut self, peer_max: u32) {
+        let max = (peer_max as usize).min(DYNAMIC_MAX);
+        if max != self.dyn_table.max {
+            let min = self.pending_max.map_or(max, |(min, _)| min.min(max));
+            self.pending_max = Some((min, max));
+            self.dyn_table.set_max(max);
+        }
+    }
+
+    /// Encode a header list in order. Indexed for exact retained matches,
     /// literal-with-incremental-indexing otherwise (Chrome's strategy).
     /// Sensitive headers (cookie, authorization) use never-indexed to
     /// match Chrome's HPACK encoder : keeps the dynamic table identical.
     pub fn encode(&mut self, headers: &[(String, String)]) -> Vec<u8> {
         let mut out = Vec::new();
+        if let Some((min, max)) = self.pending_max.take() {
+            encode_int(&mut out, min as u64, 5, 0x20);
+            if max != min {
+                encode_int(&mut out, max as u64, 5, 0x20);
+            }
+        }
         for (name, value) in headers {
             let name_l = name.to_ascii_lowercase();
-            // Exact (name, value) static match → indexed.
-            let exact = STATIC_TABLE
-                .iter()
-                .position(|(n, v)| *n == name_l && *v == value.as_str());
-            if let Some(i) = exact {
-                encode_int(&mut out, (i + 1) as u64, 7, 0x80);
-                continue;
-            }
             // Chrome marks sensitive headers as never-indexed to prevent
             // them from entering the dynamic table.
             let sensitive = matches!(
                 name_l.as_str(),
                 "cookie" | "authorization" | "proxy-authorization"
             );
-            let name_idx = STATIC_TABLE.iter().position(|(n, _)| *n == name_l);
+            if !sensitive && let Some(index) = self.dyn_table.exact(&name_l, value) {
+                encode_int(&mut out, index as u64, 7, 0x80);
+                continue;
+            }
+            let name_idx = self.dyn_table.name(&name_l);
             if sensitive {
                 // Never indexed (0x10 prefix, 4-bit integer).
                 match name_idx {
-                    Some(i) => encode_int(&mut out, (i + 1) as u64, 4, 0x10),
+                    Some(i) => encode_int(&mut out, i as u64, 4, 0x10),
                     None => {
                         out.push(0x10);
                         encode_string(&mut out, name_l.as_bytes());
@@ -252,7 +306,7 @@ impl Encoder {
             } else {
                 // Literal with incremental indexing (0x40 prefix, 6-bit integer).
                 match name_idx {
-                    Some(i) => encode_int(&mut out, (i + 1) as u64, 6, 0x40),
+                    Some(i) => encode_int(&mut out, i as u64, 6, 0x40),
                     None => {
                         out.push(0x40);
                         encode_string(&mut out, name_l.as_bytes());
@@ -271,6 +325,7 @@ impl Encoder {
 
 pub struct Decoder {
     dyn_table: DynTable,
+    ceiling: usize,
 }
 
 impl Default for Decoder {
@@ -289,19 +344,27 @@ impl Decoder {
         // index then resolved past the end of our table and the whole
         // response died with "hpack: bad index N". A larger decoder table
         // than the peer uses is free; a smaller one breaks the wire.
+        Self::with_limit(DYNAMIC_MAX)
+    }
+
+    pub fn with_limit(ceiling: usize) -> Self {
+        let ceiling = ceiling.min(DYNAMIC_MAX);
         Self {
-            dyn_table: DynTable::new(DYNAMIC_MAX),
-        } // server-controlled via SETTINGS, never above what we advertised
+            dyn_table: DynTable::new(ceiling),
+            ceiling,
+        }
     }
 
     pub fn decode(&mut self, block: &[u8]) -> Result<Vec<(String, String)>, FetchError> {
         let mut headers = Vec::new();
         let mut pos = 0usize;
+        let mut decoded_size = 0usize;
         while pos < block.len() {
             let b = block[pos];
             if b & 0x80 != 0 {
                 // Indexed.
-                let idx = decode_int(block, &mut pos, 7)? as usize;
+                let idx = usize::try_from(decode_int(block, &mut pos, 7)?)
+                    .map_err(|_| FetchError::Http("hpack: index overflow".into()))?;
                 let (n, v) = self
                     .dyn_table
                     .get(idx)
@@ -318,26 +381,34 @@ impl Decoder {
                 headers.push((name, value));
             } else if b & 0xe0 == 0x20 {
                 // Dynamic table size update.
-                let new_max = decode_int(block, &mut pos, 5)? as usize;
+                let new_max = usize::try_from(decode_int(block, &mut pos, 5)?)
+                    .map_err(|_| FetchError::Http("hpack: table size overflow".into()))?;
                 // RFC 7541 §4.2: must not exceed what we advertised
                 // (Chrome's HEADER_TABLE_SIZE = 65536). An uncapped
                 // update lets a hostile server balloon our decoder
                 // table without bound.
-                if new_max > DYNAMIC_MAX {
+                if !headers.is_empty() {
+                    return Err(FetchError::Http(
+                        "hpack: table size update after fields".into(),
+                    ));
+                }
+                if new_max > self.ceiling {
                     return Err(FetchError::Http(format!(
-                        "hpack: table size update {new_max} exceeds {DYNAMIC_MAX}"
+                        "hpack: table size update {new_max} exceeds {}",
+                        self.ceiling
                     )));
                 }
-                self.dyn_table.max = new_max;
-                while self.dyn_table.size > self.dyn_table.max && !self.dyn_table.entries.is_empty()
-                {
-                    let (n, v) = self.dyn_table.entries.remove(0);
-                    self.dyn_table.size -= n.len() + v.len() + 32;
-                }
+                self.dyn_table.set_max(new_max);
             } else {
                 // Literal without indexing (0x00) / never indexed (0x10).
                 let (name, value) = self.decode_literal(block, &mut pos, 4)?;
                 headers.push((name, value));
+            }
+            if let Some((name, value)) = headers.last() {
+                decoded_size += name.len() + value.len() + 32;
+                if decoded_size > 256 << 10 {
+                    return Err(FetchError::Http("hpack: decoded fields exceed cap".into()));
+                }
             }
         }
         Ok(headers)
@@ -349,7 +420,8 @@ impl Decoder {
         pos: &mut usize,
         prefix: u8,
     ) -> Result<(String, String), FetchError> {
-        let name_idx = decode_int(block, pos, prefix)? as usize;
+        let name_idx = usize::try_from(decode_int(block, pos, prefix)?)
+            .map_err(|_| FetchError::Http("hpack: name index overflow".into()))?;
         let name = if name_idx == 0 {
             decode_string(block, pos)?
         } else {
@@ -369,6 +441,89 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stealth_v3_hpack_repeated_fields_use_dynamic_indices() {
+        let fields = vec![("x-owned-proof".into(), "a repeated value".into())];
+        let mut encoder = Encoder::new();
+        let first = encoder.encode(&fields);
+        let second = encoder.encode(&fields);
+        assert!(
+            second.len() < first.len(),
+            "repeated fields should use the retained table"
+        );
+        let mut decoder = Decoder::new();
+        assert_eq!(decoder.decode(&first).unwrap(), fields);
+        assert_eq!(decoder.decode(&second).unwrap(), fields);
+    }
+
+    #[test]
+    fn stealth_v3_hpack_secrets_are_never_indexed_even_when_empty() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        for name in ["cookie", "authorization", "proxy-authorization"] {
+            for value in ["", "secret"] {
+                let encoded = encoder.encode(&[(name.into(), value.into())]);
+                assert_eq!(
+                    encoded[0] & 0xf0,
+                    0x10,
+                    "{name} must be never-indexed even when empty"
+                );
+                assert_eq!(
+                    decoder.decode(&encoded).unwrap(),
+                    vec![(name.into(), value.into())]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stealth_v3_hpack_encoder_starts_at_the_peers_default_4096() {
+        assert_eq!(Encoder::new().dyn_table.max, 4096);
+    }
+
+    #[test]
+    fn stealth_v3_hpack_shrink_then_grow_synchronizes_the_peers_table() {
+        let fields = vec![("x-owned".into(), "proof".into())];
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        assert_eq!(decoder.decode(&encoder.encode(&fields)).unwrap(), fields);
+        encoder.set_max(0);
+        encoder.set_max(64);
+        let block = encoder.encode(&fields);
+        assert_eq!(
+            &block[..3],
+            &[0x20, 0x3f, 0x21],
+            "announce the minimum before the final size"
+        );
+        assert_eq!(decoder.decode(&block).unwrap(), fields);
+        assert_eq!(decoder.dyn_table.max, 64);
+        assert_eq!(decoder.decode(&encoder.encode(&fields)).unwrap(), fields);
+    }
+
+    #[test]
+    fn stealth_v3_hpack_rejects_late_updates_and_decoded_index_amplification() {
+        assert!(
+            Decoder::new()
+                .decode(&[0x88, 0x20])
+                .unwrap_err()
+                .to_string()
+                .contains("after fields")
+        );
+        let mut decoder = Decoder::new();
+        decoder
+            .decode(&literal_with_indexing("x-owned", 1000))
+            .unwrap();
+        let error = decoder.decode(&[0xbe; 300]).unwrap_err();
+        assert!(error.to_string().contains("decoded fields exceed cap"));
+        let mut malformed = vec![0x00, 0x7f];
+        malformed.extend_from_slice(&[0xff; 8]);
+        malformed.push(0x7f);
+        assert!(
+            Decoder::new().decode(&malformed).is_err(),
+            "hostile encoded lengths must return an error rather than overflow"
+        );
+    }
 
     /// A literal header field with incremental indexing and a brand-new
     /// name (0x40 + name index 0), value forced raw (H=0) so the byte

@@ -35,6 +35,12 @@ pub struct H2Conn {
     decoder: Decoder,
     next_stream: u32,
     conn_window: i64,
+    conn_window_target: i64,
+    stream_window_target: i64,
+    header_list_limit: usize,
+    peer_frame_size: usize,
+    peer_header_list_limit: usize,
+    peer_concurrency: u32,
 }
 
 impl H2Conn {
@@ -44,6 +50,13 @@ impl H2Conn {
         profile: &BrowserProfile,
     ) -> Result<Self, FetchError> {
         let h2 = &profile.h2;
+        if h2.header_table_size > 65536
+            || h2.initial_window_size > 0x7fff_ffff
+            || h2.conn_window_update > 0x7fff_ffff - 65535
+            || h2.enable_push != 0
+        {
+            return Err(FetchError::Http("h2: unsupported client settings".into()));
+        }
         let settings = settings_payload(&[
             (0x1, h2.header_table_size),
             (0x2, h2.enable_push),
@@ -68,29 +81,37 @@ impl H2Conn {
         buf.extend_from_slice(&settings);
         // WINDOW_UPDATE frame (stream 0)
         let inc = h2.conn_window_update;
-        buf.extend_from_slice(&[
-            0,
-            0,
-            4,
-            WINDOW_UPDATE,
-            0,
-            0,
-            0,
-            0,
-            0,
-            ((inc >> 24) & 0x7f) as u8,
-            (inc >> 16) as u8,
-            (inc >> 8) as u8,
-            inc as u8,
-        ]);
+        if inc != 0 {
+            buf.extend_from_slice(&[
+                0,
+                0,
+                4,
+                WINDOW_UPDATE,
+                0,
+                0,
+                0,
+                0,
+                0,
+                ((inc >> 24) & 0x7f) as u8,
+                (inc >> 16) as u8,
+                (inc >> 8) as u8,
+                inc as u8,
+            ]);
+        }
         stream.write_all(&buf).await?;
         stream.flush().await?;
         Ok(Self {
             stream,
             encoder: Encoder::new(),
-            decoder: Decoder::new(),
+            decoder: Decoder::with_limit(h2.header_table_size as usize),
             next_stream: 1,
             conn_window: 65535 + inc as i64,
+            conn_window_target: 65535 + inc as i64,
+            stream_window_target: h2.initial_window_size as i64,
+            header_list_limit: (h2.max_header_list_size as usize).min(MAX_HEADER_BLOCK),
+            peer_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            peer_header_list_limit: usize::MAX,
+            peer_concurrency: u32::MAX,
         })
     }
 
@@ -108,7 +129,7 @@ impl H2Conn {
         let _ = self.stream.flush().await;
     }
 
-    /// One GET request → full response. Stream-per-request for now (pool later).
+    /// One GET at a time; connection pooling reuses completed serial streams.
     pub async fn get(
         &mut self,
         authority: &str,
@@ -116,6 +137,11 @@ impl H2Conn {
         extra_headers: &[(String, String)],
     ) -> Result<H2Response, FetchError> {
         let stream_id = self.next_stream;
+        if stream_id > 0x7fff_ffff || self.peer_concurrency == 0 {
+            return Err(FetchError::Http(
+                "h2: peer cannot accept a new stream".into(),
+            ));
+        }
         self.next_stream += 2;
 
         let mut headers: Vec<(String, String)> = vec![
@@ -125,41 +151,82 @@ impl H2Conn {
             (":path".into(), path.into()),
         ];
         headers.extend(extra_headers.iter().cloned());
+        if headers.iter().any(|(n, v)| {
+            !crate::fetch::guards::valid_header_value(n)
+                || !crate::fetch::guards::valid_header_value(v)
+        }) {
+            return Err(FetchError::Http("h2: malformed request field".into()));
+        }
+        let request_size: usize = headers.iter().map(|(n, v)| n.len() + v.len() + 32).sum();
+        if request_size > self.peer_header_list_limit.min(MAX_HEADER_BLOCK) {
+            return Err(FetchError::Http(
+                "h2: request fields exceed peer limit".into(),
+            ));
+        }
         let block = self.encoder.encode(&headers);
         // PRIORITY flag + Chrome's 5-byte priority block, exactly as
         // the real browser sends it on the request HEADERS frame.
-        let mut framed = Vec::with_capacity(CHROME_REQ_PRIORITY.len() + block.len());
+        let first = block
+            .len()
+            .min(self.peer_frame_size - CHROME_REQ_PRIORITY.len());
+        let mut framed = Vec::with_capacity(CHROME_REQ_PRIORITY.len() + first);
         framed.extend_from_slice(&CHROME_REQ_PRIORITY);
-        framed.extend_from_slice(&block);
+        framed.extend_from_slice(&block[..first]);
         write_frame(
             &mut self.stream,
             HEADERS,
-            FLAG_END_HEADERS | FLAG_END_STREAM | FLAG_PRIORITY,
+            FLAG_END_STREAM
+                | FLAG_PRIORITY
+                | if first == block.len() {
+                    FLAG_END_HEADERS
+                } else {
+                    0
+                },
             stream_id,
             &framed,
         )
         .await?;
+        let remaining = &block[first..];
+        for (i, chunk) in remaining.chunks(self.peer_frame_size).enumerate() {
+            let final_chunk = (i + 1) * self.peer_frame_size >= remaining.len();
+            write_frame(
+                &mut self.stream,
+                CONTINUATION,
+                if final_chunk { FLAG_END_HEADERS } else { 0 },
+                stream_id,
+                chunk,
+            )
+            .await?;
+        }
         self.stream.flush().await?;
 
         let mut status = 0u16;
         let mut resp_headers: Vec<(String, String)> = Vec::new();
         let mut body: Vec<u8> = Vec::new();
         let mut header_frag: Vec<u8> = Vec::new();
-        let initial_window = 6_291_456i64;
+        let initial_window = self.stream_window_target;
         let mut stream_window: i64 = initial_window;
         let mut got_headers = false;
-        // RFC 9113: END_STREAM may ride the HEADERS frame that opens
-        // the block OR be implied by the response ending at the final
-        // CONTINUATION (a bodyless response with a fragmented header
-        // block). Only checking the HEADERS frame hung such responses
-        // until the 30s response timeout.
+        // END_STREAM belongs to the opening HEADERS frame. Preserve it
+        // until the last CONTINUATION; CONTINUATION has no END_STREAM flag.
         let mut end_stream = false;
+        let mut continuation = false;
+        let mut header_blocks = 0;
 
         loop {
             let (hdr, payload) = read_frame(&mut self.stream).await?;
+            if continuation && (hdr.ty != CONTINUATION || hdr.stream_id != stream_id) {
+                return Err(FetchError::Http(
+                    "h2: interleaved CONTINUATION block".into(),
+                ));
+            }
+            if hdr.ty == CONTINUATION && !continuation {
+                return Err(FetchError::Http("h2: unopened CONTINUATION block".into()));
+            }
             match hdr.ty {
                 SETTINGS => {
                     if hdr.flags & FLAG_ACK == 0 {
+                        self.apply_settings(&payload)?;
                         write_frame(&mut self.stream, SETTINGS, FLAG_ACK, 0, &[]).await?;
                         self.stream.flush().await?;
                     }
@@ -173,18 +240,26 @@ impl H2Conn {
                 WINDOW_UPDATE => {}
                 HEADERS | CONTINUATION if hdr.stream_id == stream_id => {
                     if hdr.ty == HEADERS {
-                        // Strip padding/priority fields if flagged.
-                        let mut off = 0usize;
-                        if hdr.flags & FLAG_PADDED != 0 && !payload.is_empty() {
-                            off = payload[0] as usize + 1;
-                        }
+                        let mut fragment = unpad(&payload, hdr.flags)?;
                         if hdr.flags & FLAG_PRIORITY != 0 {
-                            off += 5;
+                            if fragment.len() < 5 {
+                                return Err(FetchError::Http(
+                                    "h2: truncated HEADERS priority".into(),
+                                ));
+                            }
+                            let dependency =
+                                u32::from_be_bytes(fragment[..4].try_into().unwrap()) & 0x7fff_ffff;
+                            if dependency == stream_id {
+                                return Err(FetchError::Http(
+                                    "h2: self-dependent HEADERS priority".into(),
+                                ));
+                            }
+                            fragment = &fragment[5..];
                         }
-                        header_frag = payload.get(off..).unwrap_or(&[]).to_vec();
+                        header_frag = fragment.to_vec();
                         // The block cap below guards CONTINUATION
                         // accumulation; an unfragmented HEADERS frame
-                        // is bounded only by the 1 MiB frame cap, so
+                        // is bounded by the default 16 KiB frame cap, so
                         // apply the same documented bound here.
                         if header_frag.len() > MAX_HEADER_BLOCK {
                             return Err(FetchError::Http("h2: header block exceeds cap".into()));
@@ -198,39 +273,39 @@ impl H2Conn {
                         }
                         header_frag.extend_from_slice(&payload);
                     }
+                    continuation = hdr.flags & FLAG_END_HEADERS == 0;
                     if hdr.flags & FLAG_END_HEADERS != 0 {
                         let decoded = self.decoder.decode(&header_frag)?;
-                        for (n, v) in decoded {
-                            // HTTP/2 field names are lowercase; a
-                            // nonconforming peer's mixed-case name
-                            // must not dodge the case-sensitive
-                            // content-encoding/alt-svc lookups
-                            // downstream. Normalize like the h1 reader.
-                            let n = n.to_ascii_lowercase();
-                            // RFC 9113 §8.2.2: CR/LF in field values is
-                            // malformed. Such a value must never reach the
-                            // cookie jar : it would split later h1 requests.
-                            if !crate::fetch::guards::valid_header_value(&n)
-                                || !crate::fetch::guards::valid_header_value(&v)
-                            {
+                        header_blocks += 1;
+                        if header_blocks > 64 {
+                            return Err(FetchError::Http("h2: too many header sections".into()));
+                        }
+                        let block_status =
+                            response_status(&decoded, got_headers, self.header_list_limit)?;
+                        let fields: Vec<_> = decoded
+                            .into_iter()
+                            .filter(|(n, _)| !n.starts_with(':'))
+                            .collect();
+                        if got_headers {
+                            if !end_stream {
                                 return Err(FetchError::Http(
-                                    "h2: header name/value contains CR/LF/NUL : malformed".into(),
+                                    "h2: trailers without END_STREAM".into(),
                                 ));
                             }
-                            if n == ":status" {
-                                // Status 0 never exists on the wire:
-                                // missing or unparseable :status is a
-                                // malformed response, not a success
-                                // with a nonsense code.
-                                status = v.parse().unwrap_or(0);
-                                if status == 0 {
-                                    return Err(FetchError::Http("h2: unparseable :status".into()));
+                            resp_headers.extend(fields);
+                        } else if let Some(code) = block_status {
+                            if code < 200 {
+                                if end_stream {
+                                    return Err(FetchError::Http(
+                                        "h2: informational response ended stream".into(),
+                                    ));
                                 }
-                            } else if !n.starts_with(':') {
-                                resp_headers.push((n, v));
+                            } else {
+                                status = code;
+                                resp_headers = fields;
+                                got_headers = true;
                             }
                         }
-                        got_headers = true;
                         header_frag.clear();
                         if end_stream {
                             break;
@@ -238,19 +313,21 @@ impl H2Conn {
                     }
                 }
                 DATA if hdr.stream_id == stream_id => {
-                    let data = if hdr.flags & FLAG_PADDED != 0 && !payload.is_empty() {
-                        let pad = payload[0] as usize;
-                        let end = payload.len().saturating_sub(pad);
-                        payload.get(1..end).unwrap_or(&[])
-                    } else {
-                        &payload[..]
-                    };
+                    if !got_headers {
+                        return Err(FetchError::Http("h2: DATA before headers".into()));
+                    }
+                    let data = unpad(&payload, hdr.flags)?;
+                    if payload.len() as i64 > stream_window
+                        || payload.len() as i64 > self.conn_window
+                    {
+                        return Err(FetchError::Http("h2: DATA exceeds receive window".into()));
+                    }
                     body.extend_from_slice(data);
                     if body.len() > MAX_BODY {
                         return Err(FetchError::Http("h2: response body exceeds cap".into()));
                     }
-                    stream_window -= data.len() as i64;
-                    self.conn_window -= data.len() as i64;
+                    stream_window -= payload.len() as i64;
+                    self.conn_window -= payload.len() as i64;
                     // Replenish flow-control windows at half consumption.
                     if stream_window < initial_window / 2 {
                         let inc = (initial_window - stream_window) as u32;
@@ -264,8 +341,8 @@ impl H2Conn {
                         .await?;
                         stream_window += inc as i64;
                     }
-                    if self.conn_window < 15_000_000 / 2 {
-                        let inc = (15_000_000 - self.conn_window) as u32;
+                    if self.conn_window < self.conn_window_target / 2 {
+                        let inc = (self.conn_window_target - self.conn_window) as u32;
                         write_frame(&mut self.stream, WINDOW_UPDATE, 0, 0, &inc.to_be_bytes())
                             .await?;
                         self.conn_window += inc as i64;
@@ -287,22 +364,10 @@ impl H2Conn {
                     return Err(FetchError::Http("h2 goaway".into()));
                 }
                 PUSH_PROMISE => {
-                    // RFC 7540 §6.4: RST_STREAM's payload is a 4-byte
-                    // error code, not a stream id (this used to send
-                    // `stream_id`'s own bytes. We advertise
-                    // ENABLE_PUSH=0 in SETTINGS, so a conforming
-                    // server never pushes; REFUSED_STREAM tells a
-                    // non-conforming one plainly why this is refused.
-                    const REFUSED_STREAM: u32 = 0x7;
-                    write_frame(
-                        &mut self.stream,
-                        RST_STREAM,
-                        0,
-                        hdr.stream_id,
-                        &REFUSED_STREAM.to_be_bytes(),
-                    )
-                    .await
-                    .ok();
+                    return Err(FetchError::Http("h2: push despite ENABLE_PUSH=0".into()));
+                }
+                HEADERS | CONTINUATION | DATA => {
+                    return Err(FetchError::Http("h2: unexpected response stream".into()));
                 }
                 PRIORITY => {}
                 _ => {}
@@ -314,12 +379,143 @@ impl H2Conn {
         if status == 0 {
             return Err(FetchError::Http("h2: response missing :status".into()));
         }
+        if matches!(status, 204 | 304) && !body.is_empty() {
+            return Err(FetchError::Http("h2: DATA on a bodyless response".into()));
+        }
+        let mut content_length = None;
+        for (_, value) in resp_headers
+            .iter()
+            .filter(|(name, _)| name == "content-length")
+        {
+            let length = value
+                .parse::<u64>()
+                .ok()
+                .filter(|_| value.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| FetchError::Http("h2: invalid content-length".into()))?;
+            if content_length.is_some_and(|previous| previous != length) {
+                return Err(FetchError::Http("h2: conflicting content-length".into()));
+            }
+            content_length = Some(length);
+        }
+        // A 304's length describes the selected representation, not its
+        // absent body. GET responses with a body must match the wire length.
+        if status != 304 && content_length.is_some_and(|length| length != body.len() as u64) {
+            return Err(FetchError::Http(
+                "h2: content-length differs from DATA".into(),
+            ));
+        }
         Ok(H2Response {
             status,
             headers: resp_headers,
             body,
         })
     }
+
+    fn apply_settings(&mut self, payload: &[u8]) -> Result<(), FetchError> {
+        for setting in payload.as_chunks::<6>().0 {
+            let id = u16::from_be_bytes(setting[..2].try_into().unwrap());
+            let value = u32::from_be_bytes(setting[2..].try_into().unwrap());
+            match id {
+                1 => self.encoder.set_max(value),
+                // RFC9113 permits a server to explicitly disable push.
+                2 if value != 0 => {
+                    return Err(FetchError::Http("h2: invalid enable push setting".into()));
+                }
+                3 => self.peer_concurrency = value,
+                // GET closes its sending side in HEADERS; there is no DATA
+                // send window to adjust, but illegal values remain errors.
+                4 if value > 0x7fff_ffff => {
+                    return Err(FetchError::Http(
+                        "h2: invalid initial window setting".into(),
+                    ));
+                }
+                5 if !(16_384..=0xff_ffff).contains(&value) => {
+                    return Err(FetchError::Http("h2: invalid max frame setting".into()));
+                }
+                5 => self.peer_frame_size = value as usize,
+                6 => self.peer_header_list_limit = value as usize,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unpad(payload: &[u8], flags: u8) -> Result<&[u8], FetchError> {
+    if flags & FLAG_PADDED == 0 {
+        return Ok(payload);
+    }
+    let pad = payload
+        .first()
+        .copied()
+        .ok_or_else(|| FetchError::Http("h2: missing padding length".into()))?
+        as usize;
+    if pad >= payload.len() {
+        return Err(FetchError::Http("h2: invalid padding length".into()));
+    }
+    Ok(&payload[1..payload.len() - pad])
+}
+
+fn response_status(
+    fields: &[(String, String)],
+    trailers: bool,
+    limit: usize,
+) -> Result<Option<u16>, FetchError> {
+    let mut status = None;
+    let mut regular = false;
+    let mut size = 0;
+    for (name, value) in fields {
+        size += name.len() + value.len() + 32;
+        if size > limit {
+            return Err(FetchError::Http(
+                "h2: response fields exceed advertised limit".into(),
+            ));
+        }
+        if !crate::fetch::guards::valid_header_value(name)
+            || !crate::fetch::guards::valid_header_value(value)
+            || name.bytes().any(|b| b.is_ascii_uppercase())
+            || value.starts_with([' ', '\t'])
+            || value.ends_with([' ', '\t'])
+        {
+            return Err(FetchError::Http("h2: malformed header name/value".into()));
+        }
+        if name.starts_with(':') {
+            if name != ":status" || trailers || status.is_some() || regular {
+                return Err(FetchError::Http(
+                    "h2: invalid response pseudo-header".into(),
+                ));
+            }
+            let code = value
+                .parse::<u16>()
+                .ok()
+                .filter(|code| value.len() == 3 && (100..=599).contains(code) && *code != 101)
+                .ok_or_else(|| FetchError::Http("h2: unparseable :status".into()))?;
+            status = Some(code);
+        } else {
+            if name.is_empty()
+                || !name.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b)
+                })
+                || matches!(
+                    name.as_str(),
+                    "connection"
+                        | "proxy-connection"
+                        | "keep-alive"
+                        | "transfer-encoding"
+                        | "upgrade"
+                        | "te"
+                )
+                || (trailers && name == "content-length")
+            {
+                return Err(FetchError::Http("h2: invalid connection field".into()));
+            }
+            regular = true;
+        }
+    }
+    if !trailers && status.is_none() {
+        return Err(FetchError::Http("h2: response missing :status".into()));
+    }
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -367,13 +563,5 @@ mod parity_tests {
     fn request_priority_matches_chrome_151() {
         assert_eq!(CHROME_REQ_PRIORITY, [0x80, 0x00, 0x00, 0x00, 0xff]);
         assert_eq!(FLAG_END_HEADERS | FLAG_END_STREAM | FLAG_PRIORITY, 0x25);
-    }
-
-    /// Pseudo-header order: m,a,s,p : Chromium's header order.
-    #[test]
-    fn pseudo_header_order_is_chrome() {
-        // Mirrors the order in H2Conn::get; keep both in lockstep.
-        let order = [":method", ":authority", ":scheme", ":path"];
-        assert_eq!(order, [":method", ":authority", ":scheme", ":path"]);
     }
 }
