@@ -1826,7 +1826,9 @@ impl Ghost {
                     .filter(|e| !e.is_empty())
                     .map(str::to_owned)
             }
-            Err(e) if !e.to_string().contains("cdp timeout") => Some(e.to_string()),
+            // Keep automation transport errors intact: the bounded read
+            // recovery must distinguish them from Chrome's errorText below.
+            Err(e) if !e.to_string().contains("cdp timeout") => return Err(e),
             // Settle-window timeouts are the documented queue
             // behavior above; the poll loop is the real referee.
             _ => None,

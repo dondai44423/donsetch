@@ -1183,34 +1183,63 @@ mod pool_tests {
         crate::config::install(config).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/owned", listener.local_addr().unwrap());
+        let active_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let kill_pid = active_pid.clone();
         let server = tokio::spawn(async move {
-            let mut seen = Vec::new();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut handlers = tokio::task::JoinSet::new();
             loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    assert!(request.len() < 8192);
-                    request.push(stream.read_u8().await.unwrap());
-                }
-                let request = String::from_utf8(request).unwrap();
-                let path = request.split_whitespace().nth(1).unwrap().to_owned();
-                seen.push(path.clone());
-                assert!(seen.len() <= 8, "owned peer request bound");
-                let (status, body) = match path.as_str() {
-                    "/owned" => (201, format!("<html><body><article><h1>Owned recovered generation</h1><p>{}</p></article></body></html>",
-                        "This is useful owned research content with a real status from the new browser. ".repeat(30))),
-                    "/human" => (403, "<h1>Verify you are human</h1><form><div class='g-recaptcha'></div></form>".into()),
-                    "/favicon.ico" => (404, String::new()),
-                    _ => panic!("unexpected owned request {path}"),
-                };
-                let head = format!(
-                    "HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(head.as_bytes()).await.unwrap();
-                stream.write_all(body.as_bytes()).await.unwrap();
-                if path == "/human" {
-                    return seen;
+                tokio::select! {
+                    accepted = listener.accept(), if handlers.len() < 8 => {
+                        let (mut stream, _) = accepted.unwrap();
+                        let seen = seen.clone();
+                        let kill_pid = kill_pid.clone();
+                        handlers.spawn(async move {
+                            let mut request = Vec::new();
+                            while !request.ends_with(b"\r\n\r\n") {
+                                assert!(request.len() < 8192);
+                                match tokio::time::timeout(Duration::from_secs(3), stream.read_u8()).await {
+                                    Ok(Ok(byte)) => request.push(byte),
+                                    Ok(Err(error)) if request.is_empty() && matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset) => return None,
+                                    Err(_) if request.is_empty() => return None, // Idle preconnect.
+                                    other => panic!("incomplete owned request: {other:?}"),
+                                }
+                            }
+                            let request = String::from_utf8(request).unwrap();
+                            let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                            let ordinal = {
+                                let mut seen = seen.lock().unwrap();
+                                seen.push(path.clone());
+                                assert!(seen.len() <= 12, "owned peer request bound");
+                                seen.iter().filter(|p| **p == path).count()
+                            };
+                            if path == "/during" && ordinal == 1 {
+                                let pid = kill_pid.load(std::sync::atomic::Ordering::Acquire);
+                                assert!(pid > 0, "only the acquired fixture browser may be killed");
+                                assert_eq!(unsafe { libc::kill(-pid, libc::SIGKILL) }, 0);
+                                return Some(path);
+                            }
+                            let (status, body) = match path.as_str() {
+                                "/owned" | "/during" => (201, format!("<html><body><article><h1>Owned recovered generation</h1><p>{}</p></article></body></html>",
+                                    "This is useful owned research content with a real status from the new browser. ".repeat(30))),
+                                "/human" => (403, "<h1>Verify you are human</h1><form><div class='g-recaptcha'></div></form>".into()),
+                                "/favicon.ico" => (404, String::new()),
+                                _ => panic!("unexpected owned request {path}"),
+                            };
+                            let head = format!(
+                                "HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            stream.write_all(head.as_bytes()).await.unwrap();
+                            stream.write_all(body.as_bytes()).await.unwrap();
+                            Some(path)
+                        });
+                    }
+                    finished = handlers.join_next(), if !handlers.is_empty() => {
+                        if finished.unwrap().unwrap().as_deref() == Some("/human") {
+                            return seen.lock().unwrap().clone();
+                        }
+                    }
                 }
             }
         });
@@ -1254,6 +1283,28 @@ mod pool_tests {
         );
         assert!(read.page.html.contains("Owned recovered generation"));
         assert_eq!(read.recovery.unwrap().reason, "transport-dead");
+        active_pid.store(
+            read.guard.pid().unwrap() as i32,
+            std::sync::atomic::Ordering::Release,
+        );
+        let read = manager
+            .read_document(
+                read.guard,
+                &profile,
+                &url.replace("/owned", "/during"),
+                Duration::from_secs(15),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            read.guard.pid().unwrap() as i32,
+            active_pid.load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(read.guard.wire, wire);
+        assert_eq!(read.page.document.status, Some(201));
+        assert_eq!(read.page.document.url, url.replace("/owned", "/during"));
+        assert!(read.page.html.contains("Owned recovered generation"));
+        assert_eq!(read.recovery.unwrap().reason, "transport-dead");
         let current_pid = read.guard.pid().unwrap();
         let started = Instant::now();
         let human = manager
@@ -1278,6 +1329,7 @@ mod pool_tests {
         assert_eq!(human.page.document.status, Some(403));
         let seen = server.await.unwrap();
         assert_eq!(seen.iter().filter(|p| p.as_str() == "/owned").count(), 1);
+        assert_eq!(seen.iter().filter(|p| p.as_str() == "/during").count(), 2);
         assert_eq!(seen.iter().filter(|p| p.as_str() == "/human").count(), 1);
         let error = manager
             .read_document(
