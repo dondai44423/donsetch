@@ -824,9 +824,9 @@ fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) ->
     adapter_host && !no_adapter && !matches!(verdict, Verdict::ContentOk)
 }
 
-// An adapter refusal or newly initialized session earns an HTTP recheck.
-// Saved wall memory must not skip that recovery; this call can still escalate
-// from its observed response and explicit browser requests keep precedence.
+// Reddit adapter/session recovery earns an HTTP recheck after initialization.
+// Its saved wall memory must not skip that recovery. Other hosts retain their
+// learned cooldown; explicit browser requests keep precedence.
 fn fetch_route(
     state: &crate::ghost::cache::GhostState,
     host: &str,
@@ -837,7 +837,11 @@ fn fetch_route(
 ) -> RouteDecision {
     if tier == "2" && !is_pdf_url && !adapter_host {
         RouteDecision::SkipToSolve
-    } else if tier == "1" || is_pdf_url || adapter_host || retry_http {
+    } else if tier == "1"
+        || is_pdf_url
+        || adapter_host
+        || (retry_http && matches!(host, "www.reddit.com" | "reddit.com"))
+    {
         RouteDecision::Cold
     } else {
         state.route_for(host)
@@ -4989,6 +4993,13 @@ mod adapter_hop_tests {
         assert!(matches!(
             fetch_route(&state, host, "auto", false, false, true),
             RouteDecision::Cold
+        ));
+        state
+            .profiles
+            .insert("stackoverflow.com".into(), state.profiles[host].clone());
+        assert!(matches!(
+            fetch_route(&state, "stackoverflow.com", "auto", false, false, true),
+            RouteDecision::SolveCooldown(_)
         ));
         // Explicit browser requests and other remembered walls keep their route.
         assert!(matches!(
