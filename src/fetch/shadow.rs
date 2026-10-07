@@ -122,8 +122,9 @@ pub async fn maybe_shadow(
     let fetcher = Arc::clone(fetcher);
     let state = Arc::clone(state);
     let page_url = page_url.to_string();
+    let route = page.route.clone();
     let handle = tokio::spawn(async move {
-        let fetched = shadow_burst(&fetcher, &page_url, assets).await;
+        let fetched = shadow_burst(&fetcher, &page_url, assets, &route).await;
         if fetched > 0 {
             let mut st = state.lock().await;
             st.note_shadow(fetched);
@@ -165,6 +166,7 @@ async fn shadow_burst(
     fetcher: &Arc<Fetcher>,
     page_url: &str,
     assets: Vec<(String, RequestClass)>,
+    route: &crate::transport::request_route::RequestRoute,
 ) -> usize {
     use futures_util::stream::{self, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -187,7 +189,7 @@ async fn shadow_burst(
                     {
                         return;
                     }
-                    let proxy = match crate::transport::proxy::from_env_for(&asset_url) {
+                    let proxy = match route.proxy_for(&asset_url) {
                         Ok(proxy) => proxy,
                         Err(_) => {
                             failures.fetch_add(1, Ordering::Relaxed);

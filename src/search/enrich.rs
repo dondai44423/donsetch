@@ -31,8 +31,7 @@ pub struct PrewarmCache {
 }
 
 pub struct PrewarmEntry {
-    pub body: Vec<u8>,
-    pub content_type: String,
+    pub outcome: crate::fetch::client::FetchOutcome,
     pub at: Instant,
 }
 
@@ -47,8 +46,8 @@ impl PrewarmCache {
         }
     }
 
-    pub(super) fn put(&mut self, url: &str, body: Vec<u8>, content_type: String) {
-        if body.len() > PREWARM_BODY_MAX {
+    pub(super) fn put(&mut self, url: &str, outcome: crate::fetch::client::FetchOutcome) {
+        if outcome.body.len() > PREWARM_BODY_MAX {
             return; // huge pages: extraction is cheap, RAM isn't
         }
         // Bound: evict oldest beyond cap.
@@ -65,8 +64,7 @@ impl PrewarmCache {
         self.entries.insert(
             url.to_string(),
             PrewarmEntry {
-                body,
-                content_type,
+                outcome,
                 at: Instant::now(),
             },
         );
@@ -131,7 +129,8 @@ impl Searcher {
                 // route out, a direct dial here failed and the result was
                 // scored QualityObs::Dead: live search results got demoted
                 // as dead links because of the egress, not the page.
-                let env_proxy = match crate::transport::proxy::from_env_for(&url) {
+                let route = crate::transport::request_route::RequestRoute::configured();
+                let env_proxy = match route.proxy_for(&url) {
                     Ok(proxy) => proxy,
                     // An unusable client route is not evidence that the page died.
                     Err(_) => return (i, None, Some(String::new()), QualityObs::Neutral),
@@ -155,7 +154,8 @@ impl Searcher {
                     }
                     // Refused / DNS-dead / nothing recovered = dead.
                     Ok(Err(_)) => (i, None, None, QualityObs::Dead),
-                    Ok(Ok(o)) => {
+                    Ok(Ok(mut o)) => {
+                        o.route = route;
                         // Wall-family verdicts first: a gated page is
                         // alive, never a dead link. Challenge walls
                         // answer 403/429 (cf-mitigated), so the
@@ -196,7 +196,7 @@ impl Searcher {
                         // when there is no metadata to enrich with.
                         sink.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .put(&url, o.body.clone(), ct);
+                            .put(&url, o);
                         // A live page with no extractable title/desc is
                         // still alive: return the neutral marker, never
                         // the dead-link (None, None) signal.
@@ -444,6 +444,7 @@ mod tests {
         assert!(
             entry
                 .unwrap()
+                .outcome
                 .body
                 .windows(b"hop-ok".len())
                 .any(|w| w == b"hop-ok")

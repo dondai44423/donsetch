@@ -70,33 +70,11 @@ pub const WINLOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_s
 #[cfg(windows)]
 pub const WINLOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(120);
 
-tokio::task_local! {
-    /// (direct retry, Chrome network error). Each fetch owns its flags;
-    /// cancelling the future drops them instead of changing a sibling call.
-    pub(crate) static GHOST_CALL: std::cell::Cell<(bool, bool)>;
-}
-
 /// Chrome's network error document. Require its DOM structure as well as
 /// an error code, so troubleshooting articles remain readable.
 pub fn is_chrome_error_html(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
     lower.contains("main-frame-error") && lower.contains("error-code") && lower.contains("err_")
-}
-
-pub fn note_last_ghost_chrome_error(on: bool) {
-    let _ = GHOST_CALL.try_with(|flags| flags.set((flags.get().0, on)));
-}
-
-pub fn last_ghost_chrome_error() -> bool {
-    GHOST_CALL.try_with(|flags| flags.get().1).unwrap_or(false)
-}
-
-pub fn set_ghost_direct(on: bool) {
-    let _ = GHOST_CALL.try_with(|flags| flags.set((on, flags.get().1)));
-}
-
-pub(super) fn ghost_direct() -> bool {
-    GHOST_CALL.try_with(|flags| flags.get().0).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -140,47 +118,6 @@ mod wave450_retry_tests {
         );
     }
     use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn wave450_browser_retry_flags_are_isolated_and_cancel_safe() {
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let first = GHOST_CALL.scope(std::cell::Cell::new((false, false)), async {
-            set_ghost_direct(true);
-            note_last_ghost_chrome_error(true);
-            ready_tx.send(()).unwrap();
-            release_rx.await.unwrap();
-            assert!(ghost_direct());
-            assert!(last_ghost_chrome_error());
-        });
-        let second = GHOST_CALL.scope(std::cell::Cell::new((false, false)), async {
-            ready_rx.await.unwrap();
-            assert!(!ghost_direct());
-            assert!(!last_ghost_chrome_error());
-            release_tx.send(()).unwrap();
-        });
-        tokio::join!(first, second);
-        let work = GHOST_CALL.scope(std::cell::Cell::new((false, false)), async {
-            set_ghost_direct(true);
-            note_last_ghost_chrome_error(true);
-            std::future::pending::<()>().await;
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), work)
-                .await
-                .is_err()
-        );
-        assert!(!ghost_direct());
-        assert!(!last_ghost_chrome_error());
-        assert_ne!(
-            GhostWire::default(),
-            GhostWire {
-                direct: true,
-                ..Default::default()
-            }
-        );
-    }
 
     #[test]
     fn wave450_network_error_quotation_is_not_a_browser_error_page() {
@@ -240,11 +177,10 @@ pub struct Ghost {
     /// Persona-coherent wire identity (v4 E2): viewport + locale used
     /// for launch args, CDP languages, and device metrics.
     wire: GhostWire,
-    /// Local credential relay when the egress lane requires auth
-    /// (Chrome cannot authenticate proxies itself). Owns the
-    /// listener: dropped with the Ghost.
+    /// Owned relays for proxy credentials and configured target bypasses.
+    /// Dropping the Ghost closes their listeners and active tunnels.
     #[allow(dead_code)] // held for its lifetime; Drop aborts the relay
-    relay: Option<relay::Relay>,
+    relays: Vec<relay::Relay>,
     dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -277,8 +213,10 @@ impl Drop for Operation {
 pub struct GhostWire {
     pub viewport: (u32, u32),
     pub locale: String,
-    /// Direct retry changes browser routing and therefore pool identity.
+    /// An explicit direct override changes routing and therefore pool identity.
     pub direct: bool,
+    /// Selected immutable HTTP/browser policy; absent only for legacy callers.
+    pub route: Option<crate::transport::request_route::RequestRoute>,
 }
 
 impl Default for GhostWire {
@@ -287,6 +225,7 @@ impl Default for GhostWire {
             viewport: (1920, 1080),
             locale: "en-US".into(),
             direct: false,
+            route: None,
         }
     }
 }
@@ -305,6 +244,7 @@ impl GhostWire {
             viewport: (w, h),
             locale,
             direct: false,
+            route: None,
         }
     }
 }
@@ -1038,6 +978,18 @@ impl Ghost {
         display: Option<&str>,
         wire: &GhostWire,
     ) -> Result<Self, FetchError> {
+        let mut selected_wire = wire.clone();
+        if selected_wire.direct {
+            selected_wire.route = Some(crate::transport::request_route::RequestRoute::direct());
+        } else if selected_wire.route.is_none() {
+            selected_wire.route = Some(crate::transport::request_route::RequestRoute::configured());
+        }
+        let wire = &selected_wire;
+        let (http_proxy, https_proxy, bypass) = wire
+            .route
+            .as_ref()
+            .expect("route selected")
+            .browser_proxies()?;
         // Unused on macOS/Windows (Xvfb is Linux-only) : clippy -Dwarnings errors on it.
         #[cfg(not(linux_like))]
         let _ = display;
@@ -1219,52 +1171,53 @@ impl Ghost {
             chrome_args.push("--no-sandbox".into());
             chrome_args.push("--disable-setuid-sandbox".into());
         }
-        // ── HTTP proxy ──
-        // Prefer a sticky lane from the shared egress pool when the
-        // fetch opt-in is on (`proxy.fetch_rotate`; off by default,
-        // so the browser rides the home IP like tier 1). Fall back
-        // to env/slot. Chrome CANNOT authenticate a proxy
-        // itself: --proxy-server carries no credentials and no
-        // dialog we can drive headless, so an authenticated lane
-        // made Chrome render its own ERR_SOCKS_CONNECTION_FAILED
-        // error page and the whole tier-2 attempt died. Authed
-        // lanes now ride a local relay: Chrome speaks plain socks5
-        // to 127.0.0.1, the relay performs the upstream handshake
-        // with the lane's own credentials (exactly what the tier-1
-        // client does) and pipes bytes.
-        let pool_proxy = if wire.direct {
-            // Direct retry after a Chrome error page: no lanes at
-            // all, direct is the only chance left.
-            None
+        let mut relays = Vec::new();
+        if http_proxy.is_none() && https_proxy.is_none() {
+            chrome_args.push("--no-proxy-server".into());
         } else {
-            crate::search::egress::global().and_then(|pool| {
-                if !pool.has_proxies() || !crate::config::cfg().proxy.fetch_rotate {
-                    return None;
+            let mut endpoints = Vec::new();
+            for proxy in [http_proxy.as_ref(), https_proxy.as_ref()] {
+                let Some(proxy) = proxy else {
+                    endpoints.push("direct://".to_owned());
+                    continue;
+                };
+                // Identical protocol routes share a single credential relay.
+                if endpoints.len() == 1 && http_proxy == https_proxy {
+                    endpoints.push(endpoints[0].clone());
+                    continue;
                 }
-                pool.pick_fetch("ghost.local", true).and_then(|e| e.proxy)
-            })
-        };
-        let mut relay: Option<relay::Relay> = None;
-        if let Some(p) = if wire.direct {
-            None
-        } else {
-            match pool_proxy {
-                Some(proxy) => Some(proxy),
-                None => crate::transport::proxy::from_env_for("https://ghost.local/")?,
+                let endpoint =
+                    if !proxy.user.is_empty() || !proxy.pass.is_empty() || !bypass.is_empty() {
+                        let relay = relay::Relay::spawn_with_bypass(
+                            std::sync::Arc::new(proxy.clone()),
+                            bypass.clone(),
+                        )
+                        .await
+                        .map_err(|e| FetchError::ghost(format!("proxy relay bind failed: {e}")))?;
+                        let endpoint = format!("socks5://127.0.0.1:{}", relay.port);
+                        relays.push(relay);
+                        endpoint
+                    } else {
+                        proxy.chrome_proxy_arg()
+                    };
+                endpoints.push(endpoint);
             }
-        } {
-            let authed = !p.user.is_empty() || !p.pass.is_empty();
-            let arg = if authed {
-                let r = relay::Relay::spawn(std::sync::Arc::new(p.clone()))
-                    .await
-                    .map_err(|e| FetchError::ghost(format!("proxy relay bind failed: {e}")))?;
-                let arg = r.chrome_arg();
-                relay = Some(r);
-                arg
-            } else {
-                p.chrome_proxy_arg()
-            };
-            chrome_args.push(arg);
+            // Preserve Chromium's HTTPS-before-HTTP choice for WebSockets.
+            // No direct fallback is added to a selected proxy's list.
+            chrome_args.push(format!(
+                "--proxy-server=http={};https={};socks={}",
+                endpoints[0],
+                endpoints[1],
+                if https_proxy.is_some() {
+                    &endpoints[1]
+                } else {
+                    &endpoints[0]
+                }
+            ));
+            // The request guard still enforces URL/DNS policy. Disable Chrome's
+            // implicit local bypass so an explicit proxy is actually honored.
+            // Configured NO_PROXY is evaluated by our relay with HTTP's matcher.
+            chrome_args.push("--proxy-bypass-list=<-loopback>".into());
         }
         // ── Stealth mode selection ──
         //
@@ -1622,7 +1575,7 @@ impl Ghost {
             #[cfg(windows)]
             winlock_heartbeat,
             wire: wire.clone(),
-            relay,
+            relays,
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }

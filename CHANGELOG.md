@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fetch browser recovery and HTTP replay retain the selected route. Protocol
+  proxy settings and per-target bypasses are captured for the request;
+  unauthenticated proxies use Chromium's proxy setting, and failed required
+  proxies no longer trigger a direct retry. Shadow assets retain the page route.
+  Browser slots distinguish route credentials, and successful relay connections
+  clear prior failure strikes while their tunnels remain active.
+- Search prewarm handoff preserves its actual document status, URL and route,
+  and serves only compatible route contexts. Proxy bypass matching normalizes
+  domain case, trailing dots and equivalent IP literals.
 - Invalid selected proxy settings return an error instead of silently dialing
   direct. Proxy endpoints reject empty or malformed hosts and zero ports;
   supported proxy schemes are case-insensitive.

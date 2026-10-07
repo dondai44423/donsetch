@@ -31,15 +31,23 @@ const PROXY_CONNECT_BUDGET: Duration = Duration::from_secs(30);
 /// True when `host` matches a NO_PROXY entry. Comma-separated
 /// suffix match: "example.com" matches "foo.example.com".
 /// "*" disables all proxying.
+#[cfg(test)]
 fn no_proxy_match(host: &str) -> bool {
+    no_proxy_match_value(host, &no_proxy_value())
+}
+
+pub(crate) fn no_proxy_value() -> String {
     let cfg = crate::config::cfg();
-    let no_proxy = if !cfg.proxy.no_proxy.is_empty() {
+    if !cfg.proxy.no_proxy.is_empty() {
         cfg.proxy.no_proxy.clone()
     } else {
         std::env::var("NO_PROXY")
             .or_else(|_| std::env::var("no_proxy"))
             .unwrap_or_default()
-    };
+    }
+}
+
+pub(crate) fn no_proxy_match_value(host: &str, no_proxy: &str) -> bool {
     if no_proxy.is_empty() {
         return false;
     }
@@ -50,6 +58,7 @@ fn no_proxy_match(host: &str) -> bool {
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
+    let host = host_unbracketed.trim_end_matches('.');
     let host_ip: Option<std::net::IpAddr> = host_unbracketed.parse().ok();
     for entry in no_proxy.split(',') {
         let entry = entry.trim();
@@ -99,21 +108,30 @@ fn no_proxy_match(host: &str) -> bool {
         // Literal IP entry matches a literal IP host exactly (after
         // bracket stripping); a bare IPv6 entry like "::1" also lands
         // on this arm via host_unbracketed == entry.
-        if entry.parse::<std::net::IpAddr>().is_ok() && host_ip.is_some() {
-            if host_unbracketed == entry {
+        if let Ok(entry_ip) = entry.parse::<std::net::IpAddr>()
+            && host_ip.is_some()
+        {
+            if host_ip == Some(entry_ip) {
                 return true;
             }
             continue;
         }
-        let entry = entry.strip_prefix('.').unwrap_or(entry);
-        if host == entry || host_unbracketed == entry {
+        let entry = entry
+            .strip_prefix('.')
+            .unwrap_or(entry)
+            .trim_end_matches('.');
+        if entry.is_empty() {
+            continue;
+        }
+        if host.eq_ignore_ascii_case(entry) {
             return true;
         }
         // host.ends_with(&format!(".{entry}")) without the per-entry
         // allocation: the char before a matching suffix must be '.'.
-        // (Byte-identical semantics, including the empty-entry edge.)
         if host.len() > entry.len()
-            && host.ends_with(entry)
+            && host
+                .get(host.len() - entry.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(entry))
             && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
         {
             return true;
@@ -157,13 +175,13 @@ fn cidr_match(host: std::net::IpAddr, net: std::net::IpAddr, bits: u8) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProxyScheme {
     Http,
     Socks5,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Proxy {
     pub host: String,
     pub port: u16,
@@ -643,9 +661,8 @@ impl Proxy {
         }
     }
 
-    /// Chrome-compatible `--proxy-server` value (scheme://host:port, no
-    /// credentials : Chrome handles proxy auth via its own dialog or
-    /// `--proxy-auth` extension). Used for the Ghost browser tier.
+    /// Credential-free native proxy URI for Chromium's `--proxy-server` map.
+    /// Authenticated routes require the browser's owned credential relay.
     pub fn chrome_proxy_arg(&self) -> String {
         format!(
             "{}://{}:{}",
@@ -747,7 +764,7 @@ pub fn load_all() -> Vec<Proxy> {
 /// variable set to "" as unset, so `HTTPS_PROXY=""` must fall
 /// through to https_proxy / ALL_PROXY instead of short-circuiting the
 /// chain with an empty value.
-fn env_proxy_var(name: &str) -> Option<String> {
+pub(crate) fn env_proxy_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -764,72 +781,7 @@ fn env_proxy_var(name: &str) -> Option<String> {
 /// value counts as unset (curl parity): it does not starve the
 /// fallbacks after it.
 pub fn from_env_for(url: &str) -> Result<Option<Proxy>, FetchError> {
-    let parsed = url::Url::parse(url)
-        .map_err(|_| FetchError::Http("proxy resolution requires a valid HTTP(S) URL".into()))?;
-    let scheme = parsed.scheme();
-    if !matches!(scheme, "http" | "https") {
-        return Err(FetchError::Http(
-            "proxy resolution requires an HTTP(S) URL".into(),
-        ));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| FetchError::Http("proxy resolution requires a host".into()))?;
-
-    // NO_PROXY bypass.
-    if no_proxy_match(host) {
-        return Ok(None);
-    }
-
-    // Resolution order: the explicit config slot ([proxy] https or
-    // [proxy] http) beats the config "all" slot, which beats the
-    // ambient env chain of the same scheme (upper, lower, ALL_PROXY,
-    // all_proxy). The ambient chain is gated by
-    // proxy.from_environment; config values stay live regardless.
-    // This is what doctor reports ("from_env_for consults the config
-    // layer first"); an earlier comment here described the reverse
-    // order, which the code has never implemented.
-    let cfg = crate::config::cfg();
-    let (cfg_slot, env_name) = if scheme == "https" {
-        (&cfg.proxy.https, "HTTPS_PROXY")
-    } else {
-        (&cfg.proxy.http, "HTTP_PROXY")
-    };
-    let explicit = if !cfg_slot.trim().is_empty() {
-        Some(cfg_slot.trim())
-    } else if !cfg.proxy.all.trim().is_empty() {
-        Some(cfg.proxy.all.trim())
-    } else {
-        None
-    };
-    let env_val = match explicit {
-        Some(v) => v.to_string(),
-        // The ambient env layer is gated by proxy.from_environment:
-        // explicit [proxy] slots stay live even when the ambient
-        // convention is disabled (the gate must never starve a TOML
-        // proxy).
-        None if cfg.proxy.from_environment => {
-            let Some(value) = env_proxy_var(env_name)
-                .or_else(|| env_proxy_var(&env_name.to_lowercase()))
-                .or_else(|| env_proxy_var("ALL_PROXY"))
-                .or_else(|| env_proxy_var("all_proxy"))
-            else {
-                return Ok(None);
-            };
-            value
-        }
-        None => return Ok(None),
-    };
-    let env_val = env_val.trim();
-    if env_val.is_empty() {
-        return Ok(None);
-    }
-    Proxy::parse(env_val)
-        .map(Some)
-        .map_err(|error| match error {
-            FetchError::Http(message) => FetchError::ProxyConfig(message),
-            other => FetchError::ProxyConfig(other.to_string()),
-        })
+    super::request_route::RequestRoute::configured().proxy_for(url)
 }
 
 /// Save proxies to the config file. Atomic write (temp + rename).
@@ -878,6 +830,28 @@ pub(crate) fn base64(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stealth_v3_no_proxy_normalizes_host_case_and_ip_spelling() {
+        assert!(super::no_proxy_match_value(
+            "child.example.com",
+            ".EXAMPLE.COM:443"
+        ));
+        assert!(super::no_proxy_match_value(
+            "[::1]",
+            "[0:0:0:0:0:0:0:1]:8443"
+        ));
+        assert!(super::no_proxy_match_value("example.com.", "EXAMPLE.COM"));
+        for (host, bypass) in [
+            ("otherexample.com", "example.com"),
+            ("[::2]", "[::1]"),
+            ("example.com.", "."),
+        ] {
+            assert!(
+                !super::no_proxy_match_value(host, bypass),
+                "{host} must not bypass {bypass}"
+            );
+        }
+    }
     #[test]
     fn stealth_v3_proxy_endpoint_validation_rejects_invalid_hosts_and_zero_port() {
         for raw in [

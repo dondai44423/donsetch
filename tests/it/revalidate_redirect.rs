@@ -142,6 +142,63 @@ async fn revalidation_conditionals_never_ride_a_redirect_hop() {
 static ENV_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[tokio::test]
+async fn stealth_v3_redirect_keeps_original_proxy_policy_when_ambient_changes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    unsafe {
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+        std::env::remove_var("DONSETCH_NO_ENV_PROXY");
+        std::env::set_var("HTTP_PROXY", format!("http://{address}"));
+        std::env::set_var("NO_PROXY", "");
+        std::env::remove_var("no_proxy");
+    }
+    let server = tokio::spawn(async move {
+        let mut heads = Vec::new();
+        for ordinal in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(stream.read_u8().await.unwrap());
+            }
+            heads.push(String::from_utf8(head).unwrap());
+            if ordinal == 0 {
+                unsafe {
+                    std::env::set_var("HTTP_PROXY", "socks4://broken.invalid:1080");
+                    std::env::set_var("NO_PROXY", "*");
+                }
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            } else {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nselected-policy").await.unwrap();
+            }
+        }
+        heads
+    });
+    let fetcher = Fetcher::new(BrowserProfile::host_default()).unwrap();
+    let outcome = fetcher
+        .fetch_persona(&format!("http://{address}/first"), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.body, b"selected-policy");
+    let heads = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(heads[0].starts_with(&format!("GET http://{address}/first HTTP/1.1\r\n")));
+    assert!(
+        heads[1].starts_with(&format!("GET http://{address}/next HTTP/1.1\r\n")),
+        "redirect escaped the selected proxy: {}",
+        heads[1]
+    );
+    assert_eq!(
+        outcome.route.proxy_for(&outcome.url).unwrap().unwrap().port,
+        address.port()
+    );
+}
+
+#[tokio::test]
 async fn stealth_v3_persona_revalidation_keeps_languages_separate() {
     use donsetch::fetch::client::CacheState;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

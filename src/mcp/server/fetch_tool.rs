@@ -60,25 +60,22 @@ async fn fetch_with_budget(
 ) -> Value {
     let started = std::time::Instant::now();
     let witness = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut result = crate::ghost::GHOST_CALL
+    let mut result = FETCH_TRACE
         .scope(
-            std::cell::Cell::new((false, false)),
-            FETCH_TRACE.scope(
-                witness.clone(),
-                run_with_budget(
-                    Box::pin(fetch_single(daemon, args, url)),
-                    deadline,
-                    ctx,
-                    || {
-                        let prior = witness
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clone();
-                        let mut result = deadline_error(url);
-                        fold_trace_into_result(&mut result, prior);
-                        result
-                    },
-                ),
+            witness.clone(),
+            run_with_budget(
+                Box::pin(fetch_single(daemon, args, url)),
+                deadline,
+                ctx,
+                || {
+                    let prior = witness
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let mut result = deadline_error(url);
+                    fold_trace_into_result(&mut result, prior);
+                    result
+                },
             ),
         )
         .await;
@@ -1324,6 +1321,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(&orig_url)
+            .filter(|entry| entry.outcome.route == daemon.fetcher.route_for_fetch(&orig_url))
     } else {
         None
     };
@@ -1333,18 +1331,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         trace.step("prewarm", "search-handoff", "hit", 0);
         // law 6: make the warm handoff observable in `donsetch status`.
         daemon.state.lock().await.note_prewarm_served();
-        out = Some(crate::fetch::client::FetchOutcome {
-            url: orig_url.clone(),
-            status: 200,
-            alpn: "h2".to_string(),
-            headers: vec![("content-type".to_string(), entry.content_type)],
-            body: entry.body,
-            redirects: 0,
-            cache: crate::fetch::client::CacheState::None,
-            used_pool: true,
-            verdict: Verdict::ContentOk,
-            elapsed: std::time::Duration::from_millis(0),
-        });
+        out = Some(entry.outcome);
     }
 
     let mut adapter_session_seeded = false;
@@ -1860,39 +1847,24 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             }
         }
 
-        // Chrome renders ITS OWN error page (ERR_SOCKS_CONNECTION_
-        // FAILED etc.) when the egress lane is dead: the ghost stage
-        // fails with kind "walled" and a stable tiny-text DOM. One
-        // direct retry (no lane at all) usually just works; ride it
-        // before giving up. One-shot per fetch, never sticky.
-        let mut ghost_direct_tried = false;
-        let ghost_result = loop {
-            crate::ghost::note_last_ghost_chrome_error(false);
-            match ghost_escalate(
-                daemon,
-                &url,
-                &host,
-                &opts,
-                challenge || shell_warm || (skip_tier1 && tier != "2"),
-                tier == "2" || opts.selector.is_some(),
-                shot,
-                &mut trace,
-                budget,
-            )
-            .await
-            {
-                Ok(done) => break Ok(done),
-                Err((msg, kind)) => {
-                    if !ghost_direct_tried && crate::ghost::last_ghost_chrome_error() {
-                        crate::ghost::set_ghost_direct(true);
-                        ghost_direct_tried = true;
-                        continue;
-                    }
-                    break Err((msg, kind));
-                }
-            }
-        };
-        crate::ghost::set_ghost_direct(false);
+        let route = out
+            .as_ref()
+            .map(|out| out.route.clone())
+            .unwrap_or_else(|| daemon.fetcher.route_for_fetch(&url));
+        let ghost_result = ghost_escalate(
+            daemon,
+            &url,
+            &host,
+            &opts,
+            challenge || shell_warm || (skip_tier1 && tier != "2"),
+            tier == "2" || opts.selector.is_some(),
+            shot,
+            &mut trace,
+            budget,
+            &route,
+            persona_al.as_deref(),
+        )
+        .await;
         match ghost_result {
             Ok((e, tier2, status, furl, html)) => {
                 if stitch {
@@ -2404,10 +2376,12 @@ pub(super) async fn ghost_escalate(
     shot: Option<&str>,
     trace: &mut Trace,
     budget: Budget,
+    route: &crate::transport::request_route::RequestRoute,
+    accept_language: Option<&str>,
 ) -> Result<(extract::Extracted, &'static str, u16, String, String), (String, &'static str)> {
     let t0 = std::time::Instant::now();
     // v4 E2: ghost agrees with the persona pin (viewport + locale).
-    let wire = {
+    let mut wire = {
         let state = daemon.state.lock().await;
         state
             .personas
@@ -2416,6 +2390,7 @@ pub(super) async fn ghost_escalate(
             .map(|p| p.ghost_wire())
             .unwrap_or_default()
     };
+    wire.route = Some(route.clone());
     trace.step("2", "browser-launch", "started", 0);
     let g = daemon
         .ghost_mgr
@@ -2436,12 +2411,6 @@ pub(super) async fn ghost_escalate(
         .await
         .map_err(|error| {
             let message = error.to_string();
-            if message.contains("ERR_PROXY_")
-                || message.contains("ERR_SOCKS_")
-                || message.contains("ERR_TUNNEL_")
-            {
-                crate::ghost::note_last_ghost_chrome_error(true);
-            }
             trace.step("2", "ghost-render", &message, t1.elapsed().as_millis());
             (format!("browser navigation error: {message}"), "transient")
         })?;
@@ -2479,7 +2448,6 @@ pub(super) async fn ghost_escalate(
         );
     }
     if crate::ghost::is_chrome_error_html(&page.html) {
-        crate::ghost::note_last_ghost_chrome_error(true);
         return Err((
             format!("browser network error at {url}: Chrome could not load the document"),
             "transient",
@@ -2645,15 +2613,19 @@ pub(super) async fn ghost_escalate(
             }
         }
     }
-    if !page.cookies.is_empty() && !crate::ghost::ghost_direct() {
+    if !page.cookies.is_empty() {
         daemon.fetcher.import_cookies(&page.cookies).await;
         crate::ghost::cache::store_session_cookies(&page.cookies);
     }
     // Retry tier 1 with fresh cookies : the cheap path back to
     // normal HTTP when the gate was cookie-driven.
     let t2 = std::time::Instant::now();
-    let retry = if !browser_only && !page.cookies.is_empty() && !crate::ghost::ghost_direct() {
-        let r = daemon.fetcher.fetch(url).await.ok();
+    let retry = if !browser_only && !page.cookies.is_empty() {
+        let r = daemon
+            .fetcher
+            .fetch_persona_on_route(url, accept_language, Some(route))
+            .await
+            .ok();
         trace.step(
             "1",
             "http-retry-with-ghost-cookies",
@@ -2778,7 +2750,7 @@ pub(super) async fn ghost_escalate(
         // Learning is gated on WALL-DRIVEN escalation AND gated on
         // CONTENT : success is "we got content", not "we got HTTP
         // 200". The replay probe (or its absence) sets replay_ok.
-        if (learn || page.vendor.is_some()) && !crate::ghost::ghost_direct() {
+        if learn || page.vendor.is_some() {
             daemon.state.lock().await.record_solved(
                 host,
                 &page.cookies,

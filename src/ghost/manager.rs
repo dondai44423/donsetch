@@ -400,7 +400,27 @@ impl GhostManager {
         host: Option<&str>,
         mut wire: crate::ghost::GhostWire,
     ) -> Result<GhostGuard, FetchError> {
-        wire.direct |= super::ghost_direct();
+        if wire.direct {
+            wire.route = Some(crate::transport::request_route::RequestRoute::direct());
+        } else if wire.route.is_none() {
+            let proxy = if crate::config::cfg().proxy.fetch_rotate {
+                crate::search::egress::global()
+                    .and_then(|pool| pool.pick_fetch(host.unwrap_or_default(), true))
+                    .and_then(|lane| lane.proxy)
+            } else {
+                None
+            };
+            wire.route = Some(
+                proxy
+                    .map(crate::transport::request_route::RequestRoute::pinned)
+                    .unwrap_or_else(crate::transport::request_route::RequestRoute::configured),
+            );
+        }
+        // Configuration fails before slot reservation or display/browser startup.
+        wire.route
+            .as_ref()
+            .expect("route selected")
+            .browser_proxies()?;
         let key = persona_key(profile, &wire);
         let queued = Instant::now();
         let reservation = self.reserve(key, host).await?;
@@ -1368,6 +1388,7 @@ mod pool_tests {
             viewport: (1280, 800),
             locale: "fr-FR".into(),
             direct: true,
+            route: Some(crate::transport::request_route::RequestRoute::direct()),
         };
         let guard = manager
             .acquire_for_wire(&profile, Some("127.0.0.1"), wire.clone())
@@ -1600,6 +1621,18 @@ mod pool_tests {
         different = wire.clone();
         different.locale = "de-DE".into();
         assert_ne!(original, persona_key(&profile, &different));
+        different = wire.clone();
+        different.route = Some(crate::transport::request_route::RequestRoute::pinned(
+            crate::transport::proxy::Proxy::parse("http://alice:owned-secret@proxy.example:8080")
+                .unwrap(),
+        ));
+        let routed = persona_key(&profile, &different);
+        assert_ne!(original, routed);
+        different.route = Some(crate::transport::request_route::RequestRoute::pinned(
+            crate::transport::proxy::Proxy::parse("http://alice:changed@proxy.example:8080")
+                .unwrap(),
+        ));
+        assert_ne!(routed, persona_key(&profile, &different));
         different = wire;
         different.viewport = (1280, 720);
         assert_ne!(original, persona_key(&profile, &different));

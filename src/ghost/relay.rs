@@ -100,10 +100,17 @@ impl Relay {
     /// Bind a loopback listener and own the bounded tunnel tasks.
     /// Bind failures propagate; callers must retain the selected route.
     pub async fn spawn(proxy: Arc<crate::transport::proxy::Proxy>) -> std::io::Result<Relay> {
+        Self::spawn_with_bypass(proxy, String::new()).await
+    }
+
+    pub(crate) async fn spawn_with_bypass(
+        proxy: Arc<crate::transport::proxy::Proxy>,
+        bypass: String,
+    ) -> std::io::Result<Relay> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let port = listener.local_addr()?.port();
         let handle = tokio::spawn(async move {
-            accept_loop(listener, proxy).await;
+            accept_loop(listener, proxy, Arc::new(bypass)).await;
         });
         Ok(Relay {
             port,
@@ -128,7 +135,11 @@ impl Drop for Relay {
 const MAX_TUNNELS: usize = 64;
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-async fn accept_loop(listener: TcpListener, proxy: Arc<crate::transport::proxy::Proxy>) {
+async fn accept_loop(
+    listener: TcpListener,
+    proxy: Arc<crate::transport::proxy::Proxy>,
+    bypass: Arc<String>,
+) {
     let strikes = std::sync::Arc::new(std::sync::Mutex::new(StrikeCache::default()));
     let mut tunnels = JoinSet::new();
     loop {
@@ -144,8 +155,9 @@ async fn accept_loop(listener: TcpListener, proxy: Arc<crate::transport::proxy::
                 }
                 let proxy = Arc::clone(&proxy);
                 let strikes = Arc::clone(&strikes);
+                let bypass = Arc::clone(&bypass);
                 tunnels.spawn(async move {
-                    let _ = serve_socks5_client(stream, proxy, strikes).await;
+                    let _ = serve_socks5_client(stream, proxy, strikes, bypass).await;
                 });
             }
         }
@@ -156,6 +168,7 @@ async fn serve_socks5_client(
     mut client: TcpStream,
     proxy: Arc<crate::transport::proxy::Proxy>,
     strikes: std::sync::Arc<std::sync::Mutex<StrikeCache>>,
+    bypass: Arc<String>,
 ) -> std::io::Result<()> {
     let Some((host, port)) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_socks5_target(&mut client))
@@ -183,8 +196,19 @@ async fn serve_socks5_client(
         return Ok(());
     }
 
-    match proxy.connect(&host, port).await {
+    let connected = if crate::transport::proxy::no_proxy_match_value(&host, &bypass) {
+        crate::transport::tcp::happy_connect(&host, port).await
+    } else {
+        proxy.connect(&host, port).await
+    };
+    match connected {
         Ok(mut upstream) => {
+            // The route has healed when upstream connect succeeds, even if
+            // this browser tunnel remains active for the rest of the page.
+            strikes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .note_success(&host_key);
             if client
                 .write_all(&[5u8, 0u8, 0u8, 1u8, 0, 0, 0, 0, 0, 0])
                 .await
@@ -193,13 +217,6 @@ async fn serve_socks5_client(
                 return Ok(());
             }
             let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
-            // A successful connect clears the host's strikes: the
-            // outage that struck it is over, and a fast-reject held
-            // past the healing would starve the page forever.
-            strikes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .note_success(&host_key);
             Ok(())
         }
         Err(e) => {
@@ -309,6 +326,163 @@ fn format_ipv6(octets: &[u8; 16]) -> String {
 mod relay_tests {
     use super::*;
     use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn stealth_v3_relay_bypass_keeps_other_hosts_on_selected_proxy() {
+        unsafe {
+            std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+        }
+        let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_port = direct.local_addr().unwrap().port();
+        let direct_peer = tokio::spawn(async move {
+            let (mut stream, _) = direct.accept().await.unwrap();
+            let mut ping = [0; 4];
+            stream.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            stream.write_all(b"direct-route").await.unwrap();
+        });
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Arc::new(
+            crate::transport::proxy::Proxy::parse(&format!(
+                "http://{}",
+                upstream.local_addr().unwrap()
+            ))
+            .unwrap(),
+        );
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reached.clone();
+        let proxy_peer = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(stream.read_u8().await.unwrap());
+            }
+            assert!(
+                head.starts_with(b"CONNECT example.org:80 HTTP/1.1\r\n"),
+                "{head:?}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 Established\r\n\r\nproxy-route!")
+                .await
+                .unwrap();
+        });
+        let relay = Relay::spawn_with_bypass(proxy, "127.0.0.1:1".into())
+            .await
+            .unwrap();
+        async fn connect(port: u16, target: &[u8]) -> TcpStream {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            client.write_all(target).await.unwrap();
+            let mut result = [0; 10];
+            client.read_exact(&mut result).await.unwrap();
+            assert_eq!(&result[..2], &[5, 0]);
+            client
+        }
+        let mut target = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        target.extend_from_slice(&direct_port.to_be_bytes());
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connect(relay.port, &target),
+        )
+        .await
+        .unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut content = [0; 12];
+        client.read_exact(&mut content).await.unwrap();
+        assert_eq!(&content, b"direct-route");
+        assert_eq!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "bypassed origin must never dial the proxy"
+        );
+        drop(client);
+        direct_peer.await.unwrap();
+        let mut proxied = connect(relay.port, b"\x05\x01\x00\x03\x0bexample.org\x00\x50").await;
+        proxied.read_exact(&mut content).await.unwrap();
+        assert_eq!(&content, b"proxy-route!");
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 1);
+        proxy_peer.await.unwrap();
+        drop(proxied);
+        drop(relay);
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_relay_connected_tunnel_clears_strikes_before_close() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = Arc::new(
+            crate::transport::proxy::Proxy::parse(&format!(
+                "http://{}",
+                upstream.local_addr().unwrap()
+            ))
+            .unwrap(),
+        );
+        let (release, released) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(stream.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(b"CONNECT example.org:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut ping = [0; 4];
+            stream.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            released.await.unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let strikes = Arc::new(std::sync::Mutex::new(StrikeCache::default()));
+        strikes.lock().unwrap().note_failure("example.org:443");
+        strikes.lock().unwrap().note_failure("example.org:443");
+        let observed = strikes.clone();
+        let tunnel = tokio::spawn(serve_socks5_client(
+            stream,
+            proxy,
+            strikes,
+            Arc::new(String::new()),
+        ));
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut answer = [0; 2];
+        client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer, [5, 0]);
+        client
+            .write_all(b"\x05\x01\x00\x03\x0bexample.org\x01\xbb")
+            .await
+            .unwrap();
+        let mut success = [0; 10];
+        client.read_exact(&mut success).await.unwrap();
+        assert_eq!(&success[..2], &[5, 0]);
+        client.write_all(b"ping").await.unwrap();
+        let mut pong = [0; 4];
+        client.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+        assert!(
+            !observed
+                .lock()
+                .unwrap()
+                .strikes
+                .contains_key("example.org:443"),
+            "an actual connected live tunnel must clear prior failures before it closes"
+        );
+        release.send(()).unwrap();
+        drop(client);
+        peer.await.unwrap();
+        tunnel.await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn stealth_v3_relay_malformed_targets_never_dial_upstream() {

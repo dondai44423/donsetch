@@ -10,6 +10,7 @@ use crate::error::FetchError;
 use crate::ghost::cache::CookieRecord;
 use crate::profile::{BrowserProfile, RequestClass};
 use crate::transport::pool::Pool;
+use crate::transport::request_route::RequestRoute;
 use crate::transport::{h1, h2::conn::H2Conn, proxy, tcp, tls};
 
 use super::cookies::CookieJar;
@@ -29,6 +30,8 @@ pub enum CacheState {
 }
 
 pub struct FetchOutcome {
+    /// Routing policy selected before the first request, retained for recovery.
+    pub route: RequestRoute,
     /// Final URL after redirects.
     pub url: String,
     pub status: u16,
@@ -228,6 +231,7 @@ impl Fetcher {
                 legacy_user_agent: None,
                 accept_language: None,
             },
+            None,
         )
         .await
     }
@@ -242,6 +246,7 @@ impl Fetcher {
         skip_cache: bool,
         pool_pick: bool,
         identity: RequestIdentity<'_>,
+        route_override: Option<&RequestRoute>,
     ) -> Result<FetchOutcome, FetchError> {
         // Centralized URL safety gate (fetch tier). The synchronous
         // literal checks run here (scheme, credentials, localhost and
@@ -265,12 +270,13 @@ impl Fetcher {
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
             .unwrap_or_default();
-        let pool_lane = if pool_pick_enabled(
-            proxy,
-            pool_pick,
-            crate::config::cfg().proxy.fetch_rotate,
-            self.egress.as_deref(),
-        ) {
+        let pool_lane = if route_override.is_none()
+            && pool_pick_enabled(
+                proxy,
+                pool_pick,
+                crate::config::cfg().proxy.fetch_rotate,
+                self.egress.as_deref(),
+            ) {
             self.egress
                 .as_ref()
                 .and_then(|pool| pool.pick_fetch(&fetch_host, true))
@@ -278,26 +284,29 @@ impl Fetcher {
             None
         };
         let pool_lane_id = pool_lane.as_ref().map(|e| e.id.clone());
+        let use_pool_lane = pool_lane_is_proxy(pool_lane.as_ref());
         // Only a real lane pins the request and mutes env proxies. A
         // `direct` answer from the pool (every lane dead, or burned
         // for this host) must leave the env-proxy path in charge:
         // otherwise HTTPS_PROXY is silently ignored and the request
         // leaves on the real address (#302 review).
-        let use_pool_lane = pool_lane_is_proxy(pool_lane.as_ref());
         let pinned_pool = pool_lane.as_ref().and_then(|e| e.proxy.as_ref());
         // Resolve the actual route before lookup, and retain this exact
         // sent-header snapshot even if another response changes the jar.
-        let initial_env = if proxy.is_none() && !use_pool_lane {
-            crate::transport::proxy::from_env_for(url_str)?
-        } else {
-            None
-        };
-        let initial_proxy = proxy.or(pinned_pool).or(initial_env.as_ref());
+        let route = route_override.cloned().unwrap_or_else(|| {
+            proxy
+                .or(if use_pool_lane { pinned_pool } else { None })
+                .cloned()
+                .map(RequestRoute::pinned)
+                .unwrap_or_else(RequestRoute::configured)
+        });
+        let initial_proxy = route.proxy_for(url_str)?;
         let initial_url =
             url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
         let initial_headers =
             self.request_headers(&initial_url, &[], use_jar, referer, identity)?;
-        let cache_key = Self::representation_key(url_str, initial_proxy, use_jar, &initial_headers);
+        let cache_key =
+            Self::representation_key(url_str, initial_proxy.as_ref(), use_jar, &initial_headers);
         let check = if skip_cache {
             CacheCheck::None
         } else {
@@ -310,6 +319,7 @@ impl Fetcher {
             CacheCheck::Fresh(body, status, headers) => {
                 let verdict = walls::detect(status, &headers, &body);
                 return Ok(FetchOutcome {
+                    route,
                     url: url_str.into(),
                     status,
                     alpn: "cache".into(),
@@ -340,14 +350,12 @@ impl Fetcher {
         // chain by design.
 
         loop {
-            let env_proxy = if first_request {
-                initial_env.clone()
-            } else if proxy.is_none() && !use_pool_lane {
-                crate::transport::proxy::from_env_for(&current)?
+            let hop_proxy = if first_request {
+                initial_proxy.clone()
             } else {
-                None
+                route.proxy_for(&current)?
             };
-            let effective_proxy = proxy.or(pinned_pool).or(env_proxy.as_ref());
+            let effective_proxy = hop_proxy.as_ref();
             // Referer applies to the initial request only.
             // Redirects get no referer (avoids cross-origin leak).
             let ref_arg = if first_request { referer } else { None };
@@ -378,6 +386,7 @@ impl Fetcher {
                     return Err(e);
                 }
             };
+            out.route = route.clone();
             if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
                 match out.status {
                     429 => pool.note_fetch_rate_limited(&fetch_host, id),
@@ -531,6 +540,7 @@ impl Fetcher {
                                     );
                             }
                             out = retry;
+                            out.route = route.clone();
                         }
                     }
 
@@ -631,6 +641,35 @@ impl Fetcher {
         url_str: &str,
         accept_language: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_persona_on_route(url_str, accept_language, None)
+            .await
+    }
+
+    /// Select a browser-only fetch route with the same opt-in pool policy as HTTP.
+    pub fn route_for_fetch(&self, url: &str) -> RequestRoute {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned));
+        let proxy = if crate::config::cfg().proxy.fetch_rotate {
+            self.egress
+                .as_ref()
+                .and_then(|pool| pool.pick_fetch(host.as_deref().unwrap_or_default(), true))
+                .and_then(|lane| lane.proxy)
+        } else {
+            None
+        };
+        proxy
+            .map(RequestRoute::pinned)
+            .unwrap_or_else(RequestRoute::configured)
+    }
+
+    /// Repeat HTTP under the policy that produced the browser document.
+    pub async fn fetch_persona_on_route(
+        &self,
+        url_str: &str,
+        accept_language: Option<&str>,
+        route: Option<&RequestRoute>,
+    ) -> Result<FetchOutcome, FetchError> {
         self.fetch_via_jar_identity(
             url_str,
             None,
@@ -643,6 +682,7 @@ impl Fetcher {
                 legacy_user_agent: None,
                 accept_language,
             },
+            route,
         )
         .await
     }
@@ -801,8 +841,14 @@ impl Fetcher {
     ) -> Result<FetchOutcome, FetchError> {
         let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
         let headers = self.request_headers(&url, conditional, use_jar, referer, identity)?;
-        self.fetch_once_with_headers(url_str, proxy, use_jar, headers)
-            .await
+        let mut out = self
+            .fetch_once_with_headers(url_str, proxy, use_jar, headers)
+            .await?;
+        out.route = proxy
+            .cloned()
+            .map(RequestRoute::pinned)
+            .unwrap_or_else(RequestRoute::direct);
+        Ok(out)
     }
 
     async fn fetch_once_with_headers(
@@ -1230,6 +1276,7 @@ fn finish(
     // site of truth instead of N re-detections (Q4).
     let verdict = walls::detect(status, &headers, &body);
     Ok(FetchOutcome {
+        route: RequestRoute::direct(),
         url,
         status,
         alpn: alpn.into(),
