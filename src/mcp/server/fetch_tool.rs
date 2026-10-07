@@ -42,10 +42,11 @@ impl Budget {
         let Some(d) = self.deadline else {
             return default;
         };
-        // Leave room to assemble and return the envelope.
-        let usable = d
-            .saturating_sub(self.start.elapsed())
-            .saturating_sub(std::time::Duration::from_secs(2));
+        // Reserve at most a tenth of the remaining time for the envelope.
+        // A fixed two seconds would consume short calls before navigation.
+        let remaining = d.saturating_sub(self.start.elapsed());
+        let reserve = (remaining / 10).min(std::time::Duration::from_secs(2));
+        let usable = remaining.saturating_sub(reserve);
         usable.min(default)
     }
 }
@@ -5244,9 +5245,33 @@ mod budget_tests {
     }
 
     #[test]
+    fn stealth_v3_short_budget_still_allocates_a_browser_pass() {
+        for ms in [500, 1000, 2000] {
+            let b = Budget::of(&args_with(Some(ms)));
+            let pass = b.pass(20);
+            assert!(
+                pass >= std::time::Duration::from_millis(ms / 2),
+                "the envelope reserve cannot consume the whole {ms}ms budget: {pass:?}"
+            );
+            assert!(pass < std::time::Duration::from_millis(ms));
+        }
+        let expired = Budget {
+            deadline: Some(std::time::Duration::from_millis(500)),
+            start: std::time::Instant::now() - std::time::Duration::from_millis(501),
+        };
+        assert_eq!(
+            expired.pass(20),
+            std::time::Duration::ZERO,
+            "expired budget cannot gain time"
+        );
+    }
+
+    #[test]
     fn a_tiny_deadline_never_allocates_time_beyond_the_call() {
         let b = Budget::of(&args_with(Some(500)));
-        assert_eq!(b.pass(20), std::time::Duration::ZERO);
+        let pass = b.pass(20);
+        assert!(pass > std::time::Duration::ZERO);
+        assert!(pass < std::time::Duration::from_millis(500));
     }
 
     #[tokio::test]

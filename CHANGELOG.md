@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deleted content. Cache freshness accounts for Date, Age and response time;
   conflicting directives require validation, and uncacheable policies evict old
   entries. Stored headers are bounded and exclude connection-specific fields.
+- Short fetch deadlines retain time for browser work; returning the result
+  reserves a bounded share of the remaining budget instead of consuming every
+  deadline of two seconds or less before navigation starts.
 
 ## [4.5.7] - 2026-10-07
 
