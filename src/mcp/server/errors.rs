@@ -222,7 +222,7 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
 /// | network.dns / network.timeout / network.ratelimit | transport |
 /// | wall.challenge / wall.challenge_unsolved / wall.empty_shell / wall.captcha / wall.paywall / wall.auth | blocked |
 /// | cloak.suspected | tier-1 content is likely decoy |
-/// | content.notfound / content.binary / content.oversize / content.extract | body |
+/// | content.notfound / content.binary / content.oversize / content.extract / content.incomplete | body |
 /// | guard.ssrf | blocked by design |
 /// | parse.encoding | charset-level failure |
 /// | archive.stale | served an old snapshot |
@@ -257,6 +257,7 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         _ if m.contains("timeout") || m.contains("timed out") => "network.timeout",
         _ if m.contains("rate limit") || m.contains("429") => "network.ratelimit",
         _ if m.contains("binary content") => "content.binary",
+        _ if v == "Incomplete" || m.contains("browser document incomplete") => "content.incomplete",
         _ if m.contains("too large") || m.contains("oversize") => "content.oversize",
         _ if m.contains("invalid url") => "fetch.invalid",
         _ if m.contains("bad seed") => "crawl.seed",
@@ -327,6 +328,8 @@ pub(super) fn tool_error_structured(
                 "walled"
             } else if code == "content.notfound" {
                 "notfound"
+            } else if code == "content.incomplete" {
+                "incomplete"
             } else {
                 "error"
             });
@@ -405,6 +408,7 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
 #[derive(Default)]
 pub(super) struct Trace {
     steps: Vec<Value>,
+    pub(super) browser_document: Option<crate::ghost::document::Document>,
 }
 
 tokio::task_local! {
@@ -415,6 +419,22 @@ tokio::task_local! {
 }
 
 impl Trace {
+    pub(super) fn observe_browser(&mut self, document: &crate::ghost::document::Document) {
+        self.browser_document = Some(document.clone());
+        self.step(
+            "2",
+            "browser-document",
+            &format!(
+                "generation={} status={}",
+                document.generation,
+                document
+                    .status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unavailable".into())
+            ),
+            0,
+        );
+    }
     pub(super) fn step(&mut self, tier: &str, action: &str, outcome: &str, ms: u128) {
         let step = json!({
             "tier": tier,
@@ -731,6 +751,31 @@ mod error_code_tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stealth_v3_incomplete_document_is_retryable_without_invented_notfound() {
+        let result = tool_error_structured(
+            "browser document incomplete: content did not settle",
+            "transient",
+            Some(json!({"url":"https://owned.test/empty", "status":200,
+                "verdict":"Incomplete"})),
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["errorKind"], "transient");
+        assert_eq!(result["code"], "content.incomplete");
+        let state = &result["structuredContent"];
+        assert_eq!(state["read_status"], "incomplete");
+        assert_eq!(state["status"], 200);
+        assert_eq!(state["content_ok"], false);
+        assert_eq!(state["content_complete"], false);
+        assert!(state.get("suggested_query").is_none());
+        assert!(!state["next_action"].as_str().unwrap().is_empty());
+        assert_eq!(error_code("not found: /missing", None), "content.notfound");
+        assert_eq!(
+            error_code("walled", Some(&json!({"verdict":"Challenge"}))),
+            "wall.challenge"
+        );
+    }
 
     #[test]
     pub(super) fn codes_are_stable() {

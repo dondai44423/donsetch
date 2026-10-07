@@ -23,7 +23,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use super::{FREEZE_AFTER, Ghost, REAP_AFTER};
 use crate::error::FetchError;
@@ -58,6 +58,7 @@ fn pool_size(no_pool: bool, slots_env: Option<&str>, default: usize) -> usize {
 /// read once per acquire. Cheap Copy snapshot.
 #[derive(Clone)]
 struct Snap {
+    reserved: bool,
     live: bool,
     key: Option<u64>,
     host: Option<String>,
@@ -83,6 +84,7 @@ struct Slot {
 
 pub struct GhostManager {
     meta: Arc<Mutex<Vec<Snap>>>,
+    available: Arc<Semaphore>,
     slots: Vec<Arc<AsyncMutex<Slot>>>,
     /// Xvfb display string (":99") on Linux, None elsewhere. The
     /// display is pool-wide: every slot's Chrome attaches to it.
@@ -102,7 +104,30 @@ pub struct GhostManager {
 pub struct GhostGuard {
     meta: Arc<Mutex<Vec<Snap>>>,
     guard: OwnedMutexGuard<Slot>,
+    // Fields drop in declaration order: release the slot lock before making
+    // its reservation available to a waiter.
+    _reservation: Reservation,
     idx: usize,
+    pub queue_wait: Duration,
+    pub reused: bool,
+}
+
+struct Reservation {
+    meta: Arc<Mutex<Vec<Snap>>>,
+    idx: usize,
+    touch: bool,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+        snaps[self.idx].reserved = false;
+        if self.touch {
+            snaps[self.idx].used = Instant::now();
+        }
+        // The owned semaphore permit releases after this metadata update.
+    }
 }
 
 impl Deref for GhostGuard {
@@ -120,6 +145,24 @@ impl DerefMut for GhostGuard {
 
 impl Drop for GhostGuard {
     fn drop(&mut self) {
+        if self
+            .guard
+            .ghost
+            .as_ref()
+            .is_some_and(|g| g.is_dirty() || g.link_dead())
+        {
+            // Drop owns and kills only this browser tree. A cancelled job's
+            // late document/events can never contaminate the next reservation.
+            self.guard.ghost = None;
+            self.guard.key = None;
+            self.guard.host = None;
+            self.guard.wire = None;
+        }
+        if self.guard.ghost.is_none() {
+            self.guard.key = None;
+            self.guard.host = None;
+            self.guard.wire = None;
+        }
         // Stamp the slot we held. tokio's blocking_lock is safe in a
         // drop path (contended only across job lifetimes, the meta
         // critical section is microseconds).
@@ -127,6 +170,9 @@ impl Drop for GhostGuard {
             && let Some(snap) = snaps.get_mut(self.idx)
         {
             snap.used = Instant::now();
+            snap.live = self.guard.ghost.is_some();
+            snap.key = self.guard.key;
+            snap.host = self.guard.host.clone();
         }
         // On Windows and macOS, a frozen browser window stays visible
         // (Windows: taskbar, macOS: desktop). On Linux with Xvfb the
@@ -171,13 +217,14 @@ fn xvfb_missing_hint() -> Option<&'static str> {
 /// reuse; a profile change must never silently inherit another
 /// persona's browser (the single-slot era reused whatever was warm,
 /// which let scorecard probes run under the fetch profile's browser).
-fn persona_key(profile: &BrowserProfile) -> u64 {
+fn persona_key(profile: &BrowserProfile, wire: &crate::ghost::GhostWire) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     profile.name.hash(&mut h);
     format!("{:?}", profile.tls).hash(&mut h);
     format!("{:?}", profile.h2).hash(&mut h);
     profile.user_agent.hash(&mut h);
     format!("{:?}", profile.platform).hash(&mut h);
+    wire.hash(&mut h);
     h.finish()
 }
 
@@ -201,6 +248,7 @@ impl GhostManager {
         let meta: Vec<Snap> = slots
             .iter()
             .map(|_| Snap {
+                reserved: false,
                 live: false,
                 key: None,
                 host: None,
@@ -209,6 +257,7 @@ impl GhostManager {
             .collect();
         let mgr = Arc::new(Self {
             meta: Arc::new(Mutex::new(meta)),
+            available: Arc::new(Semaphore::new(seed)),
             slots: slots
                 .into_iter()
                 .map(|s| Arc::new(AsyncMutex::new(s)))
@@ -317,14 +366,25 @@ impl GhostManager {
         mut wire: crate::ghost::GhostWire,
     ) -> Result<GhostGuard, FetchError> {
         wire.direct |= super::ghost_direct();
-        let key = persona_key(profile);
-        let idx = {
-            let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
-            claim_slot(&mut snaps, key, host)
-        };
+        let key = persona_key(profile, &wire);
+        let queued = Instant::now();
+        let reservation = self.reserve(key, host).await?;
+        let queue_wait = queued.elapsed();
+        let idx = reservation.idx;
         // Lock only the chosen slot. Other slots stay free for
         // concurrent acquires.
-        let mut guard = Arc::clone(&self.slots[idx]).lock_owned().await;
+        let guard = Arc::clone(&self.slots[idx]).lock_owned().await;
+        // Own cleanup before any launch/kill/display await. Acquisition may
+        // be cancelled or fail before there is a browser to return.
+        let mut held = GhostGuard {
+            meta: Arc::clone(&self.meta),
+            guard,
+            _reservation: reservation,
+            idx,
+            queue_wait,
+            reused: false,
+        };
+        let guard = &mut held.guard;
         if guard.key != Some(key) {
             // Persona switch on a still-live browser: the slot's
             // browser belongs to another identity. Kill it instead
@@ -387,11 +447,48 @@ impl GhostManager {
                 snap.used = Instant::now();
             }
         }
-        Ok(GhostGuard {
+        held.reused = !need_launch;
+        Ok(held)
+    }
+
+    async fn reserve(&self, key: u64, host: Option<&str>) -> Result<Reservation, FetchError> {
+        // FIFO admission waits on global availability, never on a chosen busy
+        // host. Cancelling a waiter removes it from the semaphore's queue.
+        let permit = Arc::clone(&self.available)
+            .acquire_owned()
+            .await
+            .map_err(|_| FetchError::ghost("browser pool closed"))?;
+        let idx = {
+            let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+            claim_slot(&mut snaps, key, host)
+                .ok_or_else(|| FetchError::ghost("browser pool reservation invariant failed"))?
+        };
+        Ok(Reservation {
             meta: Arc::clone(&self.meta),
-            guard,
             idx,
+            touch: true,
+            _permit: permit,
         })
+    }
+
+    fn try_reserve_idle(&self, idx: usize) -> Option<(Reservation, Duration)> {
+        let permit = Arc::clone(&self.available).try_acquire_owned().ok()?;
+        let mut snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let snap = snaps.get_mut(idx)?;
+        let idle = snap.used.elapsed();
+        if snap.reserved || !snap.live || idle <= FREEZE_AFTER {
+            return None;
+        }
+        snap.reserved = true;
+        Some((
+            Reservation {
+                meta: Arc::clone(&self.meta),
+                idx,
+                touch: false,
+                _permit: permit,
+            },
+            idle,
+        ))
     }
 
     /// Freeze every slot idle past FREEZE_AFTER; reap those past
@@ -401,10 +498,14 @@ impl GhostManager {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
+            if self.available.is_closed() {
+                break;
+            }
             for (idx, slot) in self.slots.iter().enumerate() {
-                let idle = {
-                    let snaps = self.meta.lock().unwrap_or_else(|p| p.into_inner());
-                    snaps.get(idx).map(|s| s.used.elapsed()).unwrap_or_default()
+                // Maintenance owns capacity too. A job cannot claim this
+                // slot between the idle check and an awaited graceful reap.
+                let Some((_maintenance, idle)) = self.try_reserve_idle(idx) else {
+                    continue;
                 };
                 let Ok(mut guard) = slot.try_lock() else {
                     continue; // job in flight; defer to the next tick
@@ -454,6 +555,7 @@ impl GhostManager {
 
     /// Daemon shutdown: kill every slot's browser, then the pool Xvfb.
     pub async fn shutdown(&self) {
+        self.available.close();
         for slot in &self.slots {
             let mut guard = slot.lock().await;
             if let Some(mut g) = guard.ghost.take() {
@@ -484,8 +586,8 @@ impl GhostManager {
 /// reuse (a thaw beats a relaunch), then coldest eviction.
 /// DECISION ONLY: killing a stranger persona's browser before
 /// relaunching lives in acquire_for.
-fn pick_slot(snaps: &[Snap], key: u64, host: Option<&str>) -> usize {
-    let mine = |v: &Snap| v.key == Some(key);
+fn pick_slot(snaps: &[Snap], key: u64, host: Option<&str>) -> Option<usize> {
+    let mine = |v: &Snap| !v.reserved && v.key == Some(key);
     // Affinities compete only when the job and the slot both name
     // a host and the hosts differ; a hostless job or slot rides
     // along with anything.
@@ -498,13 +600,13 @@ fn pick_slot(snaps: &[Snap], key: u64, host: Option<&str>) -> usize {
             .iter()
             .position(|v| v.live && mine(v) && v.host.as_deref() == Some(host))
     {
-        return i;
+        return Some(i);
     }
     if let Some(i) = snaps
         .iter()
         .position(|v| v.live && mine(v) && compatible(v))
     {
-        return i;
+        return Some(i);
     }
     // Held-empty same-persona slot (browser reaped under this
     // persona, or a same-host launch already in flight): reuse
@@ -513,27 +615,26 @@ fn pick_slot(snaps: &[Snap], key: u64, host: Option<&str>) -> usize {
         .iter()
         .position(|v| !v.live && mine(v) && compatible(v))
     {
-        return i;
+        return Some(i);
     }
     // Spill: unclaimed slots first, then any browserless slot
     // (a stranger's reaped slot costs nothing to take over).
-    if let Some(i) = snaps.iter().position(|v| !v.live && v.key.is_none()) {
-        return i;
+    if let Some(i) = snaps
+        .iter()
+        .position(|v| !v.reserved && !v.live && v.key.is_none())
+    {
+        return Some(i);
     }
-    if let Some(i) = snaps.iter().position(|v| !v.live) {
-        return i;
+    if let Some(i) = snaps.iter().position(|v| !v.reserved && !v.live) {
+        return Some(i);
     }
     // Every slot is warm and affined elsewhere. Reusing our own
     // coldest browser costs a thaw; evicting a stranger's costs a
     // kill AND a launch : prefer our own.
     if let Some(i) = coldest(snaps, |v| v.live && mine(v)) {
-        return i;
+        return Some(i);
     }
-    coldest(snaps, |_| true)
-        // Only reachable with a zero-slot pool, a construction
-        // bug; acquire_for would index-panic instead of spawning.
-        // The pool build clamps to >=1 so this is unreachable.
-        .unwrap_or(usize::MAX)
+    coldest(snaps, |v| !v.reserved)
 }
 
 fn coldest(snaps: &[Snap], eligible: impl Fn(&Snap) -> bool) -> Option<usize> {
@@ -551,27 +652,547 @@ fn coldest(snaps: &[Snap], eligible: impl Fn(&Snap) -> bool) -> Option<usize> {
 /// jobs to different hosts spread across slots instead of all
 /// stacking behind one slot's launch. The launch outcome (live)
 /// lands in the snapshot after acquire finishes, as before.
-fn claim_slot(snaps: &mut [Snap], key: u64, host: Option<&str>) -> usize {
-    let idx = pick_slot(snaps, key, host);
-    if let Some(snap) = snaps.get_mut(idx) {
-        snap.key = Some(key);
-        snap.host = host.map(|h| h.to_string());
-        snap.used = Instant::now();
-    }
-    idx
+fn claim_slot(snaps: &mut [Snap], key: u64, host: Option<&str>) -> Option<usize> {
+    let idx = pick_slot(snaps, key, host)?;
+    let snap = &mut snaps[idx];
+    snap.reserved = true;
+    snap.key = Some(key);
+    snap.host = host.map(str::to_owned);
+    snap.used = Instant::now();
+    Some(idx)
 }
 
 #[cfg(test)]
 mod pool_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires an installed Chromium; owns a local HTTP origin and private browser"]
+    async fn stealth_v3_native_documents_reload_actions_and_terminal_tiny_walls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let test_started = Instant::now();
+        let mut config = crate::config::DonsetchConfig::default();
+        config.browser.backend = crate::config::BrowserBackend::Headless;
+        config.browser.cloak_auto_download = false;
+        config.browser.pool_slots = 1;
+        config.proxy.from_environment = false;
+        config.debug.ghost = true;
+        // This process owns the fixture origin. Product defaults remain strict.
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let requests = requests.clone();
+                connections.spawn(async move {
+                    let mut bytes = Vec::new();
+                    while bytes.len() < 16 * 1024 {
+                        let mut buf = [0; 2048];
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 { return; }
+                        bytes.extend_from_slice(&buf[..n]);
+                        if bytes.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    }
+                    let request = String::from_utf8_lossy(&bytes);
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    requests.lock().unwrap().push(path.clone());
+                    let (status, body) = match path.as_str() {
+                        "/a" => (200, format!("<article><h1>Old document A</h1><p>{}</p></article>", "Old fixture content. ".repeat(30))),
+                        "/b" => {
+                            tokio::time::sleep(Duration::from_millis(800)).await;
+                            (201, format!("<article><h1>New document B</h1><p>{}</p></article>", "New fixture content. ".repeat(30)))
+                        }
+                        "/spa" => (202, format!("<button id='next' onclick=\"document.querySelector('article').innerHTML='<h1>Interacted document</h1><p>{}</p>';document.querySelector('article').style.backgroundColor='#123456'\">Next</button><article><h1>Before interaction</h1><p>{}</p></article>", "Visible new content. ".repeat(80), "Old article content. ".repeat(80))),
+                        "/human" => (403, "<h1>Verify you are human</h1><form><div class='g-recaptcha'></div></form>".into()),
+                        "/bootstrap" => (200, "<script>window.KPSDK={};</script><script src='/sensor/ips.js?x-kpsdk-im=opaque'></script>".into()),
+                        "/empty" => (200, "<html><body><main id='root'></main></body></html>".into()),
+                        "/redirect" => (200, "<script>location.replace('/redirect-final')</script><h1>Transient document</h1>".into()),
+                        "/redirect-final" => (201, format!("<article><h1>Redirected native document</h1><p>{}</p></article>", "Redirected useful content. ".repeat(80))),
+                        "/auth" => (401, format!("<article><h1>Restricted content</h1><p>{}</p></article>", "Ordinary looking response. ".repeat(80))),
+                        "/paywall" => (402, "<h1>Payment required</h1>".into()),
+                        "/status404" => (404, format!("<article><h1>Ordinary article</h1><p>{}</p></article>", "A missing page must not become content. ".repeat(80))),
+                        _ => (404, "<h1>Not found</h1>".into()),
+                    };
+                    let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+                while connections.try_join_next().is_some() {}
+            }
+        });
+        let mgr = GhostManager::new().await;
+        let profile = BrowserProfile::chrome(151, crate::profile::Platform::Linux, false);
+        eprintln!("[owned-doc] acquiring {:?}", test_started.elapsed());
+        let mut g = mgr.acquire_for(&profile, Some("127.0.0.1")).await.unwrap();
+        eprintln!("[owned-doc] A navigation {:?}", test_started.elapsed());
+        g.navigate(&format!("{base}/a")).await.unwrap();
+        let a = g.document();
+        assert_eq!(a.status, Some(200));
+        let started = Instant::now();
+        eprintln!("[owned-doc] B navigation {:?}", test_started.elapsed());
+        g.navigate(&format!("{base}/b")).await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "A completed B before B responded"
+        );
+        let b = g.document();
+        assert!(b.generation > a.generation);
+        assert_ne!(b.loader, a.loader);
+        assert_eq!(b.url, format!("{base}/b"));
+        assert_eq!(b.status, Some(201));
+        let html = g.outer_html().await.unwrap();
+        assert!(html.contains("New document B") && !html.contains("Old document A"));
+        eprintln!("[owned-doc] B navigation {:?}", test_started.elapsed());
+        g.navigate(&format!("{base}/b")).await.unwrap();
+        let reloaded = g.document();
+        assert!(reloaded.generation > b.generation);
+        assert_ne!(reloaded.loader, b.loader);
+        assert_eq!(reloaded.status, Some(201));
+        eprintln!("[owned-doc] SPA render {:?}", test_started.elapsed());
+        let page =
+            super::super::ops::ghost_fetch(&mut g, &format!("{base}/spa"), Duration::from_secs(8))
+                .await
+                .unwrap();
+        assert_eq!(page.outcome, super::super::ops::BrowserOutcome::Content);
+        assert_eq!(page.document.status, Some(202));
+        let geometry = g
+            .eval_json("({x:screenX,y:screenY,outerWidth,outerHeight,hidden:document.hidden})")
+            .await
+            .unwrap();
+        assert_eq!(geometry["x"], 0);
+        assert_eq!(geometry["y"], 0);
+        assert!(geometry["outerWidth"].as_u64().unwrap() > 0);
+        assert!(geometry["outerHeight"].as_u64().unwrap() > 0);
+        assert_eq!(geometry["hidden"], false);
+        let actions = [
+            super::super::actions::Action::Click {
+                selector: Some("#next".into()),
+                text: None,
+            },
+            super::super::actions::Action::WaitText {
+                text: "Interacted document".into(),
+                timeout_ms: 2000,
+            },
+        ];
+        eprintln!("[owned-doc] actions {:?}", test_started.elapsed());
+        super::super::actions::run(&mut g, &actions).await.unwrap();
+        eprintln!("[owned-doc] actions done {:?}", test_started.elapsed());
+        let html = g.outer_html().await.unwrap();
+        assert!(
+            html.contains("<h1>Interacted document</h1>")
+                && !html.contains("<h1>Before interaction</h1>")
+        );
+        let point = g.eval_json("(()=>{const r=document.querySelector('article').getBoundingClientRect();return {x:r.x+1,y:r.y+1}})()").await.unwrap();
+        let png = g.screenshot_bytes(false).await.unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgb8();
+        let pixel = image.get_pixel(
+            point["x"].as_f64().unwrap() as u32,
+            point["y"].as_f64().unwrap() as u32,
+        );
+        assert_eq!(
+            pixel.0,
+            [0x12, 0x34, 0x56],
+            "capture must paint the actual interacted document"
+        );
+        assert_eq!(g.document().generation, page.document.generation);
+        assert!(
+            !g.window_minimized
+                .load(std::sync::atomic::Ordering::Acquire),
+            "capture must not minimize a native hidden surface"
+        );
+        let started = Instant::now();
+        eprintln!("[owned-doc] human {:?}", test_started.elapsed());
+        let human = super::super::ops::ghost_fetch(
+            &mut g,
+            &format!("{base}/human"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            human.outcome,
+            super::super::ops::BrowserOutcome::HumanRequired
+        );
+        assert!(human.html.len() < 500);
+        assert_eq!(human.document.status, Some(403));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "tiny human wall waited for render deadline"
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            super::super::ops::solve(&mut g, &format!("{base}/human"), Duration::from_secs(5))
+                .await
+                .unwrap(),
+            super::super::ops::SolveOutcome::CaptchaWalled
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "legacy solve must also stop on a tiny human wall"
+        );
+        for (path, status, outcome) in [
+            ("auth", 401, super::super::ops::BrowserOutcome::AuthRequired),
+            ("paywall", 402, super::super::ops::BrowserOutcome::Paywall),
+            (
+                "status404",
+                404,
+                super::super::ops::BrowserOutcome::NotFound,
+            ),
+        ] {
+            let page = super::super::ops::ghost_fetch(
+                &mut g,
+                &format!("{base}/{path}"),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.document.status, Some(status));
+            assert_eq!(
+                page.outcome, outcome,
+                "native status {status} must outrank ordinary-looking DOM"
+            );
+        }
+        let redirected = super::super::ops::ghost_fetch(
+            &mut g,
+            &format!("{base}/redirect"),
+            Duration::from_secs(8),
+        )
+        .await
+        .unwrap();
+        assert_eq!(redirected.document.url, format!("{base}/redirect-final"));
+        assert_eq!(redirected.document.status, Some(201));
+        assert_eq!(
+            redirected.outcome,
+            super::super::ops::BrowserOutcome::Content
+        );
+        assert!(
+            redirected.html.contains("Redirected native document")
+                && !redirected.html.contains("Transient document")
+        );
+        eprintln!("[owned-doc] bootstrap {:?}", test_started.elapsed());
+        let bootstrap = super::super::ops::ghost_fetch(
+            &mut g,
+            &format!("{base}/bootstrap"),
+            Duration::from_millis(1500),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bootstrap.outcome,
+            super::super::ops::BrowserOutcome::ManagedChallenge
+        );
+        assert_eq!(bootstrap.vendor.as_deref(), Some("kasada"));
+        eprintln!("[owned-doc] empty {:?}", test_started.elapsed());
+        let empty = super::super::ops::ghost_fetch(
+            &mut g,
+            &format!("{base}/empty"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty.outcome, super::super::ops::BrowserOutcome::Incomplete);
+        assert_eq!(empty.document.status, Some(200));
+        let file = crate::paths::cache_dir().join("owned-status-unavailable.html");
+        std::fs::write(&file, "<h1>Owned file document</h1>").unwrap();
+        g.navigate_raw(url::Url::from_file_path(file).unwrap().as_str(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            g.document().status,
+            None,
+            "file response has no HTTP status"
+        );
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.as_str() == "/b")
+                .count(),
+            2
+        );
+        eprintln!("[owned-doc] teardown {:?}", test_started.elapsed());
+        drop(g);
+        mgr.shutdown().await;
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires an installed Chromium; owns a fresh private browser"]
+    async fn stealth_v3_native_cancel_retires_owned_browser_before_reuse() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.browser.backend = crate::config::BrowserBackend::Headless;
+        config.browser.cloak_auto_download = false;
+        config.browser.pool_slots = 1;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let profile = BrowserProfile::chrome(151, crate::profile::Platform::Linux, false);
+        let mgr = GhostManager::new().await;
+        let mut g = mgr.acquire_for(&profile, Some("owned.test")).await.unwrap();
+        let first_pid = g.pid().unwrap();
+        let file = crate::paths::cache_dir().join("owned-cancel.html");
+        std::fs::write(
+            &file,
+            "<h1>Owned cancellation fixture</h1><p>Fresh document.</p>",
+        )
+        .unwrap();
+        let url = url::Url::from_file_path(&file).unwrap().to_string();
+        g.navigate_raw(&url, false).await.unwrap();
+        let visible = [crate::ghost::actions::Action::WaitText {
+            text: "Owned cancellation fixture".into(),
+            timeout_ms: 2000,
+        }];
+        assert!(crate::ghost::actions::run(&mut g, &visible).await.is_ok());
+        let absent = [crate::ghost::actions::Action::WaitText {
+            text: "This text does not exist".into(),
+            timeout_ms: 100,
+        }];
+        let failure = crate::ghost::actions::run(&mut g, &absent)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.0, 0);
+        assert!(failure.1.contains("timeout"));
+        assert!(
+            !g.is_dirty(),
+            "a completed negative action is different from cancellation"
+        );
+        let actions = [crate::ghost::actions::Action::Wait { ms: 30_000 }];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                crate::ghost::actions::run(&mut g, &actions)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            g.is_dirty(),
+            "the cancelled action reached its wait and contaminated this generation"
+        );
+        drop(g);
+        assert!(
+            mgr.slots[0].lock().await.ghost.is_none(),
+            "cancelled process must be retired before releasing capacity"
+        );
+        let mut fresh = mgr.acquire_for(&profile, Some("owned.test")).await.unwrap();
+        assert_ne!(fresh.pid().unwrap(), first_pid);
+        assert!(!fresh.reused);
+        fresh.navigate_raw(&url, false).await.unwrap();
+        assert!(
+            crate::ghost::actions::run(&mut fresh, &visible)
+                .await
+                .is_ok()
+        );
+        assert!(!fresh.is_dirty());
+        let second_pid = fresh.pid().unwrap();
+        // This PID belongs to the fresh process acquired above, never an
+        // ambient/user browser. Exercise an actual abrupt transport loss.
+        assert_eq!(
+            unsafe { libc::kill(-(second_pid as i32), libc::SIGKILL) },
+            0
+        );
+        for _ in 0..50 {
+            if fresh.link_dead() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(fresh.link_dead());
+        let failed_at = Instant::now();
+        let error = crate::ghost::ops::ghost_fetch(
+            &mut fresh,
+            "https://owned.test/",
+            Duration::from_secs(5),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("cdp link closed"));
+        assert!(failed_at.elapsed() < Duration::from_secs(1));
+        drop(fresh);
+        let mut replacement = mgr.acquire_for(&profile, Some("owned.test")).await.unwrap();
+        assert_ne!(replacement.pid().unwrap(), second_pid);
+        replacement.navigate_raw(&url, false).await.unwrap();
+        assert!(
+            crate::ghost::actions::run(&mut replacement, &visible)
+                .await
+                .is_ok()
+        );
+        drop(replacement);
+        mgr.shutdown().await;
+        assert!(mgr.slots[0].lock().await.ghost.is_none());
+    }
+
     fn v(live: bool, key: Option<u64>, host: Option<&str>, idle_s: u64) -> Snap {
         Snap {
+            reserved: false,
             live,
             key,
             host: host.map(|h| h.to_string()),
             used: Instant::now() - Duration::from_secs(idle_s),
         }
+    }
+
+    #[test]
+    fn stealth_v3_pool_identity_includes_native_wire_context() {
+        let profile = BrowserProfile::chrome(151, crate::profile::Platform::Linux, false);
+        let wire = crate::ghost::GhostWire::default();
+        let original = persona_key(&profile, &wire);
+        assert_eq!(original, persona_key(&profile, &wire.clone()));
+        let mut different = wire.clone();
+        different.direct = true;
+        assert_ne!(original, persona_key(&profile, &different));
+        different = wire.clone();
+        different.locale = "de-DE".into();
+        assert_ne!(original, persona_key(&profile, &different));
+        different = wire;
+        different.viewport = (1280, 720);
+        assert_ne!(original, persona_key(&profile, &different));
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_failed_acquisition_clears_metadata_before_capacity_returns() {
+        let meta = Arc::new(Mutex::new(vec![v(false, Some(11), Some("old.test"), 0)]));
+        let available = Arc::new(Semaphore::new(1));
+        let permit = available.clone().acquire_owned().await.unwrap();
+        meta.lock().unwrap()[0].reserved = true;
+        let slot = Arc::new(AsyncMutex::new(Slot {
+            ghost: None,
+            key: Some(11),
+            host: Some("old.test".into()),
+            wire: Some(crate::ghost::GhostWire::default()),
+        }));
+        let held = GhostGuard {
+            meta: meta.clone(),
+            guard: slot.clone().lock_owned().await,
+            _reservation: Reservation {
+                meta: meta.clone(),
+                idx: 0,
+                touch: true,
+                _permit: permit,
+            },
+            idx: 0,
+            queue_wait: Duration::ZERO,
+            reused: false,
+        };
+        assert_eq!(available.available_permits(), 0);
+        drop(held);
+        assert_eq!(available.available_permits(), 1);
+        let snap = &meta.lock().unwrap()[0];
+        assert!(!snap.reserved && !snap.live);
+        assert_eq!(snap.key, None);
+        assert_eq!(snap.host, None);
+        assert!(slot.try_lock().unwrap().wire.is_none());
+    }
+
+    #[test]
+    fn stealth_v3_busy_affinity_never_beats_an_idle_slot() {
+        let mut views = vec![
+            v(true, Some(11), Some("a.test"), 0),
+            v(false, None, None, 0),
+        ];
+        views[0].reserved = true;
+        assert_eq!(
+            pick_slot(&views, 11, Some("a.test")),
+            Some(1),
+            "host affinity cannot queue behind a busy browser"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_waiter_takes_released_slot_and_cancel_releases_capacity() {
+        let mgr = Arc::new(GhostManager {
+            meta: Arc::new(Mutex::new(vec![v(false, None, None, 0); 3])),
+            available: Arc::new(Semaphore::new(3)),
+            slots: Vec::new(), // Reservation test: no process or slot lock needed.
+            display: tokio::sync::OnceCell::new(),
+            xvfb: AsyncMutex::new(None),
+        });
+        let slow = mgr.reserve(11, Some("slow.test")).await.unwrap();
+        let short = mgr.reserve(11, Some("short.test")).await.unwrap();
+        let other = mgr.reserve(11, Some("other.test")).await.unwrap();
+        let released = short.idx;
+        let mut waiter = Box::pin(mgr.reserve(11, Some("slow.test")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "all three jobs hold reservations"
+        );
+        drop(short);
+        let job = tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.idx, released,
+            "waiter must use the released short slot while slow stays busy"
+        );
+        let mut cancelled = Box::pin(mgr.reserve(11, None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut cancelled)
+                .await
+                .is_err()
+        );
+        drop(cancelled);
+        drop(job);
+        let next = tokio::time::timeout(Duration::from_millis(100), mgr.reserve(11, None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.idx, released);
+        drop(next);
+        drop(slow);
+        drop(other);
+        assert_eq!(mgr.available.available_permits(), 3);
+        assert!(mgr.meta.lock().unwrap().iter().all(|s| !s.reserved));
+        {
+            let mut snaps = mgr.meta.lock().unwrap();
+            snaps[0].live = true;
+            snaps[0].used = Instant::now() - Duration::from_secs(40);
+        }
+        let (maintenance, _) = mgr.try_reserve_idle(0).unwrap();
+        assert!(
+            mgr.try_reserve_idle(0).is_none(),
+            "maintenance cannot reserve an owned slot twice"
+        );
+        let job = mgr.reserve(11, None).await.unwrap();
+        assert_ne!(
+            job.idx, maintenance.idx,
+            "a job must not queue behind an awaited reap"
+        );
+        drop(job);
+        drop(maintenance);
+        assert!(
+            mgr.meta.lock().unwrap()[0].used.elapsed() >= Duration::from_secs(40),
+            "maintenance must not keep postponing its own reap clock"
+        );
+        let held = [
+            mgr.reserve(11, None).await.unwrap(),
+            mgr.reserve(11, None).await.unwrap(),
+            mgr.reserve(11, None).await.unwrap(),
+        ];
+        let mut blocked = Box::pin(mgr.reserve(11, None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err()
+        );
+        mgr.shutdown().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), blocked)
+                .await
+                .unwrap()
+                .is_err(),
+            "shutdown must wake queued jobs with a closed-pool error"
+        );
+        drop(held);
     }
 
     // The daemon runs ONE profile, so every acquire shares one
@@ -588,11 +1209,11 @@ mod pool_tests {
         ];
         assert_eq!(
             pick_slot(&views, k, Some("b.test")),
-            1,
+            Some(1),
             "a new host must open a free slot, not steal a.test's warm session"
         );
         // The reverse direction holds too: a.test keeps its slot.
-        assert_eq!(pick_slot(&views, k, Some("a.test")), 0);
+        assert_eq!(pick_slot(&views, k, Some("a.test")), Some(0));
     }
 
     #[test]
@@ -605,7 +1226,7 @@ mod pool_tests {
         ];
         assert_eq!(
             pick_slot(&views, k, Some("d.test")),
-            1,
+            Some(1),
             "warm same-persona reuse (no relaunch) beats killing a stranger's browser"
         );
     }
@@ -623,16 +1244,16 @@ mod pool_tests {
             v(false, None, None, 0),
         ];
         let k = 11;
-        assert_eq!(claim_slot(&mut views, k, Some("a.test")), 0);
+        assert_eq!(claim_slot(&mut views, k, Some("a.test")), Some(0));
         assert_eq!(
             claim_slot(&mut views, k, Some("b.test")),
-            1,
+            Some(1),
             "a second in-flight host must not stack behind a.test's launch"
         );
         assert_eq!(
             claim_slot(&mut views, k, Some("a.test")),
-            0,
-            "the same host joins the in-flight claim and warm-serves after it"
+            Some(2),
+            "a busy same-host claim must spill into the remaining idle slot"
         );
     }
 
@@ -644,7 +1265,7 @@ mod pool_tests {
             v(true, Some(k), Some("b.test"), 1),
             v(true, Some(22), None, 1),
         ];
-        assert_eq!(pick_slot(&views, k, Some("a.test")), 0);
+        assert_eq!(pick_slot(&views, k, Some("a.test")), Some(0));
     }
 
     #[test]
@@ -653,7 +1274,7 @@ mod pool_tests {
         let views = vec![v(false, None, None, 0), v(true, Some(k), None, 60)];
         assert_eq!(
             pick_slot(&views, k, None),
-            1,
+            Some(1),
             "warm same-persona browser beats a launch"
         );
     }
@@ -663,7 +1284,7 @@ mod pool_tests {
         // Slot belongs to persona A. Persona B picks the same slot,
         // and acquire_for must kill instead of inheriting.
         let views = vec![v(true, Some(11), Some("a.test"), 10)];
-        assert_eq!(pick_slot(&views, 22, None), 0);
+        assert_eq!(pick_slot(&views, 22, None), Some(0));
         assert_ne!(11, 22);
     }
 
@@ -673,7 +1294,7 @@ mod pool_tests {
         let views = vec![v(true, Some(9), None, 1), v(false, None, None, 0)];
         assert_eq!(
             pick_slot(&views, k, None),
-            1,
+            Some(1),
             "empty slot beats evicting a warm browser"
         );
     }
@@ -682,7 +1303,7 @@ mod pool_tests {
     fn coldest_evicted_when_no_capacity() {
         let k = 11;
         let views = vec![v(true, Some(9), None, 3), v(true, Some(8), None, 60)];
-        assert_eq!(pick_slot(&views, k, None), 1);
+        assert_eq!(pick_slot(&views, k, None), Some(1));
     }
 
     #[test]

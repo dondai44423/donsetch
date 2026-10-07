@@ -273,6 +273,20 @@ pub async fn run(
     g: &mut Ghost,
     actions: &[Action],
 ) -> Result<Vec<ActionOutcome>, (usize, String, Vec<ActionOutcome>)> {
+    let mut operation = g.operation();
+    let restore = g.unminimize_for_capture().await;
+    let result = run_inner(g, actions).await;
+    if restore.needs_surface_wait() {
+        g.reminimize_after_capture().await;
+    }
+    operation.finish();
+    result
+}
+
+async fn run_inner(
+    g: &mut Ghost,
+    actions: &[Action],
+) -> Result<Vec<ActionOutcome>, (usize, String, Vec<ActionOutcome>)> {
     let mut outcomes = Vec::with_capacity(actions.len());
     for (i, a) in actions.iter().enumerate() {
         let t0 = std::time::Instant::now();

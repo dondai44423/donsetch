@@ -9,6 +9,7 @@ pub enum Vendor {
     Cloudflare,
     DataDome,
     Akamai,
+    Kasada,
     PerimeterX,
     Imperva,
     Sucuri,
@@ -32,6 +33,134 @@ pub enum Verdict {
     Paywall,
     /// 404 or content-less page dressed as success.
     SoftNotFound,
+}
+
+/// Whether an HTTP denial warrants a browser observation. Explicit tier and
+/// deadline checks belong to the caller; this policy is shared by fetch/crawl.
+pub fn browser_recovery(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    verdict: Verdict,
+) -> bool {
+    if matches!(status, 401 | 402 | 404)
+        || matches!(
+            verdict,
+            Verdict::AuthWall | Verdict::Paywall | Verdict::SoftNotFound
+        )
+    {
+        return false;
+    }
+    if let Some(ct) = header(headers, "content-type") {
+        let mime = ct.split(';').next().unwrap_or_default().trim();
+        if !["text/html", "text/plain", "application/xhtml+xml"]
+            .iter()
+            .any(|allowed| mime.eq_ignore_ascii_case(allowed))
+        {
+            return false;
+        }
+    } else {
+        // A missing MIME type does not turn API JSON or binary denial data
+        // into a browser document. Inspect only a bounded prefix.
+        let prefix = &body[..body.len().min(512)];
+        let text = String::from_utf8_lossy(prefix);
+        if text.trim_start().starts_with(['{', '['])
+            || prefix.starts_with(b"%PDF-")
+            || prefix
+                .iter()
+                .any(|b| *b == 0 || (*b < 0x20 && !b.is_ascii_whitespace()))
+        {
+            return false;
+        }
+    }
+    if content_gate(body).is_some() {
+        return false;
+    }
+    matches!(verdict, Verdict::Challenge(_)) || (status == 403 && verdict == Verdict::Blocked)
+}
+
+#[cfg(test)]
+mod stealth_v3_tests {
+    use super::*;
+
+    #[test]
+    fn stealth_v3_kasada_bootstrap_is_not_content_or_not_found() {
+        let body = b"<html><body><script>window.KPSDK={};KPSDK.start=Date.now();</script><script src='/sensor/ips.js?x-kpsdk-im=opaque'></script><iframe src='javascript:;' style='display:none'></iframe></body></html>";
+        assert!(matches!(detect_dom_smart(body), Verdict::Challenge(_)));
+        let article = format!(
+            "<article><h1>Kasada integration</h1><p>{}</p></article><script>window.KPSDK={{}};</script><script src='/ips.js'></script>",
+            "Public documentation of an embedded monitoring script. ".repeat(40)
+        );
+        assert_eq!(detect_dom_smart(article.as_bytes()), Verdict::ContentOk);
+        assert_eq!(
+            detect_dom_smart(b"<p>KPSDK and ips.js are filenames in this example.</p>"),
+            Verdict::ContentOk
+        );
+    }
+
+    #[test]
+    fn stealth_v3_plain_html_403_can_receive_one_browser_observation() {
+        let body = b"<html><h1>Forbidden</h1><p>Request denied.</p></html>";
+        let verdict = detect(403, &[], body);
+        assert_eq!(verdict, Verdict::Blocked);
+        assert!(browser_recovery(403, &[], body, verdict));
+    }
+
+    #[test]
+    fn stealth_v3_http_denial_negative_cases_stay_terminal() {
+        for status in [401, 402, 404, 429, 500, 502, 503] {
+            let body = b"Request denied";
+            assert!(
+                !browser_recovery(status, &[], body, detect(status, &[], body)),
+                "status={status}"
+            );
+        }
+        for (content_type, body) in [
+            (
+                "application/json",
+                b"{\"error\":\"permission denied\"}".as_slice(),
+            ),
+            ("application/pdf", b"%PDF-1.7".as_slice()),
+            (
+                "text/html",
+                b"<title>Sign in</title><form><input type='password'></form>".as_slice(),
+            ),
+        ] {
+            let headers = vec![("Content-Type".into(), content_type.into())];
+            assert!(
+                !browser_recovery(403, &headers, body, detect(403, &headers, body)),
+                "type={content_type}"
+            );
+        }
+        let headers = vec![("Retry-After".into(), "60".into())];
+        assert!(!browser_recovery(
+            429,
+            &headers,
+            b"Too many requests",
+            Verdict::Blocked
+        ));
+    }
+
+    #[test]
+    fn stealth_v3_late_interactive_wall_is_terminal_but_article_is_content() {
+        let html = format!(
+            "<title>Prove your humanity</title><script>{}</script><h1>Prove your humanity</h1><form><div class='g-recaptcha'></div></form>",
+            "x".repeat(350_000)
+        );
+        assert!(matches!(
+            detect_dom_smart(html.as_bytes()),
+            Verdict::Challenge(_)
+        ));
+        assert!(
+            human_captcha(html.as_bytes()),
+            "late widget must be found in a large wall"
+        );
+        let article = format!(
+            "<article><h1>CAPTCHA tutorial</h1><p>{}</p><div class='g-recaptcha'></div></article>",
+            "This tutorial explains integration of a contact widget. ".repeat(40)
+        );
+        assert_eq!(detect_dom_smart(article.as_bytes()), Verdict::ContentOk);
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +518,14 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let turnstile_shell =
         text.contains("challenges.cloudflare.com") && text.contains("cf-turnstile");
     let visible = visible_text_count(body);
+    if visible < 80
+        && text.contains("<script")
+        && text.contains("kpsdk")
+        && text.contains("/ips.js")
+        && !text.contains("<article")
+    {
+        return Some(Vendor::Kasada);
+    }
     if visible < 400
         && (turnstile_shell || INTERSTITIAL_MARKERS.iter().any(|m| text.contains(m)))
         && !text.contains("<form")
@@ -406,7 +543,7 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
 /// different failure codes (issue #282's `wall.captcha` vs
 /// `wall.challenge_unsolved`).
 pub fn interactive_captcha(body: &[u8]) -> bool {
-    let scan = &body[..body.len().min(64 * 1024)];
+    let scan = &body[..body.len().min(512 * 1024)];
     let text = String::from_utf8_lossy(scan).to_lowercase();
     [
         "recaptcha",
@@ -426,7 +563,7 @@ pub fn interactive_captcha(body: &[u8]) -> bool {
 /// the browser can clear with its own first-party state. Call only after the
 /// page was classified as a captcha, never on ordinary embedded widgets.
 pub fn human_captcha(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]).to_lowercase();
+    let text = String::from_utf8_lossy(&body[..body.len().min(512 * 1024)]).to_lowercase();
     [
         "hcaptcha",
         "recaptcha",

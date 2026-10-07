@@ -1156,13 +1156,15 @@ impl Crawler {
                         continue 'work;
                     }
 
-                    // Ghost escalation for bot walls: if the page
-                    // is a Challenge verdict and ghost is available,
-                    // try rendering in the headless browser before
-                    // skipping. Ghost may solve the challenge.
+                    // Shared HTTP denial policy: one browser observation for
+                    // eligible documents, including an unbranded plain 403.
                     let mut ghost_html: Option<String> = None;
-                    if matches!(page.verdict, Verdict::Challenge(_))
-                        && let Some(ref ghost_hook) = ghost_hook
+                    if crate::detect::walls::browser_recovery(
+                        page.status,
+                        &page.headers,
+                        &page.body,
+                        page.verdict,
+                    ) && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
                         if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {

@@ -17,6 +17,7 @@ pub mod actions;
 pub mod cache;
 pub mod cdp;
 pub mod cloak;
+pub mod document;
 pub mod manager;
 pub mod ops;
 pub mod probe;
@@ -99,6 +100,35 @@ pub(super) fn ghost_direct() -> bool {
 
 #[cfg(test)]
 mod wave450_retry_tests {
+
+    #[tokio::test]
+    async fn stealth_v3_cancelled_operation_marks_browser_dirty_during_sleep() {
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let flag = dirty.clone();
+        let task = tokio::spawn(async move {
+            let mut operation = Operation {
+                dirty: flag,
+                finished: false,
+            };
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            operation.finish();
+        });
+        started_rx.await.unwrap();
+        assert!(!dirty.load(std::sync::atomic::Ordering::Acquire));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(dirty.load(std::sync::atomic::Ordering::Acquire));
+        let clean = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut operation = Operation {
+            dirty: clean.clone(),
+            finished: false,
+        };
+        operation.finish();
+        drop(operation);
+        assert!(!clean.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn wave450_each_browser_slot_owns_a_unique_temporary_profile() {
@@ -212,12 +242,35 @@ pub struct Ghost {
     /// listener: dropped with the Ghost.
     #[allow(dead_code)] // held for its lifetime; Drop aborts the relay
     relay: Option<relay::Relay>,
+    dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A cancelled browser operation can leave navigation or paused requests in
+/// flight. Its process must not be handed to another job. Normal errors finish
+/// the operation too; a transport-dead browser is retired separately.
+pub(crate) struct Operation {
+    dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished: bool,
+}
+
+impl Operation {
+    pub(crate) fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Per-persona ghost wire identity (v4 E2). Defaults are the old
 /// hardcoded 1920x1080 / en-US so callers that have no persona stay
 /// byte-identical.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GhostWire {
     pub viewport: (u32, u32),
     pub locale: String,
@@ -951,7 +1004,7 @@ impl WindowRestore {
     /// Only a window that was never minimized can skip the wait: a
     /// failed restore leaves the window un-presented too, and a
     /// capture against it fails the same instant way.
-    fn needs_surface_wait(self) -> bool {
+    fn needs_surface_wait(&self) -> bool {
         !matches!(self, Self::NotMinimized)
     }
 }
@@ -1251,6 +1304,14 @@ impl Ghost {
         {
             chrome_args.push("--headless=new".into());
         }
+        let hidden_surface = chrome_args.iter().any(|a| a == "--headless=new")
+            || (cfg!(linux_like) && display.is_some());
+        if hidden_surface {
+            // These surfaces are already invisible. Minimizing prevents
+            // frame/input acknowledgements (measured 5s per mouse event).
+            chrome_args.retain(|a| !a.starts_with("--window-position="));
+            chrome_args.push("--window-position=0,0".into());
+        }
         // Modern Chrome (136+) sets navigator.webdriver
         // under --headless/--remote-debugging-port even
         // raw. This blink switch restores the real-
@@ -1372,7 +1433,10 @@ impl Ghost {
             fetch_guard.abort();
             return Err(FetchError::ghost(format!("Fetch.enable: {e}")));
         }
+        cdp.track_document(session.clone());
         cdp.call(Some(&session), "Page.enable", json!({})).await?;
+        cdp.call(Some(&session), "Network.enable", json!({}))
+            .await?;
 
         // No script is injected before page scripts, deliberately.
         //
@@ -1405,13 +1469,8 @@ impl Ghost {
         // `--disable-blink-features=AutomationControlled` covers the
         // headless case without defining anything.
         // invisible even on macOS (Dock) and Windows (taskbar).
-        // Combined with --window-position=-32000,-32000, the
-        // window is both off-screen and minimized. Chrome still
-        // renders normally (minimized ≠ background tab; the
-        // active tab's visibilityState stays "visible").
-        // The state is kept: a capture un-minimizes the window for
-        // its call and re-minimizes after (a minimized window
-        // presents no frames, issue #331).
+        // Native desktop windows remain off-screen/minimized. Virtual
+        // and headless surfaces stay normal so input and rendering work.
         let mut window_id: Option<i64> = None;
         let mut window_minimized = false;
         if let Ok(win) = cdp
@@ -1424,17 +1483,21 @@ impl Ghost {
             && let Some(id) = win.get("windowId").and_then(Value::as_i64)
         {
             window_id = Some(id);
-            let _ = cdp
-                .call(
-                    None,
-                    "Browser.setWindowBounds",
-                    json!({
-                        "windowId": id,
-                        "bounds": { "windowState": "minimized" }
-                    }),
-                )
-                .await;
-            window_minimized = true;
+            if !hidden_surface
+                && cdp
+                    .call(
+                        None,
+                        "Browser.setWindowBounds",
+                        json!({
+                            "windowId": id,
+                            "bounds": { "windowState": "minimized" }
+                        }),
+                    )
+                    .await
+                    .is_ok()
+            {
+                window_minimized = true;
+            }
         }
 
         // The layout viewport is pinned whenever the renderer has no real
@@ -1526,6 +1589,7 @@ impl Ghost {
             winlock_heartbeat,
             wire: wire.clone(),
             relay,
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1575,6 +1639,21 @@ impl Ghost {
     /// frame. Such a browser answers nothing and must be relaunched.
     pub fn link_dead(&self) -> bool {
         self.cdp.is_dead()
+    }
+
+    pub fn document(&self) -> document::Document {
+        self.cdp.document()
+    }
+
+    pub(crate) fn operation(&self) -> Operation {
+        Operation {
+            dirty: self.dirty.clone(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Acquire) || self.cdp.was_cancelled()
     }
 
     /// Reap the browser entirely : the whole process tree,
@@ -1651,18 +1730,19 @@ impl Ghost {
     /// until the generic 20s CDP timeout, blocking tier-2 entirely.
     ///
     /// Bound the `Page.navigate` response wait, retaining any errorText.
-    /// Poll `current_url()` after a settle-window timeout : it uses the
-    /// browser-level `Target.getTargetInfo`, which is routed
-    /// separately from the page session and still returns the
-    /// advancing URL. This succeeds on both healthy Chrome (fast
-    /// response) and the buggy 151/152 builds (no response at all).
+    /// Observe main-frame commit events after a response timeout. They
+    /// identify the new loader without another queued page-session call;
+    /// the previous page's nonblank URL cannot complete this navigation.
     pub async fn navigate(&self, url: &str) -> Result<(), FetchError> {
         // Centralized SSRF guard for browser tier: validates scheme,
         // credentials, literal IP ranges and (async) DNS resolution.
         // This is the sole gate for all Ghost navigations - solve,
         // render, ghost_fetch and actions all flow through here, so
         // tier=2 cannot bypass it.
-        self.navigate_raw(url, true).await
+        let mut operation = self.operation();
+        let result = self.navigate_raw(url, true).await;
+        operation.finish();
+        result
     }
 
     /// Navigate without the SSRF guard. Internal use only
@@ -1691,6 +1771,8 @@ impl Ghost {
         // BlockedByClient, DNS failure) is recorded: the poll loop
         // below only knows "URL never advanced", which used to hide
         // the actual cause behind a generic 20s timeout message.
+        let before = self.document();
+        let mut expected_loader = None;
         let nav_err: Option<String> = match self
             .cdp
             .call_with_timeout(
@@ -1701,11 +1783,17 @@ impl Ghost {
             )
             .await
         {
-            Ok(reply) => reply
-                .get("errorText")
-                .and_then(Value::as_str)
-                .filter(|e| !e.is_empty())
-                .map(str::to_owned),
+            Ok(reply) => {
+                expected_loader = reply
+                    .get("loaderId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                reply
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+            }
             Err(e) if !e.to_string().contains("cdp timeout") => Some(e.to_string()),
             // Settle-window timeouts are the documented queue
             // behavior above; the poll loop is the real referee.
@@ -1716,13 +1804,18 @@ impl Ghost {
             return Err(FetchError::ghost(format!("navigate failed: {why}")));
         }
 
-        // Poll the target URL until it advances off the initial
-        // blank page (about:blank is what createTarget starts at).
+        // A reused target already has a nonblank URL. Require a commit for
+        // this navigation, including reloads and legitimate redirects.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            let cur = self.current_url().await.unwrap_or_default();
-            let advanced = !cur.is_empty() && !cur.starts_with("about:blank");
-            if advanced {
+            if self.link_dead() {
+                return Err(FetchError::ghost("cdp link closed during navigation"));
+            }
+            if let Some(current) =
+                self.cdp
+                    .navigation_committed(&before, expected_loader.as_deref(), url)
+            {
+                let cur = current.url;
                 if cur.starts_with("chrome-error:") {
                     return Err(FetchError::ghost("navigate failed: Chrome network error"));
                 }
@@ -1738,12 +1831,9 @@ impl Ghost {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err(FetchError::ghost(match &nav_err {
-                    Some(why) => {
-                        format!("navigate: target URL never advanced past about:blank ({why})")
-                    }
-                    None => "navigate: target URL never advanced past about:blank".into(),
-                }));
+                return Err(FetchError::ghost(
+                    "navigate: no committed document for requested navigation",
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
@@ -1925,6 +2015,13 @@ impl Ghost {
     /// puts it back after; the invisibility the minimize bought is
     /// unchanged.
     async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
+        let mut operation = self.operation();
+        let result = self.capture_screenshot_inner(params).await;
+        operation.finish();
+        result
+    }
+
+    async fn capture_screenshot_inner(&self, params: Value) -> Result<String, FetchError> {
         let restore = self.unminimize_for_capture().await;
         // macOS only: the measured state-flip/surface race lives there; other
         // platforms keep their pre-wait behavior and lean on the single retry.
@@ -1956,7 +2053,9 @@ impl Ghost {
                 .call(Some(&self.session), "Page.captureScreenshot", params)
                 .await;
         }
-        self.reminimize_after_capture().await;
+        if restore.needs_surface_wait() {
+            self.reminimize_after_capture().await;
+        }
         result?
             .get("data")
             .and_then(Value::as_str)
@@ -2104,6 +2203,17 @@ impl Ghost {
     /// CDP input events are isTrusted=true; detection is
     /// behavioral, so the path curves and overshoots.
     pub async fn click(&self, x: f64, y: f64) -> Result<(), FetchError> {
+        let mut operation = self.operation();
+        let restore = self.unminimize_for_capture().await;
+        let result = self.click_inner(x, y).await;
+        if restore.needs_surface_wait() {
+            self.reminimize_after_capture().await;
+        }
+        operation.finish();
+        result
+    }
+
+    async fn click_inner(&self, x: f64, y: f64) -> Result<(), FetchError> {
         // Pre-movement: bezier-ish arc from a random offset.
         let mut rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2155,6 +2265,17 @@ impl Ghost {
     /// Move the mouse to (x, y) along the human path WITHOUT
     /// pressing : hover. Reuses the click pre-move geometry.
     pub async fn hover(&self, x: f64, y: f64) -> Result<(), FetchError> {
+        let mut operation = self.operation();
+        let restore = self.unminimize_for_capture().await;
+        let result = self.hover_inner(x, y).await;
+        if restore.needs_surface_wait() {
+            self.reminimize_after_capture().await;
+        }
+        operation.finish();
+        result
+    }
+
+    async fn hover_inner(&self, x: f64, y: f64) -> Result<(), FetchError> {
         let mut rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())

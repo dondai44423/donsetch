@@ -167,6 +167,11 @@ test:
 t expression:
     {{budget}} cargo nextest run --cargo-profile fast {{feat}} -E 'test({{expression}})'
 
+# Explicit native qualification: only the requested ignored test scope, using
+# fresh owned browser profiles. Never part of an ordinary local test run.
+t-native expression:
+    {{budget}} cargo nextest run --cargo-profile fast {{feat}} --run-ignored only -E 'test({{expression}})'
+
 # Scoped run on the ci profile (release opts, panic=abort): use when the
 # question is release-profile behavior, not "does it pass".
 tci expression:

@@ -164,8 +164,8 @@ pub(super) fn make_ghost_hook(
                     }
                 }
             };
-            if page.captcha {
-                return Err("captcha or anti-bot challenge did not clear".to_string());
+            if page.outcome != ops::BrowserOutcome::Content {
+                return Err(format!("browser content unavailable: {:?}", page.outcome));
             }
             let verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
             if verdict != crate::detect::walls::Verdict::ContentOk {
@@ -177,7 +177,7 @@ pub(super) fn make_ghost_hook(
             }
             {
                 let mut s = state.lock().await;
-                s.record_render(&url, &page.html);
+                s.record_render(&page.document.url, &page.html);
             }
             Ok(crate::crawl::GhostRender { html: page.html })
         }
@@ -636,7 +636,7 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
                 Ok(p) => p,
                 Err(_) => return,
             };
-        if page.captcha
+        if page.outcome.is_wall()
             || matches!(
                 crate::detect::walls::detect_dom_smart(page.html.as_bytes()),
                 crate::detect::walls::Verdict::Challenge(_)
@@ -644,6 +644,12 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             )
         {
             d.state.lock().await.record_wall_failed(&host_str);
+            return;
+        }
+        if page.outcome != ops::BrowserOutcome::Content
+            || crate::detect::walls::detect_dom_smart(page.html.as_bytes())
+                != crate::detect::walls::Verdict::ContentOk
+        {
             return;
         }
         if !page.cookies.is_empty() {

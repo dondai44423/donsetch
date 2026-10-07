@@ -1516,7 +1516,10 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             _ if reddit_session_retry_eligible(&o.verdict, &host, args) => {
                 return reddit_session_fallback(daemon, args, &url, &mut trace).await;
             }
-            Verdict::Challenge(_) if tier != "1" => {}
+            _ if tier != "1"
+                && crate::detect::walls::browser_recovery(
+                    o.status, &o.headers, &o.body, o.verdict,
+                ) => {}
             v => {
                 let kind = verdict_kind(v, o.status);
                 // v3.4: bypass fetch for hard walls (Challenge/Blocked).
@@ -1670,7 +1673,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     let ex_thin = final_ex.as_ref().map(|e| e.thin).unwrap_or(false);
     let challenge = out
         .as_ref()
-        .map(|o| matches!(o.verdict, Verdict::Challenge(_)))
+        .map(|o| crate::detect::walls::browser_recovery(o.status, &o.headers, &o.body, o.verdict))
         .unwrap_or(false)
         || extraction_wall.is_some();
 
@@ -1853,7 +1856,8 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 &url,
                 &host,
                 &opts,
-                challenge || shell_warm || skip_tier1,
+                challenge || shell_warm || (skip_tier1 && tier != "2"),
+                tier == "2" || opts.selector.is_some(),
                 shot,
                 &mut trace,
                 budget,
@@ -1907,20 +1911,35 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                     Some(Verdict::AuthWall)
                 } else if msg.starts_with("not found:") {
                     Some(Verdict::SoftNotFound)
+                } else if msg.starts_with("paywall:") {
+                    Some(Verdict::Paywall)
                 } else {
                     None
                 };
-                let failed_verdict = observed_gate
-                    .map(|v| format!("{v:?}"))
-                    .unwrap_or_else(|| failure_verdict(&final_verdict, kind));
+                let failed_verdict = if msg.starts_with("browser document incomplete") {
+                    "Incomplete".to_string()
+                } else {
+                    observed_gate
+                        .map(|v| format!("{v:?}"))
+                        .unwrap_or_else(|| failure_verdict(&final_verdict, kind))
+                };
+                let observed_status = trace
+                    .browser_document
+                    .as_ref()
+                    .map(|d| d.status)
+                    .unwrap_or((final_status != 0).then_some(final_status));
                 return tool_error_structured(
                     msg,
                     kind,
                     Some(json!({
-                        "url": url,
-                        "status": final_status,
+                        "url": trace.browser_document.as_ref().map(|d| d.url.as_str()).unwrap_or(&url),
+                        "status": observed_status,
                         "verdict": failed_verdict,
-                        "next_action": next_action_for(observed_gate.or_else(|| out.as_ref().map(|o| o.verdict)), final_status, kind),
+                        "next_action": if failed_verdict == "Incomplete" {
+                            "retry with a wait for expected content; the browser document did not settle".to_string()
+                        } else {
+                            next_action_for(observed_gate.or_else(|| out.as_ref().map(|o| o.verdict)), observed_status.unwrap_or(0), kind)
+                        },
                         "escalation": trace.value(),
                     })),
                 );
@@ -2359,6 +2378,7 @@ pub(super) async fn ghost_escalate(
     host: &str,
     opts: &ExtractOptions,
     learn: bool,
+    browser_only: bool,
     shot: Option<&str>,
     trace: &mut Trace,
     budget: Budget,
@@ -2381,6 +2401,12 @@ pub(super) async fn ghost_escalate(
         .await
         .map_err(|e| (format!("browser launch failed: {e}"), "permanent"))?;
     trace.step("2", "browser-launch", "ok", t0.elapsed().as_millis());
+    trace.step(
+        "2",
+        "browser-queue",
+        if g.reused { "reused" } else { "launched" },
+        g.queue_wait.as_millis(),
+    );
     let t1 = std::time::Instant::now();
     let mut page = match ops::ghost_fetch(&mut g, url, budget.pass(20)).await {
         Ok(p) => p,
@@ -2412,9 +2438,14 @@ pub(super) async fn ghost_escalate(
     trace.step(
         "2",
         "ghost-render",
-        &format!("captcha={} dom={}KB", page.captcha, page.html.len() / 1024),
+        &format!(
+            "outcome={:?} dom={}KB",
+            page.outcome,
+            page.html.len() / 1024
+        ),
         t1.elapsed().as_millis(),
     );
+    trace.observe_browser(&page.document);
     if crate::config::cfg().debug.ghost {
         let p = dump_ghost_dom(
             &crate::paths::cache_dir().join("ghost-debug"),
@@ -2435,14 +2466,21 @@ pub(super) async fn ghost_escalate(
         ));
     }
     let gate = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
-    if matches!(gate, Verdict::AuthWall | Verdict::SoftNotFound) {
-        return Err((verdict_error(gate, 200, url), verdict_kind(gate, 200)));
+    if matches!(
+        gate,
+        Verdict::AuthWall | Verdict::Paywall | Verdict::SoftNotFound
+    ) {
+        let status = page.document.status.unwrap_or(0);
+        return Err((
+            verdict_error(gate, status, &page.document.url),
+            verdict_kind(gate, status),
+        ));
     }
-    if page.captcha {
+    if page.outcome.is_wall() {
         // Interactive widgets are outside this solver's capabilities. The
         // first real DOM is decisive; another navigation cannot answer a
         // human challenge. Turnstile keeps its bounded warm second pass.
-        if crate::detect::walls::human_captcha(page.html.as_bytes()) {
+        if page.outcome == ops::BrowserOutcome::HumanRequired {
             trace.step(
                 "2",
                 "solve",
@@ -2465,15 +2503,16 @@ pub(super) async fn ghost_escalate(
         // settle re-check. Never more: two passes is the ceiling,
         // an honest captcha stays an honest captcha.
         let t1b = std::time::Instant::now();
-        let page2 = ops::ghost_fetch(&mut g, url, budget.pass(20)).await.ok();
+        let page2 = ops::ghost_fetch(&mut g, url, budget.pass(20)).await;
         match page2 {
-            Some(p2) if !p2.captcha => {
+            Ok(p2) if !p2.outcome.is_wall() => {
+                trace.observe_browser(&p2.document);
                 trace.step(
                     "2",
                     "solve-pass2",
                     &format!(
                         "cleared: captcha={} dom={}KB",
-                        p2.captcha,
+                        p2.outcome.is_wall(),
                         p2.html.len() / 1024
                     ),
                     t1b.elapsed().as_millis(),
@@ -2481,7 +2520,8 @@ pub(super) async fn ghost_escalate(
                 // Fall through into the normal harvest/retry flow.
                 page = p2;
             }
-            Some(p2) if p2.captcha => {
+            Ok(p2) if p2.outcome.is_wall() => {
+                trace.observe_browser(&p2.document);
                 // A failed second pass must leave the same trail a
                 // successful one does. The debug log showed two
                 // attempts while the escalation listed one, so the
@@ -2491,7 +2531,7 @@ pub(super) async fn ghost_escalate(
                     "solve-pass2",
                     &format!(
                         "still walled: captcha={} dom={}KB",
-                        p2.captcha,
+                        p2.outcome.is_wall(),
                         p2.html.len() / 1024
                     ),
                     t1b.elapsed().as_millis(),
@@ -2515,21 +2555,38 @@ pub(super) async fn ghost_escalate(
             }
             // ghost_fetch errored on the retry (automation failure,
             // not a wall): no wall memory recorded.
-            None => {
+            Err(error) => {
                 if let Some(p) = shot {
                     record_shot(&g, p, trace).await;
                 }
                 return Err((
-                    format!(
-                        "blocked at {url} : interactive captcha or challenge could not be solved automatically. Use an Agent browser to browse sites like these"
-                    ),
-                    "walled",
+                    format!("browser recovery failed at {url}: {error}"),
+                    "transient",
                 ));
             }
             _ => unreachable!(),
         }
     }
-    if !page.captcha {
+    let status = page.document.status.unwrap_or(0);
+    let observed_gate = match status {
+        401 => Some(Verdict::AuthWall),
+        402 => Some(Verdict::Paywall),
+        404 => Some(Verdict::SoftNotFound),
+        _ => crate::detect::walls::content_gate(page.html.as_bytes()),
+    };
+    if let Some(verdict) = observed_gate {
+        return Err((
+            verdict_error(verdict, status, &page.document.url),
+            verdict_kind(verdict, status),
+        ));
+    }
+    if page.outcome == ops::BrowserOutcome::Incomplete {
+        return Err((
+            format!("browser document incomplete at {url}: content did not settle"),
+            "transient",
+        ));
+    }
+    if !page.outcome.is_wall() {
         // Solve-grade pass for invisible walls: Akamai-class vendors
         // render a "still checking" page that settles (no captcha
         // form) but whose DOM classifies as a wall. The sensor fires
@@ -2549,7 +2606,7 @@ pub(super) async fn ghost_escalate(
             let t1b = std::time::Instant::now();
             if let Ok(p2) = ops::ghost_fetch(&mut g, url, budget.pass(20)).await {
                 let v2 = crate::detect::walls::detect_dom_smart(p2.html.as_bytes());
-                if !p2.captcha
+                if !p2.outcome.is_wall()
                     && !matches!(
                         v2,
                         crate::detect::walls::Verdict::Challenge(_)
@@ -2563,6 +2620,7 @@ pub(super) async fn ghost_escalate(
                         t1b.elapsed().as_millis(),
                     );
                     page = p2;
+                    trace.observe_browser(&page.document);
                 }
             }
         }
@@ -2574,7 +2632,7 @@ pub(super) async fn ghost_escalate(
     // Retry tier 1 with fresh cookies : the cheap path back to
     // normal HTTP when the gate was cookie-driven.
     let t2 = std::time::Instant::now();
-    let retry = if !page.cookies.is_empty() && !crate::ghost::ghost_direct() {
+    let retry = if !browser_only && !page.cookies.is_empty() && !crate::ghost::ghost_direct() {
         let r = daemon.fetcher.fetch(url).await.ok();
         trace.step(
             "1",
@@ -2598,23 +2656,8 @@ pub(super) async fn ghost_escalate(
     // serves a doomed Warm roundtrip again.
     let mut replay_content_ok = false;
 
-    // The retry is the oracle of record for TERMINAL verdicts: a
-    // 404/paywall on tier 1 means the ghost spent its time
-    // rendering a dead page (browsers render 404s too). The ghost's
-    // pretty DOM must never launder a dead URL into ContentOk.
-    //
-    // AuthWall is deliberately excluded: an auth wall on the
-    // retry means the HTTP path can't authenticate, but the
-    // browser may have (Chromium handles userinfo/cookies/JS
-    // auth natively). Discarding the ghost's content because the
-    // tier-1 retry hit a wall the browser already cleared is
-    // the core tier-2 regression in issue #15.
-    if let Some(r) = &retry
-        && matches!(r.verdict, Verdict::SoftNotFound | Verdict::Paywall)
-    {
-        let kind = verdict_kind(r.verdict, r.status);
-        return Err((verdict_error(r.verdict, r.status, &r.url), kind));
-    }
+    // HTTP replay is an independent candidate. A failed replay cannot
+    // override the browser's observed response or usable document.
 
     // Candidates: retry bytes (cheap path) and the ghost's own
     // rendered DOM. Non-thin always beats thin; within a class,
@@ -2650,7 +2693,7 @@ pub(super) async fn ghost_escalate(
     if let Ok(e2) = extract::extract(
         page.html.as_bytes(),
         extract::charset::GHOST_TEXT_CT,
-        url,
+        &page.document.url,
         opts,
     ) {
         let thin = e2.thin;
@@ -2665,8 +2708,8 @@ pub(super) async fn ghost_escalate(
                 thin,
                 e2,
                 "ghost-dom",
-                retry.as_ref().map(|r| r.status).unwrap_or(200),
-                url.to_string(),
+                page.document.status.unwrap_or(0),
+                page.document.url.clone(),
             ));
         }
     }
@@ -2681,7 +2724,7 @@ pub(super) async fn ghost_escalate(
         if let Ok(e3) = extract::extract(
             page.html.as_bytes(),
             extract::charset::GHOST_TEXT_CT,
-            url,
+            &page.document.url,
             &lopts,
         ) {
             let thin = e3.thin;
@@ -2696,8 +2739,8 @@ pub(super) async fn ghost_escalate(
                     thin,
                     e3,
                     "ghost-dom(links)",
-                    retry.as_ref().map(|r| r.status).unwrap_or(200),
-                    url.to_string(),
+                    page.document.status.unwrap_or(0),
+                    page.document.url.clone(),
                 ));
             }
         }
@@ -2715,7 +2758,7 @@ pub(super) async fn ghost_escalate(
         // Learning is gated on WALL-DRIVEN escalation AND gated on
         // CONTENT : success is "we got content", not "we got HTTP
         // 200". The replay probe (or its absence) sets replay_ok.
-        if learn && !crate::ghost::ghost_direct() {
+        if (learn || page.vendor.is_some()) && !crate::ghost::ghost_direct() {
             daemon.state.lock().await.record_solved(
                 host,
                 &page.cookies,
@@ -2730,7 +2773,11 @@ pub(super) async fn ghost_escalate(
         // cached and re-served as ContentOk forever.
         let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
         if dom_verdict == Verdict::ContentOk {
-            daemon.state.lock().await.record_render(&u, &page.html);
+            daemon
+                .state
+                .lock()
+                .await
+                .record_render(&page.document.url, &page.html);
         }
         return Ok((e, t, s, u, page.html));
     }
@@ -2748,24 +2795,32 @@ pub(super) async fn ghost_escalate(
     let candidate = pre.as_deref().unwrap_or(&page.html);
     let trimmed = candidate.trim_start();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Some(ext) =
-            crate::adapters::extract_json(trimmed.as_bytes(), "application/json", url, opts)
-        {
+        if let Some(ext) = crate::adapters::extract_json(
+            trimmed.as_bytes(),
+            "application/json",
+            &page.document.url,
+            opts,
+        ) {
             return Ok((
                 ext,
                 "ghost-json",
-                retry.as_ref().map(|r| r.status).unwrap_or(200),
-                url.to_string(),
+                page.document.status.unwrap_or(0),
+                page.document.url.clone(),
                 page.html,
             ));
         }
         // No adapter: DonSift's generic pass for the raw body.
-        if let Ok(ext) = extract::extract(trimmed.as_bytes(), "application/json", url, opts) {
+        if let Ok(ext) = extract::extract(
+            trimmed.as_bytes(),
+            "application/json",
+            &page.document.url,
+            opts,
+        ) {
             return Ok((
                 ext,
                 "ghost-json",
-                retry.as_ref().map(|r| r.status).unwrap_or(200),
-                url.to_string(),
+                page.document.status.unwrap_or(0),
+                page.document.url.clone(),
                 page.html,
             ));
         }
@@ -2781,13 +2836,17 @@ pub(super) async fn ghost_escalate(
     // chars of visible text). A captcha/challenge page with 300
     // chars of "Please verify you are a human" must NOT be
     // returned as ContentOk : the agent would trust it.
-    if !page.captcha {
+    if !page.outcome.is_wall() {
         let doc = scraper::Html::parse_document(&page.html);
         let meta = crate::extract::metadata::metadata(&doc);
         let max_chars = opts.max_chars.unwrap_or(16_000).max(200);
-        if let Some(fb) =
-            crate::extract::fallback::text_fallback(&page.html, &meta, url, opts, max_chars)
-        {
+        if let Some(fb) = crate::extract::fallback::text_fallback(
+            &page.html,
+            &meta,
+            &page.document.url,
+            opts,
+            max_chars,
+        ) {
             // The fallback is the LAST resort. A real page render
             // whose useful text is short must still succeed (live
             // case: instagram's profile card = 279 collectible
@@ -2801,11 +2860,17 @@ pub(super) async fn ghost_escalate(
             // The last resort must not resurrect junk (#282): a
             // challenge interstitial or chrome-only shell stays a
             // failure even though its text is technically non-empty.
-            let status = retry.as_ref().map(|r| r.status).unwrap_or(200);
+            let status = page.document.status.unwrap_or(0);
             if content_fail(&fb.markdown, url, status).is_none()
                 && (!fb.thin || (fb.markdown.len() >= 40 && !login_only))
             {
-                return Ok((fb, "ghost-text", 200, url.to_string(), page.html));
+                return Ok((
+                    fb,
+                    "ghost-text",
+                    page.document.status.unwrap_or(0),
+                    page.document.url.clone(),
+                    page.html,
+                ));
             }
         }
     }
@@ -2835,10 +2900,8 @@ pub(super) async fn ghost_escalate(
     }
     if page.html.len() < 5_000 {
         return Err((
-            format!(
-                "not found: {url} : page returned no extractable content (may not exist, is an empty JS shell, or the site served an anti-bot interstitial too small for the wall detector)"
-            ),
-            "permanent",
+            format!("browser document incomplete at {url}: no extractable content"),
+            "transient",
         ));
     }
     Err((
@@ -3031,10 +3094,15 @@ pub(super) async fn fetch_with_actions(
     trace.step(
         "2",
         "ghost-render",
-        &format!("captcha={} dom={}KB", page.captcha, page.html.len() / 1024),
+        &format!(
+            "captcha={} dom={}KB",
+            page.outcome.is_wall(),
+            page.html.len() / 1024
+        ),
         t1.elapsed().as_millis(),
     );
-    if page.captcha {
+    trace.observe_browser(&page.document);
+    if page.outcome.is_wall() {
         if let Some(p) = shot {
             record_shot(&g, p, &mut trace).await;
         }
@@ -3045,11 +3113,28 @@ pub(super) async fn fetch_with_actions(
             "walled",
             Some(json!({
                 "url": url,
-                "status": 200,
+                "status": page.document.status,
                 "verdict": "Challenge",
                 "next_action": next_action_for(Some(Verdict::Challenge(Vendor::Generic)), 200, "walled"),
                 "escalation": trace.value(),
             })),
+        );
+    }
+
+    let initial_gate = match page.document.status {
+        Some(401) => Some(Verdict::AuthWall),
+        Some(402) => Some(Verdict::Paywall),
+        Some(404) => Some(Verdict::SoftNotFound),
+        _ => crate::detect::walls::content_gate(page.html.as_bytes()),
+    };
+    if let Some(gate) = initial_gate {
+        return tool_error_structured(
+            verdict_error(gate, page.document.status.unwrap_or(0), &page.document.url),
+            verdict_kind(gate, page.document.status.unwrap_or(0)),
+            Some(
+                json!({"url":page.document.url, "status":page.document.status,
+                "verdict":format!("{gate:?}"), "escalation":trace.value()}),
+            ),
         );
     }
 
@@ -3083,7 +3168,7 @@ pub(super) async fn fetch_with_actions(
                 "permanent",
                 Some(json!({
                     "url": url,
-                    "status": 200,
+                    "status": page.document.status,
                     "actions": steps_json,
                     "escalation": trace.value(),
                     "next_action": "inspect the page with a plain fetch (no actions), correct the failing step's selector/text, re-run",
@@ -3093,6 +3178,7 @@ pub(super) async fn fetch_with_actions(
     };
 
     // Post-action DOM + optional screenshot for visual debugging.
+    let before = g.document();
     let html = match g.outer_html().await {
         Ok(h) => h,
         Err(e) => {
@@ -3101,40 +3187,44 @@ pub(super) async fn fetch_with_actions(
                 "transient",
                 Some(json!({
                     "url": url,
-                    "status": 200,
+                    "status": page.document.status,
                     "escalation": trace.value(),
                 })),
             );
         }
     };
-    // Post-action navigation guard: actions like click can cause the
-    // browser to navigate to a new URL (href, form submit). Re-check
-    // the current URL via the centralized SSRF gate (async DNS,
-    // fail-closed for browser tier).
-    if let Ok(cur) = g.current_url().await
-        && !cur.is_empty()
-        && !cur.starts_with("about:")
-        && let Err(e) = crate::fetch::guards::ensure_url_safe(&cur).await
-    {
-        let kind = fetch_error_kind(&e);
-        // A click lands on a host that does not resolve, or hits a
-        // resolver hiccup, just as easily as on a private address: the
-        // kind, the code and the message come from the error itself
-        // (#248). Only the policy case gets the private-address prose.
-        let next_action = if matches!(e, FetchError::Ssrf(_)) {
-            "action caused navigation to a private/loopback URL : blocked".to_string()
-        } else {
-            next_action_for(None, 0, kind)
-        };
+    let document = g.document();
+    if before.generation != document.generation {
         return tool_error_structured(
-            format!("blocked after action navigation: {e}"),
-            kind,
-            Some(json!({
-                "url": cur,
-                "code": fetch_error_code(&e),
-                "escalation": trace.value(),
-                "next_action": next_action,
-            })),
+            "post-action document changed during extraction; add a wait for the destination",
+            "transient",
+            Some(json!({"url": url, "status": null, "escalation": trace.value()})),
+        );
+    }
+    trace.observe_browser(&document);
+    // Actions can navigate; the final URL is part of the DOM's provenance.
+    if let Err(e) = crate::fetch::guards::ensure_url_safe(&document.url).await {
+        return tool_error_structured(
+            format!("post-action navigation failed: {e}"),
+            fetch_error_kind(&e),
+            Some(
+                json!({"url": document.url, "code": fetch_error_code(&e), "escalation": trace.value()}),
+            ),
+        );
+    }
+    let gate = match document.status {
+        Some(401) => Verdict::AuthWall,
+        Some(402) => Verdict::Paywall,
+        Some(404) => Verdict::SoftNotFound,
+        _ => crate::detect::walls::detect_dom_smart(html.as_bytes()),
+    };
+    if gate != Verdict::ContentOk {
+        return tool_error_structured(
+            verdict_error(gate, document.status.unwrap_or(0), &document.url),
+            verdict_kind(gate, document.status.unwrap_or(0)),
+            Some(
+                json!({"url": document.url, "status": document.status, "escalation": trace.value()}),
+            ),
         );
     }
     if let Some(p) = shot {
@@ -3168,8 +3258,12 @@ pub(super) async fn fetch_with_actions(
     // candidate ladder as ghost_escalate: prose → links-keeping
     // → raw text. A shell after actions is still a shell.
     let mut best: Option<extract::Extracted> = None;
-    if let Ok(e) = extract::extract(html.as_bytes(), extract::charset::GHOST_TEXT_CT, url, opts)
-        && !e.thin
+    if let Ok(e) = extract::extract(
+        html.as_bytes(),
+        extract::charset::GHOST_TEXT_CT,
+        &document.url,
+        opts,
+    ) && !e.thin
     {
         best = Some(e);
     }
@@ -3179,7 +3273,7 @@ pub(super) async fn fetch_with_actions(
         if let Ok(e2) = extract::extract(
             html.as_bytes(),
             extract::charset::GHOST_TEXT_CT,
-            url,
+            &document.url,
             &lopts,
         ) && !e2.thin
         {
@@ -3192,21 +3286,16 @@ pub(super) async fn fetch_with_actions(
                 "actions succeeded but the resulting page yielded no extractable content ({}KB DOM) : the site may still be loading; add a wait step and re-run",
                 html.len() / 1024
             ),
-            "walled",
+            "transient",
             Some(json!({
-                "url": url,
-                "status": 200,
+                "url": document.url,
+                "status": document.status,
+                "verdict": "Incomplete",
                 "escalation": trace.value(),
                 "next_action": "add {\"do\":\"wait_text\",\"text\":\"<expected>\"} or {\"do\":\"wait\",\"ms\":2000} before extraction",
             })),
         );
     };
-
-    // Cache the action-recovered DOM for future plain fetches.
-    let dom_verdict = crate::detect::walls::detect_dom_smart(html.as_bytes());
-    if !matches!(dom_verdict, crate::detect::walls::Verdict::Challenge(_)) {
-        daemon.state.lock().await.record_render(url, &html);
-    }
 
     let steps_json: Vec<Value> = outcomes
         .iter()
@@ -3215,9 +3304,9 @@ pub(super) async fn fetch_with_actions(
     let mut res = finish_result(
         &ex,
         "2-actions",
-        200,
+        document.status.unwrap_or(0),
         "ContentOk",
-        url,
+        &document.url,
         &trace,
         t0.elapsed().as_millis(),
     );
@@ -3387,11 +3476,14 @@ pub(super) async fn anticloak_check(
         .await
         .ok()?;
     let page = ops::ghost_fetch(&mut g, url, budget.pass(20)).await.ok()?;
-    if page.captcha {
+    if page.outcome.is_wall() {
         return Some((
             0.0,
             "browser sees a challenge where HTTP saw content".to_string(),
         ));
+    }
+    if page.outcome != ops::BrowserOutcome::Content {
+        return None; // An incomplete/access-gated comparison is inconclusive.
     }
     let ex = extract::extract(
         page.html.as_bytes(),
@@ -4295,7 +4387,7 @@ pub(super) fn finish_result(
     // Transport and extraction telemetry remains available to MCP clients but
     // no longer competes with source evidence in model context.
     let debug = json!({
-        "status": status,
+        "status": (status != 0).then_some(status),
         "tier": tier,
         "verdict": verdict,
         "quality": ex.quality,
@@ -4486,6 +4578,40 @@ mod ghost_dom_dump_tests {
 mod fetch_output_contract_tests {
     use super::{Trace, finish_result, format_fetch_markdown};
     use crate::extract::{ContentKind, Extracted};
+
+    #[test]
+    fn stealth_v3_unavailable_browser_status_is_null_not_success_200() {
+        let output = finish_result(
+            &extracted("# Owned document\n\nActual evidence."),
+            "ghost-dom",
+            0,
+            "ContentOk",
+            "https://owned.test/final",
+            &Trace::default(),
+            0,
+        );
+        assert_eq!(
+            output["structuredContent"]["url"],
+            "https://owned.test/final"
+        );
+        assert!(output["_meta"]["com.donsetch/fetch-debug"]["status"].is_null());
+        assert!(
+            output["_meta"]["com.donsetch/fetch-debug"]
+                .as_object()
+                .unwrap()
+                .contains_key("status")
+        );
+        let observed = finish_result(
+            &extracted("# Owned document\n\nActual evidence."),
+            "ghost-dom",
+            201,
+            "ContentOk",
+            "https://owned.test/final",
+            &Trace::default(),
+            0,
+        );
+        assert_eq!(observed["_meta"]["com.donsetch/fetch-debug"]["status"], 201);
+    }
 
     pub(super) fn extracted(markdown: &str) -> Extracted {
         Extracted {

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Automatic fetch and crawl can observe an unbranded HTML 403 in the browser.
+  Explicit HTTP-only fetches, API permission errors, login pages, genuine rate
+  limits and ordinary server outages keep their terminal behavior.
+- Browser jobs reserve idle slots after FIFO capacity admission, allowing
+  waiting jobs to use a released browser rather than queue behind a busy
+  same-host session. Fetch diagnostics report queue time and browser reuse.
+- Human CAPTCHA widgets late in large challenge documents are detected without
+  the former 30 KB limit. Browser results distinguish human-only walls from
+  managed challenges, preserving bounded warm recovery for the latter.
+- Cancelled browser jobs and dead DevTools connections retire their owned
+  browser. Request interception uses bounded queues and validation workers.
+- Browser documents carry their own committed URL and HTTP status through
+  rendering and actions. Empty unresolved shells report incomplete content.
+  Failed HTTP replay cannot replace a valid browser document's status.
+- Headless and virtual-display windows stay normal so native mouse events and
+  screenshots receive compositor acknowledgements promptly.
+
 ## [4.5.7] - 2026-10-07
 
 ### Fixed
