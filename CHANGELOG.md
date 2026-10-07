@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lengths, handles informational headers and trailers, and counts padded bytes
   toward flow control. Request compression reuses its dynamic table, honors
   peer table limits, keeps credentials never-indexed and fragments large fields.
+- TLS collects post-handshake session tickets for reconnects, bounds their
+  retention, checks expiry and consumes tickets before sending. Tickets stay
+  scoped to the connector, origin port and proxy identity. Changed proxy
+  credentials open a new tunnel; plaintext URLs cannot reuse a TLS H2 socket.
 
 ## [4.5.7] - 2026-10-07
 

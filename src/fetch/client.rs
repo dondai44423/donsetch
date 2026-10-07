@@ -75,10 +75,7 @@ impl Fetcher {
     /// Warm = a cached TLS session under `origin`: the repeat-navigation
     /// signal that flips TFO on at the TCP layer (Linux).
     fn sessions_has(&self, origin: &str) -> bool {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(origin)
+        tls::has_session(&self.sessions, &self.connector, origin)
     }
 
     pub fn new(profile: BrowserProfile) -> Result<Self, FetchError> {
@@ -741,7 +738,7 @@ impl Fetcher {
             format!("{host}:{port}")
         };
         let origin = match proxy {
-            Some(p) => format!("{}|{}", p.id(), authority),
+            Some(p) => format!("{}|{}", p.connection_key(), authority),
             None => authority.clone(),
         };
 
@@ -897,12 +894,16 @@ impl Fetcher {
             }
         }
 
-        // 1) Try a pooled h2 connection for this origin.
-        let pooled = self
-            .pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take_h2(&origin);
+        // 1) H2 here is TLS-only. A plaintext URL with the same authority
+        // must never borrow an HTTPS socket or send a :scheme=https request.
+        let pooled = if is_https {
+            self.pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take_h2(&origin)
+        } else {
+            None
+        };
         if let Some(mut conn) = pooled {
             match self
                 .h2_request(&mut conn, &authority, &path, &req_headers, true)
@@ -1019,16 +1020,10 @@ impl Fetcher {
         req_headers: &[(String, String)],
         proxy: Option<&proxy::Proxy>,
     ) -> Result<FetchOutcome, FetchError> {
-        // Session key for the TLS session store (egress-scoped: the
-        // proxy id when proxied, else the bare host). tls::connect
-        // inserts under THIS key, so the TFO warm check must read the
-        // same one: the pooled-origin form (authority, proxy-prefixed)
-        // never matches on a non-default port or a proxied lane, and
-        // TFO then never arms despite a cached session.
-        let session_key = match proxy {
-            Some(p) => format!("{}|{}", p.id(), host),
-            None => host.to_string(),
-        };
+        // TLS-only origin includes its port and exact proxy identity. The
+        // connector generation further partitions tickets by profile/trust.
+        // TFO consults the same key as the ticket callback.
+        let session_key = origin;
         // Dial: https through an HTTP proxy goes through a CONNECT
         // tunnel; plaintext http:// through an HTTP proxy goes RAW
         // with an absolute-form request line (RFC 9112 3.2.2) —
@@ -1037,7 +1032,10 @@ impl Fetcher {
         let tcp = match proxy {
             Some(p) if !is_https && p.is_http_connect() => p.connect_tcp().await?,
             Some(p) => p.connect(host, port).await?,
-            None => tcp::happy_connect_with(host, port, self.sessions_has(&session_key)).await?,
+            None => {
+                tcp::happy_connect_with(host, port, is_https && self.sessions_has(session_key))
+                    .await?
+            }
         };
 
         // ── Plaintext http://: raw TCP straight into h1. ──
@@ -1109,7 +1107,7 @@ impl Fetcher {
                 host,
                 tcp,
                 &self.sessions,
-                &session_key,
+                session_key,
                 handshake,
             ),
         )

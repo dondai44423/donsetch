@@ -260,9 +260,29 @@ impl Proxy {
         })
     }
 
-    /// Stable id for pool keys and health tracking.
+    /// Endpoint id for lane health tracking.
     pub fn id(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Opaque connection identity including protocol and credentials.
+    /// Credential changes may select a different exit at the same endpoint.
+    pub fn connection_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update([match self.scheme {
+            ProxyScheme::Http => 0,
+            ProxyScheme::Socks5 => 1,
+        }]);
+        hash.update(self.port.to_be_bytes());
+        for field in [&self.host, &self.user, &self.pass] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// True when traffic goes through an HTTP CONNECT hop: these are
@@ -839,6 +859,30 @@ pub(crate) fn base64(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stealth_v3_proxy_connection_identity_covers_protocol_and_each_credential_field() {
+        let original = super::Proxy::parse("http://alice:owned-secret@proxy.example:8080").unwrap();
+        let key = original.connection_key();
+        assert_eq!(key, original.clone().connection_key());
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        for variant in [
+            "socks5://alice:owned-secret@proxy.example:8080",
+            "http://bob:owned-secret@proxy.example:8080",
+            "http://alice:changed-secret@proxy.example:8080",
+            "http://alice:owned-secret@other.example:8080",
+            "http://alice:owned-secret@proxy.example:8081",
+        ] {
+            assert_ne!(key, super::Proxy::parse(variant).unwrap().connection_key());
+        }
+        let left = super::Proxy::parse("http://a:bc@proxy.example:8080").unwrap();
+        let right = super::Proxy::parse("http://ab:c@proxy.example:8080").unwrap();
+        assert_ne!(
+            left.connection_key(),
+            right.connection_key(),
+            "field boundaries are part of identity"
+        );
+    }
 
     // E1: IPv6 literals (bracketed and bare), CIDR networks and
     // host:port entries in NO_PROXY.

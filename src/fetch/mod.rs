@@ -5,3 +5,6 @@ pub mod decompress;
 pub mod guards;
 pub mod revalidate;
 pub mod shadow;
+
+#[cfg(test)]
+mod reuse_tests;

@@ -4,19 +4,80 @@
 //! native Chrome behaviors on (GREASE, extension permutation, ECH-GREASE,
 //! ALPS, brotli cert compression), configured from live-captured Chrome data.
 
-use boring::ssl::{Ssl, SslConnector, SslMethod, SslSession, SslVersion};
+use boring::ex_data::Index;
+use boring::ssl::{
+    Ssl, SslConnector, SslContext, SslMethod, SslSession, SslSessionCacheMode, SslVersion,
+};
 use boring::x509::X509;
 use foreign_types::ForeignType;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::TcpStream;
 use tokio_boring::{SslStream, SslStreamBuilder};
 
 use crate::error::FetchError;
 use crate::profile::BrowserProfile;
 
-/// Per-origin TLS session-ticket store (Chrome resumes sessions; so do we).
-pub type SessionStore = Arc<Mutex<HashMap<String, SslSession>>>;
+/// Tickets partitioned by connector generation and the caller's origin/route.
+/// At most 512 origins and four tickets per origin are retained in memory.
+pub type SessionStore = Arc<Mutex<HashMap<(u64, String), VecDeque<SslSession>>>>;
+
+struct SessionTarget {
+    store: SessionStore,
+    key: (u64, String),
+}
+
+fn session_context_index() -> Result<Index<SslContext, u64>, FetchError> {
+    static INDEX: OnceLock<Result<Index<SslContext, u64>, boring::error::ErrorStack>> =
+        OnceLock::new();
+    INDEX
+        .get_or_init(SslContext::new_ex_index)
+        .as_ref()
+        .copied()
+        .map_err(tls_err)
+}
+
+fn session_target_index() -> Result<Index<Ssl, SessionTarget>, FetchError> {
+    static INDEX: OnceLock<Result<Index<Ssl, SessionTarget>, boring::error::ErrorStack>> =
+        OnceLock::new();
+    INDEX
+        .get_or_init(Ssl::new_ex_index)
+        .as_ref()
+        .copied()
+        .map_err(tls_err)
+}
+
+fn session_store_key(connector: &SslConnector, origin: &str) -> Result<(u64, String), FetchError> {
+    let context = connector
+        .context()
+        .ex_data(session_context_index()?)
+        .copied()
+        .ok_or_else(|| FetchError::Tls("missing session context".into()))?;
+    Ok((context, origin.to_owned()))
+}
+
+fn session_valid(session: &SslSession) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // The callback normally supplies resumable sessions. Validate again at
+    // lookup because tickets can expire while a pooled connection stays live.
+    (unsafe { boring_sys::SSL_SESSION_is_resumable(session.as_ptr()) != 0 })
+        && now < session.time().saturating_add(session.timeout() as u64)
+}
+
+/// A TCP warm hint requires a live ticket for this exact connector and route.
+pub fn has_session(store: &SessionStore, connector: &SslConnector, origin: &str) -> bool {
+    let Ok(key) = session_store_key(connector, origin) else {
+        return false;
+    };
+    store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .is_some_and(|tickets| tickets.iter().any(session_valid))
+}
 
 pub fn new_session_store() -> SessionStore {
     Arc::new(Mutex::new(HashMap::new()))
@@ -160,10 +221,47 @@ fn build_connector_with(
         b.set_permute_extensions(false);
     }
 
-    // Session storage lives in connect(): tickets are
-    // egress-scoped there (a proxy's ticket must never
-    // resume from the direct IP or another proxy : that
-    // would link the lanes at the edge).
+    // SSL_get_session after the handshake returns an unresumable TLS1.3
+    // placeholder. Collect NewSessionTicket while subsequent I/O reads it.
+    // A generation belongs to this immutable context, including its trust
+    // store and profile; rebuilding a connector cannot inherit old tickets.
+    static CONTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let context = CONTEXT
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |value| value.checked_add(1),
+        )
+        .map_err(|_| FetchError::Tls("session context generation exhausted".into()))?;
+    b.set_ex_data(session_context_index()?, context);
+    let target_index = session_target_index()?;
+    b.set_session_cache_mode(SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL);
+    b.set_new_session_callback(move |ssl, session| {
+        let Some(target) = ssl.ex_data(target_index) else {
+            return;
+        };
+        if !session_valid(&session) {
+            return;
+        }
+        let mut store = target
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if store.len() >= 512
+            && !store.contains_key(&target.key)
+            && let Some(oldest) = store
+                .iter()
+                .min_by_key(|(_, tickets)| tickets.back().map_or(0, |ticket| ticket.time()))
+                .map(|(key, _)| key.clone())
+        {
+            store.remove(&oldest);
+        }
+        let tickets = store.entry(target.key.clone()).or_default();
+        if tickets.len() >= 4 {
+            tickets.pop_front();
+        }
+        tickets.push_back(session);
+    });
 
     if handshake == HandshakeProfile::ChromeTrue {
         // OCSP stapling request (status_request extension), like Chrome.
@@ -438,13 +536,32 @@ pub async fn connect(
         .into_ssl(domain)
         .map_err(tls_err)?;
 
-    // Session resumption (ticket from a previous visit to this origin).
-    if let Ok(guard) = sessions.lock()
-        && let Some(session) = guard.get(session_key)
-    {
-        // Safe: session belongs to this client ctx; stale ticket just
-        // falls back to a full handshake.
-        let _ = unsafe { ssl.set_session(session) };
+    let key = session_store_key(connector, session_key)?;
+    ssl.set_ex_data(
+        session_target_index()?,
+        SessionTarget {
+            store: Arc::clone(sessions),
+            key: key.clone(),
+        },
+    );
+    let session = {
+        let mut store = sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = store.get_mut(&key).and_then(|tickets| {
+            tickets.retain(session_valid);
+            // Consume before sending. A cancelled/failed connection cannot
+            // offer the same TLS1.3 ticket again as a passive correlator.
+            tickets.pop_front()
+        });
+        if store.get(&key).is_some_and(VecDeque::is_empty) {
+            store.remove(&key);
+        }
+        session
+    };
+    if let Some(session) = session {
+        // Safe: the key includes the exact SslContext generation.
+        unsafe { ssl.set_session(&session) }.map_err(tls_err)?;
     }
 
     if handshake == HandshakeProfile::ChromeTrue {
@@ -472,18 +589,6 @@ pub async fn connect(
         .await
         .map_err(|e| FetchError::Tls(classify_handshake_error(&e)))?;
 
-    // Chrome caches session tickets aggressively : so do
-    // we, but EGRESS-SCOPED (session_key carries the
-    // proxy id when proxied; see fetch/client.rs).
-    if let Some(sess) = stream.ssl().session() {
-        let mut store = sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if store.len() >= 512 {
-            store.clear(); // sessions are short-lived; wipe + refill
-        }
-        store.insert(session_key.to_string(), sess.to_owned());
-    }
     Ok(stream)
 }
 
@@ -575,6 +680,141 @@ pub fn trust_store_report() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stealth_v3_tls_post_handshake_ticket_resumes_the_next_connection() {
+        use boring::ssl::SslAcceptor;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let directory = crate::paths::cache_dir().join("owned-tickets");
+        std::fs::create_dir(&directory).unwrap();
+        let bundle = directory.join("owned-ca.pem");
+        std::fs::write(&bundle, cert.cert.pem()).unwrap();
+        // Nextest isolates this owned trust bundle from every other test.
+        unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor
+            .set_certificate(&X509::from_der(cert.cert.der()).unwrap())
+            .unwrap();
+        acceptor
+            .set_private_key(
+                &boring::pkey::PKey::private_key_from_der(&cert.signing_key.serialize_der())
+                    .unwrap(),
+            )
+            .unwrap();
+        acceptor
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        acceptor
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        acceptor
+            .set_session_id_context(b"owned-ticket-origin")
+            .unwrap();
+        // More peer tickets than the client retains must not grow the queue.
+        assert_eq!(
+            unsafe { boring_sys::SSL_CTX_set_num_tickets(acceptor.as_ptr(), 8) },
+            1
+        );
+        let acceptor = acceptor.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut resumed = Vec::new();
+            for _ in 0..5 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = tokio_boring::accept(&acceptor, tcp).await.unwrap();
+                resumed.push(stream.ssl().session_reused());
+                stream.write_all(b"owned").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            resumed
+        });
+        let profile = BrowserProfile::chrome_150(crate::profile::Platform::Linux);
+        let connector = build_connector(&profile).unwrap();
+        let rebuilt = build_connector(&profile).unwrap();
+        let sessions = new_session_store();
+        let key = format!("localhost:{}", address.port());
+        let other = format!("other-origin:{}", address.port());
+        let expired_key = format!("expired-origin:{}", address.port());
+        for (index, (connector, key)) in [
+            (&connector, &key),
+            (&connector, &key),
+            (&rebuilt, &key),
+            (&connector, &other),
+            (&connector, &expired_key),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let mut stream = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                connect(
+                    &profile,
+                    connector,
+                    "localhost",
+                    tcp,
+                    &sessions,
+                    key,
+                    HandshakeProfile::ChromeTrue,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(stream.ssl().version_str(), "TLSv1.3");
+            // Reading application data processes the origin's later tickets.
+            let mut body = [0; 5];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                stream.read_exact(&mut body),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&body, b"owned");
+            if index == 0 {
+                assert!(has_session(&sessions, connector, key));
+                assert!(!has_session(&sessions, &rebuilt, key));
+                assert!(!has_session(&sessions, connector, &other));
+                let store_key = session_store_key(connector, key).unwrap();
+                let expired = {
+                    let store = sessions.lock().unwrap();
+                    let tickets = store.get(&store_key).unwrap();
+                    assert_eq!(tickets.len(), 4, "eight native tickets are capped at four");
+                    // Deserialize a distinct native object; mutating a shared
+                    // reference-counted session would corrupt the real queue.
+                    SslSession::from_der(&tickets.front().unwrap().to_der().unwrap()).unwrap()
+                };
+                unsafe { boring_sys::SSL_SESSION_set_timeout(expired.as_ptr(), 0) };
+                sessions.lock().unwrap().insert(
+                    session_store_key(connector, &expired_key).unwrap(),
+                    VecDeque::from([expired]),
+                );
+                assert!(
+                    !has_session(&sessions, connector, &expired_key),
+                    "expired ticket must not arm TFO"
+                );
+            }
+            if index == 4 {
+                assert!(
+                    !stream.ssl().session_reused(),
+                    "expired cache entry requires a full handshake"
+                );
+            }
+        }
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resumed,
+            [false, true, false, false, false],
+            "the origin must observe resumption only in the matching connector/origin"
+        );
+    }
 
     struct BogusErr(String);
     impl std::fmt::Display for BogusErr {
