@@ -670,9 +670,87 @@ pub(super) fn render_fetch_batch(
     })
 }
 
+fn fetch_input(args: &Value, url: &str) -> Result<url::Url, Value> {
+    // Full parse up front: an unparseable URL would otherwise flow
+    // through the whole pipeline with host="" : poisoning domain
+    // profiles and producing confusing late errors.
+    let parsed_url = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => return Err(tool_error(format!("fetch: invalid URL ({e})"))),
+    };
+    // Validate the caller's URL before an adapter can remove credentials or
+    // rewrite the host. The rewritten endpoint is independently guarded below.
+    if let Err(error) = crate::fetch::guards::validate_url_basic(url) {
+        return Err(tool_error_structured(
+            error.to_string(),
+            "permanent",
+            Some(json!({
+                "url": url, "code": "guard.ssrf",
+                "next_action": "pass a public http(s) URL without embedded credentials",
+            })),
+        ));
+    }
+    if let Some(selector) = args.get("selector").and_then(Value::as_str)
+        && scraper::Selector::parse(selector).is_err()
+    {
+        return Err(tool_error_structured(
+            format!("invalid CSS selector: {selector}"),
+            "permanent",
+            Some(json!({
+                "url": url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax",
+            })),
+        ));
+    }
+    Ok(parsed_url)
+}
+
+fn fetch_read_options(args: &Value) -> Result<ExtractOptions, Value> {
+    let mut opts = ExtractOptions::default();
+    let preset = match args.get("mode") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) if m == "scan" => Some(800),
+        Some(Value::String(m)) if m == "read" => Some(4_000),
+        Some(Value::String(m)) if m == "deep" => Some(16_000),
+        _ => return Err(tool_error("fetch: mode must be scan, read or deep")),
+    };
+    opts.focus = args.get("focus").and_then(Value::as_str).map(String::from);
+    opts.max_chars = args
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .map(|n| (n as usize).clamp(200, 1_048_576))
+        .or(preset);
+    opts.offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(1_000_000_000) as usize;
+    opts.section = args
+        .get("section")
+        .and_then(Value::as_str)
+        .map(String::from);
+    opts.selector = args
+        .get("selector")
+        .and_then(Value::as_str)
+        .map(String::from);
+    opts.toc = args.get("toc").and_then(Value::as_bool).unwrap_or(false);
+    opts.include_links = args.get("links").and_then(Value::as_bool).unwrap_or(false);
+    opts.include_media = args.get("media").and_then(Value::as_bool).unwrap_or(false);
+    opts.must_contain = args
+        .get("must_contain")
+        .and_then(Value::as_str)
+        .map(String::from);
+    Ok(opts)
+}
+
 /// Single-URL fetch with resurrection (v3): dead URLs get one
 /// honest attempt at the Wayback Machine before the error stands.
 pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
+    if let Err(error) = fetch_input(args, url) {
+        return error;
+    }
+    if let Err(error) = fetch_read_options(args) {
+        return error;
+    }
     let archive = match args.get("archive").and_then(Value::as_str) {
         Some("off") => "off",
         Some("only") => "only",
@@ -680,7 +758,7 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     };
     if archive == "only" {
         let no_live = tool_error(format!("archive=only : skipping live fetch for {url}"));
-        return match try_resurrect(daemon, url, &no_live).await {
+        return match try_resurrect(daemon, args, url, &no_live).await {
             Ok(v) => v,
             Err(f) => resurrect_error(url, &f),
         };
@@ -712,7 +790,7 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     if !resurrectable {
         return result;
     }
-    match try_resurrect(daemon, url, &result).await {
+    match try_resurrect(daemon, args, url, &result).await {
         Ok(v) => v,
         Err(f) => {
             // The original live error stands as the primary answer;
@@ -811,6 +889,24 @@ pub(super) fn strip_part_frontmatter(md: &str) -> String {
         start += 1;
     }
     lines[start..].join("\n").trim().to_string()
+}
+
+fn fetch_url_rewrite(
+    url: &url::Url,
+    args: &Value,
+    no_adapter: bool,
+) -> Option<(String, &'static str)> {
+    crate::adapters::rewrite(url).filter(|(_, name)| {
+        !no_adapter
+            && args.get("tier").and_then(Value::as_str) != Some("2")
+            && args
+                .get("actions")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            && (args.get("section").and_then(Value::as_str).is_none()
+                || *name == "adapter:stackexchange-api")
+            && args.get("selector").and_then(Value::as_str).is_none()
+    })
 }
 
 /// Whether a tier-1 verdict means the ADAPTER rewrite bought
@@ -972,36 +1068,10 @@ fn fold_trace_into_result(res: &mut Value, prior: Vec<Value>) {
 pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
     let t0 = std::time::Instant::now();
     let budget = Budget::of(args);
-    // Full parse up front: an unparseable URL would otherwise flow
-    // through the whole pipeline with host="" : poisoning domain
-    // profiles and producing confusing late errors.
-    let parsed_url = match url::Url::parse(url) {
-        Ok(u) => u,
-        Err(e) => return tool_error(format!("fetch: invalid URL ({e})")),
+    let parsed_url = match fetch_input(args, url) {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
     };
-    // Validate the caller's URL before an adapter can remove credentials or
-    // rewrite the host. The rewritten endpoint is independently guarded below.
-    if let Err(error) = crate::fetch::guards::validate_url_basic(url) {
-        return tool_error_structured(
-            error.to_string(),
-            "permanent",
-            Some(json!({
-                "url": url, "code": "guard.ssrf",
-                "next_action": "pass a public http(s) URL without embedded credentials",
-            })),
-        );
-    }
-    if let Some(selector) = args.get("selector").and_then(Value::as_str)
-        && scraper::Selector::parse(selector).is_err()
-    {
-        return tool_error_structured(
-            format!("invalid CSS selector: {selector}"),
-            "permanent",
-            Some(json!({
-                "url": url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax",
-            })),
-        );
-    }
     let url_host = parsed_url.host_str().unwrap_or("").to_string();
 
     // Domain intelligence (v3): the adapters registry may rewrite
@@ -1015,17 +1085,12 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         .unwrap_or(false);
     let orig_url = url.to_string();
     let adapter_used: Option<&'static str>;
-    let url = match crate::adapters::rewrite(&parsed_url) {
-        Some((new_url, name))
-            if !no_adapter
-                && (args.get("section").and_then(Value::as_str).is_none()
-                    || name == "adapter:stackexchange-api")
-                && args.get("selector").and_then(Value::as_str).is_none() =>
-        {
+    let url = match fetch_url_rewrite(&parsed_url, args, no_adapter) {
+        Some((new_url, name)) => {
             adapter_used = Some(name);
             new_url
         }
-        _ => {
+        None => {
             adapter_used = None;
             url.to_string()
         }
@@ -1046,40 +1111,10 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             })),
         );
     }
-    let mut opts = ExtractOptions::default();
-    let preset = match args.get("mode") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(m)) if m == "scan" => Some(800),
-        Some(Value::String(m)) if m == "read" => Some(4_000),
-        Some(Value::String(m)) if m == "deep" => Some(16_000),
-        _ => return tool_error("fetch: mode must be scan, read or deep"),
+    let mut opts = match fetch_read_options(args) {
+        Ok(opts) => opts,
+        Err(error) => return error,
     };
-    opts.focus = args.get("focus").and_then(Value::as_str).map(String::from);
-    opts.max_chars = args
-        .get("max_chars")
-        .and_then(Value::as_u64)
-        .map(|n| (n as usize).clamp(200, 1_048_576))
-        .or(preset);
-    opts.offset = args
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(1_000_000_000) as usize;
-    opts.section = args
-        .get("section")
-        .and_then(Value::as_str)
-        .map(String::from);
-    opts.selector = args
-        .get("selector")
-        .and_then(Value::as_str)
-        .map(String::from);
-    opts.toc = args.get("toc").and_then(Value::as_bool).unwrap_or(false);
-    opts.include_links = args.get("links").and_then(Value::as_bool).unwrap_or(false);
-    opts.include_media = args.get("media").and_then(Value::as_bool).unwrap_or(false);
-    opts.must_contain = args
-        .get("must_contain")
-        .and_then(Value::as_str)
-        .map(String::from);
     let image_text = args
         .get("image_text")
         .and_then(Value::as_bool)
@@ -3596,6 +3631,7 @@ async fn archive_lookup_pair(
 
 async fn try_resurrect(
     daemon: &Arc<Daemon>,
+    args: &Value,
     url: &str,
     live_error: &Value,
 ) -> Result<Value, ResurrectError> {
@@ -3629,7 +3665,7 @@ async fn try_resurrect(
     // would fetch a URL that may still be dead, moved, or hostile.
     let opts = ExtractOptions::default();
     let mut hops: u8 = 0;
-    let (snap, mut ex) = loop {
+    let (snap, ct) = loop {
         let snap = match tokio::time::timeout(
             std::time::Duration::from_secs(20),
             daemon.fetcher.fetch(&snap_url),
@@ -3698,13 +3734,72 @@ async fn try_resurrect(
                 });
             }
             // No chain, but real-enough content : serve it.
-            None => break (snap, ex),
+            None => break (snap, ct),
         }
     };
 
+    let opts = match fetch_read_options(args) {
+        Ok(opts) => opts,
+        Err(error) => return Ok(error),
+    };
+    // First establish that the snapshot is usable, then apply the caller's
+    // scope. A short selected slice or a probe miss is not a dead snapshot.
+    let ex = extract::extract_off_worker(&snap.body, &ct, &snap_url, &opts).await;
+    Ok(archived_content(
+        ex,
+        &snap_url,
+        url,
+        &ts,
+        snap.status,
+        live_error,
+    ))
+}
+
+fn archived_content(
+    extracted: Result<extract::Extracted, extract::ExtractError>,
+    snapshot_url: &str,
+    url: &str,
+    ts: &str,
+    status: u16,
+    live_error: &Value,
+) -> Value {
+    let ex = match extracted {
+        Ok(ex) => ex,
+        Err(extract::ExtractError::SelectorNoMatch {
+            selector,
+            inspected,
+        }) => {
+            return tool_error_structured(
+                format!("CSS selector {selector:?} matched no elements in the archive snapshot"),
+                "permanent",
+                Some(
+                    json!({"url": url, "snapshot_url": snapshot_url, "code": "selector.nomatch", "elements_inspected": inspected,
+                "next_action": "correct the selector, or omit it to read the snapshot"}),
+                ),
+            );
+        }
+        Err(extract::ExtractError::BadSelector(selector)) => {
+            return tool_error_structured(
+                format!("invalid CSS selector: {selector}"),
+                "permanent",
+                Some(
+                    json!({"url": url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax"}),
+                ),
+            );
+        }
+        Err(error) => {
+            return tool_error_structured(
+                format!("archive content extraction failed: {error}"),
+                "permanent",
+                Some(
+                    json!({"url": url, "snapshot_url": snapshot_url, "next_action": "inspect the snapshot or choose another source"}),
+                ),
+            );
+        }
+    };
     // 3. Label everything: banner in content, fields in structure.
-    let date = wayback_date(&ts);
-    let age_days = wayback_age_days(&ts);
+    let date = wayback_date(ts);
+    let age_days = wayback_age_days(ts);
     let live_reason = live_error
         .pointer("/content/0/text")
         .and_then(Value::as_str)
@@ -3722,35 +3817,23 @@ async fn try_resurrect(
         String::new()
     };
     let banner = format!(
-        "*[ARCHIVED COPY : Wayback snapshot {date} ({age_days}d old){staleness}. Live fetch failed: {live_reason}]*\n\n"
+        "*[ARCHIVED COPY : Wayback snapshot {date} ({age_days}d old){staleness}. Retrieval note: {live_reason}]*\n\n"
     );
-    ex.markdown = format!("{banner}{}", ex.markdown);
-
-    let tokens = ex.markdown.len() / 4;
     let mut trace = Trace::default();
     trace.step("archive", "wayback", &format!("snapshot {ts}"), 0);
-    let structured = json!({
-        "content_ok": !ex.thin,
-        "url": url,
-        "snapshot_url": snap_url,
-        "archived": { "snapshot": ts, "date": date, "age_days": age_days },
-    });
-    let debug = json!({
-        "status": snap.status,
-        "tier": "1(wayback)",
-        "verdict": "Archived",
-        "thin": ex.thin,
-        "title": ex.title,
-        "total_chars": ex.total_chars,
-        "tokens_est": tokens,
-        "live_error": live_reason,
-        "escalation": trace.value(),
-    });
-    Ok(json!({
-        "content": [{"type": "text", "text": format_fetch_markdown(&ex, &snap_url, url)}],
-        "structuredContent": structured,
-        "_meta": {"com.donsetch/fetch-debug": debug},
-    }))
+    // The provenance banner is outside the source read budget and must not
+    // change pagination, probe state or completeness calculations.
+    let mut result = finish_result(&ex, "1(wayback)", status, "ContentOk", url, &trace, 0);
+    result["content"][0]["text"] = json!(format!(
+        "{banner}{}",
+        format_fetch_markdown(&ex, snapshot_url, url)
+    ));
+    result["structuredContent"]["snapshot_url"] = json!(snapshot_url);
+    result["structuredContent"]["archived"] =
+        json!({"snapshot": ts, "date": date, "age_days": age_days});
+    result["_meta"]["com.donsetch/fetch-debug"]["verdict"] = json!("Archived");
+    result["_meta"]["com.donsetch/fetch-debug"]["live_error"] = json!(live_reason);
+    result
 }
 
 /// Redirect chains through wayback interstitials can run several
@@ -4600,6 +4683,94 @@ mod resurrect_tests {
     };
     use serde_json::json;
 
+    #[tokio::test]
+    async fn archived_reads_keep_selector_probe_and_pagination_contracts() {
+        let html = format!(
+            "<html><head><title>Archived delivery guide</title></head><body><article><h1>Delivery</h1><p>OUTSIDE scope.</p><div id='wanted'><p>{}</p></div></article></body></html>",
+            "INSIDE reliable delivery records every operation and frees cancelled resources. "
+                .repeat(40)
+        );
+        let snapshot = "https://web.archive.org/web/20250101000000/https://example.com/guide";
+        let original = "https://example.com/guide";
+        let mut results = Vec::new();
+        for args in [
+            json!({"selector":"#wanted","max_chars":300}),
+            json!({"selector":"#missing"}),
+            json!({"must_contain":"ABSENT_PHRASE"}),
+            json!({"max_chars":300,"offset":300}),
+        ] {
+            let opts = super::fetch_read_options(&args).unwrap_or_else(|e| panic!("{e}"));
+            let extracted =
+                crate::extract::extract_off_worker(html.as_bytes(), "text/html", snapshot, &opts)
+                    .await;
+            results.push(super::archived_content(
+                extracted,
+                snapshot,
+                original,
+                "20250101000000",
+                200,
+                &json!({}),
+            ));
+        }
+        let text = results[0]["content"][0]["text"].as_str().unwrap();
+        let checks = [
+            text.contains("INSIDE") && !text.contains("OUTSIDE") && text.len() < 800,
+            results[0]["structuredContent"]["next_offset"]
+                .as_u64()
+                .is_some()
+                && results[0]["structuredContent"]["content_complete"] == false,
+            results[1]["isError"] == true
+                && results[1]["structuredContent"]["code"] == "selector.nomatch",
+            results[2]["structuredContent"]["read_status"] == "probe"
+                && results[2]["structuredContent"]["matched"] == false,
+            results[3]["structuredContent"]["next_offset"]
+                .as_u64()
+                .is_some_and(|n| n > 300),
+        ];
+        assert_eq!(checks, [true; 5], "archive caller controls: {results:?}");
+    }
+
+    // Nextest gives the daemon and process-wide configuration fresh state.
+    #[tokio::test]
+    async fn archive_only_checks_inputs_before_lookup() {
+        let daemon = std::sync::Arc::new(super::Daemon::new().await.unwrap());
+        for (url, args, code) in [
+            ("http://127.0.0.1/", json!({"archive":"only"}), "guard.ssrf"),
+            (
+                "https://fake-user:fake-pass@example.com/",
+                json!({"archive":"only"}),
+                "guard.ssrf",
+            ),
+            (
+                "https://example.com/",
+                json!({"archive":"only","selector":"["}),
+                "selector.invalid",
+            ),
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                super::fetch_single(&daemon, &args, url),
+            )
+            .await
+            .expect("input guard must precede archive network access");
+            assert_eq!(result["isError"], true, "{result}");
+            assert_eq!(result["structuredContent"]["code"], code, "{result}");
+        }
+        let result = super::fetch_single(
+            &daemon,
+            &json!({"archive":"only","mode":"wrong"}),
+            "https://example.com/",
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("mode must be")
+        );
+    }
+
     #[test]
     fn meta_refresh_follows_wayback_rewrite() {
         let html = b"<html><head><script>x</script>\
@@ -4962,6 +5133,25 @@ mod budget_tests {
 mod adapter_hop_tests {
     use super::*;
     use crate::detect::walls::Vendor;
+
+    #[test]
+    fn browser_controls_keep_the_requested_website_url() {
+        let url = url::Url::parse("https://stackoverflow.com/questions/42917566/example").unwrap();
+        let cases = [
+            json!({"tier":"2"}),
+            json!({"actions":[{"do":"wait","ms":10}]}),
+            json!({"actions":[]}),
+            json!({"tier":"1"}),
+            json!({"section":"Answer 1"}),
+            json!({"selector":"article"}),
+        ];
+        let rewrites: Vec<bool> = cases
+            .iter()
+            .map(|args| fetch_url_rewrite(&url, args, false).is_some())
+            .collect();
+        assert_eq!(rewrites, vec![false, false, true, true, true, false]);
+        assert!(fetch_url_rewrite(&url, &json!({}), true).is_none());
+    }
 
     #[test]
     fn recovery_retries_recheck_http_despite_saved_wall_routes() {

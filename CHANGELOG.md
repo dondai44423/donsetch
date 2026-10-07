@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.5.6] - 2026-10-07
+## [4.5.7] - 2026-10-07
 
 ### Fixed
 
@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback on unavailable items, service errors or backoff. API replies preserve
   website wall history; successful API reads remain available during cooldown
   without rendering incomparable API JSON. Known cooldowns return wall codes.
+  Explicit browser tier and actions retain the caller’s website URL.
 - CSS selectors fail closed across HTML, JSON, PDF and adapters. Invalid
   selectors fail before a request. Original URLs are checked before adapter
   rewriting, including credentials and private-network destinations.
@@ -47,7 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadlines preserve retrieved lexical evidence.
 - HTTP/2 pools expire idle connections without shortening fresh-response
   budgets. Archive indexes run concurrently and accept the first real capture;
-  an unreachable index cannot prove no snapshots exist. OCR image downloads
+  an unreachable index cannot prove no snapshots exist. Archive reads validate
+  caller URLs and selectors before lookup, preserve read controls and disclose
+  pagination and probe state. OCR image downloads
   overlap, inference stays ordered, bitmap channels and decode limits are
   checked, and elapsed telemetry includes OCR work.
 - Warm builds refresh Git provenance across branch commits, detached HEAD,
