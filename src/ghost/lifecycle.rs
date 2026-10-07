@@ -41,7 +41,9 @@ pub(super) fn retain_stderr(tail: &mut Vec<String>, line: &[u8]) {
     let text = String::from_utf8_lossy(line);
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        if tail.len() == 6 {
+        // GPU aborts repeat launch errors several times before their final
+        // FATAL. Keep enough preceding context for the original OS failure.
+        if tail.len() == 12 {
             tail.remove(0);
         }
         tail.push(trimmed.chars().take(200).collect());
@@ -74,9 +76,9 @@ mod tests {
         let tail = StderrTail::default();
         drain_stderr(reader, tail.clone()).await;
         let lines = tail.lock().unwrap();
-        assert_eq!(lines.len(), 6);
-        assert_eq!(lines[0], "GPU report 15");
-        assert!(lines[5].starts_with("GPU final") && lines[5].ends_with("failure"));
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[0], "GPU report 9");
+        assert!(lines[11].starts_with("GPU final") && lines[11].ends_with("failure"));
         assert!(lines.iter().all(|line| line.len() < 512));
     }
 

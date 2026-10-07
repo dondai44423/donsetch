@@ -220,6 +220,7 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
 /// | code | meaning |
 /// |---|---|
 /// | network.dns / network.timeout / network.ratelimit | transport |
+/// | browser.transport / browser.timeout | browser automation |
 /// | wall.challenge / wall.challenge_unsolved / wall.empty_shell / wall.captcha / wall.paywall / wall.auth | blocked |
 /// | cloak.suspected | tier-1 content is likely decoy |
 /// | content.notfound / content.binary / content.oversize / content.extract / content.incomplete | body |
@@ -253,6 +254,13 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
             "guard.ssrf"
         }
         _ if m.contains("deadline") => "deadline.hit",
+        _ if m.contains("cdp link closed")
+            || m.contains("cdp dropped:")
+            || m.contains("cdp send:") =>
+        {
+            "browser.transport"
+        }
+        _ if m.contains("cdp timeout:") => "browser.timeout",
         _ if m.contains("dns") => "network.dns",
         _ if m.contains("timeout") || m.contains("timed out") => "network.timeout",
         _ if m.contains("rate limit") || m.contains("429") => "network.ratelimit",
@@ -774,6 +782,48 @@ mod error_code_tests {
         assert_eq!(
             error_code("walled", Some(&json!({"verdict":"Challenge"}))),
             "wall.challenge"
+        );
+    }
+
+    #[test]
+    fn stealth_v3_browser_transport_failure_is_not_content_or_previous_http_wall() {
+        for (message, expected) in [
+            (
+                "browser navigation error: ghost: cdp link closed while reading browser DOM: transport=websocket protocol error, browser=signal: 5 (SIGTRAP), generation=4",
+                "browser.transport",
+            ),
+            (
+                "browser navigation error: ghost: cdp dropped: Page.navigate (websocket eof)",
+                "browser.transport",
+            ),
+            (
+                "browser automation error: ghost: cdp send: Connection reset",
+                "browser.transport",
+            ),
+            (
+                "browser navigation error: ghost: cdp timeout: Page.navigate",
+                "browser.timeout",
+            ),
+        ] {
+            let result = tool_error_structured(
+                message,
+                "transient",
+                Some(
+                    json!({"url":"https://owned.test/", "status":null, "verdict":"Challenge(Cloudflare)"}),
+                ),
+            );
+            assert_eq!(result["code"], expected, "{message}");
+            assert_eq!(result["structuredContent"]["code"], expected);
+            assert_eq!(result["structuredContent"]["read_status"], "error");
+            assert_eq!(result["structuredContent"]["content_ok"], false);
+        }
+        assert_eq!(
+            error_code("interactive captcha requires a human", None),
+            "wall.captcha"
+        );
+        assert_eq!(
+            error_code("SSRF guard: private/loopback", None),
+            "guard.ssrf"
         );
     }
 

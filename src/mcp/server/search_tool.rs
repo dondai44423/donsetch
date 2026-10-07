@@ -140,30 +140,19 @@ pub(super) fn make_ghost_hook(
                     .map(|p| p.ghost_wire())
                     .unwrap_or_default()
             };
-            let mut g = match ghost_mgr
+            let g = match ghost_mgr
                 .acquire_for_wire(&profile, Some(g_host.as_str()), wire)
                 .await
             {
                 Ok(g) => g,
                 Err(e) => return Err(format!("browser launch: {e}")),
             };
-            let page = match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20))
+            let read = ghost_mgr
+                .read_document(g, &profile, &url, std::time::Duration::from_secs(20))
                 .await
-            {
-                Ok(p) => p,
-                Err(first) => {
-                    if !first.to_string().contains("cdp timeout") {
-                        return Err(format!("render: {first}"));
-                    }
-                    // Only an automation settle timeout earns a warm retry.
-                    match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20)).await {
-                        Ok(p) => p,
-                        Err(second) => {
-                            return Err(format!("render: {first}; retry: {second}"));
-                        }
-                    }
-                }
-            };
+                .map_err(|error| format!("render: {error}"))?;
+            let _guard = read.guard;
+            let page = read.page;
             if page.outcome != ops::BrowserOutcome::Content {
                 return Err(format!("browser content unavailable: {:?}", page.outcome));
             }
@@ -624,18 +613,22 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
                 .map(|p| p.ghost_wire())
                 .unwrap_or_default()
         };
-        let Ok(mut g) = d
+        let Ok(g) = d
             .ghost_mgr
             .acquire_for_wire(&d.profile, Some(host_str.as_str()), wire)
             .await
         else {
             return;
         };
-        let page =
-            match ops::ghost_fetch(&mut g, &url_str, std::time::Duration::from_secs(20)).await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
+        let Ok(read) = d
+            .ghost_mgr
+            .read_document(g, &d.profile, &url_str, std::time::Duration::from_secs(20))
+            .await
+        else {
+            return;
+        };
+        let _guard = read.guard;
+        let page = read.page;
         if page.outcome.is_wall()
             || matches!(
                 crate::detect::walls::detect_dom_smart(page.html.as_bytes()),

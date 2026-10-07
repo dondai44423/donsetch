@@ -1916,7 +1916,12 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 } else {
                     None
                 };
-                let failed_verdict = if msg.starts_with("browser document incomplete") {
+                let failed_verdict = if msg.starts_with("browser navigation error:")
+                    || msg.starts_with("browser launch failed:")
+                    || msg.starts_with("browser recovery failed")
+                {
+                    "Unknown".to_string()
+                } else if msg.starts_with("browser document incomplete") {
                     "Incomplete".to_string()
                 } else {
                     observed_gate
@@ -2395,7 +2400,7 @@ pub(super) async fn ghost_escalate(
             .unwrap_or_default()
     };
     trace.step("2", "browser-launch", "started", 0);
-    let mut g = daemon
+    let g = daemon
         .ghost_mgr
         .acquire_for_wire(&daemon.profile, Some(host), wire)
         .await
@@ -2408,33 +2413,31 @@ pub(super) async fn ghost_escalate(
         g.queue_wait.as_millis(),
     );
     let t1 = std::time::Instant::now();
-    let mut page = match ops::ghost_fetch(&mut g, url, budget.pass(20)).await {
-        Ok(p) => p,
-        Err(e) => {
-            let message = e.to_string();
+    let read = daemon
+        .ghost_mgr
+        .read_document(g, &daemon.profile, url, budget.pass(20))
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
             if message.contains("ERR_PROXY_")
                 || message.contains("ERR_SOCKS_")
                 || message.contains("ERR_TUNNEL_")
             {
                 crate::ghost::note_last_ghost_chrome_error(true);
-                trace.step("2", "ghost-render", &message, t1.elapsed().as_millis());
-                return Err((format!("browser network error: {message}"), "transient"));
             }
-            if !message.contains("cdp timeout") {
-                trace.step("2", "ghost-render", &message, t1.elapsed().as_millis());
-                return Err((format!("browser navigation error: {message}"), "transient"));
-            }
-            // CDP timeouts on first attempt are transient : the
-            // browser was still warming up. Retry once before
-            // conceding a permanent failure.
-            if crate::config::cfg().debug.ghost {
-                eprintln!("[ghost_escalate] first attempt failed: {e}, retrying...");
-            }
-            ops::ghost_fetch(&mut g, url, budget.pass(20))
-                .await
-                .map_err(|e| (format!("browser automation error: {e}"), "permanent"))?
-        }
-    };
+            trace.step("2", "ghost-render", &message, t1.elapsed().as_millis());
+            (format!("browser navigation error: {message}"), "transient")
+        })?;
+    if let Some(recovery) = read.recovery {
+        trace.step(
+            "2",
+            "browser-read-retry",
+            recovery.reason,
+            recovery.elapsed.as_millis(),
+        );
+    }
+    let mut g = read.guard;
+    let mut page = read.page;
     trace.step(
         "2",
         "ghost-render",
@@ -3047,7 +3050,7 @@ pub(super) async fn fetch_with_actions(
             .map(|p| p.ghost_wire())
             .unwrap_or_default()
     };
-    let mut g = match daemon
+    let g = match daemon
         .ghost_mgr
         .acquire_for_wire(&daemon.profile, Some(host), wire)
         .await
@@ -3071,26 +3074,30 @@ pub(super) async fn fetch_with_actions(
     // Initial render through the standard ghost oracle: navigate,
     // settle, challenge handling, content checks.
     let t1 = std::time::Instant::now();
-    let page = match ops::ghost_fetch(&mut g, url, budget.pass(25)).await {
-        Ok(p) => p,
-        Err(e) => {
-            // One transient retry, same as ghost_escalate.
-            match ops::ghost_fetch(&mut g, url, budget.pass(25)).await {
-                Ok(p) => p,
-                Err(e2) => {
-                    return tool_error_structured(
-                        format!("browser automation error: {e} / {e2}"),
-                        "permanent",
-                        Some(json!({
-                            "url": url,
-                            "status": 0,
-                            "escalation": trace.value(),
-                        })),
-                    );
-                }
-            }
+    let read = match daemon
+        .ghost_mgr
+        .read_document(g, &daemon.profile, url, budget.pass(25))
+        .await
+    {
+        Ok(read) => read,
+        Err(error) => {
+            return tool_error_structured(
+                format!("browser navigation error: {error}"),
+                "transient",
+                Some(json!({ "url": url, "status": null, "escalation": trace.value() })),
+            );
         }
     };
+    if let Some(recovery) = read.recovery {
+        trace.step(
+            "2",
+            "browser-read-retry",
+            recovery.reason,
+            recovery.elapsed.as_millis(),
+        );
+    }
+    let mut g = read.guard;
+    let page = read.page;
     trace.step(
         "2",
         "ghost-render",
@@ -3470,12 +3477,18 @@ pub(super) async fn anticloak_check(
             .map(|p| p.ghost_wire())
             .unwrap_or_default()
     };
-    let mut g = daemon
+    let g = daemon
         .ghost_mgr
         .acquire_for_wire(&daemon.profile, Some(host.as_str()), wire)
         .await
         .ok()?;
-    let page = ops::ghost_fetch(&mut g, url, budget.pass(20)).await.ok()?;
+    let read = daemon
+        .ghost_mgr
+        .read_document(g, &daemon.profile, url, budget.pass(20))
+        .await
+        .ok()?;
+    let _guard = read.guard;
+    let page = read.page;
     if page.outcome.is_wall() {
         return Some((
             0.0,

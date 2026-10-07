@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scoped to the connector, origin port and proxy identity. Changed proxy
   credentials open a new tunnel; plaintext URLs cannot reuse a TLS H2 socket.
 
+- Read-only browser navigation can replace one dead or timed-out browser under
+  its original deadline, retaining viewport, locale and direct-routing settings. Fetch,
+  pre-action reads, search, crawl and screenshot share this recovery; actions
+  are never replayed. CDP failures report browser transport or timeout codes.
+
 ## [4.5.7] - 2026-10-07
 
 ### Fixed

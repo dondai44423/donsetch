@@ -65,7 +65,7 @@ pub async fn web_screenshot_tool(
     // notifications/cancelled while it did.
     let work = async {
         let inner: Result<serde_json::Value, serde_json::Value> = async {
-            let mut ghost = {
+            let ghost = {
                 // v4 E2: screenshot must claim the same persona wire
                 // as tier-1 (viewport + locale), or the capture is a
                 // different identity than the page we just fetched.
@@ -90,14 +90,19 @@ pub async fn web_screenshot_tool(
                 }
             };
 
-            if let Err(e) =
-                crate::ghost::ops::ghost_fetch(&mut ghost, target.as_str(), Duration::from_secs(20))
-                    .await
-            {
-                return Err(tool_error(format!(
-                    "web_screenshot: page failed to render: {e}"
-                )));
-            }
+            let read = daemon
+                .ghost_mgr
+                .read_document(
+                    ghost,
+                    &daemon.profile,
+                    target.as_str(),
+                    Duration::from_secs(20),
+                )
+                .await
+                .map_err(|error| {
+                    tool_error(format!("web_screenshot: page failed to render: {error}"))
+                })?;
+            let ghost = read.guard;
             if wait_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }

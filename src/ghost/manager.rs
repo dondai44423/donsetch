@@ -112,6 +112,17 @@ pub struct GhostGuard {
     pub reused: bool,
 }
 
+pub(crate) struct BrowserRead {
+    pub guard: GhostGuard,
+    pub page: super::ops::GhostPage,
+    pub recovery: Option<ReadRecovery>,
+}
+
+pub(crate) struct ReadRecovery {
+    pub reason: &'static str,
+    pub elapsed: Duration,
+}
+
 struct Reservation {
     meta: Arc<Mutex<Vec<Snap>>>,
     idx: usize,
@@ -207,6 +218,30 @@ fn xvfb_missing_hint() -> Option<&'static str> {
         Some(
             "[ghost] Xvfb not found : install with `apt install xvfb` or `pacman -S xorg-server-xvfb` (or your distro's equivalent) for invisible headful Chrome on Linux",
         )
+    } else {
+        None
+    }
+}
+
+fn read_retry_reason(error: &FetchError, dead: bool, dirty: bool) -> Option<&'static str> {
+    // A broken browser does not turn a policy/name/proxy failure into permission
+    // to navigate again. Only automation transport errors earn a read retry.
+    let FetchError::Ghost(message) = error else {
+        return None;
+    };
+    if message.contains("ERR_")
+        || !(message.starts_with("cdp ")
+            || message.starts_with("browser pass deadline exceeded")
+            || message.starts_with("browser navigation deadline exceeded"))
+    {
+        return None;
+    }
+    if dead {
+        Some("transport-dead")
+    } else if dirty {
+        Some("cancelled-generation")
+    } else if message.starts_with("cdp timeout:") {
+        Some("cdp-timeout")
     } else {
         None
     }
@@ -449,6 +484,68 @@ impl GhostManager {
         }
         held.reused = !need_launch;
         Ok(held)
+    }
+
+    /// Read a document before actions, with at most one replacement under the
+    /// original read deadline. A wall result is decisive and is never retried here.
+    pub(crate) async fn read_document(
+        &self,
+        mut guard: GhostGuard,
+        profile: &BrowserProfile,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<BrowserRead, FetchError> {
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(timeout)
+            .ok_or_else(|| FetchError::ghost("invalid browser read timeout"))?;
+        if timeout.is_zero() {
+            return Err(FetchError::ghost("browser read deadline exhausted"));
+        }
+        let first = super::ops::ghost_fetch(&mut guard, url, timeout).await;
+        let mut recovery = None;
+        let page = match first {
+            Ok(page) => page,
+            Err(error) => {
+                let Some(reason) = read_retry_reason(&error, guard.link_dead(), guard.is_dirty())
+                else {
+                    return Err(error);
+                };
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                let wire = guard.guard.wire.clone().expect("acquired browser wire");
+                let host = guard.guard.host.clone();
+                if crate::config::cfg().debug.ghost {
+                    eprintln!("[browser-read] replacing browser after {reason}: {error}");
+                }
+                // A timed-out live link is retired too: re-acquiring its slot
+                // must not return the same generation with late replies in flight.
+                guard.guard.ghost = None;
+                drop(guard);
+                guard = tokio::time::timeout_at(
+                    deadline.into(),
+                    self.acquire_for_wire(profile, host.as_deref(), wire),
+                )
+                .await
+                .map_err(|_| FetchError::ghost("browser replacement deadline exhausted"))??;
+                recovery = Some(ReadRecovery {
+                    reason,
+                    elapsed: started.elapsed(),
+                });
+                super::ops::ghost_fetch(
+                    &mut guard,
+                    url,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .await?
+            }
+        };
+        Ok(BrowserRead {
+            guard,
+            page,
+            recovery,
+        })
     }
 
     async fn reserve(&self, key: u64, host: Option<&str>) -> Result<Reservation, FetchError> {
@@ -1070,6 +1167,217 @@ mod pool_tests {
         drop(replacement);
         mgr.shutdown().await;
         assert!(mgr.slots[0].lock().await.ghost.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires installed Chromium; kills only its own browser and reads an owned HTTP peer"]
+    async fn stealth_v3_native_read_replaces_a_dead_generation_with_same_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.browser.backend = crate::config::BrowserBackend::Headless;
+        config.browser.cloak_auto_download = false;
+        config.browser.pool_slots = 1;
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/owned", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                seen.push(path.clone());
+                assert!(seen.len() <= 8, "owned peer request bound");
+                let (status, body) = match path.as_str() {
+                    "/owned" => (201, format!("<html><body><article><h1>Owned recovered generation</h1><p>{}</p></article></body></html>",
+                        "This is useful owned research content with a real status from the new browser. ".repeat(30))),
+                    "/human" => (403, "<h1>Verify you are human</h1><form><div class='g-recaptcha'></div></form>".into()),
+                    "/favicon.ico" => (404, String::new()),
+                    _ => panic!("unexpected owned request {path}"),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(body.as_bytes()).await.unwrap();
+                if path == "/human" {
+                    return seen;
+                }
+            }
+        });
+        let profile = BrowserProfile::chrome(151, crate::profile::Platform::Linux, false);
+        let manager = GhostManager::new().await;
+        let wire = crate::ghost::GhostWire {
+            viewport: (1280, 800),
+            locale: "fr-FR".into(),
+            direct: true,
+        };
+        let guard = manager
+            .acquire_for_wire(&profile, Some("127.0.0.1"), wire.clone())
+            .await
+            .unwrap();
+        let old = guard.pid().unwrap();
+        assert_eq!(unsafe { libc::kill(-(old as i32), libc::SIGKILL) }, 0);
+        for _ in 0..100 {
+            if guard.link_dead() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            guard.link_dead(),
+            "the actual killed process must reach EOF"
+        );
+        let read = manager
+            .read_document(guard, &profile, &url, Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert_ne!(read.guard.pid().unwrap(), old);
+        assert_eq!(
+            read.guard.wire, wire,
+            "replacement must retain viewport, locale and routing"
+        );
+        assert_eq!(read.page.document.status, Some(201));
+        assert_eq!(read.page.document.url, url);
+        assert_eq!(
+            read.page.outcome,
+            super::super::ops::BrowserOutcome::Content
+        );
+        assert!(read.page.html.contains("Owned recovered generation"));
+        assert_eq!(read.recovery.unwrap().reason, "transport-dead");
+        let current_pid = read.guard.pid().unwrap();
+        let started = Instant::now();
+        let human = manager
+            .read_document(
+                read.guard,
+                &profile,
+                &url.replace("/owned", "/human"),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "human wall must not consume the retry deadline"
+        );
+        assert_eq!(human.guard.pid().unwrap(), current_pid);
+        assert!(human.recovery.is_none());
+        assert_eq!(
+            human.page.outcome,
+            super::super::ops::BrowserOutcome::HumanRequired
+        );
+        assert_eq!(human.page.document.status, Some(403));
+        let seen = server.await.unwrap();
+        assert_eq!(seen.iter().filter(|p| p.as_str() == "/owned").count(), 1);
+        assert_eq!(seen.iter().filter(|p| p.as_str() == "/human").count(), 1);
+        let error = manager
+            .read_document(
+                human.guard,
+                &profile,
+                "file:///etc/passwd",
+                Duration::from_secs(5),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, FetchError::InvalidUrl(_) | FetchError::Ssrf(_)),
+            "{error}"
+        );
+        let healthy = manager
+            .acquire_for_wire(&profile, Some("127.0.0.1"), wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            healthy.pid().unwrap(),
+            current_pid,
+            "policy failure must not relaunch"
+        );
+        assert!(healthy.reused);
+        let started = Instant::now();
+        let error = manager
+            .read_document(healthy, &profile, &url, Duration::ZERO)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("deadline exhausted"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            manager.slots[0]
+                .lock()
+                .await
+                .ghost
+                .as_ref()
+                .unwrap()
+                .pid()
+                .unwrap(),
+            current_pid,
+            "an exhausted budget must not navigate or replace a healthy browser"
+        );
+        manager.shutdown().await;
+    }
+
+    #[test]
+    fn stealth_v3_read_recovery_does_not_retry_policy_network_or_access_failures() {
+        for error in [
+            FetchError::Ssrf("owned policy block".into()),
+            FetchError::Dns("NXDOMAIN".into()),
+            FetchError::DnsTimeout("resolver".into()),
+            FetchError::InvalidUrl("file:///owned".into()),
+            FetchError::Timeout,
+            FetchError::ghost("navigation: net::ERR_PROXY_CONNECTION_FAILED"),
+            FetchError::ghost("navigation: net::ERR_SOCKS_CONNECTION_FAILED"),
+            FetchError::ghost("navigation: net::ERR_TUNNEL_CONNECTION_FAILED"),
+        ] {
+            assert_eq!(read_retry_reason(&error, true, true), None, "{error}");
+        }
+        for message in [
+            "navigation: net::ERR_NAME_NOT_RESOLVED",
+            "interactive captcha requires a human",
+            "browser document incomplete",
+        ] {
+            assert_eq!(
+                read_retry_reason(&FetchError::ghost(message), true, true),
+                None
+            );
+        }
+        assert_eq!(
+            read_retry_reason(
+                &FetchError::ghost("browser pass deadline exceeded before usable content"),
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            read_retry_reason(
+                &FetchError::ghost("cdp timeout: DOM.getDocument"),
+                false,
+                false
+            ),
+            Some("cdp-timeout")
+        );
+        assert_eq!(
+            read_retry_reason(&FetchError::ghost("cdp link closed"), true, false),
+            Some("transport-dead")
+        );
+        assert_eq!(
+            read_retry_reason(
+                &FetchError::ghost("browser pass deadline exceeded before usable content"),
+                false,
+                true
+            ),
+            Some("cancelled-generation")
+        );
     }
 
     fn v(live: bool, key: Option<u64>, host: Option<&str>, idle_s: u64) -> Snap {
