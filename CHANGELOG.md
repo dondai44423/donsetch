@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Persona HTTP fetches use the shared revalidation cache with their actual
+  language and request identity. Bodyless HTTP/1 304 and 204 responses finish
+  at the headers, and cookie-warm retries reject unsolicited 304 responses.
 - Automatic fetch and crawl can observe an unbranded HTML 403 in the browser.
   Explicit HTTP-only fetches, API permission errors, login pages, genuine rate
   limits and ordinary server outages keep their terminal behavior.

@@ -216,6 +216,33 @@ impl Fetcher {
         skip_cache: bool,
         pool_pick: bool,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_via_jar_identity(
+            url_str,
+            proxy,
+            use_jar,
+            referer,
+            skip_cache,
+            pool_pick,
+            RequestIdentity {
+                class: RequestClass::Navigation,
+                legacy_user_agent: None,
+                accept_language: None,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_via_jar_identity(
+        &self,
+        url_str: &str,
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        skip_cache: bool,
+        pool_pick: bool,
+        identity: RequestIdentity<'_>,
+    ) -> Result<FetchOutcome, FetchError> {
         // Centralized URL safety gate (fetch tier). The synchronous
         // literal checks run here (scheme, credentials, localhost and
         // private literals: no dial can follow a cached return). The
@@ -266,11 +293,6 @@ impl Fetcher {
             None
         };
         let initial_proxy = proxy.or(pinned_pool).or(initial_env.as_ref());
-        let identity = RequestIdentity {
-            class: RequestClass::Navigation,
-            legacy_user_agent: None,
-            accept_language: None,
-        };
         let initial_url =
             url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
         let initial_headers =
@@ -484,6 +506,12 @@ impl Fetcher {
                             .fetch_once_with_headers(&current, effective_proxy, use_jar, headers)
                             .await
                         {
+                            if retry.status == 304 {
+                                return Err(FetchError::Http(
+                                    "304 response to cookie-warm retry without request validators"
+                                        .into(),
+                                ));
+                            }
                             retry.verdict =
                                 walls::detect(retry.status, &retry.headers, &retry.body);
                             self.cache
@@ -594,118 +622,6 @@ impl Fetcher {
         .await
     }
 
-    /// Navigation fetch whose Accept-Language is persona-coherent
-    /// (v4 E2). The rest of the header set stays profile-true.
-    /// Bounded redirect driver shared by the single-identity
-    /// wrappers (the tier-1 persona fetch today). fetch_via_jar_opts
-    /// has its own loop; these wrappers had none, so a plain 301
-    /// came back as the final response and the whole fetch failed
-    /// (live case: twitter.com -> x.com = "blocked: returned HTTP
-    /// 301"). Mirrors that loop's semantics: same SSRF guard, same
-    /// hop cap, per-hop DNS gate (fetch_once_via_identity re-gates
-    /// every URL), conditional headers dropped after the first hop.
-    async fn fetch_identity_following(
-        &self,
-        url_str: &str,
-        conditional: &[(String, String)],
-        proxy: Option<&proxy::Proxy>,
-        use_jar: bool,
-        referer: Option<&str>,
-        identity: RequestIdentity<'_>,
-    ) -> Result<FetchOutcome, FetchError> {
-        let mut cur: url::Url =
-            url::Url::parse(url_str).map_err(|e| FetchError::Http(format!("bad url: {e}")))?;
-        let mut conditional = conditional.to_vec();
-        let mut hops = 0u8;
-        // Pool-aware lane, opt-in (`proxy.fetch_rotate`, off by
-        // default; `donsetch proxy fetch on`). Same contract as
-        // `fetch_via_jar_opts`: one sticky exit per host, pinned for
-        // the whole redirect chain, rotated on 429/407/dead/timeout.
-        let fetch_host = cur
-            .host_str()
-            .map(|h| h.to_ascii_lowercase())
-            .unwrap_or_default();
-        let pool_lane = if pool_pick_enabled(
-            proxy,
-            true,
-            crate::config::cfg().proxy.fetch_rotate,
-            self.egress.as_deref(),
-        ) {
-            self.egress
-                .as_ref()
-                .and_then(|pool| pool.pick_fetch(&fetch_host, true))
-        } else {
-            None
-        };
-        let pool_lane_id = pool_lane.as_ref().map(|e| e.id.clone());
-        // Only a real lane pins the request and mutes env proxies; a
-        // `direct` answer from the pool (every lane dead, or burned
-        // for this host) leaves the env-proxy path in charge (#302).
-        let use_pool_lane = pool_lane_is_proxy(pool_lane.as_ref());
-        let pinned_pool = pool_lane.as_ref().and_then(|e| e.proxy.as_ref());
-        loop {
-            // Ambient proxy, resolved for the CURRENT url and
-            // re-resolved at every hop (curl parity, E15: a redirect
-            // into a NO_PROXY-covered host dials direct instead of
-            // riding the env proxy for the rest of the chain). An
-            // explicit lane or a pinned pool lane stays pinned for
-            // the whole chain by design.
-            let env_proxy = if proxy.is_none() && !use_pool_lane {
-                crate::transport::proxy::from_env_for(cur.as_str())
-            } else {
-                None
-            };
-            let effective = proxy.or(pinned_pool).or(env_proxy.as_ref());
-            let hop_started = Instant::now();
-            let out = match self
-                .fetch_once_via_identity(
-                    cur.as_str(),
-                    &conditional,
-                    effective,
-                    use_jar,
-                    referer,
-                    identity,
-                )
-                .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
-                        note_lane_outcome(pool, &fetch_host, id, &e);
-                    }
-                    return Err(e);
-                }
-            };
-            if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
-                match out.status {
-                    429 => pool.note_fetch_rate_limited(&fetch_host, id),
-                    200 | 304 => {
-                        pool.report_ok(&fetch_host, id);
-                        pool.observe_rtt(id, hop_started.elapsed());
-                    }
-                    _ => {}
-                }
-            }
-            if !(300..400).contains(&out.status) {
-                return Ok(out);
-            }
-            let Some(loc) = header_value(&out.headers, "location") else {
-                return Ok(out);
-            };
-            if hops >= MAX_REDIRECTS {
-                return Ok(out);
-            }
-            match crate::fetch::guards::validate_redirect_url(&cur, &loc) {
-                Ok(next) => {
-                    hops += 1;
-                    conditional.clear();
-                    cur = next;
-                }
-                Err(_) => return Ok(out),
-            }
-        }
-    }
-
     /// Tier-1 navigation-identity fetch (the daemon's Chrome-class
     /// hop). Follows redirects (bounded); cross-host hops are
     /// re-gated per hop. Honors the fetch pool opt-in like every
@@ -715,12 +631,13 @@ impl Fetcher {
         url_str: &str,
         accept_language: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_identity_following(
+        self.fetch_via_jar_identity(
             url_str,
-            &[],
             None,
             true,
             None,
+            false,
+            true,
             RequestIdentity {
                 class: RequestClass::Navigation,
                 legacy_user_agent: None,
@@ -1298,7 +1215,16 @@ fn finish(
         .find(|(n, _)| n.eq_ignore_ascii_case("content-encoding"))
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
-    let body = decompress::decompress(&encoding, &body)?;
+    let body = if status == 204 || status == 304 {
+        if !body.is_empty() {
+            return Err(FetchError::Http(format!(
+                "body bytes on bodyless HTTP {status} response"
+            )));
+        }
+        body
+    } else {
+        decompress::decompress(&encoding, &body)?
+    };
     // Wall classification lives here: every caller used to score the
     // finished outcome with walls::detect right after the call; one
     // site of truth instead of N re-detections (Q4).
@@ -1710,6 +1636,39 @@ mod transport_exit_tests {
         assert!(pool_lane_is_proxy(Some(&lane)));
         assert!(!pool_lane_is_proxy(Some(&direct)));
         assert!(!pool_lane_is_proxy(None));
+    }
+
+    #[test]
+    fn stealth_v3_bodyless_metadata_does_not_decode_a_missing_body() {
+        for status in [204, 304] {
+            for encoding in ["gzip", "br", "deflate", "zstd"] {
+                let headers = vec![("content-encoding".into(), encoding.into())];
+                let out = finish(
+                    "http://owned.test/".into(),
+                    "h1",
+                    status,
+                    headers.clone(),
+                    Vec::new(),
+                    false,
+                )
+                .expect("bodyless metadata must not start a decoder");
+                assert_eq!(out.status, status);
+                assert!(out.body.is_empty());
+                assert_eq!(out.headers, headers);
+            }
+        }
+        assert!(
+            finish(
+                "http://owned.test/".into(),
+                "h1",
+                200,
+                vec![("content-encoding".into(), "gzip".into())],
+                Vec::new(),
+                false
+            )
+            .is_err(),
+            "a truncated gzip 200 must still fail decoding"
+        );
     }
 
     // The h3 lane used to hand back a literal Verdict::ContentOk for

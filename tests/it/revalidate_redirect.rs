@@ -142,6 +142,136 @@ async fn revalidation_conditionals_never_ride_a_redirect_hop() {
 static ENV_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[tokio::test]
+async fn stealth_v3_persona_revalidation_keeps_languages_separate() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Nextest isolates process-global configuration used by sandbox.
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/language", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let (tag, body) = if head.contains("accept-language: fr-FR,fr;q=0.9\r\n") {
+                ("fr", "document francais")
+            } else {
+                assert!(head.contains("accept-language: en-US,en;q=0.9\r\n"));
+                ("en", "english document")
+            };
+            let conditional = head.contains("if-none-match:");
+            if conditional {
+                assert!(
+                    head.contains(&format!("if-none-match: \"{tag}\"\r\n")),
+                    "{head}"
+                );
+            }
+            log.lock().unwrap().push(head);
+            let response = if conditional {
+                format!(
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"{tag}\"\r\nCache-Control: max-age=600\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: \"{tag}\"\r\nVary: Accept-Language\r\nCache-Control: max-age=0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    for (locale, body) in [
+        ("en-US,en;q=0.9", b"english document".as_slice()),
+        ("fr-FR,fr;q=0.9", b"document francais".as_slice()),
+    ] {
+        assert_eq!(
+            fetcher
+                .fetch_persona(&url, Some(locale))
+                .await
+                .unwrap()
+                .body,
+            body
+        );
+    }
+    for (locale, body) in [
+        ("en-US,en;q=0.9", b"english document".as_slice()),
+        ("fr-FR,fr;q=0.9", b"document francais".as_slice()),
+    ] {
+        let validated = fetcher.fetch_persona(&url, Some(locale)).await.unwrap();
+        assert_eq!(
+            validated.cache,
+            CacheState::Revalidated,
+            "persona path must send its validators"
+        );
+        assert_eq!(validated.body, body);
+        assert_eq!(validated.status, 200);
+        let fresh = fetcher.fetch_persona(&url, Some(locale)).await.unwrap();
+        assert_eq!(fresh.cache, CacheState::Fresh);
+        assert_eq!(fresh.body, body);
+    }
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        4,
+        "two cold reads and two validations, no fresh origin reads"
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn stealth_v3_cookie_warm_retry_rejects_unsolicited_304() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned-warm", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=2 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(!head.contains("if-none-match:") && !head.contains("if-modified-since:"));
+            let response = if ordinal == 1 {
+                let body = "<h1>Just a moment...</h1><script src='/cdn-cgi/challenge-platform/cf-chl.js'></script>";
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nServer: cloudflare\r\nContent-Type: text/html\r\nSet-Cookie: clearance=warm; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                assert!(
+                    head.contains("cookie: clearance=warm\r\n"),
+                    "warm retry must actually carry the received cookie: {head}"
+                );
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".into()
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    let Err(error) = fetcher.fetch(&url).await else {
+        panic!("unsolicited warm-retry 304 must be a protocol failure, not an empty wall");
+    };
+    assert!(error.to_string().contains("304"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn stealth_v3_freshness_includes_actual_response_delay_and_validation_age() {
     use donsetch::fetch::client::CacheState;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

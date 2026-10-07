@@ -119,6 +119,17 @@ where
         break (status, headers_out, header_end);
     };
 
+    // RFC 9112 6.3: 204 and 304 end at the header terminator regardless
+    // of framing fields. A 304 Content-Length describes the selected
+    // representation, not bytes on this connection (and may exceed our cap).
+    if status == 204 || status == 304 {
+        return Ok(H1Response {
+            status,
+            headers: headers_out,
+            body: Vec::new(),
+        });
+    }
+
     let mut body = buf[header_end..].to_vec();
     let is_chunked = headers_out
         .iter()
@@ -274,6 +285,71 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stealth_v3_bodyless_status_finishes_before_peer_close() {
+        for (status, fields) in [
+            (304, "Content-Length: 10\r\n"),
+            (304, "Content-Length: 104857600\r\n"),
+            (304, "Transfer-Encoding: chunked\r\n"),
+            (204, ""),
+        ] {
+            let (mut client, mut peer) = tokio::io::duplex(4096);
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 4096);
+                    request.push(peer.read_u8().await.unwrap());
+                }
+                assert_eq!(request, b"GET /owned HTTP/1.1\r\n\r\n");
+                peer.write_all(format!("HTTP/1.1 {status} Owned\r\n{fields}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                // Hold the connection open until the client has completed.
+                released.await.unwrap();
+            });
+            let response = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                get(&mut client, "/owned", &[]),
+            )
+            .await
+            .expect("bodyless response must not wait for EOF or representation bytes")
+            .expect("bodyless response");
+            assert_eq!(response.status, status);
+            assert!(response.body.is_empty());
+            if status == 304 && fields.contains("104857600") {
+                assert!(
+                    response
+                        .headers
+                        .contains(&("content-length".into(), "104857600".into()))
+                );
+            }
+            release.send(()).unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_normal_200_still_waits_for_its_body() {
+        let (mut client, mut peer) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(peer.read_u8().await.unwrap());
+            }
+            assert_eq!(request, b"GET /owned HTTP/1.1\r\n\r\n");
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            peer.write_all(b"hello").await.unwrap();
+        });
+        let response = get(&mut client, "/owned", &[]).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+        server.await.unwrap();
+    }
+
     // RFC 9112 6.3: a message that ends before Content-Length is
     // satisfied is INCOMPLETE. The old reader broke out of the body
     // loop on EOF and returned the partial bytes as success, which
