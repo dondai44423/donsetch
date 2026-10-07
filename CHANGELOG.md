@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [4.5.5] - 2026-10-07
+## [4.5.6] - 2026-10-07
 
 ### Fixed
 
@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   browser requests keep their route.
   Stack Overflow public question URLs gain an API path for question, answers,
   comments and selected sections, with website
-  fallback on unavailable items, service errors or backoff.
+  fallback on unavailable items, service errors or backoff. API replies preserve
+  website wall history; successful API reads remain available during cooldown
+  without rendering incomparable API JSON. Known cooldowns return wall codes.
 - CSS selectors fail closed across HTML, JSON, PDF and adapters. Invalid
   selectors fail before a request. Original URLs are checked before adapter
   rewriting, including credentials and private-network destinations.

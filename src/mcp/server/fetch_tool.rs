@@ -1244,6 +1244,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             Some(json!({
                 "url": url,
                 "status": 0,
+                "code": "wall.blocked",
                 "retry_in_secs": retry_in,
                 "next_action": "wait for the cooldown, or browse the site with an interactive agent browser (your human session clears walls this host cannot)",
                 "escalation": trace.value(),
@@ -1420,6 +1421,8 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                         state.record_cold_walled(&host, vendor.as_deref());
                     }
                 }
+                // API access does not prove the original website wall cleared.
+                Verdict::ContentOk if adapter_host => state.record_fetch(&host),
                 Verdict::ContentOk => {
                     if is_warm {
                         // Warm succeeded : refresh the cookie vault (write-back).
@@ -2143,7 +2146,9 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     // stamped, never a silent pass.
     let mut cloak_warning: Option<String> = None;
     let profile_walled = daemon.state.lock().await.is_known_walled(&host);
+    // A rewritten API payload is not the original website's browser document.
     if profile_walled
+        && !adapter_host
         && !skip_tier1
         && !is_warm
         && let Some((_sim, note)) = anticloak_check(daemon, &url, &ex.markdown, budget).await
