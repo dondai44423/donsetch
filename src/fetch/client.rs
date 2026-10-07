@@ -225,52 +225,6 @@ impl Fetcher {
         crate::fetch::guards::validate_url_basic(url_str)?;
         let started = Instant::now();
 
-        // Fresh-window cache hit: no request at all (browser-true).
-        // Probes (v4 phase 0.2) skip this: a cached page is not
-        // evidence about the wall RIGHT NOW. The cache key carries
-        // the cookie lane: a jar-less search lane must never be
-        // served a body the logged-in jar fetched (and vice versa),
-        // the same reason browsers key on credentials.
-        let cache_key = format!("{}|{url_str}", if use_jar { "jar" } else { "bare" });
-        let check = {
-            let cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if skip_cache {
-                CacheCheck::None
-            } else {
-                cache.check(&cache_key)
-            }
-        };
-        let conditional = match check {
-            CacheCheck::Fresh(body, status, headers) => {
-                // Honest verdict on the cached body: a challenge page
-                // that slipped into the cache must not be re-served
-                // as ContentOk (only non-walls are stored, this is
-                // defense in depth for pre-fix entries).
-                let verdict = walls::detect(status, &headers, &body);
-                return Ok(FetchOutcome {
-                    url: url_str.into(),
-                    status,
-                    alpn: "cache".into(),
-                    headers,
-                    body,
-                    redirects: 0,
-                    cache: CacheState::Fresh,
-                    used_pool: false,
-                    verdict,
-                    elapsed: started.elapsed(),
-                });
-            }
-            CacheCheck::Revalidate(cond) => cond,
-            CacheCheck::None => Vec::new(),
-        };
-
-        let mut current = url_str.to_string();
-        let mut redirects = 0u8;
-        let mut first_request = true;
-
         // Pool-aware fetch lane, opt-in (`proxy.fetch_rotate`, off
         // by default; `donsetch proxy fetch on` turns it on). When
         // enabled, no explicit proxy is passed, and a pool exists,
@@ -304,6 +258,54 @@ impl Fetcher {
         // leaves on the real address (#302 review).
         let use_pool_lane = pool_lane_is_proxy(pool_lane.as_ref());
         let pinned_pool = pool_lane.as_ref().and_then(|e| e.proxy.as_ref());
+        // Resolve the actual route before lookup, and retain this exact
+        // sent-header snapshot even if another response changes the jar.
+        let initial_env = if proxy.is_none() && !use_pool_lane {
+            crate::transport::proxy::from_env_for(url_str)
+        } else {
+            None
+        };
+        let initial_proxy = proxy.or(pinned_pool).or(initial_env.as_ref());
+        let identity = RequestIdentity {
+            class: RequestClass::Navigation,
+            legacy_user_agent: None,
+            accept_language: None,
+        };
+        let initial_url =
+            url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
+        let initial_headers =
+            self.request_headers(&initial_url, &[], use_jar, referer, identity)?;
+        let cache_key = Self::representation_key(url_str, initial_proxy, use_jar, &initial_headers);
+        let check = if skip_cache {
+            CacheCheck::None
+        } else {
+            self.cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .check(&cache_key)
+        };
+        let conditional = match check {
+            CacheCheck::Fresh(body, status, headers) => {
+                let verdict = walls::detect(status, &headers, &body);
+                return Ok(FetchOutcome {
+                    url: url_str.into(),
+                    status,
+                    alpn: "cache".into(),
+                    headers,
+                    body,
+                    redirects: 0,
+                    cache: CacheState::Fresh,
+                    used_pool: false,
+                    verdict,
+                    elapsed: started.elapsed(),
+                });
+            }
+            CacheCheck::Revalidate(conditional) => conditional,
+            CacheCheck::None => Vec::new(),
+        };
+        let mut current = url_str.to_string();
+        let mut redirects = 0u8;
+        let mut first_request = true;
 
         // Resolve env-var proxy (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
         // when no explicit proxy lane is passed. This follows the
@@ -316,7 +318,9 @@ impl Fetcher {
         // chain by design.
 
         loop {
-            let env_proxy = if proxy.is_none() && !use_pool_lane {
+            let env_proxy = if first_request {
+                initial_env.clone()
+            } else if proxy.is_none() && !use_pool_lane {
                 crate::transport::proxy::from_env_for(&current)
             } else {
                 None
@@ -325,16 +329,23 @@ impl Fetcher {
             // Referer applies to the initial request only.
             // Redirects get no referer (avoids cross-origin leak).
             let ref_arg = if first_request { referer } else { None };
-            // Revalidation conditionals were minted for the ORIGINAL
-            // url's cache entry. Carrying them onto redirect hops lets
-            // a colliding ETag on the target produce a false 304 and
-            // merge the wrong cached body (B2). Only the first hop
-            // sends them.
-            let hop_conditional: &[(String, String)] =
-                if first_request { &conditional } else { &[] };
+            let mut wire_headers = if first_request {
+                initial_headers.clone()
+            } else {
+                let url = url::Url::parse(&current)
+                    .map_err(|_| FetchError::InvalidUrl(current.clone()))?;
+                self.request_headers(&url, &[], use_jar, ref_arg, identity)?
+            };
+            let hop_key =
+                Self::representation_key(&current, effective_proxy, use_jar, &wire_headers);
+            // Conditionals validate this context rather than define another
+            // representation. Vary on these fields is conservatively uncacheable.
+            if first_request {
+                wire_headers.extend(conditional.iter().cloned());
+            }
             let hop_started = Instant::now();
             let mut out = match self
-                .fetch_once_via(&current, hop_conditional, effective_proxy, use_jar, ref_arg)
+                .fetch_once_with_headers(&current, effective_proxy, use_jar, wire_headers)
                 .await
             {
                 Ok(o) => o,
@@ -431,11 +442,6 @@ impl Fetcher {
                 _ => {
                     out.verdict = walls::detect(out.status, &out.headers, &out.body);
 
-                    // Cache key for the URL that actually produced this
-                    // body (a redirect chain lands here with `current`
-                    // = the final hop, not the original url).
-                    let hop_key = format!("{}|{current}", if use_jar { "jar" } else { "bare" });
-
                     // Only real content enters the revalidation cache.
                     // A challenge interstitial with an ETag would
                     // otherwise be re-served fresh as "content" on
@@ -449,26 +455,31 @@ impl Fetcher {
                         cache.store(&hop_key, out.status, &out.headers, &out.body);
                     }
 
-                    // Wall pushed back. If it left a cookie, do ONE
-                    // cookie-warm retry (JS-less cookie walls pass on the
-                    // second, cookie-carrying request).
-                    if let Verdict::Challenge(_) = out.verdict
+                    // One cookie-warm retry uses the newly stored cookie, and
+                    // its body is keyed by the headers it actually sent.
+                    if matches!(out.verdict, Verdict::Challenge(_))
                         && header_value(&out.headers, "set-cookie").is_some()
-                        && let Ok(mut retry) = self
-                            .fetch_once_via(&current, &[], effective_proxy, use_jar, ref_arg)
-                            .await
                     {
-                        // The retry's Set-Cookie was stored by the
-                        // one-hop primitive itself.
-                        retry.verdict = walls::detect(retry.status, &retry.headers, &retry.body);
-                        if matches!(retry.verdict, Verdict::ContentOk) {
-                            let mut cache = self
-                                .cache
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            cache.store(&hop_key, retry.status, &retry.headers, &retry.body);
+                        let url = url::Url::parse(&current)
+                            .map_err(|_| FetchError::InvalidUrl(current.clone()))?;
+                        let headers =
+                            self.request_headers(&url, &[], use_jar, ref_arg, identity)?;
+                        let retry_key =
+                            Self::representation_key(&current, effective_proxy, use_jar, &headers);
+                        if let Ok(mut retry) = self
+                            .fetch_once_with_headers(&current, effective_proxy, use_jar, headers)
+                            .await
+                        {
+                            retry.verdict =
+                                walls::detect(retry.status, &retry.headers, &retry.body);
+                            if !skip_cache && matches!(retry.verdict, Verdict::ContentOk) {
+                                self.cache
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .store(&retry_key, retry.status, &retry.headers, &retry.body);
+                            }
+                            out = retry;
                         }
-                        out = retry;
                     }
 
                     out.elapsed = started.elapsed();
@@ -695,53 +706,37 @@ impl Fetcher {
         .await
     }
 
-    async fn fetch_once_via_identity(
+    fn request_headers(
         &self,
-        url_str: &str,
+        url: &url::Url,
         conditional: &[(String, String)],
-        proxy: Option<&proxy::Proxy>,
         use_jar: bool,
         referer: Option<&str>,
         identity: RequestIdentity<'_>,
-    ) -> Result<FetchOutcome, FetchError> {
+    ) -> Result<Vec<(String, String)>, FetchError> {
         let RequestIdentity {
             class,
             legacy_user_agent: user_agent,
             accept_language,
         } = identity;
-        // Centralized gate ensures credentials/host checks even for
-        // direct fetch_once calls (e.g. tests, internal callers).
-        // Includes DNS resolution : every target, including proxy
-        // lanes, is checked before any TCP connect.
-        crate::fetch::guards::ensure_url_safe(url_str).await?;
-        let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
-        let scheme = url.scheme();
-        if scheme != "http" && scheme != "https" {
-            return Err(FetchError::InvalidUrl(url_str.into()));
-        }
-        let is_https = scheme == "https";
         let host = url
             .host_str()
-            .ok_or_else(|| FetchError::InvalidUrl(url_str.into()))?;
+            .ok_or_else(|| FetchError::InvalidUrl(url.to_string()))?;
+        let is_https = url.scheme() == "https";
         let default_port = if is_https { 443 } else { 80 };
-        let port = url.port().unwrap_or(default_port);
-        let mut path = match url.query() {
-            Some(q) => format!("{}?{q}", url.path()),
-            None => url.path().to_string(),
-        };
-        if path.is_empty() {
-            path = "/".into();
-        }
-        let authority = if port == default_port {
-            host.to_string()
+        let authority = if url.port_or_known_default() == Some(default_port) {
+            host.to_owned()
         } else {
-            format!("{host}:{port}")
+            format!(
+                "{host}:{}",
+                url.port()
+                    .ok_or_else(|| FetchError::InvalidUrl(url.to_string()))?
+            )
         };
-        let origin = match proxy {
-            Some(p) => format!("{}|{}", p.connection_key(), authority),
-            None => authority.clone(),
+        let path = match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_owned(),
         };
-
         // Header set from profile (Chrome order, coherence) + cookie + conditionals.
         let mut req_headers = self.profile.h1_headers_for_class(&authority, &path, class);
         if let Some(al) = accept_language
@@ -808,19 +803,106 @@ impl Fetcher {
         // looks like a fresh typed navigation, which is a bot
         // fingerprint.
         if let Some(ref_url) = referer {
-            let site = sec_fetch_site(ref_url, url_str);
+            let site = sec_fetch_site(ref_url, url.as_str());
             if let Some(pos) = req_headers.iter().position(|(n, _)| n == "sec-fetch-site") {
                 req_headers[pos].1 = site.into();
             }
             // Chrome puts Referer after Sec-Fetch-Dest, before
             // Accept-Encoding.
-            let ref_val = referer_value(ref_url, url_str);
+            let ref_val = referer_value(ref_url, url.as_str());
             let pos = req_headers
                 .iter()
                 .position(|(n, _)| n == "accept-encoding")
                 .unwrap_or(req_headers.len());
             req_headers.insert(pos, ("referer".into(), ref_val));
         }
+
+        Ok(req_headers)
+    }
+
+    /// Hash the selected route and exact headers. No cookie, credential or
+    /// URL parameter is retained in the cache key or exposed in diagnostics.
+    fn representation_key(
+        url: &str,
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        headers: &[(String, String)],
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update([u8::from(use_jar)]);
+        let route = proxy.map_or_else(|| "direct".to_owned(), proxy::Proxy::connection_key);
+        for field in std::iter::once(url)
+            .chain(std::iter::once(route.as_str()))
+            .chain(
+                headers
+                    .iter()
+                    .flat_map(|(name, value)| [name.as_str(), value.as_str()]),
+            )
+        {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    async fn fetch_once_via_identity(
+        &self,
+        url_str: &str,
+        conditional: &[(String, String)],
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        identity: RequestIdentity<'_>,
+    ) -> Result<FetchOutcome, FetchError> {
+        let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
+        let headers = self.request_headers(&url, conditional, use_jar, referer, identity)?;
+        self.fetch_once_with_headers(url_str, proxy, use_jar, headers)
+            .await
+    }
+
+    async fn fetch_once_with_headers(
+        &self,
+        url_str: &str,
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        req_headers: Vec<(String, String)>,
+    ) -> Result<FetchOutcome, FetchError> {
+        // Centralized gate ensures credentials/host checks even for
+        // direct fetch_once calls (e.g. tests, internal callers).
+        // Includes DNS resolution : every target, including proxy
+        // lanes, is checked before any TCP connect.
+        crate::fetch::guards::ensure_url_safe(url_str).await?;
+        let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(FetchError::InvalidUrl(url_str.into()));
+        }
+        let is_https = scheme == "https";
+        let host = url
+            .host_str()
+            .ok_or_else(|| FetchError::InvalidUrl(url_str.into()))?;
+        let default_port = if is_https { 443 } else { 80 };
+        let port = url.port().unwrap_or(default_port);
+        let mut path = match url.query() {
+            Some(q) => format!("{}?{q}", url.path()),
+            None => url.path().to_string(),
+        };
+        if path.is_empty() {
+            path = "/".into();
+        }
+        let authority = if port == default_port {
+            host.to_string()
+        } else {
+            format!("{host}:{port}")
+        };
+        let origin = match proxy {
+            Some(p) => format!("{}|{}", p.connection_key(), authority),
+            None => authority.clone(),
+        };
 
         // Reject header values carrying CR/LF/NUL before they can
         // reach the wire: values synthesized from response data

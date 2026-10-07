@@ -142,6 +142,234 @@ async fn revalidation_conditionals_never_ride_a_redirect_hop() {
 static ENV_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[tokio::test]
+async fn stealth_v3_revalidation_new_200_replaces_the_original_request_context() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let count = {
+                let mut log = log.lock().unwrap();
+                log.push(head);
+                log.len()
+            };
+            let (body, age, tag) = if count == 1 {
+                ("old representation", 0, "v1")
+            } else {
+                ("new representation", 600, "v2")
+            };
+            tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age={age}\r\nETag: \"{tag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(
+        fetcher.fetch(&url).await.unwrap().body,
+        b"old representation"
+    );
+    assert_eq!(
+        fetcher.fetch(&url).await.unwrap().body,
+        b"new representation"
+    );
+    let fresh = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(fresh.body, b"new representation");
+    assert_eq!(
+        fresh.cache,
+        CacheState::Fresh,
+        "a conditional request returning 200 must replace the initial entry"
+    );
+    let log = seen.lock().unwrap().clone();
+    assert_eq!(log.len(), 2);
+    assert!(!log[0].contains("if-none-match:"));
+    assert!(log[1].contains("if-none-match: \"v1\"\r\n"));
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn stealth_v3_cache_tracks_sent_cookie_and_referer_not_jar_mode() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/article", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            log.lock().unwrap().push(head.clone());
+            let body = if head.contains("cookie: session=alice\r\n") {
+                "alice representation"
+            } else if head.contains("referer: ") {
+                "linked representation"
+            } else {
+                "anonymous representation"
+            };
+            tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=600\r\nVary: Cookie, Referer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    let anonymous = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(anonymous.body, b"anonymous representation");
+    assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
+    let cookie = donsetch::ghost::cache::CookieRecord {
+        name: "session".into(),
+        value: "alice".into(),
+        domain: "127.0.0.1".into(),
+        path: "/".into(),
+        expires_at: None,
+        secure: false,
+        http_only: true,
+        same_site: "Lax".into(),
+    };
+    fetcher.reset_to(std::slice::from_ref(&cookie)).await;
+    let alice = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(
+        alice.body, b"alice representation",
+        "a login must not read the anonymous fresh entry"
+    );
+    assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
+    // Unsent cookies must not invalidate this origin's fresh representation.
+    let unrelated = donsetch::ghost::cache::CookieRecord {
+        domain: "other.invalid".into(),
+        ..cookie.clone()
+    };
+    fetcher.import_cookies(&[unrelated]).await;
+    assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
+    fetcher.reset_to(&[]).await;
+    let logged_out = fetcher.fetch(&url).await.unwrap();
+    assert_eq!(
+        logged_out.body, b"anonymous representation",
+        "logout must not serve Alice's body"
+    );
+    let linked = fetcher
+        .fetch_via_jar_ref(&url, None, true, Some("https://referrer.test/path"))
+        .await
+        .unwrap();
+    assert_eq!(
+        linked.body, b"linked representation",
+        "Vary Referer requires a distinct entry"
+    );
+    assert_eq!(
+        fetcher
+            .fetch_via_jar_ref(&url, None, true, Some("https://referrer.test/path"))
+            .await
+            .unwrap()
+            .cache,
+        CacheState::Fresh
+    );
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "each actual request context must warm exactly once"
+    );
+    assert!(requests[1].contains("cookie: session=alice\r\n"));
+    assert!(requests[2].contains("referer: https://referrer.test/\r\n"));
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn stealth_v3_cache_tracks_exact_proxy_credentials_and_direct_route() {
+    use donsetch::fetch::client::CacheState;
+    use donsetch::transport::proxy::Proxy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let body = if head.contains("proxy-authorization: Basic YWxpY2U6b25l\r\n") {
+                "alice exit"
+            } else if head.contains("proxy-authorization: Basic Ym9iOnR3bw==\r\n") {
+                "bob exit"
+            } else {
+                "direct exit"
+            };
+            seen.push(head);
+            tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        seen
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    let url = format!("http://{addr}/article");
+    for (credentials, body) in [
+        ("alice:one", b"alice exit".as_slice()),
+        ("bob:two", b"bob exit".as_slice()),
+    ] {
+        let proxy = Proxy::parse(&format!("http://{credentials}@{addr}")).unwrap();
+        let response = fetcher
+            .fetch_via_jar_ref(&url, Some(&proxy), false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.body, body,
+            "fresh content must belong to this exact route"
+        );
+        assert_eq!(
+            fetcher
+                .fetch_via_jar_ref(&url, Some(&proxy), false, None)
+                .await
+                .unwrap()
+                .cache,
+            CacheState::Fresh
+        );
+    }
+    let direct = fetcher
+        .fetch_via_jar_ref(&url, None, false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        direct.body, b"direct exit",
+        "direct must not inherit a proxy representation"
+    );
+    assert_eq!(
+        fetcher
+            .fetch_via_jar_ref(&url, None, false, None)
+            .await
+            .unwrap()
+            .cache,
+        CacheState::Fresh
+    );
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[..2].iter().all(|h| h.starts_with("GET http://")));
+    assert!(seen[2].starts_with("GET /article "));
+}
+
+#[tokio::test]
 async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
     crate::sandbox();
     // Atomic test-order gate (cargo test runs both tests on one

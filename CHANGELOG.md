@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its original deadline, retaining viewport, locale and direct-routing settings. Fetch,
   pre-action reads, search, crawl and screenshot share this recovery; actions
   are never replayed. CDP failures report browser transport or timeout codes.
+- HTTP revalidation cache entries follow the selected proxy identity and exact request
+  headers, including sent cookies and referrer. Login, logout and route changes
+  cannot reuse another context's body. Invalid or wildcard Vary fields evict
+  the old entry; validation headers do not prevent a new response from warming
+  its original request context.
 
 ## [4.5.7] - 2026-10-07
 

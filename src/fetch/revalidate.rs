@@ -91,11 +91,27 @@ impl RevalidationCache {
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.clone())
         };
-        // Vary: * means every request gets a different representation;
-        // browsers never store it. Storing one arbitrary variant would
-        // serve it to every future request until eviction (E12).
-        let vary = get("vary").unwrap_or_default();
-        if vary.trim() == "*" {
+        // The request key carries every representation header, excluding
+        // validation conditionals. Check all Vary fields, not just the first.
+        let unkeyed_vary = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+            .flat_map(|(_, value)| value.split(','))
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .any(|field| {
+                field == "*"
+                    || field.eq_ignore_ascii_case("if-none-match")
+                    || field.eq_ignore_ascii_case("if-modified-since")
+                    || !field.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+                    })
+            });
+        if unkeyed_vary {
+            if let Some(old) = self.map.remove(url) {
+                self.total_bytes -= old.body.len();
+                self.queue.retain(|key| key != url);
+            }
             return;
         }
         let cache_control = get("cache-control").unwrap_or_default().to_lowercase();
@@ -180,6 +196,59 @@ fn parse_max_age(cache_control: &str) -> Option<u64> {
 #[cfg(test)]
 mod audit_tests {
     use super::*;
+
+    #[test]
+    fn stealth_v3_vary_checks_every_field_and_rejects_unkeyed_conditionals() {
+        for vary in [
+            "Cookie, *",
+            "Accept, bad field",
+            "If-None-Match",
+            "if-modified-since",
+            "Accept, \u{00e9}",
+        ] {
+            let mut cache = RevalidationCache::new();
+            cache.store(
+                "owned",
+                200,
+                &[
+                    ("cache-control".into(), "max-age=600".into()),
+                    ("vary".into(), "Accept".into()),
+                    ("Vary".into(), vary.into()),
+                ],
+                b"must not cache",
+            );
+            assert!(
+                matches!(cache.check("owned"), CacheCheck::None),
+                "invalid or unkeyed Vary: {vary}"
+            );
+        }
+        let mut cache = RevalidationCache::new();
+        cache.store(
+            "owned",
+            200,
+            &[
+                ("cache-control".into(), "max-age=600".into()),
+                ("vary".into(), "Cookie, Referer".into()),
+            ],
+            b"keyed representation",
+        );
+        assert!(matches!(cache.check("owned"), CacheCheck::Fresh(..)));
+        cache.store(
+            "owned",
+            200,
+            &[
+                ("cache-control".into(), "max-age=600".into()),
+                ("vary".into(), "*".into()),
+            ],
+            b"changed policy",
+        );
+        assert!(
+            matches!(cache.check("owned"), CacheCheck::None),
+            "a new uncacheable response must evict the old representation"
+        );
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.queue.is_empty());
+    }
 
     #[test]
     fn vary_star_is_never_stored() {
