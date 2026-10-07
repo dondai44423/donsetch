@@ -10,6 +10,17 @@ platform="${1:?platform}"
 dir="${2:?binary dir}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
+# A payload probe must never use or delete the operator's state. Doctor
+# and the non-AVX probe share this disposable cache, cleared between CPUs.
+gate_state=$(mktemp -d "${TMPDIR:-/tmp}/donsetch-gates.XXXXXX")
+trap 'rm -rf "$gate_state"' EXIT HUP INT TERM
+export DONSETCH_CACHE_DIR="$gate_state/cache"
+export DONSETCH_NO_CONFIG_FILE=1
+unset DONSETCH_CONFIG
+export XDG_CONFIG_HOME="$gate_state/config"
+export XDG_DATA_HOME="$gate_state/data"
+export XDG_STATE_HOME="$gate_state/state"
+
 cd "$root/$dir"
 
 if [ "$platform" = "win32-x64" ]; then
@@ -41,7 +52,7 @@ if [ "$platform" = "linux-x64" ]; then
     [ "$(wc -c < libonnxruntime.so)" -ge 10000000 ] || { echo "gates FAIL: libonnxruntime.so too small"; exit 1; }
     # QEMU non-AVX run when qemu-x86_64 exists (release.yml always runs it).
     if command -v qemu-x86_64 >/dev/null 2>&1; then
-        rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
+        rm -f "$DONSETCH_CACHE_DIR/avx.json"
         OUT=$(qemu-x86_64 -cpu qemu64 "./$BIN" --version 2>&1 || true)
         [ -n "$OUT" ] || { echo "gates FAIL: binary crashed on non-AVX CPU (SIGILL)"; exit 1; }
     fi

@@ -105,6 +105,10 @@ pub async fn web_screenshot_tool(
                 Ok(b) => b,
                 Err(e) => return Err(tool_error(format!("web_screenshot: capture failed: {e}"))),
             };
+            let filename = format!("capture-{}.png", crate::handles::random_base62(16));
+            let path = crate::paths::resolve_screenshot_path(&filename).map_err(tool_error)?;
+            crate::ghost::save_screenshot(&path, &png)
+                .map_err(|e| tool_error(format!("web_screenshot: saving capture failed: {e}")))?;
             let b64 = BASE64_STANDARD.encode(&png);
             Ok(json!({
                 "content": [
@@ -127,7 +131,8 @@ pub async fn web_screenshot_tool(
                     "ok": true,
                     "url": url_in,
                     "full_page": full_page,
-                    "bytes": png.len()
+                    "bytes": png.len(),
+                    "path": path
                 },
                 "isError": false
             }))

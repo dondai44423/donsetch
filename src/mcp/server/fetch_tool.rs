@@ -57,25 +57,79 @@ async fn fetch_with_budget(
     deadline: Option<std::time::Duration>,
     ctx: Option<&mut ToolCtx>,
 ) -> Value {
+    let started = std::time::Instant::now();
     let witness = Arc::new(std::sync::Mutex::new(Vec::new()));
-    crate::ghost::GHOST_CALL
+    let mut result = crate::ghost::GHOST_CALL
         .scope(
             std::cell::Cell::new((false, false)),
             FETCH_TRACE.scope(
                 witness.clone(),
-                run_with_budget(fetch_single(daemon, args, url), deadline, ctx, || {
-                    let prior = witness
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    let mut result = deadline_error(url);
-                    fold_trace_into_result(&mut result, prior);
-                    result
-                }),
+                run_with_budget(
+                    Box::pin(fetch_single(daemon, args, url)),
+                    deadline,
+                    ctx,
+                    || {
+                        let prior = witness
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        let mut result = deadline_error(url);
+                        fold_trace_into_result(&mut result, prior);
+                        result
+                    },
+                ),
             ),
         )
-        .await
+        .await;
+    let trace = witness
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    add_shot_receipt(args, &mut result, &trace);
+    drop(trace);
+    if args.get("links").and_then(Value::as_bool) == Some(true)
+        || args.get("media").and_then(Value::as_bool) == Some(true)
+    {
+        result["structuredContent"]["budget_scope"] =
+            json!("rendered markdown, including link and media markup");
+    }
+    if let Some(debug) = result.pointer_mut("/_meta/com.donsetch~1fetch-debug") {
+        debug["elapsed_ms"] = json!(started.elapsed().as_millis());
+    }
+    result
 }
+
+fn add_shot_receipt(args: &Value, result: &mut Value, trace: &[Value]) {
+    let Some(path) = args.get("shot").and_then(Value::as_str) else {
+        return;
+    };
+    let outcome = trace
+        .iter()
+        .rev()
+        .find(|step| step["action"] == "screenshot")
+        .and_then(|step| step["outcome"].as_str());
+    let reason = outcome.unwrap_or(if result["isError"] == true {
+        "skipped: fetch failed before an interactive captcha capture"
+    } else {
+        "skipped: no interactive captcha capture was needed"
+    });
+    result["structuredContent"]["shot"] = json!({
+        "requested": path,
+        "saved_to": outcome.and_then(|s| s.strip_prefix("saved: ")),
+        "reason": reason,
+    });
+}
+
+async fn record_shot(ghost: &crate::ghost::Ghost, path: &str, trace: &mut Trace) {
+    let outcome = match ghost.screenshot(path).await {
+        Ok(()) => match crate::paths::resolve_screenshot_path(path) {
+            Ok(dest) => format!("saved: {}", dest.display()),
+            Err(e) => format!("failed: {e}"),
+        },
+        Err(e) => format!("failed: {e}"),
+    };
+    trace.step("2", "screenshot", &outcome, 0);
+}
+
 pub(super) async fn fetch_tool(
     daemon: &Arc<Daemon>,
     args: &Value,
@@ -119,17 +173,13 @@ pub(super) async fn fetch_tool(
     if urls.len() == 1 && budget_tokens.is_none() {
         let url = match resolve_fetch_url(daemon, &urls[0]).await {
             Ok(u) => u,
-            Err(e) => return e,
+            Err(mut e) => {
+                add_shot_receipt(args, &mut e, &[]);
+                return e;
+            }
         };
         let result = fetch_with_budget(daemon, args, &url, deadline, ctx.as_mut()).await;
         return result;
-    }
-    let mut resolved: Vec<String> = Vec::with_capacity(urls.len());
-    for u in &urls {
-        match resolve_fetch_url(daemon, u).await {
-            Ok(r) => resolved.push(r),
-            Err(e) => return e,
-        }
     }
     // Single resolved URL: keep the single-page response shape, but
     // always run under the deadline + MCP-cancellation wrapper (#164).
@@ -138,7 +188,14 @@ pub(super) async fn fetch_tool(
     // called fetch_single bare: an uncancellable, deadline-free fetch
     // on a path that can still spawn a ghost render. budget_tokens
     // also bounds the page now, exactly like the batch path.
-    if resolved.len() == 1 {
+    if urls.len() == 1 {
+        let resolved = match resolve_fetch_url(daemon, &urls[0]).await {
+            Ok(url) => url,
+            Err(mut error) => {
+                add_shot_receipt(args, &mut error, &[]);
+                return error;
+            }
+        };
         let owned_args;
         let effective_args = if let Some(b) = budget_tokens {
             let budget_chars = b.saturating_mul(4).max(800);
@@ -150,14 +207,12 @@ pub(super) async fn fetch_tool(
             args
         };
         let result =
-            fetch_with_budget(daemon, effective_args, &resolved[0], deadline, ctx.as_mut()).await;
+            fetch_with_budget(daemon, effective_args, &resolved, deadline, ctx.as_mut()).await;
         return result;
     }
-    fetch_multi(daemon, args, resolved, budget_tokens, deadline, ctx).await
+    fetch_multi(daemon, args, urls, budget_tokens, deadline, ctx).await
 }
 
-/// Honest deadline error (v3 D1): the tool respects the agent's
-/// clock. What was fetched so far is described; nothing pretends.
 /// The verdict a FAILURE envelope reports.
 ///
 /// The success path starts the verdict at ContentOk and a prewarm hit
@@ -182,6 +237,60 @@ fn failure_verdict(current: &str, kind: &str) -> String {
 
 #[cfg(test)]
 mod failure_verdict_tests {
+    // Nextest isolates daemon state. Match the production runtime's 8 MiB
+    // stack: the unoptimized fetch future exceeds libtest's 2 MiB default.
+    #[test]
+    fn report_audit_batch_keeps_each_invalid_url_as_an_individual_result() {
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let daemon = std::sync::Arc::new(super::Daemon::new().await.unwrap());
+                let result = super::fetch_tool(&daemon,
+                    &serde_json::json!({"url":["not-a-url", "also-not-a-url"], "archive":"off"}), None).await;
+                let rows = result["structuredContent"]["results"].as_array().unwrap();
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|r| r["ok"] == false && r["code"] == "fetch.invalid"));
+                assert_eq!(rows[0]["url"], "not-a-url");
+                assert_eq!(rows[1]["url"], "also-not-a-url");
+            });
+        }).unwrap().join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn report_audit_archive_race_preserves_recovery_and_unknown_state() {
+        use super::{Avail, archive_lookup_pair};
+        for found_first in [false, true] {
+            let answer = |found: bool| async move {
+                if found {
+                    Avail::Found((
+                        "https://web.archive.org/web/20260101/http://example.com/".into(),
+                        "20260101".into(),
+                    ))
+                } else {
+                    std::future::pending::<Avail>().await
+                }
+            };
+            let recovered = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                archive_lookup_pair(answer(found_first), answer(!found_first)),
+            )
+            .await
+            .expect("an unresponsive index must not delay a real capture");
+            assert!(matches!(recovered, Avail::Found(_)));
+        }
+        assert!(matches!(
+            archive_lookup_pair(async { Avail::Empty }, async { Avail::Empty }).await,
+            Avail::Empty
+        ));
+        assert!(matches!(
+            archive_lookup_pair(async { Avail::Empty }, async { Avail::Unreachable }).await,
+            Avail::Unreachable
+        ));
+        assert!(matches!(
+            archive_lookup_pair(async { Avail::Unreachable }, async { Avail::Empty }).await,
+            Avail::Unreachable
+        ));
+    }
+
     use super::failure_verdict;
 
     #[test]
@@ -233,9 +342,13 @@ pub(super) async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result
             })),
         ));
     }
-    Err(tool_error(format!(
-        "fetch: url must be http(s), got: {raw}"
-    )))
+    Err(tool_error_structured(
+        format!("fetch: url must be http(s), got: {raw}"),
+        "permanent",
+        Some(
+            json!({"url": raw, "code": "fetch.invalid", "next_action": "pass a full http(s) URL or a valid fetch handle"}),
+        ),
+    ))
 }
 
 /// Batch fetch (v3): parallel single-fetches composed into one
@@ -271,11 +384,18 @@ pub(super) async fn fetch_multi(
         .map(|(i, u)| {
             let a = call_args.clone();
             let d = Arc::clone(daemon);
-            let url = u.clone();
+            let requested = u.clone();
             let dl = deadline;
             let prog = progress_parts.clone();
             let mut cancel = cancel_rx.clone();
             async move {
+                let url = match resolve_fetch_url(&d, &requested).await {
+                    Ok(url) => url,
+                    Err(mut error) => {
+                        add_shot_receipt(&a, &mut error, &[]);
+                        return (requested, error);
+                    }
+                };
                 let v = match cancel.as_mut() {
                     Some(rx) => tokio::select! {
                         v = fetch_with_budget(&d, &a, &url, dl, None) => v,
@@ -291,11 +411,14 @@ pub(super) async fn fetch_multi(
                         &format!("{}/{} done", i + 1, n_total),
                     );
                 }
-                v
+                (url, v)
             }
         })
         .collect();
-    let results = futures_util::future::join_all(futs).await;
+    let (urls, results): (Vec<_>, Vec<_>) = futures_util::future::join_all(futs)
+        .await
+        .into_iter()
+        .unzip();
 
     let is_err = |v: &Value| v.get("isError").and_then(Value::as_bool).unwrap_or(false);
     let md_of = |v: &Value| {
@@ -443,7 +566,7 @@ pub(super) fn render_fetch_batch(
                 if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
                     o["content_ok"] = json!(false);
                 }
-                for field in ["next_offset", "archived", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part"] {
+                for field in ["shot", "budget_scope", "next_offset", "archived", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part"] {
                     if let Some(value) = state.get(field)
                         && !value.is_null()
                     {
@@ -471,7 +594,7 @@ pub(super) fn render_fetch_batch(
             if is_err(r) {
                 o["content_ok"] = json!(false);
                 o["content_complete"] = json!(false);
-                for field in ["read_status", "next_action"] {
+                for field in ["shot", "read_status", "next_action"] {
                     if let Some(value) = r["structuredContent"].get(field) {
                         o[field] = value.clone();
                     }
@@ -562,7 +685,7 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
             Err(f) => resurrect_error(url, &f),
         };
     }
-    let result = fetch_single_inner(daemon, args, url).await;
+    let result = Box::pin(fetch_single_inner(daemon, args, url)).await;
     if archive == "off" || result.get("isError") != Some(&json!(true)) {
         return result;
     }
@@ -768,20 +891,11 @@ async fn adapter_fallback(
     trace: &mut Trace,
     action: &str,
     why: &str,
+    session_seeded: bool,
 ) -> Value {
     trace.step("adapter", action, why, 0);
-    // #291: a refused reddit `.json` hop is not the page's fate.
-    // One navigation through the legacy host first (body unused):
-    // it initializes the reddit.com session cookies the caller's
-    // host needs before it serves its real SSR page instead of the
-    // JS shell. The retry below then serves the content, with the
-    // session in the jar. Live A/B: without the hop the retry got
-    // an 8.5 KB shell (257 chars); with it, the 1 MB SSR page
-    // (1551 chars, post body).
-    let hop_done = match url::Url::parse(orig_url) {
-        Ok(pu) => reddit_session_hop(daemon, &pu, trace).await,
-        Err(_) => false,
-    };
+    // Try the public page before spending a session-init request. A blocked
+    // or thin Reddit page still gets the existing one-hop session recovery.
     // Legacy-host caller URLs retry on the content host: `old.`/
     // `np.` serve a login wall to anonymous clients, so the retry
     // there could never succeed.
@@ -795,9 +909,7 @@ async fn adapter_fallback(
     };
     let mut args2 = args.clone();
     args2["_no_adapter"] = json!(true);
-    // The hop just ran: don't let the session retry pay for a
-    // second one.
-    args2["_reddit_session"] = json!(hop_done);
+    args2["_reddit_session"] = json!(session_seeded);
     let mut res = Box::pin(fetch_single_inner(daemon, &args2, &retry_url)).await;
     if let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["adapter_fallback"] = json!(true);
@@ -843,6 +955,29 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         Ok(u) => u,
         Err(e) => return tool_error(format!("fetch: invalid URL ({e})")),
     };
+    // Validate the caller's URL before an adapter can remove credentials or
+    // rewrite the host. The rewritten endpoint is independently guarded below.
+    if let Err(error) = crate::fetch::guards::validate_url_basic(url) {
+        return tool_error_structured(
+            error.to_string(),
+            "permanent",
+            Some(json!({
+                "url": url, "code": "guard.ssrf",
+                "next_action": "pass a public http(s) URL without embedded credentials",
+            })),
+        );
+    }
+    if let Some(selector) = args.get("selector").and_then(Value::as_str)
+        && scraper::Selector::parse(selector).is_err()
+    {
+        return tool_error_structured(
+            format!("invalid CSS selector: {selector}"),
+            "permanent",
+            Some(json!({
+                "url": url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax",
+            })),
+        );
+    }
     let url_host = parsed_url.host_str().unwrap_or("").to_string();
 
     // Domain intelligence (v3): the adapters registry may rewrite
@@ -858,7 +993,10 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     let adapter_used: Option<&'static str>;
     let url = match crate::adapters::rewrite(&parsed_url) {
         Some((new_url, name))
-            if !no_adapter && args.get("section").and_then(Value::as_str).is_none() =>
+            if !no_adapter
+                && (args.get("section").and_then(Value::as_str).is_none()
+                    || name == "adapter:stackexchange-api")
+                && args.get("selector").and_then(Value::as_str).is_none() =>
         {
             adapter_used = Some(name);
             new_url
@@ -1129,13 +1267,35 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         });
     }
 
+    let mut adapter_session_seeded = false;
     if !skip_tier1 && !prewarmed {
         let t0 = std::time::Instant::now();
-        let fetched = match daemon
-            .fetcher
-            .fetch_persona(&url, persona_al.as_deref())
-            .await
-        {
+        let response = {
+            let request = daemon.fetcher.fetch_persona(&url, persona_al.as_deref());
+            if adapter_used == Some("adapter:reddit-json") {
+                // The structured endpoint and session initialization do not
+                // depend on each other's response. Overlap their network waits.
+                // A usable JSON reply wins immediately; failures still wait
+                // for the session before reading the public SSR page.
+                let seed = reddit_session_hop(daemon, &parsed_url, &mut trace);
+                tokio::pin!(request, seed);
+                tokio::select! {
+                    reply = &mut request => {
+                        if !matches!(&reply, Ok(out) if out.verdict == Verdict::ContentOk) {
+                            adapter_session_seeded = seed.await;
+                        }
+                        reply
+                    },
+                    seeded = &mut seed => {
+                        adapter_session_seeded = seeded;
+                        request.await
+                    },
+                }
+            } else {
+                request.await
+            }
+        };
+        let fetched = match response {
             Ok(o) => o,
             Err(e) => {
                 if adapter_host && !no_adapter {
@@ -1148,6 +1308,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                         &mut trace,
                         "fallback",
                         "transport error : retrying original URL",
+                        adapter_session_seeded,
                     )
                     .await;
                 }
@@ -1270,8 +1431,16 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             // fetch at exactly this point).
             _ if adapter_hop_failed(o.verdict, adapter_host, no_adapter) => {
                 let why = format!("{:?} : retrying original URL", o.verdict);
-                return adapter_fallback(daemon, args, &orig_url, &mut trace, "fallback", &why)
-                    .await;
+                return adapter_fallback(
+                    daemon,
+                    args,
+                    &orig_url,
+                    &mut trace,
+                    "fallback",
+                    &why,
+                    adapter_session_seeded,
+                )
+                .await;
             }
             // A reddit page (thread, listing, about, wiki) refused
             // at tier 1 without a session: the humanity page or the
@@ -1309,6 +1478,12 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         }
     }
 
+    if adapter_used == Some("adapter:stackexchange-api")
+        && let Some(o) = &out
+    {
+        crate::adapters::stackexchange::record_api_backoff(&o.body);
+    }
+
     // === Adapter shape check ===
     // A 200 that isn't JSON on a rewritten endpoint (login walls,
     // HTML error interstitials) bought the adapter nothing : fall
@@ -1318,10 +1493,11 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         && !no_adapter
         && let Some(o) = &out
         && matches!(o.verdict, Verdict::ContentOk)
-        && !matches!(
+        && (!matches!(
             o.body.iter().find(|b| !b.is_ascii_whitespace()),
             Some(b'{') | Some(b'[')
-        )
+        ) || (adapter_used == Some("adapter:stackexchange-api")
+            && !crate::adapters::stackexchange::api_payload_valid(&o.body, &o.url)))
     {
         return adapter_fallback(
             daemon,
@@ -1329,7 +1505,8 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             &orig_url,
             &mut trace,
             "shape-mismatch",
-            "200 but not JSON : retrying original URL",
+            "structured payload unavailable : retrying original URL",
+            adapter_session_seeded,
         )
         .await;
     }
@@ -1389,6 +1566,28 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                         })),
                     );
                 }
+            }
+            Err(extract::ExtractError::SelectorNoMatch {
+                selector,
+                inspected,
+            }) => {
+                return tool_error_structured(
+                    format!("CSS selector {selector:?} matched no elements"),
+                    "permanent",
+                    Some(
+                        json!({"url": orig_url, "code": "selector.nomatch", "elements_inspected": inspected,
+                        "next_action": "correct the selector, or omit it to read the page"}),
+                    ),
+                );
+            }
+            Err(extract::ExtractError::BadSelector(selector)) => {
+                return tool_error_structured(
+                    format!("invalid CSS selector: {selector}"),
+                    "permanent",
+                    Some(
+                        json!({"url": orig_url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax"}),
+                    ),
+                );
             }
             Err(e) => {
                 return tool_error_structured(
@@ -1554,7 +1753,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             // Defense in depth: even if a challenge page slipped into
             // the cache (pre-fix), don't serve it as ContentOk.
             let cached_verdict = crate::detect::walls::detect_dom_smart(rc.html.as_bytes());
-            if !matches!(cached_verdict, crate::detect::walls::Verdict::Challenge(_)) {
+            if cached_verdict == Verdict::ContentOk {
                 let vstr = format!("{:?}", cached_verdict);
                 trace.step("cache", "render-hit", "ok", 0);
                 let mut res = finish_result(
@@ -1634,11 +1833,21 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                 // v3.4: ghost hit a hard wall (kind == "walled"),
                 // try bypass unlocker before giving up.
                 if kind == "walled"
+                    && !msg.starts_with("authentication required")
                     && let Some(v3) = try_bypass(daemon, &url, &opts, &mut trace).await
                 {
                     return v3;
                 }
-                let failed_verdict = failure_verdict(&final_verdict, kind);
+                let observed_gate = if msg.starts_with("authentication required") {
+                    Some(Verdict::AuthWall)
+                } else if msg.starts_with("not found:") {
+                    Some(Verdict::SoftNotFound)
+                } else {
+                    None
+                };
+                let failed_verdict = observed_gate
+                    .map(|v| format!("{v:?}"))
+                    .unwrap_or_else(|| failure_verdict(&final_verdict, kind));
                 return tool_error_structured(
                     msg,
                     kind,
@@ -1646,7 +1855,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                         "url": url,
                         "status": final_status,
                         "verdict": failed_verdict,
-                        "next_action": next_action_for(out.as_ref().map(|o| o.verdict), final_status, kind),
+                        "next_action": next_action_for(observed_gate.or_else(|| out.as_ref().map(|o| o.verdict)), final_status, kind),
                         "escalation": trace.value(),
                     })),
                 );
@@ -2158,6 +2367,10 @@ pub(super) async fn ghost_escalate(
             "transient",
         ));
     }
+    let gate = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
+    if matches!(gate, Verdict::AuthWall | Verdict::SoftNotFound) {
+        return Err((verdict_error(gate, 200, url), verdict_kind(gate, 200)));
+    }
     if page.captcha {
         // Interactive widgets are outside this solver's capabilities. The
         // first real DOM is decisive; another navigation cannot answer a
@@ -2169,6 +2382,9 @@ pub(super) async fn ghost_escalate(
                 "human challenge required",
                 t1.elapsed().as_millis(),
             );
+            if let Some(path) = shot {
+                record_shot(&g, path, trace).await;
+            }
             daemon.state.lock().await.record_wall_failed(host);
             return Err((
                 format!("blocked at {url} : interactive captcha requires a human browser session"),
@@ -2214,7 +2430,7 @@ pub(super) async fn ghost_escalate(
                     t1b.elapsed().as_millis(),
                 );
                 if let Some(p) = shot {
-                    let _ = g.screenshot(p).await;
+                    record_shot(&g, p, trace).await;
                 }
                 // The wall survived BOTH passes in a real browser:
                 // this is wall-persisting evidence, recorded.
@@ -2234,7 +2450,7 @@ pub(super) async fn ghost_escalate(
             // not a wall): no wall memory recorded.
             None => {
                 if let Some(p) = shot {
-                    let _ = g.screenshot(p).await;
+                    record_shot(&g, p, trace).await;
                 }
                 return Err((
                     format!(
@@ -2446,7 +2662,7 @@ pub(super) async fn ghost_escalate(
         // enough block structure to pass !thin would otherwise be
         // cached and re-served as ContentOk forever.
         let dom_verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
-        if !matches!(dom_verdict, crate::detect::walls::Verdict::Challenge(_)) {
+        if dom_verdict == Verdict::ContentOk {
             daemon.state.lock().await.record_render(&u, &page.html);
         }
         return Ok((e, t, s, u, page.html));
@@ -2753,7 +2969,7 @@ pub(super) async fn fetch_with_actions(
     );
     if page.captcha {
         if let Some(p) = shot {
-            let _ = g.screenshot(p).await;
+            record_shot(&g, p, &mut trace).await;
         }
         return tool_error_structured(
             format!(
@@ -2787,7 +3003,7 @@ pub(super) async fn fetch_with_actions(
                 trace.step("2", &format!("action[{}]", o.step), &o.outcome, o.ms);
             }
             if let Some(p) = shot {
-                let _ = g.screenshot(p).await;
+                record_shot(&g, p, &mut trace).await;
             }
             let steps_json: Vec<Value> = partial
                 .iter()
@@ -2855,7 +3071,7 @@ pub(super) async fn fetch_with_actions(
         );
     }
     if let Some(p) = shot {
-        let _ = g.screenshot(p).await;
+        record_shot(&g, p, &mut trace).await;
     }
 
     // Cookie write-back : same discipline as ghost_escalate:
@@ -2972,42 +3188,71 @@ pub(super) async fn apply_image_ocr(
         }
         let mut section = String::from("\n## image text (OCR)\n");
         let mut ocred = 0usize;
-        for (alt, src) in images.iter().take(MAX_IMAGES) {
-            if !src.starts_with("http://") && !src.starts_with("https://") {
-                continue; // data:/relative URIs have no fetch path
-            }
-            // SSRF guard : image URLs are attacker-controllable.
-            match url::Url::parse(src) {
-                Ok(u) => match u.host_str() {
-                    Some(h) if !crate::fetch::guards::is_ssrf_host(h) => {}
-                    _ => continue,
-                },
-                Err(_) => continue,
-            }
-            let bytes = match tokio::time::timeout(
-                std::time::Duration::from_secs(12),
-                daemon.fetcher.fetch(src),
-            )
-            .await
-            {
-                Ok(Ok(o))
-                    if matches!(o.verdict, Verdict::ContentOk) && o.body.len() <= MAX_BYTES =>
+        use futures_util::{StreamExt, stream};
+        let candidates = images.iter().take(MAX_IMAGES).cloned().collect::<Vec<_>>();
+        let downloads = stream::iter(candidates.into_iter().map(|(alt, src)| {
+            let fetcher = Arc::clone(&daemon.fetcher);
+            async move {
+                if !src.starts_with("http://") && !src.starts_with("https://") {
+                    return (alt, src, None);
+                }
+                // The fetcher's DNS/redirect guards also apply after this fast guard.
+                if url::Url::parse(&src)
+                    .ok()
+                    .and_then(|u| u.host_str().map(String::from))
+                    .is_none_or(|h| crate::fetch::guards::is_ssrf_host(&h))
                 {
-                    o.body
+                    return (alt, src, None);
                 }
-                _ => {
-                    section.push_str(&format!("- {src}: [unavailable]\n"));
-                    continue;
-                }
+                let bytes = match tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    fetcher.fetch(&src),
+                )
+                .await
+                {
+                    Ok(Ok(o))
+                        if matches!(o.verdict, Verdict::ContentOk) && o.body.len() <= MAX_BYTES =>
+                    {
+                        Some(o.body)
+                    }
+                    _ => None,
+                };
+                (alt, src, bytes)
+            }
+        }))
+        .buffered(2)
+        .collect::<Vec<_>>()
+        .await;
+        // Keep document order and serialize inference through the existing
+        // engine; only independent network waits overlap.
+        for (alt, src, bytes) in downloads {
+            let Some(bytes) = bytes else {
+                section.push_str(&format!("- {src}: [unavailable]\n"));
+                continue;
             };
             let ocr_result = tokio::task::spawn_blocking(move || {
-                let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+                let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+                    .with_guessed_format()
+                    .map_err(|e| e.to_string())?;
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(128 * 1024 * 1024);
+                limits.max_image_width = Some(16_384);
+                limits.max_image_height = Some(16_384);
+                reader.limits(limits);
+                let img = reader.decode().map_err(|e| e.to_string())?;
                 let rgba = img.into_rgba8();
                 let (w, h) = (rgba.width() as usize, rgba.height() as usize);
                 let bitmap = crate::pdf::pixels::PageBitmap {
                     w,
                     h,
-                    buf: rgba.into_raw(),
+                    // PDF's bitmap contract is BGRA; image decoders return RGBA.
+                    buf: {
+                        let mut pixels = rgba.into_raw();
+                        for pixel in pixels.as_chunks_mut::<4>().0 {
+                            pixel.swap(0, 2);
+                        }
+                        pixels
+                    },
                     page_w_pt: w as f32,
                     page_h_pt: h as f32,
                 };
@@ -3031,9 +3276,9 @@ pub(super) async fn apply_image_ocr(
                         section.push_str(&format!("- {alt} ({src}): {t}\n"));
                     }
                 }
-                _ => {
-                    section.push_str(&format!("- {src}: [no text detected]\n"));
-                }
+                Ok(Ok(_)) => section.push_str(&format!("- {src}: [no text detected]\n")),
+                Ok(Err(error)) => section.push_str(&format!("- {src}: [OCR failed: {error}]\n")),
+                Err(error) => section.push_str(&format!("- {src}: [OCR task failed: {error}]\n")),
             }
         }
         if let Some(cell) = res.pointer_mut("/content/0/text")
@@ -3195,7 +3440,7 @@ async fn availability_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
     // A 200 whose body is not JSON (rate-limit HTML, an interstitial)
     // says nothing definitive : the CDX fallback gets its shot.
     let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
-        return Avail::Empty;
+        return Avail::Unreachable;
     };
     let Some(closest) = v.pointer("/archived_snapshots/closest") else {
         return Avail::Empty;
@@ -3253,7 +3498,7 @@ async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
         return Avail::Unreachable;
     }
     let Ok(v) = serde_json::from_slice::<Value>(&out.body) else {
-        return Avail::Empty;
+        return Avail::Unreachable;
     };
     match cdx_latest(&v) {
         // Rebuild from the row's `original` : it is the exact form
@@ -3293,47 +3538,49 @@ fn cdx_latest(v: &Value) -> Option<(String, String)> {
     Some((ts, original))
 }
 
+// Both indexes get their full opportunity concurrently. A found capture wins
+// immediately; "never archived" requires two empty, reachable answers.
+async fn archive_lookup_pair(
+    availability: impl std::future::Future<Output = Avail>,
+    cdx: impl std::future::Future<Output = Avail>,
+) -> Avail {
+    tokio::pin!(availability, cdx);
+    let (first, second) = tokio::select! {
+        answer = &mut availability => match answer {
+            Avail::Found(pair) => return Avail::Found(pair),
+            other => (other, cdx.await),
+        },
+        answer = &mut cdx => match answer {
+            Avail::Found(pair) => return Avail::Found(pair),
+            other => (other, availability.await),
+        },
+    };
+    match (first, second) {
+        (Avail::Found(pair), _) | (_, Avail::Found(pair)) => Avail::Found(pair),
+        (Avail::Empty, Avail::Empty) => Avail::Empty,
+        _ => Avail::Unreachable,
+    }
+}
+
 async fn try_resurrect(
     daemon: &Arc<Daemon>,
     url: &str,
     live_error: &Value,
 ) -> Result<Value, ResurrectError> {
-    // 1. Lookup: the availability API first (cheap, "closest"
-    // semantics), then the complete CDX index when it comes back
-    // empty. The availability index is lossy and scheme-strict (a
-    // capture recorded under http:// is invisible to an https://
-    // query), so an empty answer alone never earns "never archived".
-    let mut transport_failed = false;
-    let mut found = match availability_lookup(daemon, url).await {
-        Avail::Found(pair) => Some(pair),
-        Avail::Empty => None,
+    let (mut snap_url, mut ts) = match archive_lookup_pair(
+        availability_lookup(daemon, url),
+        cdx_lookup(daemon, url),
+    )
+    .await
+    {
+        Avail::Found(pair) => pair,
         Avail::Unreachable => {
-            transport_failed = true;
-            None
-        }
-    };
-    if found.is_none() {
-        found = match cdx_lookup(daemon, url).await {
-            Avail::Found(pair) => Some(pair),
-            Avail::Empty => None,
-            Avail::Unreachable => {
-                transport_failed = true;
-                None
-            }
-        };
-    }
-    let (mut snap_url, mut ts) = match found {
-        Some(pair) => pair,
-        // "The archive is down" is not "the URL was never archived" :
-        // collapsing both into one message used to assert a fact the
-        // lookup never established.
-        None if transport_failed => {
             return Err(ResurrectError {
                 stage: ResurrectStage::LookupUnreachable,
                 snapshot_url: None,
             });
         }
-        None => {
+        Avail::Empty => {
             return Err(ResurrectError {
                 stage: ResurrectStage::NoSnapshot,
                 snapshot_url: None,

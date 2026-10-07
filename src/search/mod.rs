@@ -274,14 +274,21 @@ pub struct Searcher {
 /// Semantic reranking can enter ONNX inference and wait on the shared session
 /// mutex. The ranking API stays synchronous, so the blocking pool is the narrow
 /// boundary that keeps unrelated async work progressing.
-async fn run_blocking_ranking<F, T>(job: F) -> Result<T, FetchError>
+async fn run_blocking_ranking<F, T>(job: F) -> Result<Option<T>, FetchError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(job)
-        .await
-        .map_err(|e| FetchError::Http(format!("search: ranking worker failed: {e}")))
+    let budget = stage_budget(Duration::from_secs(30), Duration::from_millis(500));
+    if budget.is_zero() {
+        return Ok(None);
+    }
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(job)).await {
+        Ok(result) => result
+            .map(Some)
+            .map_err(|e| FetchError::Http(format!("search: ranking worker failed: {e}"))),
+        Err(_) => Ok(None),
+    }
 }
 
 // v3 F1: search→fetch warm handoff store : filled by enrichment, drained
@@ -400,11 +407,10 @@ impl Searcher {
         site_filter(query, &mut results);
         query::intitle_filter(query, &mut results);
         query::filetype_filter(query, &mut results);
+        let weak = results.is_empty() || rank::relevance_is_weak(&results, query);
         Some(SearchOutcome {
             results,
-            // BYOK results are provider-ranked and never flagged weak,
-            // matching the live BYOK path.
-            weak: false,
+            weak,
             intent,
             report: report.clone(),
             cached: true,
@@ -596,11 +602,11 @@ impl Searcher {
                 if let Some((at, cached, total, reports)) = hit
                     && at.elapsed() < cache_ttl(intent_probe, query)
                 {
-                    let weak = rank::is_weak(&cached, total);
                     let mut results = cached.iter().take(max_results).cloned().collect();
                     site_filter(query, &mut results);
                     query::intitle_filter(query, &mut results);
                     query::filetype_filter(query, &mut results);
+                    let weak = rank::is_weak(&results, total, query);
                     return Ok(SearchOutcome {
                         results,
                         weak,
@@ -647,11 +653,11 @@ impl Searcher {
             .get(&cache_key)
             && at.elapsed() < cache_ttl(intent, query)
         {
-            let weak = rank::is_weak(cached, *total);
             let mut results = cached.iter().take(max_results).cloned().collect();
             site_filter(query, &mut results);
             query::intitle_filter(query, &mut results);
             query::filetype_filter(query, &mut results);
+            let weak = rank::is_weak(&results, *total, query);
             return Ok(SearchOutcome {
                 results,
                 weak,
@@ -897,52 +903,43 @@ impl Searcher {
                 previous,
             )));
         }
-        let retry_outcomes = futures_util::future::join_all(retry_futures).await;
-
-        // ── Ghost SERP cascade lane ──
-        // Google's desktop endpoint may serve a JS shell to plain HTTP.
-        // The WML HTTP lane uses a separate layout and legacy User-Agent.
-        // When the plain fan-out AND its retry wave still left the
-        // merge thin, one browser render buys a genuinely independent
-        // index family instead of shipping weak results.
-        let retry_ok: usize = ok_engines + retry_outcomes.iter().filter(|(_, r)| r.is_ok()).count();
-        let retry_hits: usize = ok_hits
-            + retry_outcomes
-                .iter()
-                .filter_map(|(_, r)| r.as_ref().ok())
-                .map(|(h, _, _, _, _)| h.len())
-                .sum::<usize>();
+        // Start the independent browser index alongside recovery requests.
+        // Waiting for failed HTTP retries first only delays a lane that can
+        // succeed without them. A healthy first merge keeps the cheap path.
         let force_lane = crate::config::cfg().search.ghost_lane == crate::config::GhostLane::Always;
         let google_http_ok = outcomes
             .iter()
-            .chain(&retry_outcomes)
             .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
         let lane_permitted = self.ghost.is_some()
             && crate::config::cfg().search.ghost_lane != crate::config::GhostLane::Never
             && !self.quarantined("google_ghost");
-        let lane_outcomes: Vec<(String, EngineResult)> = if lane_permitted
-            && google_ghost_wanted(force_lane, google_http_ok, retry_ok, retry_hits)
-        {
+        let browser_recovery = async {
+            if !lane_permitted
+                || !google_ghost_wanted(force_lane, google_http_ok, ok_engines, ok_hits)
+            {
+                return Vec::new();
+            }
             let hook = self.ghost.as_ref().unwrap().clone();
             let task = ghost_engine_task("google_ghost".to_string(), query.to_string(), hook);
             let budget = stage_budget(Duration::from_secs(30), Duration::from_secs(2));
             if budget.is_zero() {
-                vec![(
+                return vec![(
                     "google_ghost".to_string(),
                     Err(("budget-skipped".into(), "ghost".into(), true)),
-                )]
-            } else {
-                match tokio::time::timeout(budget, task).await {
-                    Ok(outcome) => vec![outcome],
-                    Err(_) => vec![(
-                        "google_ghost".to_string(),
-                        Err(("ghost-timeout".into(), "ghost".into(), true)),
-                    )],
-                }
+                )];
             }
-        } else {
-            Vec::new()
+            match tokio::time::timeout(budget, task).await {
+                Ok(outcome) => vec![outcome],
+                Err(_) => vec![(
+                    "google_ghost".to_string(),
+                    Err(("ghost-timeout".into(), "ghost".into(), true)),
+                )],
+            }
         };
+        let (retry_outcomes, lane_outcomes) = tokio::join!(
+            futures_util::future::join_all(retry_futures),
+            browser_recovery
+        );
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
@@ -1064,11 +1061,18 @@ impl Searcher {
         // With semantic reranking enabled, merge includes synchronous ONNX
         // inference. Core builds keep the existing inline fast path below.
         #[cfg(feature = "rerank")]
-        let mut results = {
+        let (mut results, ranking_finished) = {
+            let fallback = rank::merge_lexical(&per_engine, query, intent, &trust, 12);
             let query = query.to_string();
-            run_blocking_ranking(move || rank::merge(&per_engine, &query, intent, &trust, 12))
+            match run_blocking_ranking(move || rank::merge(&per_engine, &query, intent, &trust, 12))
                 .await?
+            {
+                Some(results) => (results, true),
+                None => (fallback, false),
+            }
         };
+        #[cfg(not(feature = "rerank"))]
+        let ranking_finished = true;
         #[cfg(not(feature = "rerank"))]
         let mut results = rank::merge(&per_engine, query, intent, &trust, 12);
         // B3: learned host quality nudge. After merge (and its
@@ -1091,7 +1095,6 @@ impl Searcher {
             persist::apply_outcome_demote(&mut results, &outcome);
         }
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
-        let weak = rank::is_weak(&results, total);
 
         // ── Result enrichment: prefetch top results to extract
         // real <title> and <meta description> from the actual
@@ -1127,12 +1130,14 @@ impl Searcher {
             {
                 let t = std::time::Instant::now();
                 let q = query.to_string();
-                let mut owned = std::mem::take(&mut results);
+                let mut owned = results.clone();
                 let r = run_blocking_ranking(move || {
                     crate::search::rerank::topup(&q, &mut owned, 8);
                     owned
                 });
-                results = r.await?;
+                if let Some(ranked) = r.await? {
+                    results = ranked;
+                }
                 t.elapsed().as_millis()
             } else {
                 0
@@ -1143,10 +1148,11 @@ impl Searcher {
         // halves of the build matrix.
         #[cfg(not(feature = "rerank"))]
         let topup_ms: u128 = 0;
+        let weak = rank::is_weak(&results, total, query);
         // Poisoning guard: a merge built while engines
         // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
-        let cacheable = ok_engines >= 2 && total >= 8;
+        let cacheable = ranking_finished && ok_engines >= 2 && total >= 8;
         if cacheable {
             let snapshot = {
                 let mut cache = self
@@ -1213,7 +1219,7 @@ impl Searcher {
             cached: false,
             elapsed: started.elapsed(),
             provider: None,
-            reranked: crate::search::rerank::loaded(),
+            reranked: ranking_finished && crate::search::rerank::loaded(),
             instant,
             stage_ms: stages,
         })
@@ -1581,7 +1587,8 @@ mod tests {
         // Cold: nothing cached, so a caller must go bill the provider.
         assert!(s.byok_cache_get("quic test 42", Intent::Web, 3).is_none());
 
-        let out = byok_outcome("tinyfish", &["https://a.test/", "https://b.test/"]);
+        let mut out = byok_outcome("tinyfish", &["https://a.test/", "https://b.test/"]);
+        out.results[0].title = "QUIC test 42 transport evidence".into();
         s.byok_cache_put("quic test 42", &out);
 
         // Warm: served from cache, marked cached, provider intact.
@@ -1593,6 +1600,14 @@ mod tests {
         assert!(!hit.weak);
         assert_eq!(hit.results.len(), 2);
         assert_eq!(hit.results[0].url, "https://a.test/");
+        s.byok_cache_put("qwertyuiop unrelated gibberish", &out);
+        let unrelated = s
+            .byok_cache_get("qwertyuiop unrelated gibberish", Intent::Web, 3)
+            .unwrap();
+        assert!(
+            unrelated.weak,
+            "cached provider ranking cannot certify query relevance"
+        );
     }
 
     // The BYOK namespace must not collide with the local path: a
@@ -1970,7 +1985,37 @@ mod tests {
             }
         );
 
-        assert!(worker_result.expect("blocking job should join").is_ok());
+        assert!(
+            worker_result
+                .expect("blocking job should join")
+                .expect("job completed within budget")
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "rerank")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn report_audit_semantic_deadline_retains_lexical_evidence() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let result = SEARCH_DEADLINE
+            .scope(Some(deadline), async {
+                let (ranked, started) = tokio::join!(
+                    run_blocking_ranking(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        "semantic evidence"
+                    }),
+                    started_rx,
+                );
+                started.unwrap();
+                ranked.unwrap().unwrap_or("retrieved lexical evidence")
+            })
+            .await;
+        release_tx.send(()).unwrap();
+        assert_eq!(result, "retrieved lexical evidence");
+        assert!(tokio::time::Instant::now() < deadline);
     }
 
     #[test]
@@ -2228,7 +2273,7 @@ mod tests {
             "index-family count follows the route hint: {markdown}"
         );
         assert!(markdown.contains("A focused explanation"));
-        assert!(markdown.contains("Weak results : low cross-index agreement."));
+        assert!(markdown.contains("Weak results : low query relevance or cross-index agreement."));
         assert!(markdown.contains("Degraded retrieval : 1/2 backends available."));
         for diagnostic in [
             "engines:",

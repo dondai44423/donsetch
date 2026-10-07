@@ -34,6 +34,74 @@ pub enum Verdict {
     SoftNotFound,
 }
 
+#[cfg(test)]
+mod report_audit_tests {
+    use super::*;
+
+    #[test]
+    fn report_audit_google_human_captcha_never_satisfies_the_content_oracle() {
+        let help =
+            "Our systems have detected unusual traffic from your computer network. ".repeat(20);
+        let html = format!(
+            "<script src='https://www.google.com/recaptcha/api.js'></script><form id='captcha-form' action='index'><div class='g-recaptcha'></div></form><p>{help}</p>"
+        );
+        assert!(visible_text_count(html.as_bytes()) > 1000);
+        assert_eq!(
+            detect_dom_smart(html.as_bytes()),
+            Verdict::Challenge(Vendor::Generic)
+        );
+        assert!(human_captcha(html.as_bytes()));
+        let tutorial = format!("<article><h1>Google CAPTCHA integration</h1>{html}</article>");
+        assert_eq!(detect_dom_smart(tutorial.as_bytes()), Verdict::ContentOk);
+    }
+
+    #[test]
+    fn report_audit_soft_notfound_and_auth_gates_are_not_content() {
+        for html in [
+            "<html><title>404: This page could not be found.</title><body><h1>404</h1><p>This page could not be found.</p></body></html>",
+            "<html><title>Homepage Hero Thumbnail (1).jpg</title><body><h1>404: This page could not be found.</h1><p>This page could not be found.</p></body></html>",
+        ] {
+            assert_eq!(detect(200, &[], html.as_bytes()), Verdict::SoftNotFound);
+        }
+        let login = "<html><title>LinkedIn: Log In or Sign Up</title><body><h1>Welcome to your professional community</h1><form><input type='password'><button>Sign in</button></form></body></html>";
+        assert_eq!(detect(200, &[], login.as_bytes()), Verdict::AuthWall);
+        assert_eq!(
+            detect_dom_smart(
+                "<html><title>Login – Vercel</title><body><h1>Log in to Vercel</h1></body></html>"
+                    .as_bytes()
+            ),
+            Verdict::AuthWall
+        );
+        // Vercel appends its title after ~340 KiB of styles/flight data;
+        // the first DOM scan contains only the branded H1 and login form.
+        let late_title = format!(
+            "<html><head></head><body><h1>Log in to Vercel</h1><form><input type='email'></form><script>{}</script><title>Login – Vercel</title></body></html>",
+            "x".repeat(350_000)
+        );
+        assert_eq!(detect_dom_smart(late_title.as_bytes()), Verdict::AuthWall);
+        assert_eq!(detect_dom_smart(b"<h1>Log in to Vercel with CI</h1><article><p>A practical authentication tutorial with working code and deployment instructions for continuous integration.</p></article>"), Verdict::ContentOk);
+        assert_eq!(detect_dom_smart(b"<article><h1>Log in to Vercel with CI</h1><p>A practical authentication tutorial with working code and deployment instructions for continuous integration.</p><form><input type='email'></form></article>"), Verdict::ContentOk);
+        let late_form = format!(
+            "<title>Cloudflare Dashboard | Manage Your Account</title><style>{}</style><h1>Sign in to Cloudflare</h1><form action='/login'><input type='password'><button>Sign in</button></form>",
+            "x".repeat(90_000)
+        );
+        assert_eq!(detect_dom_smart(late_form.as_bytes()), Verdict::AuthWall);
+        assert_eq!(detect(200, &[], late_form.as_bytes()), Verdict::AuthWall);
+        let instagram = format!(
+            "<title>Instagram</title><script>{}</script><form id='login_form'><input type='password'><button>Log in</button></form>",
+            "x".repeat(450_000)
+        );
+        assert_eq!(detect(200, &[], instagram.as_bytes()), Verdict::AuthWall);
+        assert_eq!(detect_dom_smart(b"<title>Login form tutorial</title><article><h1>Authentication examples</h1><p>A public tutorial with examples of client and server authentication.</p><form id='login_form'><input type='password'><button>Log in</button></form></article>"), Verdict::ContentOk);
+        let article = "<html><title>How to handle a 404 or sign in</title><body><article><h1>Authentication guide</h1><p>Our tutorial explains the message 404: This page could not be found.</p><form><input type='password'></form></article></body></html>";
+        assert_eq!(
+            detect(200, &[], article.as_bytes()),
+            Verdict::ContentOk,
+            "quoted errors and embedded sign-in forms must remain content"
+        );
+    }
+}
+
 pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict {
     let server = header(headers, "server").unwrap_or_default().to_lowercase();
     let cf_ray = header(headers, "cf-ray").is_some();
@@ -77,6 +145,9 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
         // or DonSheet (PDF parse) downstream.
         if body.starts_with(b"%PDF-") || crate::fetch::guards::is_binary_body(body) {
             return Verdict::ContentOk;
+        }
+        if let Some(verdict) = content_gate(body) {
+            return verdict;
         }
         // Interstitials dressed as 200. Body markers only
         // count on SMALL pages: interstitials are tiny,
@@ -145,6 +216,9 @@ pub fn detect_dom(body: &[u8]) -> Verdict {
 /// Real pages have 80+ visible chars even when they embed
 /// challenge widgets in a small section.
 pub fn detect_dom_smart(body: &[u8]) -> Verdict {
+    if let Some(verdict) = content_gate(body) {
+        return verdict;
+    }
     // Interstitials first: the ≥80-visible-chars override below
     // must never whitewash a challenge page. Modern CF interstitials
     // ("Performing security verification") carry 300-400 chars of
@@ -158,6 +232,84 @@ pub fn detect_dom_smart(body: &[u8]) -> Verdict {
         return Verdict::ContentOk;
     }
     detect_dom(body)
+}
+
+/// Error and authentication headings, excluding scripts' inactive route templates.
+pub fn content_gate(body: &[u8]) -> Option<Verdict> {
+    // SPA style/bootstrap data can precede the login form by hundreds of KiB.
+    // Wide DOM parsing is only needed for pages with little visible content;
+    // substantive articles keep the inexpensive heading window.
+    let scan = &body[..body.len().min(512 * 1024)];
+    let scan = if scan.len() > 64 * 1024 && visible_text_count(scan) > 1200 {
+        &scan[..64 * 1024]
+    } else {
+        scan
+    };
+    let text = String::from_utf8_lossy(scan);
+    let lower = text.to_lowercase();
+    if !["404", "not found", "log in", "login", "sign in"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        || crate::extract::nesting::max_nesting(&text) > crate::extract::nesting::MAX_NESTING
+    {
+        return None;
+    }
+    let doc = scraper::Html::parse_document(&text);
+    let title = doc
+        .select(&scraper::Selector::parse("title").unwrap())
+        .next()
+        .map(crate::extract::inline::visible_text)
+        .unwrap_or_default()
+        .to_lowercase();
+    let h1 = doc
+        .select(&scraper::Selector::parse("h1").unwrap())
+        .next()
+        .map(crate::extract::inline::visible_text)
+        .unwrap_or_default()
+        .to_lowercase();
+    if [&title, &h1].iter().any(|heading| {
+        heading.as_str() == "404"
+            || heading.starts_with("404:")
+            || heading.starts_with("404 -")
+            || heading.as_str() == "page not found"
+            || heading.as_str() == "this page could not be found."
+    }) {
+        return Some(Verdict::SoftNotFound);
+    }
+    if doc.select(&scraper::Selector::parse("form#login_form input[type='password'], form[name='login-form'] input[type='password']").unwrap()).next().is_some()
+        && doc.select(&scraper::Selector::parse("article").unwrap()).next().is_none() {
+        return Some(Verdict::AuthWall);
+    }
+    let auth_heading = [
+        "sign in",
+        "log in",
+        "login",
+        "sign in to continue",
+        "log in to continue",
+        "log in or sign up",
+    ];
+    let title_suffix = title.rsplit(':').next().unwrap_or(&title).trim();
+    let title_prefix = [" – ", " - ", " | "]
+        .iter()
+        .find_map(|separator| title.split_once(separator).map(|(prefix, _)| prefix.trim()));
+    if auth_heading.contains(&title_suffix)
+        || auth_heading.contains(&h1.as_str())
+        || title_prefix.is_some_and(|prefix| auth_heading.contains(&prefix))
+        || (["sign in to ", "log in to ", "login to "]
+            .iter()
+            .any(|prefix| h1.starts_with(prefix))
+            && doc
+                .select(&scraper::Selector::parse("article").unwrap())
+                .next()
+                .is_none()
+            && doc
+                .select(&scraper::Selector::parse("form").unwrap())
+                .next()
+                .is_some())
+    {
+        return Some(Verdict::AuthWall);
+    }
+    None
 }
 
 /// Interstitial titles/phrases that vendor challenge pages use in
@@ -203,6 +355,23 @@ const INTERSTITIAL_MARKERS: &[&str] = &[
 pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let scan = &body[..body.len().min(96 * 1024)];
     let text = String::from_utf8_lossy(scan).to_lowercase();
+
+    // Google's human CAPTCHA contains over 1000 visible chars of help text.
+    // Its actual form is decisive; the text-count oracle must not serve it.
+    if text.contains("unusual traffic") && text.contains("recaptcha") {
+        let doc = scraper::Html::parse_document(&text);
+        if doc
+            .select(&scraper::Selector::parse("form#captcha-form").unwrap())
+            .next()
+            .is_some()
+            && doc
+                .select(&scraper::Selector::parse("article").unwrap())
+                .next()
+                .is_none()
+        {
+            return Some(Vendor::Generic);
+        }
+    }
 
     // Title/H1 route: strongest signal, immune to visible-text counts.
     if interstitial_heading(&text) {

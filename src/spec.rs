@@ -385,8 +385,8 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         flag: "",
         kind: ParamKind::Str,
         cli: CliKind::PositionalSingle,
-        required: true,
-        help: "Seed http(s) URL to crawl from.",
+        required: false,
+        help: "Seed http(s) URL to crawl from; omit when continuing with resume.",
         mcp_help: None,
     },
     ParamSpec {
@@ -912,6 +912,19 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_audit_crawl_schema_permits_resume_without_a_seed() {
+        let tool = TOOLS.iter().find(|t| t.name == "web_crawl").unwrap();
+        let schema = mcp_schema(tool)["inputSchema"].clone();
+        assert!(
+            !schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|v| v == "url"))
+        );
+        assert_eq!(schema["properties"]["url"]["type"], "string");
+        assert_eq!(schema["properties"]["resume"]["type"], "string");
+    }
+
     use super::*;
 
     fn fetch_tool() -> &'static ToolSpec {

@@ -1886,3 +1886,112 @@ async fn wave450_invalid_seed_does_not_consume_a_resume_token() {
         state.seed
     );
 }
+
+#[tokio::test]
+async fn report_audit_crawl_budgets_are_hard_under_parallel_workers() {
+    let mut site = MockSite::new();
+    for i in 0..8 {
+        let body = format!(
+            "<html><title>Page {i}</title><body><article><h1>Page {i}</h1><p>{}</p>{}</article></body></html>",
+            format!("Distinct evidence on page {i}. ").repeat(900),
+            (0..8)
+                .map(|j| format!("<a href='/p{j}'>Page {j}</a>"))
+                .collect::<String>()
+        );
+        site = site.page(&format!("https://ex.com/p{i}"), 200, &body);
+    }
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut options = opts();
+    options.mode = CrawlMode::Content;
+    options.max_pages = 8;
+    options.concurrency = 4;
+    options.include_paths = vec!["/*".into()];
+    options.per_page_max = 800;
+    options.max_total_chars = 1600;
+    options.respect_robots = false;
+    let history_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writes = history_writes.clone();
+    options.on_page = Some(Arc::new(move |_, _, _, _| {
+        writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    let result = crawler
+        .crawl("https://ex.com/p0", options, None)
+        .await
+        .unwrap();
+    assert!(
+        !result.pages.is_empty(),
+        "assertions must inspect fetched evidence"
+    );
+    assert!(
+        result
+            .pages
+            .iter()
+            .all(|p| p.markdown.chars().count() <= 800),
+        "per-page body exceeded requested limit"
+    );
+    assert!(
+        result
+            .pages
+            .iter()
+            .filter(|p| !p.duplicate)
+            .map(|p| p.markdown.chars().count())
+            .sum::<usize>()
+            <= 1600,
+        "parallel workers overshot the total budget"
+    );
+    assert_eq!(result.stop, StopReason::CharBudget);
+    assert!(result.pages.iter().all(|p| p.next_offset.is_some()));
+    assert_eq!(
+        history_writes.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "capped content must not be recorded as a full baseline"
+    );
+}
+
+#[tokio::test]
+async fn report_audit_slow_seed_keeps_descendants_alive_and_page_cap_is_exact() {
+    let site = MockSite::new()
+        .page("https://ex.com/root", 200, &format!("<article><h1>Root</h1><p>{}</p><a href='/one'>One</a><a href='/two'>Two</a><a href='/three'>Three</a></article>", "Root substantive evidence. ".repeat(30)))
+        .page("https://ex.com/one", 200, &format!("<article><h1>One</h1><p>{}</p></article>", "First child substantive evidence. ".repeat(30)))
+        .page("https://ex.com/two", 200, &format!("<article><h1>Two</h1><p>{}</p></article>", "Second child substantive evidence. ".repeat(30)))
+        .page("https://ex.com/three", 200, &format!("<article><h1>Three</h1><p>{}</p></article>", "Third child substantive evidence. ".repeat(30)));
+    let (fetch, _) = site.fetcher();
+    let delayed: PageFetcher = Arc::new(move |url, lane, referer| {
+        let fetch = fetch.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            fetch(url, lane, referer).await
+        }
+        .boxed()
+    });
+    let crawler = Crawler::new(delayed, gov());
+    let mut options = opts();
+    options.mode = CrawlMode::Content;
+    options.max_pages = 2;
+    options.concurrency = 4;
+    options.include_paths = vec!["/*".into()];
+    options.respect_robots = false;
+    let result = crawler
+        .crawl("https://ex.com/root", options.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.pages.len(),
+        2,
+        "slow seed must not lose its children; simultaneous completions must respect the page cap"
+    );
+    assert_eq!(result.stop, StopReason::MaxPages);
+    let resume = result.resume.unwrap();
+    let next = crawler.crawl("", options, Some(&resume)).await.unwrap();
+    assert_eq!(
+        next.pages.len(),
+        2,
+        "in-flight pages withheld by a cap must survive resume"
+    );
+    assert!(
+        next.pages
+            .iter()
+            .all(|p| result.pages.iter().all(|old| old.url != p.url))
+    );
+}

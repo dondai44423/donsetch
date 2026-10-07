@@ -79,6 +79,15 @@ pub enum CrawlMode {
     Content,
 }
 
+// A popped page can enqueue descendants after a slow fetch. Idle workers
+// must wait for it; every error/continue/cancellation releases this guard.
+struct WorkInFlight<'a>(&'a AtomicUsize);
+impl Drop for WorkInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// One harvested crawl page.
 pub struct CrawlPage {
     pub url: String,
@@ -86,6 +95,10 @@ pub struct CrawlPage {
     pub kind: ContentKind,
     pub markdown: String,
     pub chars: usize,
+    /// Byte offset for a follow-up fetch when the returned page was capped.
+    pub next_offset: Option<usize>,
+    /// Source-side omission, independent of the returned byte budget.
+    pub partial: Option<crate::extract::PartialContent>,
     pub quality: f32,
     /// Same-content duplicate of an already-kept page.
     pub duplicate: bool,
@@ -843,6 +856,7 @@ impl Crawler {
         // sites full of junk when low-quality pages don't count
         // against the quality budget.
         let total_fetched = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
         let stop_flag: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
         let focus = Arc::new(opts.focus.clone());
 
@@ -859,6 +873,7 @@ impl Crawler {
             let chars_total = Arc::clone(&chars_total);
             let pages_done = Arc::clone(&pages_done);
             let total_fetched = Arc::clone(&total_fetched);
+            let in_flight = Arc::clone(&in_flight);
             let stop_flag = Arc::clone(&stop_flag);
             let focus = Arc::clone(&focus);
             let focus_idf = focus_idf.clone();
@@ -946,19 +961,26 @@ impl Crawler {
                     }
 
                     // ── Pop next ──
-                    let next = queue
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .pop();
-                    let Some(item) = next else {
-                        // Frontier empty : but other workers may add.
-                        // Grace: spin briefly, then exit.
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                        if queue
+                    // Claim under the queue lock so an empty observer cannot
+                    // race between pop and the in-flight increment.
+                    let next = {
+                        let mut q = queue
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .is_empty()
-                        {
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let next = q.pop();
+                        if next.is_some() {
+                            in_flight.fetch_add(1, Ordering::SeqCst);
+                        }
+                        next
+                    };
+                    let Some(item) = next else {
+                        let exhausted = {
+                            let q = queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            q.is_empty() && in_flight.load(Ordering::SeqCst) == 0
+                        };
+                        if exhausted {
                             let mut s = stop_flag
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -967,8 +989,10 @@ impl Crawler {
                             }
                             break 'work;
                         }
+                        tokio::time::sleep(Duration::from_millis(150)).await;
                         continue 'work;
                     };
+                    let _active = WorkInFlight(&in_flight);
 
                     let parsed = match Url::parse(&item.url) {
                         Ok(u) => u,
@@ -1351,7 +1375,7 @@ impl Crawler {
                         }
                     }
 
-                    let md = r.markdown;
+                    let mut md = r.markdown;
 
                     // Claim the locale-canonical path: translated
                     // variants of this page (de/, es/, fr/, ...) are
@@ -1420,7 +1444,7 @@ impl Crawler {
                             &opts_worker.exclude_paths,
                         );
 
-                    let chars = md.chars().count();
+                    let mut chars = md.chars().count();
 
                     // v4 phase 3 delta recrawl: compare the freshly
                     // extracted fingerprint with page history. An
@@ -1445,7 +1469,10 @@ impl Crawler {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "out of scope (navigation-only)".into()));
                     } else if unchanged {
-                        if let Some(rec) = &opts_worker.on_page {
+                        if r.next_offset.is_none()
+                            && r.partial.is_none()
+                            && let Some(rec) = &opts_worker.on_page
+                        {
                             rec(&page.url, r.fingerprint.as_deref(), &md, r.title.as_deref());
                         }
                         skipped
@@ -1453,7 +1480,75 @@ impl Crawler {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((page.url.clone(), "unchanged since last crawl".into()));
                     } else {
-                        let done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut next_offset = r.next_offset;
+                        let done;
+                        {
+                            // Reserve both limits under the result lock. Workers may
+                            // finish together; checking at pop time cannot enforce caps.
+                            let mut kept = pages
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let used = chars_total.load(Ordering::SeqCst);
+                            if kept.len() >= max_pages || (!duplicate && used >= max_total) {
+                                *stop_flag
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(if kept.len() >= max_pages {
+                                        StopReason::MaxPages
+                                    } else {
+                                        StopReason::CharBudget
+                                    });
+                                // This page has not been returned: preserve it for resume.
+                                queue
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .requeue(item.clone());
+                                locale_seen
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&frontier::locale_canonical(parsed.path()));
+                                if !duplicate {
+                                    dup_sigs
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove(&sig);
+                                }
+                                continue 'work;
+                            }
+                            if !duplicate {
+                                let remaining = max_total.saturating_sub(used);
+                                if chars > remaining {
+                                    md = md.chars().take(remaining).collect();
+                                    chars = remaining;
+                                    next_offset =
+                                        Some(md.len().min(r.next_offset.unwrap_or(usize::MAX)));
+                                    *stop_flag
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(StopReason::CharBudget);
+                                }
+                                chars_total.fetch_add(chars, Ordering::SeqCst);
+                            }
+                            done = pages_done.fetch_add(1, Ordering::SeqCst) + 1;
+                            kept.push(CrawlPage {
+                                url: page.url.clone(),
+                                title: r.title.clone().unwrap_or_default(),
+                                kind: r.content_kind,
+                                markdown: md.clone(),
+                                chars,
+                                next_offset,
+                                partial: r.partial.clone(),
+                                quality: r.quality,
+                                duplicate,
+                                parent: item.parent.clone(),
+                                score: item.score,
+                                lastmod: None,
+                                fetched_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            });
+                        }
                         if let Some(cb) = &opts_worker.progress {
                             cb(
                                 done,
@@ -1463,31 +1558,13 @@ impl Crawler {
                                     .len(),
                             );
                         }
-                        if !duplicate {
-                            chars_total.fetch_add(chars, Ordering::SeqCst);
-                        }
-                        if let Some(rec) = &opts_worker.on_page {
+                        // A returned slice cannot populate the full-content history.
+                        if next_offset.is_none()
+                            && r.partial.is_none()
+                            && let Some(rec) = &opts_worker.on_page
+                        {
                             rec(&page.url, r.fingerprint.as_deref(), &md, r.title.as_deref());
                         }
-                        pages
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(CrawlPage {
-                                url: page.url.clone(),
-                                title: r.title.clone().unwrap_or_default(),
-                                kind: r.content_kind,
-                                markdown: md,
-                                chars,
-                                quality: r.quality,
-                                duplicate,
-                                parent: item.parent.clone(),
-                                score: item.score,
-                                lastmod: None, // filled after worker loop from sitemap
-                                fetched_at: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
-                            });
                         if duplicate {
                             skipped
                                 .lock()

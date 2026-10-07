@@ -2605,7 +2605,7 @@ fn sweep_crashpad() {
 fn sweep_crashpad() {}
 
 /// Writes a captured image to `dest`, readable by its owner only.
-fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {
+pub(crate) fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {
     // The ghost renders with the session vault replanted, so the
     // image can show a logged-in page: same seal as the stores that
     // hold the session itself.

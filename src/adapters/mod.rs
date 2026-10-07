@@ -68,11 +68,16 @@ pub struct BuiltinRewrite {
 /// supplied the working `www.reddit.com/....json` URL was detoured
 /// through the wall first. `www.reddit.com` serves the same JSON
 /// the adapter parses, so the host stays the caller's.
-const BUILTIN_REWRITES: [BuiltinRewrite; 6] = [
+const BUILTIN_REWRITES: [BuiltinRewrite; 7] = [
     BuiltinRewrite {
         via: "adapter:reddit-json",
         description: "reddit threads, listings, about and user pages -> .json endpoints",
         apply: reddit_json_rw,
+    },
+    BuiltinRewrite {
+        via: "adapter:stackexchange-api",
+        description: "Stack Overflow questions -> public API question, answers and comments",
+        apply: stackexchange::api_url,
     },
     BuiltinRewrite {
         via: "adapter:npm-registry",
@@ -411,6 +416,9 @@ pub fn extract_json(
     if !enabled() {
         return None;
     }
+    if let Some(ex) = stackexchange::extract_api(body, url, opts) {
+        return Some(ex);
+    }
     // Cut contract, JSON edition: `must_contain` bails to the
     // non-HTML probe in extract(), which serves it properly. focus /
     // toc / section do NOT bail: the generic machinery for them
@@ -440,7 +448,7 @@ pub fn extract_html(
     url: &str,
     opts: &crate::extract::ExtractOptions,
 ) -> Option<crate::extract::Extracted> {
-    if !enabled() {
+    if opts.selector.is_some() || !enabled() {
         return None;
     }
     // Focus/toc/section/probe are pipeline features the adapters don't

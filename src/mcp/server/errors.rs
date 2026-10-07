@@ -78,7 +78,7 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
 pub(super) fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String {
     match verdict {
         Verdict::AuthWall => {
-            format!("HTTP 401 at {url} : the server requires authentication")
+            format!("authentication required at {url} (HTTP {status})")
         }
         Verdict::Paywall => format!("paywall: {url} requires payment to view content"),
         Verdict::SoftNotFound => format!("not found: {url} returned HTTP {status}"),
@@ -269,8 +269,8 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         _ if v.starts_with("Challenge") => "wall.challenge",
         _ if v == "Blocked" => "wall.blocked",
         _ if v == "Paywall" => "wall.paywall",
-        _ if v == "AuthWall" => "wall.auth",
-        _ if v == "SoftNotFound" => "content.notfound",
+        _ if v == "AuthWall" || m.contains("authentication required") => "wall.auth",
+        _ if v == "SoftNotFound" || m.starts_with("not found:") => "content.notfound",
         _ if m.contains("tls error") && m.contains("certificate verification failed") => {
             "tls.verify"
         }
@@ -305,7 +305,20 @@ pub(super) fn tool_error_structured(
         "errorKind": kind,
         "code": code
     });
-    if let Some(mut s) = structured {
+    {
+        let mut s = structured.unwrap_or_else(|| json!({
+            "next_action": if kind == "permanent" { "correct the request before retrying" } else { "retry once; if the failure repeats, inspect the reported cause" }
+        }));
+        if s.get("next_action")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            s["next_action"] = json!(if kind == "permanent" {
+                "correct the request before retrying"
+            } else {
+                "retry once; if the failure repeats, inspect the reported cause"
+            });
+        }
         // The stable code lives where agents read it.
         s["code"] = json!(code);
         if s.get("url").is_some() {
@@ -701,6 +714,21 @@ mod stitch_tests {
 }
 #[cfg(test)]
 mod error_code_tests {
+    #[test]
+    fn report_audit_all_errors_supply_machine_state_and_next_action() {
+        let raw = tool_error("invalid URL: not-a-url");
+        assert_eq!(raw["isError"], true);
+        assert_eq!(raw["structuredContent"]["code"], "fetch.invalid");
+        assert!(
+            !raw["structuredContent"]["next_action"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        let auth = tool_error("authentication required at https://example.com (HTTP 200)");
+        assert_eq!(auth["structuredContent"]["code"], "wall.auth");
+    }
+
     use super::*;
     use serde_json::json;
 

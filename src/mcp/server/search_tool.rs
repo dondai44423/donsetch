@@ -114,7 +114,10 @@ pub(super) fn make_ghost_hook(
             // Render cache shortcut (crawl only).
             if !skip_cache_read {
                 let s = state.lock().await;
-                if let Some(rc) = s.render_for(&url) {
+                if let Some(rc) = s.render_for(&url)
+                    && crate::detect::walls::detect_dom_smart(rc.html.as_bytes())
+                        == crate::detect::walls::Verdict::ContentOk
+                {
                     return Ok(crate::crawl::GhostRender {
                         html: rc.html.clone(),
                     });
@@ -149,7 +152,10 @@ pub(super) fn make_ghost_hook(
             {
                 Ok(p) => p,
                 Err(first) => {
-                    // Retry once on transient timeout.
+                    if !first.to_string().contains("cdp timeout") {
+                        return Err(format!("render: {first}"));
+                    }
+                    // Only an automation settle timeout earns a warm retry.
                     match ops::ghost_fetch(&mut g, &url, std::time::Duration::from_secs(20)).await {
                         Ok(p) => p,
                         Err(second) => {
@@ -159,7 +165,11 @@ pub(super) fn make_ghost_hook(
                 }
             };
             if page.captcha {
-                return Err("interactive captcha (unsolvable by design)".to_string());
+                return Err("captcha or anti-bot challenge did not clear".to_string());
+            }
+            let verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
+            if verdict != crate::detect::walls::Verdict::ContentOk {
+                return Err(format!("rendered access gate: {verdict:?}"));
             }
             if !page.cookies.is_empty() {
                 fetcher.import_cookies(&page.cookies).await;
@@ -198,7 +208,7 @@ pub(super) async fn search_inner(
         Ok(out) => {
             let top = out.results.first().map(|r| r.url.as_str());
             maybe_pre_solve(daemon, top);
-            render_search_outcome(daemon, &out).await
+            render_search_outcome(daemon, &out, max).await
         }
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
@@ -207,11 +217,17 @@ pub(super) async fn search_inner(
 pub(super) async fn render_search_outcome(
     daemon: &Arc<Daemon>,
     out: &crate::search::SearchOutcome,
+    requested: usize,
 ) -> Value {
     let hs = bind_search_handles(daemon, out).await;
     let hints = route_hints(daemon, out).await;
     let md = search::render_compact_markdown(out, "# Search results", Some(&hs), &hints);
-    let model = search_model_meta(out, &hs);
+    let mut model = search_model_meta(out, &hs);
+    model["requested_results"] = json!(requested.clamp(1, 12));
+    model["returned_results"] = json!(out.results.len());
+    if out.results.len() < requested.clamp(1, 12) {
+        model["underfilled"] = json!(true);
+    }
     let debug = search_debug_meta(out);
     json!({
         "content": [{ "type": "text", "text": md }],
@@ -232,6 +248,7 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
             let mut item = json!({
                 "rank": index + 1,
                 "url": result.url,
+                "source_type": crate::search::rank::source_type(&result.url),
             });
             if let Some(handle) = handles.get(index) {
                 item["handle"] = json!(handle);
@@ -372,6 +389,11 @@ pub(super) async fn search_batch_inner(
                     &hints,
                 ));
                 let mut model = search_model_meta(out, query_handles.unwrap_or(&[]));
+                model["requested_results"] = json!(max.clamp(1, 12));
+                model["returned_results"] = json!(out.results.len());
+                if out.results.len() < max.clamp(1, 12) {
+                    model["underfilled"] = json!(true);
+                }
                 model["query"] = json!(query);
                 searches.push(model);
                 let mut debug = search_debug_meta(out);
@@ -537,6 +559,7 @@ async fn byok_search_cached(
             // zero added latency).
             crate::search::site_filter(query, &mut out.results);
             out.results.truncate(max.clamp(1, 12));
+            out.weak |= crate::search::rank::relevance_is_weak(&out.results, query);
             daemon.searcher.spawn_prewarm(&out.results);
             Ok(out)
         })

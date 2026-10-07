@@ -256,8 +256,54 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     }
 
     // Render markdown.
-    let (md, title) = render(&kept, url);
+    let preferred_title = super::metadata::metadata(&Html::parse_document(html)).title;
+    let (md, title) = render(&kept, url, preferred_title);
 
+    if opts.focus.is_some() || opts.section.is_some() || opts.must_contain.is_some() {
+        // Rescued data earns the same read controls as ordinary DOM content.
+        let mut blocks = Vec::new();
+        for item in &kept {
+            let text = strip_html(&item.text);
+            if title.as_deref() == Some(text.trim()) {
+                continue;
+            }
+            if item.title_like && text.chars().count() <= 200 {
+                blocks.push(super::blocks::Block::Heading {
+                    level: 2,
+                    text,
+                    path: Vec::new(),
+                });
+            } else {
+                blocks.push(super::blocks::Block::Para {
+                    md: text,
+                    link_density: 0.0,
+                    path: Vec::new(),
+                });
+            }
+        }
+        let meta = super::metadata::Meta {
+            title,
+            byline: None,
+            published: None,
+            site: extract_site(url),
+            description: None,
+            canonical: None,
+        };
+        return super::downstream(
+            &meta,
+            blocks,
+            html.len(),
+            false,
+            false,
+            Vec::new(),
+            super::language::detect_from_text(&md),
+            None,
+            url,
+            opts,
+            opts.max_chars.unwrap_or(16_000).max(200),
+        )
+        .ok();
+    }
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
@@ -557,7 +603,7 @@ fn find_data_target<'a>(html: &'a str, suffix: &str) -> Vec<&'a str> {
 /// raw JSON body (trimmed).
 fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
-    let needle = format!(r#"type="{ty}""#);
+    let quoted = [format!(r#"type="{ty}""#), format!("type='{ty}'")];
     let mut from = 0usize;
     while from < html.len() {
         let Some(lt) = html[from..].find("<script") else {
@@ -568,7 +614,10 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
             break;
         };
         let tag_end = tag_start + tag_end_rel;
-        if html[tag_start..tag_end].contains(&needle) {
+        if quoted
+            .iter()
+            .any(|needle| html[tag_start..tag_end].contains(needle))
+        {
             let body_start = tag_end + 1;
             let rest = &html[body_start..];
             if let Some(cs) = rest.find("</script>") {
@@ -657,6 +706,18 @@ fn walk(value: &Value, path: &str, out: &mut Vec<Item>, order: &mut usize, depth
     match value {
         Value::Object(map) => {
             for (k, v) in map {
+                if matches!(
+                    k.as_str(),
+                    "notFound"
+                        | "errorBoundary"
+                        | "templateStyles"
+                        | "templateScripts"
+                        | "user_agent"
+                        | "supported_locales"
+                        | "compMap"
+                ) {
+                    continue;
+                }
                 let np = if path.is_empty() {
                     k.clone()
                 } else {
@@ -666,6 +727,17 @@ fn walk(value: &Value, path: &str, out: &mut Vec<Item>, order: &mut usize, depth
             }
         }
         Value::Array(arr) => {
+            if arr.first().and_then(Value::as_str).is_some_and(|module| {
+                matches!(
+                    module,
+                    "Bootloader"
+                        | "RequireDeferredReference"
+                        | "InstagramUserAgent"
+                        | "PolarisLocales"
+                )
+            }) {
+                return;
+            }
             for v in arr.iter().take(400) {
                 walk(v, path, out, order, depth + 1);
             }
@@ -710,6 +782,12 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
         return (0.0, false);
     }
     let low = t.to_lowercase();
+    if [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif"]
+        .iter()
+        .any(|ext| low.ends_with(ext))
+    {
+        return (0.0, false);
+    }
     if (low.contains("noopener") || low.contains("noreferrer") || low.contains("nofollow"))
         && !t.contains(' ')
     {
@@ -746,14 +824,24 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
         if lower.contains(key) {
             score += 2.0;
             key_hit = true;
-            if TITLE_KEYS.contains(key) {
+            if lower
+                .rsplit('.')
+                .next()
+                .is_some_and(|key| TITLE_KEYS.contains(&key))
+            {
                 title_like = true;
             }
             break;
         }
     }
     for key in BAD_KEYS {
-        if lower.contains(key) {
+        // Identity fields are tokens: "id" inside "children" is not an ID.
+        let bad = if matches!(*key, "id" | "guid") {
+            lower.split('.').any(|part| part == *key)
+        } else {
+            lower.contains(key)
+        };
+        if bad {
             score -= 3.0;
             break;
         }
@@ -842,13 +930,16 @@ fn dedupe(items: &mut Vec<Item>) {
 
 // ── Render ─────────────────────────────────────────────────────
 
-fn render(items: &[Item], url: &str) -> (String, Option<String>) {
+fn render(items: &[Item], url: &str, preferred_title: Option<String>) -> (String, Option<String>) {
     let mut md = String::new();
-    let mut title: Option<String> = None;
+    let mut title = preferred_title.filter(|t| !t.trim().is_empty());
+    if let Some(t) = &title {
+        md.push_str(&format!("# {t}\n\n"));
+    }
 
     // Prefer a short, title-like fragment for the heading.
     for it in items {
-        if it.title_like && it.text.chars().count() <= 200 {
+        if title.is_none() && it.title_like && it.text.chars().count() <= 200 {
             let clean = strip_html(&it.text);
             if !clean.is_empty() {
                 title = Some(clean.clone());
@@ -874,7 +965,7 @@ fn render(items: &[Item], url: &str) -> (String, Option<String>) {
 
     let mut emitted = 0usize;
     for it in items {
-        if it.title_like && title.is_some() {
+        if it.title_like && title.as_deref() == Some(strip_html(&it.text).trim()) {
             continue; // heading already shown
         }
         let clean = strip_html(&it.text);
@@ -950,19 +1041,118 @@ fn guess_lang(md: &str) -> String {
 /// Apply caller's max_chars/offset (shared shape with DonSift).
 fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
     let max = opts.max_chars.unwrap_or(16_000).max(200);
-    let offset = opts.offset;
-    let chars: Vec<char> = full.chars().collect();
-    if offset >= chars.len() {
-        return (String::new(), None);
-    }
-    let end = offset.saturating_add(max).min(chars.len());
-    let slice: String = chars[offset..end].iter().collect();
-    let next = if end < chars.len() { Some(end) } else { None };
-    (slice, next)
+    super::paginate_public(full, opts.offset, max)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_audit_js_rescue_excludes_bootstrap_configuration_without_losing_prose() {
+        let payload = serde_json::json!({"require": [
+            ["Bootloader", [], {"description":"Unused module prose. ".repeat(50)}],
+            ["PolarisLocales", [], {"text":"Simplified Chinese (China)".repeat(30)}],
+            ["RelayPrefetchedStreamCache", [], {"content": "Public profile has actual biography and useful information. ".repeat(15)}]
+        ], "user_agent": "Mozilla/5.0 Chrome/151.0.0.0 Safari/537.36", "compMap": {"description":"Fake configuration prose. ".repeat(50)}});
+        let html =
+            format!("<title>Profile</title><script type='application/json'>{payload}</script>");
+        let ex = super::extract(&html, "https://example.com/profile", &Default::default()).unwrap();
+        assert!(ex.markdown.contains("actual biography"));
+        for noise in [
+            "Unused module",
+            "Simplified Chinese",
+            "Mozilla/5.0",
+            "Fake configuration",
+        ] {
+            assert!(!ex.markdown.contains(noise));
+        }
+    }
+
+    #[test]
+    fn report_audit_js_rescue_read_controls_use_the_recovered_evidence() {
+        let payload = serde_json::json!({"children": [
+            {"title": "Funding history and valuation"},
+            {"text": "Funding round raised a billion dollars for research and development. ".repeat(12)},
+            {"title": "Unrelated manufacturing details"},
+            {"text": "Manufacturing involves assembly equipment and complicated machinery. ".repeat(15)}
+        ]});
+        let html = format!(
+            "<title>Company information</title><script type='application/json'>{payload}</script>"
+        );
+        let options = crate::extract::ExtractOptions {
+            section: Some("Funding history".into()),
+            ..Default::default()
+        };
+        let selected = super::extract(&html, "https://example.com/company", &options).unwrap();
+        assert!(selected.markdown.contains("a billion dollars"));
+        assert!(!selected.markdown.contains("assembly equipment"));
+        let probed = super::extract(
+            &html,
+            "https://example.com/company",
+            &crate::extract::ExtractOptions {
+                must_contain: Some("a billion dollars".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(probed.markdown.contains("MATCH"));
+        assert!(probed.markdown.len() < 1000);
+        let focused = super::extract(
+            &html,
+            "https://example.com/company",
+            &crate::extract::ExtractOptions {
+                focus: Some("funding billion research".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(focused.markdown.contains("a billion dollars"));
+        assert!(!focused.markdown.contains("assembly equipment"));
+    }
+
+    #[test]
+    fn report_audit_js_rescue_rejects_inactive_routes_and_asset_titles() {
+        // Shape captured from Figma's RSC route: notFound and live children
+        // coexist, with Sanity asset metadata in the same page data.
+        let payload = serde_json::json!({
+            "notFound": [["$", "title", null, {"children": "404: This page could not be found."}]],
+            "originalFilename": "Homepage Hero Thumbnail (1).jpg",
+            "children": [
+                {"title": "The real page heading appears here"},
+                {"text": "First real paragraph explains the collaborative canvas and its design tools. ".repeat(5)},
+                {"title": "Another meaningful section heading"},
+                {"text": "Second real paragraph gives practical design instructions and product details. ".repeat(5)}
+            ]
+        });
+        let html = format!(
+            "<html><title>Figma: The collaborative canvas</title><script type='application/json'>{payload}</script><body></body></html>"
+        );
+        let ex = super::extract(
+            &html,
+            "https://www.figma.com/",
+            &crate::extract::ExtractOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(ex.title.as_deref(), Some("Figma: The collaborative canvas"));
+        assert!(!ex.markdown.contains("404:") && !ex.markdown.contains("Thumbnail"));
+        for text in [
+            "The real page heading",
+            "Another meaningful section",
+            "First real paragraph",
+            "Second real paragraph",
+        ] {
+            assert!(ex.markdown.contains(text));
+        }
+        assert!(
+            ex.markdown.find("First real paragraph") < ex.markdown.find("Second real paragraph")
+        );
+        let opts = crate::extract::ExtractOptions {
+            max_chars: Some(200),
+            ..Default::default()
+        };
+        let cut = super::extract(&html, "https://www.figma.com/", &opts).unwrap();
+        assert!(cut.markdown.len() <= 200 && cut.next_offset.is_some());
+    }
+
     /// Fuzzer find (CI, 2026-08-22): a global-assignment match at
     /// the END of input advanced `from` past the string and/or
     /// mid-replacement-char : `html[from..]` panicked. The advance

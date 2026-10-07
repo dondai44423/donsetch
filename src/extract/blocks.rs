@@ -206,7 +206,7 @@ fn walk<'a>(
                     }
                     walk(child_el, base, opts, headings, out, depth + 1);
                 }
-            } else if let Some(t) = table_block(el, headings) {
+            } else if let Some(t) = table_block(el, headings, opts.selector.is_some()) {
                 push_block(t, out);
             }
         }
@@ -626,7 +626,11 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
     max_cols <= 1 && rows >= 2
 }
 
-fn table_block(el: ElementRef<'_>, headings: &[(u8, String)]) -> Option<Block> {
+fn table_block(
+    el: ElementRef<'_>,
+    headings: &[(u8, String)],
+    explicit_scope: bool,
+) -> Option<Block> {
     let mut headers = Vec::new();
     let mut rows = Vec::new();
     let mut truncated = false;
@@ -686,7 +690,7 @@ fn table_block(el: ElementRef<'_>, headings: &[(u8, String)]) -> Option<Block> {
     let total_text: usize = headers.iter().map(|h| h.len()).sum::<usize>()
         + rows.iter().flatten().map(|c| c.len()).sum::<usize>();
     let cells = headers.len() + rows.iter().map(|r| r.len()).sum::<usize>();
-    if cells <= 3 && total_text < 60 {
+    if !explicit_scope && cells <= 3 && total_text < 60 {
         return None;
     }
     Some(Block::Table {

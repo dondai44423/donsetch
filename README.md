@@ -274,6 +274,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 **DonSift extraction**: HTML bytes in, agent-native markdown out. Typed blocks (heading, paragraph, list, table, code, quote, media) with heading breadcrumbs.
 
 - **`focus`**: BM25-relevant passages with section context. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
+- **`selector`**: extract only matching HTML subtrees. A miss returns `selector.nomatch` with the inspected element count; invalid syntax returns `selector.invalid`. Non-HTML responses cannot satisfy a CSS scope.
 - **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
 - **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
 - **Classification**: `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page`, a 0-1 quality score, and inline trust signals (focus-miss, JS-shell warning, empty content).
@@ -286,6 +287,47 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 - **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites get restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable.
 - **Anti-cloak check**: on decoy-prone domains, tier-1 responses are equivalence-checked against a headless render, so `decoy suspected` is stamped instead of silently passing as content.
 
+`read_status` describes the returned projection: `content` has no remaining
+rendered bytes, `partial` has withheld bytes or a source subset, `probe` is a
+MATCH/NO-MATCH answer, `unchanged` is a history comparison, and `thin` is a
+suspected shell. Failures use `walled`, `notfound`, or `error`. Always pair it
+with `content_complete`: a projection can be exhausted while the source is
+incomplete. `next_offset` is a byte offset into collected markdown, not a page
+number. `links` and `media` share the rendered markdown budget, including their
+markup; `budget_scope` makes that accounting explicit.
+
+For parallel reads, pass an array to `web_fetch`: successful siblings remain
+available beside individual error rows. MCP retains `isError` on failed single
+calls; clients that turn it into a rejected promise should use
+`Promise.allSettled` when composing separate calls.
+
+`shot` always returns a receipt (`requested`, `saved_to`, `reason`), including
+when no captcha capture was needed. `web_screenshot` returns the inline PNG
+and a private local `path` containing the same bytes; remote clients should
+use the inline image because the path belongs to the server host.
+
+Stack Overflow question reads use the public question API with answers and
+comments. Empty, failed or incompatible API responses retain the website
+fallback; service-declared backoff is honored. Deleted/private questions and
+login-only dashboards require their own access. Fetch keeps its direct-IP
+default even with a configured proxy pool; search and crawl retain their pool
+routing.
+
+Crawl caps apply to each page's rendered markdown and the aggregate page
+content. Headers and inventory metadata are separate. A capped page carries
+`next_offset` and `content_complete: false`; it never becomes a full-content
+history baseline. Full crawl output summarizes the unfetched inventory;
+structured `map` retains the URLs. Map mode reports `mode: "map"`, `discovered`,
+and `InventoryComplete` when finished, without an empty content-page array.
+Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
+
+Search reports `requested_results`, `returned_results`, and `underfilled`
+when engines cannot supply the requested count. `weak` considers lexical
+query coverage as well as engine agreement; it is a retrieval warning, not a
+fact-check. `source_type` identifies video, community, paper, reference,
+publisher, official, institutional, and general web sources from known hosts.
+It does not certify a page's claims or assign trust to lookalike domains.
+
 **Tier 3 bypass (opt-in).** When the ghost itself hits a hard wall, fetch falls back to Bright Data Web Unlocker if a key is configured (`donsetch keys add unlocker "<token>::<Web Unlocker zone>"`). It returns HTML into the normal extraction pipeline; a challenge or empty shell remains a failed fetch. Failures carry recovery guidance on the escalation trace. `donsetch doctor --deep` checks token access, zone name and product type for free; tokens without account-zone read permission report an unverified check. Successful responses are cached locally (URL and render-mode keyed, sliding 6h TTL, 200 entries); concurrent calls within one daemon share the cache. The daily cap counts every API attempt, including retries, and the whole operation shares one timeout. A timed-out paid request is not replayed automatically. Settings live in `[bypass]`: `donsetch config show`. See the [setup guide](docs/brightdata.md). DonSeTch works without it.
 
 <details>
@@ -295,7 +337,8 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 |---|---|---|
 | Cloudflare-protected sites | interstitial | ✅ 200 OK |
 | DataDome sites | DataDome | ✅ 200 OK |
-| Stack Overflow / Medium | Cloudflare | ✅ 200 OK |
+| Stack Overflow | Cloudflare | Public questions use the keyless API first; HTML remains a fallback |
+| Medium | Cloudflare | Challenge-dependent; unresolved walls are reported honestly |
 | Reddit | bot detection | ✅ 200 OK |
 | Interactive captchas | hCaptcha / reCAPTCHA / Turnstile | ⛔ honest block without a key (with an unlocker key: ✅) |
 

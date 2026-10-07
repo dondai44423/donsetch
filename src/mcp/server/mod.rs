@@ -500,8 +500,8 @@ pub(crate) async fn call_tool_ctx(
         return Ok(rejected);
     }
     match name {
-        "web_fetch" => Ok(fetch_tool::fetch_tool(daemon, &args, ctx).await),
-        "web_search" => Ok(search_tool::search_tool(daemon, &args, ctx).await),
+        "web_fetch" => Ok(Box::pin(fetch_tool::fetch_tool(daemon, &args, ctx)).await),
+        "web_search" => Ok(Box::pin(search_tool::search_tool(daemon, &args, ctx)).await),
         "web_crawl" => Ok(crawl_tool::crawl_tool(daemon, &args, ctx).await),
         "web_screenshot" => Ok(web_screenshot_tool::web_screenshot_tool(daemon, &args, ctx).await),
         _ => Err((-32602, format!("unknown tool: {name}"))),

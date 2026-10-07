@@ -88,6 +88,7 @@ impl ExtractOptions {
     }
 }
 
+#[derive(Clone, serde::Serialize)]
 pub struct PartialContent {
     pub reason: &'static str,
     pub items_found: usize,
@@ -161,6 +162,10 @@ pub enum ContentKind {
 pub enum ExtractError {
     Wall(crate::detect::walls::Verdict),
     BadSelector(String),
+    SelectorNoMatch {
+        selector: String,
+        inspected: usize,
+    },
     /// The body was refused (nesting gate) or the parse did not finish off the worker (budget, or the task died).
     Failed(String),
 }
@@ -170,6 +175,13 @@ impl std::fmt::Display for ExtractError {
         match self {
             ExtractError::Wall(v) => write!(f, "access wall: {v:?}"),
             ExtractError::BadSelector(s) => write!(f, "invalid CSS selector: {s}"),
+            ExtractError::SelectorNoMatch {
+                selector,
+                inspected,
+            } => write!(
+                f,
+                "CSS selector {selector:?} matched no elements ({inspected} inspected)"
+            ),
             ExtractError::Failed(s) => write!(f, "{s}"),
         }
     }
@@ -378,6 +390,17 @@ pub fn extract(
     let ct = content_type.to_lowercase();
     let is_pdf = body.len() >= 5 && body.starts_with(b"%PDF-") || ct.contains("pdf");
 
+    if let Some(selector) = &opts.selector {
+        scraper::Selector::parse(selector)
+            .map_err(|_| ExtractError::BadSelector(selector.clone()))?;
+        if is_pdf || (!ct.contains("html") && !body_starts_with_html(body)) {
+            return Err(ExtractError::SelectorNoMatch {
+                selector: selector.clone(),
+                inspected: 0,
+            });
+        }
+    }
+
     if !is_pdf
         && body_starts_with_html(body)
         && let Some(vendor) = crate::detect::walls::detect_interstitial(body)
@@ -387,7 +410,7 @@ pub fn extract(
         ));
     }
 
-    if !is_pdf && (ct.contains("xml") || body.starts_with(b"<?xml")) {
+    if opts.selector.is_none() && !is_pdf && (ct.contains("xml") || body.starts_with(b"<?xml")) {
         let text = charset::decode(body, content_type);
         let mut entries = Vec::new();
         crate::crawl::sitemap::parse_sitemap(&text, &mut entries, 10_000);
@@ -406,7 +429,8 @@ pub fn extract(
     // Feeds (RSS/Atom/JSON Feed): structured rendering, never a
     // raw XML blob. Checked BEFORE passthrough : feed content
     // types (text/xml, application/rss+xml…) never say "html".
-    if !is_pdf
+    if opts.selector.is_none()
+        && !is_pdf
         && feed::is_feed(&ct, body)
         && let Some(ex) = feed::extract(body, url, opts)
     {
@@ -417,7 +441,10 @@ pub fn extract(
     // registry's URL rewrites (reddit .json, package APIs) render
     // structured : BEFORE the non-HTML passthrough so adapter JSON
     // never dumps raw.
-    if !is_pdf && let Some(ex) = crate::adapters::extract_json(body, &ct, url, opts) {
+    if opts.selector.is_none()
+        && !is_pdf
+        && let Some(ex) = crate::adapters::extract_json(body, &ct, url, opts)
+    {
         return Ok(ex);
     }
 
@@ -499,7 +526,6 @@ pub fn extract(
                     parsed.notes,
                     parsed.lang_info,
                     Some(parsed.pages_meta),
-                    None,
                     url,
                     opts,
                     max_chars,
@@ -564,7 +590,16 @@ pub fn extract(
 
     let doc = Html::parse_document(&html_text);
     let base = metadata::base_url(&doc).unwrap_or_else(|| url.to_string());
-    let meta = metadata::metadata(&doc);
+    let mut meta = metadata::metadata(&doc);
+    if url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .is_some_and(|host| host.ends_with(".wikipedia.org"))
+        && meta.byline.as_deref() == Some("Contributors to Wikimedia projects")
+    {
+        meta.byline = None;
+        meta.published = None;
+    }
     let lang_info = language::detect(&doc);
 
     // A large page that yields almost nothing is a JS
@@ -580,24 +615,21 @@ pub fn extract(
     // to_lowercase() allocation just to count three markers.
     let has_skeletons = count_ascii_ci(&html_text, "aria-busy=\"true\"", 3) >= 3;
 
-    // Scope: explicit selector or scored main-content detection.
-    //
-    // A selector that matches NOTHING must not continue with an empty
-    // scope: the blocks then come from an empty root set, the rescue
-    // paths take over, and the caller gets a DIFFERENT, worse rendering
-    // (nav-first, low quality) marked content_ok with no notice at all.
-    // An agent that constrained the scope could not tell the constraint
-    // was never applied. Mirror the documented focus/section behaviour:
-    // fall back to the DEFAULT scope and label it in the content.
-    let mut selector_missed: Option<String> = None;
+    // Explicit scopes never widen, including when a selected region is tiny.
     let roots: Vec<scraper::ElementRef<'_>> = match &opts.selector {
         Some(sel) => {
             let parsed = scraper::Selector::parse(sel)
                 .map_err(|_| ExtractError::BadSelector(sel.clone()))?;
             let matched: Vec<scraper::ElementRef<'_>> = doc.select(&parsed).collect();
             if matched.is_empty() {
-                selector_missed = Some(sel.clone());
-                score::find_main(&doc).into_iter().collect()
+                return Err(ExtractError::SelectorNoMatch {
+                    selector: sel.clone(),
+                    inspected: doc
+                        .root_element()
+                        .descendants()
+                        .filter_map(scraper::ElementRef::wrap)
+                        .count(),
+                });
             } else {
                 matched
             }
@@ -620,7 +652,6 @@ pub fn extract(
         Vec::new(),
         lang_info,
         None,
-        selector_missed,
         url,
         opts,
         max_chars,
@@ -629,7 +660,7 @@ pub fn extract(
     // A TOC is a complete projection, not a failed short extraction. Once
     // downstream has built the outline, content-oriented rescue paths must
     // not replace it with the page body.
-    if opts.toc {
+    if opts.toc || opts.selector.is_some() {
         return Ok(extracted);
     }
 
@@ -732,10 +763,6 @@ fn downstream(
     notes: Vec<String>,
     lang_info: language::LanguageInfo,
     pdf_pages: Option<Vec<crate::pdf::PageMeta>>,
-    // Set by `extract` when an explicit selector matched no element, so the
-    // content can say the constraint was not applied (the DOM is out of
-    // reach down here). None for PDFs, which have no CSS scope.
-    selector_missed: Option<String>,
     url: &str,
     opts: &ExtractOptions,
     max_chars: usize,
@@ -915,10 +942,6 @@ fn downstream(
         if let Some(s) = &opts.section {
             full = format!("*[section \"{s}\": not found : showing full content]*\n\n{full}");
         }
-    } else if let Some(sel) = &selector_missed {
-        // Same contract as focus/section: the constraint was not applied,
-        // so the content is the default rendering and says so.
-        full = format!("*[selector \"{sel}\": no matches : showing full content]*\n\n{full}");
     } else if full.trim().is_empty() || (blocks_total == 0 && meta.title.is_none()) {
         full = format!("{url}\n\n*(no extractable content)*\n");
     }
@@ -950,7 +973,6 @@ fn downstream(
         && !focus_fell_back
         && !section_missed
         && !section_hit
-        && selector_missed.is_none()
         && notes.is_empty()
         && full.len().saturating_mul(5) > unfocused.len().saturating_mul(4)
     {
@@ -997,6 +1019,7 @@ fn downstream(
     // label a short PDF as a JS-rendered page.
     let is_pdf = pdf_pages.is_some();
     let thin = !is_pdf
+        && opts.selector.is_none()
         && !section_hit
         && ((full.len() < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
             || (thin_flag && has_skeletons && full.len() < 4000)
@@ -1284,6 +1307,16 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
     // saturating: max_chars comes from tool args; a hostile/huge
     // value must not wrap end below start (slice panic).
     let mut end = start.saturating_add(max_chars).min(text.len());
+    if end < text.len() {
+        let marker_size = format!("\n\n*[truncated : continue with offset={}]*", text.len()).len();
+        // Tiny internal budgets cannot hold the instruction plus a UTF-8
+        // character. Keep the hard cap and expose continuation in metadata.
+        if max_chars >= marker_size + 4 {
+            end = start
+                .saturating_add(max_chars - marker_size)
+                .min(text.len());
+        }
+    }
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -1300,7 +1333,10 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
     // not metadata : the resume instruction must be IN
     // the markdown.
     if let Some(n) = next {
-        slice.push_str(&format!("\n\n*[truncated : continue with offset={n}]*"));
+        let marker = format!("\n\n*[truncated : continue with offset={n}]*");
+        if slice.len() + marker.len() <= max_chars {
+            slice.push_str(&marker);
+        }
     }
     (slice, next)
 }

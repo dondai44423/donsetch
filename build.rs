@@ -304,19 +304,48 @@ fn main() {
     // ── Compile-time metadata for `donsetch -v` ────────────────
     // Captured here so the binary self-reports its build identity.
 
-    // Git short hash (best-effort — may not be a git repo).
-    if let Ok(out) = Command::new("git")
+    // Git resolves linked worktrees and packed refs; watching .git alone
+    // misses commits on an existing branch and caches an old build identity.
+    let branch = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok());
+    for name in ["HEAD", "packed-refs"]
+        .into_iter()
+        .chain(branch.as_deref().map(str::trim))
+    {
+        if let Ok(out) = Command::new("git")
+            .args(["rev-parse", "--git-path", name])
+            .output()
+            && out.status.success()
+            && let Ok(path) = String::from_utf8(out.stdout)
+        {
+            let path = Path::new(path.trim());
+            // Cargo treats a missing watched file as perpetually changed.
+            // A packed branch watches its existing parent for a new loose ref.
+            let watched = if name == "packed-refs" {
+                path.exists().then_some(path)
+            } else {
+                path.ancestors().find(|parent| parent.exists())
+            };
+            if let Some(watched) = watched {
+                println!("cargo:rerun-if-changed={}", watched.display());
+            }
+        }
+    }
+    let hash = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
-    {
-        if let Ok(s) = String::from_utf8(out.stdout) {
-            println!("cargo:rustc-env=DONSETCH_GIT_HASH={}", s.trim());
-        } else {
-            println!("cargo:rustc-env=DONSETCH_GIT_HASH=unknown");
-        }
-    } else {
-        println!("cargo:rustc-env=DONSETCH_GIT_HASH=unknown");
-    }
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .filter(|hash| !hash.trim().is_empty());
+    println!(
+        "cargo:rustc-env=DONSETCH_GIT_HASH={}",
+        hash.as_deref().map(str::trim).unwrap_or("unknown")
+    );
 
     // PDFium variant string.
     let pdfium_tag = if is_shared {

@@ -1401,7 +1401,6 @@ fn short_pdf_is_not_classified_as_an_html_shell() {
         Vec::new(),
         lang,
         Some(pages),
-        None,
         "https://example.com/receipt.pdf",
         &ExtractOptions::default(),
         16_000,
@@ -1693,50 +1692,63 @@ fn css_selector_bad_returns_error() {
     assert!(r.is_err());
 }
 
-/// A selector that matches nothing must return the DEFAULT rendering plus a
-/// notice, not a different (nav-first) rendering presented as success. Issue
-/// #238: the empty scope fell through to the rescue paths, so
-/// `selector: "article.nonexistent"` handed back menus at quality 0.30 with
-/// `content_ok: true`, and an agent that had constrained the scope could not
-/// tell the constraint was never applied.
 #[test]
-fn css_selector_matching_nothing_falls_back_with_a_notice() {
-    let html = r#"<html><body>
-<nav><a href="/a">Existing user? Sign In</a><a href="/b">Sign Up</a><a href="/c">Forums</a></nav>
-<article class="message">
-  <h1>The actual thread title</h1>
-  <p>Body marker: this paragraph is the content the agent asked for, and it is long enough that
-  the extractor keeps it as a real paragraph instead of dropping it as navigation noise.</p>
-  <p>A second paragraph, so the article is more than one block and the segmenter keeps the scope.</p>
-</article>
-</body></html>"#;
+fn report_audit_selector_never_widens_short_or_missing_scope() {
+    let html = format!(
+        "<html><body><article><p>{}</p><table class='infobox'><tr><th>Founded</th><td>2021</td></tr></table></article></body></html>",
+        "Outside scope. ".repeat(300)
+    );
+    let opts = ExtractOptions {
+        selector: Some("table.infobox".into()),
+        ..Default::default()
+    };
+    let scoped = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://en.wikipedia.org/wiki/Anthropic",
+        &opts,
+    )
+    .unwrap();
+    assert!(
+        scoped.markdown.contains("Founded"),
+        "selected table must survive"
+    );
+    assert!(
+        !scoped.markdown.contains("Outside scope"),
+        "short selector must never activate a whole-page rescue"
+    );
+    assert!(!scoped.thin, "intentional small scope is not an SPA");
+    let missing = ExtractOptions {
+        selector: Some("#absent".into()),
+        ..Default::default()
+    };
+    assert!(
+        extract(
+            html.as_bytes(),
+            "text/html",
+            "https://example.com/",
+            &missing
+        )
+        .is_err(),
+        "missing selector must fail instead of widening scope"
+    );
+}
 
-    let default = extract_html_opts(html, &ExtractOptions::default());
-    let missed = extract_html_opts(
-        html,
+#[test]
+fn css_selector_matching_nothing_returns_an_error() {
+    let html = "<html><body><article><p>Real evidence.</p></article></body></html>";
+    let result = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://example.com/",
         &ExtractOptions {
-            selector: Some("article.nonexistent".to_string()),
+            selector: Some("#absent".into()),
             ..Default::default()
         },
     );
-
-    let notice = "*[selector \"article.nonexistent\": no matches : showing full content]*";
     assert!(
-        missed.markdown.starts_with(notice),
-        "a missed selector must be labeled, got: {}",
-        &missed.markdown[..missed.markdown.len().min(160)]
+        matches!(result, Err(ExtractError::SelectorNoMatch { inspected, .. }) if inspected > 0)
     );
-    let body = missed
-        .markdown
-        .split_once("\n\n")
-        .map(|(_, b)| b)
-        .unwrap_or("");
-    assert_eq!(
-        body.trim(),
-        default.markdown.trim(),
-        "a missed selector must show the DEFAULT rendering, not the rescue path's"
-    );
-    assert!(missed.markdown.contains("Body marker"));
 }
 
 // ════════════════════════════════════════════════════════════
@@ -2750,4 +2762,110 @@ fn wave450_adapter_token_estimate_measures_the_returned_slice() {
     .unwrap();
     assert!(ex.next_offset.is_some());
     assert_eq!(ex.tokens_est, ex.markdown.len() / 4);
+}
+
+#[test]
+fn report_audit_pagination_caps_markers_and_reassembles_unicode_exactly() {
+    let text = format!(
+        "{}END\n\n{}",
+        "日本語 evidence ".repeat(70),
+        "tail ".repeat(60)
+    );
+    let mut offset = 0;
+    let mut rebuilt = String::new();
+    for _ in 0..100 {
+        let (slice, next) = paginate_public(&text, offset, 200);
+        assert!(slice.len() <= 200, "marker must fit the byte budget");
+        if let Some(next) = next {
+            assert!(next > offset && text.is_char_boundary(next));
+            rebuilt.push_str(slice.split("\n\n*[truncated : continue").next().unwrap());
+            offset = next;
+        } else {
+            rebuilt.push_str(&slice);
+            break;
+        }
+    }
+    assert_eq!(
+        rebuilt, text,
+        "continuations cannot omit or repeat evidence"
+    );
+}
+
+#[test]
+fn report_audit_tiny_pagination_never_overruns_or_loses_unicode() {
+    let text = "日本語 😀 evidence";
+    for cap in 4..60 {
+        let mut offset = 0;
+        let mut rebuilt = String::new();
+        loop {
+            let (slice, next) = paginate_public(text, offset, cap);
+            assert!(slice.len() <= cap);
+            rebuilt.push_str(slice.split("\n\n*[truncated : continue").next().unwrap());
+            match next {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(rebuilt, text);
+    }
+    assert_eq!(paginate_public(text, 0, 0), (String::new(), Some(0)));
+}
+
+#[test]
+fn report_audit_focus_fallback_retains_lead_table_and_source_order() {
+    let html = r#"<html><title>Company</title><script type="application/ld+json">{"author":{"name":"Contributors to Wikimedia projects"},"datePublished":"2006-08-01"}</script><body><article><p>Company founding funding valuation lead describes the company.</p><table><tr><th>Founder</th><th>Year</th></tr><tr><td>Ada</td><td>2021</td></tr><tr><td>Bob</td><td>2022</td></tr></table><h2>Funding</h2><p>Company founding funding valuation funding round one.</p><h2>History</h2><p>Company founding funding valuation history passage.</p></article></body></html>"#;
+    let options = ExtractOptions {
+        focus: Some("company founding funding valuation".into()),
+        ..Default::default()
+    };
+    let ex = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://en.wikipedia.org/wiki/Company",
+        &options,
+    )
+    .unwrap();
+    assert!(ex.markdown.contains("less than 20% saving"));
+    assert!(!ex.markdown.contains("Contributors to Wikimedia"));
+    for (earlier, later) in [
+        ("lead describes", "Ada"),
+        ("Ada", "round one"),
+        ("round one", "history passage"),
+    ] {
+        assert!(ex.markdown.find(earlier).unwrap() < ex.markdown.find(later).unwrap());
+    }
+    let other = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://example.com/",
+        &options,
+    )
+    .unwrap();
+    assert!(
+        other.markdown.contains("Contributors to Wikimedia"),
+        "host-specific metadata must not remove other authors"
+    );
+}
+
+#[test]
+fn report_audit_selector_cannot_be_ignored_by_json_or_pdf() {
+    for (body, ct) in [
+        (
+            b"{\"text\":\"real content\"}".as_slice(),
+            "application/json",
+        ),
+        (b"%PDF-1.7".as_slice(), "application/pdf"),
+    ] {
+        let opts = ExtractOptions {
+            selector: Some("article".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            extract(body, ct, "https://example.com/document", &opts),
+            Err(ExtractError::SelectorNoMatch { inspected: 0, .. })
+        ));
+    }
 }

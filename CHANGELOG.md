@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.5.2] - 2026-10-07
+
+### Fixed
+
+- Reddit tier-one retrieval overlaps JSON and session requests while retaining
+  public HTML/session recovery. Stack Overflow public question URLs gain an API
+  path for question, answers, comments and selected sections, with website
+  fallback on unavailable items, service errors or backoff.
+- CSS selectors fail closed across HTML, JSON, PDF and adapters. Invalid
+  selectors fail before a request. Original URLs are checked before adapter
+  rewriting, including credentials and private-network destinations.
+- Login, human CAPTCHA and soft-404 pages cannot become content through browser
+  timeout or extraction rescue. DOM headings and late SPA login forms are
+  inspected; public tutorials with example forms remain readable. Automatic
+  challenges retain their recovery paths.
+- Figma extraction ignores inactive error templates, asset names and bootstrap
+  data. Recovered script prose respects focus, section and probe controls.
+  Wikipedia keeps real attribution, infobox spacing and preformatted code.
+  Low-savings focus preserves the original lead and order. Pagination advances
+  by exact UTF-8 byte offsets without losing text at paragraph boundaries.
+- Parallel crawl workers reserve page and aggregate budgets atomically, wait
+  for in-flight discovery and requeue withheld pages for resume. Resume tokens
+  work without a repeated seed. Map mode returns an explicit URL inventory.
+  Source subsets retain reason/count metadata and cannot claim full completion
+  or overwrite full-content history.
+- Screenshot requests return a receipt on success, skip and failure. Saved PNGs
+  use private atomic files and match the inline image. Native mixed URL batches
+  retain successful siblings. Boxed MCP dispatch/fetch futures prevent the live
+  stack overflow found with large requests.
+- Search warns about weak query evidence across live, cached and provider paths
+  without discarding results. Results disclose source type, video labels and
+  requested/returned counts. Browser recovery overlaps HTTP retries; semantic
+  deadlines preserve retrieved lexical evidence.
+- HTTP/2 pools expire idle connections without shortening fresh-response
+  budgets. Archive indexes run concurrently and accept the first real capture;
+  an unreachable index cannot prove no snapshots exist. OCR image downloads
+  overlap, inference stays ordered, bitmap channels and decode limits are
+  checked, and elapsed telemetry includes OCR work.
+- Warm builds refresh Git provenance across branch commits, detached HEAD,
+  packed refs and linked worktrees. Local payload checks isolate cache and
+  configuration state instead of modifying the operator's cache.
+
 ### Changed
 
 - `web_fetch` rides your own IP by default: pool use is opt-in

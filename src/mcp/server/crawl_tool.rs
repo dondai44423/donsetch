@@ -273,10 +273,7 @@ pub(super) fn render_crawl_result(
                 .filter(|url| !rendered.contains(url.as_str()))
                 .collect::<Vec<_>>();
             if !remaining.is_empty() {
-                text.push_str("## Discovered URLs not fetched\n");
-                for url in remaining {
-                    text.push_str(&format!("- {url}\n"));
-                }
+                text.push_str(&format!("## Discovered URLs not fetched\n{} URLs; inventory is in structuredContent.map.\n", remaining.len()));
             }
         }
     }
@@ -288,11 +285,22 @@ pub(super) fn render_crawl_result(
         "pages": result.pages.iter().filter(|p| !p.duplicate).map(|p| json!({
             "url": p.url,
             "lastmod": p.lastmod,
+            "content_complete": p.next_offset.is_none() && p.partial.is_none(),
+            "partial": p.partial,
+            "next_offset": p.next_offset,
         })).collect::<Vec<_>>(),
         "stop": format!("{:?}", result.stop),
     });
     if requested_mode != CrawlMode::Content {
         structured["map"] = json!(result.map);
+    }
+    if requested_mode == CrawlMode::Map {
+        structured.as_object_mut().unwrap().remove("pages");
+        structured["mode"] = json!("map");
+        structured["discovered"] = json!(result.map.len());
+        if crawl_complete(result, requested_mode) {
+            structured["stop"] = json!("InventoryComplete");
+        }
     }
     if let Some(resume) = &result.resume {
         structured["resume"] = json!(resume);
@@ -312,6 +320,7 @@ pub(super) fn render_crawl_result(
             "title": p.title,
             "kind": format!("{:?}", p.kind),
             "chars": p.chars,
+            "next_offset": p.next_offset,
             "quality": p.quality,
             "duplicate": p.duplicate,
             "parent": p.parent,
@@ -385,6 +394,15 @@ pub(super) fn render_crawl_dataset(
         "complete": crawl_complete(result, requested_mode),
         "stop": format!("{:?}", result.stop),
     });
+    let partial_pages = result
+        .pages
+        .iter()
+        .filter(|p| !p.duplicate && (p.next_offset.is_some() || p.partial.is_some()))
+        .map(|p| json!({"url": p.url, "next_offset": p.next_offset, "partial": p.partial}))
+        .collect::<Vec<_>>();
+    if !partial_pages.is_empty() {
+        structured["partial_pages"] = json!(partial_pages);
+    }
     if requested_mode != CrawlMode::Content {
         structured["map"] = json!(result.map);
     }
@@ -492,6 +510,10 @@ fn crawl_complete(result: &crate::crawl::CrawlResult, mode: CrawlMode) -> bool {
             !result.map.is_empty()
         } else {
             (!result.pages.is_empty() || !result.skipped.is_empty())
+                && result
+                    .pages
+                    .iter()
+                    .all(|p| p.next_offset.is_none() && p.partial.is_none())
                 && result.skipped.iter().all(|(_, why)| {
                     why == "unchanged since last crawl" || why.contains("duplicate")
                 })
@@ -500,6 +522,50 @@ fn crawl_complete(result: &crate::crawl::CrawlResult, mode: CrawlMode) -> bool {
 
 #[cfg(test)]
 mod crawl_output_contract_tests {
+    #[test]
+    fn report_audit_inventory_does_not_bloat_content_and_partial_pages_are_honest() {
+        let mut result = dataset_fixture();
+        result.map = (0..1000)
+            .map(|i| format!("https://example.com/page/{i}"))
+            .collect();
+        result.stop = StopReason::FrontierEmpty;
+        result.pages[0].next_offset = Some(400);
+        let content = render_crawl_result(&result, CrawlMode::Full, false);
+        assert!(content["content"][0]["text"].as_str().unwrap().len() < 1000);
+        assert_eq!(content["structuredContent"]["complete"], false);
+        assert_eq!(content["structuredContent"]["pages"][0]["next_offset"], 400);
+        let dataset = render_crawl_result(&result, CrawlMode::Full, true);
+        assert_eq!(
+            dataset["structuredContent"]["partial_pages"][0]["next_offset"],
+            400
+        );
+        result.pages[0].next_offset = None;
+        result.pages[0].partial = Some(crate::extract::PartialContent {
+            reason: "source returned a subset",
+            items_found: 3,
+            items_total: Some(20),
+        });
+        let subset = render_crawl_result(&result, CrawlMode::Full, false);
+        assert_eq!(subset["structuredContent"]["complete"], false);
+        assert_eq!(
+            subset["structuredContent"]["pages"][0]["content_complete"],
+            false
+        );
+        assert_eq!(
+            subset["structuredContent"]["pages"][0]["partial"]["items_total"],
+            20
+        );
+        let subset_data = render_crawl_result(&result, CrawlMode::Full, true);
+        assert_eq!(
+            subset_data["structuredContent"]["partial_pages"][0]["partial"]["items_found"],
+            3
+        );
+        let map = render_crawl_result(&result, CrawlMode::Map, false);
+        assert!(map["structuredContent"].get("pages").is_none());
+        assert_eq!(map["structuredContent"]["discovered"], 1000);
+        assert_eq!(map["structuredContent"]["stop"], "InventoryComplete");
+    }
+
     use super::render_crawl_result;
     use crate::crawl::{CrawlMode, CrawlPage, CrawlResult, StopReason};
     use crate::extract::ContentKind;
@@ -541,6 +607,8 @@ mod crawl_output_contract_tests {
             title: "Evidence page".into(),
             kind: ContentKind::Article,
             markdown: "# Evidence page\nhttps://example.com/docs/page\n\nUseful evidence.".into(),
+            next_offset: None,
+            partial: None,
             chars: 16,
             quality: 0.93,
             duplicate: false,
@@ -617,6 +685,8 @@ mod crawl_output_contract_tests {
             title: title.into(),
             kind: crate::extract::ContentKind::Article,
             markdown: md.into(),
+            next_offset: None,
+            partial: None,
             chars: md.len(),
             quality: 0.9,
             duplicate: dup,

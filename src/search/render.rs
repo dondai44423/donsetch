@@ -269,6 +269,10 @@ pub fn render_compact_markdown(
             index + 1,
             result.title
         ));
+        let kind = rank::source_type(&result.url);
+        if kind != "web" {
+            markdown.push_str(&format!(" · {kind}"));
+        }
         // Report how many search-index families returned this URL,
         // using the same count as ranking. This is retrieval agreement,
         // not independent corroboration of the page's claims.
@@ -293,7 +297,7 @@ pub fn render_compact_markdown(
     if out.results.is_empty() {
         markdown.push_str("No results. Retry once with a materially different formulation.\n");
     } else if out.weak {
-        markdown.push_str("Weak results : low cross-index agreement.\n");
+        markdown.push_str("Weak results : low query relevance or cross-index agreement.\n");
     }
 
     let unavailable = out

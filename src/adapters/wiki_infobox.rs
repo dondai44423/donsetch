@@ -163,7 +163,10 @@ fn field_value(td: ElementRef) -> String {
     let mut out = String::new();
     for child in td.children() {
         match child.value() {
-            scraper::Node::Text(t) => out.push_str(&t.text),
+            scraper::Node::Text(t) => {
+                out.push(' ');
+                out.push_str(&t.text);
+            }
             scraper::Node::Element(el) => {
                 let c = match ElementRef::wrap(child) {
                     Some(c) => c,
@@ -181,7 +184,10 @@ fn field_value(td: ElementRef) -> String {
                             .collect();
                         out.push_str(&items.join("; "));
                     }
-                    _ => out.push_str(&plain_text(c)),
+                    _ => {
+                        out.push(' ');
+                        out.push_str(&plain_text(c));
+                    }
                 }
             }
             _ => {}
@@ -202,7 +208,7 @@ fn field_value(td: ElementRef) -> String {
 fn plain_text(el: ElementRef) -> String {
     // Visible text only: a script/style subtree inside the element is
     // source, not content (#288).
-    inline::visible_text_raw(el).trim().to_string()
+    inline::visible_text(el)
 }
 
 /// Page furniture, checked on the element itself (selecting
@@ -260,7 +266,7 @@ pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &Extract
                 }
             }
             "pre" => {
-                let code = plain_text(el);
+                let code = inline::visible_text_raw(el).trim().to_string();
                 if !code.is_empty() {
                     let fence = crate::extract::render::code_fence(&code);
                     out.push_str(&format!("{fence}\n{code}\n{fence}\n\n"));
@@ -315,6 +321,17 @@ fn render_wiki_table(table: ElementRef, url: &str, opts: &ExtractOptions, out: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_audit_infobox_keeps_name_and_date_boundaries() {
+        let html = Html::parse_fragment(
+            "<table><tr><td><span>January</span><span>26</span>, <span>2021</span><br><a>Ada Amodei</a><a>Bob Amodei</a><sup>[2]</sup></td></tr></table>",
+        );
+        let cell = html.select(&Selector::parse("td").unwrap()).next().unwrap();
+        let value = field_value(cell);
+        assert!(value.contains("January 26") && value.contains("Ada Amodei Bob Amodei"));
+        assert!(!value.contains("[2]"));
+    }
+
     use super::*;
 
     fn opts() -> ExtractOptions {

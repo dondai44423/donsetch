@@ -359,15 +359,53 @@ pub async fn ghost_fetch(
     url: &str,
     timeout: Duration,
 ) -> Result<GhostPage, FetchError> {
-    tokio::time::timeout(timeout, ghost_fetch_inner(ghost, url, timeout))
-        .await
-        .map_err(|_| FetchError::ghost("browser pass deadline exceeded before usable content"))?
+    let started = Instant::now();
+    let mut last_html = String::new();
+    match tokio::time::timeout(
+        timeout,
+        ghost_fetch_inner(ghost, url, timeout, &mut last_html),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // A CDP call can consume the final poll's budget. Preserve the
+            // wall we actually observed instead of replacing it with an
+            // uninformative navigation timeout. A content DOM still requires
+            // the normal settle oracle; timeout never upgrades it to success.
+            let verdict = walls::detect_dom_smart(last_html.as_bytes());
+            if matches!(
+                verdict,
+                Verdict::Challenge(_)
+                    | Verdict::Blocked
+                    | Verdict::AuthWall
+                    | Verdict::SoftNotFound
+            ) {
+                let vendor = match verdict {
+                    Verdict::Challenge(v) => Some(format!("{v:?}").to_lowercase()),
+                    _ => None,
+                };
+                Ok(GhostPage {
+                    html: last_html,
+                    cookies: Vec::new(),
+                    vendor,
+                    captcha: matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked),
+                    took: started.elapsed(),
+                })
+            } else {
+                Err(FetchError::ghost(
+                    "browser pass deadline exceeded before usable content",
+                ))
+            }
+        }
+    }
 }
 
 async fn ghost_fetch_inner(
     ghost: &mut Ghost,
     url: &str,
     timeout: Duration,
+    last_html: &mut String,
 ) -> Result<GhostPage, FetchError> {
     let start = Instant::now();
     tokio::time::timeout(timeout, ghost.navigate(url))
@@ -388,7 +426,7 @@ async fn ghost_fetch_inner(
     let mut settle_streak = 0u8;
     let mut dead_streak = 0u32; // consecutive polls: DOM static + visible < 80
     let mut prev_len = 0usize;
-    let mut html = String::new();
+    let html = last_html;
 
     while start.elapsed() < timeout {
         let poll = if start.elapsed() > Duration::from_secs(5) {
@@ -397,7 +435,7 @@ async fn ghost_fetch_inner(
             200
         };
         tokio::time::sleep(Duration::from_millis(poll)).await;
-        html = match ghost.outer_html().await {
+        *html = match ghost.outer_html().await {
             Ok(h) => h,
             Err(e) => {
                 if crate::config::cfg().debug.ghost {
@@ -430,7 +468,7 @@ async fn ghost_fetch_inner(
                 || lower.contains("px-captcha"))
         {
             return Ok(GhostPage {
-                html,
+                html: std::mem::take(html),
                 cookies: Vec::new(),
                 vendor,
                 captcha: true,
@@ -447,6 +485,15 @@ async fn ghost_fetch_inner(
         // detect_dom_smart checks visible text first: ≥ 80 visible
         // chars = real content, skip challenge check.
         let verdict = walls::detect_dom_smart(html.as_bytes());
+        if matches!(verdict, Verdict::AuthWall | Verdict::SoftNotFound) {
+            return Ok(GhostPage {
+                html: std::mem::take(html),
+                cookies: Vec::new(),
+                vendor,
+                captcha: false,
+                took: start.elapsed(),
+            });
+        }
         let challenged = matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked);
         if challenged {
             if vendor.is_none()
@@ -570,7 +617,7 @@ async fn ghost_fetch_inner(
         // below that, one scroll kick fires to trigger lazy
         // hydration (infinite scroll + viewport-gated render).
         let big_dom = cur_len >= 50_000;
-        let visible = visible_text_len(&html);
+        let visible = visible_text_len(html);
         // An interstitial is never substantive, however much vendor
         // boilerplate it renders: settling on "Verifying your
         // browser…" shipped the challenge page as content (issue
@@ -597,7 +644,7 @@ async fn ghost_fetch_inner(
                         .unwrap_or_default();
                 ghost.touch();
                 return Ok(GhostPage {
-                    html,
+                    html: std::mem::take(html),
                     cookies,
                     vendor,
                     captcha: false,
@@ -670,7 +717,7 @@ async fn ghost_fetch_inner(
             );
         }
         return Ok(GhostPage {
-            html,
+            html: std::mem::take(html),
             cookies: Vec::new(),
             vendor,
             captcha: true,
@@ -684,7 +731,7 @@ async fn ghost_fetch_inner(
         .unwrap_or_default();
     ghost.touch();
     Ok(GhostPage {
-        html,
+        html: std::mem::take(html),
         cookies,
         vendor,
         captcha: false,
