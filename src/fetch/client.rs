@@ -943,9 +943,11 @@ impl Fetcher {
         // Basic auth from URL userinfo (user:pass@host). The url
         // crate strips userinfo from the authority we send in the
         // Host header (correct per RFC 3986), so we carry the
-        // credentials as an Authorization: Basic header, matching
-        // browser behavior. Without this, every tier-1 request to
-        // a basic-auth URL goes out unauthenticated (issue #15).
+        // credentials as an Authorization: Basic header (issue #15).
+        // NOTE: `validate_url_basic` refuses URLs carrying userinfo
+        // ("URL contains credentials : SSRF guard") before any dial, so
+        // this branch is unreachable through the gated fetch/browser
+        // tiers today: the guard is the credentials policy.
         if !url.username().is_empty() {
             let credentials = match url.password() {
                 Some(pass) => format!("{}:{}", url.username(), pass),
