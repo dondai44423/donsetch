@@ -217,22 +217,64 @@ async fn run_one_err(ep: &str, url: &str, dir: &std::path::Path) -> BypassFail {
 #[tokio::test]
 async fn timeout_never_replays_a_paid_post() {
     let dir = crate::sandbox().join("timeout-unlock");
-    let (ep, hits) = spin(|_| {
-        std::thread::sleep(std::time::Duration::from_millis(150));
+    // The handler parks the response until the test releases it:
+    // once the POST is read, the deadline fires first by
+    // construction. Load can stretch dispatch (counter fsync,
+    // client build, connect) but can never turn a parked response
+    // into an early one. The accept loop serves one connection at a
+    // time, so a replayed POST queues in the backlog and is counted
+    // the moment the loop comes back around for it.
+    let release = Arc::new(AtomicBool::new(false));
+    let release2 = release.clone();
+    let (ep, hits) = spin(move |_| {
+        while !release2.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         "200\n\n{\"status_code\":200,\"body\":\"done\"}".into()
     });
     let mut cfg = cfg_with_endpoint(&ep);
-    cfg.timeout = std::time::Duration::from_millis(40);
+    // At 40 ms, a loaded runner once timed the call out before the
+    // POST registered and this test misread it as a replay (CI run
+    // 37812389905). Dispatch is milliseconds of work; 5 s makes the
+    // dispatch race implausible on any runner.
+    cfg.timeout = std::time::Duration::from_millis(5000);
     let err = unlock("test-tok", "https://example.com/slow", &cfg, &dir)
         .await
         .unwrap_err();
     assert!(matches!(err, BypassFail::Network(_)), "{err}");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The POST must have registered before the deadline: exactly one
+    // arrival, or nothing about replays can be observed.
+    let observe = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut seen = hits.load(Ordering::SeqCst);
+    while seen < 1 && std::time::Instant::now() < observe {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        seen = hits.load(Ordering::SeqCst);
+    }
+    assert_eq!(
+        seen, 1,
+        "the paid POST must register exactly once (0 = the deadline raced dispatch on this host)"
+    );
+    // Release the parked response; the client is long gone, so any
+    // later arrival is a replay. One would dial now or on the
+    // ladder's 800 ms backoff; hold past both windows and demand a
+    // single arrival, ever.
+    release.store(true, Ordering::SeqCst);
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < quiet_until && hits.load(Ordering::SeqCst) == 1 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,
         "a dispatched POST cannot be blindly replayed"
     );
+    // The billing-side receipt: a replay reserves a second daily
+    // unit before it dials.
+    let counter: u32 = std::fs::read_to_string(donsetch::fetch::bypass::bypass_count_path(&dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    assert_eq!(counter, 1, "a deadline hit must not reserve a replay");
 }
 
 #[tokio::test]
