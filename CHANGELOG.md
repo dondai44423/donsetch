@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A JSON data endpoint is terminal at the HTTP tier: a `.json` URL or a
+  JSON response is fetched over plain HTTP at every tier, never routed
+  into a browser pass, and a refusal on one no longer marks the whole
+  domain walled (which used to poison the route for the human-facing
+  pages too). Live reddit `.json` on tier=auto went from 23.9s (20.5s of
+  it a browser pass after the session retry had already returned the
+  payload) to 4.0s; on tier=2 from a 20.5s deadline error to 3.9s. HTML
+  pages and tier-1 JSON fetches measure unchanged.
+
+- The decoy-equivalence (anti-cloak) probe skips JSON endpoints and PDF
+  responses: the comparison needs a browser-readable document, and a
+  data payload is not one.
+
 - A browser pass that hits its deadline before usable content now says
   exactly that, with deadline/tier advice, instead of telling the agent to
   check the network for a fault that is not there.

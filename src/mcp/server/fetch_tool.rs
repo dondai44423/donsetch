@@ -1113,18 +1113,22 @@ fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) ->
 // Reddit adapter/session recovery earns an HTTP recheck after initialization.
 // Its saved wall memory must not skip that recovery. Other hosts retain their
 // learned cooldown; explicit browser requests keep precedence.
+// v4.7 V03: JSON data endpoints (reddit `.json`, API dumps) are always Cold:
+// like PDFs, a browser pass cannot improve a raw payload.
 fn fetch_route(
     state: &crate::ghost::cache::GhostState,
     host: &str,
     tier: &str,
     is_pdf_url: bool,
+    is_json_url: bool,
     adapter_host: bool,
     retry_http: bool,
 ) -> RouteDecision {
-    if tier == "2" && !is_pdf_url && !adapter_host {
+    if tier == "2" && !is_pdf_url && !is_json_url && !adapter_host {
         RouteDecision::SkipToSolve
     } else if tier == "1"
         || is_pdf_url
+        || is_json_url
         || adapter_host
         || (retry_http && matches!(host, "www.reddit.com" | "reddit.com"))
     {
@@ -1382,6 +1386,11 @@ async fn fetch_single_inner(
     // `.pdf` suffix and the `/pdf/` path convention (arXiv serves
     // PDFs at /pdf/1706.03762 with no extension).
     let is_pdf_url = is_pdf_url_like(&url);
+    // v4.7 V03: JSON data endpoints (`reddit .json`, API dumps) are
+    // terminal at the HTTP tier : a browser cannot improve a
+    // structured payload. Same class PDFs and adapter endpoints
+    // already follow.
+    let is_json_url = is_json_url_like(&url);
 
     // === Decision: how to route this fetch? ===
     // The self-improving loop: the domain profile decides
@@ -1435,7 +1444,15 @@ async fn fetch_single_inner(
     let (route, known_walled) = {
         let state = daemon.state.lock().await;
         (
-            fetch_route(&state, &host, tier, is_pdf_url, adapter_host, retry_http),
+            fetch_route(
+                &state,
+                &host,
+                tier,
+                is_pdf_url,
+                is_json_url,
+                adapter_host,
+                retry_http,
+            ),
             state.is_known_walled(&host),
         )
     };
@@ -1637,8 +1654,10 @@ async fn fetch_single_inner(
                 // the fallback retry, and every later fetch, around
                 // tier 1 entirely. The fallback below re-probes the
                 // caller's URL itself; its own verdict is what
-                // records a wall.
-                Verdict::Challenge(_) if adapter_host => {}
+                // records a wall. v4.7 V03: the same holds for any
+                // JSON data endpoint : a `.json` challenge says
+                // nothing about the human-facing pages.
+                Verdict::Challenge(_) if adapter_host || is_json_url || is_json_endpoint(o) => {}
                 Verdict::Challenge(_) => {
                     state.record_failure(&host, crate::ghost::cache::FailClass::Block);
                     if is_warm {
@@ -1653,8 +1672,12 @@ async fn fetch_single_inner(
                         state.record_cold_walled(&host, vendor.as_deref());
                     }
                 }
-                // API access does not prove the original website wall cleared.
-                Verdict::ContentOk if adapter_host => state.record_fetch(&host),
+                // API access does not prove the original website wall
+                // cleared (v4.7 V03: nor does a JSON endpoint's success :
+                // the data lane teaches counters, not page routing).
+                Verdict::ContentOk if adapter_host || is_json_url || is_json_endpoint(o) => {
+                    state.record_fetch(&host)
+                }
                 Verdict::ContentOk => {
                     if is_warm {
                         // Warm succeeded : refresh the cookie vault (write-back).
@@ -1674,6 +1697,12 @@ async fn fetch_single_inner(
             }
         }
     }
+
+    // v4.7 V03: JSON data endpoints are terminal at the HTTP tier.
+    // The `.json` name or a JSON content type means a structured
+    // payload : a browser pass cannot improve it, it must not gate
+    // the verdict, and it must not trigger a decoy comparison.
+    let json_like = is_json_url || out.as_ref().is_some_and(is_json_endpoint);
 
     // === Verdict gate: everything except ContentOk/Challenge ===
     // is a terminal, legitimate response : clean error, no ghost.
@@ -1717,7 +1746,11 @@ async fn fetch_single_inner(
             _ if reddit_session_retry_eligible(&o.verdict, &host, args) => {
                 return reddit_session_fallback(daemon, args, &url, &mut trace, call).await;
             }
+            // v4.7 V03: a refused JSON data endpoint is terminal too :
+            // an honest wall error outranks a browser pass on a
+            // payload a browser cannot improve.
             _ if tier != "1"
+                && !json_like
                 && crate::detect::walls::browser_recovery(
                     o.status, &o.headers, &o.body, o.verdict,
                 ) => {}
@@ -1996,6 +2029,7 @@ async fn fetch_single_inner(
     }
     let need_ghost = !is_pdf_content
         && !adapter_host // adapter endpoints (reddit .json, registry APIs) are plain GETs
+        && !json_like // v4.7 V03: JSON data endpoints never escalate
         && ((challenge && tier != "1" && !is_small_404)
             || skip_tier1
             || (still_thin && tier == "auto" && !is_small_404)
@@ -2396,7 +2430,18 @@ async fn fetch_single_inner(
     let mut cloak_warning: Option<String> = None;
     // Compare suspicious HTTP-only content once. A recovery already observed
     // this browser document, and explicit tier 1 must not launch a browser.
-    if known_walled && !adapter_host && !skip_tier1 && !is_warm && !need_ghost && tier != "1" {
+    // v4.7 V03: JSON data endpoints and PDFs are terminal at the HTTP
+    // tier : the equivalence comparison needs a browser-readable
+    // document, and a data payload is not one.
+    if known_walled
+        && !adapter_host
+        && !skip_tier1
+        && !is_warm
+        && !need_ghost
+        && !json_like
+        && !is_pdf_content
+        && tier != "1"
+    {
         let started = std::time::Instant::now();
         trace.step("2", "anti-cloak", "started", 0);
         let outcome = match anticloak_check(daemon, &url, &ex.markdown, budget, &call.route).await {
@@ -3227,6 +3272,29 @@ pub(super) fn is_pdf_url_like(url: &str) -> bool {
     let path_part = no_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
     let segs: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
     segs.contains(&"pdf") || path_part.ends_with("/pdf")
+}
+
+/// v4.7 V03: JSON data-endpoint URL check : the path names a `.json`
+/// document (reddit `.json`, API dumps; query and fragment stripped,
+/// case-insensitive). A structured payload is terminal at the HTTP
+/// tier : a browser cannot improve it.
+pub(super) fn is_json_url_like(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
+    path.ends_with(".json")
+}
+
+/// A response whose content type declares JSON (application/json,
+/// application/ld+json, application/problem+json, ...).
+fn ct_is_json(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && value.to_lowercase().contains("json")
+    })
+}
+
+/// A fetched outcome that is a JSON data endpoint : its URL names a
+/// `.json` document or the response itself is JSON.
+fn is_json_endpoint(o: &crate::fetch::client::FetchOutcome) -> bool {
+    is_json_url_like(&o.url) || ct_is_json(&o.headers)
 }
 
 /// v2: fetch with an action script : navigate, act (click /
@@ -5651,48 +5719,90 @@ mod adapter_hop_tests {
             },
         );
         assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, false),
+            fetch_route(&state, host, "auto", false, false, false, false),
             RouteDecision::SkipToSolve
         ));
         assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, true),
+            fetch_route(&state, host, "auto", false, false, false, true),
             RouteDecision::Cold
         ));
         let profile = state.profiles.get_mut(host).unwrap();
         profile.wall_fail_streak = 2;
         profile.last_wall_fail = now;
         assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, false),
+            fetch_route(&state, host, "auto", false, false, false, false),
             RouteDecision::SolveCooldown(_)
         ));
         assert!(matches!(
-            fetch_route(&state, host, "auto", false, false, true),
+            fetch_route(&state, host, "auto", false, false, false, true),
             RouteDecision::Cold
         ));
         state
             .profiles
             .insert("stackoverflow.com".into(), state.profiles[host].clone());
         assert!(matches!(
-            fetch_route(&state, "stackoverflow.com", "auto", false, false, true),
+            fetch_route(
+                &state,
+                "stackoverflow.com",
+                "auto",
+                false,
+                false,
+                false,
+                true
+            ),
             RouteDecision::SolveCooldown(_)
         ));
         // Explicit browser requests and other remembered walls keep their route.
         assert!(matches!(
-            fetch_route(&state, host, "2", false, false, true),
+            fetch_route(&state, host, "2", false, false, false, true),
             RouteDecision::SkipToSolve
         ));
         assert!(matches!(
-            fetch_route(&state, host, "1", false, false, false),
+            fetch_route(&state, host, "1", false, false, false, false),
             RouteDecision::Cold
         ));
         assert!(matches!(
-            fetch_route(&state, host, "2", true, false, false),
+            fetch_route(&state, host, "2", true, false, false, false),
             RouteDecision::Cold
         ));
         assert!(matches!(
-            fetch_route(&state, host, "auto", false, true, false),
+            fetch_route(&state, host, "auto", false, false, true, false),
             RouteDecision::Cold
         ));
+        // v4.7 V03: JSON data endpoints are terminal at the HTTP tier
+        // : tier 2 stays Cold and a learned wall never skips tier 1.
+        assert!(matches!(
+            fetch_route(&state, host, "2", false, true, false, false),
+            RouteDecision::Cold
+        ));
+        assert!(matches!(
+            fetch_route(&state, host, "auto", false, true, false, false),
+            RouteDecision::Cold
+        ));
+    }
+
+    #[test]
+    fn json_endpoints_are_detected_by_url_and_content_type() {
+        assert!(is_json_url_like("https://api.example.com/items.json"));
+        assert!(is_json_url_like("https://www.reddit.com/r/rust.json"));
+        assert!(is_json_url_like("https://api.example.com/items.JSON?v=2"));
+        assert!(is_json_url_like("https://api.example.com/items.json#frag"));
+        assert!(!is_json_url_like("https://api.example.com/json"));
+        assert!(!is_json_url_like("https://api.example.com/items.jsonl"));
+        assert!(!is_json_url_like("https://api.example.com/docs.json/page"));
+        let json_ct = vec![(
+            "content-type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )];
+        assert!(ct_is_json(&json_ct));
+        let problem = vec![(
+            "Content-Type".to_string(),
+            "application/problem+json".to_string(),
+        )];
+        assert!(ct_is_json(&problem));
+        let html = vec![("content-type".to_string(), "text/html".to_string())];
+        assert!(!ct_is_json(&html));
+        assert!(!ct_is_json(&[]));
     }
 
     // #287: a challenge (or any non-content verdict) on an adapter

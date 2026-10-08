@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Read one URL or a deliberate URL batch as source markdown. Use search to discover URLs and crawl for multiple pages from one site. Prefer the smallest view that can supply the required evidence, and continue only from returned continuation state. Do not repeat a successful read unless it was thin, truncated, or failed. Automatic acquisition may use HTTP, a browser, an adapter, PDF extraction, or an archive. Failures are returned, not thrown : ok:false + code + next_action in the envelope (codes: network.*, browser.*, wall.*, content.*, tls.*, selector.*, guard.ssrf, deadline.hit, *.invalid). Treat ok=false, content_ok=false, thin=true, or a stable error code as unresolved; follow next_action or choose another source. Cite the returned source URL.",
+      "description": "Read one URL or a deliberate URL batch as source markdown. Use search to discover URLs and crawl for multiple pages from one site. Prefer the smallest view that can supply the required evidence, and continue only from returned continuation state. Do not repeat a successful read unless it was thin, truncated, or failed. Automatic acquisition may use HTTP, a browser, an adapter, PDF extraction, or an archive. JSON endpoints (`.json`, application/json) never leave plain HTTP. Failures are returned, not thrown : ok:false + code + next_action in the envelope (codes: network.*, browser.*, wall.*, content.*, tls.*, selector.*, guard.ssrf, deadline.hit, *.invalid). Treat ok=false, content_ok=false, thin=true, or a stable error code as unresolved; follow next_action or choose another source. Cite the returned source URL.",
       "inputSchema": {
         "properties": {
           "actions": {
