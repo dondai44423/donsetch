@@ -1039,10 +1039,15 @@ impl Fetcher {
                     {
                         crate::transport::routes::absorb_alt_svc(&origin, hdr_alt, "direct");
                     }
-                    self.pool
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .put_h2(&origin, conn);
+                    // A GOAWAY'd connection delivered this stream but
+                    // must never carry another: drop it instead of
+                    // pooling (RFC 9113 §6.8 drain semantics).
+                    if !conn.is_draining() {
+                        self.pool
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .put_h2(&origin, conn);
+                    }
                     return Ok(out);
                 }
                 Err(_) => { /* conn died; drop it and go fresh */ }
@@ -1244,10 +1249,12 @@ impl Fetcher {
             let out = self
                 .h2_request(&mut conn, authority, path, req_headers, false)
                 .await?;
-            self.pool
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .put_h2(origin, conn);
+            if !conn.is_draining() {
+                self.pool
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .put_h2(origin, conn);
+            }
             Ok(out)
         } else {
             let resp = tokio::time::timeout(

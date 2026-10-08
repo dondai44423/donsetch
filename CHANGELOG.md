@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HTTP/2 GOAWAY no longer aborts a response mid-flight: the client reads
+  the frame's last-stream-id, lets the in-flight stream at or below it
+  finish (the graceful-shutdown handshake real servers send), refuses new
+  streams on the draining connection, and keeps it out of the pool.
+
 - Cookies without a Path attribute stay inside the request directory: the jar
   derives the RFC 6265 default-path from the request URI, so a cookie set at
   /app/login no longer rides every path of the domain, and an empty or

@@ -546,3 +546,63 @@ async fn stealth_v3_h2_large_request_fields_are_fragmented_on_the_same_stream() 
     );
     finish(server).await;
 }
+
+#[tokio::test]
+async fn stealth_v3_h2_graceful_goaway_lets_the_inflight_stream_finish() {
+    let (mut conn, server) = fixture(
+        BrowserProfile::chrome_150(Platform::Linux),
+        |mut tls| async move {
+            // Two-phase graceful shutdown: the first GOAWAY vouches the
+            // whole stream space, so the in-flight stream still finishes.
+            write_frame(&mut tls, HEADERS, FLAG_END_HEADERS, 1, &[0x88])
+                .await
+                .unwrap();
+            write_frame(&mut tls, DATA, 0, 1, b"part-").await.unwrap();
+            let mut goaway = [0u8; 8];
+            goaway[0..4].copy_from_slice(&0x7fff_ffffu32.to_be_bytes());
+            write_frame(&mut tls, GOAWAY, 0, 0, &goaway).await.unwrap();
+            write_frame(&mut tls, DATA, FLAG_END_STREAM, 1, b"rest")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+        },
+    )
+    .await;
+    let response = conn.get("localhost", "/drain", &[]).await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"part-rest");
+    assert!(
+        conn.is_draining(),
+        "a GOAWAY'd connection must never return to the pool"
+    );
+    assert!(
+        conn.get("localhost", "/after", &[]).await.is_err(),
+        "a draining connection must refuse a new stream"
+    );
+    finish(server).await;
+}
+
+#[tokio::test]
+async fn stealth_v3_h2_goaway_below_the_stream_aborts_the_response() {
+    let (mut conn, server) = fixture(
+        BrowserProfile::chrome_150(Platform::Linux),
+        |mut tls| async move {
+            write_frame(&mut tls, HEADERS, FLAG_END_HEADERS, 1, &[0x88])
+                .await
+                .unwrap();
+            write_frame(&mut tls, DATA, 0, 1, b"part-").await.unwrap();
+            // last-stream-id 0 < stream 1: the peer will not process it.
+            let goaway = [0u8; 8];
+            write_frame(&mut tls, GOAWAY, 0, 0, &goaway).await.unwrap();
+            tls.flush().await.unwrap();
+        },
+    )
+    .await;
+    let error = conn
+        .get("localhost", "/gone", &[])
+        .await
+        .err()
+        .expect("a GOAWAY below the stream must abort the response");
+    assert!(format!("{error:?}").contains("goaway"), "{error:?}");
+    finish(server).await;
+}

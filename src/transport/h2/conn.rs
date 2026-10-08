@@ -41,6 +41,10 @@ pub struct H2Conn {
     peer_frame_size: usize,
     peer_header_list_limit: usize,
     peer_concurrency: u32,
+    /// The peer sent GOAWAY (RFC 9113 §6.8). A stream at or below its
+    /// last-stream-id may still finish; no new stream may open, and the
+    /// connection must never return to the pool.
+    draining: bool,
 }
 
 impl H2Conn {
@@ -112,6 +116,7 @@ impl H2Conn {
             peer_frame_size: DEFAULT_MAX_FRAME_SIZE,
             peer_header_list_limit: usize::MAX,
             peer_concurrency: u32::MAX,
+            draining: false,
         })
     }
 
@@ -129,6 +134,12 @@ impl H2Conn {
         let _ = self.stream.flush().await;
     }
 
+    /// True once the peer sent GOAWAY: the current stream may finish,
+    /// but the connection accepts no new stream and must not be pooled.
+    pub fn is_draining(&self) -> bool {
+        self.draining
+    }
+
     /// One GET at a time; connection pooling reuses completed serial streams.
     pub async fn get(
         &mut self,
@@ -141,6 +152,9 @@ impl H2Conn {
             return Err(FetchError::Http(
                 "h2: peer cannot accept a new stream".into(),
             ));
+        }
+        if self.draining {
+            return Err(FetchError::Http("h2: connection is draining".into()));
         }
         self.next_stream += 2;
 
@@ -361,7 +375,21 @@ impl H2Conn {
                     return Err(FetchError::Http(format!("h2 rst_stream on {stream_id}")));
                 }
                 GOAWAY => {
-                    return Err(FetchError::Http("h2 goaway".into()));
+                    // RFC 9113 §6.8: payload is last-stream-id + error
+                    // code. A graceful shutdown first sends
+                    // GOAWAY(2^31-1) so in-flight streams still complete,
+                    // then lowers the bound. Only a bound below this
+                    // stream makes the response undeliverable.
+                    let last = match payload.get(..4) {
+                        Some(b) => u32::from_be_bytes([b[0] & 0x7f, b[1], b[2], b[3]]),
+                        // read_frame already rejects short GOAWAY
+                        // payloads; fail closed if that ever changes.
+                        None => 0,
+                    };
+                    if last < stream_id {
+                        return Err(FetchError::Http("h2 goaway".into()));
+                    }
+                    self.draining = true;
                 }
                 PUSH_PROMISE => {
                     return Err(FetchError::Http("h2: push despite ENABLE_PUSH=0".into()));
