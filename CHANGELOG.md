@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A small scripted page shell keeps its hydration window: the
+  browser-settle dead-DOM early exit no longer fires before the same
+  floor the settle gate honors, so a shell that hydrates at ~2.5s is no
+  longer killed 0.14s before its own script runs and read back as
+  incomplete.
+
 - Crawl pages present the same language identity as web_fetch and the
   ghost for the same host: a host with a persona speaks the persona's
   Accept-Language on crawl requests too, instead of falling back to the

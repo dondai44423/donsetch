@@ -736,7 +736,19 @@ async fn ghost_fetch_inner(
         // Adaptive threshold: tiny DOMs (< 5KB) exit faster (8 polls
         // ≈ 1.6s early / 4s late) : a 2KB DOM with 0 visible chars is
         // clearly dead. Larger DOMs get 15 polls (≈ 3s / 7.5s).
-        if prev_len > 0 && visible < 80 && cur_len.abs_diff(prev_len) < 100 {
+        //
+        // v4.6: the hydration floor gates this exit too. A small
+        // SCRIPTED shell (< 50KB with JS) is the shape that hydrates
+        // late; the settle gate above already holds its 4s floor, and
+        // letting the dead exit fire inside that window killed a shell
+        // 0.14s before its own script ran (Incomplete, dom=0KB). Large
+        // and scriptless DOMs keep floor ZERO, so the early-exit saving
+        // is untouched where it was earned.
+        if start.elapsed() >= min_settle
+            && prev_len > 0
+            && visible < 80
+            && cur_len.abs_diff(prev_len) < 100
+        {
             dead_streak += 1;
         } else {
             dead_streak = 0;
