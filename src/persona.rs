@@ -122,10 +122,7 @@ fn env_tz() -> String {
     } else {
         Some(configured)
     };
-    candidate
-        .map(|t| t.trim().to_string())
-        .filter(|t| t.contains('/') && !t.contains(char::is_whitespace))
-        .unwrap_or_else(|| "UTC".to_string())
+    sanitize_tz(candidate.as_deref().unwrap_or_default())
 }
 
 /// Persona locale: LANG/LC_ALL ("en_US.UTF-8" -> "en-US"), else en-US.
@@ -270,6 +267,26 @@ pub(crate) fn sanitize_locale(raw: &str) -> String {
     }
 }
 
+/// Fail-closed timezone sanitizer for the wire/launch path: a corrupt
+/// on-disk persona or a hostile `persona.timezone` / TZ value must
+/// never reach the browser process environment. Shape: an IANA
+/// area/city pair; anything else falls back to UTC.
+pub(crate) fn sanitize_tz(raw: &str) -> String {
+    let candidate = raw.trim();
+    let shape_ok = !candidate.is_empty()
+        && candidate.len() <= 64
+        && candidate.contains('/')
+        && !candidate.contains(char::is_whitespace)
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'));
+    if shape_ok {
+        candidate.to_string()
+    } else {
+        "UTC".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +412,18 @@ mod tests {
         assert_eq!(sanitize_locale("en-US,fr"), "en-US");
         assert_eq!(sanitize_locale(""), "en-US");
         assert_eq!(sanitize_locale("EN-us"), "en-US", "canonical case");
+    }
+
+    #[test]
+    fn sanitize_tz_gates_the_launch_value() {
+        assert_eq!(sanitize_tz("Europe/Berlin"), "Europe/Berlin");
+        assert_eq!(sanitize_tz(" America/New_York "), "America/New_York");
+        assert_eq!(sanitize_tz("Etc/GMT+5"), "Etc/GMT+5");
+        // Hostile or shapeless input falls back, never reaching the
+        // browser environment.
+        assert_eq!(sanitize_tz("Europe/Berlin\nTZ=x"), "UTC");
+        assert_eq!(sanitize_tz("Europe/Berlin;rm -rf /"), "UTC");
+        assert_eq!(sanitize_tz("UTC"), "UTC");
+        assert_eq!(sanitize_tz(""), "UTC");
     }
 }

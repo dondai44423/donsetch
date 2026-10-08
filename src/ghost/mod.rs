@@ -218,6 +218,9 @@ impl Drop for Operation {
 pub struct GhostWire {
     pub viewport: (u32, u32),
     pub locale: String,
+    /// Persona timezone for the browser process (`TZ`), sanitized; empty
+    /// keeps the host timezone (legacy callers).
+    pub tz: String,
     /// An explicit direct override changes routing and therefore pool identity.
     pub direct: bool,
     /// Selected immutable HTTP/browser policy; absent only for legacy callers.
@@ -229,6 +232,7 @@ impl Default for GhostWire {
         Self {
             viewport: (1920, 1080),
             locale: "en-US".into(),
+            tz: String::new(),
             direct: false,
             route: None,
         }
@@ -248,6 +252,7 @@ impl GhostWire {
         Self {
             viewport: (w, h),
             locale,
+            tz: crate::persona::sanitize_tz(&p.tz),
             direct: false,
             route: None,
         }
@@ -1168,6 +1173,13 @@ impl Ghost {
                 "LANGUAGE",
                 format!("{}:{language}", locale.replace('-', "_")),
             );
+        }
+        // The persona's timezone reaches Blink through the TZ the process
+        // starts with: ICU's default zone reads it, so a host browser
+        // shows the machine's zone and diverges from the persona. An
+        // empty wire tz leaves the host untouched.
+        if !wire.tz.is_empty() {
+            cmd.env("TZ", &wire.tz);
         }
         let mut chrome_args: Vec<String> = default_chrome_args_wire(&dir, profile, wire);
         let force_headless = browser.backend == cloak::BrowserBackend::HeadlessChromium;

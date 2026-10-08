@@ -1389,6 +1389,7 @@ mod pool_tests {
             locale: "fr-FR".into(),
             direct: true,
             route: Some(crate::transport::request_route::RequestRoute::direct()),
+            ..Default::default()
         };
         let guard = manager
             .acquire_for_wire(&profile, Some("127.0.0.1"), wire.clone())

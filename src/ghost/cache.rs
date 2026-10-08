@@ -2065,6 +2065,7 @@ pub(crate) fn render_context(
         profile.user_agent.clone(),
         profile.sec_ch_ua.clone(),
         wire.locale.clone(),
+        wire.tz.clone(),
         wire.route
             .as_ref()
             .map(|route| route.id())
