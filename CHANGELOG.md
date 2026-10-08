@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daemon's background helpers are owned: the route-memory prober and
+  the search pre-solve are cancelled and joined on shutdown (and aborted
+  on drop), like the startup proxy probes already were, so a retired
+  daemon leaves no task working on its behalf.
+
 - Accepted client hints are honored the way Chrome does: an origin that
   opts in with Accept-CH receives the accepted high-entropy hints on its
   later requests (full-version-list coherent with the same request's

@@ -595,11 +595,16 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
     let host_str = host.to_string();
     let path = parsed.path().to_string();
     let url_str = url.to_string();
-    tokio::spawn(async move {
-        use std::sync::atomic::Ordering;
-        if d.pre_solve_busy.swap(true, Ordering::SeqCst) {
-            return; // one pre-solve at a time
-        }
+    // One pre-solve at a time: the flag is taken BEFORE the spawn, so
+    // the daemon's slot always holds the live handle (owned, never
+    // detached) and a lost race skips the win without burning a task.
+    if daemon
+        .pre_solve_busy
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let handle = tokio::spawn(async move {
         let _guard = PreSolveGuard(&d);
         {
             let state = d.state.lock().await;
@@ -697,6 +702,9 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             );
         }
     });
+    if let Ok(mut slot) = daemon.pre_solve_task.lock() {
+        *slot = Some(handle);
+    }
 }
 
 /// RAII reset: the pre-solve flag clears when the task ends no
