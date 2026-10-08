@@ -268,6 +268,7 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
         })
         .collect::<Vec<_>>();
     let mut item = json!({
+        "ok": true,
         "weak": out.weak,
         "results": results,
         "provider": out.provider.as_deref().unwrap_or("keyless"),
@@ -414,6 +415,7 @@ pub(super) async fn search_batch_inner(
             Err(failure) => {
                 markdown.push_str(&format!("{heading}\nFailed : {}", failure.cause));
                 searches.push(json!({
+                    "ok": false,
                     "query": query,
                     "error": failure.cause,
                     "results": [],
@@ -426,8 +428,9 @@ pub(super) async fn search_batch_inner(
     json!({
         "content": [{ "type": "text", "text": markdown }],
         "structuredContent": {
+            "ok": true,
+            "ok_count": ok,
             "query_count": queries.len(),
-            "ok": ok,
             "errors": queries.len() - ok,
             "searches": searches,
         },

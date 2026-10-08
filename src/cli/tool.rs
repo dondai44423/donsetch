@@ -285,10 +285,7 @@ fn render_result(result: &Value, json_mode: bool, quiet: bool, cmd: &str) -> u8 
         })
         .unwrap_or_default();
 
-    let is_error = result
-        .get("isError")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_error = server::is_failure(result);
 
     if is_error {
         // Strip redundant tool-name prefix from core error messages
@@ -452,10 +449,7 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
 
 /// Extract exit code from a call_tool result Value.
 fn exit_code_of(result: &Value) -> u8 {
-    let is_error = result
-        .get("isError")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_error = server::is_failure(result);
     if !is_error {
         return EXIT_OK;
     }
@@ -468,10 +462,7 @@ fn exit_code_of(result: &Value) -> u8 {
 
 /// Build the --json envelope for a single result.
 fn render_json_envelope(result: &Value, url: &str) -> Value {
-    let is_error = result
-        .get("isError")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_error = server::is_failure(result);
     let content = result
         .get("content")
         .and_then(|c| c.as_array())
@@ -627,8 +618,9 @@ mod tests {
     fn exit_code_permanent() {
         let v = json!({
             "content": [{"type": "text", "text": "bad url"}],
-            "isError": true,
-            "errorKind": "permanent"
+            "isError": false,
+            "errorKind": "permanent",
+            "structuredContent": {"ok": false}
         });
         assert_eq!(exit_code_of(&v), EXIT_PERMANENT);
     }
@@ -637,8 +629,9 @@ mod tests {
     fn exit_code_transient() {
         let v = json!({
             "content": [{"type": "text", "text": "timeout"}],
-            "isError": true,
-            "errorKind": "transient"
+            "isError": false,
+            "errorKind": "transient",
+            "structuredContent": {"ok": false}
         });
         assert_eq!(exit_code_of(&v), EXIT_TRANSIENT);
     }
@@ -647,8 +640,9 @@ mod tests {
     fn exit_code_walled() {
         let v = json!({
             "content": [{"type": "text", "text": "captcha wall"}],
-            "isError": true,
-            "errorKind": "walled"
+            "isError": false,
+            "errorKind": "walled",
+            "structuredContent": {"ok": false}
         });
         assert_eq!(exit_code_of(&v), EXIT_WALLED);
     }
@@ -657,7 +651,8 @@ mod tests {
     fn exit_code_no_kind_defaults_permanent() {
         let v = json!({
             "content": [{"type": "text", "text": "error"}],
-            "isError": true
+            "isError": false,
+            "structuredContent": {"ok": false}
         });
         assert_eq!(exit_code_of(&v), EXIT_PERMANENT);
     }
@@ -776,7 +771,7 @@ mod tests {
     fn json_envelope_success() {
         let v = json!({
             "content": [{"type": "text", "text": "# Title\nContent"}],
-            "structuredContent": {"verdict": "ContentOk"},
+            "structuredContent": {"ok": true, "verdict": "ContentOk"},
             "isError": false
         });
         let env = render_json_envelope(&v, "");
@@ -789,8 +784,9 @@ mod tests {
     fn json_envelope_error() {
         let v = json!({
             "content": [{"type": "text", "text": "blocked by captcha"}],
-            "isError": true,
-            "errorKind": "walled"
+            "isError": false,
+            "errorKind": "walled",
+            "structuredContent": {"ok": false}
         });
         let env = render_json_envelope(&v, "https://example.com");
         assert_eq!(env["ok"], json!(false));

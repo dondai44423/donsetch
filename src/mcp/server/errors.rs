@@ -340,7 +340,7 @@ pub(super) fn tool_error_structured(
     }
     let mut v = json!({
         "content": [{ "type": "text", "text": text }],
-        "isError": true,
+        "isError": false,
         "errorKind": kind,
         "code": code
     });
@@ -358,8 +358,15 @@ pub(super) fn tool_error_structured(
                 "retry once; if the failure repeats, inspect the reported cause"
             });
         }
-        // The stable code lives where agents read it.
+        // The stable code lives where agents read it (inside
+        // structuredContent so it survives the TextOnly [meta] fold,
+        // which clones structuredContent). v4.7 uniform envelope: a
+        // classified failure is a RETURNED result, never a throw :
+        // `ok:false` is the machine failure flag every consumer and
+        // client branches on.
         s["code"] = json!(code);
+        s["errorKind"] = json!(kind);
+        s["ok"] = json!(false);
         if s.get("url").is_some() {
             s["content_ok"] = json!(false);
             s["read_status"] = json!(if kind == "walled" {
@@ -379,6 +386,18 @@ pub(super) fn tool_error_structured(
         v["structuredContent"] = s;
     }
     v
+}
+
+/// v4.7 uniform envelope: a classified failure is a NORMAL tool
+/// result whose envelope carries `ok:false`; nothing raises. Lives on
+/// structuredContent so it survives the TextOnly `[meta]` fold. The
+/// one predicate every consumer branches on (MCP wire, batch
+/// renderers, shot receipts, CLI exit codes).
+pub(crate) fn is_failure(result: &Value) -> bool {
+    result
+        .pointer("/structuredContent/ok")
+        .and_then(Value::as_bool)
+        == Some(false)
 }
 
 /// The tool error for a call whose enum arguments fall outside the
@@ -823,7 +842,8 @@ mod error_code_tests {
     #[test]
     fn report_audit_all_errors_supply_machine_state_and_next_action() {
         let raw = tool_error("invalid URL: not-a-url");
-        assert_eq!(raw["isError"], true);
+        assert_eq!(raw["isError"], false);
+        assert_eq!(raw["structuredContent"]["ok"], false);
         assert_eq!(raw["structuredContent"]["code"], "fetch.invalid");
         assert!(
             !raw["structuredContent"]["next_action"]
@@ -846,7 +866,8 @@ mod error_code_tests {
             Some(json!({"url":"https://owned.test/empty", "status":200,
                 "verdict":"Incomplete"})),
         );
-        assert_eq!(result["isError"], true);
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["ok"], false);
         assert_eq!(result["errorKind"], "transient");
         assert_eq!(result["code"], "content.incomplete");
         let state = &result["structuredContent"];
@@ -970,7 +991,8 @@ mod error_code_tests {
     pub(super) fn off_list_enum_args_are_a_tool_error() {
         let args = json!({ "url": "https://example.com", "tier": "3" });
         let v = invalid_args_error("web_fetch", &args).expect("tier=3 must be refused");
-        assert_eq!(v["isError"], true);
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["structuredContent"]["ok"], false);
         assert_eq!(v["errorKind"], "permanent");
         assert_eq!(v["code"], "fetch.invalid");
         assert_eq!(v["structuredContent"]["code"], "fetch.invalid");
@@ -990,6 +1012,27 @@ mod error_code_tests {
         let args = json!({ "url": "https://example.com", "mode": "asdf" });
         let v = invalid_args_error("web_crawl", &args).expect("mode=asdf must be refused");
         assert_eq!(v["code"], "crawl.invalid");
+    }
+
+    #[test]
+    fn v47_failures_are_returned_envelopes_not_thrown() {
+        let v = tool_error_structured(
+            "fetch: deadline_ms exceeded at https://owned.test/",
+            "transient",
+            Some(json!({"url": "https://owned.test/", "code": "deadline.hit"})),
+        );
+        // Returned, never thrown: the wire shape stays a normal
+        // result; the envelope is the failure channel.
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["structuredContent"]["ok"], false);
+        assert_eq!(v["structuredContent"]["code"], "deadline.hit");
+        assert_eq!(v["structuredContent"]["errorKind"], "transient");
+        assert!(is_failure(&v));
+        let ok = json!({"content": [{"type": "text", "text": "page"}], "structuredContent": {"ok": true}});
+        assert!(!is_failure(&ok));
+        // A success envelope without the field is not a failure either.
+        let bare = json!({"content": [{"type": "text", "text": "x"}]});
+        assert!(!is_failure(&bare));
     }
 
     #[test]

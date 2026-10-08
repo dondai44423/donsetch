@@ -280,6 +280,7 @@ pub(super) fn render_crawl_result(
 
     let next_action = compute_crawl_next_action(result);
     let mut structured = json!({
+        "ok": true,
         "seed": result.seed,
         "complete": crawl_complete(result, requested_mode),
         "pages": result.pages.iter().filter(|p| !p.duplicate).map(|p| json!({
@@ -378,6 +379,7 @@ pub(super) fn render_crawl_dataset(
 
     let next_action = compute_crawl_next_action(result);
     let mut structured = json!({
+        "ok": true,
         "seed": result.seed,
         "dataset": true,
         // Schema marker (v4 F). Row shape: url/title/kind/markdown/

@@ -5,6 +5,28 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.0] - Unreleased
+
+### Changed
+
+- Tool failures are returned, never raised: every classified failure is a
+  normal result whose envelope carries `ok:false` together with its stable
+  `code`, `errorKind` and `next_action`, and the MCP `isError` flag stays
+  false, so clients that raise on it no longer turn failures into
+  exceptions an agent has to regex. Branch on `ok`/`code`; the envelope
+  contract is stated in the session instructions and every tool
+  description.
+
+### Fixed
+
+- A browser pass that hits its deadline before usable content now says
+  exactly that, with deadline/tier advice, instead of telling the agent to
+  check the network for a fault that is not there.
+
+- The `shot` skip receipt names its real cause: a learned solve-cooldown
+  refusal, a deadline hit, a browser-pass failure, or a capture that was
+  never needed, instead of one ambiguous string for all of them.
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed

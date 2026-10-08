@@ -256,18 +256,21 @@ mod tests {
     fn error_results_carry_code_and_next_action_into_meta() {
         let err = json!({
             "content": [{ "type": "text", "text": "fetch failed\n\nNext action: retry once" }],
-            "isError": true,
+            "isError": false,
             "errorKind": "transient",
             "code": "network.timeout",
-            "structuredContent": { "code": "network.timeout", "escalation": [1, 2] }
+            "structuredContent": { "ok": false, "code": "network.timeout", "escalation": [1, 2] }
         });
         let shaped = shape_result(err);
         assert!(shaped.get("structuredContent").is_none());
         let meta = shaped["content"][0]["text"].as_str().unwrap();
         assert!(meta.contains("network.timeout"));
         assert!(meta.contains("escalation"));
-        // isError + the friendly text ride along.
-        assert_eq!(shaped["isError"], true);
+        // v4.7: the failure envelope rides the fold : ok:false + code
+        // reach the model, and the result itself is not an error
+        // result (nothing for a client to raise on).
+        assert!(meta.contains("\"ok\":false"));
+        assert_eq!(shaped["isError"], false);
         assert_eq!(
             shaped["content"][1]["text"],
             "fetch failed\n\nNext action: retry once"

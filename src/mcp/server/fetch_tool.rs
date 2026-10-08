@@ -91,7 +91,7 @@ async fn fetch_with_budget(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A deadline or cancellation can interrupt an action before its result
     // arrives. The side effect may still have happened; never advise replay.
-    if result["isError"] == true
+    if is_failure(&result)
         && trace
             .iter()
             .any(|step| step["action"] == "action-execution" && step["outcome"] == "started")
@@ -128,11 +128,30 @@ fn add_shot_receipt(args: &Value, result: &mut Value, trace: &[Value]) {
         .rev()
         .find(|step| step["action"] == "screenshot")
         .and_then(|step| step["outcome"].as_str());
-    let reason = outcome.unwrap_or(if result["isError"] == true {
-        "skipped: fetch failed before an interactive captcha capture"
-    } else {
-        "skipped: no interactive captcha capture was needed"
-    });
+    let reason: String = match outcome {
+        Some(o) => o.to_string(),
+        None if !is_failure(&*result) => {
+            "skipped: no interactive captcha capture was needed".to_string()
+        }
+        None if result.pointer("/structuredContent/retry_in_secs").is_some() => {
+            "skipped: host is in a learned solve-cooldown; the fetch was refused before any captcha capture"
+                .to_string()
+        }
+        None => match result
+            .pointer("/structuredContent/code")
+            .and_then(Value::as_str)
+        {
+            Some("deadline.hit") => {
+                "skipped: the fetch hit its deadline before an interactive captcha capture"
+                    .to_string()
+            }
+            Some("browser.transport") | Some("browser.timeout") => {
+                "skipped: the browser pass failed before an interactive captcha capture"
+                    .to_string()
+            }
+            _ => "skipped: fetch failed before an interactive captcha capture".to_string(),
+        },
+    };
     result["structuredContent"]["shot"] = json!({
         "requested": path,
         "saved_to": outcome.and_then(|s| s.strip_prefix("saved: ")),
@@ -253,6 +272,139 @@ fn failure_verdict(current: &str, kind: &str) -> String {
     match kind {
         "walled" => "Blocked".to_string(),
         _ => "Unknown".to_string(),
+    }
+}
+
+/// Advice for a browser-pass failure envelope: an unsettled document
+/// waits, a deadline stall gets real deadline advice (retrying the
+/// same way will not pass a wall), everything else derives from the
+/// verdict/kind.
+fn browser_failure_next_action(
+    failed_verdict: &str,
+    deadline_stall: bool,
+    gate: Option<Verdict>,
+    status: u16,
+    kind: &str,
+) -> String {
+    if failed_verdict == "Incomplete" {
+        "retry with a wait for expected content; the browser document did not settle".to_string()
+    } else if deadline_stall {
+        "the browser pass hit its deadline before usable content : retry with a higher deadline_ms, or tier=1 for the plain-HTTP view; if it repeats, choose another source".to_string()
+    } else {
+        next_action_for(gate, status, kind)
+    }
+}
+
+#[cfg(test)]
+mod browser_failure_advice_tests {
+    use super::browser_failure_next_action;
+
+    // The TikTok report: a browser pass that hit its deadline answered
+    // "check this host from another network" : an invented network
+    // fault. A deadline stall must give deadline advice instead.
+    #[test]
+    fn a_deadline_stall_gets_deadline_advice_not_network_advice() {
+        let action = browser_failure_next_action("Unknown", true, None, 0, "transient");
+        assert!(action.contains("deadline_ms"), "{action}");
+        assert!(!action.contains("another network"), "{action}");
+    }
+
+    #[test]
+    fn an_unsettled_document_keeps_its_wait_advice() {
+        let action = browser_failure_next_action("Incomplete", false, None, 200, "transient");
+        assert!(action.contains("did not settle"), "{action}");
+    }
+
+    #[test]
+    fn a_genuine_transient_keeps_the_network_advice() {
+        let action = browser_failure_next_action("Unknown", false, None, 0, "transient");
+        assert!(action.contains("network"), "{action}");
+    }
+}
+
+#[cfg(test)]
+mod shot_receipt_tests {
+    use super::add_shot_receipt;
+    use serde_json::json;
+
+    fn reason_of(result: &serde_json::Value) -> String {
+        result["structuredContent"]["shot"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    // The 4chan report: a learned solve-cooldown refusal and a real
+    // browser failure shared one ambiguous string. Each cause now
+    // names itself.
+    #[test]
+    fn a_learned_solve_cooldown_names_itself() {
+        let mut result = json!({"structuredContent": {"ok": false, "retry_in_secs": 900}});
+        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
+        assert!(
+            reason_of(&result).contains("solve-cooldown"),
+            "{}",
+            reason_of(&result)
+        );
+    }
+
+    #[test]
+    fn a_deadline_names_itself() {
+        let mut result = json!({"structuredContent": {"ok": false, "code": "deadline.hit"}});
+        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
+        assert!(
+            reason_of(&result).contains("deadline"),
+            "{}",
+            reason_of(&result)
+        );
+    }
+
+    #[test]
+    fn a_browser_failure_names_itself() {
+        let mut result = json!({"structuredContent": {"ok": false, "code": "browser.transport"}});
+        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
+        assert!(
+            reason_of(&result).contains("browser pass failed"),
+            "{}",
+            reason_of(&result)
+        );
+    }
+
+    #[test]
+    fn a_success_without_a_capture_says_no_capture_was_needed() {
+        let mut result = json!({"structuredContent": {"ok": true}});
+        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
+        assert!(
+            reason_of(&result).contains("no interactive captcha"),
+            "{}",
+            reason_of(&result)
+        );
+    }
+
+    #[test]
+    fn an_unclassified_failure_keeps_the_generic_reason() {
+        let mut result = json!({"structuredContent": {"ok": false, "code": "content.notfound"}});
+        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
+        assert!(
+            reason_of(&result).contains("fetch failed"),
+            "{}",
+            reason_of(&result)
+        );
+    }
+
+    #[test]
+    fn a_recorded_outcome_beats_the_reason_guessing() {
+        let mut result = json!({"structuredContent": {"ok": false}});
+        add_shot_receipt(
+            &json!({"shot": "/tmp/cap.png"}),
+            &mut result,
+            &[json!({"action": "screenshot", "outcome": "saved: /tmp/cap.png"})],
+        );
+        assert!(
+            reason_of(&result).contains("saved"),
+            "{}",
+            reason_of(&result)
+        );
     }
 }
 
@@ -441,7 +593,7 @@ pub(super) async fn fetch_multi(
         .into_iter()
         .unzip();
 
-    let is_err = |v: &Value| v.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let is_err = is_failure;
     let md_of = |v: &Value| {
         v.pointer("/content/0/text")
             .and_then(Value::as_str)
@@ -530,7 +682,7 @@ pub(super) fn render_fetch_batch(
     debug_assert_eq!(urls.len(), markdowns.len());
     debug_assert_eq!(urls.len(), sliced_flags.len());
 
-    let is_err = |v: &Value| v.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let is_err = is_failure;
     let title_of = |v: &Value| {
         v.pointer("/_meta/com.donsetch~1fetch-debug/title")
             .and_then(Value::as_str)
@@ -628,8 +780,12 @@ pub(super) fn render_fetch_batch(
             o
         })
         .collect::<Vec<_>>();
+    // Envelope-level ok: false only when the whole call failed
+    // (the all-failed branch below returns an error envelope);
+    // per-URL truth rides results[].ok.
     let mut structured = json!({
-        "ok": ok_count,
+        "ok": true,
+        "ok_count": ok_count,
         "errors": err_count,
         "results": structured_results,
     });
@@ -798,7 +954,7 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
         };
     }
     let result = Box::pin(fetch_single_inner(daemon, args, url, &call)).await;
-    if archive == "off" || result.get("isError") != Some(&json!(true)) {
+    if archive == "off" || !is_failure(&result) {
         return result;
     }
     // Resurrectable failures only: dead pages, hard walls, and
@@ -1960,6 +2116,11 @@ async fn fetch_single_inner(
                     .as_ref()
                     .map(|d| d.status)
                     .unwrap_or((final_status != 0).then_some(final_status));
+                // Honest advice: a stall the browser could not clear
+                // is not a network fault (v4.7 D2 : never send an agent
+                // to "another network" for a wall the browser could
+                // not pass).
+                let deadline_stall = msg.contains("deadline");
                 return tool_error_structured(
                     msg,
                     kind,
@@ -1967,11 +2128,13 @@ async fn fetch_single_inner(
                         "url": trace.browser_document.as_ref().map(|d| d.url.as_str()).unwrap_or(&url),
                         "status": observed_status,
                         "verdict": failed_verdict,
-                        "next_action": if failed_verdict == "Incomplete" {
-                            "retry with a wait for expected content; the browser document did not settle".to_string()
-                        } else {
-                            next_action_for(observed_gate.or_else(|| out.as_ref().map(|o| o.verdict)), observed_status.unwrap_or(0), kind)
-                        },
+                        "next_action": browser_failure_next_action(
+                            &failed_verdict,
+                            deadline_stall,
+                            observed_gate.or_else(|| out.as_ref().map(|o| o.verdict)),
+                            observed_status.unwrap_or(0),
+                            kind,
+                        ),
                         "escalation": trace.value(),
                     })),
                 );
@@ -4416,6 +4579,7 @@ pub(super) fn finish_result(
     // The model-facing object contains only state that can alter its next
     // action. Evidence itself appears once in the text block below.
     let mut structured = json!({
+        "ok": true,
         "url": url,
         "content_ok": !ex.thin && verdict == "ContentOk",
         "content_kind": format!("{:?}", ex.content_kind),
@@ -4819,8 +4983,8 @@ mod batch_output_contract_tests {
         );
         let failure = json!({
             "content": [{"type": "text", "text": "request timed out"}],
-            "structuredContent": {"code": "network.timeout"},
-            "isError": true,
+            "structuredContent": {"ok": false, "code": "network.timeout"},
+            "isError": false,
         });
         let results = vec![success, failure];
         let markdowns = vec![
@@ -4841,6 +5005,7 @@ mod batch_output_contract_tests {
             "network.timeout"
         );
         let first = &output["structuredContent"]["results"][0];
+        assert_eq!(first["ok"], true);
         assert!(first.get("content_ok").is_none());
         assert!(first.get("content_kind").is_none());
         assert!(first.get("thin").is_none());
@@ -4926,7 +5091,7 @@ mod resurrect_tests {
                 .as_u64()
                 .is_some()
                 && results[0]["structuredContent"]["content_complete"] == false,
-            results[1]["isError"] == true
+            results[1]["structuredContent"]["ok"] == false
                 && results[1]["structuredContent"]["code"] == "selector.nomatch",
             results[2]["structuredContent"]["read_status"] == "probe"
                 && results[2]["structuredContent"]["matched"] == false,
@@ -4960,7 +5125,8 @@ mod resurrect_tests {
             )
             .await
             .expect("input guard must precede archive network access");
-            assert_eq!(result["isError"], true, "{result}");
+            assert_eq!(result["isError"], false, "{result}");
+            assert_eq!(result["structuredContent"]["ok"], false, "{result}");
             assert_eq!(result["structuredContent"]["code"], code, "{result}");
         }
         let result = super::fetch_single(
@@ -4969,7 +5135,8 @@ mod resurrect_tests {
             "https://example.com/",
         )
         .await;
-        assert_eq!(result["isError"], true);
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["ok"], false);
         assert!(
             result["content"][0]["text"]
                 .as_str()
@@ -5246,6 +5413,10 @@ mod budget_tests {
             5,
         );
         let sc = &result["structuredContent"];
+        assert_eq!(
+            sc["ok"], true,
+            "success envelopes carry the machine ok flag"
+        );
         assert_eq!(sc["content_ok"], true);
         assert_eq!(sc["content_complete"], false);
         assert_eq!(sc["partial"], true);
@@ -5429,7 +5600,7 @@ mod adapter_hop_tests {
                     ).await.unwrap();
                     stop.send(true).unwrap();
                     for server in servers { tokio::time::timeout(std::time::Duration::from_secs(2), server).await.unwrap().unwrap(); }
-                    assert_ne!(result["isError"], true, "{result}");
+                    assert_eq!(result["structuredContent"]["ok"], true, "{result}");
                     let events = events.lock().unwrap();
                     assert_eq!(events.len(), 2, "one adapter read and one fallback: {events:?}");
                     assert!(events[0].1.contains(".json"), "{events:?}");
