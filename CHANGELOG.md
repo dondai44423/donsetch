@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Persisted learning counters saturate instead of overflowing. Future-dated
+  solve and render records are not fresh; invalid route timestamps allow a
+  recheck and do not create permanent cooldowns or recent failure evidence.
+
 - Anti-cloak compares a previously walled site's HTTP content before clearing
   its wall history. Inconclusive comparisons retain that history; successful
   browser recovery avoids a duplicate comparison, and tier 1 stays HTTP-only.

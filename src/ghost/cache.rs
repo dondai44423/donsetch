@@ -779,6 +779,10 @@ pub fn cookies_fresh_at(profile: &DomainProfile, now: u64) -> bool {
     if profile.cookies.is_empty() {
         return false;
     }
+    // Clock rollback or invalid persisted time is not fresh solve evidence.
+    let Some(age) = now.checked_sub(profile.last_solved) else {
+        return false;
+    };
 
     // Server-set expiry: the earliest-expiring cookie is the
     // weakest link : if it's past, the batch is stale.
@@ -791,13 +795,13 @@ pub fn cookies_fresh_at(profile: &DomainProfile, now: u64) -> bool {
     // Observed lifetime: if cookies died before their stated
     // expiry in the past, trust the observation over the server.
     if let Some(observed) = profile.observed_lifetime
-        && now - profile.last_solved >= observed
+        && age >= observed
     {
         return false;
     }
 
     // Safety cap.
-    if now - profile.last_solved >= TTL_CAP {
+    if age >= TTL_CAP {
         return false;
     }
 
@@ -980,8 +984,22 @@ impl GhostState {
         let mut stale: Vec<(&String, u64)> = self
             .profiles
             .iter()
-            .filter(|(_, p)| p.needs_tier2 && n.saturating_sub(p.last_cold_check) > stale_secs)
-            .map(|(h, p)| (h, p.last_cold_check))
+            .filter(|(_, p)| {
+                p.needs_tier2
+                    && n.checked_sub(p.last_cold_check)
+                        .is_none_or(|age| age > stale_secs)
+            })
+            // Invalid future evidence gets a fresh probe before dated history.
+            .map(|(h, p)| {
+                (
+                    h,
+                    if p.last_cold_check > n {
+                        0
+                    } else {
+                        p.last_cold_check
+                    },
+                )
+            })
             .collect();
         stale.sort_by_key(|(_, t)| *t);
         stale
@@ -1159,6 +1177,7 @@ impl GhostState {
             .filter(|p| {
                 p.wall_fail_streak >= 2
                     && p.last_wall_fail > 0
+                    && p.last_wall_fail <= n
                     && n.saturating_sub(p.last_wall_fail) < solve_cooldown_secs(p.wall_fail_streak)
             })
             .count();
@@ -1380,10 +1399,11 @@ impl GhostState {
             .or(profile.egress_class.as_ref());
         if profile.wall_fail_streak >= 2 && wall_class.is_none_or(|c| c == class) {
             let cooldown = solve_cooldown_secs(profile.wall_fail_streak);
-            if profile.last_wall_fail > 0 && n.saturating_sub(profile.last_wall_fail) < cooldown {
-                return RouteDecision::SolveCooldown(
-                    cooldown.saturating_sub(n.saturating_sub(profile.last_wall_fail)),
-                );
+            if profile.last_wall_fail > 0
+                && profile.last_wall_fail <= n
+                && n - profile.last_wall_fail < cooldown
+            {
+                return RouteDecision::SolveCooldown(cooldown - (n - profile.last_wall_fail));
             }
         }
         // Egress-class gate (B1): cookies never cross classes.
@@ -1401,7 +1421,9 @@ impl GhostState {
                 return RouteDecision::Warm(profile.cookies.clone());
             }
             // Cross-class or stale cookies. Should we recheck cold?
-            if n - profile.last_cold_check > RECHECK_INTERVAL {
+            if n.checked_sub(profile.last_cold_check)
+                .is_none_or(|age| age > RECHECK_INTERVAL)
+            {
                 return RouteDecision::RecheckCold;
             }
             // Skip the doomed tier-1 attempt : go straight to solve.
@@ -1433,7 +1455,7 @@ impl GhostState {
         }
         let n = now();
         let p = self.profiles.entry(host.to_string()).or_default();
-        p.fetch_count += 1;
+        p.fetch_count = p.fetch_count.saturating_add(1);
         p.last_cold_check = n;
         self.save();
     }
@@ -1462,7 +1484,9 @@ impl GhostState {
         self.profiles.get(host).map_or(0, |p| {
             p.failures
                 .iter()
-                .filter(|(at, class)| *class == FailClass::Network && n.saturating_sub(*at) < 600)
+                .filter(|(at, class)| {
+                    *class == FailClass::Network && n.checked_sub(*at).is_some_and(|age| age < 600)
+                })
                 .count()
         })
     }
@@ -1484,7 +1508,7 @@ impl GhostState {
         let p = self.profiles.entry(host.to_string()).or_default();
         p.t1_ewma = ewma_update(p.t1_ewma, p.t1_samples, true);
         p.t1_samples = p.t1_samples.saturating_add(1);
-        p.fetch_count += 1;
+        p.fetch_count = p.fetch_count.saturating_add(1);
         p.last_cold_check = n;
         p.warm_fail_streak = 0;
         // Tier 1 got real content : whatever wall state existed
@@ -1514,8 +1538,8 @@ impl GhostState {
         let p = self.profiles.entry(host.to_string()).or_default();
         p.t1_ewma = ewma_update(p.t1_ewma, p.t1_samples, false);
         p.t1_samples = p.t1_samples.saturating_add(1);
-        p.fetch_count += 1;
-        p.walled_count += 1;
+        p.fetch_count = p.fetch_count.saturating_add(1);
+        p.walled_count = p.walled_count.saturating_add(1);
         p.needs_tier2 = true;
         p.last_cold_check = n;
         if let Some(v) = vendor {
@@ -1537,8 +1561,8 @@ impl GhostState {
         let p = self.profiles.entry(host.to_string()).or_default();
         p.warm_ewma = ewma_update(p.warm_ewma, p.warm_samples, true);
         p.warm_samples = p.warm_samples.saturating_add(1);
-        p.fetch_count += 1;
-        p.warm_ok_count += 1;
+        p.fetch_count = p.fetch_count.saturating_add(1);
+        p.warm_ok_count = p.warm_ok_count.saturating_add(1);
         p.warm_fail_streak = 0;
         p.last_refreshed = n;
         // Merge: replace by (name, domain), add new ones : but only
@@ -1578,9 +1602,9 @@ impl GhostState {
         let p = self.profiles.entry(host.to_string()).or_default();
         p.warm_ewma = ewma_update(p.warm_ewma, p.warm_samples, false);
         p.warm_samples = p.warm_samples.saturating_add(1);
-        p.fetch_count += 1;
-        p.warm_fail_count += 1;
-        p.warm_fail_streak += 1;
+        p.fetch_count = p.fetch_count.saturating_add(1);
+        p.warm_fail_count = p.warm_fail_count.saturating_add(1);
+        p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
         if p.warm_fail_streak >= 2 {
             let elapsed = n.saturating_sub(p.last_solved).max(120);
             p.observed_lifetime = Some(match p.observed_lifetime {
@@ -1619,7 +1643,7 @@ impl GhostState {
         p.cookies = filter_clearance(cookies);
         p.last_solved = n;
         p.last_refreshed = n;
-        p.solve_count += 1;
+        p.solve_count = p.solve_count.saturating_add(1);
         p.needs_tier2 = true;
         p.warm_fail_streak = 0;
         p.replay_ok = replay_ok;
@@ -1690,7 +1714,10 @@ impl GhostState {
     }
 
     pub fn render_for(&self, url: &str) -> Option<&RenderCache> {
-        self.renders.get(url).filter(|r| now() - r.at < RENDER_TTL)
+        let n = now();
+        self.renders
+            .get(url)
+            .filter(|r| n.checked_sub(r.at).is_some_and(|age| age < RENDER_TTL))
     }
 }
 
