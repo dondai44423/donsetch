@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Warm revalidation of sites that ship Last-Modified without an ETag
+  (example.com behind Cloudflare) no longer fails: a 304 that supplies
+  an ETag the stored response never had updates the stored metadata
+  (RFC 9111) instead of erroring, and once stored the ETag drives the
+  usual mismatch checks.
+
 - A small scripted page shell keeps its hydration window: the
   browser-settle dead-DOM early exit no longer fires before the same
   floor the settle gate honors, so a shell that hydrates at ~2.5s is no

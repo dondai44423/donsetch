@@ -82,19 +82,22 @@ impl RevalidationCache {
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("etag"))
             .collect();
-        if let Some((_, tag)) = tags.first() {
-            let Some(old) = snapshot.etag.as_deref() else {
-                return Err("304 ETag has no matching stored validator".into());
-            };
-            if tags.len() != 1
+        // A 304 answering a Last-Modified conditional may carry an ETag
+        // the snapshot never had (example.com behind Cloudflare: the 200
+        // ships no ETag, the 304 does). There is no stored validator to
+        // compare against, and RFC 9111 §4.3.4 makes the field metadata
+        // the merge updates; only when the snapshot actually carried an
+        // entity-tag does the comparison (and its rejection) apply.
+        if let Some((_, tag)) = tags.first()
+            && let Some(old) = snapshot.etag.as_deref()
+            && (tags.len() != 1
                 || !valid_etag(tag)
                 || !valid_etag(old)
                 || tag.trim().strip_prefix("W/").unwrap_or(tag.trim())
                     != old.trim().strip_prefix("W/").unwrap_or(old.trim())
-                || (old.starts_with("W/") && !tag.trim().starts_with("W/"))
-            {
-                return Err("304 ETag does not identify the requested representation".into());
-            }
+                || (old.starts_with("W/") && !tag.trim().starts_with("W/")))
+        {
+            return Err("304 ETag does not identify the requested representation".into());
         }
         if tags.is_empty() {
             let dates: Vec<_> = headers
@@ -912,5 +915,78 @@ mod audit_tests {
             c.map.contains_key(&format!("https://x.test/{MAX_ENTRIES}")),
             "newest survives"
         );
+    }
+
+    // example.com behind Cloudflare: the 200 has last-modified but no
+    // ETag; the 304 (answering our If-Modified-Since) carries the ETag.
+    // RFC 9111 4.3.4: the merge updates metadata; with no stored
+    // entity-tag there is nothing to compare, and the fetch must not
+    // fail. Once merged, the stored ETag drives the ordinary CAS.
+    #[test]
+    fn stealth_v3_304_etag_over_last_modified_validation_updates_metadata() {
+        let mut cache = RevalidationCache::new();
+        cache.store(
+            "owned",
+            200,
+            &[
+                (
+                    "last-modified".into(),
+                    "Sun, 04 Oct 2026 20:44:03 GMT".into(),
+                ),
+                ("age".into(), "400".into()),
+            ],
+            b"lm body",
+        );
+        let CacheCheck::Revalidate(conditional, snapshot) = cache.check("owned") else {
+            panic!("last-modified snapshot");
+        };
+        assert_eq!(conditional.len(), 1);
+        assert_eq!(conditional[0].0, "if-modified-since");
+        let (body, status, headers) = cache
+            .revalidated(
+                "owned",
+                &snapshot,
+                &[
+                    ("etag".into(), "\"fixture-lm-etag-1\"".into()),
+                    (
+                        "last-modified".into(),
+                        "Sun, 04 Oct 2026 20:44:03 GMT".into(),
+                    ),
+                ],
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(body, b"lm body");
+        assert_eq!(status, 200);
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "etag" && v == "\"fixture-lm-etag-1\"")
+        );
+        // The stored ETag now exists: the next hit compares, and a
+        // mismatched 304 still rejects (the qualified CAS).
+        let CacheCheck::Revalidate(conditional, snapshot) = cache.check("owned") else {
+            panic!("etag snapshot after merge");
+        };
+        assert!(conditional.iter().any(|(n, _)| n == "if-none-match"));
+        assert!(
+            cache
+                .revalidated(
+                    "owned",
+                    &snapshot,
+                    &[("etag".into(), "\"different\"".into())],
+                    Duration::ZERO,
+                )
+                .is_err(),
+            "a mismatched 304 must still be rejected"
+        );
+        cache
+            .revalidated(
+                "owned",
+                &snapshot,
+                &[("etag".into(), "\"fixture-lm-etag-1\"".into())],
+                Duration::ZERO,
+            )
+            .unwrap();
     }
 }
