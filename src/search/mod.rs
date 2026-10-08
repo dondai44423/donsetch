@@ -497,17 +497,16 @@ impl Searcher {
         save_cache_disk(&cache);
     }
 
-    /// Proxy preflight: probe every proxy at startup so
-    /// dead lines are benched BEFORE a query ever gets
-    /// assigned to them. Runs in the background; the first
-    /// queries just use healthy lanes. Successful probes also
-    /// seed the per-lane RTT EWMA (v4 A2).
-    pub fn preflight(self: &Arc<Self>) {
+    /// Probe configured proxies in the background and seed their RTTs.
+    /// Generic failures bench lanes only after a completed batch with a
+    /// successful echo; authentication failures are applied immediately.
+    /// The caller owns the returned task and must abort it on shutdown.
+    pub fn preflight(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let proxies = this.pool.proxies();
-            let total = proxies.len();
-            let mut dead = 0usize;
+            let mut echo_available = false;
+            let mut dead = Vec::new();
             for proxy in proxies {
                 let id = proxy.id();
                 let started = Instant::now();
@@ -520,24 +519,27 @@ impl Searcher {
                 );
                 match tokio::time::timeout(Duration::from_secs(6), probe).await {
                     Ok(Ok(o)) if o.status == 200 => {
+                        echo_available = true;
                         this.pool.observe_rtt(&id, started.elapsed());
                     }
                     Ok(Err(e)) if format!("{e}").contains("CONNECT -> 407") => {
                         this.pool.report_auth_fail(&id);
                     }
                     _ => {
-                        dead += 1;
-                        this.pool.report_dead(&id);
+                        dead.push(id);
                     }
                 }
             }
-            // ALL proxies failing means the PROBE endpoint
-            // died, not the pool : clear the marks rather
-            // than bench every lane over our own bug.
-            if total > 0 && dead == total {
-                this.pool.revive_all();
+            // An entirely unavailable shared echo is inconclusive. Publish
+            // failures only after the batch; temporary benches can otherwise
+            // move an in-flight caller onto direct before the last result.
+            // Existing dead/auth evidence is not cleared by a failed probe.
+            if echo_available {
+                for id in dead {
+                    this.pool.report_dead(&id);
+                }
             }
-        });
+        })
     }
 
     /// True when an engine is benched for chronic failure.
@@ -1491,6 +1493,180 @@ impl Drop for InflightGuard<'_> {
 mod tests {
     use super::render::clip_snippet;
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum ProbeCase {
+        Unavailable,
+        PriorBan,
+        Auth,
+        Cancelled,
+        Healthy,
+    }
+
+    async fn preflight_pair(case: ProbeCase) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxies = [&a, &b].map(|listener| {
+            crate::transport::proxy::Proxy::parse(&format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap()
+        });
+        let acceptor = if matches!(case, ProbeCase::Healthy) {
+            use boring::ssl::{SslAcceptor, SslMethod};
+            let cert = rcgen::generate_simple_self_signed(vec!["api.ipify.org".into()]).unwrap();
+            let bundle = crate::paths::cache_dir().join("owned-probe-ca.pem");
+            std::fs::write(&bundle, cert.cert.pem()).unwrap();
+            // Nextest gives this owned trust bundle its own process.
+            unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
+            let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+            acceptor
+                .set_certificate(&boring::x509::X509::from_der(cert.cert.der()).unwrap())
+                .unwrap();
+            acceptor
+                .set_private_key(
+                    &boring::pkey::PKey::private_key_from_der(&cert.signing_key.serialize_der())
+                        .unwrap(),
+                )
+                .unwrap();
+            acceptor.set_alpn_select_callback(|_, peer| {
+                boring::ssl::select_next_proto(b"\x08http/1.1", peer)
+                    .ok_or(boring::ssl::AlpnError::NOACK)
+            });
+            Some(Arc::new(acceptor.build()))
+        } else {
+            None
+        };
+        let pool = Arc::new(EgressPool::new(proxies.to_vec()));
+        if matches!(case, ProbeCase::PriorBan) {
+            pool.report_auth_fail(&proxies[0].id());
+        }
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            Arc::clone(&pool),
+        ));
+        let second_reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut servers = Vec::new();
+        for (ordinal, listener) in [a, b].into_iter().enumerate() {
+            let second_reached = Arc::clone(&second_reached);
+            let release = Arc::clone(&release);
+            let acceptor = acceptor.clone();
+            servers.push(tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 16384);
+                    head.push(socket.read_u8().await.unwrap());
+                }
+                assert!(head.starts_with(b"CONNECT api.ipify.org:443 HTTP/1.1\r\n"));
+                if ordinal == 1 {
+                    second_reached.notify_one();
+                    if matches!(case, ProbeCase::Cancelled) {
+                        assert_eq!(socket.read(&mut [0u8; 1]).await.unwrap(), 0,
+                            "aborting preflight must close its pending CONNECT");
+                        return;
+                    }
+                    release.notified().await;
+                    if let Some(acceptor) = acceptor {
+                        socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                        let mut tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            assert!(request.len() < 16384);
+                            request.push(tls.read_u8().await.unwrap());
+                        }
+                        assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                        tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n192.0.2.1").await.unwrap();
+                        return;
+                    }
+                }
+                let status = if ordinal == 0 && matches!(case, ProbeCase::Auth) {407} else {503};
+                socket.write_all(format!("HTTP/1.1 {status} Owned probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                if status == 407 {
+                    assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err(),
+                        "unchanged credentials must not retry CONNECT407");
+                }
+            }));
+        }
+        let probe = searcher.preflight();
+        tokio::time::timeout(Duration::from_secs(3), second_reached.notified())
+            .await
+            .expect("both real proxy probes must be reached");
+        let ban_before_batch = matches!(case, ProbeCase::PriorBan | ProbeCase::Auth);
+        let first_was_benched = pool.is_dead(&proxies[0].id());
+        let selected = pool.pick_fetch("owned.example", true).unwrap().id;
+        if matches!(case, ProbeCase::Cancelled) {
+            probe.abort();
+            assert!(probe.await.unwrap_err().is_cancelled());
+        } else {
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(3), probe)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for server in servers {
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            first_was_benched, ban_before_batch,
+            "generic echo failures cannot alter a lane while the batch is pending"
+        );
+        assert_eq!(
+            selected,
+            proxies[usize::from(ban_before_batch)].id(),
+            "an unresolved echo batch must preserve the selected egress"
+        );
+        assert_eq!(
+            pool.is_dead(&proxies[0].id()),
+            ban_before_batch || matches!(case, ProbeCase::Healthy)
+        );
+        assert!(
+            !pool.is_dead(&proxies[1].id()),
+            "an unavailable echo must not bench B, including after a real A407"
+        );
+        let reloaded = EgressPool::new(proxies.to_vec());
+        assert_eq!(
+            reloaded.is_dead(&proxies[0].id()),
+            pool.is_dead(&proxies[0].id()),
+            "completed health evidence must survive actual persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_does_not_bench_a_lane_before_the_probe_batch_finishes() {
+        preflight_pair(ProbeCase::Unavailable).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_preserves_prior_bans_when_echo_is_unavailable() {
+        preflight_pair(ProbeCase::PriorBan).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_applies_auth_failure_without_benching_inconclusive_peer() {
+        preflight_pair(ProbeCase::Auth).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_cancellation_closes_connect_without_publishing_partial_batch() {
+        preflight_pair(ProbeCase::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_completed_healthy_tls_echo_benches_failed_peer() {
+        preflight_pair(ProbeCase::Healthy).await;
+    }
 
     fn test_searcher() -> Searcher {
         // Hermetic: point disk cache/health at a throwaway dir so the

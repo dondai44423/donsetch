@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Startup proxy probes preserve the selected lane while their shared echo is
+  unavailable. Failed probes retain existing health bans; verified authentication
+  failures still bench their own lane without retrying unchanged credentials.
+  Daemon shutdown cancels pending preflight.
+
 - Screenshots report the captured document's final URL and native response receipt.
   Captures reject main-document changes during rendering and retain one selected
   route, persona and original tool deadline through safety checks and browser work.

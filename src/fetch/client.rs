@@ -1033,6 +1033,11 @@ impl Fetcher {
                     return Ok(out);
                 }
                 Err(e) => {
+                    // Retrying unchanged credentials cannot repair CONNECT 407
+                    // and can replace the auth evidence with a later dial error.
+                    if lane_note(&e) == Some(LaneNote::AuthFail) {
+                        return Err(e);
+                    }
                     last_err = e;
                     if attempt == 1 {
                         break;

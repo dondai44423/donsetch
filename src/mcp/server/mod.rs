@@ -60,6 +60,8 @@ pub struct Daemon {
     /// Background route-memory prober handle (v4 phase 0.2);
     /// aborted on shutdown.
     probe_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Owned startup proxy probes; cancelled on shutdown or daemon drop.
+    preflight_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -126,7 +128,7 @@ impl Daemon {
             )
             .with_ghost(search_ghost),
         );
-        searcher.preflight();
+        let preflight_task = searcher.preflight();
 
         Ok(Self {
             fetcher,
@@ -143,6 +145,7 @@ impl Daemon {
             vault_seen: tokio::sync::Mutex::new(None),
             pre_solve_busy: std::sync::atomic::AtomicBool::new(false),
             probe_task: std::sync::Mutex::new(None),
+            preflight_task: std::sync::Mutex::new(Some(preflight_task)),
         })
     }
 
@@ -162,6 +165,15 @@ impl Daemon {
     /// Shutdown: kill ghost browser + Xvfb (if owned).
     /// Called by the CLI before exit; by the MCP daemon on close.
     pub async fn shutdown(&self) {
+        let preflight = self
+            .preflight_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = preflight {
+            task.abort();
+            let _ = task.await;
+        }
         self.ghost_mgr.shutdown().await;
     }
 
@@ -206,6 +218,19 @@ impl Daemon {
             };
             let cookies = crate::ghost::cache::vault_over_jar(&sessions, &jar);
             self.fetcher.reset_to(&cookies).await;
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .preflight_task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
         }
     }
 }
@@ -591,5 +616,70 @@ mod cancel_key_tests {
         assert_eq!(cancel_key(&json!("req-7")), cancel_key(&json!("req-7")));
         assert!(cancel_key(&json!(null)).is_none());
         assert!(cancel_key(&json!({"a": 1})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod preflight_lifecycle_tests {
+    use super::Daemon;
+    use tokio::io::AsyncReadExt;
+
+    async fn stop_pending_preflight(explicit_shutdown: bool) {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::fs::write(
+            crate::transport::proxy::config_path(),
+            format!("http://{}\n", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let daemon = Daemon::new().await.unwrap();
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 16384);
+            head.push(socket.read_u8().await.unwrap());
+        }
+        assert!(head.starts_with(b"CONNECT api.ipify.org:443 HTTP/1.1\r\n"));
+        let abort = daemon
+            .preflight_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        if explicit_shutdown {
+            daemon.shutdown().await;
+            assert!(daemon.preflight_task.lock().unwrap().is_none());
+            assert!(
+                abort.is_finished(),
+                "shutdown must join the cancelled probe"
+            );
+        }
+        drop(daemon);
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            socket.read(&mut [0u8; 1]),
+        )
+        .await
+        .expect("owned CONNECT must close on daemon retirement");
+        assert_eq!(read.unwrap(), 0);
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_shutdown_joins_pending_connect() {
+        stop_pending_preflight(true).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_preflight_drop_aborts_pending_connect() {
+        stop_pending_preflight(false).await;
     }
 }
