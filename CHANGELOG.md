@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   effort like the lock itself, so the save reports its own persist
   error and the process continues.
 
+- The daily unlock-attempt counter no longer fails parallel walled
+  fetches on a slow disk: the exclusive lock covers only the counter's
+  read-modify-write and is released before the durability flush, and a
+  held lock is waited out (platform contention codes included) instead
+  of being reported as a broken counter.
+
 - Warm revalidation of sites that ship Last-Modified without an ETag
   (example.com behind Cloudflare) no longer fails: a 304 that supplies
   an ETag the stored response never had updates the stored metadata

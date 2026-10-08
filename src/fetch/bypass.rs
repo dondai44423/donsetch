@@ -176,6 +176,21 @@ pub fn bypass_count_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(format!("bypass-{}.count", date_ymd()))
 }
 
+/// Whether a failed try-lock means "held by someone else" rather than
+/// a real fault. Windows surfaces a held byte-range lock as
+/// ERROR_LOCK_VIOLATION (33) or ERROR_SHARING_VIOLATION (32); unix as
+/// EWOULDBLOCK. All of them are contention: the caller waits for the
+/// handoff instead of reporting a broken counter.
+fn is_lock_contention(e: &std::fs::TryLockError) -> bool {
+    match e {
+        std::fs::TryLockError::WouldBlock => true,
+        std::fs::TryLockError::Error(io) => {
+            io.kind() == std::io::ErrorKind::WouldBlock
+                || (cfg!(windows) && matches!(io.raw_os_error(), Some(32) | Some(33)))
+        }
+    }
+}
+
 /// Check the daily cap and bump the counter. Returns false when
 /// the cap is already exhausted. Counter files older than 31 days
 /// are pruned: they are single integers, but a long-lived machine
@@ -204,10 +219,10 @@ pub fn check_and_bump_daily(path: &Path, max: u32) -> Result<bool, BypassFail> {
     loop {
         match f.try_lock() {
             Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock)
-                if started.elapsed() < Duration::from_millis(250) =>
-            {
-                std::thread::sleep(Duration::from_millis(5))
+            // Contention: another walled fetch holds the counter. Wait
+            // for its handoff; only a persistent failure is fatal.
+            Err(e) if is_lock_contention(&e) && started.elapsed() < Duration::from_millis(1000) => {
+                std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => {
                 return Err(BypassFail::Config(format!(
@@ -246,6 +261,12 @@ pub fn check_and_bump_daily(path: &Path, max: u32) -> Result<bool, BypassFail> {
     write!(f, "{}", count + 1).map_err(counter_error)?;
     f.set_len((count + 1).to_string().len() as u64)
         .map_err(counter_error)?;
+    // Release the lock before the durability flush: the exclusive
+    // section covers only the read-modify-write above, while the flush
+    // can ride a slow disk for tens of milliseconds (a Windows runner
+    // spent whole lock budgets inside it). The counter is still synced
+    // before the attempt is reported as reserved.
+    f.unlock().map_err(counter_error)?;
     f.sync_data().map_err(counter_error)?;
     Ok(true)
 }
@@ -1079,6 +1100,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(allowed, 3, "exactly the cap may pass, got {allowed}");
         assert_eq!(on_disk.trim(), "3");
+    }
+
+    // The lock handoff must read every held-lock error as contention:
+    // a Windows byte-range lock reports platform codes, unix reports
+    // EWOULDBLOCK, and neither may read as a broken counter.
+    #[test]
+    fn lock_contention_classification_matches_held_lock_errors() {
+        use std::fs::TryLockError;
+        use std::io::ErrorKind;
+        assert!(super::is_lock_contention(&TryLockError::WouldBlock));
+        assert!(super::is_lock_contention(&TryLockError::Error(
+            ErrorKind::WouldBlock.into()
+        )));
+        assert!(!super::is_lock_contention(&TryLockError::Error(
+            ErrorKind::NotFound.into()
+        )));
+        #[cfg(windows)]
+        {
+            use std::io::Error;
+            assert!(super::is_lock_contention(&TryLockError::Error(
+                Error::from_raw_os_error(32)
+            )));
+            assert!(super::is_lock_contention(&TryLockError::Error(
+                Error::from_raw_os_error(33)
+            )));
+        }
     }
 
     // The unlocker's answer differs with `render`; a hit for one mode
