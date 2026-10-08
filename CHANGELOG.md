@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Screenshots report the captured document's final URL and native response receipt.
+  Captures reject main-document changes during rendering and retain one selected
+  route, persona and original tool deadline through safety checks and browser work.
+
 - Crawl browser recovery retains the actual HTTP route. Search's browser lane
   follows search pool policy independently of fetch's pool opt-in. Browser hooks
   retain the caller deadline and partition render reuse by route and persona wire.

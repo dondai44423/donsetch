@@ -33,6 +33,8 @@ pub async fn web_screenshot_tool(
     args: &Value,
     mut ctx: Option<super::ToolCtx>,
 ) -> Value {
+    let started = std::time::Instant::now();
+    let budget = Duration::from_secs(60);
     let url_in = match args.get("url").and_then(Value::as_str) {
         Some(u) if !u.trim().is_empty() => u.to_string(),
         _ => {
@@ -46,7 +48,7 @@ pub async fn web_screenshot_tool(
         .unwrap_or(600)
         .min(WAIT_MS_MAX);
 
-    let mut target = match validate_url_basic(&url_in) {
+    let target = match validate_url_basic(&url_in) {
         Ok(u) => u,
         Err(e) => return tool_error(e.to_string()),
     };
@@ -54,30 +56,34 @@ pub async fn web_screenshot_tool(
     if host.is_empty() {
         return tool_error("web_screenshot: the url has no host");
     }
-    target = match ensure_url_safe(target.as_str()).await {
-        Ok(u) => u,
-        Err(e) => return tool_error(e.to_string()),
-    };
-
     // The render path honors cancellation and a hard ceiling: the
     // pool-slot acquire alone can wait on another call's 20-40s
     // render, and the tool used to observe neither the deadline nor
     // notifications/cancelled while it did.
     let work = async {
         let inner: Result<serde_json::Value, serde_json::Value> = async {
+            let target = ensure_url_safe(target.as_str())
+                .await
+                .map_err(|error| tool_error(error.to_string()))?;
+            let (wire, route) = {
+                let mut state = daemon.state.lock().await;
+                let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
+                state.ensure_persona(&host, &caps);
+                state.ensure_persona_egress(&host);
+                let mut wire = state
+                    .personas
+                    .get(&host)
+                    .filter(|p| p.quarantine_reason.is_none())
+                    .map(|p| p.ghost_wire())
+                    .unwrap_or_default();
+                let route = daemon.fetcher.route_for_fetch(target.as_str());
+                wire.route = Some(route.clone());
+                (wire, route)
+            };
             let ghost = {
                 // v4 E2: screenshot must claim the same persona wire
                 // as tier-1 (viewport + locale), or the capture is a
                 // different identity than the page we just fetched.
-                let wire = {
-                    let state = daemon.state.lock().await;
-                    state
-                        .personas
-                        .get(host.as_str())
-                        .filter(|p| p.quarantine_reason.is_none())
-                        .map(|p| p.ghost_wire())
-                        .unwrap_or_default()
-                };
                 match daemon
                     .ghost_mgr
                     .acquire_for_wire(&daemon.profile, Some(&host), wire)
@@ -96,7 +102,9 @@ pub async fn web_screenshot_tool(
                     ghost,
                     &daemon.profile,
                     target.as_str(),
-                    Duration::from_secs(20),
+                    budget
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_secs(20)),
                 )
                 .await
                 .map_err(|error| {
@@ -106,10 +114,11 @@ pub async fn web_screenshot_tool(
             if wait_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
-            let png = match ghost.screenshot_bytes(full_page).await {
+            let (png, document) = match ghost.screenshot_document(full_page).await {
                 Ok(b) => b,
                 Err(e) => return Err(tool_error(format!("web_screenshot: capture failed: {e}"))),
             };
+            validate_url_basic(&document.url).map_err(|error| tool_error(error.to_string()))?;
             let filename = format!("capture-{}.png", crate::handles::random_base62(16));
             let path = crate::paths::resolve_screenshot_path(&filename).map_err(tool_error)?;
             crate::ghost::save_screenshot(&path, &png)
@@ -126,7 +135,7 @@ pub async fn web_screenshot_tool(
                         "type": "text",
                         "text": format!(
                             "Captured {} ({} view, {} PNG bytes)",
-                            url_in,
+                            document.url,
                             if full_page { "full-page" } else { "viewport" },
                             png.len()
                         )
@@ -134,12 +143,19 @@ pub async fn web_screenshot_tool(
                 ],
                 "structuredContent": {
                     "ok": true,
-                    "url": url_in,
+                    "url": document.url,
                     "full_page": full_page,
                     "bytes": png.len(),
                     "path": path
                 },
-                "isError": false
+                "isError": false,
+                "_meta": {
+                    "com.donsetch/screenshot-debug": {
+                        "requested_url": url_in,
+                        "route": route.id(),
+                        "document": document
+                    }
+                }
             }))
         }
         .await;
@@ -147,9 +163,12 @@ pub async fn web_screenshot_tool(
             Ok(v) | Err(v) => v,
         }
     };
-    super::run_with_budget(work, Some(Duration::from_secs(60)), ctx.as_mut(), || {
-        tool_error("web_screenshot: deadline exceeded (60s)")
-    })
+    super::run_with_budget(
+        work,
+        Some(budget.saturating_sub(started.elapsed())),
+        ctx.as_mut(),
+        || tool_error("web_screenshot: deadline exceeded (60s)"),
+    )
     .await
 }
 

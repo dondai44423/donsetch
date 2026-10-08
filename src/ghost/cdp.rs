@@ -273,6 +273,38 @@ impl Cdp {
             .clone()
     }
 
+    /// Capture pixels with their document receipt, rejecting observed navigation changes.
+    pub(super) async fn capture_screenshot(
+        &self,
+        session: &str,
+        params: Value,
+    ) -> Result<(String, super::document::Document), FetchError> {
+        let before = self.document();
+        if before.generation == 0 || before.frame.is_empty() || before.loader.is_empty() {
+            return Err(FetchError::ghost(
+                "screenshot has no committed main document",
+            ));
+        }
+        let result = self
+            .call(Some(session), "Page.captureScreenshot", params)
+            .await?;
+        let document = self.document();
+        if before.generation != document.generation
+            || before.frame != document.frame
+            || before.loader != document.loader
+            || before.url != document.url
+        {
+            return Err(FetchError::ghost(
+                "document changed during screenshot capture",
+            ));
+        }
+        let data = result
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FetchError::ghost("no screenshot data"))?;
+        Ok((data.to_string(), document))
+    }
+
     pub(super) fn navigation_committed(
         &self,
         before: &super::document::Document,
@@ -465,6 +497,87 @@ mod link_tests {
     use std::time::{Duration, Instant};
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn stealth_v3_screenshot_receipt_rejects_interleaved_main_document_changes() {
+        for kind in [
+            "stable",
+            "reload",
+            "same-document",
+            "iframe",
+            "other-session",
+            "status",
+            "missing-data",
+        ] {
+            let (reached, received) = oneshot::channel();
+            let url = endpoint(move |mut ws| async move {
+                let Some(Ok(Message::Text(call))) = ws.next().await else { panic!("initial command not reached") };
+                let call: Value = serde_json::from_str(&call).unwrap();
+                let initial = json!({"sessionId":"owned", "method":"Page.frameNavigated", "params":{"frame":{"id":"main", "loaderId":"first", "url":"https://owned.example/page"}}});
+                ws.send(Message::Text(initial.to_string().into())).await.unwrap();
+                ws.send(Message::Text(json!({"id":call["id"], "result":{}}).to_string().into())).await.unwrap();
+                let Some(Ok(Message::Text(call))) = ws.next().await else { panic!("capture not reached") };
+                let call: Value = serde_json::from_str(&call).unwrap();
+                assert_eq!(call["method"], "Page.captureScreenshot");
+                assert_eq!(call["sessionId"], "owned");
+                let event = match kind {
+                    "reload" => Some(json!({"sessionId":"owned", "method":"Page.frameNavigated", "params":{"frame":{"id":"main", "loaderId":"second", "url":"https://owned.example/page"}}})),
+                    "same-document" => Some(json!({"sessionId":"owned", "method":"Page.navigatedWithinDocument", "params":{"frameId":"main", "url":"https://owned.example/changed"}})),
+                    "iframe" => Some(json!({"sessionId":"owned", "method":"Page.frameNavigated", "params":{"frame":{"id":"child", "parentId":"main", "loaderId":"child-loader", "url":"https://other.example/"}}})),
+                    "other-session" => Some(json!({"sessionId":"other", "method":"Page.frameNavigated", "params":{"frame":{"id":"other-main", "loaderId":"other-loader", "url":"https://other.example/"}}})),
+                    "status" => Some(json!({"sessionId":"owned", "method":"Network.responseReceived", "params":{"type":"Document", "frameId":"main", "loaderId":"first", "response":{"url":"https://owned.example/page", "status":201}}})),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    ws.send(Message::Text(event.to_string().into())).await.unwrap();
+                }
+                let result = if kind == "missing-data" { json!({}) } else { json!({"data":"owned-pixels"}) };
+                ws.send(Message::Text(json!({"id":call["id"], "result":result}).to_string().into())).await.unwrap();
+                reached.send(()).unwrap();
+                let _ = ws.next().await;
+            }).await;
+            let cdp = Cdp::connect(&url).await.unwrap();
+            cdp.track_document("owned".into());
+            assert!(
+                cdp.capture_screenshot("owned", json!({"format":"png"}))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no committed main document")
+            );
+            cdp.call(Some("owned"), "Page.enable", json!({}))
+                .await
+                .unwrap();
+            let result = cdp
+                .capture_screenshot("owned", json!({"format":"png"}))
+                .await;
+            received.await.unwrap();
+            if matches!(kind, "reload" | "same-document") {
+                assert!(
+                    result.unwrap_err().to_string().contains("document changed"),
+                    "{kind}"
+                );
+            } else if kind == "missing-data" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("no screenshot data")
+                );
+            } else {
+                let (pixels, document) = result.unwrap();
+                assert_eq!(pixels, "owned-pixels");
+                assert_eq!(document.generation, 1);
+                assert_eq!(document.frame, "main");
+                assert_eq!(document.loader, "first");
+                assert_eq!(document.url, "https://owned.example/page");
+                assert_eq!(
+                    document.status,
+                    if kind == "status" { Some(201) } else { None }
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn stealth_v3_idle_guard_exits_when_peer_closes_without_request_traffic() {

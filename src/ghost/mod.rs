@@ -2019,14 +2019,20 @@ impl Ghost {
     /// either way, so the capture un-minimizes it for its call and
     /// puts it back after; the invisibility the minimize bought is
     /// unchanged.
-    async fn capture_screenshot_data(&self, params: Value) -> Result<String, FetchError> {
+    async fn capture_screenshot_data(
+        &self,
+        params: Value,
+    ) -> Result<(String, document::Document), FetchError> {
         let mut operation = self.operation();
         let result = self.capture_screenshot_inner(params).await;
         operation.finish();
         result
     }
 
-    async fn capture_screenshot_inner(&self, params: Value) -> Result<String, FetchError> {
+    async fn capture_screenshot_inner(
+        &self,
+        params: Value,
+    ) -> Result<(String, document::Document), FetchError> {
         let restore = self.unminimize_for_capture().await;
         // macOS only: the measured state-flip/surface race lives there; other
         // platforms keep their pre-wait behavior and lean on the single retry.
@@ -2035,11 +2041,7 @@ impl Ghost {
         }
         let mut result = self
             .cdp
-            .call(
-                Some(&self.session),
-                "Page.captureScreenshot",
-                params.clone(),
-            )
+            .capture_screenshot(&self.session, params.clone())
             .await;
         // One retry, no loop: restoring the window and the compositor
         // actually presenting its first frame are not the same instant,
@@ -2053,19 +2055,12 @@ impl Ghost {
             && Self::is_capture_surface_failure(e)
         {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            result = self
-                .cdp
-                .call(Some(&self.session), "Page.captureScreenshot", params)
-                .await;
+            result = self.cdp.capture_screenshot(&self.session, params).await;
         }
         if restore.needs_surface_wait() {
             self.reminimize_after_capture().await;
         }
-        result?
-            .get("data")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| FetchError::ghost("no screenshot data"))
+        result
     }
 
     /// Un-minimize a window we minimized at launch, best-effort.
@@ -2187,7 +2182,7 @@ impl Ghost {
     pub async fn screenshot(&self, path: &str) -> Result<(), FetchError> {
         let dest = crate::paths::resolve_screenshot_path(path)
             .map_err(|e| FetchError::ghost(format!("screenshot path rejected: {e}")))?;
-        let data = self
+        let (data, _) = self
             .capture_screenshot_data(json!({ "format": "png" }))
             .await?;
         let bytes = decode_screenshot_data(&data)?;
@@ -2198,10 +2193,20 @@ impl Ghost {
     /// #171). `full_page` asks CDP to capture beyond the viewport;
     /// everything else is the same capture as [`Self::screenshot`].
     pub async fn screenshot_bytes(&self, full_page: bool) -> Result<Vec<u8>, FetchError> {
-        let data = self
+        self.screenshot_document(full_page)
+            .await
+            .map(|(png, _)| png)
+    }
+
+    /// PNG bytes with the main-document receipt observed during their capture.
+    pub(crate) async fn screenshot_document(
+        &self,
+        full_page: bool,
+    ) -> Result<(Vec<u8>, document::Document), FetchError> {
+        let (data, document) = self
             .capture_screenshot_data(json!({ "format": "png", "captureBeyondViewport": full_page }))
             .await?;
-        decode_screenshot_data(&data)
+        Ok((decode_screenshot_data(&data)?, document))
     }
 
     /// One trusted click with a human-ish pre-move path.
