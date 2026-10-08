@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Accepted client hints are honored the way Chrome does: an origin that
+  opts in with Accept-CH receives the accepted high-entropy hints on its
+  later requests (full-version-list coherent with the same request's
+  sec-ch-ua, plus arch, bitness and model), a Critical-CH response
+  triggers exactly one replay carrying the hint, and the acceptance is
+  session-scoped per origin, never persisted and never sent to an
+  insecure or different origin.
+
 - The HTTP/2 client enforces the server preface: the first server frame must
   be SETTINGS, and anything else is refused with GOAWAY(PROTOCOL_ERROR)
   instead of being served as if the protocol had started correctly.

@@ -15,6 +15,7 @@ use crate::transport::{h1, h2::conn::H2Conn, proxy, tcp, tls};
 
 use super::cookies::CookieJar;
 use super::decompress;
+use super::hints;
 use super::revalidate::{CacheCheck, RevalidationCache};
 
 const MAX_REDIRECTS: u8 = 10;
@@ -82,6 +83,10 @@ pub struct Fetcher {
     /// is configured, fetch sticks to one lane per host and rotates
     /// on 429/407/dead/timeout. None = historical env/slot path.
     egress: Option<std::sync::Arc<crate::search::egress::EgressPool>>,
+    /// Accepted high-entropy client hints per origin (WICG UA-CH):
+    /// session-scoped, in memory, bounded. The low-entropy trio always
+    /// rides from the profile; these ride only origins that opted in.
+    accept_ch: Mutex<hints::AcceptChCache>,
 }
 
 impl Fetcher {
@@ -104,6 +109,7 @@ impl Fetcher {
             jar: Mutex::new(CookieJar::new()),
             cache: Mutex::new(RevalidationCache::new()),
             egress: None,
+            accept_ch: Mutex::new(hints::AcceptChCache::default()),
         })
     }
 
@@ -427,6 +433,13 @@ impl Fetcher {
             if first_request {
                 wire_headers.extend(conditional.iter().cloned());
             }
+            // What this hop's request carries, for the Critical-CH check
+            // below (the list itself moves into the fetch call).
+            let sent_hints: Vec<String> = wire_headers
+                .iter()
+                .filter(|(n, _)| n.starts_with("sec-ch-ua"))
+                .map(|(n, _)| n.clone())
+                .collect();
             let hop_started = Instant::now();
             let mut out = match self
                 .fetch_once_with_headers(&current, effective_proxy, use_jar, wire_headers)
@@ -616,6 +629,54 @@ impl Fetcher {
                                     );
                             }
                             out = retry;
+                            out.route = route.clone();
+                        }
+                    }
+
+                    // Bounded Critical-CH replay (WICG UA-CH): the response
+                    // marks a hint this request did not carry as critical,
+                    // so the representation is incomplete without it.
+                    // Re-issue the request ONCE with the now-accepted hints;
+                    // this arm returns right after, which bounds it.
+                    if let Some(critical) = header_value(&out.headers, "critical-ch")
+                        && hints::critical_missing(&critical, &sent_hints)
+                    {
+                        let url = url::Url::parse(&current)
+                            .map_err(|_| FetchError::InvalidUrl(current.clone()))?;
+                        let headers =
+                            self.request_headers(&url, &[], use_jar, ref_arg, site_arg, identity)?;
+                        let replay_key =
+                            Self::representation_key(&current, effective_proxy, use_jar, &headers);
+                        let replay_started = Instant::now();
+                        if let Ok(mut replay) = self
+                            .fetch_once_with_headers(&current, effective_proxy, use_jar, headers)
+                            .await
+                        {
+                            if replay.status == 304 {
+                                return Err(FetchError::Http(
+                                    "304 response to critical-ch replay without request validators"
+                                        .into(),
+                                ));
+                            }
+                            replay.verdict =
+                                walls::detect(replay.status, &replay.headers, &replay.body);
+                            self.cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&replay_key);
+                            if !skip_cache && matches!(replay.verdict, Verdict::ContentOk) {
+                                self.cache
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .store_with_delay(
+                                        &replay_key,
+                                        replay.status,
+                                        &replay.headers,
+                                        &replay.body,
+                                        replay_started.elapsed(),
+                                    );
+                            }
+                            out = replay;
                             out.route = route.clone();
                         }
                     }
@@ -817,6 +878,22 @@ impl Fetcher {
             for (name, value) in &mut req_headers {
                 if name == "user-agent" {
                     *value = ua.to_owned();
+                }
+            }
+        } else {
+            // Accepted high-entropy hints (WICG UA-CH): placed directly
+            // after the sec-ch-ua cluster the profile laid down, so the
+            // hint block keeps Chrome's grouping. The legacy-UA branch
+            // above presents a different client: hints stay stripped.
+            let hint_headers = self.accept_ch_headers(is_https, host, &authority);
+            if !hint_headers.is_empty() {
+                let pos = req_headers
+                    .iter()
+                    .position(|(n, _)| n == "sec-ch-ua-platform")
+                    .map(|i| i + 1)
+                    .unwrap_or(req_headers.len());
+                for (i, (name, value)) in hint_headers.into_iter().enumerate() {
+                    req_headers.insert(pos + i, (name, value));
                 }
             }
         }
@@ -1024,6 +1101,7 @@ impl Fetcher {
                         // fall through to h1/h2
                     } else {
                         self.store_hop_cookies(use_jar, host, is_https, &path, &h3out.headers);
+                        self.record_accept_ch(is_https, host, &authority, &h3out.headers);
                         // Same exit as every other transport: finish()
                         // decompresses and scores walls::detect, so a
                         // challenge served over h3 escalates instead of
@@ -1068,6 +1146,7 @@ impl Fetcher {
                 Ok(out) => {
                     // verdict already scored by finish()
                     self.store_hop_cookies(use_jar, host, is_https, &path, &out.headers);
+                    self.record_accept_ch(is_https, host, &authority, &out.headers);
                     // Alt-svc absorb (v4 phase 5.1): only on a direct
                     // https lane; proxies naturally exempt. It lets a
                     // later connection on the same origin take h3, for
@@ -1115,6 +1194,7 @@ impl Fetcher {
                 Ok(out) => {
                     // verdict already scored by finish()
                     self.store_hop_cookies(use_jar, host, is_https, &path, &out.headers);
+                    self.record_accept_ch(is_https, host, &authority, &out.headers);
                     // Alt-svc absorb (v4 phase 5.1): only on a direct https
                     // lane; refreshed per response so the ma= lifetime stays
                     // current (the server's own ma=, never a constant). h3
@@ -1157,6 +1237,46 @@ impl Fetcher {
     /// primitive, not the callers. The primitive is strictly one-hop,
     /// so keying on the request host/scheme is per-hop correct for
     /// redirect chains.
+    /// The accepted high-entropy hints for this origin, as wire headers
+    /// (empty when the origin never opted in, the value expired, or the
+    /// origin is not a secure context).
+    fn accept_ch_headers(
+        &self,
+        is_https: bool,
+        host: &str,
+        authority: &str,
+    ) -> Vec<(String, String)> {
+        if !hints::secure_context(is_https, host) {
+            return Vec::new();
+        }
+        let origin = format!("{}://{authority}", if is_https { "https" } else { "http" });
+        let accepted = self
+            .accept_ch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hints_for(&origin, unix_now());
+        hints::hint_headers(&self.profile, &accepted)
+    }
+
+    /// Record the response's Accept-CH for this origin (secure contexts
+    /// only, like Chrome). Session-scoped: nothing reaches disk.
+    fn record_accept_ch(
+        &self,
+        is_https: bool,
+        host: &str,
+        authority: &str,
+        headers: &[(String, String)],
+    ) {
+        if !hints::secure_context(is_https, host) {
+            return;
+        }
+        let origin = format!("{}://{authority}", if is_https { "https" } else { "http" });
+        self.accept_ch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&origin, headers, unix_now());
+    }
+
     fn store_hop_cookies(
         &self,
         use_jar: bool,
@@ -1399,6 +1519,14 @@ fn finish(
         verdict,
         elapsed: Duration::ZERO,
     })
+}
+
+/// Seconds since the Unix epoch (client-hint cache stamps).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
