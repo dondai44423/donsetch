@@ -74,6 +74,20 @@ if command -v sccache >/dev/null 2>&1; then
     export CXX="${CXX:-sccache c++}"
     export SCCACHE_DIR="${SCCACHE_DIR:-$PWD/target/sccache}"
     export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-10G}"
+    # Cross targets keep their own C compiler: the generic CC above is a
+    # host compiler, and a host toolchain compiles the target's generated
+    # config macros (e.g. oniguruma's `gid_t int` from a mingw-flavored
+    # config.h) against host headers, which stops compiling the moment
+    # the sccache hits that used to mask it go cold. The value must be a
+    # plain compiler name: boringssl's cmake build hands it straight to
+    # CMAKE_C_COMPILER and cannot take a wrapper, so the cross toolchain
+    # itself is not sccached here.
+    if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+        export CC_x86_64_pc_windows_gnu="${CC_x86_64_pc_windows_gnu:-x86_64-w64-mingw32-gcc}"
+    fi
+    if command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
+        export CXX_x86_64_pc_windows_gnu="${CXX_x86_64_pc_windows_gnu:-x86_64-w64-mingw32-g++}"
+    fi
 fi
 
 exec nice -n 19 ionice -c3 taskset -c "$cores" "$@"

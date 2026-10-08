@@ -141,6 +141,7 @@ _win-check-prereqs:
 win-check-full: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
     BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
+    CMAKE_TOOLCHAIN_FILE="{{justfile_directory()}}/scripts/mingw-cross-toolchain.cmake" \
     ORT_SKIP_DOWNLOAD=1 \
     {{budget}} cargo clippy --target x86_64-pc-windows-gnu --all-targets {{feat}} -- -Dwarnings
 
@@ -150,6 +151,7 @@ win-check-full: _win-check-prereqs
 win-check-core: _win-check-prereqs
     ASM_NASM="{{justfile_directory()}}/scripts/nasm-no-pthread.sh" \
     BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$(x86_64-w64-mingw32-gcc -print-file-name=include) -D__CLANG_MAX_ALIGN_T_DEFINED" \
+    CMAKE_TOOLCHAIN_FILE="{{justfile_directory()}}/scripts/mingw-cross-toolchain.cmake" \
     {{budget}} cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets -- -Dwarnings
 
 # Heavy by nature: soak holds the process for minutes, corpus and
