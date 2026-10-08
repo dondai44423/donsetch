@@ -330,7 +330,12 @@ fn persisted_save_reports_io_failure_and_recovers() {
                 std::fs::rename(&root, &displaced).unwrap();
                 std::fs::write(&root, "owned directory blocker").unwrap();
             }
-            "open" => std::fs::create_dir(&tmp).unwrap(),
+            "open" => {
+                // Match the writer's per-process tmp name: the fault
+                // must poison the path the SAVE will actually use.
+                let tmp = root.join(format!("ghost-state.json.{}.tmp", std::process::id()));
+                std::fs::create_dir(&tmp).unwrap();
+            }
             "rename" => {
                 std::fs::remove_file(&path).unwrap();
                 std::fs::create_dir(&path).unwrap();

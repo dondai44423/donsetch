@@ -76,6 +76,22 @@ async fn http_head(stream: &mut TcpStream) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+/// Accept one connection from whichever family the resolver picked.
+async fn accept_any(
+    v4: &tokio::net::TcpListener,
+    v6: Option<&tokio::net::TcpListener>,
+) -> TcpStream {
+    match v6 {
+        Some(v6) => {
+            tokio::select! {
+                r = v4.accept() => r.unwrap().0,
+                r = v6.accept() => r.unwrap().0,
+            }
+        }
+        None => v4.accept().await.unwrap().0,
+    }
+}
+
 #[tokio::test]
 async fn stealth_v3_transport_tls_tickets_do_not_cross_origin_ports() {
     let acceptor = owned_acceptor();
@@ -85,12 +101,18 @@ async fn stealth_v3_transport_tls_tickets_do_not_cross_origin_ports() {
         first.local_addr().unwrap().port(),
         second.local_addr().unwrap().port(),
     ];
+    // The URL host must stay `localhost` (the owned certificate's SAN),
+    // so the dial follows the resolver: mirror each port on [::1] when
+    // the stack allows it - a runner whose `localhost` answers ::1 only
+    // would otherwise refuse the primary family with no IPv4 fallback.
+    let first6 = tokio::net::TcpListener::bind(("::1", ports[0])).await.ok();
+    let second6 = tokio::net::TcpListener::bind(("::1", ports[1])).await.ok();
     let server = tokio::spawn(async move {
         let mut resumed = Vec::new();
         // One TLS context deliberately serves both ports, so an incorrectly
         // shared client ticket would be accepted and observable at the peer.
-        for listener in [first, second] {
-            let (tcp, _) = listener.accept().await.unwrap();
+        for (v4, v6) in [(first, first6), (second, second6)] {
+            let tcp = accept_any(&v4, v6.as_ref()).await;
             let mut tls = tokio_boring::accept(&acceptor, tcp).await.unwrap();
             resumed.push(tls.ssl().session_reused());
             start_h2(&mut tls, b"owned-port").await;
@@ -182,34 +204,35 @@ async fn stealth_v3_transport_new_proxy_credentials_require_their_own_tunnel() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
-        let (mut tcp, _) = listener.accept().await.unwrap();
-        let head = http_head(&mut tcp).await;
-        assert!(head.contains("Proxy-Authorization: Basic YWxpY2U6b25l\r\n"));
-        tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .unwrap();
-        let mut tls = tokio_boring::accept(&acceptor, tcp).await.unwrap();
-        start_h2(&mut tls, b"lane-alice").await;
-        loop {
-            tokio::select! {
-                frame = read_frame(&mut tls) => {
-                    let (header, _) = frame.unwrap();
-                    if header.ty == HEADERS {
-                        answer_h2(&mut tls, header.stream_id, b"lane-alice").await;
-                        return "alice";
-                    }
-                }
-                accepted = listener.accept() => {
-                    let (mut tcp, _) = accepted.unwrap();
-                    let head = http_head(&mut tcp).await;
-                    assert!(head.contains("Proxy-Authorization: Basic Ym9iOnR3bw==\r\n"));
-                    tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
-                    let mut tls = tokio_boring::accept(&acceptor, tcp).await.unwrap();
-                    start_h2(&mut tls, b"lane-bob").await;
-                    return "bob";
-                }
-            }
+        // The client fetches alice, then bob: serve strictly in that
+        // order. The old select raced bob's accept against alice's
+        // remaining frames and, on slower peers, returned before the
+        // second tunnel existed (connection refused for the second
+        // fetch).
+        let mut last = "none";
+        for (expected, body, label) in [
+            (
+                "Proxy-Authorization: Basic YWxpY2U6b25l\r\n",
+                b"lane-alice".as_slice(),
+                "alice",
+            ),
+            (
+                "Proxy-Authorization: Basic Ym9iOnR3bw==\r\n",
+                b"lane-bob".as_slice(),
+                "bob",
+            ),
+        ] {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let head = http_head(&mut tcp).await;
+            assert!(head.contains(expected));
+            tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut tls = tokio_boring::accept(&acceptor, tcp).await.unwrap();
+            start_h2(&mut tls, body).await;
+            last = label;
         }
+        last
     });
     let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
     for (credentials, body) in [

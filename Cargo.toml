@@ -90,6 +90,10 @@ http = ["dep:axum", "dep:tower-http"]
 windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Pipes"] }
 
 [dev-dependencies]
+# The owned-browser pixel test decodes a PNG; the optional runtime dep
+# rides the ocr feature, and no-feature test builds (CI linux-aarch64,
+# windows) must still compile the test.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

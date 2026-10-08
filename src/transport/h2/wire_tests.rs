@@ -469,6 +469,18 @@ async fn stealth_v3_h2_valid_zero_settings_and_invalid_peer_limits_are_distinct(
                 .await
                 .unwrap();
                 tls.flush().await.unwrap();
+                // The helper already consumed the client ACK for its
+                // own SETTINGS; the variant SETTINGS above earns a
+                // second ACK. Read it (bounded) and close with a
+                // shutdown: on Windows a close with unread inbound
+                // data sends an RST that destroyed the buffered
+                // response (WSAECONNABORTED).
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+                    let mut buf = [0u8; 64];
+                    while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
+                })
+                .await;
+                let _ = tls.shutdown().await;
             },
         )
         .await;
