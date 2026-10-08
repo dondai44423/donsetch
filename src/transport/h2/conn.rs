@@ -45,6 +45,10 @@ pub struct H2Conn {
     /// last-stream-id may still finish; no new stream may open, and the
     /// connection must never return to the pool.
     draining: bool,
+    /// The stream currently awaited, when a request is in flight; a
+    /// dropped wait leaves it set so an abandoned stream can be
+    /// cancelled (RST_STREAM CANCEL).
+    in_flight: Option<u32>,
 }
 
 impl H2Conn {
@@ -117,6 +121,7 @@ impl H2Conn {
             peer_header_list_limit: usize::MAX,
             peer_concurrency: u32::MAX,
             draining: false,
+            in_flight: None,
         })
     }
 
@@ -140,6 +145,26 @@ impl H2Conn {
         self.draining
     }
 
+    /// Cancel the stream an abandoned request left in flight (RFC 9113
+    /// §6.4/§8.1: RST_STREAM with CANCEL), so a stalled peer stops
+    /// working on it before the connection is discarded. The connection
+    /// is not reusable afterwards: frames for the cancelled stream may
+    /// still arrive on the wire.
+    pub async fn cancel_in_flight(&mut self) {
+        if let Some(stream_id) = self.in_flight.take() {
+            // CANCEL = 0x8 (RFC 9113 §7).
+            let _ = write_frame(
+                &mut self.stream,
+                RST_STREAM,
+                0,
+                stream_id,
+                &0x8u32.to_be_bytes(),
+            )
+            .await;
+            let _ = self.stream.flush().await;
+        }
+    }
+
     /// One GET at a time; connection pooling reuses completed serial streams.
     pub async fn get(
         &mut self,
@@ -157,6 +182,7 @@ impl H2Conn {
             return Err(FetchError::Http("h2: connection is draining".into()));
         }
         self.next_stream += 2;
+        self.in_flight = Some(stream_id);
 
         let mut headers: Vec<(String, String)> = vec![
             (":method".into(), "GET".into()),

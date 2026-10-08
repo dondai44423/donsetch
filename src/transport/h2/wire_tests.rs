@@ -606,3 +606,30 @@ async fn stealth_v3_h2_goaway_below_the_stream_aborts_the_response() {
     assert!(format!("{error:?}").contains("goaway"), "{error:?}");
     finish(server).await;
 }
+
+#[tokio::test]
+async fn stealth_v3_h2_abandoned_stream_is_cancelled() {
+    let (mut conn, server) = fixture(
+        BrowserProfile::chrome_150(Platform::Linux),
+        |mut tls| async move {
+            // A response that never completes: the abandoned stream must
+            // be cancelled with RST_STREAM(CANCEL) on stream 1.
+            write_frame(&mut tls, HEADERS, FLAG_END_HEADERS, 1, &[0x88])
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            let (header, payload) = read_frame(&mut tls).await.unwrap();
+            assert_eq!((header.ty, header.stream_id), (RST_STREAM, 1));
+            assert_eq!(payload, 0x8u32.to_be_bytes());
+        },
+    )
+    .await;
+    let abandoned = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        conn.get("localhost", "/stall", &[]),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the stalled response must not complete");
+    conn.cancel_in_flight().await;
+    finish(server).await;
+}

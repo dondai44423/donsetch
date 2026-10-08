@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HTTP/2 response abandoned at the wait ceiling is cancelled, not
+  silently dropped: the client sends RST_STREAM(CANCEL) on the stalled
+  stream before discarding the connection, so a stalled peer stops working
+  on a response nobody will read.
+
 - The browser runs in the persona's timezone: the zone rides the ghost wire
   (a re-mint with a different zone relaunches the browser), is sanitized
   before it can reach the process environment, and starts Chromium with TZ

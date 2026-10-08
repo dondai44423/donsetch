@@ -1330,9 +1330,20 @@ impl Fetcher {
             .cloned()
             .chain(std::iter::once(("priority".into(), "u=0, i".into())))
             .collect();
-        let resp = tokio::time::timeout(RESPONSE_TIMEOUT, conn.get(authority, path, &h2_headers))
-            .await
-            .map_err(|_| FetchError::Timeout)??;
+        let resp =
+            match tokio::time::timeout(RESPONSE_TIMEOUT, conn.get(authority, path, &h2_headers))
+                .await
+            {
+                Ok(res) => res?,
+                Err(_) => {
+                    // The wait future was dropped mid-stream: tell the peer
+                    // the stream is cancelled (RFC 9113 §6.4 CANCEL) instead
+                    // of silently closing on it, then let the caller discard
+                    // the connection.
+                    conn.cancel_in_flight().await;
+                    return Err(FetchError::Timeout);
+                }
+            };
         finish(
             url_of("https", authority, path),
             "h2",
