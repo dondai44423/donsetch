@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The HTTP/2 client enforces the server preface: the first server frame must
+  be SETTINGS, and anything else is refused with GOAWAY(PROTOCOL_ERROR)
+  instead of being served as if the protocol had started correctly.
+
 - An HTTP/2 response abandoned at the wait ceiling is cancelled, not
   silently dropped: the client sends RST_STREAM(CANCEL) on the stalled
   stream before discarding the connection, so a stalled peer stops working

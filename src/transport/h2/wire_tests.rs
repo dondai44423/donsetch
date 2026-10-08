@@ -8,7 +8,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
-async fn fixture<F, Fut>(profile: BrowserProfile, serve: F) -> (H2Conn, tokio::task::JoinHandle<()>)
+async fn fixture_peer<F, Fut>(
+    profile: BrowserProfile,
+    send_settings: bool,
+    serve: F,
+) -> (H2Conn, tokio::task::JoinHandle<()>)
 where
     F: FnOnce(SslStream<TcpStream>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
@@ -58,13 +62,15 @@ where
                 (":scheme".into(), "https".into())
             ]
         );
-        write_frame(&mut tls, SETTINGS, 0, 0, &[]).await.unwrap();
-        tls.flush().await.unwrap();
-        let (ack, payload) = read_frame(&mut tls).await.unwrap();
-        assert_eq!(
-            (ack.ty, ack.flags, ack.stream_id, payload.len()),
-            (SETTINGS, FLAG_ACK, 0, 0)
-        );
+        if send_settings {
+            write_frame(&mut tls, SETTINGS, 0, 0, &[]).await.unwrap();
+            tls.flush().await.unwrap();
+            let (ack, payload) = read_frame(&mut tls).await.unwrap();
+            assert_eq!(
+                (ack.ty, ack.flags, ack.stream_id, payload.len()),
+                (SETTINGS, FLAG_ACK, 0, 0)
+            );
+        }
         serve(tls).await;
     });
     let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -75,6 +81,14 @@ where
         .await
         .unwrap();
     (H2Conn::start(tls, &profile).await.unwrap(), server)
+}
+
+async fn fixture<F, Fut>(profile: BrowserProfile, serve: F) -> (H2Conn, tokio::task::JoinHandle<()>)
+where
+    F: FnOnce(SslStream<TcpStream>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    fixture_peer(profile, true, serve).await
 }
 
 async fn finish(server: tokio::task::JoinHandle<()>) {
@@ -631,5 +645,33 @@ async fn stealth_v3_h2_abandoned_stream_is_cancelled() {
     .await;
     assert!(abandoned.is_err(), "the stalled response must not complete");
     conn.cancel_in_flight().await;
+    finish(server).await;
+}
+
+#[tokio::test]
+async fn stealth_v3_h2_non_settings_server_preface_is_rejected() {
+    let (mut conn, server) = fixture_peer(
+        BrowserProfile::chrome_150(Platform::Linux),
+        false,
+        |mut tls| async move {
+            // The first server frame is a WINDOW_UPDATE, not SETTINGS: the
+            // client must answer GOAWAY(PROTOCOL_ERROR) and refuse the
+            // exchange (RFC 9113 §3.4).
+            write_frame(&mut tls, WINDOW_UPDATE, 0, 0, &[0, 0, 0, 1])
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            let (hdr, payload) = read_frame(&mut tls).await.unwrap();
+            assert_eq!((hdr.ty, hdr.stream_id), (GOAWAY, 0));
+            assert_eq!(&payload[4..8], &0x1u32.to_be_bytes());
+        },
+    )
+    .await;
+    let result = conn.get("localhost", "/", &[]).await;
+    let message = match &result {
+        Err(error) => format!("{error}"),
+        Ok(_) => panic!("the client must refuse a non-SETTINGS server preface"),
+    };
+    assert!(message.contains("preface"), "unexpected error: {message}");
     finish(server).await;
 }

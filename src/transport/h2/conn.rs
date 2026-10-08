@@ -49,6 +49,9 @@ pub struct H2Conn {
     /// dropped wait leaves it set so an abandoned stream can be
     /// cancelled (RST_STREAM CANCEL).
     in_flight: Option<u32>,
+    /// The server connection preface arrived (RFC 9113 §3.4): the first
+    /// frame the server sends must be SETTINGS.
+    settings_seen: bool,
 }
 
 impl H2Conn {
@@ -122,6 +125,7 @@ impl H2Conn {
             peer_concurrency: u32::MAX,
             draining: false,
             in_flight: None,
+            settings_seen: false,
         })
     }
 
@@ -255,6 +259,23 @@ impl H2Conn {
 
         loop {
             let (hdr, payload) = read_frame(&mut self.stream).await?;
+            if !self.settings_seen {
+                // RFC 9113 §3.4: the server connection preface is a
+                // SETTINGS frame and it MUST be the first frame the
+                // server sends. Anything else (including a SETTINGS ACK)
+                // is a connection error: answer GOAWAY(PROTOCOL_ERROR)
+                // like Chrome before the connection is discarded.
+                if hdr.ty != SETTINGS || hdr.flags & FLAG_ACK != 0 {
+                    let mut goaway = [0u8; 8];
+                    goaway[4..8].copy_from_slice(&0x1u32.to_be_bytes());
+                    let _ = write_frame(&mut self.stream, GOAWAY, 0, 0, &goaway).await;
+                    let _ = self.stream.flush().await;
+                    return Err(FetchError::Http(
+                        "h2: server preface was not SETTINGS".into(),
+                    ));
+                }
+                self.settings_seen = true;
+            }
             if continuation && (hdr.ty != CONTINUATION || hdr.stream_id != stream_id) {
                 return Err(FetchError::Http(
                     "h2: interleaved CONTINUATION block".into(),
