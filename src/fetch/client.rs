@@ -212,12 +212,12 @@ impl Fetcher {
             .await
     }
 
-    /// Same as `fetch_via_jar` but with a referer header. The
-    /// referer is sent on the initial request only (not redirect
-    /// hops), matching browser behavior. `sec-fetch-site` is
-    /// computed from the referer's origin vs the target's origin:
-    /// `same-origin` or `cross-site`. No referer → `none` (typed
-    /// URL, the default).
+    /// Same as `fetch_via_jar` but with a referer header, marking
+    /// the request link-initiated: `sec-fetch-site` is classified
+    /// against the initiator and walks the whole redirect chain
+    /// (worst relationship wins, Fetch Metadata §2.3), each hop
+    /// carrying the redirecting URL as referer like a browser. No
+    /// referer → `none` (typed URL), latched through redirects.
     pub async fn fetch_via_jar_ref(
         &self,
         url_str: &str,
@@ -334,7 +334,7 @@ impl Fetcher {
         let initial_url =
             url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
         let initial_headers =
-            self.request_headers(&initial_url, &[], use_jar, referer, identity)?;
+            self.request_headers(&initial_url, &[], use_jar, referer, None, identity)?;
         let cache_key =
             Self::representation_key(url_str, initial_proxy.as_ref(), use_jar, &initial_headers);
         let check = if skip_cache {
@@ -368,6 +368,11 @@ impl Fetcher {
         let mut current = url_str.to_string();
         let mut redirects = 0u8;
         let mut first_request = true;
+        // Fetch Metadata chain state (link-initiated fetches only):
+        // the worst initiator relationship seen so far, and the URL
+        // that issued the last redirect for the hop referer.
+        let mut site_worst = SiteClass::SameOrigin;
+        let mut prev: Option<String> = None;
 
         // Evaluate captured protocol/bypass settings for each current URL.
         // Explicit and pool routes remain pinned across the redirect chain.
@@ -379,15 +384,41 @@ impl Fetcher {
                 route.proxy_for(&current)?
             };
             let effective_proxy = hop_proxy.as_ref();
-            // Referer applies to the initial request only.
-            // Redirects get no referer (avoids cross-origin leak).
-            let ref_arg = if first_request { referer } else { None };
+            // Fetch Metadata across the chain (Fetch Metadata §2.3):
+            // the first hop's value derives from the initiator inside
+            // request_headers; later hops carry the worst relationship
+            // seen so far and use the redirecting URL as referer. A
+            // directly user-initiated fetch (no referer) keeps `none`
+            // and no referer through its redirects (§4.1).
+            let hop_url = if first_request {
+                initial_url.clone()
+            } else {
+                url::Url::parse(&current).map_err(|_| FetchError::InvalidUrl(current.clone()))?
+            };
+            if let Some(initiator) = referer {
+                let hop_site = classify_site(initiator, hop_url.as_str());
+                site_worst = if first_request {
+                    hop_site
+                } else {
+                    site_worst.max(hop_site)
+                };
+            }
+            let ref_arg = if first_request {
+                referer
+            } else if referer.is_some() {
+                prev.as_deref()
+            } else {
+                None
+            };
+            let site_arg = if referer.is_some() && !first_request {
+                Some(site_worst.value())
+            } else {
+                None
+            };
             let mut wire_headers = if first_request {
                 initial_headers.clone()
             } else {
-                let url = url::Url::parse(&current)
-                    .map_err(|_| FetchError::InvalidUrl(current.clone()))?;
-                self.request_headers(&url, &[], use_jar, ref_arg, identity)?
+                self.request_headers(&hop_url, &[], use_jar, ref_arg, site_arg, identity)?
             };
             let hop_key =
                 Self::representation_key(&current, effective_proxy, use_jar, &wire_headers);
@@ -519,6 +550,7 @@ impl Fetcher {
                         out.redirects = redirects;
                         return Ok(out);
                     }
+                    prev = Some(current.clone());
                     current = next.to_string();
                 }
                 _ => {
@@ -551,7 +583,7 @@ impl Fetcher {
                         let url = url::Url::parse(&current)
                             .map_err(|_| FetchError::InvalidUrl(current.clone()))?;
                         let headers =
-                            self.request_headers(&url, &[], use_jar, ref_arg, identity)?;
+                            self.request_headers(&url, &[], use_jar, ref_arg, site_arg, identity)?;
                         let retry_key =
                             Self::representation_key(&current, effective_proxy, use_jar, &headers);
                         let retry_started = Instant::now();
@@ -738,6 +770,7 @@ impl Fetcher {
         conditional: &[(String, String)],
         use_jar: bool,
         referer: Option<&str>,
+        site: Option<&'static str>,
         identity: RequestIdentity<'_>,
     ) -> Result<Vec<(String, String)>, FetchError> {
         let RequestIdentity {
@@ -829,9 +862,9 @@ impl Fetcher {
         // looks like a fresh typed navigation, which is a bot
         // fingerprint.
         if let Some(ref_url) = referer {
-            let site = sec_fetch_site(ref_url, url.as_str());
+            let hop_site = classify_site(ref_url, url.as_str());
             if let Some(pos) = req_headers.iter().position(|(n, _)| n == "sec-fetch-site") {
-                req_headers[pos].1 = site.into();
+                req_headers[pos].1 = hop_site.value().into();
             }
             // Chrome puts Referer after Sec-Fetch-Dest, before
             // Accept-Encoding.
@@ -841,6 +874,15 @@ impl Fetcher {
                 .position(|(n, _)| n == "accept-encoding")
                 .unwrap_or(req_headers.len());
             req_headers.insert(pos, ("referer".into(), ref_val));
+        }
+        // Redirect hops carry the worst chain classification, not the
+        // immediate predecessor's (Fetch Metadata §4.1: a chain that
+        // ever crossed a site keeps `cross-site`, and `same-site` only
+        // when every URL so far is same-site with the initiator).
+        if let Some(site_value) = site
+            && let Some(pos) = req_headers.iter().position(|(n, _)| n == "sec-fetch-site")
+        {
+            req_headers[pos].1 = site_value.into();
         }
 
         Ok(req_headers)
@@ -885,7 +927,7 @@ impl Fetcher {
         identity: RequestIdentity<'_>,
     ) -> Result<FetchOutcome, FetchError> {
         let url = url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
-        let headers = self.request_headers(&url, conditional, use_jar, referer, identity)?;
+        let headers = self.request_headers(&url, conditional, use_jar, referer, None, identity)?;
         let mut out = self
             .fetch_once_with_headers(url_str, proxy, use_jar, headers)
             .await?;
@@ -1355,29 +1397,53 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-/// Compute `sec-fetch-site` from the referer's origin vs the
-/// target's origin. `same-origin` = same scheme+host+port;
-/// everything else = `cross-site` (conservative : we don't
-/// compute the registrable domain for `same-site`).
-fn sec_fetch_site(referer: &str, target: &str) -> &'static str {
-    let ref_origin = url::Url::parse(referer).ok().map(|u| {
-        (
-            u.scheme().to_string(),
-            u.host_str().unwrap_or("").to_string(),
-            u.port_or_known_default(),
-        )
-    });
-    let tgt_origin = url::Url::parse(target).ok().map(|u| {
-        (
-            u.scheme().to_string(),
-            u.host_str().unwrap_or("").to_string(),
-            u.port_or_known_default(),
-        )
-    });
-    match (ref_origin, tgt_origin) {
-        (Some(r), Some(t)) if r == t => "same-origin",
-        _ => "cross-site",
+/// Schemeful same-site relationship for `sec-fetch-site` (Fetch
+/// Metadata §2.3); the ordering is the chain fold's worst-wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SiteClass {
+    SameOrigin,
+    SameSite,
+    CrossSite,
+}
+
+impl SiteClass {
+    fn value(self) -> &'static str {
+        match self {
+            SiteClass::SameOrigin => "same-origin",
+            SiteClass::SameSite => "same-site",
+            SiteClass::CrossSite => "cross-site",
+        }
     }
+}
+
+/// The "site" of a host: its registrable domain when it has one,
+/// else the host itself (IPs, localhost, single labels).
+fn site_of(host: &str) -> &str {
+    psl::domain(host.as_bytes())
+        .and_then(|domain| std::str::from_utf8(domain.as_bytes()).ok())
+        .unwrap_or(host)
+}
+
+/// Chrome's `sec-fetch-site` relationship between the initiator and
+/// a URL (schemeful): same-origin = scheme+host+port, same-site =
+/// same scheme and same registrable domain (port ignored), else
+/// cross-site. Unparseable input fails closed to cross-site.
+fn classify_site(initiator: &str, target: &str) -> SiteClass {
+    let (Ok(initiator), Ok(target)) = (url::Url::parse(initiator), url::Url::parse(target)) else {
+        return SiteClass::CrossSite;
+    };
+    if initiator.scheme() == target.scheme()
+        && initiator.host_str() == target.host_str()
+        && initiator.port_or_known_default() == target.port_or_known_default()
+    {
+        return SiteClass::SameOrigin;
+    }
+    if initiator.scheme() == target.scheme()
+        && site_of(initiator.host_str().unwrap_or("")) == site_of(target.host_str().unwrap_or(""))
+    {
+        return SiteClass::SameSite;
+    }
+    SiteClass::CrossSite
 }
 
 /// Chrome's default referrer policy `strict-origin-when-cross-origin`:
@@ -1513,6 +1579,61 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
 #[cfg(test)]
 mod transport_exit_tests {
     use super::*;
+
+    #[test]
+    fn stealth_v3_fetch_metadata_site_classification() {
+        // Chrome's sec-fetch-site values: same-origin (scheme+host+port),
+        // same-site (same scheme and registrable domain, port ignored),
+        // cross-site otherwise (schemeful).
+        assert_eq!(
+            classify_site("https://www.example.com/app", "https://www.example.com/x"),
+            SiteClass::SameOrigin
+        );
+        assert_eq!(
+            classify_site(
+                "https://www.example.com:8443/app",
+                "https://www.example.com/x"
+            ),
+            SiteClass::SameSite
+        );
+        assert_eq!(
+            classify_site("https://www.example.com/", "https://api.example.com/x"),
+            SiteClass::SameSite
+        );
+        assert_eq!(
+            classify_site("http://www.example.com/", "https://www.example.com/x"),
+            SiteClass::CrossSite
+        );
+        assert_eq!(
+            classify_site("https://www.example.com/", "https://www.example.org/x"),
+            SiteClass::CrossSite
+        );
+        assert_eq!(
+            classify_site("http://127.0.0.1:8080/", "http://127.0.0.1/x"),
+            SiteClass::SameSite
+        );
+        assert_eq!(
+            classify_site("http://127.0.0.1/", "http://127.0.0.2/x"),
+            SiteClass::CrossSite
+        );
+        assert_eq!(
+            classify_site("http://localhost/", "http://localhost:9000/x"),
+            SiteClass::SameSite
+        );
+        // The chain fold keeps the worst relationship.
+        assert_eq!(
+            SiteClass::SameOrigin.max(SiteClass::CrossSite),
+            SiteClass::CrossSite
+        );
+        assert_eq!(
+            SiteClass::SameOrigin.max(SiteClass::SameSite),
+            SiteClass::SameSite
+        );
+        assert_eq!(
+            SiteClass::SameSite.max(SiteClass::CrossSite),
+            SiteClass::CrossSite
+        );
+    }
 
     async fn owned_status_fetch(status: u16) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

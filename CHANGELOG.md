@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redirect hops keep the browser's Fetch Metadata identity: a link-initiated
+  fetch classifies `sec-fetch-site` across the whole chain (worst relationship
+  wins, so `same-site` appears where Chrome sends it), sends the redirecting
+  URL as referer on later hops (origin-only when the policy trims it), and a
+  fetch with no referer still keeps `none` and no referer through redirects.
+
 - An HTTP/2 GOAWAY no longer aborts a response mid-flight: the client reads
   the frame's last-stream-id, lets the in-flight stream at or below it
   finish (the graceful-shutdown handshake real servers send), refuses new
