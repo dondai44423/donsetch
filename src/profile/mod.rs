@@ -323,39 +323,15 @@ pub fn accept_language_for(host: &str, path: &str) -> &'static str {
     "en-US,en;q=0.9"
 }
 
-/// Persona-coherent Accept-Language (v4 E2). Real Chrome sends the
-/// user's configured languages, not a TLD guess. The persona locale
-/// is primary; a different TLD/script signal is kept as a lower-q
-/// preference so localized content still lands, without the classic
-/// "en-US browser speaking perfect ru-RU" JA4H tell.
-pub fn accept_language_with_persona(host: &str, path: &str, persona_locale: &str) -> String {
-    let base = accept_language_for(host, path);
-    // Fail-closed: the full locale is interpolated into a header.
-    // CR/LF would be rejected later by the header guard (and turn
-    // every fetch into a hard error); commas and JS must never get
-    // that far.
-    let persona_locale = crate::persona::sanitize_locale(persona_locale);
-    let persona_locale = persona_locale.as_str();
-    let plang = persona_locale
-        .split('-')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if plang.len() < 2 || plang.len() > 3 || !plang.chars().all(|c| c.is_ascii_alphabetic()) {
-        return base.to_string();
+/// Stable persona language preferences, using Chromium's single-locale
+/// expansion: a regional locale followed by its base language. Destination
+/// hosts and paths do not alter the user's configured preferences.
+pub fn accept_language_with_persona(_host: &str, _path: &str, persona_locale: &str) -> String {
+    let locale = crate::persona::sanitize_locale(persona_locale);
+    match locale.split_once('-') {
+        Some((language, _)) => format!("{locale},{language};q=0.9"),
+        None => locale,
     }
-    // Persona already matches the TLD default: ship that exact string.
-    let primary = persona_locale.split('-').next().unwrap_or("");
-    if base.starts_with(primary) || base.starts_with(&persona_locale.to_ascii_lowercase()) {
-        return format!("{persona_locale},{plang};q=0.9,en-US;q=0.8,en;q=0.7");
-    }
-    // Persona en-US on a .ru page: en first, TLD second.
-    let tld = accept_language_for(host, path);
-    let tld_primary = tld.split(',').next().unwrap_or(tld);
-    if tld_primary.is_empty() {
-        return format!("{persona_locale},{plang};q=0.9");
-    }
-    format!("{persona_locale},{plang};q=0.9,{tld_primary};q=0.8")
 }
 
 /// Probe the installed browser's major version. Cached after first call.
@@ -788,30 +764,30 @@ mod locale_tests {
     }
 
     #[test]
-    fn persona_locale_is_primary_accept_language() {
+    fn persona_languages_are_stable_native_preferences() {
         use super::accept_language_with_persona;
-        // en-US persona on a .com page: same as the TLD default.
-        let al = accept_language_with_persona("example.com", "/docs", "en-US");
-        assert!(al.starts_with("en-US,en;q=0.9"), "{al}");
-        // en-US persona on a .ru page: persona first, TLD second.
-        let al = accept_language_with_persona("example.com.ru", "/", "en-US");
-        assert!(al.starts_with("en-US,en;q=0.9,"), "{al}");
-        assert!(al.contains("ru-RU"), "TLD signal kept: {al}");
-        // de-DE persona on a .de page: persona-shaped, not the raw TLD string.
-        let al = accept_language_with_persona("example.de", "/", "de-DE");
-        assert!(al.starts_with("de-DE,de;q=0.9"), "{al}");
-        // Invalid persona locale is sanitized to en-US, then the TLD
-        // signal is kept as a lower-q preference (not a raw fallthrough).
-        let al = accept_language_with_persona("example.ru", "/", "nope");
-        assert!(al.starts_with("en-US"), "{al}");
-        assert!(al.contains("ru-RU"), "TLD kept as secondary: {al}");
-        // Hostile locale is sanitized, never interpolated raw.
-        let al = accept_language_with_persona("example.com", "/", "en-US\r\nX: y");
-        assert!(
-            !al.contains('\r') && !al.contains('\n'),
-            "CR/LF must never reach the header: {al:?}"
-        );
-        assert!(al.starts_with("en-US"), "{al}");
+        for (locale, expected) in [
+            ("en-US", "en-US,en;q=0.9"),
+            ("fr-FR", "fr-FR,fr;q=0.9"),
+            ("de-de", "de-DE,de;q=0.9"),
+            ("fr", "fr"),
+            ("nope", "en-US,en;q=0.9"),
+            ("en-US\r\nX: y", "en-US,en;q=0.9"),
+            ("fr-FR,ru;q=1", "en-US,en;q=0.9"),
+        ] {
+            for (host, path) in [
+                ("example.com", "/docs"),
+                ("example.ru", "/"),
+                ("example.de", "/wiki/%E4%B8%AD"),
+                ("example.fr", "/tags/%D0%A4%D0%B0"),
+            ] {
+                assert_eq!(
+                    accept_language_with_persona(host, path, locale),
+                    expected,
+                    "persona {locale:?} on {host}{path}"
+                );
+            }
+        }
     }
 }
 

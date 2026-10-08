@@ -286,13 +286,17 @@ pub fn default_chrome_args_wire(
     wire: &GhostWire,
 ) -> Vec<String> {
     let (vw, vh) = wire.viewport;
+    let locale = crate::persona::sanitize_locale(&wire.locale);
     let mut args = vec![
         "--remote-debugging-port=0".into(),
         format!("--user-data-dir={}", dir.display()),
         format!("--user-agent={}", profile.user_agent),
         format!("--window-size={vw},{vh}"),
         "--window-position=-32000,-32000".into(),
-        format!("--lang={}", wire.locale),
+        format!("--lang={locale}"),
+        // Chromium's native network/DOM language preference is separate from
+        // its UI locale; --lang alone leaves non-English personas inconsistent.
+        format!("--accept-lang={locale}"),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--disable-background-networking".into(),
@@ -1141,6 +1145,19 @@ impl Ghost {
             }
         }
         let mut cmd = Command::new(bin);
+        #[cfg(target_os = "linux")]
+        {
+            // Linux Chromium takes its application/ICU locale from gettext's
+            // LANGUAGE preference, rather than --lang. Include the base
+            // language so a region without its own UI bundle selects the
+            // same language before the desktop's fallback locale.
+            let locale = crate::persona::sanitize_locale(&wire.locale);
+            let language = locale.split('-').next().unwrap_or("en");
+            cmd.env(
+                "LANGUAGE",
+                format!("{}:{language}", locale.replace('-', "_")),
+            );
+        }
         let mut chrome_args: Vec<String> = default_chrome_args_wire(&dir, profile, wire);
         let force_headless = browser.backend == cloak::BrowserBackend::HeadlessChromium;
         if browser.backend == cloak::BrowserBackend::CloakBrowser {
@@ -1431,8 +1448,8 @@ impl Ghost {
         // there, and every patch that fired moved the page FURTHER from a
         // real one:
         //
-        // - `navigator.languages` already read ["en-US","en"] from
-        //   `--lang`; the patch only added an own accessor on the
+        // - `navigator.languages` already read ["en-US","en"] on the
+        //   English control; the patch only added an own accessor on the
         //   navigator instance, and real Chrome has NO own properties on
         //   `navigator` at all. The added property is itself the
         //   fingerprint.
@@ -2925,6 +2942,29 @@ mod sandbox_tests {
             !args.iter().any(|a| a == "--disable-setuid-sandbox"),
             "default args must not contain --disable-setuid-sandbox"
         );
+    }
+
+    #[test]
+    fn default_args_native_language_is_sanitized() {
+        let profile = BrowserProfile::chrome_150(crate::profile::Platform::Linux);
+        for (locale, expected) in [
+            ("fr-FR", "fr-FR"),
+            ("en-US\r\nBad", "en-US"),
+            ("fr--", "en-US"),
+        ] {
+            let wire = GhostWire {
+                locale: locale.into(),
+                ..Default::default()
+            };
+            let args =
+                default_chrome_args_wire(std::path::Path::new("owned-profile"), &profile, &wire);
+            assert!(args.contains(&format!("--lang={expected}")), "{args:?}");
+            assert!(
+                args.contains(&format!("--accept-lang={expected}")),
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|arg| arg.contains(['\r', '\n'])));
+        }
     }
 
     // A minimized window presents no frames, and the classic capture

@@ -605,14 +605,29 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
         // paths — a default-wire pre-solve would render incoherently
         // with the persona and thrash the pool slot against a
         // persona-wire fetch.
-        let wire = {
+        let route = d.fetcher.route_for_fetch(&url_str);
+        let (mut wire, persona_al) = {
             let s = d.state.lock().await;
-            s.personas
+            let persona = s
+                .personas
                 .get(&host_str)
-                .filter(|p| p.quarantine_reason.is_none())
-                .map(|p| p.ghost_wire())
-                .unwrap_or_default()
+                .filter(|p| p.quarantine_reason.is_none());
+            let language = persona.map(|p| {
+                crate::profile::accept_language_with_persona(
+                    &host_str,
+                    url::Url::parse(&url_str)
+                        .map(|url| url.path().to_string())
+                        .unwrap_or_else(|_| "/".into())
+                        .as_str(),
+                    &p.locale,
+                )
+            });
+            (
+                persona.map(|p| p.ghost_wire()).unwrap_or_default(),
+                language,
+            )
         };
+        wire.route = Some(route.clone());
         let Ok(g) = d
             .ghost_mgr
             .acquire_for_wire(&d.profile, Some(host_str.as_str()), wire)
@@ -651,7 +666,7 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             // Honest replay_ok: only verified tier-1 replay earns
             // warm routing.
             let replay_ok = matches!(
-                d.fetcher.fetch(&url_str).await,
+                d.fetcher.fetch_persona_on_route(&url_str, persona_al.as_deref(), Some(&route)).await,
                 Ok(o) if o.verdict == crate::detect::walls::Verdict::ContentOk
             );
             d.state.lock().await.record_solved(
@@ -678,6 +693,176 @@ impl Drop for PreSolveGuard<'_> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.0.pre_solve_busy.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod pre_solve_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Native Chromium, owned proxies and nextest's per-process state only.
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_pre_solve_replay_keeps_the_browser_route_after_concurrent_429() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut config = crate::config::DonsetchConfig::default();
+                        config.browser.backend = crate::config::BrowserBackend::Headless;
+                        config.browser.cloak_auto_download = false;
+                        config.browser.route_probes = false;
+                        config.proxy.from_environment = false;
+                        config.proxy.fetch_rotate = true;
+                        config.fetch.allow_private_egress = true;
+                        crate::config::install(config).unwrap();
+                        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let proxies = [&a, &b].map(|listener| {
+                            crate::transport::proxy::Proxy::parse(&format!(
+                                "http://{}", listener.local_addr().unwrap()
+                            )).unwrap()
+                        });
+                        let pool = Arc::new(EgressPool::new(proxies.to_vec()));
+                        pool.observe_rtt(&proxies[0].id(), Duration::from_millis(1));
+                        pool.observe_rtt(&proxies[1].id(), Duration::from_millis(2));
+                        crate::search::egress::install_global(Arc::clone(&pool));
+                        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                        let first_document = Arc::new(tokio::sync::Notify::new());
+                        let release_document = Arc::new(tokio::sync::Notify::new());
+                        let (stop, stopped) = tokio::sync::watch::channel(false);
+                        let mut servers = Vec::new();
+                        for (lane, listener) in [("A", a), ("B", b)] {
+                            let events = Arc::clone(&events);
+                            let first_document = Arc::clone(&first_document);
+                            let release_document = Arc::clone(&release_document);
+                            let mut stopped = stopped.clone();
+                            servers.push(tokio::spawn(async move {
+                                let mut handlers = tokio::task::JoinSet::new();
+                                loop {
+                                    tokio::select! {
+                                        _ = stopped.changed() => break,
+                                        accepted = listener.accept(), if handlers.len() < 16 => {
+                                            let (mut socket, _) = accepted.unwrap();
+                                            let events = Arc::clone(&events);
+                                            let first_document = Arc::clone(&first_document);
+                                            let release_document = Arc::clone(&release_document);
+                                            handlers.spawn(async move {
+                                                let mut head = Vec::new();
+                                                while !head.ends_with(b"\r\n\r\n") {
+                                                    assert!(head.len() < 16384);
+                                                    match tokio::time::timeout(Duration::from_secs(3), socket.read_u8()).await {
+                                                        Ok(Ok(byte)) => head.push(byte),
+                                                        _ if head.is_empty() => return,
+                                                        other => panic!("partial owned proxy request: {other:?}"),
+                                                    }
+                                                }
+                                                let request = String::from_utf8(head).unwrap();
+                                                let target = request.split_whitespace().nth(1).unwrap().to_string();
+                                                let document = target.ends_with("/owned-solve");
+                                                let burn = target.ends_with("/owned-burn");
+                                                let language_echo = target.starts_with("http://example.com/owned-language?");
+                                                let first = if document || burn || language_echo {
+                                                    let mut events = events.lock().unwrap();
+                                                    let first = document && !events.iter().any(|(_, url, _, _)| url == "http://example.com/owned-solve");
+                                                    let cookie = request.lines().find(|line| line.to_ascii_lowercase().starts_with("cookie:")).unwrap_or("").to_string();
+                                                    let language = request.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("accept-language")).map(|(_, value)| value.trim().to_string())).unwrap_or_default();
+                                                    events.push((lane, target, cookie, language));
+                                                    first
+                                                } else { false };
+                                                if first {
+                                                    first_document.notify_one();
+                                                    release_document.notified().await;
+                                                }
+                                                let (status, body, cookie) = if document {
+                                                    (200, format!("<article><h1>Owned pre-solve</h1><p>{}</p></article>",
+                                                        "The browser and verified cookie replay must retain the original route through a concurrent rate limit. ".repeat(40)) + r#"<script>
+const report = (where, value) => fetch('/owned-language?where='+where+'&value='+encodeURIComponent(JSON.stringify(value)));
+const language = () => ({language:navigator.language,languages:navigator.languages,intl:Intl.DateTimeFormat().resolvedOptions().locale});
+report('main', language());
+const worker = new Worker(URL.createObjectURL(new Blob(['postMessage(({language:navigator.language,languages:navigator.languages,intl:Intl.DateTimeFormat().resolvedOptions().locale}))'], {type:'text/javascript'})));
+worker.onmessage = event => {report('worker', event.data);worker.terminate();};
+</script>"#,
+                                                        "Set-Cookie: cf_clearance=owned-clearance; Path=/; HttpOnly\r\n")
+                                                } else if language_echo {
+                                                    (204, String::new(), "")
+                                                } else if burn {
+                                                    (429, "<h1>Too many requests</h1>".into(), "")
+                                                } else {
+                                                    (502, String::new(), "")
+                                                };
+                                                let response = format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                                let _ = socket.write_all(response.as_bytes()).await;
+                                            });
+                                        }
+                                        done = handlers.join_next(), if !handlers.is_empty() => { done.unwrap().unwrap(); }
+                                    }
+                                }
+                            }));
+                        }
+                        let mut daemon = Daemon::new().await.unwrap();
+                        daemon.fetcher = Arc::new(Fetcher::new(daemon.profile.clone()).unwrap().with_egress(Arc::clone(&pool)));
+                        daemon.state.lock().await.profiles.insert("example.com".into(), crate::ghost::cache::DomainProfile {
+                            needs_tier2: true,
+                            ..Default::default()
+                        });
+                        let mut persona = crate::persona::Persona::mint(
+                            "example.com", &crate::persona::PersonaCaps::from_profile(&daemon.profile),
+                            1, crate::ghost::cache::now());
+                        persona.locale = "fr-FR".into();
+                        daemon.state.lock().await.personas.insert("example.com".into(), persona);
+                        let daemon = Arc::new(daemon);
+                        maybe_pre_solve(&daemon, Some("http://example.com/owned-solve"));
+                        tokio::time::timeout(Duration::from_secs(15), first_document.notified()).await.unwrap();
+                        let burn = daemon.fetcher.fetch("http://example.com/owned-burn").await.unwrap();
+                        assert_eq!(burn.status, 429, "the concurrent request must really rate-limit");
+                        assert_eq!(pool.pick_fetch("example.com", true).unwrap().id, proxies[1].id(), "the actual 429 must burn A for the next independent call");
+                        release_document.notify_one();
+                        tokio::time::timeout(Duration::from_secs(15), async {
+                            while daemon.pre_solve_busy.load(std::sync::atomic::Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }).await.unwrap();
+                        tokio::time::timeout(Duration::from_secs(3), async {
+                            while events.lock().unwrap().iter().filter(|(_, url, _, _)| url.starts_with("http://example.com/owned-language?")).count() < 2 {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }).await.unwrap();
+                        daemon.ghost_mgr.shutdown().await;
+                        stop.send(true).unwrap();
+                        for server in servers { server.await.unwrap(); }
+                        assert!(daemon.state.lock().await.profiles["example.com"].replay_ok);
+                        let events = events.lock().unwrap();
+                        let documents: Vec<_> = events.iter().filter(|(_, url, _, _)| url.ends_with("/owned-solve")).collect();
+                        assert_eq!(documents.len(), 2, "one native read and one verified HTTP replay: {events:?}");
+                        assert!(documents.iter().all(|(lane, _, _, _)| *lane == "A"), "replay must keep the browser's selected route: {events:?}");
+                        assert!(documents[0].2.is_empty(), "fresh native profile has no fixture cookie");
+                        assert!(documents[1].2.contains("cf_clearance=owned-clearance"), "HTTP replay must actually carry the exported cookie: {events:?}");
+                        assert!(documents[0].3.starts_with("fr-FR"), "native read must use the persona locale: {events:?}");
+                        assert_eq!(documents[0].3, documents[1].3, "browser and replay must keep the full preference list: {events:?}");
+                        assert_eq!(documents[1].3, crate::profile::accept_language_with_persona("example.com", "/owned-solve", "fr-FR"), "replay must retain the persona language: {events:?}");
+                        let echoes: Vec<_> = events.iter().filter(|(_, url, _, _)| url.starts_with("http://example.com/owned-language?")).map(|(lane, target, _, _)| {
+                            assert_eq!(*lane, "A", "native language beacons retain the document route");
+                            let url = url::Url::parse(target).unwrap();
+                            let payload = url.query_pairs().find(|(name, _)| name == "value").unwrap().1.into_owned();
+                            serde_json::from_str::<Value>(&payload).unwrap()
+                        }).collect();
+                        assert_eq!(echoes.len(), 2, "actual main-frame and worker observations");
+                        for echo in &echoes {
+                            assert_eq!(echo["language"], "fr-FR", "{echoes:?}");
+                            assert_eq!(echo["languages"][0], "fr-FR", "{echoes:?}");
+                            // Chromium's French UI/ICU bundle is `fr`; it
+                            // need not retain the regional preference tag.
+                            assert_eq!(echo["intl"].as_str().unwrap().split('-').next(), Some("fr"), "{echoes:?}");
+                        }
+                    });
+            }).unwrap().join().unwrap();
     }
 }
 
