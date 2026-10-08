@@ -981,7 +981,7 @@ impl Fetcher {
                         crate::transport::routes::drop_h3(&origin);
                         // fall through to h1/h2
                     } else {
-                        self.store_hop_cookies(use_jar, host, is_https, &h3out.headers);
+                        self.store_hop_cookies(use_jar, host, is_https, &path, &h3out.headers);
                         // Same exit as every other transport: finish()
                         // decompresses and scores walls::detect, so a
                         // challenge served over h3 escalates instead of
@@ -1025,7 +1025,7 @@ impl Fetcher {
             {
                 Ok(out) => {
                     // verdict already scored by finish()
-                    self.store_hop_cookies(use_jar, host, is_https, &out.headers);
+                    self.store_hop_cookies(use_jar, host, is_https, &path, &out.headers);
                     // Alt-svc absorb (v4 phase 5.1): only on a direct
                     // https lane; proxies naturally exempt. It lets a
                     // later connection on the same origin take h3, for
@@ -1067,7 +1067,7 @@ impl Fetcher {
             {
                 Ok(out) => {
                     // verdict already scored by finish()
-                    self.store_hop_cookies(use_jar, host, is_https, &out.headers);
+                    self.store_hop_cookies(use_jar, host, is_https, &path, &out.headers);
                     // Alt-svc absorb (v4 phase 5.1): only on a direct https
                     // lane; refreshed per response so the ma= lifetime stays
                     // current (the server's own ma=, never a constant). h3
@@ -1115,6 +1115,7 @@ impl Fetcher {
         use_jar: bool,
         host: &str,
         is_https: bool,
+        request_path: &str,
         headers: &[(String, String)],
     ) {
         if !use_jar {
@@ -1124,7 +1125,7 @@ impl Fetcher {
             .jar
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        jar.store_from_headers(host, headers, is_https);
+        jar.store_from_headers(host, request_path, headers, is_https);
     }
 
     #[allow(clippy::too_many_arguments)]

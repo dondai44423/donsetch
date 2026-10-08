@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cookies without a Path attribute stay inside the request directory: the jar
+  derives the RFC 6265 default-path from the request URI, so a cookie set at
+  /app/login no longer rides every path of the domain, and an empty or
+  relative Path attribute falls back to that same default instead of
+  widening the cookie to the whole domain.
+
 - A browser launched after a logout no longer surfaces the dead session: the
   shared profile's cookies for logged-out domains are expired at launch,
   before the session vault is replanted, so a stale cookie cannot ride into a

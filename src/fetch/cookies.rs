@@ -166,12 +166,20 @@ impl CookieJar {
         }
     }
 
-    /// Store all Set-Cookie headers from a response for `host`.
-    /// `is_https` must reflect the scheme the response arrived
-    /// over: Secure cookies received over plain HTTP are dropped
-    /// (RFC 6265 §4.1.2.5), and the `__Secure-` / `__Host-`
-    /// prefix rules are enforced here.
-    pub fn store_from_headers(&mut self, host: &str, headers: &[(String, String)], is_https: bool) {
+    /// Store all Set-Cookie headers from a response for `host` at
+    /// `request_path`. `is_https` must reflect the scheme the response
+    /// arrived over: Secure cookies received over plain HTTP are
+    /// dropped (RFC 6265 §4.1.2.5), and the `__Secure-` / `__Host-`
+    /// prefix rules are enforced here. Cookies without a usable Path
+    /// attribute take the request path's default-path (RFC 6265
+    /// §5.1.4), never a whole-domain "/".
+    pub fn store_from_headers(
+        &mut self,
+        host: &str,
+        request_path: &str,
+        headers: &[(String, String)],
+        is_https: bool,
+    ) {
         let Some(normalized_host) = normalize_host(host) else {
             return;
         };
@@ -204,7 +212,7 @@ impl CookieJar {
             }
             let mut domain = normalized_host.clone();
             let mut host_only = true;
-            let mut path = "/".to_string();
+            let mut path = default_path(request_path).to_string();
             let mut expired = false;
             let mut expires_at: Option<u64> = None;
             let mut secure = false;
@@ -237,7 +245,15 @@ impl CookieJar {
                                 host_only = false;
                             }
                         }
-                        "path" => path = val.trim().to_string(),
+                        "path" => {
+                            // RFC 6265 §5.2.4: an empty value or one
+                            // not starting with '/' is ignored (the
+                            // default-path stands).
+                            let candidate = val.trim();
+                            if candidate.starts_with('/') {
+                                path = candidate.to_string();
+                            }
+                        }
                         "expires" => {
                             // RFC 6265 5.2.1: a non-parseable Expires is
                             // IGNORED; a past date expires the cookie.
@@ -570,6 +586,21 @@ impl CookieJar {
     }
 }
 
+/// RFC 6265 §5.1.4 default-path: the request URI's path up to (not
+/// including) the rightmost '/'; "/" when there is no earlier slash or
+/// the path does not start with '/'. A cookie without a usable Path
+/// attribute is scoped to this, never widened to the whole domain.
+fn default_path(request_path: &str) -> &str {
+    let path = request_path.split('?').next().unwrap_or("");
+    if !path.starts_with('/') {
+        return "/";
+    }
+    match path.rfind('/') {
+        None | Some(0) => "/",
+        Some(idx) => &path[..idx],
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -774,6 +805,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[("Set-Cookie".to_string(), "a=1; Domain=com".to_string())],
             false,
         );
@@ -791,6 +823,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.co.uk",
+            "/",
             &[("Set-Cookie".to_string(), "a=1; Domain=co.uk".to_string())],
             false,
         );
@@ -863,6 +896,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "sub.example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "a=1; Domain=example.com".to_string(),
@@ -990,6 +1024,7 @@ mod tests {
         let mut jar2 = CookieJar::new();
         jar2.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "a=1; Domain=example..com".to_string(),
@@ -1080,6 +1115,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "Example.COM",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "a=1; Domain=EXAMPLE.COM".to_string(),
@@ -1111,6 +1147,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "a=1; Domain=exa\r\nmple.com".to_string(),
@@ -1129,6 +1166,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "sess=SECRET; Secure; Path=/".to_string(),
@@ -1147,6 +1185,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[("Set-Cookie".to_string(), "a=1".to_string())],
             true,
         );
@@ -1155,10 +1194,63 @@ mod tests {
     }
 
     #[test]
+    fn default_path_follows_the_request_directory() {
+        assert_eq!(default_path("/app/login"), "/app");
+        assert_eq!(default_path("/app/"), "/app");
+        assert_eq!(default_path("/app"), "/");
+        assert_eq!(default_path("/"), "/");
+        assert_eq!(default_path("/a/b/c"), "/a/b");
+        assert_eq!(default_path("/a/b/c?x=/y"), "/a/b");
+        assert_eq!(default_path("relative"), "/");
+        assert_eq!(default_path(""), "/");
+    }
+
+    #[test]
+    fn cookie_without_a_path_attribute_stays_in_the_request_directory() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            "/app/login",
+            &[("Set-Cookie".to_string(), "sid=s1".to_string())],
+            true,
+        );
+        assert_eq!(
+            jar.header_for("example.com", "/app/dash", true),
+            Some("sid=s1".to_string())
+        );
+        assert_eq!(jar.header_for("example.com", "/admin", true), None);
+        assert_eq!(jar.header_for("example.com", "/", true), None);
+    }
+
+    #[test]
+    fn empty_or_relative_path_attributes_keep_the_default_path() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "example.com",
+            "/app/login",
+            &[
+                ("Set-Cookie".to_string(), "empty=1; Path=".to_string()),
+                ("Set-Cookie".to_string(), "relative=1; Path=app".to_string()),
+                ("Set-Cookie".to_string(), "rooted=1; Path=/".to_string()),
+            ],
+            true,
+        );
+        assert_eq!(
+            jar.header_for("example.com", "/app/dash", true),
+            Some("empty=1; relative=1; rooted=1".to_string())
+        );
+        assert_eq!(
+            jar.header_for("example.com", "/admin", true),
+            Some("rooted=1".to_string())
+        );
+    }
+
+    #[test]
     fn secure_cookie_from_plain_http_response_is_dropped() {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "sess=SECRET; Secure; Path=/".to_string(),
@@ -1199,6 +1291,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "a=1; HttpOnly; Path=/".to_string(),
@@ -1215,6 +1308,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "__Secure-sess=SECRET; Path=/".to_string(),
@@ -1225,6 +1319,7 @@ mod tests {
 
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "__Secure-sess=SECRET; Secure; Path=/".to_string(),
@@ -1240,6 +1335,7 @@ mod tests {
         // No Secure attribute: rejected.
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "__Host-sess=SECRET; Path=/".to_string(),
@@ -1250,6 +1346,7 @@ mod tests {
         // Domain attribute: rejected even with Secure.
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "__Host-sess=SECRET; Secure; Domain=example.com; Path=/".to_string(),
@@ -1260,6 +1357,7 @@ mod tests {
         // Correct form: accepted.
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "__Host-sess=SECRET; Secure; Path=/".to_string(),
@@ -1274,6 +1372,7 @@ mod tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.com",
+            "/",
             &[("Set-Cookie".to_string(), "a=1; SameSite=None".to_string())],
             true,
         );
@@ -1281,6 +1380,7 @@ mod tests {
 
         jar.store_from_headers(
             "example.com",
+            "/",
             &[(
                 "Set-Cookie".to_string(),
                 "a=1; SameSite=None; Secure".to_string(),
@@ -1336,6 +1436,7 @@ mod audit_tests {
         let future = "Wed, 01 Jan 2031 00:00:00 GMT";
         jar.store_from_headers(
             host,
+            "/",
             &[(
                 "set-cookie".to_string(),
                 format!("sid=1; Path=/p; Expires={future}"),
@@ -1356,6 +1457,7 @@ mod audit_tests {
         let host = "example.org";
         jar.store_from_headers(
             host,
+            "/",
             &[(
                 "set-cookie".to_string(),
                 "sid=2; Max-Age=3600; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
@@ -1380,6 +1482,7 @@ mod audit_tests {
         let host = "example.org";
         jar.store_from_headers(
             host,
+            "/",
             &[("set-cookie".to_string(), "sid=3; Max-Age=abc".to_string())],
             true,
         );
@@ -1400,6 +1503,7 @@ mod audit_tests {
         let host = "example.org";
         jar.store_from_headers(
             host,
+            "/",
             &[(
                 "set-cookie".to_string(),
                 "sid=4; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
@@ -1418,6 +1522,7 @@ mod audit_tests {
         let mut jar = CookieJar::new();
         jar.store_from_headers(
             "example.org",
+            "/",
             &[("set-cookie".to_string(), "k=v; Path=/secret".to_string())],
             true,
         );
