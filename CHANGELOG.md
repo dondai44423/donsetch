@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Replay also uses the selected persona language. Chromium receives its native
   Accept-Language preference and Linux child locale. Persona HTTP preferences
   match the native language expansion and remain stable across destinations.
+  Nondefault ports retain host-based wall history and persona lookup; invalid
+  URLs are rejected before background pre-solve starts.
 
 - Cookie-vault persistence reports directory, open, write and rename failures
   while retaining in-memory learning. A failed write preserves the prior file.

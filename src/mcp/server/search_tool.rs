@@ -555,9 +555,6 @@ async fn byok_search_cached(
         .await
 }
 
-/// Search failure → structured error: every engine (and BYOK if
-/// tried) failed. The agent needs to know retrying is safe and
-/// what the levers are (BYOK keys, intent, simpler query).
 /// Predict-prefetch the walledest top result while the agent reads
 /// results: when the top URL's domain is known-walled (skip-to-solve
 /// route), start ONE background solve NOW. The agent's fetch a few
@@ -566,18 +563,18 @@ async fn byok_search_cached(
 /// cooldown memory the fetch path uses.
 pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
     let Some(url) = top_url else { return };
-    if !url.starts_with("http") {
+    if crate::fetch::guards::validate_url_basic(url).is_err() {
         return;
     }
-    let Some(host) = url
-        .split_once("://")
-        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
-        .filter(|h| !h.is_empty() && h.contains('.'))
-    else {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return;
+    };
+    let Some(host) = parsed.host_str() else {
         return;
     };
     let d = daemon.clone();
     let host_str = host.to_string();
+    let path = parsed.path().to_string();
     let url_str = url.to_string();
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
@@ -612,16 +609,8 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
                 .personas
                 .get(&host_str)
                 .filter(|p| p.quarantine_reason.is_none());
-            let language = persona.map(|p| {
-                crate::profile::accept_language_with_persona(
-                    &host_str,
-                    url::Url::parse(&url_str)
-                        .map(|url| url.path().to_string())
-                        .unwrap_or_else(|_| "/".into())
-                        .as_str(),
-                    &p.locale,
-                )
-            });
+            let language = persona
+                .map(|p| crate::profile::accept_language_with_persona(&host_str, &path, &p.locale));
             (
                 persona.map(|p| p.ghost_wire()).unwrap_or_default(),
                 language,
@@ -706,9 +695,19 @@ mod pre_solve_tests {
     #[test]
     #[ignore = "requires native Chromium"]
     fn stealth_v3_pre_solve_replay_keeps_the_browser_route_after_concurrent_429() {
+        pre_solve_native_fixture("http://example.com/owned-solve");
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_pre_solve_uses_the_host_persona_on_a_nondefault_port() {
+        pre_solve_native_fixture("http://example.com:8443/owned-solve");
+    }
+
+    fn pre_solve_native_fixture(document_url: &'static str) {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
+            .spawn(move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -767,10 +766,10 @@ mod pre_solve_tests {
                                                 let target = request.split_whitespace().nth(1).unwrap().to_string();
                                                 let document = target.ends_with("/owned-solve");
                                                 let burn = target.ends_with("/owned-burn");
-                                                let language_echo = target.starts_with("http://example.com/owned-language?");
+                                                let language_echo = url::Url::parse(&target).is_ok_and(|url| url.path() == "/owned-language");
                                                 let first = if document || burn || language_echo {
                                                     let mut events = events.lock().unwrap();
-                                                    let first = document && !events.iter().any(|(_, url, _, _)| url == "http://example.com/owned-solve");
+                                                    let first = document && !events.iter().any(|(_, url, _, _)| url == document_url);
                                                     let cookie = request.lines().find(|line| line.to_ascii_lowercase().starts_with("cookie:")).unwrap_or("").to_string();
                                                     let language = request.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("accept-language")).map(|(_, value)| value.trim().to_string())).unwrap_or_default();
                                                     events.push((lane, target, cookie, language));
@@ -818,8 +817,8 @@ worker.onmessage = event => {report('worker', event.data);worker.terminate();};
                         persona.locale = "fr-FR".into();
                         daemon.state.lock().await.personas.insert("example.com".into(), persona);
                         let daemon = Arc::new(daemon);
-                        maybe_pre_solve(&daemon, Some("http://example.com/owned-solve"));
-                        tokio::time::timeout(Duration::from_secs(15), first_document.notified()).await.unwrap();
+                        maybe_pre_solve(&daemon, Some(document_url));
+                        tokio::time::timeout(Duration::from_secs(15), first_document.notified()).await.expect("known wall and persona must be found by host independently of the port");
                         let burn = daemon.fetcher.fetch("http://example.com/owned-burn").await.unwrap();
                         assert_eq!(burn.status, 429, "the concurrent request must really rate-limit");
                         assert_eq!(pool.pick_fetch("example.com", true).unwrap().id, proxies[1].id(), "the actual 429 must burn A for the next independent call");
@@ -830,7 +829,7 @@ worker.onmessage = event => {report('worker', event.data);worker.terminate();};
                             }
                         }).await.unwrap();
                         tokio::time::timeout(Duration::from_secs(3), async {
-                            while events.lock().unwrap().iter().filter(|(_, url, _, _)| url.starts_with("http://example.com/owned-language?")).count() < 2 {
+                            while events.lock().unwrap().iter().filter(|(_, url, _, _)| url::Url::parse(url).is_ok_and(|url| url.path() == "/owned-language")).count() < 2 {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }).await.unwrap();
@@ -841,13 +840,14 @@ worker.onmessage = event => {report('worker', event.data);worker.terminate();};
                         let events = events.lock().unwrap();
                         let documents: Vec<_> = events.iter().filter(|(_, url, _, _)| url.ends_with("/owned-solve")).collect();
                         assert_eq!(documents.len(), 2, "one native read and one verified HTTP replay: {events:?}");
+                        assert!(documents.iter().all(|(_, url, _, _)| url == document_url), "original authority and port survive browser and replay: {events:?}");
                         assert!(documents.iter().all(|(lane, _, _, _)| *lane == "A"), "replay must keep the browser's selected route: {events:?}");
                         assert!(documents[0].2.is_empty(), "fresh native profile has no fixture cookie");
                         assert!(documents[1].2.contains("cf_clearance=owned-clearance"), "HTTP replay must actually carry the exported cookie: {events:?}");
                         assert!(documents[0].3.starts_with("fr-FR"), "native read must use the persona locale: {events:?}");
                         assert_eq!(documents[0].3, documents[1].3, "browser and replay must keep the full preference list: {events:?}");
                         assert_eq!(documents[1].3, crate::profile::accept_language_with_persona("example.com", "/owned-solve", "fr-FR"), "replay must retain the persona language: {events:?}");
-                        let echoes: Vec<_> = events.iter().filter(|(_, url, _, _)| url.starts_with("http://example.com/owned-language?")).map(|(lane, target, _, _)| {
+                        let echoes: Vec<_> = events.iter().filter(|(_, url, _, _)| url::Url::parse(url).is_ok_and(|url| url.path() == "/owned-language")).map(|(lane, target, _, _)| {
                             assert_eq!(*lane, "A", "native language beacons retain the document route");
                             let url = url::Url::parse(target).unwrap();
                             let payload = url.query_pairs().find(|(name, _)| name == "value").unwrap().1.into_owned();
