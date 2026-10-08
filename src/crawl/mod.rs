@@ -1224,7 +1224,7 @@ impl Crawler {
                     ) && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
+                        if !remaining.is_zero() && claim_ghost_slot(&ghost_budget) {
                             let rendered = match page.browser_request(item.url.clone(), deadline_at)
                             {
                                 Ok(request) => {
@@ -1352,15 +1352,15 @@ impl Crawler {
                     // extraction is thin (JS shell) and the page is
                     // large enough (> 5KB, not a 404), try rendering
                     // in the headless browser. Capped at 3 per crawl;
-                    // requires 25s remaining deadline. Non-JS sites
-                    // never hit this path.
+                    // uses the original remaining deadline. Non-JS
+                    // sites never hit this path.
                     if r.thin
                         && !ghost_rendered
                         && page.body.len() > 5_000
                         && let Some(ref ghost_hook) = ghost_hook
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
+                        if !remaining.is_zero() && claim_ghost_slot(&ghost_budget) {
                             let rendered = match page.browser_request(item.url.clone(), deadline_at)
                             {
                                 Ok(request) => {

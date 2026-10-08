@@ -927,7 +927,23 @@ mod crawl_route_tests {
     #[test]
     #[ignore = "requires native Chromium"]
     fn stealth_v3_native_crawl_keeps_its_selected_http_lane() {
-        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(|| {
+        native_crawl_fixture(false, Duration::from_secs(45));
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_native_crawl_recovers_a_wall_with_a_short_budget() {
+        native_crawl_fixture(false, Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_native_crawl_recovers_a_thin_shell_with_a_short_budget() {
+        native_crawl_fixture(true, Duration::from_secs(5));
+    }
+
+    fn native_crawl_fixture(thin: bool, deadline: Duration) {
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 let mut config = crate::config::DonsetchConfig::default();
                 config.browser.backend = crate::config::BrowserBackend::Headless;
@@ -976,7 +992,9 @@ mod crawl_route_tests {
                                             events.push((lane, target.to_string()));
                                             first
                                         } else { false };
-                                        let (status, body) = if document && first && lane == "A" {
+                                        let (status, body) = if document && first && lane == "A" && thin {
+                                            (200, format!("<html><body><div id='app'></div><script>{}</script></body></html>", "/* owned shell */".repeat(400)))
+                                        } else if document && first && lane == "A" {
                                             (403, "<html><body><h1>Access denied</h1></body></html>".into())
                                         } else if document {
                                             (201, format!("<article><h1>Owned crawl route {lane}</h1><p>{}</p></article>",
@@ -999,10 +1017,12 @@ mod crawl_route_tests {
                 assert_eq!(governor.best_lane("127.0.0.1").unwrap().id,proxy.0.id());
                 let crawler = crawler.with_ghost(make_ghost_hook(
                     Arc::clone(&daemon.ghost_mgr),daemon.profile.clone(),Arc::clone(&daemon.fetcher),Arc::clone(&daemon.state),true));
+                let started = std::time::Instant::now();
                 let result = crawler.crawl(&url,crate::crawl::CrawlOptions {
                     mode:crate::crawl::CrawlMode::Content,respect_robots:false,max_pages:1,max_depth:0,
-                    deadline:Duration::from_secs(45),..Default::default()
+                    deadline,..Default::default()
                 },None).await.unwrap();
+                assert!(started.elapsed() < deadline, "useful native content must arrive inside the original budget");
                 daemon.ghost_mgr.shutdown().await;
                 stop.send(true).unwrap();
                 for server in servers { server.await.unwrap(); }

@@ -248,6 +248,107 @@ fn classifying_fetcher(inner: PageFetcher) -> PageFetcher {
 }
 
 #[tokio::test]
+async fn stealth_v3_short_browser_handoffs_use_one_original_deadline() {
+    for thin in [false, true] {
+        for stalled in [false, true] {
+            let seed = "https://ex.com/start";
+            let shell = format!(
+                "<html><body><div id='app'></div><script>{}</script></body></html>",
+                "/* owned shell */".repeat(400)
+            );
+            let (fetch, hits) = MockSite::new()
+                .page(
+                    seed,
+                    if thin { 200 } else { 403 },
+                    if thin { &shell } else { "Access denied" },
+                )
+                .fetcher();
+            let fetch: PageFetcher = Arc::new(move |url, lane, referer| {
+                let fetch = Arc::clone(&fetch);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    fetch(url, lane, referer).await
+                }
+                .boxed()
+            });
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reached = Arc::clone(&calls);
+            let cancelled = Arc::new(Mutex::new(None));
+            let cancelled_hook = Arc::clone(&cancelled);
+            let started = std::time::Instant::now();
+            let budget = Duration::from_millis(250);
+            let hook: super::GhostHook = Arc::new(move |request| {
+                let reached = Arc::clone(&reached);
+                let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+                *cancelled_hook.lock().unwrap() = Some(receiver);
+                async move {
+                    let _held_until_cancelled = sender;
+                    reached.fetch_add(1, Ordering::SeqCst);
+                    // Account for synchronous setup before crawl starts, while
+                    // rejecting a renewed budget after the 40ms HTTP read.
+                    assert!(request.deadline <= started + budget + Duration::from_millis(10));
+                    if stalled {
+                        futures_util::future::pending::<()>().await;
+                    }
+                    Ok(super::GhostRender {
+                        html: html(
+                            "Bounded browser content",
+                            "Useful evidence within the caller's remaining time.",
+                        ),
+                        document: crate::ghost::document::Document {
+                            url: request.url,
+                            status: Some(201),
+                            generation: 7,
+                            ..Default::default()
+                        },
+                    })
+                }
+                .boxed()
+            });
+            let result = Crawler::new(classifying_fetcher(fetch), gov())
+                .with_ghost(hook)
+                .crawl(
+                    seed,
+                    CrawlOptions {
+                        mode: CrawlMode::Content,
+                        respect_robots: false,
+                        max_pages: 1,
+                        max_depth: 0,
+                        deadline: budget,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "thin={thin}, stalled={stalled}"
+            );
+            assert_eq!(hits.lock().unwrap().as_slice(), [seed]);
+            assert!(started.elapsed() < budget + Duration::from_millis(300));
+            assert!(matches!(
+                cancelled.lock().unwrap().as_mut().unwrap().try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ));
+            if stalled {
+                assert_eq!(result.stop, StopReason::Deadline);
+                assert!(
+                    !result
+                        .pages
+                        .iter()
+                        .any(|page| page.markdown.contains("Bounded browser content"))
+                );
+            } else {
+                assert_eq!(result.pages.len(), 1);
+                assert!(result.pages[0].markdown.contains("Bounded browser content"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn stealth_v3_browser_redirects_obey_scope_host_and_robots_for_wall_and_thin_pages() {
     for thin in [false, true] {
         for target in [
