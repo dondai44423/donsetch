@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A 304 response counts as lane health only after it validates: an unsolicited
+  or mismatched 304 no longer marks the lane healthy before its rejection,
+  while a validated revalidation still does.
+
 - The crawl adapter attributes transport errors with the same typed classifier
   as fetch, instead of text matching: an unresolvable origin, an origin-side or
   interception certificate failure, a URL-level policy refusal, and an

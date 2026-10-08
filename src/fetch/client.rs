@@ -413,7 +413,11 @@ impl Fetcher {
             if let (Some(pool), Some((host, id))) = (&self.egress, pool_lane) {
                 match out.status {
                     429 => pool.note_fetch_rate_limited(host, id),
-                    200..=299 | 304 => {
+                    // A bare 304 is a claim, not a result: it is scored
+                    // only once the validator snapshot accepts the merge
+                    // below. An unsolicited or mismatched 304 must not
+                    // read as lane health before its rejection.
+                    200..=299 => {
                         pool.report_ok(host, id);
                         pool.observe_rtt(id, hop_started.elapsed());
                     }
@@ -439,6 +443,12 @@ impl Fetcher {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .revalidated(&cache_key, snapshot, &out.headers, hop_started.elapsed())
                     .map_err(FetchError::Http)?;
+                // The claim validated: only now does the hop count as
+                // lane health.
+                if let (Some(pool), Some((host, id))) = (&self.egress, pool_lane) {
+                    pool.report_ok(host, id);
+                    pool.observe_rtt(id, hop_started.elapsed());
+                }
                 out.status = status;
                 out.headers = headers;
                 out.body = body;
