@@ -55,6 +55,8 @@ pub struct FetchedPage {
 /// payload the injected `GhostHook` returns.
 pub struct GhostRender {
     pub html: String,
+    /// The native main-document receipt (original observation for cached renders).
+    pub document: crate::ghost::document::Document,
 }
 
 /// One browser handoff with the caller's selected route and absolute deadline.
@@ -66,6 +68,18 @@ pub struct GhostRequest {
 }
 
 impl FetchedPage {
+    fn apply_render(&mut self, rendered: GhostRender) {
+        self.url = rendered.document.url;
+        self.status = rendered.document.status.unwrap_or(0);
+        self.headers = vec![(
+            "content-type".into(),
+            crate::extract::charset::GHOST_TEXT_CT.into(),
+        )];
+        self.body = rendered.html.into_bytes();
+        self.verdict = Verdict::ContentOk;
+        self.error_hint = None;
+    }
+
     fn browser_request(&self, url: String, deadline: Instant) -> Result<GhostRequest, String> {
         Ok(GhostRequest {
             url,
@@ -913,9 +927,6 @@ impl Crawler {
             let seed_host2 = seed_host.clone();
             let seed_norm_w = seed_norm.clone();
             let robots_cache = Arc::clone(&robots_cache);
-            // The redirect recheck consults the host gate inside the
-            // worker: each iteration needs its own clone.
-            let host_ok = host_ok.clone();
             let max_pages = opts.max_pages;
             // Sitemap found ⇒ link discovery does not depend on the
             // seed fetch ⇒ even the seed is skippable in delta mode.
@@ -1143,7 +1154,8 @@ impl Crawler {
                         tokio::time::sleep(wait).await;
                     }
 
-                    let page = fetch(item.url.clone(), lane.id.clone(), item.parent.clone()).await;
+                    let mut page =
+                        fetch(item.url.clone(), lane.id.clone(), item.parent.clone()).await;
                     if page.cached {
                         // Warm-cache hit: free : no governor signal.
                     } else {
@@ -1183,9 +1195,27 @@ impl Crawler {
                         continue 'work;
                     }
 
+                    if let Err(reason) = redirect_target_allowed(
+                        &fetch,
+                        &governor,
+                        &robots_cache,
+                        &opts_worker,
+                        &seed_host2,
+                        &parsed,
+                        &page.url,
+                    )
+                    .await
+                    {
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((item.url.clone(), reason));
+                        continue 'work;
+                    }
+
                     // Shared HTTP denial policy: one browser observation for
                     // eligible documents, including an unbranded plain 403.
-                    let mut ghost_html: Option<String> = None;
+                    let mut ghost_rendered = false;
                     if crate::detect::walls::browser_recovery(
                         page.status,
                         &page.headers,
@@ -1205,7 +1235,27 @@ impl Crawler {
                                 Err(error) => Err(error),
                             };
                             match rendered {
-                                Ok(gp) => ghost_html = Some(gp.html),
+                                Ok(gp) => {
+                                    if let Err(reason) = redirect_target_allowed(
+                                        &fetch,
+                                        &governor,
+                                        &robots_cache,
+                                        &opts_worker,
+                                        &seed_host2,
+                                        &parsed,
+                                        &gp.document.url,
+                                    )
+                                    .await
+                                    {
+                                        skipped
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .push((item.url.clone(), reason));
+                                        continue 'work;
+                                    }
+                                    page.apply_render(gp);
+                                    ghost_rendered = true;
+                                }
                                 Err(why) => {
                                     skipped
                                         .lock()
@@ -1222,7 +1272,7 @@ impl Crawler {
                     // Wall/denylist verdicts → skip honestly.
                     // (Unless ghost rendered the page : then treat
                     // as ContentOk and proceed to extraction.)
-                    if ghost_html.is_none() && !matches!(page.verdict, Verdict::ContentOk) {
+                    if !ghost_rendered && !matches!(page.verdict, Verdict::ContentOk) {
                         let why = if item.retries > 0 {
                             format!(
                                 "{} (failed after {} retries)",
@@ -1242,72 +1292,11 @@ impl Crawler {
                             .push((item.url.clone(), why));
                         continue 'work;
                     }
-                    // ── Redirect recheck ──
-                    // Every scope/robots gate above ran on the QUEUED
-                    // url, but results, dataset and history key on the
-                    // POST-REDIRECT final URL. A same-host seed that
-                    // 302s across hosts (open redirect) or into a
-                    // robots-disallowed / out-of-scope path used to
-                    // land there unchecked. Re-gate the final URL.
-                    let final_parsed = match Url::parse(&page.url) {
-                        Ok(u) => u,
-                        Err(_) => {
-                            skipped
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push((item.url.clone(), "redirect target unparseable".into()));
-                            continue 'work;
-                        }
-                    };
-                    if final_parsed != parsed {
-                        let host_ok_final = host_ok(&final_parsed);
-                        let scope_ok_final = scope_allowed(
-                            final_parsed.path(),
-                            &opts_worker.include_paths,
-                            &opts_worker.exclude_paths,
-                        );
-                        let robots_ok_final = !opts_worker.respect_robots
-                            || robots_allows(&fetch, &governor, &robots_cache, &final_parsed).await;
-                        if !host_ok_final || !scope_ok_final || !robots_ok_final {
-                            skipped
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push((
-                                    item.url.clone(),
-                                    format!("redirected out of scope -> {}", page.url),
-                                ));
-                            continue 'work;
-                        }
-                    }
-
                     // Count every successful fetch (safety valve
                     // against sites full of low-quality pages).
                     total_fetched.fetch_add(1, Ordering::SeqCst);
 
-                    // ── Canonical URL resolution ──
-                    // Extract <link rel="canonical" href="..."> to
-                    // prevent double-fetching the same page under
-                    // different URLs (trailing slash, index.html,
-                    // tracking variants).
                     let page_url = page.url.clone();
-                    if let Some(canon_href) =
-                        extract_canonical(&String::from_utf8_lossy(&page.body))
-                        && let Ok(canon_parsed) = Url::parse(&canon_href)
-                    {
-                        let canon_norm = frontier::normalize(&canon_parsed);
-                        let fetched_norm = frontier::normalize(&parsed);
-                        if canon_norm != fetched_norm {
-                            // Mark the canonical form as seen so
-                            // it won't be fetched separately.
-                            queue
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .mark_seen(canon_norm.clone());
-                            // Record the canonical as the page's
-                            // true URL for output.
-                            // (page_url is updated below.)
-                        }
-                    }
 
                     // ── Binary content guard ──
                     // Skip non-HTML (images, video, fonts, archives)
@@ -1318,7 +1307,7 @@ impl Crawler {
                         .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("text/html");
-                    if ghost_html.is_none() && crate::fetch::guards::is_binary(&page.body, ctype) {
+                    if !ghost_rendered && crate::fetch::guards::is_binary(&page.body, ctype) {
                         let kind = ctype.split(';').next().unwrap_or("unknown").trim();
                         skipped
                             .lock()
@@ -1331,11 +1320,8 @@ impl Crawler {
                     let mut eo = ExtractOptions::default();
                     eo.focus = focus.as_ref().clone();
                     eo.max_chars = Some(opts_worker.per_page_max);
-                    let body_bytes: &[u8] = ghost_html
-                        .as_deref()
-                        .map(|s| s.as_bytes())
-                        .unwrap_or(&page.body);
-                    let body_ctype = if ghost_html.is_some() {
+                    let body_bytes = page.body.as_slice();
+                    let body_ctype = if ghost_rendered {
                         crate::extract::charset::GHOST_TEXT_CT
                     } else {
                         ctype
@@ -1369,7 +1355,7 @@ impl Crawler {
                     // requires 25s remaining deadline. Non-JS sites
                     // never hit this path.
                     if r.thin
-                        && ghost_html.is_none()
+                        && !ghost_rendered
                         && page.body.len() > 5_000
                         && let Some(ref ghost_hook) = ghost_hook
                     {
@@ -1386,15 +1372,43 @@ impl Crawler {
                             };
                             match rendered {
                                 Ok(gp) => {
-                                    if let Ok(r2) = extract::extract(
+                                    if let Err(reason) = redirect_target_allowed(
+                                        &fetch,
+                                        &governor,
+                                        &robots_cache,
+                                        &opts_worker,
+                                        &seed_host2,
+                                        &parsed,
+                                        &gp.document.url,
+                                    )
+                                    .await
+                                    {
+                                        skipped
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .push((item.url.clone(), reason));
+                                        continue 'work;
+                                    }
+                                    match extract::extract(
                                         gp.html.as_bytes(),
                                         crate::extract::charset::GHOST_TEXT_CT,
-                                        &page_url,
+                                        &gp.document.url,
                                         &eo,
-                                    ) && !r2.thin
-                                    {
-                                        r = r2;
-                                        ghost_html = Some(gp.html);
+                                    ) {
+                                        Ok(rendered) => {
+                                            r = rendered;
+                                            page.apply_render(gp);
+                                        }
+                                        Err(error) => {
+                                            skipped
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .push((
+                                                    item.url.clone(),
+                                                    format!("browser extract failed: {error}"),
+                                                ));
+                                            continue 'work;
+                                        }
                                     }
                                 }
                                 Err(why) => {
@@ -1407,6 +1421,38 @@ impl Crawler {
                                         ));
                                 }
                             }
+                        }
+                    }
+
+                    if page.url != item.url
+                        && let Ok(final_url) = Url::parse(&page.url)
+                    {
+                        queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .mark_seen(frontier::normalize(&final_url));
+                    }
+
+                    // ── Canonical URL resolution ──
+                    // Extract <link rel="canonical" href="..."> to
+                    // prevent double-fetching the same page under
+                    // different URLs (trailing slash, index.html,
+                    // tracking variants).
+                    if let Some(canon_href) =
+                        extract_canonical(&String::from_utf8_lossy(&page.body))
+                        && let Ok(canon_parsed) = Url::parse(&canon_href)
+                    {
+                        let canon_norm = frontier::normalize(&canon_parsed);
+                        let fetched_norm = Url::parse(&page.url)
+                            .map(|url| frontier::normalize(&url))
+                            .unwrap_or_default();
+                        if canon_norm != fetched_norm {
+                            // Mark the canonical form as seen so
+                            // it won't be fetched separately.
+                            queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .mark_seen(canon_norm.clone());
                         }
                     }
 
@@ -1611,9 +1657,7 @@ impl Crawler {
 
                     // ── Harvest outlinks into the frontier ──
                     if item.depth < max_depth {
-                        let html = ghost_html
-                            .clone()
-                            .unwrap_or_else(|| String::from_utf8_lossy(&page.body).into_owned());
+                        let html = String::from_utf8_lossy(&page.body);
                         // <base href> handling: resolve relative
                         // links against the base URL when present.
                         // The base itself resolves against the
@@ -1691,7 +1735,7 @@ impl Crawler {
                                             nu,
                                             s,
                                             item.depth,
-                                            Some(item.url.clone()),
+                                            Some(page.url.clone()),
                                         );
                                         continue;
                                     }
@@ -1705,7 +1749,7 @@ impl Crawler {
                                         focus.as_deref(),
                                         focus_idf.as_deref(),
                                     );
-                                    q.push_with_parent(nu, s, item.depth, Some(item.url.clone()));
+                                    q.push_with_parent(nu, s, item.depth, Some(page.url.clone()));
                                 }
                             }
                         } // ls + q dropped before feed discovery's await
@@ -1740,7 +1784,7 @@ impl Crawler {
                                 tokio::time::sleep(fw).await;
                             }
                             let feed_page =
-                                fetch(fu.to_string(), lane.id.clone(), Some(item.url.clone()))
+                                fetch(fu.to_string(), lane.id.clone(), Some(page.url.clone()))
                                     .await;
                             total_fetched.fetch_add(1, Ordering::SeqCst);
                             if !matches!(feed_page.verdict, Verdict::ContentOk) {
@@ -1800,7 +1844,7 @@ impl Crawler {
                                                 u,
                                                 s,
                                                 item.depth + 1,
-                                                Some(item.url.clone()),
+                                                Some(page.url.clone()),
                                             );
                                             continue;
                                         }
@@ -1814,7 +1858,7 @@ impl Crawler {
                                             u,
                                             s,
                                             item.depth + 1,
-                                            Some(item.url.clone()),
+                                            Some(page.url.clone()),
                                         );
                                     }
                                 }
@@ -1890,7 +1934,7 @@ impl Crawler {
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             for (cu, _anchor, s) in filtered {
-                                q.push_with_parent(cu, s, item.depth + 1, Some(item.url.clone()));
+                                q.push_with_parent(cu, s, item.depth + 1, Some(page.url.clone()));
                             }
                         } // q dropped here
                     }
@@ -2220,6 +2264,31 @@ fn host_matches(a: &str, b: &str) -> bool {
     let a = a.strip_prefix("www.").unwrap_or(a);
     let b = b.strip_prefix("www.").unwrap_or(b);
     a.eq_ignore_ascii_case(b)
+}
+
+/// Recheck a candidate's actual final URL before extraction or browser recovery.
+async fn redirect_target_allowed(
+    fetch: &PageFetcher,
+    governor: &Governor,
+    robots: &sitemap::RobotsCache,
+    opts: &CrawlOptions,
+    seed_host: &str,
+    queued: &Url,
+    target: &str,
+) -> Result<(), String> {
+    let final_url = crate::fetch::guards::validate_url_basic(target)
+        .map_err(|error| format!("invalid redirect target: {error}"))?;
+    if final_url != *queued
+        && ((opts.same_host
+            && !final_url
+                .host_str()
+                .is_some_and(|host| host_matches(host, seed_host)))
+            || !scope_allowed(final_url.path(), &opts.include_paths, &opts.exclude_paths)
+            || (opts.respect_robots && !robots_allows(fetch, governor, robots, &final_url).await))
+    {
+        return Err(format!("redirected out of scope -> {target}"));
+    }
+    Ok(())
 }
 
 /// The per-origin robots gate used at fetch time (and the redirect

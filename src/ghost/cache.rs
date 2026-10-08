@@ -330,6 +330,8 @@ fn bump_vault_epoch(state: &mut GhostState) {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RenderCache {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<crate::ghost::document::Document>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     pub html: String,
     pub at: u64,
@@ -1683,14 +1685,34 @@ impl GhostState {
     }
 
     pub fn record_render(&mut self, url: &str, html: &str) {
-        self.record_render_entry(url, html, None);
+        self.record_render_entry(url, html, None, None);
     }
 
     pub fn record_render_context(&mut self, url: &str, html: &str, context: &str) {
-        self.record_render_entry(url, html, Some(context.to_string()));
+        self.record_render_entry(url, html, Some(context.to_string()), None);
     }
 
-    fn record_render_entry(&mut self, url: &str, html: &str, context: Option<String>) {
+    pub fn record_render_document(
+        &mut self,
+        document: &crate::ghost::document::Document,
+        html: &str,
+        context: &str,
+    ) {
+        self.record_render_entry(
+            &document.url,
+            html,
+            Some(context.to_string()),
+            Some(document.clone()),
+        );
+    }
+
+    fn record_render_entry(
+        &mut self,
+        url: &str,
+        html: &str,
+        context: Option<String>,
+        document: Option<crate::ghost::document::Document>,
+    ) {
         // Skip oversized pages : caching 1MB+ HTML bloats the state
         // file with no benefit (large pages are usually not SPAs
         // that need render caching).
@@ -1711,6 +1733,7 @@ impl GhostState {
         self.renders.insert(
             url.to_string(),
             RenderCache {
+                document,
                 context,
                 html: html.to_string(),
                 at: now(),

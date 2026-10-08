@@ -3,7 +3,7 @@
 use serde_json::Value;
 use std::collections::VecDeque;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Document {
     pub generation: u64,
     pub frame: String,

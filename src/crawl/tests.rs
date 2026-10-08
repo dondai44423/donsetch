@@ -235,6 +235,284 @@ fn html(title: &str, body: &str) -> String {
     )
 }
 
+fn classifying_fetcher(inner: PageFetcher) -> PageFetcher {
+    Arc::new(move |url, lane, referer| {
+        let inner = Arc::clone(&inner);
+        async move {
+            let mut page = inner(url, lane, referer).await;
+            page.verdict = crate::detect::walls::detect(page.status, &page.headers, &page.body);
+            page
+        }
+        .boxed()
+    })
+}
+
+#[tokio::test]
+async fn stealth_v3_browser_redirects_obey_scope_host_and_robots_for_wall_and_thin_pages() {
+    for thin in [false, true] {
+        for target in [
+            "https://ex.com/outside",
+            "https://other.example/allowed",
+            "https://ex.com/robots-denied",
+        ] {
+            let seed = "https://ex.com/start";
+            let shell = format!(
+                "<html><body><div id='app'></div><script>{}</script></body></html>",
+                "/* owned shell */".repeat(400)
+            );
+            let (fetch, _) = MockSite::new()
+                .page(
+                    "https://ex.com/robots.txt",
+                    200,
+                    "User-agent: *\nDisallow: /robots-denied\n",
+                )
+                .page(
+                    seed,
+                    if thin { 200 } else { 403 },
+                    if thin {
+                        &shell
+                    } else {
+                        "<html><body>Access denied</body></html>"
+                    },
+                )
+                .fetcher();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let reached = Arc::clone(&calls);
+            let hook: super::GhostHook = Arc::new(move |_| {
+                reached.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Ok(super::GhostRender {
+                        html: html(
+                            "Owned browser document",
+                            "The final browser document supplies its own evidence.",
+                        ),
+                        document: crate::ghost::document::Document {
+                            url: target.into(),
+                            status: Some(201),
+                            generation: 7,
+                            ..Default::default()
+                        },
+                    })
+                }
+                .boxed()
+            });
+            let result = Crawler::new(classifying_fetcher(fetch), gov())
+                .with_ghost(hook)
+                .crawl(
+                    seed,
+                    CrawlOptions {
+                        mode: CrawlMode::Content,
+                        deadline: Duration::from_secs(30),
+                        include_paths: vec!["/*".into()],
+                        exclude_paths: vec!["/outside".into()],
+                        max_pages: 1,
+                        max_depth: 0,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "browser branch not reached: thin={thin}, target={target}"
+            );
+            assert!(
+                result.pages.is_empty(),
+                "out-of-scope browser content returned: thin={thin}, target={target}"
+            );
+            assert!(
+                result
+                    .skipped
+                    .iter()
+                    .any(|(_, reason)| reason.contains("redirected out of scope")),
+                "{:?}",
+                result.skipped
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stealth_v3_allowed_browser_redirect_owns_url_and_relative_links() {
+    for thin in [false, true] {
+        let seed = "https://ex.com/start";
+        let final_url = "https://ex.com/allowed/final";
+        let shell = format!(
+            "<html><body><div id='app'></div><script>{}</script></body></html>",
+            "/* owned shell */".repeat(400)
+        );
+        let (fetch, hits) = MockSite::new()
+            .page(
+                seed,
+                if thin { 200 } else { 403 },
+                if thin {
+                    &shell
+                } else {
+                    "<html><body>Access denied</body></html>"
+                },
+            )
+            .page(
+                "https://ex.com/allowed/next",
+                200,
+                &html(
+                    "Distinct child",
+                    "A second document with independent research evidence.",
+                ),
+            )
+            .fetcher();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reached = Arc::clone(&calls);
+        let hook: super::GhostHook = Arc::new(move |_| {
+            reached.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(super::GhostRender {
+                    html: html(
+                        "Owned final document",
+                        "The browser final URL owns this content.",
+                    ) + "<a href='next'>Next chapter</a><a href='final'>Self document</a>",
+                    document: crate::ghost::document::Document {
+                        url: final_url.into(),
+                        status: Some(201),
+                        generation: 7,
+                        ..Default::default()
+                    },
+                })
+            }
+            .boxed()
+        });
+        let result = Crawler::new(classifying_fetcher(fetch), gov())
+            .with_ghost(hook)
+            .crawl(
+                seed,
+                CrawlOptions {
+                    mode: CrawlMode::Content,
+                    deadline: Duration::from_secs(30),
+                    respect_robots: false,
+                    include_paths: vec!["/*".into()],
+                    max_pages: 2,
+                    max_depth: 1,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(result.pages.iter().any(|page| page.url == final_url && page.markdown.contains("Owned final document")),
+            "thin={thin}, pages={:?}, skipped={:?}", result.pages.iter().map(|page| (&page.url, &page.markdown)).collect::<Vec<_>>(), result.skipped);
+        assert!(
+            result
+                .pages
+                .iter()
+                .any(|page| page.url == "https://ex.com/allowed/next")
+        );
+        assert_eq!(
+            result
+                .pages
+                .iter()
+                .find(|page| page.url == "https://ex.com/allowed/next")
+                .unwrap()
+                .parent
+                .as_deref(),
+            Some(final_url)
+        );
+        assert!(!result.pages.iter().any(|page| page.url == seed));
+        assert!(
+            !result.queued.iter().any(|url| url == final_url),
+            "the browser final document is already visited"
+        );
+        assert!(
+            !hits.lock().unwrap().iter().any(|url| url == final_url),
+            "the browser final document must not be fetched again"
+        );
+        assert!(
+            hits.lock()
+                .unwrap()
+                .iter()
+                .any(|url| url == "https://ex.com/allowed/next")
+        );
+    }
+}
+
+#[tokio::test]
+async fn stealth_v3_browser_unknown_status_never_inherits_http_denial() {
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/", 403, "Access denied")
+        .fetcher();
+    let mut page = fetch("https://ex.com/".into(), "owned-lane".into(), None).await;
+    let route = page.route.clone();
+    page.apply_render(super::GhostRender {
+        html: html("Owned browser", "Content with no observed network status."),
+        document: crate::ghost::document::Document {
+            url: "https://ex.com/final".into(),
+            status: None,
+            generation: 3,
+            ..Default::default()
+        },
+    });
+    assert_eq!(
+        page.status, 0,
+        "zero is unknown, not a synthesized200 or inherited403"
+    );
+    assert_eq!(page.url, "https://ex.com/final");
+    assert_eq!(page.route, route);
+    assert_eq!(page.lane, "owned-lane");
+    assert!(
+        String::from_utf8(page.body)
+            .unwrap()
+            .contains("Owned browser")
+    );
+}
+
+#[tokio::test]
+async fn stealth_v3_http_redirect_outside_scope_does_not_start_browser() {
+    let seed = "https://ex.com/start";
+    let (inner, hits) = MockSite::new().page(seed, 403, "Access denied").fetcher();
+    let fetch: PageFetcher = Arc::new(move |url, lane, referer| {
+        let inner = Arc::clone(&inner);
+        async move {
+            let mut page = inner(url, lane, referer).await;
+            page.url = "https://ex.com/outside".into();
+            page.verdict = Verdict::Blocked;
+            page
+        }
+        .boxed()
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reached = Arc::clone(&calls);
+    let hook: super::GhostHook = Arc::new(move |_| {
+        reached.fetch_add(1, Ordering::SeqCst);
+        async { Err("out-of-scope browser must not start".into()) }.boxed()
+    });
+    let result = Crawler::new(fetch, gov())
+        .with_ghost(hook)
+        .crawl(
+            seed,
+            CrawlOptions {
+                mode: CrawlMode::Content,
+                respect_robots: false,
+                deadline: Duration::from_secs(30),
+                include_paths: vec!["/*".into()],
+                exclude_paths: vec!["/outside".into()],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.lock().unwrap().as_slice(), [seed]);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(result.pages.is_empty());
+    assert!(
+        result
+            .skipped
+            .iter()
+            .any(|(_, reason)| reason == "redirected out of scope -> https://ex.com/outside")
+    );
+}
+
 #[tokio::test]
 async fn wave450_seed_preflight_uses_an_available_governor_lane() {
     let (inner, _) = MockSite::new()

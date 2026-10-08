@@ -135,11 +135,14 @@ pub(super) fn make_ghost_hook(
                 if !skip_cache_read {
                     let s = state.lock().await;
                     if let Some(rc) = s.render_for_context(&url, &context)
+                        && let Some(document) = rc.document.as_ref()
+                        && document.url == url
                         && crate::detect::walls::detect_dom_smart(rc.html.as_bytes())
                             == crate::detect::walls::Verdict::ContentOk
                     {
                         return Ok(crate::crawl::GhostRender {
                             html: rc.html.clone(),
+                            document: document.clone(),
                         });
                     }
                 }
@@ -173,8 +176,11 @@ pub(super) fn make_ghost_hook(
                 state
                     .lock()
                     .await
-                    .record_render_context(&page.document.url, &page.html, &context);
-                Ok(crate::crawl::GhostRender { html: page.html })
+                    .record_render_document(&page.document, &page.html, &context);
+                Ok(crate::crawl::GhostRender {
+                    html: page.html,
+                    document: page.document,
+                })
             })
             .await
             .unwrap_or_else(|_| Err("browser handoff deadline exceeded".into()))
@@ -889,8 +895,13 @@ mod crawl_route_tests {
         let context = crate::ghost::cache::render_context(&profile, &wire, None);
         let url = "https://owned.example/expired";
         let mut state = GhostState::default();
-        state.record_render_context(
-            url,
+        state.record_render_document(
+            &crate::ghost::document::Document {
+                url: url.into(),
+                generation: 7,
+                status: Some(201),
+                ..Default::default()
+            },
             "<article><h1>Owned cached article</h1><p>Useful cached content.</p></article>",
             &context,
         );

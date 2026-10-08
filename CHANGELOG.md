@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retain the caller deadline and partition render reuse by route and persona wire.
   Missing crawl lanes fail closed; updating a cached render preserves other pages.
   Buffered seed responses retain their governor assignment for health feedback.
+  Browser redirects retain their own URL/status and pass crawl scope and robots
+  checks before extraction, history updates or link discovery.
+  Child links use the final document as their parent; visited aliases are removed
+  from the frontier so redirects and canonical links do not queue duplicate reads.
 
 - Background pre-solve retains its selected browser route for cookie replay,
   even when a concurrent rate limit rotates the next independent request.

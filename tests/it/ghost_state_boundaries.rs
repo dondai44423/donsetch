@@ -184,6 +184,27 @@ fn persisted_scoped_render_rejects_expired_and_future_timestamps() {
 }
 
 #[test]
+fn persisted_browser_render_retains_its_own_document_receipt() {
+    let (mut state, original, bytes) = copied_state(&json!({"version":3}));
+    for status in [Some(201), None] {
+        let document = donsetch::ghost::document::Document {
+            generation: 7,
+            frame: "owned-main".into(),
+            loader: "owned-loader".into(),
+            url: URL.into(),
+            status,
+        };
+        state.record_render_document(&document, "owned browser content", "owned-route-a");
+        let saved = GhostState::load();
+        let render = saved.render_for_context(URL, "owned-route-a").unwrap();
+        assert_eq!(render.document.as_ref(), Some(&document));
+        assert_eq!(render.html, "owned browser content");
+        assert!(saved.render_for(URL).is_none());
+    }
+    assert_eq!(std::fs::read(original).unwrap(), bytes);
+}
+
+#[test]
 fn persisted_render_replacement_at_capacity_keeps_other_entries() {
     let mut seed = json!({"version": 3, "renders": {}});
     for i in 0..20 {

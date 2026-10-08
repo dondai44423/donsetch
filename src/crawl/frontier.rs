@@ -460,13 +460,16 @@ impl FrontierQueue {
         self.heap.is_empty()
     }
 
-    /// Mark a URL as seen without enqueuing it. Used for
+    /// Mark a URL as seen and remove its pending alias. Used for
     /// canonical URL resolution: when a page declares a
     /// canonical URL different from its fetched URL, the
     /// canonical form is marked seen to prevent a separate
     /// fetch of the same content under a different URL.
     pub fn mark_seen(&mut self, url: String) {
-        self.seen.insert(url);
+        // A new key cannot already be queued. Scan only known aliases.
+        if !self.seen.insert(url.clone()) {
+            self.heap.retain(|item| item.url != url);
+        }
     }
 }
 
@@ -575,6 +578,19 @@ pub fn effective_excludes(user: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stealth_v3_observed_final_url_removes_only_its_queued_alias() {
+        let mut queue = FrontierQueue::new();
+        let final_url = Url::parse("https://ex.com/allowed/final").unwrap();
+        let other = Url::parse("https://ex.com/allowed/next").unwrap();
+        assert!(queue.push(final_url.clone(), 10.0, 1));
+        assert!(queue.push(other.clone(), 5.0, 1));
+        queue.mark_seen(normalize(&final_url));
+        assert_eq!(queue.pop().unwrap().url, normalize(&other));
+        assert!(queue.pop().is_none());
+        assert!(!queue.push(final_url, 10.0, 1));
+    }
 
     // One index page can carry 100 000 links; each became a heap
     // entry, and the whole heap was copied into every tool response
