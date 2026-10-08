@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Successful HTTP responses across the 2xx range update fetch and crawl lane
+  health. Crawl content still requires a usable page before clearing penalties;
+  a successful status on a login wall does not qualify.
+
 - Startup proxy probes preserve the selected lane while their shared echo is
   unavailable. Failed probes retain existing health bans; verified authentication
   failures still bench their own lane without retrying unchanged credentials.

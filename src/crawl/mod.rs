@@ -1160,7 +1160,7 @@ impl Crawler {
                         // Warm-cache hit: free : no governor signal.
                     } else {
                         match (page.status, &page.verdict) {
-                            (200, Verdict::ContentOk) => {
+                            (200..=299, Verdict::ContentOk) => {
                                 // No dwell: pacing is the governor's
                                 // rung/jitter ladder alone (law 11, v4
                                 // phase 3). The old size-proportional

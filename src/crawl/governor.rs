@@ -575,6 +575,149 @@ fn prune_hosts(hosts: &mut HashMap<String, HostPenalty>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::client::Fetcher;
+    use crate::search::egress::EgressPool;
+    use crate::transport::proxy::Proxy;
+    use std::sync::Arc;
+
+    async fn owned_status_crawl(
+        status: u16,
+        auth_wall: bool,
+    ) -> (Arc<Governor>, Arc<EgressPool>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/owned-status", origin.local_addr().unwrap());
+        let proxy =
+            Proxy::parse(&format!("http://{}", unused_proxy.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(socket.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(b"GET /owned-status HTTP/1.1\r\n"));
+            let body = if auth_wall {
+                "<html><title>Sign in</title><form><input type='password'></form></html>"
+                    .to_string()
+            } else if status == 403 {
+                "<html><h1>Access denied</h1></html>".to_string()
+            } else {
+                format!(
+                    "<article><h1>Owned status {status}</h1><p>{}</p></article>",
+                    "Useful content from a successful response must not penalize its lane. "
+                        .repeat(50)
+                )
+            };
+            socket.write_all(format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let pool = Arc::new(EgressPool::new(vec![proxy.clone()]));
+        let (crawler, governor) = super::super::real::build(
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap()),
+            Arc::clone(&pool),
+        );
+        let result = crawler
+            .crawl(
+                &url,
+                super::super::CrawlOptions {
+                    mode: super::super::CrawlMode::Content,
+                    respect_robots: false,
+                    max_pages: 1,
+                    max_depth: 0,
+                    deadline: std::time::Duration::from_secs(2),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.pages.len(), usize::from(status != 403 && !auth_wall));
+        if status != 403 && !auth_wall {
+            assert!(
+                result.pages[0]
+                    .markdown
+                    .contains(&format!("Owned status {status}"))
+            );
+            assert!(result.pages[0].markdown.contains("Useful content"));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), unused_proxy.accept())
+                .await
+                .is_err(),
+            "the unused lane must receive no request"
+        );
+        (governor, pool, proxy.id())
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_201_keeps_crawl_governor_lane_healthy() {
+        let (governor, _, _) = owned_status_crawl(201, false).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(lane.rung, 0, "a useful HTTP201 must not add a failure rung");
+        assert!(
+            lane.baseline_ms.is_some(),
+            "the actual response must reach success feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_201_updates_crawl_pool_health() {
+        let (_, pool, _) = owned_status_crawl(201, false).await;
+        assert!(
+            pool.rtt_ms("direct").is_some(),
+            "a real HTTP201 must teach the lane RTT"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_200_retains_crawl_health_feedback() {
+        let (governor, pool, _) = owned_status_crawl(200, false).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(lane.rung, 0);
+        assert!(lane.baseline_ms.is_some());
+        assert!(pool.rtt_ms("direct").is_some());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_403_still_penalizes_crawl_lane() {
+        let (governor, pool, unused_proxy) = owned_status_crawl(403, false).await;
+        assert_eq!(governor.best_lane("127.0.0.1").unwrap().id, unused_proxy);
+        assert!(pool.rtt_ms("direct").is_none());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_299_updates_crawl_health() {
+        let (governor, pool, _) = owned_status_crawl(299, false).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(lane.rung, 0);
+        assert!(lane.baseline_ms.is_some());
+        assert!(pool.rtt_ms("direct").is_some());
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_201_auth_wall_still_penalizes_crawl_content() {
+        let (governor, pool, _) = owned_status_crawl(201, true).await;
+        let lanes = governor.lanes.lock().unwrap();
+        let lane = lanes.get(&("127.0.0.1".into(), "direct".into())).unwrap();
+        assert_eq!(
+            lane.rung, 1,
+            "HTTP success cannot make a login page useful content"
+        );
+        assert!(lane.baseline_ms.is_none());
+        assert!(
+            pool.rtt_ms("direct").is_some(),
+            "the transport still reached its peer"
+        );
+    }
 
     fn gov(kinds: &[LaneKind]) -> Governor {
         let lanes = kinds

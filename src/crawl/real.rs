@@ -134,7 +134,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                         let cached = matches!(out.cache, CacheState::Fresh);
                         if !cached {
                             match out.status {
-                                200 | 304 => {
+                                200..=299 | 304 => {
                                     if !host.is_empty() {
                                         pool.report_ok(&host, &lane);
                                     }

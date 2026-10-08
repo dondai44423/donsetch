@@ -384,7 +384,7 @@ impl Fetcher {
             if let (Some(pool), Some((host, id))) = (&self.egress, pool_lane) {
                 match out.status {
                     429 => pool.note_fetch_rate_limited(host, id),
-                    200 | 304 => {
+                    200..=299 | 304 => {
                         pool.report_ok(host, id);
                         pool.observe_rtt(id, hop_started.elapsed());
                     }
@@ -1449,6 +1449,64 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
 #[cfg(test)]
 mod transport_exit_tests {
     use super::*;
+
+    async fn owned_status_fetch(status: u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.proxy.fetch_rotate = true;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/owned-status", origin.local_addr().unwrap());
+        let proxy =
+            proxy::Proxy::parse(&format!("http://{}", proxy_listener.local_addr().unwrap()))
+                .unwrap();
+        let expected_head = format!("GET {url} HTTP/1.1\r\n");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = proxy_listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(socket.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(expected_head.as_bytes()));
+            socket.write_all(format!("HTTP/1.1 {status} Owned\r\nContent-Length: 5\r\nConnection: close\r\n\r\nowned").as_bytes()).await.unwrap();
+        });
+        let pool = std::sync::Arc::new(crate::search::egress::EgressPool::new(vec![proxy.clone()]));
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default())
+            .unwrap()
+            .with_egress(std::sync::Arc::clone(&pool));
+        let response = fetcher.fetch(&url).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(response.status, status);
+        assert_eq!(response.body, b"owned");
+        assert_eq!(
+            response.route.proxy_for(&url).unwrap().unwrap().id(),
+            proxy.id()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), origin.accept())
+                .await
+                .is_err(),
+            "a pooled success must not reach direct"
+        );
+        assert!(
+            pool.rtt_ms(&proxy.id()).is_some(),
+            "HTTP{status} must teach the selected pool lane RTT"
+        );
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_201_updates_fetch_pool_health() {
+        owned_status_fetch(201).await;
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_success_status_200_retains_fetch_pool_health() {
+        owned_status_fetch(200).await;
+    }
 
     // #248 split Dns/DnsTimeout out of Io/Timeout. Those variants
     // describe the ORIGIN's name (the guard resolves the target before
