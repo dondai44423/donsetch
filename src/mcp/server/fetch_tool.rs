@@ -2661,8 +2661,12 @@ pub(super) async fn ghost_escalate(
         }
     }
     if !page.cookies.is_empty() {
-        daemon.fetcher.import_vault_cookies(&page.cookies).await;
-        crate::ghost::cache::store_session_cookies(&page.cookies);
+        // A pooled browser can predate a logout for one of its
+        // domains: a dead session must not ride back into the jar
+        // or the vault.
+        let cookies = crate::ghost::cache::session_cookies_since(&page.cookies, g.launched_epoch);
+        daemon.fetcher.import_vault_cookies(&cookies).await;
+        crate::ghost::cache::store_session_cookies(&cookies);
     }
     // Retry tier 1 with fresh cookies : the cheap path back to
     // normal HTTP when the gate was cookie-driven.
@@ -2798,13 +2802,18 @@ pub(super) async fn ghost_escalate(
         // CONTENT : success is "we got content", not "we got HTTP
         // 200". The replay probe (or its absence) sets replay_ok.
         if learn || page.vendor.is_some() {
+            // A pooled browser can predate a logout for one of its
+            // domains: a dead session must not ride back into the
+            // learned route or the vault.
+            let cookies =
+                crate::ghost::cache::session_cookies_since(&page.cookies, g.launched_epoch);
             daemon.state.lock().await.record_solved(
                 host,
-                &page.cookies,
+                &cookies,
                 page.vendor.as_deref(),
                 replay_content_ok,
             );
-            crate::ghost::cache::store_session_cookies(&page.cookies);
+            crate::ghost::cache::store_session_cookies(&cookies);
         }
         // Don't cache challenge/wall DOMs : defense in depth alongside
         // the ghost_fetch timeout check. A challenge page that has

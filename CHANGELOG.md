@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The tier-2 browser harvest honors logouts that land mid-call: cookies for a
+  domain cleared at or after the browser's launch are filtered before they
+  reach the jar, the learned route, or the vault, so a pooled browser that
+  predates a logout can no longer re-vault the dead session.
+
 - The startup proxy preflight obeys one global batch budget: a pool of stalled
   lanes no longer costs up to 6s per lane of startup, a budget-cut partial
   batch publishes nothing, and doctor --deep treats an all-failed probe batch
