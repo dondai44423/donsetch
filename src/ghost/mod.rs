@@ -1039,8 +1039,14 @@ impl Ghost {
                         let got =
                             unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                         if got == 0 {
+                            if crate::config::cfg().debug.ghost {
+                                eprintln!("[ghost] profile lock acquired: shared profile");
+                            }
                             (profile_dir(), None, None::<std::path::PathBuf>)
                         } else {
+                            if crate::config::cfg().debug.ghost {
+                                eprintln!("[ghost] profile lock contended: temp profile");
+                            }
                             let t = temporary_profile_dir();
                             (t.clone(), Some(t), None::<std::path::PathBuf>)
                         }
@@ -1381,7 +1387,10 @@ impl Ghost {
         // session, or a vendor that binds sessions to fingerprints
         // sees the same login riding two profiles.
         if temp_profile.is_none() {
+            Self::purge_cleared_session_cookies(&cdp).await;
             Self::restore_session_cookies(&cdp).await;
+        } else if crate::config::cfg().debug.ghost {
+            eprintln!("[ghost] temp profile: purge + replant skipped");
         }
 
         // One page target, attached flat.
@@ -1950,6 +1959,92 @@ impl Ghost {
     pub async fn cookies(&self) -> Result<Vec<cache::CookieRecord>, FetchError> {
         let res = self.cdp.call(None, "Storage.getCookies", json!({})).await?;
         Ok(Self::parse_cdp_cookies(&res))
+    }
+
+    /// Drop browser cookies whose domain's session was cleared. The
+    /// shared profile outlives logouts by days, and a dead session
+    /// cookie (server-side invalid) must not ride into a new browser.
+    /// Runs before the vault replant, so a re-authenticated domain
+    /// ends with exactly the vault's fresh set. Best-effort: a cookie
+    /// that refuses to delete must never fail a launch.
+    async fn purge_cleared_session_cookies(cdp: &cdp::Cdp) {
+        let state = crate::ghost::cache::GhostState::load();
+        let cleared: Vec<String> = state
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.session_cleared_epoch > 0)
+            .map(|(host, _)| host.clone())
+            .collect();
+        if crate::config::cfg().debug.ghost {
+            eprintln!("[ghost] purge entry: {} cleared domain(s)", cleared.len());
+        }
+        if cleared.is_empty() {
+            return;
+        }
+        let Ok(res) = cdp.call(None, "Storage.getCookies", json!({})).await else {
+            if crate::config::cfg().debug.ghost {
+                eprintln!("[ghost] purge: Storage.getCookies failed");
+            }
+            return;
+        };
+        let cookies = Self::parse_cdp_cookies(&res);
+        if crate::config::cfg().debug.ghost {
+            eprintln!(
+                "[ghost] purge: {} cleared domain(s), {} browser cookies",
+                cleared.len(),
+                cookies.len()
+            );
+        }
+        // The browser endpoint exposes Storage.setCookies but not
+        // Network.deleteCookies ("wasn't found" on the browser session),
+        // so a cleared cookie is expired: an expiry in the past makes
+        // the browser drop it and never send it again.
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(86_400) as f64;
+        for cookie in cookies {
+            let domain = cookie.domain.trim_start_matches('.');
+            if !cleared
+                .iter()
+                .any(|d| crate::auth::cookie_belongs_to(d, domain))
+            {
+                continue;
+            }
+            let path = if cookie.path.is_empty() {
+                "/"
+            } else {
+                cookie.path.as_str()
+            };
+            if let Err(error) = cdp
+                .call(
+                    None,
+                    "Storage.setCookies",
+                    json!({ "cookies": [{
+                        "name": cookie.name,
+                        "value": "",
+                        "domain": cookie.domain,
+                        "path": path,
+                        "secure": cookie.secure,
+                        "httpOnly": cookie.http_only,
+                        "sameSite": if cookie.same_site.is_empty() {
+                            "Lax".to_string()
+                        } else {
+                            cookie.same_site.clone()
+                        },
+                        "expires": past,
+                    }] }),
+                )
+                .await
+                && crate::config::cfg().debug.ghost
+            {
+                eprintln!(
+                    "[ghost] purge expire {} {}: {error}",
+                    cookie.name, cookie.domain
+                );
+            }
+        }
     }
 
     /// Replant the session vault into a fresh browser. Best-effort:

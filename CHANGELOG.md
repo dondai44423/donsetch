@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A browser launched after a logout no longer surfaces the dead session: the
+  shared profile's cookies for logged-out domains are expired at launch,
+  before the session vault is replanted, so a stale cookie cannot ride into a
+  fresh browser. The purge keys on each cookie's own domain, so live sessions
+  are untouched.
+
 - The tier-2 browser harvest honors logouts that land mid-call: cookies for a
   domain cleared at or after the browser's launch are filtered before they
   reach the jar, the learned route, or the vault, so a pooled browser that
