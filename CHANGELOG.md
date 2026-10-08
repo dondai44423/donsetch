@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Anti-cloak compares a previously walled site's HTTP content before clearing
+  its wall history. Inconclusive comparisons retain that history; successful
+  browser recovery avoids a duplicate comparison, and tier 1 stays HTTP-only.
+
 - Fetch selects its route once before adapter and archive recovery. Related
   fallbacks, browser actions and replay retain that route and the original
   deadline; selected pool lanes retain their health feedback without a new pick.

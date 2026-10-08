@@ -1276,14 +1276,13 @@ async fn fetch_single_inner(
     };
     let retry_http =
         no_adapter || args.get("_reddit_session").and_then(Value::as_bool) == Some(true);
-    let route = fetch_route(
-        &*daemon.state.lock().await,
-        &host,
-        tier,
-        is_pdf_url,
-        adapter_host,
-        retry_http,
-    );
+    let (route, known_walled) = {
+        let state = daemon.state.lock().await;
+        (
+            fetch_route(&state, &host, tier, is_pdf_url, adapter_host, retry_http),
+            state.is_known_walled(&host),
+        )
+    };
 
     let warm_cookies: Vec<CookieRecord> = match &route {
         RouteDecision::Warm(c) => c.clone(),
@@ -1505,8 +1504,11 @@ async fn fetch_single_inner(
                         // Warm succeeded : refresh the cookie vault (write-back).
                         let snap = daemon.fetcher.jar_snapshot(&host);
                         state.record_warm_ok(&host, &snap);
+                    } else if known_walled {
+                        // A previously walled site may serve bait to HTTP. Keep
+                        // its wall memory until a browser comparison is equivalent.
+                        state.record_fetch(&host);
                     } else {
-                        // Cold (or recheck) succeeded : if was needs_tier2, wall is gone.
                         state.record_cold_ok(&host);
                     }
                 }
@@ -2229,15 +2231,24 @@ async fn fetch_single_inner(
     // cleanly is suspicious. One equivalence check; a warning is
     // stamped, never a silent pass.
     let mut cloak_warning: Option<String> = None;
-    let profile_walled = daemon.state.lock().await.is_known_walled(&host);
-    // A rewritten API payload is not the original website's browser document.
-    if profile_walled
-        && !adapter_host
-        && !skip_tier1
-        && !is_warm
-        && let Some((_sim, note)) = anticloak_check(daemon, &url, &ex.markdown, budget).await
-    {
-        cloak_warning = Some(note);
+    // Compare suspicious HTTP-only content once. A recovery already observed
+    // this browser document, and explicit tier 1 must not launch a browser.
+    if known_walled && !adapter_host && !skip_tier1 && !is_warm && !need_ghost && tier != "1" {
+        let started = std::time::Instant::now();
+        trace.step("2", "anti-cloak", "started", 0);
+        let outcome = match anticloak_check(daemon, &url, &ex.markdown, budget, &call.route).await {
+            CloakComparison::Equivalent => {
+                daemon.state.lock().await.record_cold_ok(&host);
+                "equivalent"
+            }
+            CloakComparison::Divergent(note) => {
+                cloak_warning = Some(note);
+                "divergent"
+            }
+            CloakComparison::Unavailable(reason) => reason,
+        };
+        trace.step("2", "anti-cloak", outcome, started.elapsed().as_millis());
+        res["_meta"]["com.donsetch/fetch-debug"]["escalation"] = trace.value();
     }
     if let Some(note) = &cloak_warning {
         if let Some(cell) = res.pointer_mut("/content/0/text")
@@ -3483,20 +3494,27 @@ pub(super) async fn apply_image_ocr(
     }
 }
 
+enum CloakComparison {
+    Equivalent,
+    Divergent(String),
+    Unavailable(&'static str),
+}
+
 /// v3 anti-cloak: a domain KNOWN to be walled (needs_tier2 in the
 /// profile) suddenly serving clean tier-1 content is suspicious :
 /// bot walls sometimes serve benign-looking bait to suspected
 /// bots. Render the same URL in the real browser and compare word
 /// sets. Material divergence → `cloak_suspected` with a trust
 /// recommendation. Cost: one browser render, only on suspicion.
-pub(super) async fn anticloak_check(
+async fn anticloak_check(
     daemon: &Arc<Daemon>,
     url: &str,
     tier1_markdown: &str,
     budget: Budget,
-) -> Option<(f64, String)> {
+    route: &RequestRoute,
+) -> CloakComparison {
     let host = crate::search::rank::host_of(url);
-    let wire = {
+    let mut wire = {
         let state = daemon.state.lock().await;
         state
             .personas
@@ -3505,41 +3523,46 @@ pub(super) async fn anticloak_check(
             .map(|p| p.ghost_wire())
             .unwrap_or_default()
     };
-    let g = daemon
+    wire.route = Some(route.clone());
+    let Ok(g) = daemon
         .ghost_mgr
         .acquire_for_wire(&daemon.profile, Some(host.as_str()), wire)
         .await
-        .ok()?;
-    let read = daemon
+    else {
+        return CloakComparison::Unavailable("unavailable:launch");
+    };
+    let Ok(read) = daemon
         .ghost_mgr
         .read_document(g, &daemon.profile, url, budget.pass(20))
         .await
-        .ok()?;
+    else {
+        return CloakComparison::Unavailable("unavailable:transport");
+    };
     let _guard = read.guard;
     let page = read.page;
     if page.outcome.is_wall() {
-        return Some((
-            0.0,
+        return CloakComparison::Divergent(
             "browser sees a challenge where HTTP saw content".to_string(),
-        ));
+        );
     }
     if page.outcome != ops::BrowserOutcome::Content {
-        return None; // An incomplete/access-gated comparison is inconclusive.
+        return CloakComparison::Unavailable("unavailable:access");
     }
-    let ex = extract::extract(
+    let Ok(ex) = extract::extract(
         page.html.as_bytes(),
         extract::charset::GHOST_TEXT_CT,
         url,
         &ExtractOptions::default(),
-    )
-    .ok()?;
+    ) else {
+        return CloakComparison::Unavailable("unavailable:extraction");
+    };
     pub(super) fn words(s: &str) -> std::collections::HashSet<&str> {
         s.split_whitespace().collect()
     }
     let a = words(tier1_markdown);
     let b = words(&ex.markdown);
     if b.is_empty() {
-        return None; // browser got nothing : inconclusive, not bait
+        return CloakComparison::Unavailable("unavailable:empty");
     }
     let inter = a.intersection(&b).count();
     let union = a.union(&b).count();
@@ -3549,14 +3572,11 @@ pub(super) async fn anticloak_check(
         inter as f64 / union as f64
     };
     if sim < 0.55 {
-        Some((
-            sim,
-            format!(
-                "HTTP and browser content diverge (similarity {sim:.2}) : the HTTP copy may be bot-bait; browser tier text is the one to trust"
-            ),
+        CloakComparison::Divergent(format!(
+            "HTTP and browser content diverge (similarity {sim:.2}) : the HTTP copy may be bot-bait; browser tier text is the one to trust"
         ))
     } else {
-        None
+        CloakComparison::Equivalent
     }
 }
 
