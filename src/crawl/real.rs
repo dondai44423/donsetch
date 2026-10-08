@@ -18,6 +18,7 @@ use futures_util::FutureExt;
 
 use crate::detect::walls::Verdict;
 use crate::fetch::client::{CacheState, Fetcher};
+use crate::ghost::cache::GhostState;
 use crate::search::egress::EgressPool;
 
 use super::governor::{Governor, Lane, LaneKind};
@@ -47,7 +48,11 @@ fn pool_lanes(proxies: &[crate::transport::proxy::Proxy], rotate: bool) -> Vec<L
 /// jar/pool/cache as everything else in the process); `pool` is
 /// the process-wide egress fabric (health + dead benches shared
 /// with search and fetch).
-pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Governor>) {
+pub fn build(
+    fetcher: Arc<Fetcher>,
+    pool: Arc<EgressPool>,
+    state: Option<Arc<tokio::sync::Mutex<GhostState>>>,
+) -> (Crawler, Arc<Governor>) {
     let proxies = Arc::new(pool.proxies());
     let rotate = crate::config::cfg().proxy.crawl_rotate;
     let governor = Arc::new(Governor::new(pool_lanes(&proxies, rotate)));
@@ -64,6 +69,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                 let fetcher = Arc::clone(&fetcher);
                 let pool = Arc::clone(&pool);
                 let proxies = Arc::clone(&proxies);
+                let state = state.clone();
                 // v4 phase 3: the same adapter registry web_fetch uses
                 // shapes crawl fetches, so a reddit/npm class URL rides
                 // the cheap .json/registry path instead of the HTML app.
@@ -72,13 +78,18 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                 // rewritten endpoint. DONSETCH_NO_ADAPTERS silences this
                 // exactly as it does in web_fetch (handled inside
                 // adapters::rewrite).
-                let fetch_url = url::Url::parse(&url)
-                    .ok()
-                    .and_then(|u| crate::adapters::rewrite(&u).map(|(alt, _via)| alt))
+                let parsed = url::Url::parse(&url).ok();
+                let fetch_url = parsed
+                    .as_ref()
+                    .and_then(|u| crate::adapters::rewrite(u).map(|(alt, _via)| alt))
                     .unwrap_or_else(|| url.clone());
-                let host = url::Url::parse(&url)
-                    .ok()
+                let host = parsed
+                    .as_ref()
                     .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                    .unwrap_or_default();
+                let path = parsed
+                    .as_ref()
+                    .map(|u| u.path().to_string())
                     .unwrap_or_default();
                 async move {
                     let started = Instant::now();
@@ -120,14 +131,33 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                     // cached body made every delta recrawl compare the
                     // previous crawl's own content and report zero
                     // changes forever).
+                    // v4 E2 coherence: a host with a persona presents
+                    // the persona's language on crawl pages exactly as
+                    // web_fetch and the ghost do; a host without one
+                    // keeps the TLD/script heuristic.
+                    let persona_al = match &state {
+                        Some(state) => {
+                            let st = state.lock().await;
+                            st.personas
+                                .get(&host)
+                                .filter(|p| p.quarantine_reason.is_none())
+                                .map(|p| {
+                                    crate::profile::accept_language_with_persona(
+                                        &host, &path, &p.locale,
+                                    )
+                                })
+                        }
+                        None => None,
+                    };
                     match fetcher
-                        .fetch_via_jar_opts(
+                        .fetch_via_jar_language(
                             &fetch_url,
                             proxy.as_ref(),
                             use_jar,
                             referer.as_deref(),
                             true,
                             false,
+                            persona_al.as_deref(),
                             redirect_gate,
                         )
                         .await
@@ -225,7 +255,11 @@ mod tests {
         });
         let fetcher =
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
-        let (crawler, governor) = build(fetcher, Arc::new(EgressPool::new(vec![proxy.clone()])));
+        let (crawler, governor) = build(
+            fetcher,
+            Arc::new(EgressPool::new(vec![proxy.clone()])),
+            None,
+        );
         let result = crawler
             .crawl(
                 &url,
@@ -282,7 +316,7 @@ mod tests {
         });
         let fetcher =
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
-        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
+        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())), None);
         let page = (crawler.fetch)(url, "missing-owned-proxy".into(), None, None).await;
         let reached_origin = origin.await.unwrap();
         assert!(

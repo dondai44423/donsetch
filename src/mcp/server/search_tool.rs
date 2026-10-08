@@ -1030,7 +1030,11 @@ mod crawl_route_tests {
                     }));
                 }
                 let daemon = Daemon::new().await.unwrap();
-                let (crawler, governor) = crate::crawl::real::build(Arc::clone(&daemon.fetcher),pool);
+                let (crawler, governor) = crate::crawl::real::build(
+                    Arc::clone(&daemon.fetcher),
+                    pool,
+                    Some(Arc::clone(&daemon.state)),
+                );
                 // Only the owned A lane is currently ready; fetch's pool opt-in
                 // remains off. The crawl's independent lane choice must travel.
                 for _ in 0..8 { governor.on_error("127.0.0.1", "direct"); }

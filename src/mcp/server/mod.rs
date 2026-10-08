@@ -121,8 +121,11 @@ impl Daemon {
             true,
         );
 
-        let (crawler, _gov) =
-            crawl_real::build(Arc::clone(&fetcher), std::sync::Arc::clone(&egress));
+        let (crawler, _gov) = crawl_real::build(
+            Arc::clone(&fetcher),
+            std::sync::Arc::clone(&egress),
+            Some(Arc::clone(&state)),
+        );
         let crawler = crawler.with_ghost(ghost_hook);
 
         let searcher = Arc::new(

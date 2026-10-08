@@ -620,6 +620,7 @@ mod tests {
         let (crawler, governor) = super::super::real::build(
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap()),
             Arc::clone(&pool),
+            None,
         );
         let result = crawler
             .crawl(

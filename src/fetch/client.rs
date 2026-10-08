@@ -252,6 +252,34 @@ impl Fetcher {
         pool_pick: bool,
         redirect_gate: Option<RedirectGate>,
     ) -> Result<FetchOutcome, FetchError> {
+        self.fetch_via_jar_language(
+            url_str,
+            proxy,
+            use_jar,
+            referer,
+            skip_cache,
+            pool_pick,
+            None,
+            redirect_gate,
+        )
+        .await
+    }
+
+    /// As `fetch_via_jar_opts`, with the caller's persona language: a
+    /// crawl page must present the same language identity as web_fetch
+    /// and the ghost for the same host (v4 E2 coherence).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_via_jar_language(
+        &self,
+        url_str: &str,
+        proxy: Option<&proxy::Proxy>,
+        use_jar: bool,
+        referer: Option<&str>,
+        skip_cache: bool,
+        pool_pick: bool,
+        accept_language: Option<&str>,
+        redirect_gate: Option<RedirectGate>,
+    ) -> Result<FetchOutcome, FetchError> {
         self.fetch_via_jar_identity(
             url_str,
             proxy,
@@ -262,7 +290,7 @@ impl Fetcher {
             RequestIdentity {
                 class: RequestClass::Navigation,
                 legacy_user_agent: None,
-                accept_language: None,
+                accept_language,
             },
             None,
             redirect_gate,

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Crawl pages present the same language identity as web_fetch and the
+  ghost for the same host: a host with a persona speaks the persona's
+  Accept-Language on crawl requests too, instead of falling back to the
+  TLD/script heuristic while the fetch tool speaks the persona.
+
 - The daemon's background helpers are owned: the route-memory prober and
   the search pre-solve are cancelled and joined on shutdown (and aborted
   on drop), like the startup proxy probes already were, so a retired
