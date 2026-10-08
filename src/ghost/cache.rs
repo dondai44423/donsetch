@@ -329,6 +329,8 @@ fn bump_vault_epoch(state: &mut GhostState) {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RenderCache {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     pub html: String,
     pub at: u64,
 }
@@ -1681,6 +1683,14 @@ impl GhostState {
     }
 
     pub fn record_render(&mut self, url: &str, html: &str) {
+        self.record_render_entry(url, html, None);
+    }
+
+    pub fn record_render_context(&mut self, url: &str, html: &str, context: &str) {
+        self.record_render_entry(url, html, Some(context.to_string()));
+    }
+
+    fn record_render_entry(&mut self, url: &str, html: &str, context: Option<String>) {
         // Skip oversized pages : caching 1MB+ HTML bloats the state
         // file with no benefit (large pages are usually not SPAs
         // that need render caching).
@@ -1688,7 +1698,8 @@ impl GhostState {
             return;
         }
         // LRU cap: evict oldest renders when at capacity.
-        if self.renders.len() >= RENDER_MAX
+        if !self.renders.contains_key(url)
+            && self.renders.len() >= RENDER_MAX
             && let Some(oldest_key) = self
                 .renders
                 .iter()
@@ -1700,6 +1711,7 @@ impl GhostState {
         self.renders.insert(
             url.to_string(),
             RenderCache {
+                context,
                 html: html.to_string(),
                 at: now(),
             },
@@ -1709,10 +1721,52 @@ impl GhostState {
 
     pub fn render_for(&self, url: &str) -> Option<&RenderCache> {
         let n = now();
-        self.renders
-            .get(url)
-            .filter(|r| n.checked_sub(r.at).is_some_and(|age| age < RENDER_TTL))
+        self.renders.get(url).filter(|r| {
+            r.context.is_none() && n.checked_sub(r.at).is_some_and(|age| age < RENDER_TTL)
+        })
     }
+
+    pub fn render_for_context(&self, url: &str, context: &str) -> Option<&RenderCache> {
+        let n = now();
+        self.renders.get(url).filter(|r| {
+            r.context.as_deref() == Some(context)
+                && n.checked_sub(r.at).is_some_and(|age| age < RENDER_TTL)
+        })
+    }
+}
+
+/// Opaque cache partition for a browser route, build and persona wire.
+pub(crate) fn render_context(
+    profile: &crate::profile::BrowserProfile,
+    wire: &crate::ghost::GhostWire,
+    persona: Option<(u32, u64)>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for value in [
+        profile.user_agent.clone(),
+        profile.sec_ch_ua.clone(),
+        wire.locale.clone(),
+        wire.route
+            .as_ref()
+            .map(|route| route.id())
+            .unwrap_or_default(),
+        format!("{:?}", crate::config::cfg().browser.backend),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.update(wire.viewport.0.to_be_bytes());
+    hash.update(wire.viewport.1.to_be_bytes());
+    hash.update([u8::from(persona.is_some())]);
+    if let Some((generation, seed)) = persona {
+        hash.update(generation.to_be_bytes());
+        hash.update(seed.to_be_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ────────────────────────── legacy migration ──────────────────────────
@@ -1736,6 +1790,41 @@ struct LegacySolved {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stealth_v3_render_context_tracks_wire_build_and_persona_changes() {
+        let profile = crate::profile::BrowserProfile::host_default();
+        let wire = crate::ghost::GhostWire {
+            route: Some(crate::transport::request_route::RequestRoute::direct()),
+            ..Default::default()
+        };
+        let context = render_context(&profile, &wire, Some((3, 17)));
+        assert_eq!(context.len(), 64);
+        assert_eq!(context, render_context(&profile, &wire, Some((3, 17))));
+        let mut changed = wire.clone();
+        changed.route = Some(crate::transport::request_route::RequestRoute::pinned(
+            crate::transport::proxy::Proxy::parse("http://owned:secret@127.0.0.1:8080").unwrap(),
+        ));
+        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
+        changed = wire.clone();
+        changed.locale = "fr-FR".into();
+        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
+        changed = wire.clone();
+        changed.viewport.0 += 1;
+        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
+        changed = wire.clone();
+        changed.viewport.1 += 1;
+        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
+        let mut changed = profile.clone();
+        changed.user_agent.push_str(" changed");
+        assert_ne!(context, render_context(&changed, &wire, Some((3, 17))));
+        changed = profile.clone();
+        changed.sec_ch_ua.push_str(" changed");
+        assert_ne!(context, render_context(&changed, &wire, Some((3, 17))));
+        for persona in [None, Some((4, 17)), Some((3, 18))] {
+            assert_ne!(context, render_context(&profile, &wire, persona));
+        }
+    }
 
     fn cr(name: &str, value: &str, domain: &str, exp: Option<u64>) -> CookieRecord {
         CookieRecord {

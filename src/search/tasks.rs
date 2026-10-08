@@ -211,45 +211,60 @@ pub(super) async fn engine_task_with_budget(
 /// The browser-render SERP lane. Runs the SERP URL through the
 /// shared ghost hook (render cache shortcut included), parses
 /// with the desktop parser (separate from the WML HTTP layout), and
-/// reports honestly: "google_ghost" on the engine list, egress
-/// "ghost". Health is transport-specific; ranking still counts only
+/// reports the selected pool lane or configured route as egress.
+/// Health is transport-specific; ranking still counts only
 /// one Google index family across HTTP and browser results.
 pub(super) async fn ghost_engine_task(
     engine: String,
     query: String,
     hook: crate::crawl::GhostHook,
+    pool: &EgressPool,
+    budget: std::time::Duration,
 ) -> (String, EngineResult) {
     let started = Instant::now();
+    if budget.is_zero() {
+        return (engine, Err(("budget-skipped".into(), "ghost".into(), true)));
+    }
     let Some(url) = engines::serp_url("google_ghost", &query) else {
         return (engine, Err(("no-url".into(), "ghost".into(), true)));
     };
-    // The hook runs acquire + render + one retry internally,
-    // so the budget here covers a completed first attempt plus
-    // most of the retry: cutting mid-retry is fine, the first
-    // render usually lands inside 15s.
-    let rendered = match tokio::time::timeout(std::time::Duration::from_secs(30), hook(url)).await {
-        Err(_) => return (engine, Err(("ghost-timeout".into(), "ghost".into(), true))),
-        Ok(Err(e)) => {
-            let status = if e.contains("captcha") {
+    // Search owns its pool policy independently of fetch's pool opt-in.
+    let lane = pool.pick("google_ghost", &[], true);
+    let route = lane
+        .as_ref()
+        .and_then(|lane| lane.proxy.clone())
+        .map(crate::transport::request_route::RequestRoute::pinned)
+        .unwrap_or_else(crate::transport::request_route::RequestRoute::configured);
+    let egress = lane
+        .filter(|lane| lane.proxy.is_some())
+        .map(|lane| lane.id)
+        .unwrap_or_else(|| route.id());
+    let request = crate::crawl::GhostRequest {
+        url,
+        route,
+        deadline: started + budget,
+    };
+    let deadline = request.deadline;
+    let rendered = match tokio::time::timeout_at(deadline.into(), hook(request)).await {
+        Err(_) => return (engine, Err(("ghost-timeout".into(), egress, true))),
+        Ok(Err(error)) => {
+            let status = if error.contains("captcha") {
                 "blocked:captcha"
             } else {
                 "ghost-render"
             };
-            return (engine, Err((status.into(), "ghost".into(), true)));
+            return (engine, Err((status.into(), egress, true)));
         }
-        Ok(Ok(r)) => r.html,
+        Ok(Ok(rendered)) => rendered.html,
     };
     let (hits, instant) = engines::parse_with_instant("google_ghost", &rendered);
     let ms = started.elapsed().as_millis() as u64;
     if hits.len() < 3 {
         // 200-but-no-results 2026 Google = bot wall or an AI-mode
         // shell: either way the lane produced nothing usable.
-        return (
-            engine,
-            Err(("blocked:captcha".into(), "ghost".into(), true)),
-        );
+        return (engine, Err(("blocked:captcha".into(), egress, true)));
     }
-    (engine, Ok((hits, ms, "ghost".into(), true, instant)))
+    (engine, Ok((hits, ms, egress, true, instant)))
 }
 
 pub(super) async fn vertical_task(
@@ -289,6 +304,90 @@ fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stealth_v3_search_browser_owns_pool_policy_and_deadline() {
+        use futures_util::FutureExt;
+        use std::sync::{Arc, Mutex};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.fetch_rotate = false;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:8080").unwrap();
+        let pool = EgressPool::new(vec![proxy.clone()]);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let hook: crate::crawl::GhostHook = Arc::new(move |request| {
+            captured.lock().unwrap().push(request);
+            async { Err("owned stop".into()) }.boxed()
+        });
+        let before = Instant::now();
+        let budget = std::time::Duration::from_millis(250);
+        let (engine, result) = ghost_engine_task(
+            "google_ghost".into(),
+            "owned query".into(),
+            hook,
+            &pool,
+            budget,
+        )
+        .await;
+        let after = Instant::now();
+        assert_eq!(engine, "google_ghost");
+        let (status, egress, was_engine) = result.unwrap_err();
+        assert_eq!(status, "ghost-render");
+        assert_eq!(egress, proxy.id());
+        assert!(was_engine);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.route.proxy_for(&request.url).unwrap(), Some(proxy));
+        assert!(request.url.contains("owned+query") || request.url.contains("owned%20query"));
+        assert!(request.deadline >= before + budget && request.deadline <= after + budget);
+    }
+
+    #[tokio::test]
+    async fn stealth_v3_search_browser_timeout_retains_its_lane_and_zero_budget_does_no_work() {
+        use futures_util::FutureExt;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:8080").unwrap();
+        let pool = EgressPool::new(vec![proxy.clone()]);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let reached = Arc::clone(&polls);
+        let hook: crate::crawl::GhostHook = Arc::new(move |_| {
+            let reached = Arc::clone(&reached);
+            async move {
+                reached.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<crate::crawl::GhostRender, String>>().await
+            }
+            .boxed()
+        });
+        let (_, result) = ghost_engine_task(
+            "google_ghost".into(),
+            "owned query".into(),
+            Arc::clone(&hook),
+            &pool,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, "budget-skipped");
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        let (_, result) = ghost_engine_task(
+            "google_ghost".into(),
+            "owned query".into(),
+            hook,
+            &pool,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(
+            result.err().unwrap(),
+            ("ghost-timeout".into(), proxy.id(), true)
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn engine_budget_includes_pacing_without_starting_network() {

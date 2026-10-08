@@ -97,7 +97,7 @@ pub(super) fn parse_search_queries(args: &Value) -> Result<Vec<String>, String> 
     Ok(queries)
 }
 
-/// Honest deadline error for search (v3 D1).
+/// Render a selected browser request within its caller's absolute deadline.
 pub(super) fn make_ghost_hook(
     ghost_mgr: std::sync::Arc<GhostManager>,
     profile: BrowserProfile,
@@ -105,70 +105,79 @@ pub(super) fn make_ghost_hook(
     state: Arc<tokio::sync::Mutex<GhostState>>,
     skip_cache_read: bool,
 ) -> crate::crawl::GhostHook {
-    std::sync::Arc::new(move |url: String| {
-        let ghost_mgr = std::sync::Arc::clone(&ghost_mgr);
+    std::sync::Arc::new(move |request: crate::crawl::GhostRequest| {
+        let ghost_mgr = Arc::clone(&ghost_mgr);
         let profile = profile.clone();
-        let fetcher = std::sync::Arc::clone(&fetcher);
+        let fetcher = Arc::clone(&fetcher);
         let state = Arc::clone(&state);
         async move {
-            // Render cache shortcut (crawl only).
-            if !skip_cache_read {
-                let s = state.lock().await;
-                if let Some(rc) = s.render_for(&url)
-                    && crate::detect::walls::detect_dom_smart(rc.html.as_bytes())
-                        == crate::detect::walls::Verdict::ContentOk
-                {
-                    return Ok(crate::crawl::GhostRender {
-                        html: rc.html.clone(),
-                    });
+            let deadline = request.deadline;
+            if deadline <= std::time::Instant::now() {
+                return Err("browser handoff deadline exceeded".into());
+            }
+            tokio::time::timeout_at(deadline.into(), async move {
+                let url = request.url;
+                let g_host = crate::search::rank::host_of(&url);
+                let (mut wire, persona) = {
+                    let s = state.lock().await;
+                    let persona = s
+                        .personas
+                        .get(&g_host)
+                        .filter(|p| p.quarantine_reason.is_none());
+                    (
+                        persona.map(|p| p.ghost_wire()).unwrap_or_default(),
+                        persona.map(|p| (p.generation, p.entropy_seed)),
+                    )
+                };
+                wire.route = Some(request.route);
+                let context = crate::ghost::cache::render_context(&profile, &wire, persona);
+                // Legacy URL-only records cannot establish this route/persona.
+                if !skip_cache_read {
+                    let s = state.lock().await;
+                    if let Some(rc) = s.render_for_context(&url, &context)
+                        && crate::detect::walls::detect_dom_smart(rc.html.as_bytes())
+                            == crate::detect::walls::Verdict::ContentOk
+                    {
+                        return Ok(crate::crawl::GhostRender {
+                            html: rc.html.clone(),
+                        });
+                    }
                 }
-            }
-            let g_host = crate::search::rank::host_of(&url);
-            // v4 E2: the ghost render must agree with the persona pin
-            // (viewport + locale) for this host, exactly as the tier-1
-            // fetch paths and web_screenshot do — otherwise the SERP
-            // render goes out on the default en-US/default-viewport
-            // wire while the persona's HTTP fetches use its own, an
-            // incoherent fingerprint (and a relaunch thrash when a
-            // default-wire and a persona-wire acquire alternate on one
-            // pool slot).
-            let wire = {
-                let s = state.lock().await;
-                s.personas
-                    .get(&g_host)
-                    .filter(|p| p.quarantine_reason.is_none())
-                    .map(|p| p.ghost_wire())
-                    .unwrap_or_default()
-            };
-            let g = match ghost_mgr
-                .acquire_for_wire(&profile, Some(g_host.as_str()), wire)
-                .await
-            {
-                Ok(g) => g,
-                Err(e) => return Err(format!("browser launch: {e}")),
-            };
-            let read = ghost_mgr
-                .read_document(g, &profile, &url, std::time::Duration::from_secs(20))
-                .await
-                .map_err(|error| format!("render: {error}"))?;
-            let _guard = read.guard;
-            let page = read.page;
-            if page.outcome != ops::BrowserOutcome::Content {
-                return Err(format!("browser content unavailable: {:?}", page.outcome));
-            }
-            let verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
-            if verdict != crate::detect::walls::Verdict::ContentOk {
-                return Err(format!("rendered access gate: {verdict:?}"));
-            }
-            if !page.cookies.is_empty() {
-                fetcher.import_cookies(&page.cookies).await;
-                crate::ghost::cache::store_session_cookies(&page.cookies);
-            }
-            {
-                let mut s = state.lock().await;
-                s.record_render(&page.document.url, &page.html);
-            }
-            Ok(crate::crawl::GhostRender { html: page.html })
+                let g = ghost_mgr
+                    .acquire_for_wire(&profile, Some(g_host.as_str()), wire)
+                    .await
+                    .map_err(|error| format!("browser launch: {error}"))?;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let read = ghost_mgr
+                    .read_document(
+                        g,
+                        &profile,
+                        &url,
+                        remaining.min(std::time::Duration::from_secs(20)),
+                    )
+                    .await
+                    .map_err(|error| format!("render: {error}"))?;
+                let _guard = read.guard;
+                let page = read.page;
+                if page.outcome != ops::BrowserOutcome::Content {
+                    return Err(format!("browser content unavailable: {:?}", page.outcome));
+                }
+                let verdict = crate::detect::walls::detect_dom_smart(page.html.as_bytes());
+                if verdict != crate::detect::walls::Verdict::ContentOk {
+                    return Err(format!("rendered access gate: {verdict:?}"));
+                }
+                if !page.cookies.is_empty() {
+                    fetcher.import_cookies(&page.cookies).await;
+                    crate::ghost::cache::store_session_cookies(&page.cookies);
+                }
+                state
+                    .lock()
+                    .await
+                    .record_render_context(&page.document.url, &page.html, &context);
+                Ok(crate::crawl::GhostRender { html: page.html })
+            })
+            .await
+            .unwrap_or_else(|_| Err("browser handoff deadline exceeded".into()))
         }
         .boxed()
     })
@@ -563,10 +572,7 @@ async fn byok_search_cached(
 /// cooldown memory the fetch path uses.
 pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
     let Some(url) = top_url else { return };
-    if crate::fetch::guards::validate_url_basic(url).is_err() {
-        return;
-    }
-    let Ok(parsed) = url::Url::parse(url) else {
+    let Ok(parsed) = crate::fetch::guards::validate_url_basic(url) else {
         return;
     };
     let Some(host) = parsed.host_str() else {
@@ -863,6 +869,139 @@ worker.onmessage = event => {report('worker', event.data);worker.terminate();};
                         }
                     });
             }).unwrap().join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod crawl_route_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn stealth_v3_expired_browser_handoff_cannot_return_cached_content() {
+        let profile = BrowserProfile::host_default();
+        let route = crate::transport::request_route::RequestRoute::direct();
+        let wire = crate::ghost::GhostWire {
+            route: Some(route.clone()),
+            ..Default::default()
+        };
+        let context = crate::ghost::cache::render_context(&profile, &wire, None);
+        let url = "https://owned.example/expired";
+        let mut state = GhostState::default();
+        state.record_render_context(
+            url,
+            "<article><h1>Owned cached article</h1><p>Useful cached content.</p></article>",
+            &context,
+        );
+        assert!(state.render_for_context(url, &context).is_some());
+        let manager = GhostManager::new().await;
+        let hook = make_ghost_hook(
+            Arc::clone(&manager),
+            profile.clone(),
+            Arc::new(Fetcher::new(profile).unwrap()),
+            Arc::new(tokio::sync::Mutex::new(state)),
+            false,
+        );
+        let result = hook(crate::crawl::GhostRequest {
+            url: url.into(),
+            route,
+            deadline: std::time::Instant::now() - Duration::from_secs(1),
+        })
+        .await;
+        manager.shutdown().await;
+        assert!(matches!(result, Err(ref reason) if reason == "browser handoff deadline exceeded"));
+    }
+
+    #[test]
+    #[ignore = "requires native Chromium"]
+    fn stealth_v3_native_crawl_keeps_its_selected_http_lane() {
+        std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let mut config = crate::config::DonsetchConfig::default();
+                config.browser.backend = crate::config::BrowserBackend::Headless;
+                config.browser.cloak_auto_download = false;
+                config.browser.route_probes = false;
+                config.proxy.from_environment = false;
+                config.proxy.fetch_rotate = false;
+                config.fetch.allow_private_egress = true;
+                config.fetch.shadow_fetch = crate::config::ShadowFetch::Never;
+                crate::config::install(config).unwrap();
+                let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/owned-crawl", origin.local_addr().unwrap());
+                let proxy = (crate::transport::proxy::Proxy::parse(&format!("http://{}",proxy.local_addr().unwrap())).unwrap(), proxy);
+                let pool = Arc::new(EgressPool::new(vec![proxy.0.clone()]));
+                let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let (stop, stopped) = tokio::sync::watch::channel(false);
+                let mut servers = Vec::new();
+                for (lane, listener) in [("DIRECT", origin), ("A", proxy.1)] {
+                    let events = Arc::clone(&events);
+                    let mut stopped = stopped.clone();
+                    servers.push(tokio::spawn(async move {
+                        let mut handlers = tokio::task::JoinSet::new();
+                        loop {
+                            tokio::select! {
+                                _ = stopped.changed() => break,
+                                accepted = listener.accept(), if handlers.len() < 16 => {
+                                    let (mut socket, _) = accepted.unwrap();
+                                    let events = Arc::clone(&events);
+                                    handlers.spawn(async move {
+                                        let mut head = Vec::new();
+                                        while !head.ends_with(b"\r\n\r\n") {
+                                            assert!(head.len() < 16384);
+                                            match tokio::time::timeout(Duration::from_secs(3),socket.read_u8()).await {
+                                                Ok(Ok(byte)) => head.push(byte),
+                                                _ if head.is_empty() => return,
+                                                other => panic!("partial owned crawl request: {other:?}"),
+                                            }
+                                        }
+                                        let head = String::from_utf8(head).unwrap();
+                                        let target = head.split_whitespace().nth(1).unwrap();
+                                        let document = target.ends_with("/owned-crawl");
+                                        let first = if document {
+                                            let mut events = events.lock().unwrap();
+                                            let first = events.is_empty();
+                                            events.push((lane, target.to_string()));
+                                            first
+                                        } else { false };
+                                        let (status, body) = if document && first && lane == "A" {
+                                            (403, "<html><body><h1>Access denied</h1></body></html>".into())
+                                        } else if document {
+                                            (201, format!("<article><h1>Owned crawl route {lane}</h1><p>{}</p></article>",
+                                                "Useful research content from the selected route must survive the actual HTTP to native browser handoff. ".repeat(45)))
+                                        } else { (502, String::new()) };
+                                        let response = format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                        let _ = socket.write_all(response.as_bytes()).await;
+                                    });
+                                }
+                                done = handlers.join_next(), if !handlers.is_empty() => { done.unwrap().unwrap(); }
+                            }
+                        }
+                    }));
+                }
+                let daemon = Daemon::new().await.unwrap();
+                let (crawler, governor) = crate::crawl::real::build(Arc::clone(&daemon.fetcher),pool);
+                // Only the owned A lane is currently ready; fetch's pool opt-in
+                // remains off. The crawl's independent lane choice must travel.
+                for _ in 0..8 { governor.on_error("127.0.0.1", "direct"); }
+                assert_eq!(governor.best_lane("127.0.0.1").unwrap().id,proxy.0.id());
+                let crawler = crawler.with_ghost(make_ghost_hook(
+                    Arc::clone(&daemon.ghost_mgr),daemon.profile.clone(),Arc::clone(&daemon.fetcher),Arc::clone(&daemon.state),true));
+                let result = crawler.crawl(&url,crate::crawl::CrawlOptions {
+                    mode:crate::crawl::CrawlMode::Content,respect_robots:false,max_pages:1,max_depth:0,
+                    deadline:Duration::from_secs(45),..Default::default()
+                },None).await.unwrap();
+                daemon.ghost_mgr.shutdown().await;
+                stop.send(true).unwrap();
+                for server in servers { server.await.unwrap(); }
+                let events = events.lock().unwrap();
+                assert_eq!(result.pages.len(),1,"real HTTP denial must recover useful native content: {:?}",result.skipped);
+                assert_eq!(events.len(),2,"one actual HTTP read and one native read: {events:?}");
+                assert!(events.iter().all(|(lane,_)| *lane=="A"),"native recovery must retain the crawl's selected lane: {events:?}");
+                assert!(result.pages[0].markdown.contains("Owned crawl route A"));
+            });
+        }).unwrap().join().unwrap();
     }
 }
 

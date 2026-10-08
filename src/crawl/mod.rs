@@ -32,6 +32,8 @@ use sitemap::SitemapEntry;
 
 /// A fetched page as the orchestrator sees it.
 pub struct FetchedPage {
+    /// The actual HTTP policy; absent when no request produced a response.
+    pub route: Option<crate::transport::request_route::RequestRoute>,
     /// Final URL after redirects.
     pub url: String,
     pub status: u16,
@@ -53,7 +55,28 @@ pub struct GhostRender {
     pub html: String,
 }
 
-/// Injected ghost escalation hook. Takes a URL, returns
+/// One browser handoff with the caller's selected route and absolute deadline.
+#[derive(Clone, Debug)]
+pub struct GhostRequest {
+    pub url: String,
+    pub route: crate::transport::request_route::RequestRoute,
+    pub deadline: Instant,
+}
+
+impl FetchedPage {
+    fn browser_request(&self, url: String, deadline: Instant) -> Result<GhostRequest, String> {
+        Ok(GhostRequest {
+            url,
+            route: self
+                .route
+                .clone()
+                .ok_or("HTTP response has no route for browser handoff")?,
+            deadline,
+        })
+    }
+}
+
+/// Injected ghost escalation hook. Takes a selected request, returns
 /// rendered HTML + cookies on success, Err(reason) on failure
 /// (captcha, timeout, launch error) : the reason flows into the
 /// crawl's skipped[] so the agent sees WHY the browser tier
@@ -61,7 +84,7 @@ pub struct GhostRender {
 /// when a page is a JS shell (thin extraction) or a bot wall
 /// (Challenge verdict). Capped at 3 per crawl.
 pub type GhostHook =
-    Arc<dyn Fn(String) -> BoxFuture<'static, Result<GhostRender, String>> + Send + Sync>;
+    Arc<dyn Fn(GhostRequest) -> BoxFuture<'static, Result<GhostRender, String>> + Send + Sync>;
 
 /// Pluggable fetch: real = DonShadow, tests = in-memory map.
 pub type PageFetcher =
@@ -520,6 +543,7 @@ impl Crawler {
                     {
                         Ok(page) => page,
                         Err(_) => FetchedPage {
+                            route: None,
                             url,
                             status: 0,
                             headers: Vec::new(),
@@ -1168,13 +1192,16 @@ impl Crawler {
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
                         if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
-                            match tokio::time::timeout_at(
-                                deadline_at.into(),
-                                ghost_hook(item.url.clone()),
-                            )
-                            .await
-                            .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                            let rendered = match page.browser_request(item.url.clone(), deadline_at)
                             {
+                                Ok(request) => {
+                                    tokio::time::timeout_at(deadline_at.into(), ghost_hook(request))
+                                        .await
+                                        .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match rendered {
                                 Ok(gp) => ghost_html = Some(gp.html),
                                 Err(why) => {
                                     skipped
@@ -1345,13 +1372,16 @@ impl Crawler {
                     {
                         let remaining = deadline_at.saturating_duration_since(Instant::now());
                         if remaining > Duration::from_secs(25) && claim_ghost_slot(&ghost_budget) {
-                            match tokio::time::timeout_at(
-                                deadline_at.into(),
-                                ghost_hook(item.url.clone()),
-                            )
-                            .await
-                            .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                            let rendered = match page.browser_request(item.url.clone(), deadline_at)
                             {
+                                Ok(request) => {
+                                    tokio::time::timeout_at(deadline_at.into(), ghost_hook(request))
+                                        .await
+                                        .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match rendered {
                                 Ok(gp) => {
                                     if let Ok(r2) = extract::extract(
                                         gp.html.as_bytes(),

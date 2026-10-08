@@ -144,6 +144,7 @@ impl MockSite {
                     {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 429,
                             headers: vec![],
@@ -163,6 +164,7 @@ impl MockSite {
                     {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 500,
                             headers: vec![],
@@ -179,6 +181,7 @@ impl MockSite {
                         .unwrap_or_else(|| "text/html".to_string());
                     match pages.get(&url) {
                         Some((status, body)) => FetchedPage {
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: *status,
                             headers: vec![("content-type".into(), ct)],
@@ -189,6 +192,7 @@ impl MockSite {
                             error_hint: None,
                         },
                         None => FetchedPage {
+                            route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 404,
                             headers: vec![],
@@ -344,6 +348,7 @@ async fn wave450_deadline_bounds_discovery_and_page_io() {
             called.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(2)).await;
             FetchedPage {
+                route: Some(crate::transport::request_route::RequestRoute::direct()),
                 url,
                 status: 200,
                 headers: vec![],

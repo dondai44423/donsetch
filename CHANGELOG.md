@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Crawl browser recovery retains the actual HTTP route. Search's browser lane
+  follows search pool policy independently of fetch's pool opt-in. Browser hooks
+  retain the caller deadline and partition render reuse by route and persona wire.
+  Missing crawl lanes fail closed; updating a cached render preserves other pages.
+
 - Background pre-solve retains its selected browser route for cookie replay,
   even when a concurrent rate limit rotates the next independent request.
   Replay also uses the selected persona language. Chromium receives its native

@@ -921,7 +921,6 @@ impl Searcher {
                 return Vec::new();
             }
             let hook = self.ghost.as_ref().unwrap().clone();
-            let task = ghost_engine_task("google_ghost".to_string(), query.to_string(), hook);
             let budget = stage_budget(Duration::from_secs(30), Duration::from_secs(2));
             if budget.is_zero() {
                 return vec![(
@@ -929,13 +928,16 @@ impl Searcher {
                     Err(("budget-skipped".into(), "ghost".into(), true)),
                 )];
             }
-            match tokio::time::timeout(budget, task).await {
-                Ok(outcome) => vec![outcome],
-                Err(_) => vec![(
+            vec![
+                ghost_engine_task(
                     "google_ghost".to_string(),
-                    Err(("ghost-timeout".into(), "ghost".into(), true)),
-                )],
-            }
+                    query.to_string(),
+                    hook,
+                    &self.pool,
+                    budget,
+                )
+                .await,
+            ]
         };
         let (retry_outcomes, lane_outcomes) = tokio::join!(
             futures_util::future::join_all(retry_futures),

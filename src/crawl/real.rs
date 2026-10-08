@@ -78,9 +78,20 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                 .unwrap_or_default();
             async move {
                 let started = Instant::now();
-                // Never assign a globally benched line mid-crawl.
-                if lane != "direct" && pool.is_dead(&lane) {
+                let proxy = if lane == "direct" {
+                    None
+                } else {
+                    proxies.iter().find(|p| p.id() == lane).cloned()
+                };
+                // A missing or benched assignment must not become a direct read.
+                if lane != "direct" && (proxy.is_none() || pool.is_dead(&lane)) {
+                    let reason = if proxy.is_none() {
+                        "unavailable"
+                    } else {
+                        "benched"
+                    };
                     return FetchedPage {
+                        route: None,
                         url,
                         status: 0,
                         headers: Vec::new(),
@@ -88,14 +99,9 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                         verdict: Verdict::Blocked,
                         latency: started.elapsed(),
                         cached: false,
-                        error_hint: Some(format!("egress: lane {lane} is benched")),
+                        error_hint: Some(format!("egress: lane {lane} is {reason}")),
                     };
                 }
-                let proxy = if lane == "direct" {
-                    None
-                } else {
-                    proxies.iter().find(|p| p.id() == lane).cloned()
-                };
                 // Proxy lanes: shared jar OUT : one cookie carrying
                 // lane B's identity would link the two egress IPs.
                 let use_jar = proxy.is_none();
@@ -140,6 +146,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                             }
                         }
                         FetchedPage {
+                            route: Some(out.route),
                             url: out.url,
                             status: out.status,
                             headers: out.headers,
@@ -162,6 +169,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                             }
                         }
                         FetchedPage {
+                            route: None,
                             url,
                             status: 0,
                             headers: Vec::new(),
@@ -185,6 +193,49 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
 mod tests {
     use super::*;
     use crate::transport::proxy::Proxy;
+
+    #[tokio::test]
+    async fn stealth_v3_missing_crawl_lane_never_falls_back_to_direct() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/owned", listener.local_addr().unwrap());
+        let origin = tokio::spawn(async move {
+            let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    .await
+            else {
+                return false;
+            };
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nowned",
+                )
+                .await
+                .unwrap();
+            true
+        });
+        let fetcher =
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
+        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
+        let page = (crawler.fetch)(url, "missing-owned-proxy".into(), None).await;
+        let reached_origin = origin.await.unwrap();
+        assert!(
+            !reached_origin,
+            "unknown crawl lane leaked a real direct request"
+        );
+        assert!(page.route.is_none());
+        assert_eq!(page.status, 0);
+        assert!(page.error_hint.unwrap().contains("unavailable"));
+    }
 
     #[test]
     fn crawl_leaves_the_pool_with_the_opt_out() {

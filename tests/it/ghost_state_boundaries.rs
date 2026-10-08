@@ -141,6 +141,89 @@ fn persisted_future_render_is_not_served() {
 }
 
 #[test]
+fn persisted_render_context_rejects_other_routes_and_legacy_entries() {
+    let seed = json!({"version": 3, "renders": {URL: {"html": "legacy", "at": now()}}});
+    let (mut state, original, bytes) = copied_state(&seed);
+    assert_eq!(state.render_for(URL).unwrap().html, "legacy");
+    assert!(state.render_for_context(URL, "owned-route-a").is_none());
+    state.record_render_context(URL, "scoped-owned", "owned-route-a");
+    let state = GhostState::load();
+    assert_eq!(
+        state.render_for_context(URL, "owned-route-a").unwrap().html,
+        "scoped-owned"
+    );
+    assert!(state.render_for_context(URL, "owned-route-b").is_none());
+    assert!(state.render_for(URL).is_none());
+    assert!(donsetch::ghost::cache::clear_session_cookies_for(HOST));
+    assert!(
+        GhostState::load()
+            .render_for_context(URL, "owned-route-a")
+            .is_none()
+    );
+    assert_eq!(std::fs::read(original).unwrap(), bytes);
+}
+
+#[test]
+fn persisted_scoped_render_rejects_expired_and_future_timestamps() {
+    for at in [now() - 301, now() + 3600, u64::MAX] {
+        let seed = json!({"version": 3, "renders": {URL: {
+            "html": "stale", "at": at, "context": "owned-route-a"
+        }}});
+        let (mut state, original, bytes) = copied_state(&seed);
+        assert!(state.render_for_context(URL, "owned-route-a").is_none());
+        state.record_render_context(URL, "fresh-owned", "owned-route-a");
+        assert_eq!(
+            GhostState::load()
+                .render_for_context(URL, "owned-route-a")
+                .unwrap()
+                .html,
+            "fresh-owned"
+        );
+        assert_eq!(std::fs::read(original).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn persisted_render_replacement_at_capacity_keeps_other_entries() {
+    let mut seed = json!({"version": 3, "renders": {}});
+    for i in 0..20 {
+        seed["renders"][format!("https://boundary.example/{i}")] =
+            json!({"html": "owned", "at": now() - 30 + i, "context": "owned-route-a"});
+    }
+    let (mut state, original, bytes) = copied_state(&seed);
+    state.record_render_context(
+        "https://boundary.example/19",
+        "replacement",
+        "owned-route-b",
+    );
+    let saved = GhostState::load();
+    assert_eq!(
+        saved.renders.len(),
+        20,
+        "updating an existing key must not evict another page"
+    );
+    assert!(saved.renders.contains_key("https://boundary.example/0"));
+    assert_eq!(
+        saved
+            .render_for_context("https://boundary.example/19", "owned-route-b")
+            .unwrap()
+            .html,
+        "replacement"
+    );
+    state.record_render_context("https://boundary.example/new", "new", "owned-route-b");
+    let saved = GhostState::load();
+    assert_eq!(saved.renders.len(), 20);
+    assert!(!saved.renders.contains_key("https://boundary.example/0"));
+    assert!(saved.renders.contains_key("https://boundary.example/1"));
+    assert!(
+        saved
+            .render_for_context("https://boundary.example/new", "owned-route-b")
+            .is_some()
+    );
+    assert_eq!(std::fs::read(original).unwrap(), bytes);
+}
+
+#[test]
 fn persisted_future_cold_check_rearms_instead_of_skipping_http_forever() {
     for future in [now() + 3600, u64::MAX] {
         let seed = json!({"version": 3, "profiles": {HOST: {
