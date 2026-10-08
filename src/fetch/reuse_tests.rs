@@ -10,7 +10,11 @@ use tokio::net::TcpStream;
 use tokio_boring::SslStream;
 
 fn owned_acceptor() -> SslAcceptor {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    // Both names are acceptable hosts for these tests: the literal IPv4
+    // keeps the dial deterministic on every platform (no resolver in the
+    // path), and `localhost` stays covered for the resolver-path test.
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
     let directory = crate::paths::cache_dir().join("owned-reuse");
     std::fs::create_dir(&directory).unwrap();
     let bundle = directory.join("ca.pem");
@@ -76,20 +80,42 @@ async fn http_head(stream: &mut TcpStream) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-/// Accept one connection from whichever family the resolver picked.
-async fn accept_any(
-    v4: &tokio::net::TcpListener,
-    v6: Option<&tokio::net::TcpListener>,
-) -> TcpStream {
-    match v6 {
-        Some(v6) => {
-            tokio::select! {
-                r = v4.accept() => r.unwrap().0,
-                r = v6.accept() => r.unwrap().0,
-            }
-        }
-        None => v4.accept().await.unwrap().0,
+/// Close a served peer without provoking a Windows RST: read whatever the
+/// client left inbound (bounded) and close with a TLS shutdown. A close
+/// with unread inbound data answers RST on Windows, which surfaces at the
+/// client as an abort or retry instead of a clean end of stream.
+async fn quiet_close(tls: &mut SslStream<TcpStream>) {
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+        let mut buf = [0u8; 64];
+        while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
+    })
+    .await;
+    let _ = tls.shutdown().await;
+}
+
+/// Accept whichever listener receives the next dial.
+async fn accept_either(listeners: &[tokio::net::TcpListener; 2]) -> TcpStream {
+    tokio::select! {
+        r = listeners[0].accept() => r.unwrap().0,
+        r = listeners[1].accept() => r.unwrap().0,
     }
+}
+
+/// Accept the next dial, or give up after the idle window - the bounded
+/// drain that serves a late (retried) dial instead of letting it land on
+/// a closed port as a refusal.
+async fn accept_either_idle(
+    listeners: &[tokio::net::TcpListener; 2],
+    idle: std::time::Duration,
+) -> Option<TcpStream> {
+    tokio::time::timeout(idle, async {
+        tokio::select! {
+            r = listeners[0].accept() => r.unwrap().0,
+            r = listeners[1].accept() => r.unwrap().0,
+        }
+    })
+    .await
+    .ok()
 }
 
 #[tokio::test]
@@ -101,21 +127,29 @@ async fn stealth_v3_transport_tls_tickets_do_not_cross_origin_ports() {
         first.local_addr().unwrap().port(),
         second.local_addr().unwrap().port(),
     ];
-    // The URL host must stay `localhost` (the owned certificate's SAN),
-    // so the dial follows the resolver: mirror each port on [::1] when
-    // the stack allows it - a runner whose `localhost` answers ::1 only
-    // would otherwise refuse the primary family with no IPv4 fallback.
-    let first6 = tokio::net::TcpListener::bind(("::1", ports[0])).await.ok();
-    let second6 = tokio::net::TcpListener::bind(("::1", ports[1])).await.ok();
+    // Literal-host URLs dial IPv4 directly on every platform; both
+    // listeners stay bound for the whole task and a bounded drain serves
+    // any late dial, so a transient peer abort plus retry can never land
+    // on a closed port as a refusal.
+    let listeners = [first, second];
     let server = tokio::spawn(async move {
         let mut resumed = Vec::new();
         // One TLS context deliberately serves both ports, so an incorrectly
         // shared client ticket would be accepted and observable at the peer.
-        for (v4, v6) in [(first, first6), (second, second6)] {
-            let tcp = accept_any(&v4, v6.as_ref()).await;
+        for _ in 0..2 {
+            let tcp = accept_either(&listeners).await;
             let mut tls = tokio_boring::accept(&acceptor, tcp).await.unwrap();
             resumed.push(tls.ssl().session_reused());
             start_h2(&mut tls, b"owned-port").await;
+            quiet_close(&mut tls).await;
+        }
+        while let Some(tcp) =
+            accept_either_idle(&listeners, std::time::Duration::from_millis(1200)).await
+        {
+            if let Ok(mut tls) = tokio_boring::accept(&acceptor, tcp).await {
+                start_h2(&mut tls, b"owned-port").await;
+                quiet_close(&mut tls).await;
+            }
         }
         resumed
     });
@@ -123,11 +157,11 @@ async fn stealth_v3_transport_tls_tickets_do_not_cross_origin_ports() {
     for port in ports {
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            fetcher.fetch(&format!("https://localhost:{port}/")),
+            fetcher.fetch(&format!("https://127.0.0.1:{port}/")),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_or_else(|_| panic!("fetch of port {port} timed out"))
+        .unwrap_or_else(|e| panic!("fetch of port {port} failed: {e}"));
         assert_eq!(response.body, b"owned-port");
     }
     assert_eq!(
@@ -204,46 +238,55 @@ async fn stealth_v3_transport_new_proxy_credentials_require_their_own_tunnel() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
-        // The client fetches alice, then bob: serve strictly in that
-        // order. The old select raced bob's accept against alice's
-        // remaining frames and, on slower peers, returned before the
-        // second tunnel existed (connection refused for the second
-        // fetch).
-        let mut last = "none";
-        for (expected, body, label) in [
-            (
-                "Proxy-Authorization: Basic YWxpY2U6b25l\r\n",
-                b"lane-alice".as_slice(),
-                "alice",
-            ),
-            (
-                "Proxy-Authorization: Basic Ym9iOnR3bw==\r\n",
-                b"lane-bob".as_slice(),
-                "bob",
-            ),
-        ] {
-            let (mut tcp, _) = listener.accept().await.unwrap();
+        // Serve each tunnel by the credentials its CONNECT carried and
+        // record the observed head. The bounded idle window keeps an extra
+        // dial (a peer-side retry after a transient abort) from panicking
+        // the fixture - the property is asserted on the recording instead
+        // of inside the peer loop, so a failure reports the full wire.
+        let mut tunnels: Vec<(String, String)> = Vec::new();
+        loop {
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_millis(2500), listener.accept())
+                    .await;
+            let (mut tcp, _) = match accepted {
+                Ok(Ok(conn)) => conn,
+                _ => break,
+            };
             let head = http_head(&mut tcp).await;
-            assert!(head.contains(expected));
+            let who = if head.contains("Proxy-Authorization: Basic YWxpY2U6b25l") {
+                "alice"
+            } else if head.contains("Proxy-Authorization: Basic Ym9iOnR3bw==") {
+                "bob"
+            } else {
+                "unknown"
+            };
+            tunnels.push((who.to_string(), head));
             tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
                 .unwrap();
             let mut tls = tokio_boring::accept(&acceptor, tcp).await.unwrap();
+            let body: &[u8] = match who {
+                "alice" => b"lane-alice".as_slice(),
+                "bob" => b"lane-bob".as_slice(),
+                _ => b"lane-unknown".as_slice(),
+            };
             start_h2(&mut tls, body).await;
-            last = label;
+            quiet_close(&mut tls).await;
         }
-        last
+        tunnels
     });
     let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
-    for (credentials, body) in [
+    let cases = [
         ("alice:one", b"lane-alice".as_slice()),
         ("bob:two", b"lane-bob".as_slice()),
-    ] {
+    ];
+    let mut observed: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for (credentials, _) in cases.iter() {
         let proxy = Proxy::parse(&format!("http://{credentials}@127.0.0.1:{port}")).unwrap();
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             fetcher.fetch_via_jar_opts(
-                "https://localhost/",
+                "https://127.0.0.1/",
                 Some(&proxy),
                 false,
                 None,
@@ -253,19 +296,42 @@ async fn stealth_v3_transport_new_proxy_credentials_require_their_own_tunnel() {
             ),
         )
         .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(response.alpn, "h2");
+        .unwrap_or_else(|_| panic!("fetch via {credentials} timed out"))
+        .unwrap_or_else(|e| panic!("fetch via {credentials} failed: {e}"));
+        observed.push((
+            credentials.to_string(),
+            response.alpn.clone(),
+            response.body.clone(),
+        ));
+    }
+    let tunnels = tokio::time::timeout(std::time::Duration::from_secs(6), server)
+        .await
+        .expect("the owned peer did not finish")
+        .expect("the owned peer panicked");
+    for ((credentials, alpn, body), (_, expected)) in observed.iter().zip(cases.iter()) {
         assert_eq!(
-            response.body, body,
-            "proxy credentials selected a different egress identity"
+            alpn, "h2",
+            "fetch via {credentials} negotiated {alpn}; tunnels: {tunnels:?}"
+        );
+        assert_eq!(
+            body.as_slice(),
+            *expected,
+            "fetch via {credentials} received {:?}; tunnels: {tunnels:?}",
+            String::from_utf8_lossy(body)
         );
     }
-    assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(3), server)
-            .await
-            .unwrap()
-            .unwrap(),
-        "bob"
+    let alice_at = tunnels.iter().position(|(who, _)| who == "alice");
+    let bob_at = tunnels.iter().position(|(who, _)| who == "bob");
+    assert!(
+        alice_at.is_some(),
+        "no CONNECT carried the alice credentials: {tunnels:?}"
+    );
+    assert!(
+        bob_at.is_some(),
+        "no CONNECT carried the bob credentials: {tunnels:?}"
+    );
+    assert!(
+        alice_at < bob_at,
+        "alice's tunnel must precede bob's: {tunnels:?}"
     );
 }
