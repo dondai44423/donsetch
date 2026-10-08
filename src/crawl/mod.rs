@@ -32,6 +32,8 @@ use sitemap::SitemapEntry;
 
 /// A fetched page as the orchestrator sees it.
 pub struct FetchedPage {
+    /// Governor assignment that produced this page, including buffered reads.
+    pub lane: String,
     /// The actual HTTP policy; absent when no request produced a response.
     pub route: Option<crate::transport::request_route::RequestRoute>,
     /// Final URL after redirects.
@@ -537,12 +539,13 @@ impl Crawler {
                     }
                     match tokio::time::timeout_at(
                         deadline_at.into(),
-                        inner(url.clone(), lane, referer),
+                        inner(url.clone(), lane.clone(), referer),
                     )
                     .await
                     {
                         Ok(page) => page,
                         Err(_) => FetchedPage {
+                            lane,
                             route: None,
                             url,
                             status: 0,
@@ -1152,12 +1155,12 @@ impl Crawler {
                                 // skim dwell was a vestigial
                                 // human-reading simulation that only
                                 // bought latency.
-                                governor.on_success(host, &lane.id, page.latency)
+                                governor.on_success(host, &page.lane, page.latency)
                             }
                             (429, _) | (503, _) => {
-                                governor.on_throttled(host, &lane.id);
+                                governor.on_throttled(host, &page.lane);
                             }
-                            _ => governor.on_error(host, &lane.id),
+                            _ => governor.on_error(host, &page.lane),
                         }
                     }
 

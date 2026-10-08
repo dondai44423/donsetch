@@ -733,6 +733,7 @@ mod tests {
                         .push(url.clone());
                     let (status, body) = entry.unwrap_or((404, "not found".to_string()));
                     crate::crawl::FetchedPage {
+                        lane: _lane,
                         route: Some(crate::transport::request_route::RequestRoute::direct()),
                         url,
                         status,

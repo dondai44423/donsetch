@@ -144,6 +144,7 @@ impl MockSite {
                     {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
+                            lane: _lane.clone(),
                             route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 429,
@@ -164,6 +165,7 @@ impl MockSite {
                     {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
+                            lane: _lane.clone(),
                             route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 500,
@@ -181,6 +183,7 @@ impl MockSite {
                         .unwrap_or_else(|| "text/html".to_string());
                     match pages.get(&url) {
                         Some((status, body)) => FetchedPage {
+                            lane: _lane.clone(),
                             route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: *status,
@@ -192,6 +195,7 @@ impl MockSite {
                             error_hint: None,
                         },
                         None => FetchedPage {
+                            lane: _lane,
                             route: Some(crate::transport::request_route::RequestRoute::direct()),
                             url,
                             status: 404,
@@ -342,12 +346,13 @@ async fn wave450_seed_redirect_relocates_scope_and_reuses_response() {
 async fn wave450_deadline_bounds_discovery_and_page_io() {
     let called = Arc::new(AtomicUsize::new(0));
     let counts = called.clone();
-    let fetch: PageFetcher = Arc::new(move |url, _, _| {
+    let fetch: PageFetcher = Arc::new(move |url, lane, _| {
         let called = counts.clone();
         async move {
             called.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(2)).await;
             FetchedPage {
+                lane,
                 route: Some(crate::transport::request_route::RequestRoute::direct()),
                 url,
                 status: 200,

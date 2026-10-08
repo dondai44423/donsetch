@@ -91,6 +91,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                         "benched"
                     };
                     return FetchedPage {
+                        lane: lane.clone(),
                         route: None,
                         url,
                         status: 0,
@@ -146,6 +147,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                             }
                         }
                         FetchedPage {
+                            lane: lane.clone(),
                             route: Some(out.route),
                             url: out.url,
                             status: out.status,
@@ -169,6 +171,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                             }
                         }
                         FetchedPage {
+                            lane: lane.clone(),
                             route: None,
                             url,
                             status: 0,
@@ -193,6 +196,56 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
 mod tests {
     use super::*;
     use crate::transport::proxy::Proxy;
+
+    #[tokio::test]
+    async fn stealth_v3_buffered_seed_feedback_charges_the_actual_lane() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/owned-prime", origin.local_addr().unwrap());
+        let proxy =
+            Proxy::parse(&format!("http://{}", proxy_listener.local_addr().unwrap())).unwrap();
+        let origin = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found").await.unwrap();
+            String::from_utf8(head).unwrap()
+        });
+        let fetcher =
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
+        let (crawler, governor) = build(fetcher, Arc::new(EgressPool::new(vec![proxy.clone()])));
+        let result = crawler
+            .crawl(
+                &url,
+                super::super::CrawlOptions {
+                    mode: super::super::CrawlMode::Content,
+                    respect_robots: false,
+                    max_pages: 1,
+                    max_depth: 0,
+                    deadline: std::time::Duration::from_secs(2),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let request = origin.await.unwrap();
+        assert!(request.starts_with("GET /owned-prime HTTP/1.1\r\n"));
+        assert!(result.pages.is_empty());
+        assert_eq!(
+            governor.best_lane("127.0.0.1").unwrap().id,
+            proxy.id(),
+            "the actual DIRECT404 must delay direct, leaving the unused proxy ready"
+        );
+    }
 
     #[tokio::test]
     async fn stealth_v3_missing_crawl_lane_never_falls_back_to_direct() {
