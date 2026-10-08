@@ -509,17 +509,6 @@ impl EgressPool {
         self.save_health_disk_if_dirty();
     }
 
-    /// Preflight guard: un-bench every lane (used when the
-    /// probe endpoint itself died and burned all proxies).
-    pub fn revive_all(&self) {
-        self.dead
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.mark_dirty();
-        self.save_health_disk_if_dirty();
-    }
-
     /// True when the pool has any proxy lanes at all : the
     /// no-proxy default changes lane policy (direct serves
     /// all engines, with strict pacing).

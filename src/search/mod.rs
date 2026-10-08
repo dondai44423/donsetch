@@ -500,14 +500,29 @@ impl Searcher {
     /// Probe configured proxies in the background and seed their RTTs.
     /// Generic failures bench lanes only after a completed batch with a
     /// successful echo; authentication failures are applied immediately.
-    /// The caller owns the returned task and must abort it on shutdown.
+    /// One global batch budget caps the whole run: a pool of stalled
+    /// lanes cannot cost N * 6s of startup. The caller owns the returned
+    /// task and must abort it on shutdown.
     pub fn preflight(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Per-probe liveness timeout plus one ceiling for the whole
+            // batch. A probe never outlives the remaining budget, and
+            // lanes the budget never reaches stay unprobed (inconclusive:
+            // nothing is published for them).
+            const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+            const BATCH_BUDGET: Duration = Duration::from_secs(20);
             let proxies = this.pool.proxies();
+            let batch_started = Instant::now();
+            let mut completed = true;
             let mut echo_available = false;
             let mut dead = Vec::new();
             for proxy in proxies {
+                let remaining = BATCH_BUDGET.saturating_sub(batch_started.elapsed());
+                if remaining.is_zero() {
+                    completed = false;
+                    break;
+                }
                 let id = proxy.id();
                 let started = Instant::now();
                 let probe = this.fetcher.fetch_once_via(
@@ -517,7 +532,7 @@ impl Searcher {
                     false,
                     None,
                 );
-                match tokio::time::timeout(Duration::from_secs(6), probe).await {
+                match tokio::time::timeout(PROBE_TIMEOUT.min(remaining), probe).await {
                     Ok(Ok(o)) if o.status == 200 => {
                         echo_available = true;
                         this.pool.observe_rtt(&id, started.elapsed());
@@ -531,10 +546,12 @@ impl Searcher {
                 }
             }
             // An entirely unavailable shared echo is inconclusive. Publish
-            // failures only after the batch; temporary benches can otherwise
-            // move an in-flight caller onto direct before the last result.
-            // Existing dead/auth evidence is not cleared by a failed probe.
-            if echo_available {
+            // failures only after a completed batch; temporary benches can
+            // otherwise move an in-flight caller onto direct before the
+            // last result. Existing dead/auth evidence is not cleared by a
+            // failed probe, and a budget-cut partial batch publishes
+            // nothing at all.
+            if completed && echo_available {
                 for id in dead {
                     this.pool.report_dead(&id);
                 }
@@ -1666,6 +1683,82 @@ mod tests {
     #[tokio::test]
     async fn stealth_v3_preflight_completed_healthy_tls_echo_benches_failed_peer() {
         preflight_pair(ProbeCase::Healthy).await;
+    }
+
+    // The batch must obey one global ceiling: a pool of stalled lanes
+    // used to cost N * 6s of startup (8 lanes = 48s serial). With the
+    // ceiling the run stops at ~20s, the partial batch publishes
+    // nothing, and the unprobed lanes stay unbenched.
+    #[tokio::test]
+    async fn stealth_v3_preflight_batch_obeys_a_global_ceiling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let mut listeners = Vec::new();
+        let mut proxies = Vec::new();
+        for _ in 0..8 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            proxies.push(
+                crate::transport::proxy::Proxy::parse(&format!(
+                    "http://{}",
+                    listener.local_addr().unwrap()
+                ))
+                .unwrap(),
+            );
+            listeners.push(listener);
+        }
+        let pool = Arc::new(EgressPool::new(proxies.clone()));
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            Arc::clone(&pool),
+        ));
+        let mut servers = Vec::new();
+        for listener in listeners {
+            servers.push(tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            assert!(head.len() < 16384);
+                            let mut buf = [0u8; 1024];
+                            let Ok(n) = socket.read(&mut buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..n]);
+                        }
+                        // Accept the tunnel, then stall the handshake so
+                        // the probe dies on its own timeout.
+                        if socket
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await
+                            .is_ok()
+                        {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                    });
+                }
+            }));
+        }
+        let started = Instant::now();
+        searcher.preflight().await.unwrap();
+        let elapsed = started.elapsed();
+        for server in servers {
+            server.abort();
+        }
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "preflight must obey the global ceiling; 8 stalled lanes took {elapsed:?} \
+             (serial N * 6s = 48s)"
+        );
+        assert!(
+            proxies.iter().all(|p| !pool.is_dead(&p.id())),
+            "a budget-cut partial batch must publish nothing"
+        );
     }
 
     fn test_searcher() -> Searcher {

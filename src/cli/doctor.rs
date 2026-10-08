@@ -783,6 +783,19 @@ async fn check_egress_lanes(deep: bool) -> CheckResult {
         let proxies = pool.proxies();
         if !proxies.is_empty() {
             let results = crate::cli::proxy::probe_all(&proxies).await;
+            // Every probe failing is inconclusive about the lanes: the
+            // shared probe endpoint itself may be down. Health state is
+            // left untouched: failed probes are not benched and prior
+            // bans are never revived away (the old "benches cleared"
+            // erased legitimate dead/auth evidence).
+            if results.iter().all(|r| !r.alive) {
+                bits.push(
+                    "all lanes failed the live probe (the probe endpoint may be down): \
+                     health state left untouched, no benches written or cleared"
+                        .into(),
+                );
+                return CheckResult::Warn(bits.join(" · "));
+            }
             let mut dead = 0usize;
             let mut slow = 0usize;
             for (px, r) in proxies.iter().zip(results.iter()) {
@@ -808,15 +821,6 @@ async fn check_egress_lanes(deep: bool) -> CheckResult {
                         r.error.as_deref().unwrap_or("probe failed")
                     ));
                 }
-            }
-            // All dead = probe endpoint died, not the pool.
-            if !proxies.is_empty() && dead == proxies.len() {
-                pool.revive_all();
-                bits.push(
-                    "all lanes failed the live probe (likely api.ipify.org down); benches cleared"
-                        .into(),
-                );
-                return CheckResult::Warn(bits.join(" · "));
             }
             if dead > 0 {
                 return CheckResult::Fail(

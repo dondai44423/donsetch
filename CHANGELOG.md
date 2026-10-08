@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The startup proxy preflight obeys one global batch budget: a pool of stalled
+  lanes no longer costs up to 6s per lane of startup, a budget-cut partial
+  batch publishes nothing, and doctor --deep treats an all-failed probe batch
+  as inconclusive: failed probes are not benched, and prior dead/auth bans are
+  never cleared by a probe.
+
 - A 304 response counts as lane health only after it validates: an unsolicited
   or mismatched 304 no longer marks the lane healthy before its rejection,
   while a validated revalidation still does.
