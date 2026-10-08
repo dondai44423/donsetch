@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cookie-vault persistence reports directory, open, write and rename failures
+  while retaining in-memory learning. A failed write preserves the prior file.
+
 - Persisted learning counters saturate instead of overflowing. Future-dated
   solve and render records are not fresh; invalid route timestamps allow a
   recheck and do not create permanent cooldowns or recent failure evidence.

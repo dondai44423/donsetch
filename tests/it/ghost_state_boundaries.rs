@@ -210,3 +210,114 @@ fn persisted_future_cold_check_is_due_for_probe_with_stale_hosts() {
     assert_eq!(state.probe_candidates(20_000, 1), [HOST]);
     assert_eq!(std::fs::read(original).unwrap(), bytes);
 }
+
+#[test]
+fn persisted_save_reports_io_failure_and_recovers() {
+    const CHILD: &str = "DONSETCH_TEST_STATE_IO_CHILD";
+    let root = crate::sandbox();
+    let path = root.join("ghost-state.json");
+    let tmp = root.join("ghost-state.json.tmp");
+    let displaced = root.with_extension("displaced");
+    if let Ok(fault) = std::env::var(CHILD) {
+        let mut state = GhostState::load();
+        assert_eq!(state.profiles[HOST].fetch_count, 7);
+        match fault.as_str() {
+            "mkdir" => {
+                std::fs::rename(&root, &displaced).unwrap();
+                std::fs::write(&root, "owned directory blocker").unwrap();
+            }
+            "open" => std::fs::create_dir(&tmp).unwrap(),
+            "rename" => {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+            #[cfg(unix)]
+            "write" => {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // Limit only this owned child. Its stderr/stdout are pipes;
+                // the real temporary state write fails with EFBIG.
+                unsafe {
+                    assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit), 0);
+                    limit.rlim_cur = 0;
+                    assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+                    libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                }
+            }
+            "healthy" => {}
+            other => panic!("unknown owned I/O fault: {other}"),
+        }
+        state.record_fetch(HOST);
+        assert_eq!(state.profiles[HOST].fetch_count, 8);
+        println!("ACTUAL OBSERVATION AND SAVE REACHED");
+        return;
+    }
+
+    let run_child = |fault| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ghost_state_boundaries::persisted_save_reports_io_failure_and_recovers",
+                "--nocapture",
+            ])
+            .env(CHILD, fault)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "owned child: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ACTUAL OBSERVATION AND SAVE REACHED")
+        );
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let faults = [
+        "mkdir",
+        "open",
+        "rename",
+        #[cfg(unix)]
+        "write",
+    ];
+    let mut unreported = Vec::new();
+    for fault in faults {
+        let seed = json!({"version": 3, "profiles": {HOST: {
+            "fetch_count": 7, "session_cookies": [{
+                "name": "session", "value": "OWNED-SECRET-NEVER-LOG", "domain": HOST
+            }]
+        }}});
+        let (_, original, bytes) = copied_state(&seed);
+        let stderr = run_child(fault);
+        assert!(!stderr.contains("OWNED-SECRET-NEVER-LOG"));
+        if !stderr.contains("[ghost] cookie vault persist failed:") {
+            unreported.push(fault);
+        }
+        match fault {
+            "mkdir" => {
+                assert_eq!(
+                    std::fs::read(displaced.join("ghost-state.json")).unwrap(),
+                    bytes
+                );
+                std::fs::remove_file(&root).unwrap();
+                std::fs::rename(&displaced, &root).unwrap();
+            }
+            "rename" => {
+                std::fs::remove_dir(&path).unwrap();
+                std::fs::copy(&original, &path).unwrap();
+            }
+            _ => assert_eq!(std::fs::read(&path).unwrap(), bytes),
+        }
+        if tmp.is_dir() {
+            std::fs::remove_dir(&tmp).unwrap();
+        } else if tmp.exists() {
+            std::fs::remove_file(&tmp).unwrap();
+        }
+        assert_eq!(std::fs::read(original).unwrap(), bytes);
+        let stderr = run_child("healthy");
+        assert!(!stderr.contains("cookie vault persist failed"), "{stderr}");
+        assert_eq!(GhostState::load().profiles[HOST].fetch_count, 8);
+    }
+    assert!(
+        unreported.is_empty(),
+        "silent persistence failures: {unreported:?}"
+    );
+}

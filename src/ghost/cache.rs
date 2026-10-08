@@ -936,11 +936,6 @@ impl GhostState {
         Self::default()
     }
 
-    /// Atomic save: write to temp, rename. Survives crashes.
-    /// No-op in test builds : tests exercise the pure decision
-    /// and freshness logic without disk side effects.
-    /// No-op when DONSEEK_NO_DISK_STATE is set : keeps in-memory
-    /// state for the session but doesn't persist to disk.
     /// The recorded origin for a host: scheme and port, defaults
     /// https:443. The prober builds probe URLs from this.
     pub fn profile_origin(&self, host: &str) -> (String, u16) {
@@ -1239,6 +1234,9 @@ impl GhostState {
         crate::config::cfg().state.cookie_vault as usize * self.tier1_cookies.len()
     }
 
+    /// Write a complete snapshot to a private temporary file, then rename.
+    /// Persistence errors are reported on stderr; in-memory learning survives.
+    /// Unit-test builds and `state.no_disk_state` skip disk writes.
     pub fn save(&mut self) {
         // Always persist the current format version: a fresh state
         // derives Default (version 0) and would otherwise keep
@@ -1268,56 +1266,52 @@ impl GhostState {
                 return;
             }
             let p = path();
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Merge monotonic counters against the disk state as it
-            // exists RIGHT NOW: independent load() snapshots race
-            // (a stale in-memory copy saving later would otherwise
-            // rewind lifetimes). Max-merge is correct for counters:
-            // they only grow. Real case: the pool-warm receipt.
-            if let Ok(bytes) = std::fs::read(&p)
-                && let Ok(disk) = serde_json::from_slice::<GhostState>(&bytes)
-            {
-                self.probes_total = self.probes_total.max(disk.probes_total);
-                self.shadowed_assets_total =
-                    self.shadowed_assets_total.max(disk.shadowed_assets_total);
-                self.prewarmed_served_total =
-                    self.prewarmed_served_total.max(disk.prewarmed_served_total);
-                self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
-                self.merge_vault_from_disk(&disk);
-            }
-            if let Ok(s) = serde_json::to_string(self) {
+            let persist = (|| -> std::io::Result<()> {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                // Merge monotonic counters against the disk state as it
+                // exists RIGHT NOW: independent load() snapshots race
+                // (a stale in-memory copy saving later would otherwise
+                // rewind lifetimes). Max-merge is correct for counters:
+                // they only grow. Real case: the pool-warm receipt.
+                if let Ok(bytes) = std::fs::read(&p)
+                    && let Ok(disk) = serde_json::from_slice::<GhostState>(&bytes)
+                {
+                    self.probes_total = self.probes_total.max(disk.probes_total);
+                    self.shadowed_assets_total =
+                        self.shadowed_assets_total.max(disk.shadowed_assets_total);
+                    self.prewarmed_served_total =
+                        self.prewarmed_served_total.max(disk.prewarmed_served_total);
+                    self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
+                    self.merge_vault_from_disk(&disk);
+                }
+                let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
                 let tmp = p.with_extension("json.tmp");
                 // 0600 BEFORE content lands on disk: the state file
                 // carries harvested cookies (clearance / session
                 // identifiers) and must not be world-readable, even
                 // transiently on the tmp file.
-                let write_ok = {
-                    #[cfg(unix)]
-                    {
-                        use std::io::Write;
-                        use std::os::unix::fs::OpenOptionsExt;
-                        std::fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .mode(0o600)
-                            .open(&tmp)
-                            .and_then(|mut f| f.write_all(s.as_bytes()))
-                            .is_ok()
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        std::fs::write(&tmp, &s).is_ok()
-                    }
-                };
-                if write_ok && let Err(e) = std::fs::rename(&tmp, &p) {
-                    // e.g. antivirus lock on Windows: harvested
-                    // clearance cookies are lost this session : say
-                    // so instead of silently re-burning ghost solves.
-                    eprintln!("[ghost] cookie vault persist failed: {e}");
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&tmp)?
+                        .write_all(&bytes)?;
                 }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&tmp, &bytes)?;
+                }
+                std::fs::rename(&tmp, &p)
+            })();
+            if let Err(error) = persist {
+                eprintln!("[ghost] cookie vault persist failed: {error}");
             }
         }
     }
