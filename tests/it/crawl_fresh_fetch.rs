@@ -74,7 +74,7 @@ async fn recrawl_never_serves_the_fresh_window() {
     //    serves body A with ZERO requests. This is exactly what broke
     //    the delta leg before the fix: the "new" fetch = the old body.
     let cached = fetcher
-        .fetch_via_jar_opts(&url, None, false, None, false, false)
+        .fetch_via_jar_opts(&url, None, false, None, false, false, None)
         .await
         .expect("cached fetch");
     assert!(
@@ -90,7 +90,7 @@ async fn recrawl_never_serves_the_fresh_window() {
     // 3) The crawl fetch path (skip_cache=true): must dial the origin
     //    and see body B even though a fresh entry exists.
     let fresh = fetcher
-        .fetch_via_jar_opts(&url, None, false, None, true, false)
+        .fetch_via_jar_opts(&url, None, false, None, true, false, None)
         .await
         .expect("fresh fetch");
     assert_eq!(

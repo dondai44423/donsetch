@@ -390,7 +390,7 @@ pub fn origin_of(url: &url::Url) -> String {
 /// crawl.
 pub async fn fetch_robots(fetch: &PageFetcher, origin: &str) -> Robots {
     let robots_url = format!("{origin}/robots.txt");
-    let page = fetch(robots_url, "direct".to_string(), None).await;
+    let page = fetch(robots_url, "direct".to_string(), None, None).await;
     robots_for_origin(page.status, &page.body, origin)
 }
 
@@ -552,7 +552,7 @@ pub async fn discover(
 /// Fetch one sitemap candidate and decode it to text.
 /// None = non-200, binary, or undecodable.
 async fn fetch_sitemap_text(fetch: &PageFetcher, loc: &str) -> Option<String> {
-    let page = fetch(loc.to_string(), "direct".to_string(), None).await;
+    let page = fetch(loc.to_string(), "direct".to_string(), None, None).await;
     if page.status != 200 {
         return None;
     }
@@ -724,7 +724,10 @@ mod tests {
             .map(|(u, s, b)| (u.to_string(), (s, b.to_string())))
             .collect();
         let fetch: crate::crawl::PageFetcher = Arc::new(
-            move |url: String, _lane: String, _referer: Option<String>| {
+            move |url: String,
+                  _lane: String,
+                  _referer: Option<String>,
+                  _gate: Option<crate::fetch::client::RedirectGate>| {
                 let h = Arc::clone(&h);
                 let entry = table.get(&url).cloned();
                 async move {

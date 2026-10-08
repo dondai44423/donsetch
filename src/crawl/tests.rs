@@ -119,8 +119,11 @@ impl MockSite {
         let content_types = Arc::new(self.content_types);
         let referers = Arc::clone(&self.referers);
         let hits2 = Arc::clone(&hits);
-        let f: PageFetcher =
-            Arc::new(move |url: String, _lane: String, referer: Option<String>| {
+        let f: PageFetcher = Arc::new(
+            move |url: String,
+                  _lane: String,
+                  referer: Option<String>,
+                  _gate: Option<crate::fetch::client::RedirectGate>| {
                 let pages = Arc::clone(&pages);
                 let throttles = Arc::clone(&throttles);
                 let transients = Arc::clone(&transients);
@@ -209,7 +212,8 @@ impl MockSite {
                     }
                 }
                 .boxed()
-            });
+            },
+        );
         (f, hits)
     }
 }
@@ -236,10 +240,10 @@ fn html(title: &str, body: &str) -> String {
 }
 
 fn classifying_fetcher(inner: PageFetcher) -> PageFetcher {
-    Arc::new(move |url, lane, referer| {
+    Arc::new(move |url, lane, referer, gate| {
         let inner = Arc::clone(&inner);
         async move {
-            let mut page = inner(url, lane, referer).await;
+            let mut page = inner(url, lane, referer, gate).await;
             page.verdict = crate::detect::walls::detect(page.status, &page.headers, &page.body);
             page
         }
@@ -263,11 +267,11 @@ async fn stealth_v3_short_browser_handoffs_use_one_original_deadline() {
                     if thin { &shell } else { "Access denied" },
                 )
                 .fetcher();
-            let fetch: PageFetcher = Arc::new(move |url, lane, referer| {
+            let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
                 let fetch = Arc::clone(&fetch);
                 async move {
                     tokio::time::sleep(Duration::from_millis(40)).await;
-                    fetch(url, lane, referer).await
+                    fetch(url, lane, referer, gate).await
                 }
                 .boxed()
             });
@@ -542,7 +546,7 @@ async fn stealth_v3_browser_unknown_status_never_inherits_http_denial() {
     let (fetch, _) = MockSite::new()
         .page("https://ex.com/", 403, "Access denied")
         .fetcher();
-    let mut page = fetch("https://ex.com/".into(), "owned-lane".into(), None).await;
+    let mut page = fetch("https://ex.com/".into(), "owned-lane".into(), None, None).await;
     let route = page.route.clone();
     page.apply_render(super::GhostRender {
         html: html("Owned browser", "Content with no observed network status."),
@@ -571,10 +575,10 @@ async fn stealth_v3_browser_unknown_status_never_inherits_http_denial() {
 async fn stealth_v3_http_redirect_outside_scope_does_not_start_browser() {
     let seed = "https://ex.com/start";
     let (inner, hits) = MockSite::new().page(seed, 403, "Access denied").fetcher();
-    let fetch: PageFetcher = Arc::new(move |url, lane, referer| {
+    let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
         let inner = Arc::clone(&inner);
         async move {
-            let mut page = inner(url, lane, referer).await;
+            let mut page = inner(url, lane, referer, gate).await;
             page.url = "https://ex.com/outside".into();
             page.verdict = Verdict::Blocked;
             page
@@ -628,9 +632,9 @@ async fn wave450_seed_preflight_uses_an_available_governor_lane() {
         .fetcher();
     let lanes = Arc::new(Mutex::new(Vec::new()));
     let recorded = lanes.clone();
-    let fetch: PageFetcher = Arc::new(move |url, lane, referer| {
+    let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
         recorded.lock().unwrap().push(lane.clone());
-        inner(url, lane, referer)
+        inner(url, lane, referer, gate)
     });
     let governor = Arc::new(Governor::new(vec![Lane {
         id: "proxy-only".into(),
@@ -679,10 +683,10 @@ async fn wave450_seed_redirect_relocates_scope_and_reuses_response() {
             ),
         )
         .fetcher();
-    let fetch: PageFetcher = Arc::new(move |u, lane, referer| {
+    let fetch: PageFetcher = Arc::new(move |u, lane, referer, gate| {
         let inner = inner.clone();
         async move {
-            let mut p = inner(u.clone(), lane, referer).await;
+            let mut p = inner(u.clone(), lane, referer, gate).await;
             if u == seed {
                 p.url = resolved.into();
                 p.body
@@ -725,7 +729,7 @@ async fn wave450_seed_redirect_relocates_scope_and_reuses_response() {
 async fn wave450_deadline_bounds_discovery_and_page_io() {
     let called = Arc::new(AtomicUsize::new(0));
     let counts = called.clone();
-    let fetch: PageFetcher = Arc::new(move |url, lane, _| {
+    let fetch: PageFetcher = Arc::new(move |url, lane, _, _gate| {
         let called = counts.clone();
         async move {
             called.fetch_add(1, Ordering::SeqCst);
@@ -2346,11 +2350,11 @@ async fn report_audit_slow_seed_keeps_descendants_alive_and_page_cap_is_exact() 
         .page("https://ex.com/two", 200, &format!("<article><h1>Two</h1><p>{}</p></article>", "Second child substantive evidence. ".repeat(30)))
         .page("https://ex.com/three", 200, &format!("<article><h1>Three</h1><p>{}</p></article>", "Third child substantive evidence. ".repeat(30)));
     let (fetch, _) = site.fetcher();
-    let delayed: PageFetcher = Arc::new(move |url, lane, referer| {
+    let delayed: PageFetcher = Arc::new(move |url, lane, referer, gate| {
         let fetch = fetch.clone();
         async move {
             tokio::time::sleep(Duration::from_millis(350)).await;
-            fetch(url, lane, referer).await
+            fetch(url, lane, referer, gate).await
         }
         .boxed()
     });

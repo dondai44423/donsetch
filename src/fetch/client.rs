@@ -46,6 +46,16 @@ pub struct FetchOutcome {
     pub elapsed: Duration,
 }
 
+/// Pre-navigation redirect policy (v4.6): consulted for every
+/// redirect hop BEFORE the target is dialed. Returning false stops
+/// the chain — the redirect response itself becomes the outcome and
+/// the caller records the honest skip — so an excluded or
+/// robots-disallowed redirect target is never requested. Owned and
+/// `'static`: callers clone in whatever the decision needs.
+pub type RedirectGate = std::sync::Arc<
+    dyn Fn(url::Url) -> futures_util::future::BoxFuture<'static, bool> + Send + Sync,
+>;
+
 /// Per-request identity knobs. Copy: the redirect driver hands
 /// the same identity to every hop.
 #[derive(Clone, Copy)]
@@ -198,7 +208,7 @@ impl Fetcher {
     /// (a cached page is not evidence about the wall RIGHT NOW).
     /// Used only by the background route-memory prober.
     pub async fn fetch_cold_probe(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
-        self.fetch_via_jar_opts(url_str, None, false, None, true, true)
+        self.fetch_via_jar_opts(url_str, None, false, None, true, true, None)
             .await
     }
 
@@ -215,7 +225,7 @@ impl Fetcher {
         use_jar: bool,
         referer: Option<&str>,
     ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_via_jar_opts(url_str, proxy, use_jar, referer, false, true)
+        self.fetch_via_jar_opts(url_str, proxy, use_jar, referer, false, true, None)
             .await
     }
 
@@ -223,6 +233,9 @@ impl Fetcher {
     /// cache entirely (probe path only; everything else keeps it).
     /// `pool_pick` gates the opt-in pool lane (`proxy.fetch_rotate`);
     /// crawl passes `false` because it owns its lane choice.
+    /// `redirect_gate` is consulted for every redirect hop before the
+    /// target is dialed (crawl scope/robots; `None` = follow freely).
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_via_jar_opts(
         &self,
         url_str: &str,
@@ -231,6 +244,7 @@ impl Fetcher {
         referer: Option<&str>,
         skip_cache: bool,
         pool_pick: bool,
+        redirect_gate: Option<RedirectGate>,
     ) -> Result<FetchOutcome, FetchError> {
         self.fetch_via_jar_identity(
             url_str,
@@ -245,6 +259,7 @@ impl Fetcher {
                 accept_language: None,
             },
             None,
+            redirect_gate,
         )
         .await
     }
@@ -260,6 +275,7 @@ impl Fetcher {
         pool_pick: bool,
         identity: RequestIdentity<'_>,
         route_override: Option<&RequestRoute>,
+        redirect_gate: Option<RedirectGate>,
     ) -> Result<FetchOutcome, FetchError> {
         // Centralized URL safety gate (fetch tier). The synchronous
         // literal checks run here (scheme, credentials, localhost and
@@ -482,6 +498,17 @@ impl Fetcher {
                             return Err(e);
                         }
                     };
+                    // Pre-navigation redirect policy (crawl scope and
+                    // robots): a refused hop is never dialed; the
+                    // redirect response returns as the outcome so the
+                    // caller records the honest skip.
+                    if let Some(gate) = redirect_gate.as_ref()
+                        && !gate(next.clone()).await
+                    {
+                        out.elapsed = started.elapsed();
+                        out.redirects = redirects;
+                        return Ok(out);
+                    }
                     current = next.to_string();
                 }
                 _ => {
@@ -690,6 +717,7 @@ impl Fetcher {
                 accept_language,
             },
             route,
+            None,
         )
         .await
     }
@@ -1519,6 +1547,70 @@ mod transport_exit_tests {
     #[tokio::test]
     async fn stealth_v3_success_status_200_retains_fetch_pool_health() {
         owned_status_fetch(200).await;
+    }
+
+    // v4.6: a redirect hop refused by the per-request policy must
+    // never be dialed — the chain stops at the redirect response.
+    #[tokio::test]
+    async fn redirect_gate_refuses_before_the_target_is_dialed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        let target = format!("http://127.0.0.1:{port}/target");
+        let start = format!("http://127.0.0.1:{port}/start");
+        let hits: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let h = std::sync::Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = origin.accept().await {
+                let mut head = Vec::new();
+                loop {
+                    let mut b = [0u8; 512];
+                    let n = socket.read(&mut b).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&b[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&head);
+                let path = text
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                h.lock().unwrap().push(path.clone());
+                let response = if path == "/start" {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nowned"
+                        .to_string()
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let gate: RedirectGate = std::sync::Arc::new(|_url: url::Url| Box::pin(async { false }));
+        let out = fetcher
+            .fetch_via_jar_opts(&start, None, false, None, true, false, Some(gate))
+            .await
+            .unwrap();
+        assert_eq!(out.status, 302, "the redirect response returns honestly");
+        assert_eq!(out.url, start);
+        server.abort();
+        let seen = hits.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec!["/start".to_string()],
+            "the refused target must never be dialed"
+        );
     }
 
     // #248 split Dns/DnsTimeout out of Io/Timeout. Those variants

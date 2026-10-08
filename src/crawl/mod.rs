@@ -103,9 +103,17 @@ pub type GhostHook =
     Arc<dyn Fn(GhostRequest) -> BoxFuture<'static, Result<GhostRender, String>> + Send + Sync>;
 
 /// Pluggable fetch: real = DonShadow, tests = in-memory map.
-pub type PageFetcher =
-    Arc<dyn Fn(String, String, Option<String>) -> BoxFuture<'static, FetchedPage> + Send + Sync>;
-//            (url, lane_id, referer) -> page
+pub type PageFetcher = Arc<
+    dyn Fn(
+            String,
+            String,
+            Option<String>,
+            Option<crate::fetch::client::RedirectGate>,
+        ) -> BoxFuture<'static, FetchedPage>
+        + Send
+        + Sync,
+>;
+//            (url, lane_id, referer, redirect_policy) -> page
 
 /// Crawl surface mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,7 +548,7 @@ impl Crawler {
         let fetch: PageFetcher = {
             let inner = self.fetch.clone();
             let buffered = buffered.clone();
-            Arc::new(move |url, lane, referer| {
+            Arc::new(move |url, lane, referer, redirect_gate| {
                 let inner = inner.clone();
                 let buffered = buffered.clone();
                 Box::pin(async move {
@@ -553,7 +561,7 @@ impl Crawler {
                     }
                     match tokio::time::timeout_at(
                         deadline_at.into(),
-                        inner(url.clone(), lane.clone(), referer),
+                        inner(url.clone(), lane.clone(), referer, redirect_gate),
                     )
                     .await
                     {
@@ -622,6 +630,7 @@ impl Crawler {
                     robots_url.clone(),
                     seed_lane.clone().unwrap_or_else(|| "direct".into()),
                     None,
+                    None,
                 )
                 .await;
                 let robots = sitemap::robots_for_origin(page.status, &page.body, &origin);
@@ -644,7 +653,11 @@ impl Crawler {
                     .wait_for(&seed_host, &lane, 0)
                     .min(deadline_at.saturating_duration_since(Instant::now()));
                 tokio::time::sleep(wait).await;
-                let page = fetch(seed.clone(), lane, None).await;
+                // The seed hop is identity resolution, not a scoped
+                // crawl step: its redirect may adopt a new host by
+                // design (short URLs, www moves), so it stays
+                // ungated; worker hops carry the policy.
+                let page = fetch(seed.clone(), lane, None, None).await;
                 if matches!(page.verdict, Verdict::ContentOk)
                     && (200..300).contains(&page.status)
                     && let Ok(resolved) = Url::parse(&page.url)
@@ -927,6 +940,11 @@ impl Crawler {
             let seed_host2 = seed_host.clone();
             let seed_norm_w = seed_norm.clone();
             let robots_cache = Arc::clone(&robots_cache);
+            // Pre-navigation redirect policy (v4.6): every redirect hop
+            // is checked BEFORE it is dialed — same-host, scope and
+            // robots — so an excluded target is never requested.
+            let redirect_gate =
+                build_redirect_gate(&fetch, &robots_cache, &governor, &seed_host2, &opts_worker);
             let max_pages = opts.max_pages;
             // Sitemap found ⇒ link discovery does not depend on the
             // seed fetch ⇒ even the seed is skippable in delta mode.
@@ -1154,8 +1172,43 @@ impl Crawler {
                         tokio::time::sleep(wait).await;
                     }
 
-                    let mut page =
-                        fetch(item.url.clone(), lane.id.clone(), item.parent.clone()).await;
+                    let mut page = fetch(
+                        item.url.clone(),
+                        lane.id.clone(),
+                        item.parent.clone(),
+                        redirect_gate.clone(),
+                    )
+                    .await;
+                    // A redirect hop the pre-navigation policy refused
+                    // (the target was never dialed: this is the bare
+                    // redirect response) is recorded as a skip and
+                    // never counts against lane health — the lane
+                    // delivered its response correctly.
+                    if (300..400).contains(&page.status)
+                        && let Some(target) = page
+                            .headers
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                            .map(|(_, value)| value.clone())
+                    {
+                        let reason = match Url::parse(&page.url) {
+                            Ok(base) => {
+                                match crate::fetch::guards::validate_redirect_url(&base, &target) {
+                                    Ok(final_url) => {
+                                        format!("redirected out of scope -> {final_url}")
+                                    }
+                                    Err(error) => format!("invalid redirect target: {error}"),
+                                }
+                            }
+                            Err(_) => format!("redirected out of scope -> {target}"),
+                        };
+                        skipped
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((item.url.clone(), reason));
+                        continue 'work;
+                    }
+
                     if page.cached {
                         // Warm-cache hit: free : no governor signal.
                     } else {
@@ -1783,9 +1836,13 @@ impl Crawler {
                             if !fw.is_zero() {
                                 tokio::time::sleep(fw).await;
                             }
-                            let feed_page =
-                                fetch(fu.to_string(), lane.id.clone(), Some(page.url.clone()))
-                                    .await;
+                            let feed_page = fetch(
+                                fu.to_string(),
+                                lane.id.clone(),
+                                Some(page.url.clone()),
+                                redirect_gate.clone(),
+                            )
+                            .await;
                             total_fetched.fetch_add(1, Ordering::SeqCst);
                             if !matches!(feed_page.verdict, Verdict::ContentOk) {
                                 continue;
@@ -2267,6 +2324,51 @@ fn host_matches(a: &str, b: &str) -> bool {
 }
 
 /// Recheck a candidate's actual final URL before extraction or browser recovery.
+/// Build the per-request redirect gate for a crawl: consulted for
+/// every redirect hop BEFORE it is dialed. Refuses same-host,
+/// scope and robots violations; the hop's response then returns as
+/// the bare redirect and the caller records the skip.
+fn build_redirect_gate(
+    fetch: &PageFetcher,
+    robots: &Arc<sitemap::RobotsCache>,
+    governor: &Arc<Governor>,
+    seed_host: &str,
+    opts: &CrawlOptions,
+) -> Option<crate::fetch::client::RedirectGate> {
+    Some(Arc::new({
+        let fetch = Arc::clone(fetch);
+        let robots = Arc::clone(robots);
+        let governor = Arc::clone(governor);
+        let seed = seed_host.to_string();
+        let policy = opts.clone();
+        move |target: url::Url| {
+            let fetch = fetch.clone();
+            let robots = Arc::clone(&robots);
+            let governor = Arc::clone(&governor);
+            let seed = seed.clone();
+            let policy = policy.clone();
+            Box::pin(async move {
+                if policy.same_host
+                    && !target
+                        .host_str()
+                        .is_some_and(|host| host_matches(host, &seed))
+                {
+                    return false;
+                }
+                if !scope_allowed(target.path(), &policy.include_paths, &policy.exclude_paths) {
+                    return false;
+                }
+                if policy.respect_robots
+                    && !robots_allows(&fetch, &governor, &robots, &target).await
+                {
+                    return false;
+                }
+                true
+            })
+        }
+    }))
+}
+
 async fn redirect_target_allowed(
     fetch: &PageFetcher,
     governor: &Governor,

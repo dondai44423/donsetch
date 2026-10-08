@@ -56,121 +56,45 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
         let fetcher = Arc::clone(&fetcher);
         let pool = Arc::clone(&pool);
         let proxies = Arc::clone(&proxies);
-        Arc::new(move |url: String, lane: String, referer: Option<String>| {
-            let fetcher = Arc::clone(&fetcher);
-            let pool = Arc::clone(&pool);
-            let proxies = Arc::clone(&proxies);
-            // v4 phase 3: the same adapter registry web_fetch uses
-            // shapes crawl fetches, so a reddit/npm class URL rides
-            // the cheap .json/registry path instead of the HTML app.
-            // The candidate URL stays canonical: dedup, history and
-            // output rows key on it, the wire just asks for the
-            // rewritten endpoint. DONSETCH_NO_ADAPTERS silences this
-            // exactly as it does in web_fetch (handled inside
-            // adapters::rewrite).
-            let fetch_url = url::Url::parse(&url)
-                .ok()
-                .and_then(|u| crate::adapters::rewrite(&u).map(|(alt, _via)| alt))
-                .unwrap_or_else(|| url.clone());
-            let host = url::Url::parse(&url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
-                .unwrap_or_default();
-            async move {
-                let started = Instant::now();
-                let proxy = if lane == "direct" {
-                    None
-                } else {
-                    proxies.iter().find(|p| p.id() == lane).cloned()
-                };
-                // A missing or benched assignment must not become a direct read.
-                if lane != "direct" && (proxy.is_none() || pool.is_dead(&lane)) {
-                    let reason = if proxy.is_none() {
-                        "unavailable"
+        Arc::new(
+            move |url: String,
+                  lane: String,
+                  referer: Option<String>,
+                  redirect_gate: Option<crate::fetch::client::RedirectGate>| {
+                let fetcher = Arc::clone(&fetcher);
+                let pool = Arc::clone(&pool);
+                let proxies = Arc::clone(&proxies);
+                // v4 phase 3: the same adapter registry web_fetch uses
+                // shapes crawl fetches, so a reddit/npm class URL rides
+                // the cheap .json/registry path instead of the HTML app.
+                // The candidate URL stays canonical: dedup, history and
+                // output rows key on it, the wire just asks for the
+                // rewritten endpoint. DONSETCH_NO_ADAPTERS silences this
+                // exactly as it does in web_fetch (handled inside
+                // adapters::rewrite).
+                let fetch_url = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| crate::adapters::rewrite(&u).map(|(alt, _via)| alt))
+                    .unwrap_or_else(|| url.clone());
+                let host = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                    .unwrap_or_default();
+                async move {
+                    let started = Instant::now();
+                    let proxy = if lane == "direct" {
+                        None
                     } else {
-                        "benched"
+                        proxies.iter().find(|p| p.id() == lane).cloned()
                     };
-                    return FetchedPage {
-                        lane: lane.clone(),
-                        route: None,
-                        url,
-                        status: 0,
-                        headers: Vec::new(),
-                        body: Vec::new(),
-                        verdict: Verdict::Blocked,
-                        latency: started.elapsed(),
-                        cached: false,
-                        error_hint: Some(format!("egress: lane {lane} is {reason}")),
-                    };
-                }
-                // Proxy lanes: shared jar OUT : one cookie carrying
-                // lane B's identity would link the two egress IPs.
-                let use_jar = proxy.is_none();
-                // v4 F2: cross-process politeness floor. The in-process
-                // governor already spaced this request; a second
-                // donsetch process on the same host still needs a
-                // shared last-stamp. Best-effort, kill-switchable.
-                crate::crawl::host_pace::wait_and_stamp(&host).await;
-                // A recrawl exists to see what changed : serve the
-                // live response, never the revalidation cache (the
-                // cached body made every delta recrawl compare the
-                // previous crawl's own content and report zero
-                // changes forever).
-                match fetcher
-                    .fetch_via_jar_opts(
-                        &fetch_url,
-                        proxy.as_ref(),
-                        use_jar,
-                        referer.as_deref(),
-                        true,
-                        false,
-                    )
-                    .await
-                {
-                    Ok(out) => {
-                        // Fresh-window cache hit made ZERO requests:
-                        // exclude from governor pacing. Revalidated
-                        // hits made a (304) request, keep them.
-                        let cached = matches!(out.cache, CacheState::Fresh);
-                        if !cached {
-                            match out.status {
-                                200..=299 | 304 => {
-                                    if !host.is_empty() {
-                                        pool.report_ok(&host, &lane);
-                                    }
-                                    pool.observe_rtt(&lane, started.elapsed());
-                                }
-                                429 | 503 if !host.is_empty() && lane != "direct" => {
-                                    pool.note_fetch_rate_limited(&host, &lane);
-                                }
-                                _ => {}
-                            }
-                        }
-                        FetchedPage {
-                            lane: lane.clone(),
-                            route: Some(out.route),
-                            url: out.url,
-                            status: out.status,
-                            headers: out.headers,
-                            body: out.body,
-                            verdict: out.verdict,
-                            latency: started.elapsed(),
-                            cached,
-                            error_hint: None,
-                        }
-                    }
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        if lane != "direct" {
-                            if msg.contains("CONNECT -> 407") {
-                                pool.note_fetch_auth_fail(&host, &lane);
-                            } else if msg.contains("timeout") || msg.contains("timed out") {
-                                pool.note_fetch_timeout(&host, &lane);
-                            } else {
-                                pool.note_fetch_dead(&host, &lane);
-                            }
-                        }
-                        FetchedPage {
+                    // A missing or benched assignment must not become a direct read.
+                    if lane != "direct" && (proxy.is_none() || pool.is_dead(&lane)) {
+                        let reason = if proxy.is_none() {
+                            "unavailable"
+                        } else {
+                            "benched"
+                        };
+                        return FetchedPage {
                             lane: lane.clone(),
                             route: None,
                             url,
@@ -180,13 +104,95 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                             verdict: Verdict::Blocked,
                             latency: started.elapsed(),
                             cached: false,
-                            error_hint: Some(format!("network: {e}")),
+                            error_hint: Some(format!("egress: lane {lane} is {reason}")),
+                        };
+                    }
+                    // Proxy lanes: shared jar OUT : one cookie carrying
+                    // lane B's identity would link the two egress IPs.
+                    let use_jar = proxy.is_none();
+                    // v4 F2: cross-process politeness floor. The in-process
+                    // governor already spaced this request; a second
+                    // donsetch process on the same host still needs a
+                    // shared last-stamp. Best-effort, kill-switchable.
+                    crate::crawl::host_pace::wait_and_stamp(&host).await;
+                    // A recrawl exists to see what changed : serve the
+                    // live response, never the revalidation cache (the
+                    // cached body made every delta recrawl compare the
+                    // previous crawl's own content and report zero
+                    // changes forever).
+                    match fetcher
+                        .fetch_via_jar_opts(
+                            &fetch_url,
+                            proxy.as_ref(),
+                            use_jar,
+                            referer.as_deref(),
+                            true,
+                            false,
+                            redirect_gate,
+                        )
+                        .await
+                    {
+                        Ok(out) => {
+                            // Fresh-window cache hit made ZERO requests:
+                            // exclude from governor pacing. Revalidated
+                            // hits made a (304) request, keep them.
+                            let cached = matches!(out.cache, CacheState::Fresh);
+                            if !cached {
+                                match out.status {
+                                    200..=299 | 304 => {
+                                        if !host.is_empty() {
+                                            pool.report_ok(&host, &lane);
+                                        }
+                                        pool.observe_rtt(&lane, started.elapsed());
+                                    }
+                                    429 | 503 if !host.is_empty() && lane != "direct" => {
+                                        pool.note_fetch_rate_limited(&host, &lane);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            FetchedPage {
+                                lane: lane.clone(),
+                                route: Some(out.route),
+                                url: out.url,
+                                status: out.status,
+                                headers: out.headers,
+                                body: out.body,
+                                verdict: out.verdict,
+                                latency: started.elapsed(),
+                                cached,
+                                error_hint: None,
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("{e}");
+                            if lane != "direct" {
+                                if msg.contains("CONNECT -> 407") {
+                                    pool.note_fetch_auth_fail(&host, &lane);
+                                } else if msg.contains("timeout") || msg.contains("timed out") {
+                                    pool.note_fetch_timeout(&host, &lane);
+                                } else {
+                                    pool.note_fetch_dead(&host, &lane);
+                                }
+                            }
+                            FetchedPage {
+                                lane: lane.clone(),
+                                route: None,
+                                url,
+                                status: 0,
+                                headers: Vec::new(),
+                                body: Vec::new(),
+                                verdict: Verdict::Blocked,
+                                latency: started.elapsed(),
+                                cached: false,
+                                error_hint: Some(format!("network: {e}")),
+                            }
                         }
                     }
                 }
-            }
-            .boxed()
-        })
+                .boxed()
+            },
+        )
     };
 
     (Crawler::new(fetch, Arc::clone(&governor)), governor)
@@ -279,7 +285,7 @@ mod tests {
         let fetcher =
             Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
         let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
-        let page = (crawler.fetch)(url, "missing-owned-proxy".into(), None).await;
+        let page = (crawler.fetch)(url, "missing-owned-proxy".into(), None, None).await;
         let reached_origin = origin.await.unwrap();
         assert!(
             !reached_origin,

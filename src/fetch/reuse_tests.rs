@@ -226,6 +226,7 @@ async fn stealth_v3_transport_new_proxy_credentials_require_their_own_tunnel() {
                 None,
                 true,
                 false,
+                None,
             ),
         )
         .await

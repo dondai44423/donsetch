@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Crawl redirects are decided before the network: each redirect hop of a
+  queued page is checked for same-host scope and robots permission before the
+  target is dialed, so an excluded or disallowed target is never requested;
+  the hop records an honest skip instead, and a refusal is neutral for lane
+  health (a policy decision, not a lane fault).
+
 - The cookie vault reconciles writers transactionally: snapshot saves, cookie
   harvests and logouts serialize on one advisory lock with per-process
   temporary files, and cached renders carry capture and logout generations, so
