@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   responses: the comparison needs a browser-readable document, and a
   data payload is not one.
 
+- Error codes stay honest when an error message quotes a URL: the text
+  classifier no longer reads the URL's own port, path, or query as the
+  failure signal (a Cloudflare wall on port 42945 classified as
+  `network.ratelimit`), and a bare `429` now needs a standalone number,
+  so a port or a duration cannot masquerade as an HTTP status.
+
 - A browser pass that hits its deadline before usable content now says
   exactly that, with deadline/tier advice, instead of telling the agent to
   check the network for a fault that is not there.

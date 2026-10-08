@@ -210,6 +210,41 @@ pub(super) fn tool_error_kind(message: impl Into<String>, kind: &str) -> Value {
     tool_error_structured(message, kind, None)
 }
 
+/// Message sniffing reads symptoms, never data : error text quotes
+/// the URL we looked at, and the URL's own port (`:42945`), path
+/// (`/dns/`), or query (`?timeout=5`) must not be read as the
+/// failure. Strips every http(s) URL token before classification.
+/// (V24: a Cloudflare wall on port 42945 classified as a rate limit.)
+fn without_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let hit = match (rest.find("http://"), rest.find("https://")) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let Some(i) = hit else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..i]);
+        out.push(' ');
+        let url = &rest[i..];
+        let end = url.find(|c: char| c.is_whitespace()).unwrap_or(url.len());
+        rest = &url[end..];
+    }
+}
+
+/// True when `needle` occurs in `text` not embedded in a longer run
+/// of ASCII digits : a port (`:42945`) or a duration (`1429ms`) is
+/// not an HTTP status.
+fn has_standalone_digits(text: &str, needle: &str) -> bool {
+    let digit = |c: Option<char>| c.is_some_and(|d| d.is_ascii_digit());
+    text.match_indices(needle).any(|(i, _)| {
+        !digit(text[..i].chars().next_back()) && !digit(text[i + needle.len()..].chars().next())
+    })
+}
+
 /// Error with structure: the 50-case report asked for honest
 /// machine-readable failure state : status, verdict, url,
 /// next_action, and the escalation trace : so an agent can
@@ -242,7 +277,7 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
     {
         return Cow::Owned(code.to_string());
     }
-    let m = msg.to_ascii_lowercase();
+    let m = without_urls(&msg.to_ascii_lowercase());
     let v = structured
         .and_then(|s| s.get("verdict"))
         .and_then(Value::as_str)
@@ -270,7 +305,7 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         }
         _ if m.contains("dns") => "network.dns",
         _ if m.contains("timeout") || m.contains("timed out") => "network.timeout",
-        _ if m.contains("rate limit") || m.contains("429") => "network.ratelimit",
+        _ if m.contains("rate limit") || has_standalone_digits(&m, "429") => "network.ratelimit",
         _ if m.contains("binary content") => "content.binary",
         _ if v == "Incomplete" || m.contains("browser document incomplete") => "content.incomplete",
         _ if m.contains("too large") || m.contains("oversize") => "content.oversize",
@@ -985,6 +1020,58 @@ mod error_code_tests {
             "crawl.resume"
         );
         assert_eq!(error_code("fetch: invalid URL", None), "fetch.invalid");
+    }
+
+    // V24: sniffing reads symptoms, never data : a wall error quoting
+    // its URL made the classifier read a rate limit out of the wall's
+    // own PORT (live case: the V03 fixture server answered on 42945).
+    #[test]
+    pub(super) fn a_url_port_is_not_a_rate_limit() {
+        let wall = json!({"verdict": "Challenge(Cloudflare)", "status": 403});
+        assert_eq!(
+            error_code(
+                "bot wall: http://127.0.0.1:42945/wall is protected by Cloudflare (try fetch with tier=2 for headless browser)",
+                Some(&wall)
+            ),
+            "wall.challenge"
+        );
+        // A status that is not glued to other digits still classifies.
+        assert_eq!(
+            error_code("server answered HTTP 429", None),
+            "network.ratelimit"
+        );
+        assert_eq!(
+            error_code("rate limited: too many requests", None),
+            "network.ratelimit"
+        );
+    }
+
+    #[test]
+    pub(super) fn url_words_are_not_failure_signal() {
+        let wall = json!({"verdict": "Challenge(Cloudflare)", "status": 403});
+        assert_eq!(
+            error_code(
+                "bot wall: https://dns.example.com/x is protected by Cloudflare",
+                Some(&wall)
+            ),
+            "wall.challenge"
+        );
+        assert_eq!(
+            error_code(
+                "blocked: https://x.example/retry?timeout=5 returned a wall",
+                Some(&wall)
+            ),
+            "wall.challenge"
+        );
+        // Genuine transport prose still classifies.
+        assert_eq!(
+            error_code("dns error: failed to lookup address information", None),
+            "network.dns"
+        );
+        assert_eq!(
+            error_code("request timed out after 30s", None),
+            "network.timeout"
+        );
     }
 
     #[test]
