@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The crawl adapter attributes transport errors with the same typed classifier
+  as fetch, instead of text matching: an unresolvable origin, an origin-side or
+  interception certificate failure, a URL-level policy refusal, and an
+  unclassified protocol error no longer bench a healthy proxy lane, and
+  origin-side signals become pair probation with host rotation. Only genuine
+  lane-level failures bench.
+
 - Crawl redirects are decided before the network: each redirect hop of a
   queued page is checked for same-host scope and robots permission before the
   target is dialed, so an excluded or disallowed target is never requested;

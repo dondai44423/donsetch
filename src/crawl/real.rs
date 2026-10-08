@@ -165,15 +165,13 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                             }
                         }
                         Err(e) => {
-                            let msg = format!("{e}");
+                            // The typed classifier is the single source of
+                            // attribution: origin DNS and certificate
+                            // failures, policy refusals and local errors
+                            // leave lane health alone; only genuine
+                            // lane-level failures bench it.
                             if lane != "direct" {
-                                if msg.contains("CONNECT -> 407") {
-                                    pool.note_fetch_auth_fail(&host, &lane);
-                                } else if msg.contains("timeout") || msg.contains("timed out") {
-                                    pool.note_fetch_timeout(&host, &lane);
-                                } else {
-                                    pool.note_fetch_dead(&host, &lane);
-                                }
+                                crate::fetch::client::note_lane_outcome(&pool, &host, &lane, &e);
                             }
                             FetchedPage {
                                 lane: lane.clone(),

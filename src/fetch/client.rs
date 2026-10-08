@@ -1428,8 +1428,10 @@ fn pool_pick_enabled(
 /// (the message reads "dns timeout", which `contains("timed out")`
 /// never matched).
 ///
-/// Lane accounting for one failed hop on a pool lane.
-fn note_lane_outcome(
+/// Lane accounting for one failed hop on a pool lane. Shared by the
+/// fetch path and the crawl adapter so both attribute errors the same
+/// way: origin-side and local errors never bench a healthy lane.
+pub(crate) fn note_lane_outcome(
     pool: &crate::search::egress::EgressPool,
     host: &str,
     egress_id: &str,
@@ -1459,6 +1461,9 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
     let msg = e.to_string();
     match e {
         FetchError::Dns(_) | FetchError::DnsTimeout(_) => None,
+        // URL-level refusals never reached a dial (policy, malformed
+        // URL, our own hop budget): no verdict about the lane.
+        FetchError::InvalidUrl(_) | FetchError::Ssrf(_) | FetchError::TooManyRedirects => None,
         FetchError::Timeout => Some(LaneNote::Timeout),
         // A certificate-verify failure is the certificate the far
         // side presented, not lane health: on a SOCKS5 tunnel and a
@@ -1650,6 +1655,16 @@ mod transport_exit_tests {
             None
         );
         assert_eq!(lane_note(&FetchError::Http("parser died".into())), None);
+        // URL-level classes that never dialed: a malformed URL whose
+        // text happens to contain "connect" must not read as a dead
+        // lane either.
+        assert_eq!(
+            lane_note(&FetchError::InvalidUrl(
+                "http://connectivity.example:99999/".into()
+            )),
+            None
+        );
+        assert_eq!(lane_note(&FetchError::TooManyRedirects), None);
     }
 
     // The vocabulary split: cert-verify failures are origin-side (the
