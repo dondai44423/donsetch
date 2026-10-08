@@ -537,3 +537,65 @@ async fn stealth_v3_invalid_ambient_proxy_keeps_explicit_bypass_and_lane_control
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn stealth_v3_selected_route_keeps_lane_health_for_the_next_call() {
+    use donsetch::search::egress::EgressPool;
+    use donsetch::transport::proxy::Proxy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe {
+        std::env::set_var("DONSETCH_FETCH_ROTATE", "1");
+        std::env::remove_var("DONSETCH_NO_FETCH_ROTATE");
+        std::env::set_var("DONSETCH_NO_ENV_PROXY", "1");
+        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+    }
+    let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxies = [&a, &b].map(|listener| {
+        Proxy::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap()
+    });
+    let pool = Arc::new(EgressPool::new(proxies.to_vec()));
+    let fetcher = Fetcher::new(BrowserProfile::host_default())
+        .unwrap()
+        .with_egress(Arc::clone(&pool));
+    let url = "http://127.0.0.1:51999/selected-route-health";
+    let selected = fetcher.route_for_fetch(url);
+    assert_eq!(selected.proxy_for(url).unwrap().unwrap(), proxies[0]);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = a.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 16384);
+            head.push(socket.read_u8().await.unwrap());
+        }
+        assert!(head.starts_with(b"GET http://127.0.0.1:51999/selected-route-health HTTP/1.1\r\n"));
+        socket
+            .write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fetcher.fetch_persona_on_route(url, None, Some(&selected)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(out.status, 429);
+    assert_eq!(out.route, selected);
+    assert_ne!(
+        pool.pick_fetch("127.0.0.1", false).unwrap().id,
+        proxies[0].id(),
+        "the actual selected proxy returned 429, so the next call must change lanes"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), b.accept())
+            .await
+            .is_err(),
+        "health feedback must not start a second request in this call"
+    );
+}

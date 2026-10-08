@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fetch selects its route once before adapter and archive recovery. Related
+  fallbacks, browser actions and replay retain that route and the original
+  deadline; selected pool lanes retain their health feedback without a new pick.
+
 - Fetch browser recovery and HTTP replay retain the selected route. Protocol
   proxy settings and per-target bypasses are captured for the request;
   unauthenticated proxies use Chromium's proxy setting, and failed required

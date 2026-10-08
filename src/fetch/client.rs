@@ -283,23 +283,24 @@ impl Fetcher {
         } else {
             None
         };
-        let pool_lane_id = pool_lane.as_ref().map(|e| e.id.clone());
-        let use_pool_lane = pool_lane_is_proxy(pool_lane.as_ref());
-        // Only a real lane pins the request and mutes env proxies. A
-        // `direct` answer from the pool (every lane dead, or burned
-        // for this host) must leave the env-proxy path in charge:
-        // otherwise HTTPS_PROXY is silently ignored and the request
-        // leaves on the real address (#302 review).
-        let pinned_pool = pool_lane.as_ref().and_then(|e| e.proxy.as_ref());
-        // Resolve the actual route before lookup, and retain this exact
-        // sent-header snapshot even if another response changes the jar.
+        // A pool answer without a proxy leaves configured routing in charge.
+        // The selected pool host/id travel with the route so related hops and
+        // browser replay teach the original assignment without picking again.
         let route = route_override.cloned().unwrap_or_else(|| {
-            proxy
-                .or(if use_pool_lane { pinned_pool } else { None })
-                .cloned()
-                .map(RequestRoute::pinned)
-                .unwrap_or_else(RequestRoute::configured)
+            if let Some(proxy) = proxy {
+                RequestRoute::pinned(proxy.clone())
+            } else if pool_lane_is_proxy(pool_lane.as_ref()) {
+                let lane = pool_lane.as_ref().expect("proxy lane");
+                RequestRoute::pooled(
+                    lane.proxy.clone().expect("proxy lane"),
+                    fetch_host.clone(),
+                    lane.id.clone(),
+                )
+            } else {
+                RequestRoute::configured()
+            }
         });
+        let pool_lane = route.pool_lane();
         let initial_proxy = route.proxy_for(url_str)?;
         let initial_url =
             url::Url::parse(url_str).map_err(|_| FetchError::InvalidUrl(url_str.into()))?;
@@ -339,15 +340,8 @@ impl Fetcher {
         let mut redirects = 0u8;
         let mut first_request = true;
 
-        // Resolve env-var proxy (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
-        // when no explicit proxy lane is passed. This follows the
-        // curl/wget convention so users can route all DonSeTch
-        // traffic through a proxy with a single env var. Re-resolved
-        // for the CURRENT url at every hop (curl parity, E15: a
-        // redirect to a NO_PROXY-covered host dials direct instead of
-        // riding the env proxy for the rest of the chain). Explicit
-        // proxy lanes and pool sticky lanes stay pinned for the whole
-        // chain by design.
+        // Evaluate captured protocol/bypass settings for each current URL.
+        // Explicit and pool routes remain pinned across the redirect chain.
 
         loop {
             let hop_proxy = if first_request {
@@ -380,18 +374,18 @@ impl Fetcher {
             {
                 Ok(o) => o,
                 Err(e) => {
-                    if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
-                        note_lane_outcome(pool, &fetch_host, id, &e);
+                    if let (Some(pool), Some((host, id))) = (&self.egress, pool_lane) {
+                        note_lane_outcome(pool, host, id, &e);
                     }
                     return Err(e);
                 }
             };
             out.route = route.clone();
-            if let (Some(pool), Some(id)) = (&self.egress, &pool_lane_id) {
+            if let (Some(pool), Some((host, id))) = (&self.egress, pool_lane) {
                 match out.status {
-                    429 => pool.note_fetch_rate_limited(&fetch_host, id),
+                    429 => pool.note_fetch_rate_limited(host, id),
                     200 | 304 => {
-                        pool.report_ok(&fetch_host, id);
+                        pool.report_ok(host, id);
                         pool.observe_rtt(id, hop_started.elapsed());
                     }
                     _ => {}
@@ -645,22 +639,22 @@ impl Fetcher {
             .await
     }
 
-    /// Select a browser-only fetch route with the same opt-in pool policy as HTTP.
+    /// Select once for the whole fetch call, including related fallback URLs.
     pub fn route_for_fetch(&self, url: &str) -> RequestRoute {
         let host = url::Url::parse(url)
             .ok()
-            .and_then(|url| url.host_str().map(str::to_owned));
-        let proxy = if crate::config::cfg().proxy.fetch_rotate {
-            self.egress
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+        if crate::config::cfg().proxy.fetch_rotate
+            && let Some(lane) = self
+                .egress
                 .as_ref()
-                .and_then(|pool| pool.pick_fetch(host.as_deref().unwrap_or_default(), true))
-                .and_then(|lane| lane.proxy)
-        } else {
-            None
-        };
-        proxy
-            .map(RequestRoute::pinned)
-            .unwrap_or_else(RequestRoute::configured)
+                .and_then(|pool| pool.pick_fetch(&host, true))
+            && let Some(proxy) = lane.proxy
+        {
+            return RequestRoute::pooled(proxy, host, lane.id);
+        }
+        RequestRoute::configured()
     }
 
     /// Repeat HTTP under the policy that produced the browser document.

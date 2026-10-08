@@ -10,6 +10,11 @@ pub struct RequestRoute(RoutePolicy);
 enum RoutePolicy {
     Direct,
     Pinned(Proxy),
+    Pool {
+        proxy: Proxy,
+        host: String,
+        lane: String,
+    },
     Configured {
         http: Option<String>,
         https: Option<String>,
@@ -31,6 +36,18 @@ impl RequestRoute {
         Self(RoutePolicy::Pinned(proxy))
     }
 
+    pub(crate) fn pooled(proxy: Proxy, host: String, lane: String) -> Self {
+        Self(RoutePolicy::Pool { proxy, host, lane })
+    }
+
+    /// The original pool assignment, retained for health feedback on later hops.
+    pub(crate) fn pool_lane(&self) -> Option<(&str, &str)> {
+        match &self.0 {
+            RoutePolicy::Pool { host, lane, .. } => Some((host, lane)),
+            _ => None,
+        }
+    }
+
     pub fn configured() -> Self {
         let http = configured_proxy_value("http");
         let https = configured_proxy_value("https");
@@ -49,7 +66,9 @@ impl RequestRoute {
         use sha2::{Digest, Sha256};
         match &self.0 {
             RoutePolicy::Direct => "direct".into(),
-            RoutePolicy::Pinned(proxy) => format!("proxy:{}", proxy.connection_key()),
+            RoutePolicy::Pinned(proxy) | RoutePolicy::Pool { proxy, .. } => {
+                format!("proxy:{}", proxy.connection_key())
+            }
             RoutePolicy::Configured {
                 http,
                 https,
@@ -85,7 +104,7 @@ impl RequestRoute {
         }
         match &self.0 {
             RoutePolicy::Direct => Ok(None),
-            RoutePolicy::Pinned(proxy) => Ok(Some(proxy.clone())),
+            RoutePolicy::Pinned(proxy) | RoutePolicy::Pool { proxy, .. } => Ok(Some(proxy.clone())),
             RoutePolicy::Configured {
                 http,
                 https,
@@ -109,7 +128,7 @@ impl RequestRoute {
     ) -> Result<(Option<Proxy>, Option<Proxy>, String), FetchError> {
         match &self.0 {
             RoutePolicy::Direct => Ok((None, None, String::new())),
-            RoutePolicy::Pinned(proxy) => {
+            RoutePolicy::Pinned(proxy) | RoutePolicy::Pool { proxy, .. } => {
                 Ok((Some(proxy.clone()), Some(proxy.clone()), String::new()))
             }
             RoutePolicy::Configured {

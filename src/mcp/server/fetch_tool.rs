@@ -6,6 +6,7 @@
 use serde_json::{Value, json};
 
 use super::*;
+use crate::transport::request_route::RequestRoute;
 
 /// The caller's whole-call budget, carried into the browser helpers so a
 /// single pass can be sized against what is left of it.
@@ -49,6 +50,12 @@ impl Budget {
         let usable = remaining.saturating_sub(reserve);
         usable.min(default)
     }
+}
+
+/// State selected once before adapter, archive or browser work.
+struct FetchCall {
+    route: RequestRoute,
+    budget: Budget,
 }
 
 async fn fetch_with_budget(
@@ -759,9 +766,10 @@ fn fetch_read_options(args: &Value) -> Result<ExtractOptions, Value> {
 /// Single-URL fetch with resurrection (v3): dead URLs get one
 /// honest attempt at the Wayback Machine before the error stands.
 pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
-    if let Err(error) = fetch_input(args, url) {
-        return error;
-    }
+    let parsed_url = match fetch_input(args, url) {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
     if let Err(error) = fetch_read_options(args) {
         return error;
     }
@@ -770,14 +778,26 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
         Some("only") => "only",
         _ => "auto",
     };
+    let budget = Budget::of(args);
+    // Preserve persona binding before the pool pick, then freeze that route
+    // for the entire call. A related adapter host cannot bind another lane.
+    let route = {
+        let host = parsed_url.host_str().unwrap_or_default();
+        let mut state = daemon.state.lock().await;
+        let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
+        state.ensure_persona(host, &caps);
+        state.ensure_persona_egress(host);
+        daemon.fetcher.route_for_fetch(url)
+    };
+    let call = FetchCall { route, budget };
     if archive == "only" {
         let no_live = tool_error(format!("archive=only : skipping live fetch for {url}"));
-        return match try_resurrect(daemon, args, url, &no_live).await {
+        return match try_resurrect(daemon, args, url, &no_live, &call.route).await {
             Ok(v) => v,
             Err(f) => resurrect_error(url, &f),
         };
     }
-    let result = Box::pin(fetch_single_inner(daemon, args, url)).await;
+    let result = Box::pin(fetch_single_inner(daemon, args, url, &call)).await;
     if archive == "off" || result.get("isError") != Some(&json!(true)) {
         return result;
     }
@@ -804,7 +824,7 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     if !resurrectable {
         return result;
     }
-    match try_resurrect(daemon, args, url, &result).await {
+    match try_resurrect(daemon, args, url, &result, &call.route).await {
         Ok(v) => v,
         Err(f) => {
             // The original live error stands as the primary answer;
@@ -964,12 +984,20 @@ fn fetch_route(
 /// serves the real SSR page instead of the humanity interstitial
 /// or the JS shell. The body is discarded; the side effect is the
 /// cookie jar. Returns whether a navigation actually ran.
-async fn reddit_session_hop(daemon: &Arc<Daemon>, u: &url::Url, trace: &mut Trace) -> bool {
+async fn reddit_session_hop(
+    daemon: &Arc<Daemon>,
+    u: &url::Url,
+    trace: &mut Trace,
+    route: &RequestRoute,
+) -> bool {
     let Some(oldu) = crate::adapters::reddit_session_url(u) else {
         return false;
     };
     let t0 = std::time::Instant::now();
-    let hop = daemon.fetcher.fetch_persona(&oldu, None).await;
+    let hop = daemon
+        .fetcher
+        .fetch_persona_on_route(&oldu, None, Some(route))
+        .await;
     trace.step(
         "1",
         "reddit-session",
@@ -984,15 +1012,16 @@ async fn reddit_session_fallback(
     args: &Value,
     url: &str,
     trace: &mut Trace,
+    call: &FetchCall,
 ) -> Value {
     let hop_done = match url::Url::parse(url) {
-        Ok(pu) => reddit_session_hop(daemon, &pu, trace).await,
+        Ok(pu) => reddit_session_hop(daemon, &pu, trace, &call.route).await,
         Err(_) => false,
     };
     let prior = trace.value().as_array().cloned().unwrap_or_default();
     let mut args2 = args.clone();
     args2["_reddit_session"] = json!(true);
-    let mut res = Box::pin(fetch_single_inner(daemon, &args2, url)).await;
+    let mut res = Box::pin(fetch_single_inner(daemon, &args2, url, call)).await;
     if let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["reddit_session"] = json!(hop_done);
     }
@@ -1018,6 +1047,7 @@ fn reddit_session_retry_eligible(verdict: &Verdict, host: &str, args: &Value) ->
 /// reads as ONE ladder rather than two unrelated hops. The retry
 /// runs the full generic pipeline, which escalates on its own
 /// rules (HTML fetch, ghost, cookie retry).
+#[allow(clippy::too_many_arguments)]
 async fn adapter_fallback(
     daemon: &Arc<Daemon>,
     args: &Value,
@@ -1026,6 +1056,7 @@ async fn adapter_fallback(
     action: &str,
     why: &str,
     session_seeded: bool,
+    call: &FetchCall,
 ) -> Value {
     trace.step("adapter", action, why, 0);
     // Try the public page before spending a session-init request. A blocked
@@ -1044,7 +1075,7 @@ async fn adapter_fallback(
     let mut args2 = args.clone();
     args2["_no_adapter"] = json!(true);
     args2["_reddit_session"] = json!(session_seeded);
-    let mut res = Box::pin(fetch_single_inner(daemon, &args2, &retry_url)).await;
+    let mut res = Box::pin(fetch_single_inner(daemon, &args2, &retry_url, call)).await;
     if let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["adapter_fallback"] = json!(true);
     }
@@ -1079,9 +1110,14 @@ fn fold_trace_into_result(res: &mut Value, prior: Vec<Value>) {
 }
 
 #[allow(clippy::field_reassign_with_default)]
-pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
+async fn fetch_single_inner(
+    daemon: &Arc<Daemon>,
+    args: &Value,
+    url: &str,
+    call: &FetchCall,
+) -> Value {
     let t0 = std::time::Instant::now();
-    let budget = Budget::of(args);
+    let budget = call.budget;
     let parsed_url = match fetch_input(args, url) {
         Ok(parsed) => parsed,
         Err(error) => return error,
@@ -1175,7 +1211,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             );
         }
         return fetch_with_actions(
-            daemon, &url, &url_host, &opts, &actions, shot, image_text, budget,
+            daemon, &url, &url_host, &opts, &actions, shot, image_text, call,
         )
         .await;
     }
@@ -1218,9 +1254,6 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         // re-mints automatically.
         let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
         state.ensure_persona(&host, &caps);
-        // v4 A2: bind an exclusive egress lane to this persona
-        // (no burned / foreign-persona reuse).
-        state.ensure_persona_egress(&host);
     }
     // v4 E2: persona locale drives Accept-Language so tier-1 and
     // the ghost claim one language identity. Viewport/locale for the
@@ -1321,7 +1354,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(&orig_url)
-            .filter(|entry| entry.outcome.route == daemon.fetcher.route_for_fetch(&orig_url))
+            .filter(|entry| entry.outcome.route == call.route)
     } else {
         None
     };
@@ -1338,13 +1371,17 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
     if !skip_tier1 && !prewarmed {
         let t0 = std::time::Instant::now();
         let response = {
-            let request = daemon.fetcher.fetch_persona(&url, persona_al.as_deref());
+            let request = daemon.fetcher.fetch_persona_on_route(
+                &url,
+                persona_al.as_deref(),
+                Some(&call.route),
+            );
             if adapter_used == Some("adapter:reddit-json") {
                 // The structured endpoint and session initialization do not
                 // depend on each other's response. Overlap their network waits.
                 // A usable JSON reply wins immediately; failures still wait
                 // for the session before reading the public SSR page.
-                let seed = reddit_session_hop(daemon, &parsed_url, &mut trace);
+                let seed = reddit_session_hop(daemon, &parsed_url, &mut trace, &call.route);
                 tokio::pin!(request, seed);
                 tokio::select! {
                     reply = &mut request => {
@@ -1376,6 +1413,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                         "fallback",
                         "transport error : retrying original URL",
                         adapter_session_seeded,
+                        call,
                     )
                     .await;
                 }
@@ -1508,6 +1546,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
                     "fallback",
                     &why,
                     adapter_session_seeded,
+                    call,
                 )
                 .await;
             }
@@ -1518,7 +1557,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             // turns that into the card. Cheap enough to try before
             // any ghost pass, on tier 1 and on auto alike.
             _ if reddit_session_retry_eligible(&o.verdict, &host, args) => {
-                return reddit_session_fallback(daemon, args, &url, &mut trace).await;
+                return reddit_session_fallback(daemon, args, &url, &mut trace, call).await;
             }
             _ if tier != "1"
                 && crate::detect::walls::browser_recovery(
@@ -1579,6 +1618,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             "shape-mismatch",
             "structured payload unavailable : retrying original URL",
             adapter_session_seeded,
+            call,
         )
         .await;
     }
@@ -1794,7 +1834,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
         && (still_thin || shell_text || challenge_text || chrome_text)
         && reddit_session_retry_eligible(&Verdict::Blocked, &host, args)
     {
-        return reddit_session_fallback(daemon, args, &url, &mut trace).await;
+        return reddit_session_fallback(daemon, args, &url, &mut trace, call).await;
     }
     let need_ghost = !is_pdf_content
         && !adapter_host // adapter endpoints (reddit .json, registry APIs) are plain GETs
@@ -1847,10 +1887,6 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             }
         }
 
-        let route = out
-            .as_ref()
-            .map(|out| out.route.clone())
-            .unwrap_or_else(|| daemon.fetcher.route_for_fetch(&url));
         let ghost_result = ghost_escalate(
             daemon,
             &url,
@@ -1861,7 +1897,7 @@ pub(super) async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: 
             shot,
             &mut trace,
             budget,
-            &route,
+            &call.route,
             persona_al.as_deref(),
         )
         .await;
@@ -3016,7 +3052,7 @@ pub(super) fn is_pdf_url_like(url: &str) -> bool {
 /// on the interacted-with page. One call replaces hound's
 /// navigate→act→act→read round-trips.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn fetch_with_actions(
+async fn fetch_with_actions(
     daemon: &Arc<Daemon>,
     url: &str,
     host: &str,
@@ -3024,13 +3060,14 @@ pub(super) async fn fetch_with_actions(
     actions: &[crate::ghost::actions::Action],
     shot: Option<&str>,
     image_text: bool,
-    budget: Budget,
+    call: &FetchCall,
 ) -> Value {
+    let budget = call.budget;
     let mut trace = Trace::default();
     trace.step("route", "actions", "browser-script", 0);
 
     let t0 = std::time::Instant::now();
-    let wire = {
+    let mut wire = {
         let state = daemon.state.lock().await;
         state
             .personas
@@ -3039,6 +3076,7 @@ pub(super) async fn fetch_with_actions(
             .map(|p| p.ghost_wire())
             .unwrap_or_default()
     };
+    wire.route = Some(call.route.clone());
     let g = match daemon
         .ghost_mgr
         .acquire_for_wire(&daemon.profile, Some(host), wire)
@@ -3583,14 +3621,16 @@ enum Avail {
 }
 
 /// Availability API lookup (keyless, public).
-async fn availability_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
+async fn availability_lookup(daemon: &Arc<Daemon>, url: &str, route: &RequestRoute) -> Avail {
     let avail_url = format!(
         "https://archive.org/wayback/available?url={}",
         encode_query_value(url)
     );
     let fetched = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        daemon.fetcher.fetch(&avail_url),
+        daemon
+            .fetcher
+            .fetch_persona_on_route(&avail_url, None, Some(route)),
     )
     .await;
     let Ok(Ok(out)) = fetched else {
@@ -3637,7 +3677,7 @@ async fn availability_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
 /// http:// answers an https:// query (the availability API is
 /// scheme-strict and misses those). limit=-5 keeps the LAST rows,
 /// i.e. the captures nearest the present.
-async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
+async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str, route: &RequestRoute) -> Avail {
     let bare = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -3648,7 +3688,9 @@ async fn cdx_lookup(daemon: &Arc<Daemon>, url: &str) -> Avail {
     );
     let fetched = tokio::time::timeout(
         std::time::Duration::from_secs(12),
-        daemon.fetcher.fetch(&cdx_url),
+        daemon
+            .fetcher
+            .fetch_persona_on_route(&cdx_url, None, Some(route)),
     )
     .await;
     let Ok(Ok(out)) = fetched else {
@@ -3729,10 +3771,11 @@ async fn try_resurrect(
     args: &Value,
     url: &str,
     live_error: &Value,
+    route: &RequestRoute,
 ) -> Result<Value, ResurrectError> {
     let (mut snap_url, mut ts) = match archive_lookup_pair(
-        availability_lookup(daemon, url),
-        cdx_lookup(daemon, url),
+        availability_lookup(daemon, url, route),
+        cdx_lookup(daemon, url, route),
     )
     .await
     {
@@ -3763,7 +3806,9 @@ async fn try_resurrect(
     let (snap, ct) = loop {
         let snap = match tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            daemon.fetcher.fetch(&snap_url),
+            daemon
+                .fetcher
+                .fetch_persona_on_route(&snap_url, None, Some(route)),
         )
         .await
         {
@@ -5286,6 +5331,84 @@ mod budget_tests {
 mod adapter_hop_tests {
     use super::*;
     use crate::detect::walls::Vendor;
+
+    // Nextest owns config/state; match the production runtime's 8 MiB stack.
+    #[test]
+    fn stealth_v3_adapter_fallback_keeps_the_callers_selected_lane() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all().build().unwrap();
+                runtime.block_on(async {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    unsafe {
+                        std::env::set_var("DONSETCH_FETCH_ROTATE", "1");
+                        std::env::remove_var("DONSETCH_NO_FETCH_ROTATE");
+                        std::env::set_var("DONSETCH_NO_ENV_PROXY", "1");
+                        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
+                        std::env::set_var("DONSETCH_NO_ROUTE_PROBES", "1");
+                    }
+                    let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let proxies = [&a, &b].map(|listener| {
+                        crate::transport::proxy::Proxy::parse(&format!(
+                            "http://{}", listener.local_addr().unwrap()
+                        )).unwrap()
+                    });
+                    let pool = Arc::new(crate::search::egress::EgressPool::new(proxies.to_vec()));
+                    crate::search::egress::install_global(Arc::clone(&pool));
+                    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let (stop, stopped) = tokio::sync::watch::channel(false);
+                    let mut servers = Vec::new();
+                    for (lane, listener) in [("A", a), ("B", b)] {
+                        let events = Arc::clone(&events);
+                        let mut stopped = stopped.clone();
+                        servers.push(tokio::spawn(async move {
+                            loop {
+                                let mut socket = tokio::select! {
+                                    _ = stopped.changed() => break,
+                                    accepted = listener.accept() => accepted.unwrap().0,
+                                };
+                                let mut head = Vec::new();
+                                while !head.ends_with(b"\r\n\r\n") {
+                                    assert!(head.len() < 16384);
+                                    head.push(socket.read_u8().await.unwrap());
+                                }
+                                let request = String::from_utf8(head).unwrap();
+                                let target = request.split_whitespace().nth(1).unwrap().to_owned();
+                                events.lock().unwrap().push((lane, target.clone()));
+                                let (status, body) = if target.contains(".json") {
+                                    (429, "<html><body>Too many requests</body></html>".to_string())
+                                } else {
+                                    (200, format!("<article><h1>Owned fallback lane {lane}</h1><p>{}</p></article>",
+                                        "This complete research document must retain the proxy selected for the original call. ".repeat(40)))
+                                };
+                                socket.write_all(format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                            }
+                        }));
+                    }
+                    let mut daemon = Daemon::new().await.unwrap();
+                    daemon.fetcher = Arc::new(Fetcher::new(daemon.profile.clone()).unwrap().with_egress(Arc::clone(&pool)));
+                    let daemon = Arc::new(daemon);
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(8),
+                        fetch_single(&daemon, &json!({"tier":"1", "archive":"off"}), "http://old.reddit.com/r/owned/")
+                    ).await.unwrap();
+                    stop.send(true).unwrap();
+                    for server in servers { tokio::time::timeout(std::time::Duration::from_secs(2), server).await.unwrap().unwrap(); }
+                    assert_ne!(result["isError"], true, "{result}");
+                    let events = events.lock().unwrap();
+                    assert_eq!(events.len(), 2, "one adapter read and one fallback: {events:?}");
+                    assert!(events[0].1.contains(".json"), "{events:?}");
+                    assert!(!events[1].1.contains(".json"), "{events:?}");
+                    assert!(events.iter().all(|(lane, _)| *lane == "A"),
+                        "a related fallback must not repick after the adapter burns its lane: {events:?}");
+                    assert!(result["content"][0]["text"].as_str().unwrap().contains("Owned fallback lane A"), "{result}");
+                    assert!(!pool.is_dead(&proxies[0].id()),
+                        "an origin 429 must not globally bench a reachable proxy");
+                });
+            }).unwrap().join().unwrap();
+    }
 
     #[test]
     fn browser_controls_keep_the_requested_website_url() {
