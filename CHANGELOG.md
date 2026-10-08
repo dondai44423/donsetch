@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A faulted or unwritable cache directory no longer takes the process
+  down while the state write lock is acquired: lock creation is best
+  effort like the lock itself, so the save reports its own persist
+  error and the process continues.
+
 - Warm revalidation of sites that ship Last-Modified without an ETag
   (example.com behind Cloudflare) no longer fails: a 304 that supplies
   an ETag the stored response never had updates the stored metadata

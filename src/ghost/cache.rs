@@ -401,12 +401,22 @@ impl StateWriteLock {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let file = std::fs::OpenOptions::new()
+            let file = match std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(false)
                 .open(&path)
-                .expect("ghost-state lock file");
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    // A faulted or displaced cache root must not take
+                    // the process down here: locking is best effort
+                    // (like the flock failure below), and the save
+                    // reports its own persist error.
+                    eprintln!("[ghost] cookie vault lock failed: {error}");
+                    return Self { file: None };
+                }
+            };
             loop {
                 let got = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
                 if got == 0 {
@@ -439,7 +449,19 @@ impl StateWriteLock {
                         STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
                         return Self { file: Some(file) };
                     }
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                    // ERROR_SHARING_VIOLATION: another donsetch process
+                    // holds the lock; wait for it. Anything else (a
+                    // faulted or displaced cache root) is best effort:
+                    // report and proceed without the lock so the save
+                    // can surface its own persist error instead of
+                    // spinning here.
+                    Err(error) if error.raw_os_error() == Some(32) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => {
+                        eprintln!("[ghost] cookie vault lock failed: {error}");
+                        return Self { file: None };
+                    }
                 }
             }
         }
