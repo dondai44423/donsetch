@@ -92,7 +92,7 @@ impl Daemon {
                 Vec::new()
             };
             let replay = crate::ghost::cache::vault_over_jar(&sessions, &jar);
-            fetcher.import_cookies(&replay).await;
+            fetcher.import_vault_cookies(&replay).await;
         }
 
         // Build ghost escalation hook for the crawl: renders

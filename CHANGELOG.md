@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The cookie vault reconciles writers transactionally: snapshot saves, cookie
+  harvests and logouts serialize on one advisory lock with per-process
+  temporary files, and cached renders carry capture and logout generations, so
+  a render captured after a harvest survives the next save while a logged-out
+  domain's cached documents stay deleted even when a live daemon still holds
+  them.
+
+- Logout now reaches every store that held the session: vault-backed cookie
+  imports register their domains with the browser jar so a jar rebuild really
+  clears them, and a browser reaped after a logout no longer re-vaults the
+  dead session it still held (cookies for a domain cleared at or after the
+  browser's launch are filtered from the reap harvest).
+
 - Successful HTTP responses across the 2xx range update fetch and crawl lane
   health. Crawl content still requires a usable page before clearing penalties;
   a successful status on a login wall does not qualify.

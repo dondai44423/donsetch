@@ -170,8 +170,15 @@ pub(super) fn make_ghost_hook(
                     return Err(format!("rendered access gate: {verdict:?}"));
                 }
                 if !page.cookies.is_empty() {
-                    fetcher.import_cookies(&page.cookies).await;
-                    crate::ghost::cache::store_session_cookies(&page.cookies);
+                    // A pooled browser can predate a logout for one of
+                    // its domains: a dead session must not ride back
+                    // into the jar or the vault.
+                    let cookies = crate::ghost::cache::session_cookies_since(
+                        &page.cookies,
+                        _guard.launched_epoch,
+                    );
+                    fetcher.import_vault_cookies(&cookies).await;
+                    crate::ghost::cache::store_session_cookies(&cookies);
                 }
                 state
                     .lock()
@@ -662,8 +669,13 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             return;
         }
         if !page.cookies.is_empty() {
-            d.fetcher.import_cookies(&page.cookies).await;
-            crate::ghost::cache::store_session_cookies(&page.cookies);
+            // A pooled browser can predate a logout for one of its
+            // domains: a dead session must not ride back into the
+            // jar or the vault.
+            let cookies =
+                crate::ghost::cache::session_cookies_since(&page.cookies, _guard.launched_epoch);
+            d.fetcher.import_vault_cookies(&cookies).await;
+            crate::ghost::cache::store_session_cookies(&cookies);
             // Honest replay_ok: only verified tier-1 replay earns
             // warm routing.
             let replay_ok = matches!(

@@ -2661,7 +2661,7 @@ pub(super) async fn ghost_escalate(
         }
     }
     if !page.cookies.is_empty() {
-        daemon.fetcher.import_cookies(&page.cookies).await;
+        daemon.fetcher.import_vault_cookies(&page.cookies).await;
         crate::ghost::cache::store_session_cookies(&page.cookies);
     }
     // Retry tier 1 with fresh cookies : the cheap path back to
@@ -3289,7 +3289,11 @@ async fn fetch_with_actions(
         tokio::time::timeout(std::time::Duration::from_secs(3), g.cookies()).await
         && !cookies.is_empty()
     {
-        daemon.fetcher.import_cookies(&cookies).await;
+        // A pooled browser can predate a logout for one of its
+        // domains: a dead session must not ride back into the jar
+        // or the vault.
+        let cookies = crate::ghost::cache::session_cookies_since(&cookies, g.launched_epoch);
+        daemon.fetcher.import_vault_cookies(&cookies).await;
         crate::ghost::cache::store_session_cookies(&cookies);
         if page.vendor.is_some() {
             daemon

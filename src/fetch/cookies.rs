@@ -148,6 +148,24 @@ impl CookieJar {
         }
     }
 
+    /// Import VAULT-backed cookies (session harvests, the boot vault
+    /// replay): stored like any raw cookie, and their domains are
+    /// registered as vault-fed so a later reset (login / logout
+    /// rebuild) drops them. Without the registration a logout's
+    /// rebuild cannot see the domain and the dead session survives
+    /// in the jar, rides the next request, and re-vaults on the next
+    /// tier-1 sync.
+    pub fn import_vault(&mut self, cookies: &[CookieRecord]) {
+        for c in cookies {
+            self.store_raw(c);
+        }
+        for c in cookies {
+            if let Some(d) = normalize_domain(&c.domain) {
+                self.vault_domains.insert(d);
+            }
+        }
+    }
+
     /// Store all Set-Cookie headers from a response for `host`.
     /// `is_https` must reflect the scheme the response arrived
     /// over: Secure cookies received over plain HTTP are dropped

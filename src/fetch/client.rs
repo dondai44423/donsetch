@@ -121,6 +121,19 @@ impl Fetcher {
         }
     }
 
+    /// Import VAULT-backed cookies (session harvests, the boot vault
+    /// replay): as `import_cookies`, and the domains register as
+    /// vault-fed so a login/logout jar rebuild really clears them —
+    /// an unregistered domain is invisible to the reset and its dead
+    /// session survives the logout in the jar.
+    pub async fn import_vault_cookies(&self, cookies: &[CookieRecord]) {
+        let mut jar = self
+            .jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        jar.import_vault(cookies);
+    }
+
     /// Replace the jar wholesale from the session vault (login or
     /// logout just happened on disk). Anything not in `cookies` is
     /// gone, which is exactly what a logout requires.

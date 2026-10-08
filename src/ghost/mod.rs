@@ -140,6 +140,11 @@ pub struct Ghost {
     target: String,
     frozen: bool,
     pub last_used: Instant,
+    /// Vault epoch when this browser launched (vault ordering): a
+    /// session cleared at or after this epoch must not be harvested
+    /// back into the vault by this browser's reap — the browser
+    /// predates the clear and only holds a dead session.
+    pub launched_epoch: u64,
     /// Holds an flock on the shared profile dir. Kept alive for
     /// the Ghost's lifetime so concurrent donsetch processes see
     /// the lock and fall back to a temp profile instead of
@@ -1580,6 +1585,7 @@ impl Ghost {
             target,
             frozen: false,
             last_used: Instant::now(),
+            launched_epoch: crate::ghost::cache::disk_epoch_now(),
             profile_lock,
             temp_profile,
             fetch_guard: Some(fetch_guard),
@@ -1716,6 +1722,11 @@ impl Ghost {
             && let Ok(Ok(list)) =
                 tokio::time::timeout(std::time::Duration::from_secs(3), self.cookies()).await
         {
+            // A pooled browser can outlive a logout for one of its
+            // domains: only cookies a browser launched at
+            // `launched_epoch` may still claim survive the filter, so
+            // this reap cannot re-vault a dead session.
+            let list = cache::session_cookies_since(&list, self.launched_epoch);
             cache::store_session_cookies(&list);
         }
         let cdp = self.cdp.clone();

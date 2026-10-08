@@ -58,6 +58,12 @@ pub struct DomainProfile {
     /// browser's own kill-without-flush.
     #[serde(default)]
     pub session_cookies: Vec<CookieRecord>,
+    /// Last vault stamp that DELETED this host's session material
+    /// (logout / clear). A render captured at or before this stamp
+    /// must not survive a later merge, or an unsaved snapshot would
+    /// resurrect the logged-out DOM.
+    #[serde(default)]
+    pub session_cleared_epoch: u64,
     /// When tier 2 last solved (unix seconds).
     #[serde(default)]
     pub last_solved: u64,
@@ -189,6 +195,8 @@ const STATE_VERSION: u32 = 3;
 impl DomainProfile {
     /// Most recent signal of any kind; the LRU eviction key.
     fn last_activity(&self) -> u64 {
+        // LRU key. A future stamp (clock skew / corrupt file) is not
+        // infinite activity: clamp to now so eviction still ages it.
         [
             self.last_solved,
             self.last_refreshed,
@@ -199,6 +207,7 @@ impl DomainProfile {
         .into_iter()
         .max()
         .unwrap_or(0)
+        .min(now())
     }
 }
 
@@ -297,6 +306,11 @@ pub struct GhostState {
     pub profiles: HashMap<String, DomainProfile>,
     #[serde(default)]
     pub renders: HashMap<String, RenderCache>,
+    /// Tier-1 echo stashed by sync_tier1_cookies for the save that
+    /// follows to re-apply after disk reconciliation: (stamp of the
+    /// snapshot, rows). Process-local; never serialized.
+    #[serde(skip)]
+    pub pending_tier1: Option<(u64, Vec<CookieRecord>)>,
     /// Vault epoch for cross-writer reconciliation: the session
     /// vault has TWO writer classes (the load-modify-save helpers
     /// store_session_cookies / clear_session_cookies_for, which
@@ -310,21 +324,178 @@ pub struct GhostState {
     pub vault_epoch: u64,
 }
 
-/// Process-local bump source for vault epochs. load() seeds the
-/// state with the epoch persisted on disk, so a strictly larger
-/// local stamp is always newer than every disk state this process
-/// has seen.
-static VAULT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Stamp `state` as a fresh vault write: strictly newer than the
-/// disk state it was loaded from (load() seeded the epoch from that
-/// file, and disk may already carry a higher stamp written by another
-/// process) and than every earlier in-process stamp.
+/// Stamp a vault write one past the state it was built from. Every
+/// writer re-reads ghost-state.json under the write lock before
+/// modifying it, so disk epochs are totally ordered across
+/// processes; no process-local counter participates (a local chain
+/// can outrun the disk and then mis-order against a sibling
+/// process's logout). Saturating: u64::MAX stays u64::MAX.
 fn bump_vault_epoch(state: &mut GhostState) {
-    state.vault_epoch = state
-        .vault_epoch
-        .max(VAULT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-        + 1;
+    state.vault_epoch = state.vault_epoch.saturating_add(1);
+}
+
+/// The vault epoch currently on disk, for stamping captures against
+/// the disk write order. Only the field is deserialized.
+pub(crate) fn disk_epoch_now() -> u64 {
+    #[derive(serde::Deserialize)]
+    struct EpochOnly {
+        #[serde(default)]
+        vault_epoch: u64,
+    }
+    std::fs::read(path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<EpochOnly>(&bytes).ok())
+        .map(|e| e.vault_epoch)
+        .unwrap_or(0)
+}
+
+/// The subset of `cookies` a browser launched at epoch `since` may
+/// still claim: a domain session-cleared at or after `since` is a
+/// dead session to that browser, and re-importing or re-vaulting it
+/// would undo the logout. Loads the state once. A launch epoch of 0
+/// (the browser started before any vault write) predates every
+/// clear, so ever-cleared domains filter out; the `> 0` guard is
+/// what keeps never-cleared domains (cleared_epoch 0) for every
+/// launch vintage.
+pub(crate) fn session_cookies_since(cookies: &[CookieRecord], since: u64) -> Vec<CookieRecord> {
+    let state = GhostState::load();
+    cookies
+        .iter()
+        .filter(|c| {
+            let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
+            !state
+                .profiles
+                .get(&host)
+                .is_some_and(|p| p.session_cleared_epoch > 0 && p.session_cleared_epoch >= since)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Cross-process serialization for every ghost-state.json writer:
+/// the cookie helpers, snapshot saves and any other donsetch process
+/// sharing the cache dir. Unix takes a blocking flock, which the
+/// kernel releases on crash; the Windows branch holds the file open
+/// with no sharing, which makes competing opens wait and is equally
+/// released on process death.
+struct StateWriteLock {
+    #[allow(dead_code)] // RAII: held for the lock, never read
+    file: Option<std::fs::File>,
+}
+
+impl StateWriteLock {
+    #[cfg(not(test))]
+    fn acquire() -> Self {
+        // Nested acquisition (save() reached from load()'s one-time
+        // migrations while a helper already holds the lock): the
+        // outer guard keeps the lock; re-locking would self-deadlock
+        // (flock and the Windows share-mode open are both
+        // non-reentrant).
+        if STATE_LOCK_DEPTH.with(|d| d.get()) > 0 {
+            return Self { file: None };
+        }
+        let path = crate::paths::cache_dir().join("ghost-state.lock");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .expect("ghost-state lock file");
+            loop {
+                let got = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if got == 0 {
+                    STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
+                    return Self { file: Some(file) };
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    // Best effort, like every other state write:
+                    // report and proceed rather than wedge the caller.
+                    eprintln!("[ghost] cookie vault lock failed: {error}");
+                    STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
+                    return Self { file: Some(file) };
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            loop {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
+                        return Self { file: Some(file) };
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self { file: None }
+        }
+    }
+
+    #[cfg(test)]
+    fn acquire() -> Self {
+        Self { file: None }
+    }
+}
+
+#[cfg(not(test))]
+thread_local! {
+    /// Re-entrancy depth for the state write lock (same thread):
+    /// save() nested inside a helper's load-modify-save must not
+    /// re-lock; see StateWriteLock::acquire.
+    static STATE_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
+impl Drop for StateWriteLock {
+    fn drop(&mut self) {
+        // Only the outer guard (the one that actually locked) counts
+        // down; nested guards hold no file.
+        if self.file.is_some() {
+            STATE_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+}
+
+/// Stamp the deletion of `key`'s session material across every
+/// profile it touches (apex + subdomains) plus hosts that only ever
+/// appeared as render URLs: a capture recorded at or before `stamp`
+/// can never survive a later merge.
+fn stamp_session_cleared(state: &mut GhostState, key: &str, extra_hosts: &[String], stamp: u64) {
+    for (host, p) in state.profiles.iter_mut() {
+        if crate::auth::cookie_belongs_to(key, host) {
+            p.session_cleared_epoch = stamp;
+        }
+    }
+    for host in extra_hosts {
+        state
+            .profiles
+            .entry(host.clone())
+            .or_default()
+            .session_cleared_epoch = stamp;
+    }
+    state
+        .profiles
+        .entry(key.to_string())
+        .or_default()
+        .session_cleared_epoch = stamp;
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -335,6 +506,11 @@ pub struct RenderCache {
     pub context: Option<String>,
     pub html: String,
     pub at: u64,
+    /// Vault ordering stamp taken at capture: a merge drops this
+    /// render when its host's session_cleared_epoch is at or after
+    /// this value (the capture predates the recorded deletion).
+    #[serde(default)]
+    pub capture_epoch: u64,
 }
 
 // ────────────────────────── route memory (v4 phase 0) ──────────────────────────
@@ -627,6 +803,10 @@ pub fn store_session_cookies(cookies: &[CookieRecord]) {
     if cookies.is_empty() {
         return;
     }
+    // Serialize the whole load-modify-save with every other state
+    // writer (daemon saves, logouts, sibling processes): without it
+    // an interleaved pair lost whichever write landed first.
+    let _lock = StateWriteLock::acquire();
     let mut state = GhostState::load();
     for c in cookies {
         if !is_session_worthy(c) {
@@ -666,7 +846,7 @@ pub fn store_session_cookies(cookies: &[CookieRecord]) {
         }
     }
     bump_vault_epoch(&mut state);
-    state.save();
+    state.persist();
 }
 
 /// Everything currently vaulted, across all domains, for replay
@@ -722,6 +902,7 @@ pub fn clear_session_cookies_for(domain: &str) -> bool {
     if key.is_empty() {
         return false;
     }
+    let _lock = StateWriteLock::acquire();
     let mut state = GhostState::load();
     let mut removed = false;
     // Issue #173: the tier-1 echo of the vault (synced by sync_tier1_cookies)
@@ -748,18 +929,32 @@ pub fn clear_session_cookies_for(domain: &str) -> bool {
     // tier-2 fetch shortcut, so a logged-out domain's dashboard would
     // still hand back its authenticated DOM for up to five minutes.
     // Drop every render whose host belongs to the logged-out domain.
+    // The affected hosts also carry the deletion stamp below, so a
+    // live snapshot cannot resurrect one of these documents.
     let before_r = state.renders.len();
+    let mut cleared_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
     state.renders.retain(|url, _| {
         let host = crate::search::rank::host_of(url);
-        !crate::auth::cookie_belongs_to(&key, &host)
+        if crate::auth::cookie_belongs_to(&key, &host) {
+            cleared_hosts.insert(host);
+            false
+        } else {
+            true
+        }
     });
     removed |= state.renders.len() != before_r;
     if removed {
         // Stamp the deletion so a live daemon snapshot (whose
         // tier1_cookies / renders predate this logout) adopts the
-        // disk side on its next save instead of resurrecting them.
+        // disk side on its next save instead of resurrecting them,
+        // and so a capture ordered at or before the stamp can never
+        // survive a merge (the render keep-rule in
+        // merge_vault_from_disk).
         bump_vault_epoch(&mut state);
-        state.save();
+        let stamp = state.vault_epoch;
+        let extras: Vec<String> = cleared_hosts.into_iter().collect();
+        stamp_session_cleared(&mut state, &key, &extras, stamp);
+        state.persist();
     }
     removed
 }
@@ -831,6 +1026,19 @@ impl GhostState {
                     profile.cookies = filter_clearance(&profile.cookies);
                     if profile.cookies.len() != before {
                         changed = true;
+                    }
+                    // Corrupt or legacy floats must not steer routing:
+                    // a NaN / out-of-range EWMA is not evidence.
+                    for ewma in [
+                        &mut profile.t1_ewma,
+                        &mut profile.ghost_ewma,
+                        &mut profile.warm_ewma,
+                    ] {
+                        let value = *ewma;
+                        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                            *ewma = default_ewma();
+                            changed = true;
+                        }
                     }
                 }
                 // The session vault's own migration: junk from
@@ -1199,17 +1407,24 @@ impl GhostState {
     /// values. Does NOT save: the caller is already inside the
     /// state lock and the outcome record after it saves once.
     pub fn sync_tier1_cookies(&mut self, all: &[CookieRecord]) {
-        // This snapshot is now a tier-1 vault writer: stamp it newer
-        // than the disk state it came from, or a helper's concurrent
-        // logout deletion (disk epoch bump) and this sync could
-        // reorder. Writing without a stamp would also let the NEXT
-        // save adopt a stale disk tier-1 echo over this one.
-        bump_vault_epoch(self);
         if !crate::config::cfg().state.cookie_vault
             || crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off
         {
             return;
         }
+        // Stash the snapshot for the save that follows: persist()
+        // reconciles with disk first and re-applies the echo after,
+        // so a helper harvest or logout landing in between is adopted
+        // (never discarded by this writer, never discarded itself),
+        // and a row a deletion removed cannot be re-raised.
+        self.pending_tier1 = Some((self.vault_epoch, all.to_vec()));
+        self.merge_tier1_jar(all);
+    }
+
+    /// The jar-merge mechanics for sync_tier1_cookies: dedupe by
+    /// (name, domain, path), refresh in place at the front, drop
+    /// expired and pathological values, cap the tail.
+    fn merge_tier1_jar(&mut self, all: &[CookieRecord]) {
         let now = now();
         for c in all {
             if c.domain.is_empty()
@@ -1242,6 +1457,18 @@ impl GhostState {
     /// Persistence errors are reported on stderr; in-memory learning survives.
     /// Unit-test builds and `state.no_disk_state` skip disk writes.
     pub fn save(&mut self) {
+        // Serialize with every other ghost-state writer: the cookie
+        // helpers and other processes write the same file, and a
+        // nested load-modify-save interleave used to lose whichever
+        // write landed first.
+        let _lock = StateWriteLock::acquire();
+        self.persist();
+    }
+
+    /// The write itself. Callers already holding the state write
+    /// lock (the cookie helpers) must call this, never `save()`: the
+    /// lock is not re-entrant.
+    fn persist(&mut self) {
         // Always persist the current format version: a fresh state
         // derives Default (version 0) and would otherwise keep
         // re-running one-time migrations on every load.
@@ -1279,19 +1506,41 @@ impl GhostState {
                 // (a stale in-memory copy saving later would otherwise
                 // rewind lifetimes). Max-merge is correct for counters:
                 // they only grow. Real case: the pool-warm receipt.
-                if let Ok(bytes) = std::fs::read(&p)
-                    && let Ok(disk) = serde_json::from_slice::<GhostState>(&bytes)
-                {
+                let disk = std::fs::read(&p)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<GhostState>(&bytes).ok());
+                if let Some(disk) = &disk {
                     self.probes_total = self.probes_total.max(disk.probes_total);
                     self.shadowed_assets_total =
                         self.shadowed_assets_total.max(disk.shadowed_assets_total);
                     self.prewarmed_served_total =
                         self.prewarmed_served_total.max(disk.prewarmed_served_total);
                     self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
-                    self.merge_vault_from_disk(&disk);
+                    self.merge_vault_from_disk(disk);
+                }
+                // A stashed tier-1 echo re-applies AFTER the merge:
+                // adoption cannot drop it, and a row a session clear
+                // that postdates the snapshot removed stays removed.
+                if let Some((snapshot_epoch, rows)) = self.pending_tier1.take() {
+                    let keep: Vec<CookieRecord> = rows
+                        .into_iter()
+                        .filter(|c| {
+                            let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
+                            !disk.as_ref().is_some_and(|d| {
+                                d.profiles
+                                    .get(&host)
+                                    .is_some_and(|p| p.session_cleared_epoch > snapshot_epoch)
+                            })
+                        })
+                        .collect();
+                    self.merge_tier1_jar(&keep);
+                    bump_vault_epoch(self);
                 }
                 let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
-                let tmp = p.with_extension("json.tmp");
+                // Unique per process: a mixed-version writer that does
+                // not share this advisory lock can never clobber this
+                // write's temporary file.
+                let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
                 // 0600 BEFORE content lands on disk: the state file
                 // carries harvested cookies (clearance / session
                 // identifiers) and must not be world-readable, even
@@ -1336,25 +1585,65 @@ impl GhostState {
     /// a daemon save rewrote the file from its boot-era snapshot:
     /// every harvest since was erased, and every logout deletion
     /// came back (dead sessions replayed on the next launch).
+    /// Renders reconcile per key: a live capture is not erased by an
+    /// unrelated newer disk epoch, and a capture stamped at or before
+    /// a host's session clear is dropped, never resurrected.
     pub fn merge_vault_from_disk(&mut self, disk: &GhostState) {
-        if disk.vault_epoch > self.vault_epoch {
-            for (host, dp) in disk.profiles.iter() {
-                match self.profiles.get_mut(host) {
-                    // Both sides know the host: disk's vault wins.
-                    Some(p) => p.session_cookies = dp.session_cookies.clone(),
-                    // Disk-only host: a helper harvested a host this
-                    // snapshot has never seen. Adopt the whole
-                    // profile (its wall-state rode along on disk;
-                    // dropping it here would strand the harvest).
-                    None => {
-                        self.profiles.insert(host.clone(), dp.clone());
-                    }
+        if disk.vault_epoch <= self.vault_epoch {
+            return;
+        }
+        for (host, dp) in disk.profiles.iter() {
+            match self.profiles.get_mut(host) {
+                // Both sides know the host: disk's session vault wins,
+                // and its deletion stamp rides along so a later merge
+                // orders captures against it.
+                Some(p) => {
+                    p.session_cookies = dp.session_cookies.clone();
+                    p.session_cleared_epoch = dp.session_cleared_epoch;
+                }
+                // Disk-only host: a helper harvested a host this
+                // snapshot has never seen. Adopt the whole profile
+                // (its wall-state rode along on disk; dropping it
+                // here would strand the harvest).
+                None => {
+                    self.profiles.insert(host.clone(), dp.clone());
                 }
             }
-            self.tier1_cookies = disk.tier1_cookies.clone();
-            self.renders = disk.renders.clone();
-            self.vault_epoch = disk.vault_epoch;
         }
+        self.tier1_cookies = disk.tier1_cookies.clone();
+        // Renders merge per key: adopting the disk map wholesale
+        // dropped every render the live snapshot captured after the
+        // disk write that created the newer epoch, and keeping the
+        // snapshot's map wholesale would resurrect a logged-out DOM.
+        // A self-only render survives exactly when no session clear
+        // for its host is stamped at or after its capture.
+        self.renders.retain(|url, r| {
+            if disk.renders.contains_key(url) {
+                return true; // superseded below when disk's is newer
+            }
+            let host = crate::search::rank::host_of(url);
+            let cleared = disk
+                .profiles
+                .get(&host)
+                .map(|p| p.session_cleared_epoch)
+                .unwrap_or(0);
+            cleared < r.capture_epoch
+        });
+        for (url, dr) in disk.renders.iter() {
+            match self.renders.get_mut(url) {
+                // Both captured it: the newer capture wins; an equal
+                // second keeps the live snapshot's copy.
+                Some(sr) => {
+                    if dr.at > sr.at {
+                        *sr = dr.clone();
+                    }
+                }
+                None => {
+                    self.renders.insert(url.clone(), dr.clone());
+                }
+            }
+        }
+        self.vault_epoch = disk.vault_epoch;
     }
 
     // ── Decision ──
@@ -1719,13 +2008,15 @@ impl GhostState {
         if html.len() > RENDER_MAX_HTML {
             return;
         }
-        // LRU cap: evict oldest renders when at capacity.
+        // LRU cap: evict oldest renders when at capacity. Future
+        // stamps (clock skew) clamp to now so they cannot pin the
+        // eviction forever.
         if !self.renders.contains_key(url)
             && self.renders.len() >= RENDER_MAX
             && let Some(oldest_key) = self
                 .renders
                 .iter()
-                .min_by_key(|(_, r)| r.at)
+                .min_by_key(|(_, r)| r.at.min(now()))
                 .map(|(k, _)| k.clone())
         {
             self.renders.remove(&oldest_key);
@@ -1737,6 +2028,10 @@ impl GhostState {
                 context,
                 html: html.to_string(),
                 at: now(),
+                // Anchor to the disk write order (sibling processes
+                // share no counter): one past the freshest epoch this
+                // state knows.
+                capture_epoch: disk_epoch_now().max(self.vault_epoch).saturating_add(1),
             },
         );
         self.save();
@@ -2001,6 +2296,178 @@ mod tests {
         disk.tier1_cookies = vec![];
         mine.merge_vault_from_disk(&disk);
         assert_eq!(mine.tier1_cookies.len(), 1, "tie = snapshot stands");
+    }
+
+    // == v4.6 vault ordering: captures vs deletions ==
+
+    fn render(html: &str, at: u64, capture_epoch: u64) -> RenderCache {
+        RenderCache {
+            document: None,
+            context: Some("ctx".into()),
+            html: html.into(),
+            at,
+            capture_epoch,
+        }
+    }
+
+    // The vault RED, at merge level: a helper harvest (newer disk
+    // epoch, no clear for the host) must not discard a live capture
+    // recorded after the harvest; the capture stamp outranks it.
+    #[test]
+    fn live_capture_after_helper_harvest_survives_the_snapshot_merge() {
+        let mut mine = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        mine.renders
+            .insert("http://ex.com/owned".into(), render("live", 100, 7));
+        let mut disk = GhostState {
+            vault_epoch: 6,
+            ..Default::default()
+        };
+        disk.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cookies = vec![cr("sid", "harvested", ".ex.com", None)];
+        mine.merge_vault_from_disk(&disk);
+        assert!(
+            mine.renders.contains_key("http://ex.com/owned"),
+            "the live capture must survive the harvest's newer epoch"
+        );
+        assert_eq!(
+            mine.profiles["ex.com"].session_cookies[0].value, "harvested",
+            "the harvest must still be adopted"
+        );
+        assert_eq!(mine.vault_epoch, 6);
+    }
+
+    // A logout stamped AFTER the capture must delete the unsaved
+    // capture too: no authenticated DOM resurrection.
+    #[test]
+    fn logout_after_capture_drops_the_unsaved_render() {
+        let mut mine = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        mine.renders
+            .insert("http://ex.com/secret".into(), render("auth", 100, 7));
+        let mut disk = GhostState {
+            vault_epoch: 8,
+            ..Default::default()
+        };
+        disk.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cleared_epoch = 8;
+        mine.merge_vault_from_disk(&disk);
+        assert!(
+            !mine.renders.contains_key("http://ex.com/secret"),
+            "a pre-logout capture must not survive its deletion"
+        );
+    }
+
+    // The reverse order is legitimate: a capture stamped after the
+    // clear (anonymous fetch or re-login) survives later merges.
+    #[test]
+    fn capture_after_logout_survives_the_next_merge() {
+        let mut mine = GhostState {
+            vault_epoch: 8,
+            ..Default::default()
+        };
+        mine.renders
+            .insert("http://ex.com/anon".into(), render("post", 200, 9));
+        let mut disk = GhostState {
+            vault_epoch: 9,
+            ..Default::default()
+        };
+        disk.profiles
+            .entry("ex.com".into())
+            .or_default()
+            .session_cleared_epoch = 8;
+        mine.merge_vault_from_disk(&disk);
+        assert!(mine.renders.contains_key("http://ex.com/anon"));
+    }
+
+    // Same key both sides: the newer capture wins; an equal second
+    // keeps the live snapshot's copy; disk-only keys are adopted.
+    #[test]
+    fn render_merge_prefers_the_newer_capture_and_keeps_ties() {
+        let mut mine = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        mine.renders
+            .insert("http://ex.com/a".into(), render("old", 100, 6));
+        mine.renders
+            .insert("http://ex.com/b".into(), render("tie-mine", 150, 6));
+        let mut disk = GhostState {
+            vault_epoch: 6,
+            ..Default::default()
+        };
+        disk.renders
+            .insert("http://ex.com/a".into(), render("new", 120, 5));
+        disk.renders
+            .insert("http://ex.com/b".into(), render("tie-disk", 150, 5));
+        disk.renders
+            .insert("http://ex.com/c".into(), render("adopted", 140, 5));
+        mine.merge_vault_from_disk(&disk);
+        assert_eq!(mine.renders["http://ex.com/a"].html, "new");
+        assert_eq!(mine.renders["http://ex.com/b"].html, "tie-mine");
+        assert_eq!(mine.renders["http://ex.com/c"].html, "adopted");
+    }
+
+    // Deletion stamps ride onto every profile the logout touches,
+    // including hosts that only ever appeared as render URLs.
+    #[test]
+    fn session_clear_stamp_reaches_subdomains_and_render_hosts() {
+        let mut state = GhostState::default();
+        state.profiles.entry("ex.com".into()).or_default();
+        state.profiles.entry("app.ex.com".into()).or_default();
+        state.profiles.entry("other.com".into()).or_default();
+        let extras = vec!["deep.app.ex.com".to_string()];
+        stamp_session_cleared(&mut state, "ex.com", &extras, 42);
+        assert_eq!(state.profiles["ex.com"].session_cleared_epoch, 42);
+        assert_eq!(state.profiles["app.ex.com"].session_cleared_epoch, 42);
+        assert_eq!(state.profiles["deep.app.ex.com"].session_cleared_epoch, 42);
+        assert_eq!(state.profiles["other.com"].session_cleared_epoch, 0);
+    }
+
+    // Vault writes stamp one past the state they were built from
+    // and saturate instead of wrapping into the past.
+    #[test]
+    fn vault_writes_stamp_one_past_their_base_and_saturate() {
+        let mut base = GhostState {
+            vault_epoch: 40,
+            ..Default::default()
+        };
+        bump_vault_epoch(&mut base);
+        assert_eq!(base.vault_epoch, 41);
+        let mut top = GhostState {
+            vault_epoch: u64::MAX,
+            ..Default::default()
+        };
+        bump_vault_epoch(&mut top);
+        assert_eq!(top.vault_epoch, u64::MAX);
+    }
+
+    // The capture stamp is taken at record time and must not raise
+    // the snapshot's own epoch (that would skip adopting the
+    // harvest's disk state at the save that follows).
+    #[test]
+    fn record_render_stamps_the_capture_without_raising_the_vault() {
+        let mut state = GhostState {
+            vault_epoch: 5,
+            ..Default::default()
+        };
+        state.record_render_context("http://ex.com/p", "<p>x</p>", "ctx");
+        let r = &state.renders["http://ex.com/p"];
+        assert!(
+            r.capture_epoch > state.vault_epoch,
+            "capture {} must outrank the vault epoch {}",
+            r.capture_epoch,
+            state.vault_epoch
+        );
+        assert_eq!(state.vault_epoch, 5, "the snapshot's epoch must not move");
     }
 
     // == v4 phase 0: route memory ==
