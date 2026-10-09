@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shortened tool descriptions and measured all four definitions: 2,369
   `o200k_base` tokens in compact `tools/list` JSON, versus 2,657 in 4.7.0.
 
+- Updated config, libc and the public suffix list; includes the reviewed
+  Tokio patch for Windows child-process cleanup and runtime fixes.
+
 ### Fixed
 
 - Missing-page search hints use readable path words with a site restriction,

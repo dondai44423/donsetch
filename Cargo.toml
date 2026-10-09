@@ -53,7 +53,7 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.238" }
+psl = { version = "=2.1.239" }
 # OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
 # below, never here: Cargo unions features across every matching target
 # section, so declaring it in more than one place is how `load-dynamic` once
