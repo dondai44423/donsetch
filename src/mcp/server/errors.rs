@@ -435,7 +435,9 @@ fn moved_page_query(raw: &str) -> Option<String> {
         .filter(|word| {
             word.chars().any(char::is_alphabetic)
                 && word.len() <= 64
-                && !matches!(*word, "html" | "htm" | "php" | "aspx" | "index")
+                && !["html", "htm", "php", "aspx", "index"]
+                    .iter()
+                    .any(|noise| word.eq_ignore_ascii_case(noise))
         })
         .take(12)
         .collect();
@@ -1301,6 +1303,7 @@ mod boundary_tests {
         for url in [
             "https://example.com/?token=secret",
             "https://example.com/index.html",
+            "https://user:secret@example.com/INDEX.HTML?token=secret#private",
             "https://example.com/%E6%97%A5?token=secret",
         ] {
             assert_eq!(moved_page_query(url), None);
