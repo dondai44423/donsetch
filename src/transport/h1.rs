@@ -11,7 +11,7 @@ pub struct H1Response {
     pub body: Vec<u8>,
 }
 
-use super::MAX_BODY;
+use super::{MAX_BODY, STALL_TIMEOUT, read_stall};
 
 /// Cap on any framing line the client accumulates while looking
 /// for its terminator: the header block, a chunk-size line, the
@@ -53,8 +53,17 @@ where
         req.push_str("\r\n");
     }
     req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await?;
-    stream.flush().await?;
+    // Request write under the same wall as the header phase: the peer
+    // must take bytes within 30s of the request. The body below is
+    // bounded by progress instead, so a slow-but-moving transfer may
+    // outlive this.
+    tokio::time::timeout(STALL_TIMEOUT, async {
+        stream.write_all(req.as_bytes()).await?;
+        stream.flush().await?;
+        Ok::<(), FetchError>(())
+    })
+    .await
+    .map_err(|_| FetchError::Timeout)??;
 
     // Read header blocks until a FINAL status arrives. Interim (1xx)
     // responses precede the real one on the same connection : 100
@@ -66,58 +75,65 @@ where
     // "read to close" body.
     let mut buf: Vec<u8> = Vec::with_capacity(16384);
     let mut tmp = [0u8; 16384];
-    let mut interim = 0usize;
-    let (status, headers_out, header_end) = loop {
-        let header_end = loop {
-            if let Some(pos) = find(&buf, b"\r\n\r\n") {
-                break pos + 4;
-            }
-            if buf.len() > MAX_LINE {
-                return Err(FetchError::Http("h1: header block too large".into()));
-            }
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Err(FetchError::Http("h1: eof before headers".into()));
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        };
+    // The header phase keeps one 30s wall: a peer that never answers
+    // must fail fast. The BODY below is bounded by progress instead,
+    // so a slow-but-moving transfer may outlive that wall.
+    let (status, headers_out, header_end) = tokio::time::timeout(STALL_TIMEOUT, async {
+        let mut interim = 0usize;
+        loop {
+            let header_end = loop {
+                if let Some(pos) = find(&buf, b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if buf.len() > MAX_LINE {
+                    return Err(FetchError::Http("h1: header block too large".into()));
+                }
+                let n = stream.read(&mut tmp).await?;
+                if n == 0 {
+                    return Err(FetchError::Http("h1: eof before headers".into()));
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            };
 
-        let head = String::from_utf8_lossy(&buf[..header_end]);
-        let mut lines = head.lines();
-        let status_line = lines.next().unwrap_or("");
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| FetchError::Http(format!("h1: bad status line: {status_line}")))?;
-        if (100..200).contains(&status) {
-            // 101 means the server thinks it negotiated an upgrade
-            // this client never requested : the framing after it is
-            // not HTTP/1.1, bail instead of misparsing it.
-            if status == 101 {
-                return Err(FetchError::Http(
-                    "h1: unexpected 101 switching protocols (no upgrade requested)".into(),
-                ));
+            let head = String::from_utf8_lossy(&buf[..header_end]);
+            let mut lines = head.lines();
+            let status_line = lines.next().unwrap_or("");
+            let status: u16 = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| FetchError::Http(format!("h1: bad status line: {status_line}")))?;
+            if (100..200).contains(&status) {
+                // 101 means the server thinks it negotiated an upgrade
+                // this client never requested : the framing after it is
+                // not HTTP/1.1, bail instead of misparsing it.
+                if status == 101 {
+                    return Err(FetchError::Http(
+                        "h1: unexpected 101 switching protocols (no upgrade requested)".into(),
+                    ));
+                }
+                interim += 1;
+                // A server streaming 1xx forever must hit a counter,
+                // not the response timeout.
+                if interim > MAX_INTERIM {
+                    return Err(FetchError::Http(format!(
+                        "h1: more than {MAX_INTERIM} interim responses"
+                    )));
+                }
+                buf.drain(..header_end);
+                continue;
             }
-            interim += 1;
-            // A server streaming 1xx forever must hit a counter,
-            // not the response timeout.
-            if interim > MAX_INTERIM {
-                return Err(FetchError::Http(format!(
-                    "h1: more than {MAX_INTERIM} interim responses"
-                )));
+            let mut headers_out = Vec::new();
+            for line in lines {
+                if let Some((n, v)) = line.split_once(':') {
+                    headers_out.push((n.trim().to_ascii_lowercase(), v.trim().to_string()));
+                }
             }
-            buf.drain(..header_end);
-            continue;
+            break Ok::<_, FetchError>((status, headers_out, header_end));
         }
-        let mut headers_out = Vec::new();
-        for line in lines {
-            if let Some((n, v)) = line.split_once(':') {
-                headers_out.push((n.trim().to_ascii_lowercase(), v.trim().to_string()));
-            }
-        }
-        break (status, headers_out, header_end);
-    };
+    })
+    .await
+    .map_err(|_| FetchError::Timeout)??;
 
     // RFC 9112 6.3: 204 and 304 end at the header terminator regardless
     // of framing fields. A 304 Content-Length describes the selected
@@ -166,7 +182,7 @@ where
             )));
         }
         while body.len() < cl {
-            let n = stream.read(&mut tmp).await?;
+            let n = read_stall(stream, &mut tmp).await?;
             if n == 0 {
                 // RFC 9112 6.3: a message that ends before
                 // Content-Length is satisfied is INCOMPLETE, not
@@ -185,7 +201,7 @@ where
     } else {
         // Read to close : still capped.
         loop {
-            let n = stream.read(&mut tmp).await?;
+            let n = read_stall(stream, &mut tmp).await?;
             if n == 0 {
                 break;
             }
@@ -232,7 +248,7 @@ where
             if raw.len() > MAX_LINE {
                 return Err(FetchError::Http("h1: chunk size line too large".into()));
             }
-            let n = stream.read(&mut tmp).await?;
+            let n = read_stall(stream, &mut tmp).await?;
             if n == 0 {
                 return Err(FetchError::Http("h1: eof in chunk size".into()));
             }
@@ -256,7 +272,7 @@ where
                 if rest.len() > MAX_LINE {
                     return Err(FetchError::Http("h1: trailer section too large".into()));
                 }
-                let n = stream.read(&mut tmp).await?;
+                let n = read_stall(stream, &mut tmp).await?;
                 if n == 0 {
                     break;
                 }
@@ -271,7 +287,7 @@ where
             return Err(FetchError::Http("h1: chunked body exceeds cap".into()));
         }
         while rest.len() < size + 2 {
-            let n = stream.read(&mut tmp).await?;
+            let n = read_stall(stream, &mut tmp).await?;
             if n == 0 {
                 return Err(FetchError::Http("h1: eof in chunk data".into()));
             }
@@ -607,5 +623,60 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("interim"), "{err}");
+    }
+
+    // A body that keeps moving may outlive any fixed wall (the
+    // `donsetch -u` shape): under paused time each gap below is 10s of
+    // virtual time and the total is 100s, all under the 30s stall
+    // bound, so the fetch must complete.
+    #[tokio::test(start_paused = true)]
+    async fn body_transfer_outlives_the_wall_while_it_moves() {
+        let (mut client, mut peer) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 4096);
+                request.push(peer.read_u8().await.unwrap());
+            }
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\n")
+                .await
+                .unwrap();
+            peer.flush().await.unwrap();
+            for i in 0..10u8 {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                peer.write_all(&[b'0' + i; 3]).await.unwrap();
+                peer.flush().await.unwrap();
+            }
+        });
+        let response = get(&mut client, "/slow", &[]).await.expect("slow body");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.len(), 30);
+        server.await.unwrap();
+    }
+
+    // ... and a body that STOPS moving must still be killed at the
+    // stall bound: a dead peer may not hold a fetch forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_body_is_still_timed_out() {
+        let (mut client, mut peer) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 4096);
+                request.push(peer.read_u8().await.unwrap());
+            }
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                .await
+                .unwrap();
+            peer.flush().await.unwrap();
+            // Never send the rest; hold the connection open.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        let err = get(&mut client, "/dead", &[])
+            .await
+            .err()
+            .expect("a stalled body must time out");
+        assert!(matches!(err, FetchError::Timeout), "{err}");
+        server.abort();
     }
 }

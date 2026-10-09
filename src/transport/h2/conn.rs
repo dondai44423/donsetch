@@ -8,6 +8,7 @@ use super::frame::*;
 use super::hpack::{Decoder, Encoder};
 use crate::error::FetchError;
 use crate::profile::BrowserProfile;
+use crate::transport::STALL_TIMEOUT;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -216,33 +217,42 @@ impl H2Conn {
         let mut framed = Vec::with_capacity(CHROME_REQ_PRIORITY.len() + first);
         framed.extend_from_slice(&CHROME_REQ_PRIORITY);
         framed.extend_from_slice(&block[..first]);
-        write_frame(
-            &mut self.stream,
-            HEADERS,
-            FLAG_END_STREAM
-                | FLAG_PRIORITY
-                | if first == block.len() {
-                    FLAG_END_HEADERS
-                } else {
-                    0
-                },
-            stream_id,
-            &framed,
-        )
-        .await?;
         let remaining = &block[first..];
-        for (i, chunk) in remaining.chunks(self.peer_frame_size).enumerate() {
-            let final_chunk = (i + 1) * self.peer_frame_size >= remaining.len();
+        // Request writes carry the same stall bound as reads: a peer
+        // that stops draining its socket must fail the exchange, not
+        // wedge it. Only no-progress windows are bounded; a transfer
+        // that keeps moving may take as long as the link needs.
+        tokio::time::timeout(STALL_TIMEOUT, async {
             write_frame(
                 &mut self.stream,
-                CONTINUATION,
-                if final_chunk { FLAG_END_HEADERS } else { 0 },
+                HEADERS,
+                FLAG_END_STREAM
+                    | FLAG_PRIORITY
+                    | if first == block.len() {
+                        FLAG_END_HEADERS
+                    } else {
+                        0
+                    },
                 stream_id,
-                chunk,
+                &framed,
             )
             .await?;
-        }
-        self.stream.flush().await?;
+            for (i, chunk) in remaining.chunks(self.peer_frame_size).enumerate() {
+                let final_chunk = (i + 1) * self.peer_frame_size >= remaining.len();
+                write_frame(
+                    &mut self.stream,
+                    CONTINUATION,
+                    if final_chunk { FLAG_END_HEADERS } else { 0 },
+                    stream_id,
+                    chunk,
+                )
+                .await?;
+            }
+            self.stream.flush().await?;
+            Ok::<(), FetchError>(())
+        })
+        .await
+        .map_err(|_| FetchError::Timeout)??;
 
         let mut status = 0u16;
         let mut resp_headers: Vec<(String, String)> = Vec::new();
@@ -258,7 +268,14 @@ impl H2Conn {
         let mut header_blocks = 0;
 
         loop {
-            let (hdr, payload) = read_frame(&mut self.stream).await?;
+            // Per-frame stall bound: the next frame must arrive within
+            // STALL_TIMEOUT (a 16 KiB frame needs a ~4 kbps floor), while
+            // the response itself may take as long as the link needs. A
+            // wall around the whole exchange turned every slow-but-moving
+            // body into a timeout.
+            let (hdr, payload) = tokio::time::timeout(STALL_TIMEOUT, read_frame(&mut self.stream))
+                .await
+                .map_err(|_| FetchError::Timeout)??;
             if !self.settings_seen {
                 // RFC 9113 §3.4: the server connection preface is a
                 // SETTINGS frame and it MUST be the first frame the
@@ -268,8 +285,14 @@ impl H2Conn {
                 if hdr.ty != SETTINGS || hdr.flags & FLAG_ACK != 0 {
                     let mut goaway = [0u8; 8];
                     goaway[4..8].copy_from_slice(&0x1u32.to_be_bytes());
-                    let _ = write_frame(&mut self.stream, GOAWAY, 0, 0, &goaway).await;
-                    let _ = self.stream.flush().await;
+                    // Best-effort GOAWAY, still stall-bounded: the old
+                    // wall covered this write; a peer that violates the
+                    // preface must not be able to wedge the task here.
+                    let _ = tokio::time::timeout(STALL_TIMEOUT, async {
+                        let _ = write_frame(&mut self.stream, GOAWAY, 0, 0, &goaway).await;
+                        let _ = self.stream.flush().await;
+                    })
+                    .await;
                     return Err(FetchError::Http(
                         "h2: server preface was not SETTINGS".into(),
                     ));
@@ -288,14 +311,24 @@ impl H2Conn {
                 SETTINGS => {
                     if hdr.flags & FLAG_ACK == 0 {
                         self.apply_settings(&payload)?;
-                        write_frame(&mut self.stream, SETTINGS, FLAG_ACK, 0, &[]).await?;
-                        self.stream.flush().await?;
+                        tokio::time::timeout(STALL_TIMEOUT, async {
+                            write_frame(&mut self.stream, SETTINGS, FLAG_ACK, 0, &[]).await?;
+                            self.stream.flush().await?;
+                            Ok::<(), FetchError>(())
+                        })
+                        .await
+                        .map_err(|_| FetchError::Timeout)??;
                     }
                 }
                 PING => {
                     if hdr.flags & FLAG_ACK == 0 {
-                        write_frame(&mut self.stream, PING, FLAG_ACK, 0, &payload).await?;
-                        self.stream.flush().await?;
+                        tokio::time::timeout(STALL_TIMEOUT, async {
+                            write_frame(&mut self.stream, PING, FLAG_ACK, 0, &payload).await?;
+                            self.stream.flush().await?;
+                            Ok::<(), FetchError>(())
+                        })
+                        .await
+                        .map_err(|_| FetchError::Timeout)??;
                     }
                 }
                 WINDOW_UPDATE => {}
@@ -392,20 +425,28 @@ impl H2Conn {
                     // Replenish flow-control windows at half consumption.
                     if stream_window < initial_window / 2 {
                         let inc = (initial_window - stream_window) as u32;
-                        write_frame(
-                            &mut self.stream,
-                            WINDOW_UPDATE,
-                            0,
-                            stream_id,
-                            &inc.to_be_bytes(),
+                        tokio::time::timeout(
+                            STALL_TIMEOUT,
+                            write_frame(
+                                &mut self.stream,
+                                WINDOW_UPDATE,
+                                0,
+                                stream_id,
+                                &inc.to_be_bytes(),
+                            ),
                         )
-                        .await?;
+                        .await
+                        .map_err(|_| FetchError::Timeout)??;
                         stream_window += inc as i64;
                     }
                     if self.conn_window < self.conn_window_target / 2 {
                         let inc = (self.conn_window_target - self.conn_window) as u32;
-                        write_frame(&mut self.stream, WINDOW_UPDATE, 0, 0, &inc.to_be_bytes())
-                            .await?;
+                        tokio::time::timeout(
+                            STALL_TIMEOUT,
+                            write_frame(&mut self.stream, WINDOW_UPDATE, 0, 0, &inc.to_be_bytes()),
+                        )
+                        .await
+                        .map_err(|_| FetchError::Timeout)??;
                         self.conn_window += inc as i64;
                     }
                     if hdr.flags & FLAG_END_STREAM != 0 {

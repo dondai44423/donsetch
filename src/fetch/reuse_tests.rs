@@ -335,3 +335,85 @@ async fn stealth_v3_transport_new_proxy_credentials_require_their_own_tunnel() {
         "alice's tunnel must precede bob's: {tunnels:?}"
     );
 }
+
+/// Keep at least one short pending timer alive for the whole test.
+/// With paused time, tokio auto-advances to the NEXT pending timer
+/// whenever the runtime parks - it does so even while waiting on real
+/// socket I/O - so a park with no nearer timer jumps the virtual clock
+/// to whatever deadline is pending. A metronome keeps every jump small;
+/// the stall bound under test then fires only after 30 virtual seconds
+/// without a byte, which is exactly the property under test.
+fn metronome() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    })
+}
+
+/// Answer the request, then send `abc` and hold the connection open
+/// forever: only the client's own stall bound may decide the outcome.
+/// Every wire error is tolerated (the client is expected to abandon
+/// this exchange), and each connection runs on its own task so one
+/// abandoned connection cannot kill the listener a retry dials next.
+async fn answer_h2_stalled(tls: &mut SslStream<TcpStream>) -> Result<(), ()> {
+    let mut preface = [0; 24];
+    tls.read_exact(&mut preface).await.map_err(|_| ())?;
+    let id = loop {
+        let (header, _) = read_frame(tls).await.map_err(|_| ())?;
+        if header.ty == HEADERS {
+            break header.stream_id;
+        }
+    };
+    write_frame(tls, SETTINGS, 0, 0, &[])
+        .await
+        .map_err(|_| ())?;
+    write_frame(tls, SETTINGS, FLAG_ACK, 0, &[])
+        .await
+        .map_err(|_| ())?;
+    write_frame(tls, HEADERS, FLAG_END_HEADERS, id, &[0x88])
+        .await
+        .map_err(|_| ())?;
+    write_frame(tls, DATA, 0, id, b"abc")
+        .await
+        .map_err(|_| ())?;
+    tls.flush().await.map_err(|_| ())?;
+    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    Ok(())
+}
+
+/// The bound that must survive the fix: a body that STOPS moving is
+/// still timed out - a dead peer may not hold a fetch forever. (The
+/// slow-but-moving direction cannot live in this suite: with paused
+/// time the clock can outrun real socket I/O, so a real-time fixture
+/// owns that receipt; the h1 side is pinned by the duplex tests in
+/// transport::h1.)
+#[tokio::test(start_paused = true)]
+async fn stealth_v3_fetch_stalled_h2_body_still_times_out() {
+    let _beat = metronome();
+    let acceptor = owned_acceptor();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let Ok(mut tls) = tokio_boring::accept(&acceptor, tcp).await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let _ = answer_h2_stalled(&mut tls).await;
+            });
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        fetcher.fetch(&format!("https://127.0.0.1:{port}/dead")),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the stall must be decided, not hung"))
+    .err()
+    .expect("a body that stops moving must time out");
+    assert!(matches!(err, crate::error::FetchError::Timeout), "{err}");
+    server.abort();
+}

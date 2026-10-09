@@ -19,7 +19,6 @@ use super::hints;
 use super::revalidate::{CacheCheck, RevalidationCache};
 
 const MAX_REDIRECTS: u8 = 10;
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheState {
@@ -1398,10 +1397,10 @@ impl Fetcher {
                 }
                 None => req_headers,
             };
-            let resp =
-                tokio::time::timeout(RESPONSE_TIMEOUT, h1::get(&mut stream, &target, req_headers))
-                    .await
-                    .map_err(|_| FetchError::Timeout)??;
+            // No wall-clock wrap here: the transport bounds the request
+            // write and the header phase itself, and bounds the body by
+            // progress (see STALL_TIMEOUT).
+            let resp = h1::get(&mut stream, &target, req_headers).await?;
             return finish(
                 url_of("http", authority, path),
                 "h1",
@@ -1460,12 +1459,7 @@ impl Fetcher {
             }
             Ok(out)
         } else {
-            let resp = tokio::time::timeout(
-                RESPONSE_TIMEOUT,
-                h1::get(&mut tls_stream, path, req_headers),
-            )
-            .await
-            .map_err(|_| FetchError::Timeout)??;
+            let resp = h1::get(&mut tls_stream, path, req_headers).await?;
             finish(
                 url_of("https", authority, path),
                 "h1",
@@ -1491,20 +1485,22 @@ impl Fetcher {
             .cloned()
             .chain(std::iter::once(("priority".into(), "u=0, i".into())))
             .collect();
-        let resp =
-            match tokio::time::timeout(RESPONSE_TIMEOUT, conn.get(authority, path, &h2_headers))
-                .await
-            {
-                Ok(res) => res?,
-                Err(_) => {
-                    // The wait future was dropped mid-stream: tell the peer
-                    // the stream is cancelled (RFC 9113 §6.4 CANCEL) instead
-                    // of silently closing on it, then let the caller discard
-                    // the connection.
+        // No wall-clock wrap here: the transport bounds the request
+        // writes, each frame read and each internal write by stall
+        // (STALL_TIMEOUT), so a slow-but-moving body may outlive any
+        // fixed wall. A timed-out get leaves the stream in flight: tell
+        // the peer the stream is cancelled (RFC 9113 §6.4 CANCEL)
+        // instead of silently closing on it, then let the caller
+        // discard the connection.
+        let resp = match conn.get(authority, path, &h2_headers).await {
+            Ok(res) => res,
+            Err(e) => {
+                if matches!(e, FetchError::Timeout) {
                     conn.cancel_in_flight().await;
-                    return Err(FetchError::Timeout);
                 }
-            };
+                return Err(e);
+            }
+        };
         finish(
             url_of("https", authority, path),
             "h2",

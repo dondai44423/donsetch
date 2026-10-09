@@ -99,6 +99,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "1", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Paused-time tests (Builder::start_paused via #[tokio::test]): the
+# stall-vs-wall semantics run against the real 30s constants without
+# sleeping 30 real seconds.
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 sha2 = "0.11"

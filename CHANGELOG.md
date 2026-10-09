@@ -5,6 +5,23 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.3] - 2026-10-09
+
+### Fixed
+
+- Fetches whose response body cannot finish inside 30 seconds no longer
+  fail mid-transfer. The whole exchange used to be bounded by one
+  30-second wall clock (headers plus body), so `donsetch -u` died with
+  "Download failed: timeout" on any link that could not pull a 7 to 22MB
+  release asset that fast; measured on a link serving about 100KB/s, the
+  transfer was killed at exactly +30s while bytes were still arriving
+  steadily, on the attempt and on its retry. The body is now bounded by
+  progress: a read with no bytes for 30 seconds times out, while a
+  transfer that keeps moving may take as long as the link needs. Request
+  writes and the response header phase keep their 30-second bounds, and
+  h2 frame reads stall out on the same 30 seconds, so a dead or silent
+  peer still fails fast.
+
 ## [4.7.2] - 2026-10-09
 
 ### Fixed
