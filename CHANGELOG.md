@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract is stated in the session instructions and every tool
   description.
 
+- `web_fetch` `focus` guidance now carries the behavior it always had:
+  a response saving less than 20% (or matching nothing) is labeled and
+  falls back to the full page, and `toc` + `section` is named as the
+  guaranteed reducer. No behavior change.
+
 ### Fixed
 
 - A JSON data endpoint is terminal at the HTTP tier: a `.json` URL or a

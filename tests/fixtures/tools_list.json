@@ -77,7 +77,7 @@
             "type": "integer"
           },
           "focus": {
-            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response is labeled and falls back to the full page.",
+            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section.",
             "type": "string"
           },
           "image_text": {

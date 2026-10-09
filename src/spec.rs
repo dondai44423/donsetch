@@ -127,9 +127,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Relevance query : selects matching passages with section context using BM25. A cached cross-encoder may rescue a lexical miss on pages of at most 8 blocks; fetch never downloads a model. No match or less than 20% saving returns full content with a notice.",
+        help: "Relevance query : selects matching passages with section context using BM25. A cached cross-encoder may rescue a lexical miss on pages of at most 8 blocks; fetch never downloads a model. No match or less than 20% saving returns full content with a notice; toc + section narrows deterministically when focus falls back.",
         mcp_help: Some(
-            "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response is labeled and falls back to the full page.",
+            "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section.",
         ),
     },
     ParamSpec {
