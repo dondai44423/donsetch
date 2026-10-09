@@ -88,14 +88,19 @@ impl RevalidationCache {
         // compare against, and RFC 9111 §4.3.4 makes the field metadata
         // the merge updates; only when the snapshot actually carried an
         // entity-tag does the comparison (and its rejection) apply.
+        // If-None-Match matching ignores the weak prefix (RFC 9110
+        // §13.1.2): a 304 that upgrades W/"x" to "x" — or downgrades —
+        // still identifies the stored representation, and the merge
+        // adopts the validator the origin just named. A different
+        // opaque tag, an unparseable tag, or an ambiguous multi-tag
+        // answer identifies something else and is a rejected 304: the
+        // caller's bounded recovery refetches it unconditionally.
         if let Some((_, tag)) = tags.first()
             && let Some(old) = snapshot.etag.as_deref()
             && (tags.len() != 1
                 || !valid_etag(tag)
                 || !valid_etag(old)
-                || tag.trim().strip_prefix("W/").unwrap_or(tag.trim())
-                    != old.trim().strip_prefix("W/").unwrap_or(old.trim())
-                || (old.starts_with("W/") && !tag.trim().starts_with("W/")))
+                || opaque_tag(tag) != opaque_tag(old))
         {
             return Err("304 ETag does not identify the requested representation".into());
         }
@@ -269,12 +274,15 @@ fn stored_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The opaque entity-tag: the quoted string with any weak prefix
+/// removed (RFC 9110 §8.8.3). If-None-Match matching compares only the
+/// opaque tag; the W/ prefix never participates.
+fn opaque_tag(tag: &str) -> &str {
+    tag.trim().strip_prefix("W/").unwrap_or(tag.trim())
+}
+
 fn valid_etag(tag: &str) -> bool {
-    let tag = tag
-        .trim()
-        .strip_prefix("W/")
-        .unwrap_or(tag.trim())
-        .as_bytes();
+    let tag = opaque_tag(tag).as_bytes();
     tag.len() >= 2
         && tag[0] == b'"'
         && tag[tag.len() - 1] == b'"'
@@ -988,5 +996,59 @@ mod audit_tests {
                 Duration::ZERO,
             )
             .unwrap();
+    }
+
+    // RFC 9110 §13.1.2: If-None-Match is a weak comparison. A 304 that
+    // names the same opaque tag with a different weak prefix — either
+    // direction — identifies the stored representation and must merge;
+    // only a different opaque tag is a mismatch. (Pre-fix, the W/ ->
+    // strong upgrade was rejected, so every revalidation from such an
+    // origin paid a pointless unconditional refetch; the toc->section
+    // workflow paid it on each call.)
+    #[test]
+    fn stealth_v3_304_etag_weak_comparison_ignores_the_prefix() {
+        for (stored, returned) in [
+            ("W/\"x\"", "\"x\""),   // upgrade
+            ("\"x\"", "W/\"x\""),   // downgrade
+            ("W/\"x\"", "W/\"x\""), // same
+            ("\"x\"", "\"x\""),     // strong
+        ] {
+            let mut cache = RevalidationCache::new();
+            cache.store("owned", 200, &[("etag".into(), stored.into())], b"body");
+            let CacheCheck::Revalidate(_, snapshot) = cache.check("owned") else {
+                panic!("validator snapshot for {stored}");
+            };
+            let merged = cache.revalidated(
+                "owned",
+                &snapshot,
+                &[
+                    ("etag".into(), returned.into()),
+                    ("cache-control".into(), "max-age=600".into()),
+                ],
+                Duration::ZERO,
+            );
+            assert!(
+                merged.is_ok(),
+                "{stored} vs {returned} must validate (weak comparison): {merged:?}"
+            );
+            assert_eq!(merged.unwrap().0.as_slice(), b"body");
+        }
+        // A different opaque tag still fails closed: the stored body
+        // is not the representation the origin just described.
+        let mut cache = RevalidationCache::new();
+        cache.store("owned", 200, &[("etag".into(), "\"x\"".into())], b"body");
+        let CacheCheck::Revalidate(_, snapshot) = cache.check("owned") else {
+            panic!("validator snapshot");
+        };
+        assert!(
+            cache
+                .revalidated(
+                    "owned",
+                    &snapshot,
+                    &[("etag".into(), "\"y\"".into())],
+                    Duration::ZERO,
+                )
+                .is_err()
+        );
     }
 }
