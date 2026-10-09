@@ -69,6 +69,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inventory with stop `InventoryComplete`; sitemap-backed maps (MDN:
   120 URLs) are unchanged.
 
+- Crawl `mode:"map"` inventories are relevance-ranked against the seed
+  (or the caller's `focus` when set) with the same scoring the crawl
+  frontier uses, IDF over the site's own inventory included, and the
+  `map_cap` cut now keeps from the ranked list: a topic seed pulls its
+  own neighborhood to the front instead of handing the agent a pure
+  recency dump to hand-filter. MDN's WebGPU seed now leads with
+  `WebGPU_API` before the generic API pages; a section-root seed
+  (`/api/`) ranks flat and keeps the previous order. Ranking reorders
+  only, it never filters: the same inventory, capped as before.
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed

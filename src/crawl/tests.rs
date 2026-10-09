@@ -985,6 +985,36 @@ async fn map_mode_falls_back_to_seed_links_without_a_sitemap() {
     assert!(!hits.iter().any(|h| h.ends_with("/b")));
 }
 
+// V06: the map is relevance-ranked against the seed, not a pure
+// recency slice. A topic seed pulls its own neighborhood to the
+// front of the inventory; ranking reorders, it never filters.
+#[tokio::test]
+async fn map_mode_ranks_seed_relevant_urls_first() {
+    let sitemap = r#"<urlset>
+<url><loc>https://ex.com/docs/alpha_thing</loc></url>
+<url><loc>https://ex.com/docs/beta_thing</loc></url>
+<url><loc>https://ex.com/docs/gamma_thing</loc></url>
+<url><loc>https://ex.com/docs/delta_thing</loc></url>
+<url><loc>https://ex.com/docs/webgpu_api</loc></url>
+<url><loc>https://ex.com/docs/using_webgpu</loc></url>
+</urlset>"#;
+    let site = MockSite::new().page("https://ex.com/sitemap.xml", 200, sitemap);
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = crawler
+        .crawl("https://ex.com/docs/webgpu_api", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.map.len(), 6, "ranking reorders, never filters");
+    assert!(
+        r.map[0].contains("webgpu") && r.map[1].contains("webgpu"),
+        "seed-relevant URLs first, got {:?}",
+        r.map
+    );
+}
+
 // ── Basic crawl ───────────────────────────────────────────
 
 #[tokio::test]

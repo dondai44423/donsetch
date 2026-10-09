@@ -718,10 +718,29 @@ impl Crawler {
             sitemap_entries = entries;
             let mut map_locales: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            for e in &sitemap_entries {
-                if map.len() >= opts.map_cap {
-                    break;
-                }
+            // Relevance ranking against the seed (V06): the caller's
+            // focus when set, else the seed's own last path segment
+            // ("WebGPU_API" -> "webgpu api"). A section-root seed or
+            // a segment shared by everything ranks flat and keeps the
+            // sitemap's newest-first order; a topic seed pulls its
+            // own neighborhood to the front, before the map_cap cut.
+            let map_query: Option<String> = opts.focus.clone().or_else(|| {
+                seed_url
+                    .path()
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .map(|s| s.replace(['-', '_', '.'], " "))
+            });
+            let map_idf = map_query.as_ref().map(|_| {
+                score::FocusIdf::from_paths(sitemap_entries.iter().filter_map(|e| {
+                    Url::parse(&e.loc)
+                        .ok()
+                        .filter(|u| host_ok(u))
+                        .map(|u| u.path().to_string())
+                }))
+            });
+            let mut ranked: Vec<(f64, usize, String)> = Vec::new();
+            for (order, e) in sitemap_entries.iter().enumerate() {
                 if let Ok(u) = Url::parse(&e.loc) {
                     if !host_ok(&u) {
                         continue;
@@ -742,9 +761,30 @@ impl Crawler {
                     if !map_locales.insert(lcanon) {
                         continue;
                     }
-                    map.push(e.loc.clone());
+                    let relevance = match &map_query {
+                        Some(q) => score::score_candidate_with_idf(
+                            "",
+                            u.path(),
+                            Some(q.as_str()),
+                            map_idf.as_ref(),
+                        ),
+                        None => 0.0,
+                    };
+                    ranked.push((relevance, order, e.loc.clone()));
                 }
             }
+            // Relevant first; ties keep the sitemap order (newest
+            // first, entry order preserved by the stable sort key).
+            ranked.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            map = ranked
+                .into_iter()
+                .take(opts.map_cap)
+                .map(|(_, _, loc)| loc)
+                .collect();
         } else {
             // Content-only still reads robots for Disallow
             // rules when respect_robots is on.
