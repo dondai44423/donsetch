@@ -75,9 +75,9 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 
 <div align="center">
 
-<a href="https://fluxionai.world/register?source=github&campaign=github-donsetch&promo=DONSETCH"><img src="assets/sponsors/fluxion-ai-partner-banner.png" alt="Fluxion AI: one gateway to the world's leading AI models. Get $3 in API credit through the DonSeTch partner link." width="100%"></a>
+<a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH"><img src="assets/sponsors/sidrune-ai-partner-banner.png" alt="Sidrune AI: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through the DonSeTch partner link." width="100%"></a>
 
-**Fluxion AI** provides reliable, cost-efficient access to GPT, Claude, and other leading AI models through one unified API. Save up to 70% compared with official API pricing, and get $3 in API credits when you sign up through [this link](https://fluxionai.world/register?source=github&campaign=github-donsetch&promo=DONSETCH).
+**Sidrune AI**: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through [this link](https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH).
 
 </div>
 
