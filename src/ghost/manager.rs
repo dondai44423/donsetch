@@ -91,8 +91,11 @@ pub struct GhostManager {
     /// Lazily initialized on the FIRST browser acquire: a tier-1-only
     /// process must not pay Xvfb probes (`which Xvfb`, an `xdpyinfo`
     /// spawn, an X11 connect, or an Xvfb start) for a browser it will
-    /// never launch. Acquire awaits the cell; once set it is stable.
-    display: tokio::sync::OnceCell<Option<String>>,
+    /// never launch. Outer None = not decided yet; Some(None) = decided
+    /// headless; Some(Some(env)) = a display that is re-verified on
+    /// every later acquire, because a display that died mid-session
+    /// must be replaced, never replayed as a tombstone.
+    display: AsyncMutex<Option<Option<String>>>,
     /// The pool-wide Xvfb handle; killed once at daemon shutdown
     /// (previously one per manager; the pool shares one).
     xvfb: AsyncMutex<Option<super::xvfb::Xvfb>>,
@@ -297,7 +300,7 @@ impl GhostManager {
                 .into_iter()
                 .map(|s| Arc::new(AsyncMutex::new(s)))
                 .collect(),
-            display: tokio::sync::OnceCell::new(),
+            display: AsyncMutex::new(None),
             xvfb: AsyncMutex::new(None),
         });
         let reaper = Arc::clone(&mgr);
@@ -305,71 +308,102 @@ impl GhostManager {
         mgr
     }
 
-    /// Start (or adopt) the pool display on first need. Idempotent:
-    /// concurrent first acquires serialize on the OnceCell. This is
-    /// the same selection logic the old boot-time init used, moved to
-    /// the moment a browser is actually going to launch.
+    /// Start (or adopt) the pool display on first need, then keep it
+    /// honest: every later call re-verifies the display before handing
+    /// it to Chrome, because a display that died mid-session (crash,
+    /// oom, a borrowed display whose owner exited) must be replaced,
+    /// never replayed as a tombstone for the rest of the process.
     async fn ensure_display(&self) -> Option<String> {
-        self.display
-            .get_or_init(|| async {
-                // Termux (Android) has no X11 by default. Skip Xvfb
-                // entirely; Ghost will use --headless=new mode.
-                let is_termux = std::env::var_os("PREFIX")
-                    .map(|p| p.to_string_lossy().contains("com.termux"))
-                    .unwrap_or(false);
-                // A forced headless backend does not need a virtual
-                // display. Avoid starting Xvfb so the selection is
-                // explicit in both process and args.
-                if super::cloak::headless_mode_requested() {
-                    if crate::config::cfg().debug.ghost {
-                        eprintln!("[ghost] headless backend selected, skipping Xvfb");
-                    }
-                    return None;
+        // Termux (Android) has no X11 by default. Skip Xvfb entirely;
+        // Ghost will use --headless=new mode.
+        let is_termux = std::env::var_os("PREFIX")
+            .map(|p| p.to_string_lossy().contains("com.termux"))
+            .unwrap_or(false);
+        // A forced headless backend does not need a virtual display.
+        // Avoid starting Xvfb so the selection is explicit in both
+        // process and args.
+        if super::cloak::headless_mode_requested() {
+            if crate::config::cfg().debug.ghost {
+                eprintln!("[ghost] headless backend selected, skipping Xvfb");
+            }
+            return None;
+        }
+        if is_termux {
+            if crate::config::cfg().debug.ghost {
+                eprintln!("[ghost] Termux detected, using headless mode (no Xvfb)");
+            }
+            return None;
+        }
+        let decided = self.display.lock().await.clone();
+        match decided {
+            // Decided headless (no Xvfb install): stable for the
+            // process, exactly like the old OnceCell's cached None.
+            Some(None) => return None,
+            Some(Some(disp)) => {
+                if super::xvfb::display_alive().await {
+                    return Some(disp);
                 }
-                if is_termux {
-                    if crate::config::cfg().debug.ghost {
-                        eprintln!("[ghost] Termux detected, using headless mode (no Xvfb)");
-                    }
-                    return None;
-                }
-                if !super::xvfb::is_available() {
-                    // Xvfb not installed on a Linux-family system: warn
-                    // the user. Chrome will run headful off-screen
-                    // (--window-position=-32000,-32000 + CDP minimize),
-                    // but on Linux a minimized window may still flash on
-                    // screen briefly. Xvfb is the clean solution there.
-                    // macOS/Windows never see this hint (issue #81).
-                    if let Some(hint) = xvfb_missing_hint() {
-                        eprintln!("{hint}");
-                    }
-                    return None;
-                }
-                match super::xvfb::Xvfb::start().await {
-                    Ok(xvfb) => {
-                        let disp = xvfb.display_env();
-                        if crate::config::cfg().debug.ghost {
-                            // A borrowed display was reused, not started: a
-                            // pre-existing X server is not ours, and saying
-                            // "started" for it was wrong (#258).
-                            if xvfb.is_borrowed() {
-                                eprintln!("[ghost] Xvfb reused on {disp} (already running)");
-                            } else {
-                                eprintln!("[ghost] Xvfb started on {disp}");
-                            }
-                        }
-                        *self.xvfb.lock().await = Some(xvfb);
-                        Some(disp)
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[ghost] Xvfb start failed: {e}, falling back to headful off-screen mode"
-                        );
-                        None
+                // The display died mid-session: retire it, then fall
+                // through to a fresh start below.
+                eprintln!("[ghost] Xvfb {disp} is gone; restarting the display");
+                self.retire_display().await;
+            }
+            None => {}
+        }
+        if !super::xvfb::is_available() {
+            // Xvfb not installed on a Linux-family system: say so once.
+            // Ghost then runs Chromium headless (no display needed) for
+            // the life of this process; macOS/Windows never see this
+            // hint (issue #81).
+            if let Some(hint) = xvfb_missing_hint() {
+                eprintln!("{hint}");
+            }
+            *self.display.lock().await = Some(None);
+            return None;
+        }
+        match super::xvfb::Xvfb::start().await {
+            Ok(xvfb) => {
+                let disp = xvfb.display_env();
+                if crate::config::cfg().debug.ghost {
+                    // A borrowed display was reused, not started: a
+                    // pre-existing X server is not ours, and saying
+                    // "started" for it was wrong (#258).
+                    if xvfb.is_borrowed() {
+                        eprintln!("[ghost] Xvfb reused on {disp} (already running)");
+                    } else {
+                        eprintln!("[ghost] Xvfb started on {disp}");
                     }
                 }
-            })
-            .await
-            .clone()
+                *self.xvfb.lock().await = Some(xvfb);
+                *self.display.lock().await = Some(Some(disp.clone()));
+                Some(disp)
+            }
+            Err(e) => {
+                if cfg!(target_os = "linux") {
+                    eprintln!("[ghost] Xvfb start failed: {e}, falling back to headless mode");
+                } else {
+                    eprintln!(
+                        "[ghost] Xvfb start failed: {e}, falling back to headful off-screen mode"
+                    );
+                }
+                *self.display.lock().await = Some(None);
+                None
+            }
+        }
+    }
+
+    /// Drop the cached display decision (and kill whatever owned the
+    /// display), so the next ensure_display derives a fresh one. Used
+    /// when a launch proves the display unusable even after the
+    /// one-shot headless retry.
+    async fn retire_display(&self) {
+        let mut chosen = self.display.lock().await;
+        if chosen.as_ref().is_some_and(Option::is_some) {
+            if let Some(old) = self.xvfb.lock().await.take() {
+                old.kill().await;
+            }
+            *chosen = None;
+        }
     }
 
     /// Acquire the ghost: launch if absent, thaw if frozen,
@@ -483,7 +517,20 @@ impl GhostManager {
                 old.kill().await;
             }
             let display = self.ensure_display().await;
-            guard.ghost = Some(Ghost::launch_wire(profile, display.as_deref(), &wire).await?);
+            match Ghost::launch_wire(profile, display.as_deref(), &wire).await {
+                Ok(ghost) => guard.ghost = Some(ghost),
+                Err(error) => {
+                    // The display-class failure that survived the one-shot
+                    // headless retry: retire the display so the next call
+                    // derives a fresh one instead of replaying the corpse.
+                    if display.is_some()
+                        && crate::ghost::is_platform_init_failure(&error.to_string())
+                    {
+                        self.retire_display().await;
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             if crate::config::cfg().debug.ghost {
                 eprintln!("[pool] warm serve slot {}", idx);
@@ -689,7 +736,10 @@ impl GhostManager {
     /// has initialized the display.
     #[allow(dead_code)]
     pub fn is_headful(&self) -> bool {
-        self.display.get().is_some_and(|d| d.is_some())
+        self.display
+            .try_lock()
+            .ok()
+            .is_some_and(|d| d.as_ref().is_some_and(Option::is_some))
     }
 }
 
@@ -1694,7 +1744,7 @@ mod pool_tests {
             meta: Arc::new(Mutex::new(vec![v(false, None, None, 0); 3])),
             available: Arc::new(Semaphore::new(3)),
             slots: Vec::new(), // Reservation test: no process or slot lock needed.
-            display: tokio::sync::OnceCell::new(),
+            display: AsyncMutex::new(None),
             xvfb: AsyncMutex::new(None),
         });
         let slow = mgr.reserve(11, Some("slow.test")).await.unwrap();
@@ -1920,5 +1970,77 @@ mod xvfb_hint_tests {
             super::xvfb_missing_hint().is_none(),
             "the Xvfb install hint must not exist off Linux (issue #81)"
         );
+    }
+}
+
+/// Real-Xvfb restart coverage: a display that dies mid-session must be
+/// replaced by ensure_display, not replayed as a tombstone (the state
+/// that left every later launch dying in ~80ms with "Missing X server
+/// or $DISPLAY"). Linux-only: Xvfb is the only real virtual display.
+#[cfg(linux_like)]
+#[cfg(test)]
+mod display_recovery_tests {
+    use super::*;
+
+    /// Live Xvfb serving `display`, by /proc cmdline.
+    #[cfg(target_os = "linux")]
+    fn find_xvfb_pid(display: &str) -> Option<u32> {
+        for entry in std::fs::read_dir("/proc").ok()? {
+            let entry = entry.ok()?;
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let parts: Vec<&[u8]> = cmd.split(|b| *b == 0).collect();
+            if parts.len() >= 2 && parts[0].ends_with(b"Xvfb") && parts[1] == display.as_bytes() {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dead_display_is_replaced_not_replayed() {
+        // 105: outside the displays the ghost::xvfb tests own (99, 106-109).
+        unsafe {
+            std::env::set_var("DONSETCH_XVFB_DISPLAY", "105");
+        }
+        let mgr = GhostManager::with_slot_default(1).await;
+        let first = mgr.ensure_display().await.expect("display comes up");
+        assert_eq!(first, ":105");
+        let owned = find_xvfb_pid(":105").expect("owned Xvfb is live");
+
+        // Kill the display outright: the crash/oom/cleanup class.
+        unsafe {
+            libc::kill(owned as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while super::super::xvfb::display_alive().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed display still answers: tombstone probe is broken"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let second = mgr
+            .ensure_display()
+            .await
+            .expect("display must be replaced");
+        assert_eq!(second, ":105");
+        assert!(
+            super::super::xvfb::display_alive().await,
+            "the replacement must answer the X protocol"
+        );
+        let replacement = find_xvfb_pid(":105").expect("replacement Xvfb is live");
+        assert_ne!(replacement, owned, "a fresh process must serve the display");
+
+        mgr.shutdown().await;
+        unsafe {
+            std::env::remove_var("DONSETCH_XVFB_DISPLAY");
+        }
     }
 }

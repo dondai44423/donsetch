@@ -1160,27 +1160,17 @@ impl Ghost {
                 let _ = std::fs::remove_file(dir.join(f));
             }
         }
-        let mut cmd = Command::new(bin);
+        // Linux Chromium takes its application/ICU locale from gettext's
+        // LANGUAGE preference, rather than --lang. Include the base
+        // language so a region without its own UI bundle selects the
+        // same language before the desktop's fallback locale. Applied to
+        // every launch attempt below.
         #[cfg(target_os = "linux")]
-        {
-            // Linux Chromium takes its application/ICU locale from gettext's
-            // LANGUAGE preference, rather than --lang. Include the base
-            // language so a region without its own UI bundle selects the
-            // same language before the desktop's fallback locale.
+        let language_env = {
             let locale = crate::persona::sanitize_locale(&wire.locale);
             let language = locale.split('-').next().unwrap_or("en");
-            cmd.env(
-                "LANGUAGE",
-                format!("{}:{language}", locale.replace('-', "_")),
-            );
-        }
-        // The persona's timezone reaches Blink through the TZ the process
-        // starts with: ICU's default zone reads it, so a host browser
-        // shows the machine's zone and diverges from the persona. An
-        // empty wire tz leaves the host untouched.
-        if !wire.tz.is_empty() {
-            cmd.env("TZ", &wire.tz);
-        }
+            format!("{}:{language}", locale.replace('-', "_"))
+        };
         let mut chrome_args: Vec<String> = default_chrome_args_wire(&dir, profile, wire);
         let force_headless = browser.backend == cloak::BrowserBackend::HeadlessChromium;
         if browser.backend == cloak::BrowserBackend::CloakBrowser {
@@ -1275,32 +1265,30 @@ impl Ghost {
         // Fallback (no display, no platform support): --headless=new.
 
         #[cfg(linux_like)]
-        {
-            if force_headless {
-                chrome_args.push("--headless=new".into());
-            } else if let Some(disp) = display {
-                // Linux + Xvfb: headful on virtual display.
-                cmd.env("DISPLAY", disp);
-                chrome_args.push("--ozone-platform=x11".into());
-            } else {
-                // No Xvfb available (Termux, headless server, WSL
-                // without X11). Fall back to headless mode.
-                // Native GPU support remains enabled when available.
-                chrome_args.push("--headless=new".into());
-            }
-        }
-
+        let want_headless = force_headless || display.is_none();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if force_headless {
-            chrome_args.push("--headless=new".into());
-        }
-
+        let want_headless = force_headless;
         // Unknown platforms (not Linux/Android/macOS/Windows): headless
         // fallback. Android is covered by linux_like above.
         #[cfg(not(any(linux_like, target_os = "macos", target_os = "windows")))]
-        {
+        let want_headless = true;
+        if want_headless {
+            // No display to run against (Xvfb absent, Termux, WSL
+            // without X11, forced headless). Native GPU support remains
+            // enabled when available.
             chrome_args.push("--headless=new".into());
         }
+        #[cfg(linux_like)]
+        if !want_headless {
+            // Linux + Xvfb: headful on the virtual display.
+            chrome_args.push("--ozone-platform=x11".into());
+        }
+        // DISPLAY for the primary headful attempt (Linux + Xvfb only).
+        // The headless retry below runs without it.
+        #[cfg(linux_like)]
+        let primary_display: Option<&str> = if want_headless { None } else { display };
+        #[cfg(not(linux_like))]
+        let primary_display: Option<&str> = None;
         let hidden_surface = chrome_args.iter().any(|a| a == "--headless=new")
             || (cfg!(linux_like) && display.is_some());
         if hidden_surface {
@@ -1315,58 +1303,97 @@ impl Ghost {
         // browser default; not JS-enumerable.
         chrome_args.push("--disable-blink-features=AutomationControlled".into());
         chrome_args.push("about:blank".into());
-        cmd.args(&chrome_args);
-        // Own process group (Unix) / Job Object (Windows):
-        // freeze/thaw/kill the whole browser tree.
-        proc::Proc::prepare_cmd(&mut cmd);
-        // stdin MUST be null: a child inheriting the parent's
-        // controlling terminal gets SIGTTIN the moment it reads
-        // stdin (a daemon running attached to a tty), and the whole
-        // browser tree freezes in state T = the DevTools handshake
-        // never completes (live case: the daemon's chromiums sat in
-        // Tl for hours; every tier-2 attempt died with "devtools ws
-        // timeout").
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        // No orphans even if donsetch dies hard. Linux/Android:
-        // prctl(PR_SET_PDEATHSIG). macOS has no prctl; Windows
-        // uses the Job Object's KILL_ON_JOB_CLOSE.
-        #[cfg(linux_like)]
-        unsafe {
-            cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec());
-        }
-        let mut child = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| FetchError::ghost(format!("spawn: {e}")))?;
-        let proc = proc::Proc::from_child(&child)?;
+        // ── Launch loop ──
+        // One primary attempt in the selected mode. A platform-init
+        // failure (headful Chrome handed an unusable X/Wayland display:
+        // "Missing X server or $DISPLAY" / "The platform failed to
+        // initialize") retries once in headless mode, which needs no
+        // display at all. The user-visible contract: a dead display
+        // degrades the quality of the render, never the availability of
+        // the browser.
+        let mut attempt = 0u8;
+        let (mut child, proc, ws_url, reader, stderr_tail) = loop {
+            let retry = attempt > 0;
+            let args = if retry {
+                headless_retry_args(&chrome_args)
+            } else {
+                chrome_args.clone()
+            };
+            let mut cmd = Command::new(&bin);
+            #[cfg(target_os = "linux")]
+            cmd.env("LANGUAGE", &language_env);
+            // The persona's timezone reaches Blink through the TZ the
+            // process starts with: ICU's default zone reads it, so a host
+            // browser shows the machine's zone and diverges from the
+            // persona. An empty wire tz leaves the host untouched.
+            if !wire.tz.is_empty() {
+                cmd.env("TZ", &wire.tz);
+            }
+            if retry {
+                // The failed display must not leak into the retry:
+                // headless initializes its own surfaces, and xcb probes
+                // against a dead X socket only add noise.
+                cmd.env_remove("DISPLAY");
+            } else if let Some(disp) = primary_display {
+                cmd.env("DISPLAY", disp);
+            }
+            cmd.args(&args);
+            // Own process group (Unix) / Job Object (Windows):
+            // freeze/thaw/kill the whole browser tree.
+            proc::Proc::prepare_cmd(&mut cmd);
+            // stdin MUST be null: a child inheriting the parent's
+            // controlling terminal gets SIGTTIN the moment it reads
+            // stdin (a daemon running attached to a tty), and the whole
+            // browser tree freezes in state T = the DevTools handshake
+            // never completes (live case: the daemon's chromiums sat in
+            // Tl for hours; every tier-2 attempt died with "devtools ws
+            // timeout").
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            // No orphans even if donsetch dies hard. Linux/Android:
+            // prctl(PR_SET_PDEATHSIG). macOS has no prctl; Windows
+            // uses the Job Object's KILL_ON_JOB_CLOSE.
+            #[cfg(linux_like)]
+            unsafe {
+                cmd.as_std_mut().pre_exec(proc::pdeath_pre_exec());
+            }
+            let mut child = cmd
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| FetchError::ghost(format!("spawn: {e}")))?;
+            let proc = proc::Proc::from_child(&child)?;
 
-        // The ws endpoint arrives on stderr:
-        // "DevTools listening on ws://127.0.0.1:PORT/..."
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
-        let mut reader = BufReader::new(stderr);
-        let mut stderr_tail: Vec<String> = Vec::new();
-        let ws_url = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            scan_for_ws_url(&mut reader, &mut stderr_tail),
-        )
-        .await
-        .map_err(|_| {
-            FetchError::ghost(format!(
-                "devtools ws timeout ({})",
-                launch_failure_detail(&stderr_tail)
-            ))
-        })?
-        .ok_or_else(|| {
-            FetchError::ghost(format!(
-                "no devtools ws line ({})",
-                launch_failure_detail(&stderr_tail)
-            ))
-        })?;
+            // The ws endpoint arrives on stderr:
+            // "DevTools listening on ws://127.0.0.1:PORT/..."
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
+            let mut reader = BufReader::new(stderr);
+            let mut stderr_tail: Vec<String> = Vec::new();
+            let scanned = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                scan_for_ws_url(&mut reader, &mut stderr_tail),
+            )
+            .await;
+            if let Ok(Some(ws_url)) = scanned {
+                break (child, proc, ws_url, reader, stderr_tail);
+            }
+            let timed_out = scanned.is_err();
+            let detail = launch_failure_detail(&stderr_tail);
+            let _ = child.kill().await;
+            if !retry && !want_headless && is_platform_init_failure(&detail) {
+                eprintln!("[ghost] headful launch failed ({detail}); retrying headless");
+                attempt += 1;
+                continue;
+            }
+            return Err(FetchError::ghost(if timed_out {
+                format!("devtools ws timeout ({detail})")
+            } else {
+                format!("no devtools ws line ({detail})")
+            }));
+        };
 
         let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(stderr_tail));
         let stderr_reader = lifecycle::OwnedTask(tokio::spawn(lifecycle::drain_stderr(
@@ -2916,10 +2943,75 @@ fn launch_failure_detail(tail: &[String]) -> String {
     }
 }
 
+/// A platform-initialization failure: Chromium never opened a window
+/// system (no usable X server, no Wayland platform, ozone init
+/// failed). `launch_wire` retries this class once in headless mode,
+/// which needs no display at all; a dead virtual display therefore
+/// degrades the render quality, never the availability of the browser.
+/// The manager reads the same classifier to retire a display that a
+/// launch proved unusable.
+pub(crate) fn is_platform_init_failure(detail: &str) -> bool {
+    detail.contains("Missing X server or $DISPLAY")
+        || detail.contains("Failed to initialize Wayland platform")
+        || detail.contains("The platform failed to initialize")
+}
+
+/// The same launch forced into headless mode: the X11/ozone selection
+/// is dropped and `--headless=new` is appended. Persona, proxy and
+/// blink flags ride unchanged.
+fn headless_retry_args(args: &[String]) -> Vec<String> {
+    let mut retry: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--ozone-platform"))
+        .cloned()
+        .collect();
+    retry.push("--headless=new".into());
+    retry
+}
+
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
     use crate::profile::BrowserProfile;
+
+    // The headless retry must produce exactly the same launch minus the
+    // display selection: persona/proxy/blink flags survive, the X11
+    // ozone target is gone, and headless appears exactly once.
+    #[test]
+    fn headless_retry_drops_x11_and_adds_headless() {
+        let args = vec![
+            "--user-agent=UA".to_string(),
+            "--ozone-platform=x11".to_string(),
+            "--proxy-server=http=direct://".to_string(),
+            "--window-position=0,0".to_string(),
+        ];
+        let retry = super::headless_retry_args(&args);
+        assert!(!retry.iter().any(|a| a.starts_with("--ozone-platform")));
+        assert_eq!(
+            retry
+                .iter()
+                .filter(|a| a.as_str() == "--headless=new")
+                .count(),
+            1
+        );
+        assert!(retry.iter().any(|a| a == "--user-agent=UA"));
+        assert!(retry.iter().any(|a| a == "--proxy-server=http=direct://"));
+        assert_eq!(retry.last().map(String::as_str), Some("--headless=new"));
+    }
+
+    // The exact stderr classes that mean "no window system": the retry
+    // class. Transport and other failures must NOT trigger a retry.
+    #[test]
+    fn platform_init_failure_class_matches_the_display_errors() {
+        assert!(super::is_platform_init_failure(
+            "browser said: [1:1:ERROR:ui/ozone/platform/x11/ozone_platform_x11.cc:257] Missing X server or $DISPLAY | [1:1:ERROR:ui/aura/env.cc:246] The platform failed to initialize.  Exiting."
+        ));
+        assert!(super::is_platform_init_failure(
+            "browser said: Failed to initialize Wayland platform"
+        ));
+        assert!(!super::is_platform_init_failure("devtools ws timeout"));
+        assert!(!super::is_platform_init_failure("browser said nothing"));
+    }
 
     #[tokio::test]
     async fn stealth_v3_dom_read_reacquires_only_a_stale_root_once() {

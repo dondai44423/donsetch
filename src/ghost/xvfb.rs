@@ -482,7 +482,9 @@ mod linux {
     /// listening on its X11 socket, in either namespace. A stale
     /// socket (from a killed Xvfb process) will still have the
     /// file but no server: connecting fails with ECONNREFUSED.
-    async fn display_alive() -> bool {
+    /// Used by GhostManager to revalidate a cached display before
+    /// every launch (a dead display must be replaced, not replayed).
+    pub async fn display_alive() -> bool {
         if !x_socket_alive() {
             return false;
         }
@@ -574,6 +576,11 @@ mod other {
         }
         #[allow(dead_code)]
         pub async fn kill(self) {}
+    }
+
+    /// Non-Linux family: there is no virtual display to check.
+    pub async fn display_alive() -> bool {
+        false
     }
 
     pub fn is_available() -> bool {
