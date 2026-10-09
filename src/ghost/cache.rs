@@ -1424,7 +1424,7 @@ impl GhostState {
 
     /// Tier-1 jar flush (v4 phase 1.4): merge the whole jar into
     /// the persisted snapshot. Browser-true mechanics: dedupe
-    /// (name, domain, path), refresh in place at the front (cap
+    /// (name, scope-folded domain, path), refresh in place at the front (cap
     /// evicts the coldest tail), drop expired and pathological
     /// values. Does NOT save: the caller is already inside the
     /// state lock and the outcome record after it saves once.
@@ -1444,7 +1444,7 @@ impl GhostState {
     }
 
     /// The jar-merge mechanics for sync_tier1_cookies: dedupe by
-    /// (name, domain, path), refresh in place at the front, drop
+    /// (name, scope-folded domain, path), refresh in place at the front, drop
     /// expired and pathological values, cap the tail.
     fn merge_tier1_jar(&mut self, all: &[CookieRecord]) {
         let now = now();
@@ -1456,11 +1456,17 @@ impl GhostState {
             {
                 continue;
             }
-            let key = (c.name.clone(), c.domain.clone(), c.path.clone());
+            // Scope-folded key: ".x.com" and "x.com" are one
+            // cookie to the jar (`store_raw` normalizes both to
+            // x.com), so a row re-synced under the scoped form must
+            // replace its bare twin, not sit beside it and let the
+            // older host-only flag win the next replay.
+            let fold = |d: &str| d.trim_start_matches('.').to_ascii_lowercase();
+            let key = (c.name.clone(), fold(&c.domain), c.path.clone());
             if let Some(pos) = self
                 .tier1_cookies
                 .iter()
-                .position(|x| (x.name.clone(), x.domain.clone(), x.path.clone()) == key)
+                .position(|x| (x.name.clone(), fold(&x.domain), x.path.clone()) == key)
             {
                 self.tier1_cookies.remove(pos);
             }
@@ -3659,6 +3665,38 @@ mod tests {
         let json = serde_json::to_string(&st).unwrap();
         let back: GhostState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tier1_cookies.len(), TIER1_COOKIE_MAX);
+    }
+
+    // V02: a cookie re-synced under its scoped form (".x.com") must
+    // replace a bare twin ("x.com"), because `store_raw` folds both
+    // to one jar cookie : leaving the bare row in place let the
+    // older host-only form win the next replay.
+    #[test]
+    fn tier1_jar_sync_folds_scope_into_the_dedupe_key() {
+        let mut st = GhostState::default();
+        let rec = |n: &str, v: &str, d: &str| CookieRecord {
+            name: n.into(),
+            value: v.into(),
+            domain: d.into(),
+            path: "/".into(),
+            expires_at: None,
+            secure: false,
+            http_only: false,
+            same_site: "Lax".into(),
+        };
+        st.sync_tier1_cookies(&[rec("loid", "old", "reddit.com")]);
+        assert_eq!(st.tier1_cookies.len(), 1);
+        st.sync_tier1_cookies(&[rec("loid", "new", ".reddit.com")]);
+        assert_eq!(
+            st.tier1_cookies.len(),
+            1,
+            "the scoped form must replace the bare row, not sit beside it"
+        );
+        assert_eq!(st.tier1_cookies[0].value, "new");
+        // And the bare form folds back the same way.
+        st.sync_tier1_cookies(&[rec("loid", "bare", "reddit.com")]);
+        assert_eq!(st.tier1_cookies.len(), 1);
+        assert_eq!(st.tier1_cookies[0].value, "bare");
     }
 
     // The vault kill switch maps through the config layer

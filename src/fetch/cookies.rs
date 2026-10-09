@@ -458,6 +458,20 @@ impl CookieJar {
         });
     }
 
+    /// The persisted domain of a cookie record. A domain cookie
+    /// keeps its leading dot (".reddit.com"), a host-only cookie
+    /// stays bare ("www.reddit.com"). The dot is load-bearing:
+    /// `store_raw` reads it back as the host_only flag, so a bare
+    /// export demotes every replayed domain cookie to one exact
+    /// host and a vault relink silently stops sending the session.
+    fn record_domain(c: &Cookie) -> String {
+        if c.host_only {
+            c.domain.clone()
+        } else {
+            format!(".{}", c.domain)
+        }
+    }
+
     /// Export all cookies matching `host` as CookieRecords
     /// for write-back to the persistent domain profile.
     pub fn snapshot_for(&self, host: &str) -> Vec<CookieRecord> {
@@ -479,7 +493,7 @@ impl CookieJar {
             .map(|c| CookieRecord {
                 name: c.name.clone(),
                 value: c.value.clone(),
-                domain: c.domain.clone(),
+                domain: Self::record_domain(c),
                 // Carry the real path: a hard-coded "/" widens
                 // path-scoped cookies on the export/import cycle
                 // (snapshot -> vault replant -> store_raw), letting a
@@ -505,7 +519,7 @@ impl CookieJar {
             .map(|c| CookieRecord {
                 name: c.name.clone(),
                 value: c.value.clone(),
-                domain: c.domain.clone(),
+                domain: Self::record_domain(c),
                 path: c.path.clone(),
                 expires_at: c.expires_at,
                 secure: c.secure,
@@ -1529,5 +1543,56 @@ mod audit_tests {
         let snap = jar.snapshot_for("example.org");
         let c = snap.iter().find(|c| c.name == "k").expect("cookie");
         assert_eq!(c.path, "/secret", "export must keep the real path (B6)");
+    }
+
+    // V02: the vault round trip (snapshot -> records -> store_raw)
+    // must keep cookie domain scope. `store_raw` reads host-only off
+    // the leading dot, so an export that emitted the bare normalized
+    // domain demoted every domain cookie to one exact host: reddit's
+    // `loid` (Domain=.reddit.com) stopped matching www.reddit.com
+    // after a state relink and every fetch re-ran the session hop.
+    #[test]
+    fn domain_scope_survives_the_vault_round_trip() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "www.reddit.com",
+            "/",
+            &[(
+                "set-cookie".to_string(),
+                "loid=abc; Domain=.reddit.com; Path=/; Secure".to_string(),
+            )],
+            true,
+        );
+        assert!(jar.header_for("www.reddit.com", "/", true).is_some());
+        let records = jar.snapshot_all();
+        let mut replayed = CookieJar::new();
+        replayed.import_vault(&records);
+        assert!(
+            replayed.header_for("www.reddit.com", "/", true).is_some(),
+            "a Domain cookie must still match the set host after the replay"
+        );
+        assert!(
+            replayed.header_for("old.reddit.com", "/", true).is_some(),
+            "a Domain cookie must still match sibling hosts after the replay"
+        );
+    }
+
+    #[test]
+    fn host_only_scope_survives_the_vault_round_trip() {
+        let mut jar = CookieJar::new();
+        jar.store_from_headers(
+            "www.reddit.com",
+            "/",
+            &[("set-cookie".to_string(), "sid=1; Path=/".to_string())],
+            true,
+        );
+        let records = jar.snapshot_all();
+        let mut replayed = CookieJar::new();
+        replayed.import_vault(&records);
+        assert!(replayed.header_for("www.reddit.com", "/", true).is_some());
+        assert!(
+            replayed.header_for("old.reddit.com", "/", true).is_none(),
+            "a host-only cookie must not widen to siblings on replay"
+        );
     }
 }
