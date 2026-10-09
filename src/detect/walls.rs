@@ -43,7 +43,7 @@ pub fn browser_recovery(
     body: &[u8],
     verdict: Verdict,
 ) -> bool {
-    if matches!(status, 401 | 402 | 404)
+    if matches!(status, 401 | 402 | 404 | 410)
         || matches!(
             verdict,
             Verdict::AuthWall | Verdict::Paywall | Verdict::SoftNotFound
@@ -280,7 +280,7 @@ pub fn detect(status: u16, headers: &[(String, String)], body: &[u8]) -> Verdict
 
     match status {
         401 | 402 => return Verdict::AuthWall,
-        404 => return Verdict::SoftNotFound,
+        404 | 410 => return Verdict::SoftNotFound,
         403 | 429 | 503 => {
             return classify_wall(&text, headers, is_cf, status, true);
         }
@@ -1574,4 +1574,23 @@ fn instagram_logged_out_shell_is_auth_wall() {
         detect(200, &[], body.as_bytes()),
         Verdict::AuthWall
     ));
+}
+
+#[cfg(test)]
+mod gone_tests {
+    use super::*;
+    #[test]
+    fn v471_gone_is_terminal_not_a_bot_wall() {
+        for body in [
+            b"".as_slice(),
+            b"<h1>Gone</h1>",
+            b"<script src='/cdn-cgi/challenge-platform/x'></script>",
+        ] {
+            assert_eq!(detect(410, &[], body), Verdict::SoftNotFound);
+        }
+        assert_eq!(
+            detect(200, &[], b"<h1>Gone fishing</h1><p>We are open today.</p>"),
+            Verdict::ContentOk
+        );
+    }
 }

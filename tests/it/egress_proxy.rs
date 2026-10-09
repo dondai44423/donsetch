@@ -230,7 +230,7 @@ async fn fetch_via_intercepting_proxy_fails_honestly_without_ca() {
 // commands ride. It used to pass `None` down to the redirect driver, so
 // on a host whose only route out is HTTP_PROXY (a container, a locked
 // down office network) every tool call died with "Network is
-// unreachable" while `donsetch doctor` and the archive fallback, which
+// unreachable" while `donsetch doctor` and other direct fetches, which
 // ride `fetch()`, reported egress healthy: two call chains into the
 // same dialer and only one of them resolved the ambient proxy.
 #[tokio::test(flavor = "multi_thread")]

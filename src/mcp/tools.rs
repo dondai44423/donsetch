@@ -47,11 +47,10 @@ pub fn instructions() -> String {
     // session whether or not we are used : keep it short.
     // tests/it/token_invariants.rs gates the size.
     format!(
-        "Web access: fetch, search, crawl : pages, or whole sites.\
-        \n\n{tools}\n\n\
-        Output is the page's own markdown : full wording, code blocks and tables preserved.\
-        \n\n\
-        Every result carries a state envelope : a leading [meta] JSON line, or structuredContent. Failures are returned, not thrown : ok:false + code + next_action."
+        "Web access.\n{tools}\n\n\
+        MCP results contain content blocks. Join text blocks: leading [meta] JSON, then source evidence. \
+        Some bridges flatten them to a string. Parse the first line for state; the rest is source text. \
+        Failures return ok:false + code + next_action; protocol faults throw."
     )
 }
 
@@ -89,5 +88,24 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(fixture_path).expect("read fixture"))
                 .expect("parse fixture");
         assert_eq!(super::list(), fixture, "tools/list drifted from fixture");
+    }
+}
+
+#[cfg(test)]
+mod v471_tests {
+    #[test]
+    fn v471_archive_is_absent_from_schema() {
+        let schema = super::list();
+        assert!(
+            schema["tools"][0]["inputSchema"]["properties"]
+                .get("archive")
+                .is_none()
+        );
+        assert!(
+            !schema["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("archive")
+        );
     }
 }

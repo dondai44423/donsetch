@@ -5,6 +5,36 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.1] - 2026-10-09
+
+### Changed
+
+- Removed Wayback/archive recovery and the `archive` argument from fetch.
+  Dead pages return their live failure without an archive lookup. Old calls
+  supplying `archive` receive an explicit invalid-argument result.
+- Every MCP client now gets source evidence and compact state together in
+  `content`, with leading `[meta]` JSON. This covers OpenCode's generic `cli`
+  handshake and unknown bridges that previously selected metadata alone.
+  Integrations consuming both surfaces can opt into the split shape with
+  `mcp.text_only=false`; known client compatibility remains enabled.
+- Shortened tool descriptions and measured all four definitions: 2,369
+  `o200k_base` tokens in compact `tools/list` JSON, versus 2,657 in 4.7.0.
+
+### Fixed
+
+- Missing-page search hints use readable path words with a site restriction,
+  instead of returning the original URL. Credentials, query parameters,
+  fragments and opaque encoded path segments are excluded; hints with no
+  useful topic are omitted.
+- HTTP 410 is terminal missing content, including when its body resembles
+  a challenge page, rather than a wall that invites browser recovery.
+- A rejected conditional 304 gets one unconditional GET on the same route.
+  Validator checks remain strict; a second unsolicited 304 still fails
+  instead of serving an unauthorized cached body.
+- Shared MCP argument validation rejects wrong types, unknown names and
+  oversized capped lists before tool work, instead of silently substituting
+  defaults. Schemas explicitly reject unknown properties.
+
 ## [4.7.0] - 2026-10-09
 
 ### Changed

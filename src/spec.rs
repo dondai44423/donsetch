@@ -195,17 +195,6 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         ),
     },
     ParamSpec {
-        name: "archive",
-        flag: "archive",
-        kind: ParamKind::Enum(&["auto", "only", "off"]),
-        cli: CliKind::Flag,
-        required: false,
-        help: "Dead-page recovery via the keyless Wayback Machine. auto (default): on hard failure (404/paywall/unsolvable wall) serve the nearest archived snapshot, clearly labeled with its date. only: skip the live fetch, go straight to the archive. off: never.",
-        mcp_help: Some(
-            "Archived-page policy: auto (default) falls back when the live page is unavailable; only skips the live page; off disables archive recovery.",
-        ),
-    },
-    ParamSpec {
         name: "since_last",
         flag: "since-last",
         kind: ParamKind::SetTrue,
@@ -575,8 +564,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_fetch",
         cli_cmd: "fetch",
         summary: "Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)",
-        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). structuredContent.changed carries the verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nDead links: archive=auto (default) serves the nearest Wayback snapshot, honestly labeled with its age; archive=only skips the live web.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay plain HTTP at any tier; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). JS-only pages need actions=[{click|type|press|scroll|wait,...}] : deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: structuredContent.next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: content[0].text is one canonical source document. structuredContent contains only actionable model state such as url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, cloak warning, thin (present only when the read is a suspected shell), and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
-        mcp_description: "Read one URL or a deliberate URL batch as source markdown. Use search to discover URLs and crawl for multiple pages from one site. Prefer the smallest view that can supply the required evidence, and continue only from returned continuation state. Do not repeat a successful read unless it was thin, truncated, or failed. Automatic acquisition may use HTTP, a browser, an adapter, PDF extraction, or an archive. JSON endpoints (`.json`, application/json) never leave plain HTTP. Failures are returned, not thrown : ok:false + code + next_action in the envelope (codes: network.*, browser.*, wall.*, content.*, tls.*, selector.*, guard.ssrf, deadline.hit, *.invalid). Time: plain HTTP reads ~0.3-2s; a browser escalation 17-31s; a dead URL ~10s (HTTP, browser, then archive); interactive-captcha give-up is the worst case (41-42s). Treat ok=false, content_ok=false, thin=true, or a stable error code as unresolved; follow next_action or choose another source. Cite the returned source URL.",
+        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay plain HTTP at any tier; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). JS-only pages need actions=[{click|type|press|scroll|wait,...}] : deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, cloak warning, thin (present only when the read is a suspected shell), and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
+        mcp_description: "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints at every tier; HTML may escalate to a browser and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
         params: FETCH_PARAMS,
         examples: &[
             "donsetch fetch https://example.com/article",
@@ -590,8 +579,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_search",
         cli_cmd: "search",
         summary: "Web search : keyless aggregation or optional configured providers",
-        description: "Web search : returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nEach result is one compact evidence row: fetch handle (or raw URL), title, host, focused snippet, and a browser-cost warning only when relevant. Rank already represents DonSeTch's scoring decision, so per-engine scores and timing are not repeated in model context. Weak or degraded retrieval remains explicitly labeled. Multi-query mode keeps one clearly labeled ranked section per formulation.\n\nDefault: keyless backends fused by cross-engine consensus + local semantic reranking. Configured BYOK providers are preferred; keyless search remains the fallback. Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over automatically (one provider; intent maps to its filters, and the keyless verticals do not join).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nResponse: content[0].text is the ranked evidence list. structuredContent contains provider, degraded/failed_engines, weak plus rank, URL and optional fetch handle for each result; multi-query mode keeps those lists separate. Engine health, score, cache, provider, reranker and timing diagnostics live in _meta.\n\nAfter search: fetch the best result via its S-handle : enrichment pre-fetches top results, so the next fetch is near-instant.",
-        mcp_description: "Discover ranked candidate sources. Use this before fetch when you do not already have a URL; it returns titles and snippets, not page contents. A snippet supports only claims it states explicitly. Treat weak or degraded results as incomplete, and fetch a candidate when its full text is required. Search handles resolve directly in fetch; cite source URLs from the result metadata accompanying the ranked list. Failures are returned, not thrown : ok:false + code + next_action.",
+        description: "Web search : returns ranked URLs + titles + snippets. Use to decide WHAT to fetch (web_fetch reads content; this never does).\n\nOne query is the normal path. For an ambiguous, multilingual, exploratory, or hard-to-recall information need, add up to two query_variants: all searches run in parallel and come back as clearly separated result sets, with no automatic rewriting or guessed answers.\n\nEach result is one compact evidence row: fetch handle (or raw URL), title, host, focused snippet, and a browser-cost warning only when relevant. Rank already represents DonSeTch's scoring decision, so per-engine scores and timing are not repeated in model context. Weak or degraded retrieval remains explicitly labeled. Multi-query mode keeps one clearly labeled ranked section per formulation.\n\nDefault: keyless backends fused by cross-engine consensus + local semantic reranking. Configured BYOK providers are preferred; keyless search remains the fallback. Verticals via intent: GitHub, Wikipedia, HN, Scholar, news, StackExchange, MDN. BYOK: providers configured via `donsetch keys` (Tavily/Exa/Serper/TinyFish/Parallel/BrightData) take over automatically (one provider; intent maps to its filters, and the keyless verticals do not join).\n\ndeadline_ms caps the whole call (honest deadline error, never a hang).\n\nResponse: content contains leading [meta] JSON and the ranked evidence list. State includes provider, degraded/failed_engines, weak plus rank, URL and optional fetch handle for each result; multi-query mode keeps those lists separate. Engine health, score, cache, provider, reranker and timing diagnostics live in _meta.\n\nAfter search: fetch the best result via its S-handle : enrichment pre-fetches top results, so the next fetch is near-instant.",
+        mcp_description: "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. Weak or degraded results are incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
         params: SEARCH_PARAMS,
         examples: &[
             "donsetch search rust async trait objects",
@@ -604,8 +593,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_crawl",
         cli_cmd: "crawl",
         summary: "Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)",
-        description: "Crawl a site from a seed : for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap : the site map when the site has one, else the seed page's links · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped. dataset=true emits JSON Lines (one object per page).\n\nBudgets: focus (topic) ranks the frontier by BM25-lite link-text/URL-path keyword scoring and crawls only matches : set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory : returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: content[0].text is one linear site-evidence document. structuredContent contains seed, completion, page URLs, stop reason and any resume/next action. Map mode returns its URL inventory in structuredContent.map. Queue, skip, score, quality, crawl-delay and timing diagnostics live in _meta. FrontierEmpty is complete only when requested evidence was obtained without failed or excluded pages; MaxPages, CharBudget, DepthLimit, Deadline, ThrottledOut and Cancelled are incomplete.",
-        mcp_description: "Read multiple pages from one known site. Use search to discover a site and fetch for one page. Scope the crawl to the requested evidence and set explicit budgets. FrontierEmpty is complete only when the requested evidence was obtained without failed or excluded pages; budget, deadline, throttle, cancellation, or depth stops are incomplete and may return a resume token. Cite the returned page URLs. dataset=true returns JSONL (one object per page). Failures are returned, not thrown : ok:false + code + next_action.",
+        description: "Crawl a site from a seed : for multi-page extraction (docs, API refs, wikis). Single page → web_fetch; finding sites → web_search.\n\nTwo-phase: sitemap discovery (cheap URL inventory) first, then focus-ranked page fetching with adaptive per-host pacing. Docs sites (mkdocs/docusaurus/sphinx/antora) get their nav as the site map automatically.\n\nModes: full (default) = map + content · map = URL inventory only, very cheap : the site map when the site has one, else the seed page's links · content = BFS from seed, no sitemap (use when sitemap is missing). PDF pages auto-parsed, not skipped. dataset=true emits JSON Lines (one object per page).\n\nBudgets: focus (topic) ranks the frontier by BM25-lite link-text/URL-path keyword scoring and crawls only matches : set it whenever you have a topic. max_pages / max_total_chars / deadline_s cap the run; resume tokens continue across calls. since_last=true skips pages unchanged since your last crawl of the site (fingerprint memory : returns only what moved). Send _meta.progressToken for live per-page progress (\"12 pages, 34 queued\"); cancellation stops gracefully and keeps the resume token.\n\nResponse: content contains leading [meta] JSON and one site-evidence document. State includes seed, completion, page URLs, stop reason and any resume/next action. Map mode renders its URL inventory in the text body. Queue, skip, score, quality, crawl-delay and timing diagnostics live in _meta. FrontierEmpty is complete only when requested evidence was obtained without failed or excluded pages; MaxPages, CharBudget, DepthLimit, Deadline, ThrottledOut and Cancelled are incomplete.",
+        mcp_description: "Read multiple pages of a known site within explicit budgets. Text starts with [meta] JSON containing completion, page URLs and resume state. FrontierEmpty is complete only if evidence was obtained without failed or excluded pages; budget, deadline, throttle, cancellation and depth stops are incomplete. Cite page URLs. dataset=true returns JSONL after the metadata line.",
         params: CRAWL_PARAMS,
         examples: &[
             "donsetch crawl https://docs.site.com --topic \"authentication\"",
@@ -618,8 +607,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_screenshot",
         cli_cmd: "screenshot",
         summary: "Open a URL in a real browser, return the page as PNG",
-        description: "A rendered PNG of a page: DonSeTch opens the URL in the same tier-2 browser it already keeps for challenge walls, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport. The result carries the PNG inline plus structuredContent {path, bytes}; the path is server-local, under the screenshots dir of the cache root, and full-page captures can run several MB.",
-        mcp_description: "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height (can be several MB); wait_ms adds settle time after load (max 5000, default 600); deadline_ms caps the whole call (500-600000 ms, default 60000). Returns the PNG as an image content block plus structuredContent {path, bytes}; the path is server-local under the screenshots root, so hand it to a file-reading tool when your client cannot view image blocks. Private/loopback URLs are blocked like web_fetch. Failures are returned, not thrown : ok:false + code + next_action.",
+        description: "A rendered PNG of a page: DonSeTch opens the URL in the same tier-2 browser it already keeps for challenge walls, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport. The result carries the PNG inline plus [meta] JSON {path, bytes}; the path is server-local, under the screenshots dir of the cache root, and full-page captures can run several MB.",
+        mcp_description: "Capture a URL as a rendered PNG in the browser. Returns an image content block and [meta] JSON with path and bytes. The path is server-local; use the inline image on remote clients. Full-page captures can be several MB. Private/loopback URLs are blocked like fetch. Failures return ok:false, code and next_action.",
         params: SCREENSHOT_PARAMS,
         examples: &[
             "donsetch screenshot https://example.com",
@@ -637,29 +626,58 @@ pub fn by_cli_cmd(cmd: &str) -> Option<&'static ToolSpec> {
 
 // ── Argument validation ──────────────────────────────────────
 
-/// Check every enum argument in `args` against the variants its spec
-/// lists. An absent or `null` argument passes, so the tool's own
-/// default applies. On failure the message names the first offending
-/// parameter, the accepted values, and the value received.
-pub fn check_enum_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
+/// Validate the argument object against parameter names, types, list limits
+/// and enum variants. Absent or null fields retain handler defaults;
+/// handlers enforce required fields, ranges and cross-field constraints.
+pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
+    let object = args.as_object().ok_or("arguments must be an object")?;
+    for name in object.keys() {
+        if !tool.params.iter().any(|p| p.name == name) {
+            return Err(format!(
+                "unknown parameter {name:?}; use the current tools/list schema"
+            ));
+        }
+    }
     for p in tool.params {
-        let ParamKind::Enum(variants) = p.kind else {
-            continue;
-        };
-        // `null` passes because the handlers already read it as unset.
-        let value = match args.get(p.name) {
+        // Optional nulls retain the handlers' established unset semantics.
+        let value = match object.get(p.name) {
             None | Some(Value::Null) => continue,
             Some(v) => v,
         };
-        if value.as_str().is_some_and(|s| variants.contains(&s)) {
-            continue;
+        if let ParamKind::Enum(variants) = p.kind {
+            if value.as_str().is_some_and(|s| variants.contains(&s)) {
+                continue;
+            }
+            let allowed = variants
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!("{} must be one of {allowed}; got {value}", p.name));
         }
-        let allowed = variants
-            .iter()
-            .map(|v| format!("\"{v}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!("{} must be one of {allowed}; got {value}", p.name));
+        let strings = |limit: usize| {
+            value
+                .as_array()
+                .is_some_and(|items| items.len() <= limit && items.iter().all(Value::is_string))
+        };
+        let valid = match p.kind {
+            ParamKind::Str => value.is_string(),
+            ParamKind::Usize => value.as_u64().is_some_and(|n| usize::try_from(n).is_ok()),
+            ParamKind::StrOrList => value.is_string() || strings(12),
+            ParamKind::StrList => strings(usize::MAX),
+            ParamKind::StrListMax(max) => strings(max),
+            ParamKind::SetTrue | ParamKind::SetFalse => value.is_boolean(),
+            ParamKind::ActionList => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_object)),
+            ParamKind::Enum(_) => unreachable!("enums checked above"),
+        };
+        if !valid {
+            return Err(format!(
+                "{} has the wrong type or size; use the current tools/list schema",
+                p.name
+            ));
+        }
     }
     Ok(())
 }
@@ -749,6 +767,7 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
             "type": "object",
             "properties": Value::Object(props),
             "required": required,
+            "additionalProperties": false,
         }
     })
 }
@@ -771,8 +790,7 @@ Use --focus to narrow the content, --must-contain for a cheap \
 probe, and a result handle from a search result (donsetch fetch \
 @10hd73d) to fetch a result directly. \
 --actions sends clicks/typing to a headless browser for \
-sites that need interaction. \
---archive serves a Wayback snapshot when the live page is dead."
+sites that need interaction."
         }
         "search" => {
             "Search the web across 10+ keyless engines, merged with \
@@ -1037,36 +1055,30 @@ mod tests {
         ];
         for bad in &bad_values {
             let args = json!({ "url": "https://example.com", "tier": bad });
-            let err = check_enum_args(fetch, &args).expect_err("off-list tier accepted");
+            let err = check_args(fetch, &args).expect_err("off-list tier accepted");
             assert!(
                 err.contains(r#"tier must be one of "auto", "1", "2""#),
                 "{err}"
             );
         }
         assert_eq!(
-            check_enum_args(fetch, &json!({ "tier": "3" })),
+            check_args(fetch, &json!({ "tier": "3" })),
             Err(r#"tier must be one of "auto", "1", "2"; got "3""#.to_string())
         );
-        for bad in ["asdf", "bogus", "Off"] {
-            assert!(
-                check_enum_args(fetch, &json!({ "archive": bad })).is_err(),
-                "{bad}"
-            );
-        }
         for bad in ["asdf", "images", "Code"] {
             let args = json!({ "intent": bad });
-            assert!(check_enum_args(search_tool(), &args).is_err(), "{bad}");
+            assert!(check_args(search_tool(), &args).is_err(), "{bad}");
         }
         for bad in ["asdf", "deep", "MAP"] {
             let args = json!({ "mode": bad });
-            assert!(check_enum_args(crawl_tool(), &args).is_err(), "{bad}");
+            assert!(check_args(crawl_tool(), &args).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn listed_absent_and_null_enum_args_pass() {
         for tool in TOOLS {
-            assert_eq!(check_enum_args(tool, &json!({})), Ok(()), "{}", tool.name);
+            assert_eq!(check_args(tool, &json!({})), Ok(()), "{}", tool.name);
             for p in tool.params {
                 let ParamKind::Enum(variants) = p.kind else {
                     continue;
@@ -1075,7 +1087,7 @@ mod tests {
                     let mut args = json!({});
                     args[p.name] = json!(v);
                     assert_eq!(
-                        check_enum_args(tool, &args),
+                        check_args(tool, &args),
                         Ok(()),
                         "{}.{} = {v}",
                         tool.name,
@@ -1084,13 +1096,7 @@ mod tests {
                 }
                 let mut args = json!({});
                 args[p.name] = Value::Null;
-                assert_eq!(
-                    check_enum_args(tool, &args),
-                    Ok(()),
-                    "{}.{}",
-                    tool.name,
-                    p.name
-                );
+                assert_eq!(check_args(tool, &args), Ok(()), "{}.{}", tool.name, p.name);
             }
         }
     }

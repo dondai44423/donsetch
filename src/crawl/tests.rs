@@ -2544,3 +2544,19 @@ async fn report_audit_slow_seed_keeps_descendants_alive_and_page_cap_is_exact() 
             .all(|p| result.pages.iter().all(|old| old.url != p.url))
     );
 }
+
+#[tokio::test]
+async fn v471_map_keeps_scoped_seed_links() {
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/read", 200, "<html><title>Guide</title><article><p>Readable guide.</p><a href='/read/second'>Second page</a></article></html>");
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut options = opts();
+    options.mode = CrawlMode::Map;
+    let result = crawler
+        .crawl("https://ex.com/read", options, None)
+        .await
+        .unwrap();
+    assert_eq!(result.map, ["https://ex.com/read/second"]);
+}

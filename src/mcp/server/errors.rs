@@ -262,7 +262,6 @@ fn has_standalone_digits(text: &str, needle: &str) -> bool {
 /// | content.notfound / content.binary / content.oversize / content.extract / content.incomplete | body |
 /// | guard.ssrf | blocked by design |
 /// | parse.encoding | charset-level failure |
-/// | archive.stale | served an old snapshot |
 /// | deadline.hit | time budget exhausted |
 /// | crawl.seed / crawl.resume / fetch.invalid / search.invalid / crawl.invalid | input errors |
 pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, str> {
@@ -316,7 +315,6 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         _ if m.contains("anti-bot challenge that did not clear") => "wall.challenge_unsolved",
         _ if m.contains("navigation and login chrome") => "wall.empty_shell",
         _ if m.contains("captcha") => "wall.captcha",
-        _ if m.contains("archived copy") || m.contains("snapshot") => "archive.stale",
         _ if v.starts_with("Challenge") => "wall.challenge",
         _ if v == "Blocked" => "wall.blocked",
         _ if v == "Paywall" => "wall.paywall",
@@ -414,13 +412,34 @@ pub(super) fn tool_error_structured(
                 "error"
             });
             s["content_complete"] = json!(false);
-            if code == "content.notfound" {
-                s["suggested_query"] = s["url"].clone();
+            if code == "content.notfound"
+                && let Some(query) = s["url"].as_str().and_then(moved_page_query)
+            {
+                s["suggested_query"] = json!(query);
             }
         }
         v["structuredContent"] = s;
     }
     v
+}
+
+/// Use readable path words to locate a moved page. Never echo credentials,
+/// query parameters, fragments, or opaque percent-encoded path segments.
+fn moved_page_query(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    let words: Vec<_> = url
+        .path_segments()?
+        .filter(|part| !part.contains('%'))
+        .flat_map(|part| part.split(|c: char| !c.is_alphanumeric()))
+        .filter(|word| {
+            word.chars().any(char::is_alphabetic)
+                && word.len() <= 64
+                && !matches!(*word, "html" | "htm" | "php" | "aspx" | "index")
+        })
+        .take(12)
+        .collect();
+    (!words.is_empty()).then(|| format!("site:{host} {}", words.join(" ")))
 }
 
 /// v4.7 uniform envelope: a classified failure is a NORMAL tool
@@ -435,19 +454,19 @@ pub(crate) fn is_failure(result: &Value) -> bool {
         == Some(false)
 }
 
-/// The tool error for a call whose enum arguments fall outside the
+/// The tool error for a call whose arguments fall outside the
 /// spec, with code `<cli_cmd>.invalid` (`fetch.invalid`, …). `None`
 /// when the arguments pass or the spec does not list the tool.
 pub(super) fn invalid_args_error(name: &str, args: &Value) -> Option<Value> {
     let tool = crate::spec::TOOLS.iter().find(|t| t.name == name)?;
-    let problem = crate::spec::check_enum_args(tool, args).err()?;
+    let problem = crate::spec::check_args(tool, args).err()?;
     let cmd = tool.cli_cmd;
     Some(tool_error_structured(
         format!("{cmd}: {problem}"),
         "permanent",
         Some(json!({
             "code": format!("{cmd}.invalid"),
-            "next_action": "retry with one of the listed values, or omit the parameter for its default",
+            "next_action": "correct the parameter using the current tools/list schema, or omit an optional parameter",
         })),
     ))
 }
@@ -625,8 +644,7 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<&'static str> {
 }
 
 /// Machine class for a transport-level fetch failure, recorded in
-/// the error's structuredContent so callers (and the resurrection
-/// gate) can tell "the site is gone" from "the net is bad". Mirrors
+/// the error's structuredContent so callers can tell "the site is gone" from "the net is bad". Mirrors
 /// friendly_fetch_error's branching; the strings are API surface.
 pub(super) fn transport_class(e: &FetchError) -> &'static str {
     match e {
@@ -1090,8 +1108,8 @@ mod error_code_tests {
         );
         assert!(text.contains("Next action:"), "{text}");
 
-        let args = json!({ "url": "https://example.com", "archive": "asdf" });
-        let v = invalid_args_error("web_fetch", &args).expect("archive=asdf must be refused");
+        let args = json!({ "url": "https://example.com", "mode": "asdf" });
+        let v = invalid_args_error("web_fetch", &args).expect("mode=asdf must be refused");
         assert_eq!(v["code"], "fetch.invalid");
         let args = json!({ "query": "q", "intent": "asdf" });
         let v = invalid_args_error("web_search", &args).expect("intent=asdf must be refused");
@@ -1124,7 +1142,7 @@ mod error_code_tests {
 
     #[test]
     pub(super) fn listed_enum_args_and_unknown_tools_pass_through() {
-        let args = json!({ "url": "https://example.com", "tier": "2", "archive": "off" });
+        let args = json!({ "url": "https://example.com", "tier": "2" });
         assert!(invalid_args_error("web_fetch", &args).is_none());
         assert!(
             invalid_args_error("web_fetch", &json!({ "url": "https://example.com" })).is_none()
@@ -1227,5 +1245,64 @@ mod error_code_tests {
             .as_ref(),
             "wall.empty_shell"
         );
+    }
+}
+
+#[cfg(test)]
+mod v471_tests {
+    use super::*;
+    #[test]
+    fn v471_dead_page_suggests_topic_without_url_secrets() {
+        let url = "https://docs.example.com/guides/rust-async.html?token=secret#private";
+        let result = tool_error_structured(
+            format!("not found: {url} returned HTTP 404"),
+            "permanent",
+            Some(json!({"url":url})),
+        );
+        let query = result["structuredContent"]["suggested_query"]
+            .as_str()
+            .expect("useful topic query");
+        assert_eq!(query, "site:docs.example.com guides rust async");
+        assert!(!query.contains("secret") && !query.contains("private"));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn v471_argument_types_and_unknown_keys_are_rejected() {
+        for args in [
+            json!([]),
+            json!({"deadline_ms":"500"}),
+            json!({"deadline_ms":-1}),
+            json!({"focus":true}),
+            json!({"toc":"false"}),
+            json!({"url":[1]}),
+            json!({"actions":{}}),
+            json!({"archive":"only"}),
+        ] {
+            let result = invalid_args_error("web_fetch", &args)
+                .expect("invalid arguments must not silently use defaults");
+            assert_eq!(result["structuredContent"]["code"], "fetch.invalid");
+            assert_eq!(result["structuredContent"]["ok"], false);
+        }
+        assert!(
+            invalid_args_error(
+                "web_fetch",
+                &json!({"url":"https://example.com","deadline_ms":500,"toc":false,"focus":null})
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn v471_topic_hint_is_absent_for_roots_and_opaque_paths() {
+        for url in [
+            "https://example.com/?token=secret",
+            "https://example.com/index.html",
+            "https://example.com/%E6%97%A5?token=secret",
+        ] {
+            assert_eq!(moved_page_query(url), None);
+        }
     }
 }

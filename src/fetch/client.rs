@@ -379,7 +379,7 @@ impl Fetcher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .check(&cache_key)
         };
-        let (conditional, validation) = match check {
+        let (mut conditional, mut validation) = match check {
             CacheCheck::Fresh(body, status, headers) => {
                 let verdict = walls::detect(status, &headers, &body);
                 return Ok(FetchOutcome {
@@ -509,12 +509,23 @@ impl Fetcher {
                         "304 response without a matching request validator snapshot".into(),
                     ));
                 };
-                let (body, status, headers) = self
+                let merged = self
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .revalidated(&cache_key, snapshot, &out.headers, hop_started.elapsed())
-                    .map_err(FetchError::Http)?;
+                    .revalidated(&cache_key, snapshot, &out.headers, hop_started.elapsed());
+                let (body, status, headers) = match merged {
+                    Ok(merged) => merged,
+                    Err(reason) => {
+                        // The server's validator cannot authorize this cached body.
+                        // Recover on the same route with one unconditional GET.
+                        // Clearing the snapshot makes a second 304 a protocol error.
+                        eprintln!("[fetch] rejected conditional response: {reason}; refetching");
+                        conditional.clear();
+                        validation = None;
+                        continue;
+                    }
+                };
                 // The claim validated: only now does the hop count as
                 // lane health.
                 if let (Some(pool), Some((host, id))) = (&self.egress, pool_lane) {

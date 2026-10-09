@@ -57,7 +57,7 @@ section!(TransportSection {
 });
 
 section!(McpSection {
-    text_only: bool = false,
+    text_only: bool = true,
     url_handles: bool = true,
 });
 

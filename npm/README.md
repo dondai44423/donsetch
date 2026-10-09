@@ -98,10 +98,12 @@ donsetch update
 
 | Tool | What it does |
 |---|---|
-| `web_fetch` | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes, `archive` resurrection. |
+| `web_fetch` | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes. |
 | `web_search` | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | `web_crawl` | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
 | `web_screenshot` | Rendered PNG of any URL through the same browser tier, with the usual URL safety guards. |
+
+MCP results default to self-contained text: leading `[meta]` JSON followed by source evidence, including for unknown client bridges. PNGs remain image blocks.
 
 Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `deadline.hit`, `network.dns`…), an `errorKind` (`permanent`, `transient`, `walled`) and a `next_action`, so agents branch on codes instead of parsing prose.
 
@@ -110,7 +112,7 @@ Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `d
 - **Search without keys.** Six keyless engines across four independent index families plus eight official verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv, StackExchange, MDN, Google News), merged by consensus and re-ranked locally by an ONNX cross-encoder. 95.5% answer-in-snippet over 110 questions across 11 niches with no keys at all.
 - **PDFs done properly.** A custom PDFium FFI, no Python subprocess. Tables and borders come from the rendered bitmap, text from the glyph stream, and the trust audit flags exactly the regions that need OCR.
 - **Crawl with manners.** Per-host adaptive pacing that honors `Retry-After` and robots `Crawl-delay`, cross-process politeness so two crawls do not double a site's rate, near-duplicate detection, resume tokens that survive restarts, and honest stop reasons.
-- **Fetch that answers honestly.** `content_ok`, `thin`, `changed` with section diffs, `archive.stale` with the snapshot's age, `decoy suspected` instead of silently passing a cloaked page. No fake success.
+- **Fetch that answers honestly.** `content_ok`, `thin`, `changed` with section diffs, `decoy suspected` instead of silently passing a cloaked page. No fake success.
 - **Login to walled sites.** `donsetch login x.com` opens YOUR browser, you sign in, and the session cookies land in the 0600 vault that tier-1 fetches and tier-2 renders already replay. Credentials never enter DonSeTch.
 - **Works everywhere.** Linux, macOS, Windows. npm, Homebrew, the Pi agent as a native extension, and the DeepSeek Harness as a first-class plugin.
 

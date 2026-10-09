@@ -50,7 +50,7 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 | 📄 **Pixel-fusion PDF** | Glyphs and rendered pixels come from the same content stream and are fused deterministically, with a per-region trust audit. Scanned PDFs auto-OCR. |
 | 🧬 **Built from scratch** | Own HTTP/2 (HPACK, flow control, priority), own extraction engine, own PDF parser, own search aggregator, own crawl engine. |
 | 🔗 **Token control** | Links render as `[text](L12)`, results as `S1…Sn`, and `fetch S3` just works: 3 tokens instead of 80. `focus`, `toc`, `section`, `must_contain` and `since_last` each cut a page down to what the agent actually needs. |
-| 🪶 **~2.4k tool schema** | All four tools, measured from `tools/list`. Every token earns its place. |
+| 🪶 **~2.4k tool schema** | All four tools: 2,369 tokens (`o200k_base`, compact `tools/list` JSON). |
 | 🩺 **`doctor`** | One command sweeps config, search health, egress, TLS, browser, DNS, captive portal, secret-store permissions, and fixes what is mechanically fixable. |
 
 ## 🎬 Demo
@@ -233,26 +233,35 @@ donsetch crawl https://docs.python.org --mode map --topic asyncio
 ```
 
 <details>
-<summary><b>If your client shows only half the result (the <code>[meta]</code> fold)</b></summary>
+<summary><b>MCP results and client bridges</b></summary>
 
-An MCP result has two surfaces: `content` (the page markdown) and `structuredContent` (raw URLs behind the `S3` handles, `next_offset`, resume tokens, `content_ok`, `thin`, error codes, `next_action`). MCP never said which one a client renders, so clients drop one: Claude Code and VS Code keep `structuredContent` and discard `content`, OpenCode v1 (tested on 1.18.3) keeps `content` and discards `structuredContent`, and OpenCode 2 (Code Mode on by default, tested on 2.0.16) keeps `structuredContent` and discards `content`, like Claude Code. The Pi extension is another shape: it hands the model `content` only (`structuredContent` never reaches the model there), so the document arrives without the URLs behind the handles.
+By default, every client receives evidence and actionable state together in
+`content`: a leading `[meta] {JSON}` line followed by source markdown. This
+also works for unknown wrappers and OpenCode's generic `cli` handshake.
+`structuredContent` is omitted so a bridge cannot select metadata and drop
+the document. PNG captures remain image content blocks; diagnostics stay in
+`_meta`. The same contract applies over stdio and HTTP.
 
-Symptoms: tool metadata but no page text, or page text but no citable URL behind an `S3` handle, no pagination, no error codes. The fix is the same for all of them: DonSeTch folds the state into a compact leading `[meta]` text block, keeps the markdown as a clean block behind it, and omits `structuredContent`. The known clients get the fold automatically, detected by `clientInfo.name` at the handshake: Claude Code, VS Code, OpenCode, and the Pi extension (`pi-donsetch`). Any other client (a wrapper or fork under a different name, `claude-code-proxy` say) is not detected and keeps the token-optimal split:
+Raw MCP returns a result object with a `content` array. Some agent bridges
+flatten its text blocks into a string. Handle both at the integration boundary:
 
-```bash
-DONSETCH_MCP__TEXT_ONLY=1 donsetch mcp   # force the fold for every client
+```js
+const text = typeof result === "string"
+  ? result
+  : result.content.filter(block => block.type === "text")
+      .map(block => block.text).join("\n\n");
+const end = text.indexOf("\n");
+if (!text.startsWith("[meta] ") || end < 0) throw new Error("Missing result state");
+const state = JSON.parse(text.slice(7, end));
+const markdown = text.slice(end + 1).trimStart();
+// Inspect state.ok, content_ok, next_offset, resume or next_action.
 ```
 
-or in `donsetch.toml`:
-
-```toml
-[mcp]
-text_only = true
-```
-
-Fail-closed like the other flags: only an explicit `1`/`true` turns it on; the legacy `DONSETCH_MCP_TEXT_ONLY` name still works (`donsetch config show --legacy` maps the old names).
-
-**OpenCode 2.x needs one of those today.** It reports `clientInfo.name` as `cli` (its `process.env.OPENCODE_CLIENT ?? "cli"` default, which `serve` never overrides), too generic to claim in the name list, and its Code Mode shows the model `structuredContent` only. Until OpenCode restores a usable name upstream, set `text_only` for it.
+For integrations that deliberately consume both surfaces, `[mcp] text_only =
+false` restores the split result for unrecognized clients. Known clients that
+drop one surface retain compatibility folding. The typed
+`DONSETCH_MCP__TEXT_ONLY` setting and legacy `DONSETCH_MCP_TEXT_ONLY=1`
+remain supported. The default requires no client-specific configuration.
 
 </details>
 
@@ -260,12 +269,12 @@ Fail-closed like the other flags: only an explicit `1`/`true` turns it on; the l
 
 | Tool | What it does |
 |---|---|
-| 🌐 **`web_fetch`** | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes, `archive` resurrection. |
+| 🌐 **`web_fetch`** | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes. |
 | 🔎 **`web_search`** | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | 🕷️ **`web_crawl`** | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
 | 📸 **`web_screenshot`** | Rendered PNG of any URL through the same tier-2 browser. URL goes through the usual safety guards. CLI twin: `donsetch screenshot URL [--out PATH]`. |
 
-Tool schemas: `donsetch tools` (same JSON as MCP `tools/list`). Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `deadline.hit`, `archive.stale`, `network.dns`…), an `errorKind` (`permanent`, `transient`, `walled`), and a `next_action` line, so agents branch on codes instead of parsing prose. The model surface carries evidence and the state that changes the next action; transport telemetry (tier, quality, escalation trace, timings, engines) stays under `_meta`, for example `_meta["com.donsetch/fetch-debug"]`.
+Tool schemas: `donsetch tools` (same JSON as MCP `tools/list`). Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `deadline.hit`, `network.dns`…), an `errorKind` (`permanent`, `transient`, `walled`), and a `next_action` line, so agents branch on codes instead of parsing prose. The model surface carries evidence and the state that changes the next action; transport telemetry (tier, quality, escalation trace, timings, engines) stays under `_meta`, for example `_meta["com.donsetch/fetch-debug"]`.
 
 ## 🌐 Fetch
 
@@ -280,7 +289,6 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 - **Classification**: `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page`, a 0-1 quality score, and inline trust signals (focus-miss, JS-shell warning, empty content).
 - **Page memory**: every fetch is fingerprinted, so a re-fetch reports `changed` with section-level diffs, and `since_last=true` collapses a re-check to one line (~30 tokens).
 - **`must_contain`**: verifies a claim against the full page but returns MATCH/NO-MATCH plus up to 3 excerpts (~60 tokens instead of 4k).
-- **`archive=auto`**: a dead link serves the nearest Wayback snapshot, honestly labeled with its age.
 - **`stitch=true`**: collects up to six same-host parts within 1 MiB. Output obeys `max_chars`; `next_offset` resumes collected text and `next_part` identifies an unfinished part.
 - **Read budgets**: `mode=scan` / `read` / `deep` set 800 / 4000 / 16000 extracted bytes; explicit `max_chars` wins. The source title/URL header and structured metadata sit outside this body budget. `read_status` and `content_complete` distinguish partial output from a complete read. Reddit subsets expose `partial` and known item counts.
 - **`deadline_ms` everywhere**: real MCP cancellation, progress notifications, ms cost footer. Nothing can silently hang.
@@ -298,9 +306,9 @@ number. `links` and `media` share the rendered markdown budget, including their
 markup; `budget_scope` makes that accounting explicit.
 
 For parallel reads, pass an array to `web_fetch`: successful siblings remain
-available beside individual error rows. MCP retains `isError` on failed single
-calls; clients that turn it into a rejected promise should use
-`Promise.allSettled` when composing separate calls.
+available beside individual error rows. Classified failures return normally
+with `ok:false`, `code`, and `next_action`; protocol errors remain JSON-RPC
+errors. Inspect each result before using its evidence.
 
 `shot` always returns a receipt (`requested`, `saved_to`, `reason`), including
 when no captcha capture was needed. `web_screenshot` returns the inline PNG
@@ -310,9 +318,9 @@ use the inline image because the path belongs to the server host.
 **Wall time and freshness (observed).** Plain HTTP reads 0.3-2s; search
 0.7-2.9s; guards are instant (an SSRF block ~13ms, a solve-cooldown
 refusal ~33ms); auth-wall refusals 11-14s; a browser escalation 17-31s;
-an interactive-captcha give-up 41-42s (the suite worst case). A dead URL
-is slower than many live ones: HTTP fails, the browser tries, then the
-archive lookup runs, so the honest error lands around 10s. Repeat calls
+an interactive-captcha give-up 41-42s (the suite worst case). Dead URLs return the live failure directly; automatic archive recovery has
+been removed. A readable URL path may supply a `suggested_query` for locating
+a moved copy; query parameters and fragments are excluded. Repeat calls
 are cache-backed: a repeated search returned in ~10ms against ~5.0s
 cold, a re-fetched page 1.5s against ~11.9s cold. `changed` and
 `since_last` verdicts compare stored history, not a live revalidation:

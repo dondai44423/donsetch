@@ -10,15 +10,15 @@
 //!   (the pi extension: the model sees the document but never the
 //!   compact state).
 //!
-//! DonSeTch's shape is deliberately split: `content` carries the
+//! Internally, results are split: `content` carries the
 //! document markdown, `structuredContent` carries compact actionable
 //! state (verdict, next_offset, resume tokens, error codes). Clients
 //! that render both lose nothing; clients that pick one need the
 //! surfaces merged into the one they actually show.
 //!
 //! Three layers, explicit precedence:
-//! 1. Default: unchanged split shape (token-optimal) for every
-//!    client not recognized and with no override set.
+//! 1. Default: self-contained text for every client, including unknown
+//!    wrappers. Set `mcp.text_only=false` to opt into the split shape.
 //! 2. Handshake detection: `clientInfo.name` on `initialize` matching
 //!    a known text-only client flips that session to TextOnly.
 //! 3. Manual override: `DONSETCH_MCP_TEXT_ONLY=1` forces TextOnly for
@@ -27,8 +27,7 @@
 //!
 //! TextOnly shape (validated end to end by the issue reporter's own
 //! stdio proxy): the full `structuredContent` is folded into a compact
-//! leading `[meta]` text block (lossless by construction, ~10% of the
-//! document), `structuredContent` is dropped, and the document stays a
+//! leading `[meta]` text block, `structuredContent` is dropped, and the document stays a
 //! clean markdown text block. Every tool folds the same way,
 //! web_search included: its model-facing `structuredContent` is the
 //! lean `{weak, results:[{rank,url,handle}]}` routing state built by
@@ -120,9 +119,8 @@ pub fn mode_from_params(params: &Value) -> ClientMode {
     }
 }
 
-/// Manual override. Fail-closed parse (same convention as the other
-/// env flags): only an explicit true value turns it on; unset, empty,
-/// or any other value leaves the handshake in charge.
+/// Typed configuration defaults to folded text. An explicit false leaves
+/// the handshake in charge; legacy true still forces folded text.
 pub fn env_override() -> Option<ClientMode> {
     if crate::config::cfg().mcp.text_only {
         Some(ClientMode::TextOnly)
@@ -193,6 +191,14 @@ pub fn shape_result(mut result: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v471_unknown_bridge_gets_evidence_and_state_by_default() {
+        // OpenCode 2 reports `cli`; future wrappers must not need a name list.
+        let cell = ModeCell::new();
+        cell.set(mode_from_params(&json!({"clientInfo":{"name":"cli"}})));
+        assert_eq!(effective(&cell), ClientMode::TextOnly);
+    }
 
     fn fetch_result() -> Value {
         json!({
@@ -365,8 +371,8 @@ mod tests {
     // test), so each of these three arms is its own test with the env
     // state in place BEFORE the first cfg() call.
     #[test]
-    fn text_only_override_off_by_default() {
-        assert_eq!(env_override(), None);
+    fn text_only_override_on_by_default() {
+        assert_eq!(env_override(), Some(ClientMode::TextOnly));
     }
 
     #[test]
@@ -380,10 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn text_only_override_false_stays_off() {
-        // =false must NOT enable it (fail-closed flag parse).
+    fn text_only_override_false_allows_explicit_split() {
+        // An explicit typed false opts into the split shape for unknown clients.
         unsafe {
-            std::env::set_var("DONSETCH_MCP_TEXT_ONLY", "false");
+            std::env::set_var("DONSETCH_MCP__TEXT_ONLY", "false");
         }
         assert_eq!(env_override(), None);
     }

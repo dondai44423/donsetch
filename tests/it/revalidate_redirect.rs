@@ -403,7 +403,7 @@ async fn stealth_v3_304_changed_validators_fail_without_merging_a_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/owned-validator", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            for ordinal in 1..=2 {
+            for ordinal in 1..=if valid { 2 } else { 3 } {
                 let (mut tcp, _) = listener.accept().await.unwrap();
                 let mut head = Vec::new();
                 while !head.ends_with(b"\r\n\r\n") {
@@ -418,6 +418,12 @@ async fn stealth_v3_304_changed_validators_fail_without_merging_a_body() {
                         "if-modified-since:"
                     };
                     assert!(head.contains(expected));
+                }
+                if ordinal == 3 {
+                    assert!(
+                        !head.contains("if-none-match:") && !head.contains("if-modified-since:"),
+                        "retry must be unconditional: {head}"
+                    );
                 }
                 let response = if ordinal == 1 {
                     format!(
@@ -1016,4 +1022,58 @@ async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
 
     unsafe { std::env::remove_var("HTTP_PROXY") };
     unsafe { std::env::remove_var("NO_PROXY") };
+}
+
+#[tokio::test]
+async fn v471_mismatched_304_refetches_once_without_validators() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/owned-mismatch", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=3 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let conditional =
+                head.contains("if-none-match:") || head.contains("if-modified-since:");
+            assert_eq!(conditional, ordinal == 2, "request {ordinal}: {head}");
+            let response = if ordinal == 2 {
+                "HTTP/1.1 304 Not Modified\r\nETag: \"other\"\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            } else {
+                let body = if ordinal == 1 {
+                    "old body"
+                } else {
+                    "fresh body"
+                };
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=0\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+            tcp.shutdown().await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"old body");
+    let fresh = fetcher
+        .fetch(&url)
+        .await
+        .expect("mismatched 304 must recover with an unconditional GET");
+    assert_eq!(fresh.status, 200);
+    assert_eq!(
+        fresh.body, b"fresh body",
+        "never return the unvalidated stale body"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
 }

@@ -28,8 +28,11 @@ fn html_server() -> String {
             let mut s = stream;
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf);
-            let body = "<html><head><title>Stack probe</title></head><body>\
-                        <h1>Stack probe</h1><p>The worker thread answered.</p></body></html>";
+            let body = format!(
+                "<html><head><title>Stack probe</title></head><body>\
+                 <article><h1>Stack probe</h1><p>{}</p></article></body></html>",
+                "The worker thread answered with readable evidence. ".repeat(40)
+            );
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
@@ -88,10 +91,10 @@ fn mcp_fetch_answers_instead_of_aborting() {
     });
 
     for msg in [
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"stack-probe","version":"0"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cli","version":"2.0.16"}}}"#.to_string(),
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
         format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"web_fetch","arguments":{{"url":"{url}"}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"web_fetch","arguments":{{"url":"{url}","tier":"1","max_chars":600}}}}}}"#
         ),
     ] {
         stdin.write_all(msg.as_bytes()).unwrap();
@@ -122,5 +125,23 @@ fn mcp_fetch_answers_instead_of_aborting() {
     assert!(
         answer.contains("\"result\"") || answer.contains("\"error\""),
         "no JSON-RPC answer to tools/call; stderr was: {err_text}"
+    );
+    let reply: serde_json::Value = serde_json::from_str(&answer).unwrap();
+    let result = &reply["result"];
+    assert!(result.get("structuredContent").is_none(), "{reply}");
+    let content = result["content"].as_array().expect("MCP content blocks");
+    let meta = content[0]["text"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("[meta] ")
+        .expect("unknown client receives self-contained text by default");
+    let state: serde_json::Value = serde_json::from_str(meta).unwrap();
+    assert_eq!(state["content_ok"], true, "{reply}");
+    assert!(state["next_offset"].as_u64().unwrap() > 0, "{reply}");
+    assert!(
+        content.iter().any(|block| block["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("The worker thread answered"))),
+        "client must receive page evidence alongside continuation: {reply}"
     );
 }
