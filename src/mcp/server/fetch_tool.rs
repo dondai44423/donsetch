@@ -1167,6 +1167,17 @@ async fn reddit_session_hop(
     true
 }
 
+/// Reddit's anonymous identity cookie, `loid`, is the gate for the
+/// direct `.json` endpoint (verified live: loid alone serves the
+/// listing, absent it is refused). When the jar already carries it
+/// the pre-emptive legacy-host hop is a redundant request; without
+/// it the hop is what seeds a session. A refusal on a direct
+/// attempt still runs the one-shot session fallback, so a stale
+/// loid self-heals.
+fn reddit_session_live(cookies: &[CookieRecord]) -> bool {
+    cookies.iter().any(|c| c.name == "loid")
+}
+
 async fn reddit_session_fallback(
     daemon: &Arc<Daemon>,
     args: &Value,
@@ -1548,11 +1559,14 @@ async fn fetch_single_inner(
                 persona_al.as_deref(),
                 Some(&call.route),
             );
-            if adapter_used == Some("adapter:reddit-json") {
+            let needs_seed = adapter_used == Some("adapter:reddit-json")
+                && !reddit_session_live(&daemon.fetcher.jar_snapshot(&host));
+            if needs_seed {
                 // The structured endpoint and session initialization do not
                 // depend on each other's response. Overlap their network waits.
                 // A usable JSON reply wins immediately; failures still wait
-                // for the session before reading the public SSR page.
+                // for the session before reading the public SSR page. A jar
+                // that already holds the session skips the hop entirely.
                 let seed = reddit_session_hop(daemon, &parsed_url, &mut trace, &call.route);
                 tokio::pin!(request, seed);
                 tokio::select! {
@@ -5828,6 +5842,30 @@ mod adapter_hop_tests {
         ));
         // The retry itself must not bounce (`_no_adapter`).
         assert!(!adapter_hop_failed(Verdict::Blocked, true, true));
+    }
+
+    // V02: `loid` is the gateway cookie for the direct `.json`
+    // endpoint. When the jar holds it, the pre-emptive hop is
+    // skipped; the refusal ladder still covers a revoked session.
+    #[test]
+    fn a_live_loid_gates_the_preemptive_reddit_hop() {
+        let cookie = |name: &str| CookieRecord {
+            name: name.into(),
+            value: "v".into(),
+            domain: ".reddit.com".into(),
+            path: "/".into(),
+            expires_at: None,
+            secure: true,
+            http_only: true,
+            same_site: "Lax".into(),
+        };
+        assert!(reddit_session_live(&[cookie("loid")]));
+        assert!(reddit_session_live(&[
+            cookie("session_tracker"),
+            cookie("loid")
+        ]));
+        assert!(!reddit_session_live(&[cookie("session_tracker")]));
+        assert!(!reddit_session_live(&[]));
     }
 
     // The session retry: reddit page refusals at tier 1 get one

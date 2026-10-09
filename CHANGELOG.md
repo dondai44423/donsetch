@@ -46,6 +46,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal, a deadline hit, a browser-pass failure, or a capture that was
   never needed, instead of one ambiguous string for all of them.
 
+- A domain cookie (a `Domain=` cookie, such as reddit's `loid`) keeps
+  its scope across the tier-1 vault round trip: the snapshot re-exports
+  the leading dot, so a replayed jar still sends the session to `www.`
+  hosts on its first request. Before this, re-import demoted every
+  domain cookie to one exact host, and every warm reddit fetch after a
+  state relink re-ran the legacy-host session hop plus a refused first
+  attempt. Warm `/r/rust` p50 went from 2822ms to 1192ms (n=10
+  interleaved A/B; cold unchanged at ~3.1s, where one hop is the
+  session establishment).
+
+- The reddit session hop is skipped when the jar already carries a
+  live session: one redundant request is dropped per warm fetch, and a
+  refusal still runs the one-shot session recovery, so a stale session
+  self-heals on its own.
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed
