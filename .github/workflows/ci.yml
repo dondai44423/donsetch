@@ -297,10 +297,12 @@ jobs:
       # tests whose value is genuinely platform-specific.
       # The heavy set (soak/corpus/landmarks/live) runs in the nightly
       # `heavy` job and in every platform's full matrix there.
+      # This step includes a cold native compile/link, just like the full
+      # lane. Per-test hangs remain bounded by nextest's 30-second timeout.
       - name: Test (nextest, smoke)
         if: matrix.tests == 'smoke'
         run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} -E 'test(mcp::supervisor) | test(profile::) | test(extract::) | test(pdf::) | test(ghost::) | test(onnx::)'
-        timeout-minutes: 30
+        timeout-minutes: 60
 
       # The cross-platform check for the lanes that run no suite: compile
       # every target (tests included, no LINK). This is what keeps those

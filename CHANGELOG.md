@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Native smoke CI budgets include cold compilation and linking, while
+  preserving nextest's per-test timeout. Intel macOS cold builds no longer
+  have to fit compilation and test execution into the previous 30-minute cap.
 - Malformed CLI `--actions` JSON is rejected during argument parsing before
   any fetch starts, rather than silently running without the requested steps.
 - Missing-page search hints use readable path words with a site restriction,
