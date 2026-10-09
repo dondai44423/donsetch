@@ -294,9 +294,13 @@
       "name": "web_crawl"
     },
     {
-      "description": "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height; wait_ms adds settle time after load (max 5000, default 600). Private/loopback URLs are blocked like web_fetch. Failures are returned, not thrown : ok:false + code + next_action.",
+      "description": "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height (can be several MB); wait_ms adds settle time after load (max 5000, default 600); deadline_ms caps the whole call (500-600000 ms, default 60000). Returns the PNG as an image content block plus structuredContent {path, bytes}; the path is server-local under the screenshots root, so hand it to a file-reading tool when your client cannot view image blocks. Private/loopback URLs are blocked like web_fetch. Failures are returned, not thrown : ok:false + code + next_action.",
       "inputSchema": {
         "properties": {
+          "deadline_ms": {
+            "description": "Hard time budget in ms (500-600000, default 60000). On expiry: an honest deadline error with next_action, never a silent hang.",
+            "type": "integer"
+          },
           "full_page": {
             "description": "Capture the full page height, not just the viewport.",
             "type": "boolean"

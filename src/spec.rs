@@ -557,6 +557,17 @@ const SCREENSHOT_PARAMS: &[ParamSpec] = &[
         help: "Extra settle time after load, up to 5000 ms. Default 600.",
         mcp_help: Some("Extra milliseconds to wait after load, max 5000."),
     },
+    ParamSpec {
+        name: "deadline_ms",
+        flag: "deadline-ms",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Hard time budget for this call in ms (500-600000, default 60000). On expiry: honest deadline error + next_action : never a silent hang.",
+        mcp_help: Some(
+            "Hard time budget in ms (500-600000, default 60000). On expiry: an honest deadline error with next_action, never a silent hang.",
+        ),
+    },
 ];
 
 pub static TOOLS: &[ToolSpec] = &[
@@ -607,8 +618,8 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_screenshot",
         cli_cmd: "screenshot",
         summary: "Open a URL in a real browser, return the page as PNG",
-        description: "A rendered PNG of a page: DonSeTch opens the URL in the same tier-2 browser it already keeps for challenge walls, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport.",
-        mcp_description: "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height; wait_ms adds settle time after load (max 5000, default 600). Private/loopback URLs are blocked like web_fetch. Failures are returned, not thrown : ok:false + code + next_action.",
+        description: "A rendered PNG of a page: DonSeTch opens the URL in the same tier-2 browser it already keeps for challenge walls, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport. The result carries the PNG inline plus structuredContent {path, bytes}; the path is server-local, under the screenshots dir of the cache root, and full-page captures can run several MB.",
+        mcp_description: "Capture a URL as a rendered PNG in a real browser. full_page captures the full page height (can be several MB); wait_ms adds settle time after load (max 5000, default 600); deadline_ms caps the whole call (500-600000 ms, default 60000). Returns the PNG as an image content block plus structuredContent {path, bytes}; the path is server-local under the screenshots root, so hand it to a file-reading tool when your client cannot view image blocks. Private/loopback URLs are blocked like web_fetch. Failures are returned, not thrown : ok:false + code + next_action.",
         params: SCREENSHOT_PARAMS,
         examples: &[
             "donsetch screenshot https://example.com",

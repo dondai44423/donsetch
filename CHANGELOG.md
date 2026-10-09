@@ -119,6 +119,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the relative-name rule in `next_action`, and the `shot` help
   carries the same contract.
 
+- `web_screenshot` gains `deadline_ms` (500-600000 ms, default 60000)
+  with the same clamp and default as `web_fetch`: the budget used to be
+  a fixed 60s the caller could not change, and an ignored `deadline_ms`
+  on a never-settling page ran to the internal ~20s cap (measured
+  21.1s for a 4s budget). Expiry now lands at the caller's wall as
+  `deadline.hit` (measured 4.0s for 4s): the outer wrapper carries a
+  dedicated envelope naming the budget (next_action: raise deadline_ms
+  or wait_ms, or capture the viewport instead of the full page), and
+  the render pass's own remaining-budget cap reports the same code when
+  it wins the race. The tool text now states the return shape (inline
+  image block plus `structuredContent` path/bytes), the server-local
+  screenshots root, and the full-page size (multi-MB).
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed
