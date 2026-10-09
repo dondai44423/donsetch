@@ -4422,6 +4422,22 @@ pub(super) fn apply_page_history(
         facts.complete,
     );
     let Some(fp) = ex_fingerprint else {
+        // No fingerprint: nothing about this read is change-trackable
+        // (adapter/fallback/probe paths). Say so in the verdict field
+        // instead of omitting it; a since_last check additionally gets
+        // the note, since a full page would otherwise read as if the
+        // check had run.
+        if let Some(sc) = res.pointer_mut("/structuredContent") {
+            sc["changed"] = json!("no_baseline");
+        }
+        if since_last
+            && let Some(cell) = res.pointer_mut("/content/0/text")
+            && let Some(md) = cell.as_str().map(String::from)
+        {
+            *cell = json!(format!(
+                "*[since_last: no prior snapshot (change tracking is unavailable for this read) : returning full content]*\n\n{md}"
+            ));
+        }
         return;
     };
     let mut hist = daemon
@@ -4465,6 +4481,9 @@ pub(super) fn apply_page_history(
             ("unchanged", _) => {
                 format!("{title_line}{url}\n\n*unchanged since last fetch ({ago}s ago)*\n")
             }
+            ("new", _) => format!(
+                "{title_line}{url}\n\n*no prior snapshot for this URL : refetch without since_last for full content*\n"
+            ),
             (_, Some(d)) => format!(
                 "{title_line}{url}\n\n*changed since last fetch ({changed}, {ago}s ago):*\n\n- {d}\n\n*(full content: refetch without since_last)*\n"
             ),
@@ -4898,6 +4917,68 @@ mod ghost_dom_dump_tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod page_history_signal_tests {
+    use super::*;
+
+    // V08: a read with no fingerprint (adapter/fallback/probe paths)
+    // can never answer a since_last check; it must say so instead of
+    // silently returning a full page with no verdict and no signal.
+    #[tokio::test]
+    async fn since_last_without_a_fingerprint_signals_no_baseline() {
+        let daemon = Arc::new(Daemon::new().await.unwrap());
+        let mut res = json!({
+            "content": [{"type": "text", "text": "# T\nhttps://x.test/\n\nbody"}],
+            "structuredContent": {"ok": true},
+        });
+        apply_page_history(
+            &daemon,
+            &mut res,
+            "https://x.test/no-fingerprint",
+            PageFacts {
+                fingerprint: None,
+                markdown: "body",
+                title: Some("T"),
+                complete: true,
+            },
+            true,
+        );
+        assert_eq!(res["structuredContent"]["changed"], "no_baseline");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no prior snapshot"), "got: {text}");
+    }
+
+    // V08: a first-seen URL (fingerprint present, no prior record) is
+    // labeled, not told "new since last fetch (0s ago)".
+    #[tokio::test]
+    async fn since_last_on_a_first_seen_url_says_no_prior_snapshot() {
+        let daemon = Arc::new(Daemon::new().await.unwrap());
+        let mut res = json!({
+            "content": [{"type": "text", "text": "# T\nhttps://x.test/\n\nbody"}],
+            "structuredContent": {"ok": true},
+        });
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        apply_page_history(
+            &daemon,
+            &mut res,
+            &format!("https://x.test/first-seen-{unique}"),
+            PageFacts {
+                fingerprint: Some("deadbeef"),
+                markdown: "body",
+                title: Some("T"),
+                complete: true,
+            },
+            true,
+        );
+        assert_eq!(res["structuredContent"]["changed"], "new");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no prior snapshot"), "got: {text}");
     }
 }
 

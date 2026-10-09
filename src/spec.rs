@@ -211,9 +211,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "Change check instead of full read: if the page is unchanged since your last fetch, output collapses to a one-line verdict; if changed, you get the section-level delta (added/removed/changed). Refetch without it for full content. Monitoring/re-verification at ~zero tokens.",
+        help: "Change check instead of full read: if the page is unchanged since your last fetch, output collapses to a one-line verdict; if changed, you get the section-level delta (added/removed/changed). Refetch without it for full content. Monitoring/re-verification at ~zero tokens. Tracked per URL; a URL with no prior baseline is labeled in the output.",
         mcp_help: Some(
-            "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page. Do not combine with reading filters or rendering fields.",
+            "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page; a URL with no prior baseline says so (changed:\"no_baseline\" when the read has no change tracking, else a no-prior-snapshot notice). History is tracked per URL (crawl's since_last is per site). Do not combine with reading filters or rendering fields.",
         ),
     },
     ParamSpec {
@@ -500,7 +500,7 @@ const CRAWL_PARAMS: &[ParamSpec] = &[
         required: false,
         help: "Delta crawl: pages are re-checked against fingerprint memory; only new/changed pages are returned. Monitoring and re-crawls at a fraction of the cost.",
         mcp_help: Some(
-            "Return only pages new or changed since the last crawl of this site. Use for monitoring or a repeated crawl, not a first visit.",
+            "Return only pages new or changed since the last crawl of this site (a site-wide baseline; web_fetch's since_last tracks per URL). Use for monitoring or a repeated crawl, not a first visit.",
         ),
     },
     ParamSpec {

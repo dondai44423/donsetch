@@ -126,7 +126,7 @@
             "type": "string"
           },
           "since_last": {
-            "description": "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page. Do not combine with reading filters or rendering fields.",
+            "description": "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page; a URL with no prior baseline says so (changed:\"no_baseline\" when the read has no change tracking, else a no-prior-snapshot notice). History is tracked per URL (crawl's since_last is per site). Do not combine with reading filters or rendering fields.",
             "type": "boolean"
           },
           "stitch": {
@@ -280,7 +280,7 @@
             "type": "boolean"
           },
           "since_last": {
-            "description": "Return only pages new or changed since the last crawl of this site. Use for monitoring or a repeated crawl, not a first visit.",
+            "description": "Return only pages new or changed since the last crawl of this site (a site-wide baseline; web_fetch's since_last tracks per URL). Use for monitoring or a repeated crawl, not a first visit.",
             "type": "boolean"
           },
           "url": {

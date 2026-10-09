@@ -84,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`/api/`) ranks flat and keeps the previous order. Ranking reorders
   only, it never filters: the same inventory, capped as before.
 
+- `since_last` change checks work on adapter pages now: Wikipedia
+  infobox reads (and every other adapter) used to record no change
+  fingerprint, so a re-check silently returned the full page with no
+  verdict and no signal. Adapter reads that still carry no fingerprint
+  say so in the result now (`changed:"no_baseline"` plus a notice on a
+  `since_last` check), and a first-seen URL is labeled "no prior
+  snapshot" instead of "new since last fetch (0s ago)". Successful
+  fetches carry `structuredContent.changed` on every read.
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed

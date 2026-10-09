@@ -115,7 +115,10 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         quality: 0.9,
         pdf_pages: None,
         images: Vec::new(),
-        fingerprint: None,
+        // Change tracking (since_last verdicts) needs the fingerprint
+        // the generic path records: sha256 of the full pre-pagination
+        // markdown.
+        fingerprint: Some(crate::pages::history::PageHistory::fingerprint(&full)),
         via: Some("adapter:wikipedia-infobox"),
         partial: None,
     })
@@ -374,6 +377,23 @@ mod tests {
         // Body still present after the infobox.
         assert!(ex.markdown.contains("## History"));
         assert!(ex.markdown.contains("personal project in 2006"));
+    }
+
+    // V08: an adapter read must carry a change fingerprint so a
+    // since_last re-fetch can answer with a verdict; None silently
+    // disabled change tracking for every adapter page.
+    #[test]
+    fn an_infobox_read_carries_a_change_fingerprint() {
+        let url = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+        let ex = extract(WIKI, url, &opts()).unwrap();
+        let fp = ex.fingerprint.expect("since_last needs a fingerprint");
+        // Stable across identical input.
+        let again = extract(WIKI, url, &opts()).unwrap();
+        assert_eq!(again.fingerprint.as_deref(), Some(fp.as_str()));
+        // Sensitive to content.
+        let edited = WIKI.replace("personal project in 2006", "personal project in 2007");
+        let other = extract(&edited, url, &opts()).unwrap();
+        assert_ne!(other.fingerprint.as_deref(), Some(fp.as_str()));
     }
 
     #[test]
