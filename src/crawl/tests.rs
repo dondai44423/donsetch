@@ -953,6 +953,38 @@ async fn map_mode_focus_filters() {
     assert!(r.map[0].contains("migration"));
 }
 
+// V05: a sitemap-less origin must not read as an empty site in map
+// mode. The seed page is already in the buffer (identity hop), so
+// map falls back to harvesting its links : the same discovery full
+// starts from, without fetching any page of its own.
+#[tokio::test]
+async fn map_mode_falls_back_to_seed_links_without_a_sitemap() {
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/a\">Page A</a><a href=\"/b\">Page B</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/", 200, seed);
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert_eq!(r.pages.len(), 0, "map stays inventory-only");
+    assert!(
+        r.map.iter().any(|u| u.ends_with("/a")) && r.map.iter().any(|u| u.ends_with("/b")),
+        "map must fall back to the seed page's links, got {:?} (skipped={:?})",
+        r.map,
+        r.skipped
+    );
+    // The fallback must not fetch the linked pages themselves.
+    let hits = hits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(!hits.iter().any(|h| h.ends_with("/a")));
+    assert!(!hits.iter().any(|h| h.ends_with("/b")));
+}
+
 // ── Basic crawl ───────────────────────────────────────────
 
 #[tokio::test]

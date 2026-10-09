@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal still runs the one-shot session recovery, so a stale session
   self-heals on its own.
 
+- Crawl `mode:"map"` no longer reads as an empty site when the origin
+  has no sitemap: the seed page, already fetched for identity, now
+  supplies the URL inventory, so map and full agree on what a seed
+  exposes, at zero added requests and no page fetches. `nodejs.org/api`
+  went from `discovered:0` with guidance blaming the seed to a 72-URL
+  inventory with stop `InventoryComplete`; sitemap-backed maps (MDN:
+  120 URLs) are unchanged.
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed

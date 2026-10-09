@@ -255,7 +255,7 @@
             "type": "integer"
           },
           "mode": {
-            "description": "full (default) discovers pages and reads content; map returns only the URL inventory; content follows links from the seed when no usable site map exists.",
+            "description": "full (default) discovers pages and reads content; map returns only the URL inventory (a site map when one exists, otherwise the seed page's links, with no page fetches); content follows links from the seed when no usable site map exists.",
             "enum": [
               "full",
               "map",

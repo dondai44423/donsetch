@@ -763,12 +763,68 @@ impl Crawler {
             robots_cache.insert(seed_origin.clone(), Arc::new(robots.clone()));
         }
         if opts.mode == CrawlMode::Map {
-            // Map-only crawl: cheap exit. Guide the agent when no
-            // sitemap was found.
+            // Map-only crawl: cheap exit. The seed page was already
+            // fetched in the identity hop and sits in the buffer, so
+            // when no sitemap exists map falls back to harvesting its
+            // links : a sitemap-less origin must not read as an empty
+            // site while full/content read real pages from the same
+            // seed (map and full have to agree on what exists).
+            if map.is_empty() {
+                let buffered_seed = buffered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&frontier::normalize(&seed_url));
+                if let Some(page) = buffered_seed
+                    && matches!(page.verdict, Verdict::ContentOk)
+                    && (200..300).contains(&page.status)
+                {
+                    let html = String::from_utf8_lossy(&page.body);
+                    let page_url_parsed =
+                        Url::parse(&page.url).unwrap_or_else(|_| seed_url.clone());
+                    // <base href> resolves against the document
+                    // URL first, the page loop's rule.
+                    let base = extract_base_href(&html)
+                        .and_then(|bh| page_url_parsed.join(&bh).ok())
+                        .filter(|b| matches!(b.scheme(), "http" | "https"))
+                        .unwrap_or(page_url_parsed);
+                    let mut harvested_locales: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for (href, _anchor) in self_harvest_static(&html, &base) {
+                        if map.len() >= opts.map_cap {
+                            break;
+                        }
+                        let Some(u) = frontier::resolve(&base, &href) else {
+                            continue;
+                        };
+                        if !host_ok(&u) {
+                            continue;
+                        }
+                        if !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths) {
+                            continue;
+                        }
+                        if opts.respect_robots && !robots.allows_url(&u) {
+                            continue;
+                        }
+                        if let Some(q) = &opts.focus
+                            && !score::focus_match("", u.path(), q)
+                        {
+                            continue;
+                        }
+                        let lcanon = frontier::locale_canonical(u.path());
+                        if !harvested_locales.insert(lcanon) {
+                            continue;
+                        }
+                        // Canonical fetchable form (fragment,
+                        // tracking params, default port away):
+                        // the same shape the frontier queues.
+                        map.push(frontier::normalize(&u));
+                    }
+                }
+            }
             let skipped = if map.is_empty() {
                 vec![(
                     seed.to_string(),
-                    "no sitemap found at common locations : use mode=content to BFS from the seed"
+                    "no sitemap found at common locations and the seed page exposed no usable links : try mode=full or mode=content"
                         .into(),
                 )]
             } else {
