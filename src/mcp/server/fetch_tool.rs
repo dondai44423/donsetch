@@ -608,61 +608,13 @@ pub(super) async fn fetch_multi(
         .collect();
     let mut sliced_flags = vec![false; results.len()];
     if let Some(budget_tok) = budget_tokens {
-        let budget_chars = budget_tok * 4;
-        let lens: Vec<usize> = markdowns
-            .iter()
-            .map(|m| m.as_ref().map(|s| s.len()).unwrap_or(0))
-            .collect();
-        let total: usize = lens.iter().sum();
-        if total > budget_chars && total > 0 {
-            let n_ok = lens.iter().filter(|&&l| l > 0).count().max(1);
-            let floor = (budget_chars / n_ok / 4).clamp(300, 4_000);
-            let mut alloc: Vec<usize> = lens
-                .iter()
-                .map(|&l| {
-                    if l == 0 {
-                        0
-                    } else {
-                        (budget_chars * l / total).max(floor)
-                    }
-                })
-                .collect();
-            // Trim the largest allocations down to fit the budget.
-            let mut over: i128 = alloc.iter().sum::<usize>() as i128 - budget_chars as i128;
-            while over > 0 {
-                let (idx, _) = alloc
-                    .iter()
-                    .enumerate()
-                    .filter(|(_i, a)| **a > floor)
-                    .max_by_key(|(i, a)| (**a as i128, std::cmp::Reverse(*i)))
-                    .map(|(i, a)| (i, *a))
-                    .unwrap_or((0, 0));
-                let take = (alloc[idx] - floor).min(over as usize);
-                if take == 0 {
-                    break;
-                }
-                alloc[idx] -= take;
-                over -= take as i128;
-            }
-            for (i, m) in markdowns.iter_mut().enumerate() {
-                if let Some(md) = m
-                    && md.len() > alloc[i]
-                {
-                    let mut cut = alloc[i];
-                    while cut > 0 && !md.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    let truncated = format!(
-                        "{}\n\n*[budget-sliced: showing {} of {} chars : refetch this url alone with max_chars for the rest]*",
-                        &md[..cut],
-                        cut,
-                        md.len()
-                    );
-                    *m = Some(truncated);
-                    sliced_flags[i] = true;
-                }
-            }
-        }
+        slice_batch_markdowns(
+            &urls,
+            &results,
+            &mut markdowns,
+            budget_tok,
+            &mut sliced_flags,
+        );
     }
 
     render_fetch_batch(&urls, &results, &markdowns, budget_tokens, &sliced_flags)
@@ -683,19 +635,13 @@ pub(super) fn render_fetch_batch(
     debug_assert_eq!(urls.len(), sliced_flags.len());
 
     let is_err = is_failure;
-    let title_of = |v: &Value| {
-        v.pointer("/_meta/com.donsetch~1fetch-debug/title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
 
     let mut text = String::new();
     let ok_count = markdowns.iter().filter(|m| m.is_some()).count();
     let err_count = results.len() - ok_count;
     for (i, r) in results.iter().enumerate() {
         if let Some(md) = &markdowns[i] {
-            let title = title_of(r);
+            let title = batch_title(r);
             let head = if title.is_empty() {
                 urls[i].as_str()
             } else {
@@ -706,24 +652,15 @@ pub(super) fn render_fetch_batch(
                 &urls[i],
                 (!title.is_empty()).then_some(title.as_str()),
             );
-            text.push_str(&format!(
-                "## [{}] {}\n{}\n\n{}\n\n---\n\n",
-                i + 1,
-                head,
-                urls[i],
-                body
-            ));
+            text.push_str(&batch_ok_header(i, head, &urls[i]));
+            text.push_str(&body);
+            text.push_str(BATCH_MEMBER_SEP);
         } else {
             let msg = r
                 .pointer("/content/0/text")
                 .and_then(Value::as_str)
                 .unwrap_or("fetch failed");
-            text.push_str(&format!(
-                "## [{}] {} : ERROR\n{}\n\n---\n\n",
-                i + 1,
-                urls[i],
-                msg
-            ));
+            text.push_str(&batch_error_block(i, &urls[i], msg));
         }
     }
     let structured_results = results
@@ -845,6 +782,127 @@ pub(super) fn render_fetch_batch(
         "structuredContent": structured,
         "_meta": {"com.donsetch/fetch-batch-debug": debug},
     })
+}
+
+/// Separator between batch members in the composed document.
+const BATCH_MEMBER_SEP: &str = "\n\n---\n\n";
+
+/// The composed header for an OK batch member.
+fn batch_ok_header(index: usize, head: &str, url: &str) -> String {
+    format!("## [{}] {}\n{}\n\n", index + 1, head, url)
+}
+
+/// The composed block for a failed batch member (error text verbatim).
+fn batch_error_block(index: usize, url: &str, msg: &str) -> String {
+    format!("## [{}] {} : ERROR\n{}\n\n---\n\n", index + 1, url, msg)
+}
+
+/// The member title recorded by its fetch ("" when absent).
+fn batch_title(v: &Value) -> String {
+    v.pointer("/_meta/com.donsetch~1fetch-debug/title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The in-content marker appended to a budget-sliced member.
+fn batch_slice_marker(cut: usize, orig: usize) -> String {
+    format!(
+        "\n\n*[budget-sliced: showing {cut} of {orig} chars : refetch this url alone with max_chars for the rest]*"
+    )
+}
+
+/// Slice OK batch markdowns to fit the shared budget. Pure so unit
+/// tests pin the accounting (fetch_multi composes with
+/// render_fetch_batch, which must agree with these helpers).
+pub(super) fn slice_batch_markdowns(
+    urls: &[String],
+    results: &[Value],
+    markdowns: &mut [Option<String>],
+    budget_tokens: usize,
+    sliced_flags: &mut [bool],
+) {
+    let budget_chars = budget_tokens.saturating_mul(4);
+    let lens: Vec<usize> = markdowns
+        .iter()
+        .map(|m| m.as_ref().map(|s| s.len()).unwrap_or(0))
+        .collect();
+    let total: usize = lens.iter().sum();
+    if total > budget_chars && total > 0 {
+        // Everything the composer adds outside the member bodies rides
+        // the same budget: member headers and separators, error text
+        // verbatim, and a reserve for the per-member slicing marker.
+        // The previous shape charged none of it, so a real batch ran
+        // ~9% over its budget (markers alone: N x ~100 chars).
+        const SLICE_MARKER_RESERVE: usize = 120;
+        let mut fixed = 0usize;
+        for (i, r) in results.iter().enumerate() {
+            if lens[i] > 0 {
+                fixed +=
+                    batch_ok_header(i, &batch_title(r), &urls[i]).len() + BATCH_MEMBER_SEP.len();
+                fixed += SLICE_MARKER_RESERVE;
+            } else {
+                let msg = r
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("fetch failed");
+                fixed += batch_error_block(i, &urls[i], msg).len();
+            }
+        }
+        let pool = budget_chars.saturating_sub(fixed);
+        let n_ok = lens.iter().filter(|&&l| l > 0).count().max(1);
+        let fair = pool / n_ok;
+        let floor = (pool / n_ok / 4).clamp(300, 4_000).min(fair);
+        let mut alloc: Vec<usize> = lens
+            .iter()
+            .map(|&l| {
+                if l == 0 {
+                    0
+                } else {
+                    (pool * l / total).max(floor)
+                }
+            })
+            .collect();
+        // Trim the largest allocations down to fit the pool.
+        let mut over: i128 = alloc.iter().sum::<usize>() as i128 - pool as i128;
+        while over > 0 {
+            let (idx, _) = alloc
+                .iter()
+                .enumerate()
+                .filter(|(_i, a)| **a > floor)
+                .max_by_key(|(i, a)| (**a as i128, std::cmp::Reverse(*i)))
+                .map(|(i, a)| (i, *a))
+                .unwrap_or((0, 0));
+            let take = (alloc[idx] - floor).min(over as usize);
+            if take == 0 {
+                break;
+            }
+            alloc[idx] -= take;
+            over -= take as i128;
+        }
+        for (i, m) in markdowns.iter_mut().enumerate() {
+            if let Some(md) = m
+                && md.len() > alloc[i]
+            {
+                let orig = md.len();
+                let mut cut = alloc[i];
+                // Reserve the marker inside the member's own share so
+                // it can never push the batch past its budget.
+                for _ in 0..3 {
+                    let want = alloc[i].saturating_sub(batch_slice_marker(cut, orig).len());
+                    if cut <= want {
+                        break;
+                    }
+                    cut = want;
+                }
+                while cut > 0 && !md.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                *m = Some(format!("{}{}", &md[..cut], batch_slice_marker(cut, orig)));
+                sliced_flags[i] = true;
+            }
+        }
+    }
 }
 
 fn fetch_input(args: &Value, url: &str) -> Result<url::Url, Value> {
@@ -4979,6 +5037,47 @@ mod page_history_signal_tests {
         assert_eq!(res["structuredContent"]["changed"], "new");
         let text = res["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no prior snapshot"), "got: {text}");
+    }
+}
+
+#[cfg(test)]
+mod batch_budget_tests {
+    use super::{render_fetch_batch, slice_batch_markdowns};
+    use serde_json::{Value, json};
+
+    // V09: the composed batch never exceeds the shared budget. The
+    // old accounting left member headers and the slicing marker
+    // uncounted (measured ~9% over on a real batch).
+    #[test]
+    fn a_batch_stays_within_its_token_budget() {
+        let urls: Vec<String> = (0..6).map(|i| format!("https://ex.test/{i}")).collect();
+        let big = "x".repeat(9_000);
+        let results: Vec<Value> = urls
+            .iter()
+            .map(|_| {
+                json!({
+                    "content": [{"type": "text", "text": big.clone()}],
+                    "_meta": {"com.donsetch/fetch-debug": {"title": "T"}},
+                    "structuredContent": {"ok": true},
+                })
+            })
+            .collect();
+        let mut markdowns: Vec<Option<String>> =
+            results.iter().map(|_| Some(big.clone())).collect();
+        let mut flags = vec![false; urls.len()];
+        slice_batch_markdowns(&urls, &results, &mut markdowns, 2_000, &mut flags);
+        assert!(
+            flags.iter().all(|f| *f),
+            "every over-share member gets sliced"
+        );
+        let out = render_fetch_batch(&urls, &results, &markdowns, Some(2_000), &flags);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.len() <= 2_000 * 4,
+            "batch output {} bytes exceeds its {} byte budget",
+            text.len(),
+            2_000 * 4
+        );
     }
 }
 

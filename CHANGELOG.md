@@ -93,6 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot" instead of "new since last fetch (0s ago)". Successful
   fetches carry `structuredContent.changed` on every read.
 
+- URL batches respect their `budget_tokens` share: member headers,
+  separators, error text and the per-member "budget-sliced" marker are
+  all charged to the budget, and the marker is reserved inside each
+  member's own slice, so the composed batch stays within it. A 3-URL
+  live batch at 800 tokens measured 111.6% of budget before and 83.4%
+  after; the old shape left all of that uncounted (about 9% over on
+  real batches).
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed
