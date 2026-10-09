@@ -47,8 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Removed Wayback/archive recovery and the `archive` argument from fetch.
-  Dead pages return their live failure without an archive lookup. Old calls
-  supplying `archive` receive an explicit invalid-argument result.
+  Dead pages return their live failure without an archive lookup. This was
+  dropped because it was slow, degraded fetch speed in practice, and
+  generally proved annoying to handle during testing; it was rarely used,
+  so there was little value in keeping it. Old calls supplying `archive`
+  receive an explicit invalid-argument result.
 - Every MCP client now gets source evidence and compact state together in
   `content`, with leading `[meta]` JSON. This covers OpenCode's generic `cli`
   handshake and unknown bridges that previously selected metadata alone.
