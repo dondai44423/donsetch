@@ -168,9 +168,9 @@ DonSeTch is built from scratch — no dependency on existing OSS web tooling:
 
 ## Reporting issues
 
-- **Bugs**: include the URL you tried to fetch/search/crawl, the DonSeTch version (`donsetch --version`), and the structuredContent from the response.
+- **Bugs**: include the URL you tried to fetch/search/crawl, the DonSeTch version (`donsetch --version`), and the leading `[meta]` JSON plus relevant response text (or `structuredContent` if split output is enabled).
 - **Anti-bot failures**: include the site URL and the `verdict` field from the response.
-- **Search issues**: include the query, the `engines` report from structuredContent, and whether `weak=true`.
+- **Search issues**: include the query, the `engines` report from response metadata, and whether `weak=true`.
 
 ## Reviewers & maintainers
 
