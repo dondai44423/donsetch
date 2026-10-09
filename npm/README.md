@@ -81,7 +81,7 @@ Downloads the prebuilt binary for your platform from [GitHub Releases](https://g
 
 Prefer HTTP over stdio? `donsetch mcp --http --port 8765`, clients connect to `http://localhost:8765/mcp`. Sessions, cancellation, `/health`, token auth (`DONSETCH_HTTP_TOKEN`) and per-request timeouts are documented in `donsetch mcp --help`.
 
-If your client shows only half of each result (tool metadata but no page text, or text but no citable URLs), it is dropping one of the two MCP result surfaces. Claude Code, VS Code, OpenCode, and the Pi extension get the `[meta]` fold automatically; `DONSETCH_MCP_TEXT_ONLY=1 donsetch mcp` forces it for every other client.
+Every client gets the `[meta]` fold by default: compact state and source evidence arrive together in `content`, including for unknown bridges and OpenCode's generic `cli` handshake. Raw MCP returns content blocks; some bridges join them into a string. Parse the leading `[meta]` JSON line, then read the source text. See the full README for the explicit split-output option.
 
 ### 2. As a CLI (for humans and scripts)
 

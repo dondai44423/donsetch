@@ -130,7 +130,7 @@ pub fn env_override() -> Option<ClientMode> {
 }
 
 /// The mode a session's tool responses take: explicit override first,
-/// then whatever the handshake detected, then the default split shape.
+/// then the handshake mode when folded output is explicitly disabled.
 pub fn effective(cell: &ModeCell) -> ClientMode {
     env_override().unwrap_or_else(|| cell.get())
 }
@@ -330,7 +330,7 @@ mod tests {
         // `content` only, so it folds like the rest.
         let pi = json!({ "clientInfo": { "name": "pi-donsetch" } });
         assert_eq!(mode_from_params(&pi), ClientMode::TextOnly);
-        // An unlisted client keeps the token-optimal split shape.
+        // An unlisted handshake does not trigger a known-client override.
         let other = json!({ "clientInfo": { "name": "cursor" } });
         assert_eq!(mode_from_params(&other), ClientMode::Default);
     }

@@ -644,8 +644,8 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<&'static str> {
 }
 
 /// Machine class for a transport-level fetch failure, recorded in
-/// the error's structuredContent so callers can tell "the site is gone" from "the net is bad". Mirrors
-/// friendly_fetch_error's branching; the strings are API surface.
+/// the result state so callers can distinguish site failures from network
+/// failures. Mirrors friendly_fetch_error; the strings are API surface.
 pub(super) fn transport_class(e: &FetchError) -> &'static str {
     match e {
         FetchError::Timeout => "timeout",
@@ -1281,6 +1281,7 @@ mod boundary_tests {
             json!({"url":[1]}),
             json!({"actions":{}}),
             json!({"archive":"only"}),
+            json!({"url":vec!["https://example.com";13]}),
         ] {
             let result = invalid_args_error("web_fetch", &args)
                 .expect("invalid arguments must not silently use defaults");
@@ -1304,5 +1305,53 @@ mod boundary_tests {
         ] {
             assert_eq!(moved_page_query(url), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod transport_class_tests {
+    #[test]
+    fn transport_classes_separate_death_from_ambiguity() {
+        use super::transport_class;
+        use crate::error::FetchError;
+        // Certificate, DNS and connection failures retain distinct classes.
+        assert_eq!(
+            transport_class(&FetchError::Tls("certificate verify failed".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Tls("handshake failure".into())),
+            "tls"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "Name or service not known"
+            ))),
+            "dns"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other("connection refused"))),
+            "refused"
+        );
+        // Timeouts and protocol failures retain their own retry signals.
+        assert_eq!(transport_class(&FetchError::Timeout), "timeout");
+        assert_eq!(
+            transport_class(&FetchError::Tls("connection reset by peer".into())),
+            "reset"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Io(std::io::Error::other(
+                "connection timed out"
+            ))),
+            "timeout"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Http("parser died".into())),
+            "protocol"
+        );
+        assert_eq!(
+            transport_class(&FetchError::Ghost("no browser".into())),
+            "ghost"
+        );
     }
 }
