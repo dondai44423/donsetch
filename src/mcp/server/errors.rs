@@ -292,10 +292,14 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
             "guard.ssrf"
         }
         _ if m.contains("deadline") => "deadline.hit",
-        _ if m.contains("cdp timeout:") || m.contains("cdp connect: ws handshake timeout") => {
+        _ if m.contains("cdp timeout:")
+            || m.contains("cdp connect: ws handshake timeout")
+            || m.contains("devtools ws timeout") =>
+        {
             "browser.timeout"
         }
-        _ if m.contains("cdp link closed")
+        _ if m.contains("no devtools ws line")
+            || m.contains("cdp link closed")
             || m.contains("cdp dropped:")
             || m.contains("cdp send:")
             || m.contains("cdp connect:") =>
@@ -965,6 +969,14 @@ mod error_code_tests {
             (
                 "browser launch failed: ghost: cdp connect: ws handshake timeout",
                 "browser.timeout",
+            ),
+            (
+                "web_screenshot: no browser: ghost: devtools ws timeout (browser said nothing)",
+                "browser.timeout",
+            ),
+            (
+                "browser launch failed: ghost: no devtools ws line (browser exited)",
+                "browser.transport",
             ),
         ] {
             let result = tool_error_structured(
