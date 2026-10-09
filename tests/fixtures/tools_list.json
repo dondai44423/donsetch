@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Read one URL or a deliberate URL batch as source markdown. Use search to discover URLs and crawl for multiple pages from one site. Prefer the smallest view that can supply the required evidence, and continue only from returned continuation state. Do not repeat a successful read unless it was thin, truncated, or failed. Automatic acquisition may use HTTP, a browser, an adapter, PDF extraction, or an archive. JSON endpoints (`.json`, application/json) never leave plain HTTP. Failures are returned, not thrown : ok:false + code + next_action in the envelope (codes: network.*, browser.*, wall.*, content.*, tls.*, selector.*, guard.ssrf, deadline.hit, *.invalid). Treat ok=false, content_ok=false, thin=true, or a stable error code as unresolved; follow next_action or choose another source. Cite the returned source URL.",
+      "description": "Read one URL or a deliberate URL batch as source markdown. Use search to discover URLs and crawl for multiple pages from one site. Prefer the smallest view that can supply the required evidence, and continue only from returned continuation state. Do not repeat a successful read unless it was thin, truncated, or failed. Automatic acquisition may use HTTP, a browser, an adapter, PDF extraction, or an archive. JSON endpoints (`.json`, application/json) never leave plain HTTP. Failures are returned, not thrown : ok:false + code + next_action in the envelope (codes: network.*, browser.*, wall.*, content.*, tls.*, selector.*, guard.ssrf, deadline.hit, *.invalid). Time: plain HTTP reads ~0.3-2s; a browser escalation 17-31s; a dead URL ~10s (HTTP, browser, then archive); interactive-captcha give-up is the worst case (41-42s). Treat ok=false, content_ok=false, thin=true, or a stable error code as unresolved; follow next_action or choose another source. Cite the returned source URL.",
       "inputSchema": {
         "properties": {
           "actions": {
@@ -89,7 +89,7 @@
             "type": "boolean"
           },
           "max_chars": {
-            "description": "Max markdown chars (default 16000). Truncated pages include next_offset for resumption.",
+            "description": "Max extracted-markdown bytes to return (default 16000; ~4 bytes per token). Truncated pages include next_offset for resumption.",
             "type": "integer"
           },
           "media": {
@@ -97,7 +97,7 @@
             "type": "boolean"
           },
           "mode": {
-            "description": "Output budget preset: scan=800, read=4000, deep=16000. Explicit max_chars wins; omission keeps the 16000 default. All presets return next_offset when truncated.",
+            "description": "Byte budget for the extracted source markdown (~4 bytes per token): scan=800, read=4000, deep=16000. Explicit max_chars wins; omission keeps the 16000 default. All presets return next_offset when truncated; budget_tokens is the token-denominated budget.",
             "enum": [
               "scan",
               "read",
@@ -114,7 +114,7 @@
             "type": "integer"
           },
           "section": {
-            "description": "Heading name (substring, case-insensitive): return only that section. Use after toc.",
+            "description": "Heading name (substring, case-insensitive) or an sN id from a toc outline: return only that section. Use after toc.",
             "type": "string"
           },
           "selector": {
@@ -173,11 +173,11 @@
       "inputSchema": {
         "properties": {
           "deadline_ms": {
-            "description": "Hard time budget in ms (500-600000) for the whole call (engines keep their own timeouts). On expiry: an honest deadline error.",
+            "description": "Hard time budget in ms (500-600000) for the whole call; per-backend timeouts stay below it. On expiry: an honest deadline error.",
             "type": "integer"
           },
           "intent": {
-            "description": "auto (default) detects from the query. code: + GitHub, HN, StackExchange, MDN. paper: + Scholar, arXiv. news: + Google News, HN. entity: + Wikipedia. web: general only.",
+            "description": "auto (default) detects from the query. Keyless mode adds keyless verticals: code: + GitHub, HN, StackExchange, MDN; paper: + Scholar, arXiv; news: + Google News, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
             "enum": [
               "auto",
               "web",

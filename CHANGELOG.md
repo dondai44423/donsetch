@@ -132,6 +132,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image block plus `structuredContent` path/bytes), the server-local
   screenshots root, and the full-page size (multi-MB).
 
+- Tool-definition honesty sweep: search `intent` now describes the
+  keyless fan-out and the single-provider reality under BYOK (no
+  phantom extra engines); read-budget presets and `max_chars` state
+  their unit (extracted-markdown bytes, about 4 per token;
+  `budget_tokens` for tokens); `next_offset` is named as a
+  source-document offset to pass back verbatim; `section` accepts the
+  `sN` ids a `toc` outline prints (verified live, it always did);
+  `thin` is listed as an output field; and the README carries observed
+  wall times (HTTP 0.3-2s, browser 17-31s, captcha give-up 41-42s
+  worst, dead URLs about 10s), the cache/freshness distinction (fast
+  is not fresh), and a worked reading ladder (toc ~170 tokens,
+  section ~840, must_contain ~70).
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed

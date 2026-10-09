@@ -284,6 +284,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 - **`stitch=true`**: collects up to six same-host parts within 1 MiB. Output obeys `max_chars`; `next_offset` resumes collected text and `next_part` identifies an unfinished part.
 - **Read budgets**: `mode=scan` / `read` / `deep` set 800 / 4000 / 16000 extracted bytes; explicit `max_chars` wins. The source title/URL header and structured metadata sit outside this body budget. `read_status` and `content_complete` distinguish partial output from a complete read. Reddit subsets expose `partial` and known item counts.
 - **`deadline_ms` everywhere**: real MCP cancellation, progress notifications, ms cost footer. Nothing can silently hang.
+- **API/JSON endpoints**: `.json` URLs and JSON responses are terminal at HTTP at any tier; for other API paths pin `tier:1` to keep the read on plain HTTP.
 - **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites get restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable.
 - **Anti-cloak check**: on decoy-prone domains, tier-1 responses are equivalence-checked against a headless render, so `decoy suspected` is stamped instead of silently passing as content.
 
@@ -306,6 +307,24 @@ when no captcha capture was needed. `web_screenshot` returns the inline PNG
 and a private local `path` containing the same bytes; remote clients should
 use the inline image because the path belongs to the server host.
 
+**Wall time and freshness (observed).** Plain HTTP reads 0.3-2s; search
+0.7-2.9s; guards are instant (an SSRF block ~13ms, a solve-cooldown
+refusal ~33ms); auth-wall refusals 11-14s; a browser escalation 17-31s;
+an interactive-captcha give-up 41-42s (the suite worst case). A dead URL
+is slower than many live ones: HTTP fails, the browser tries, then the
+archive lookup runs, so the honest error lands around 10s. Repeat calls
+are cache-backed: a repeated search returned in ~10ms against ~5.0s
+cold, a re-fetched page 1.5s against ~11.9s cold. `changed` and
+`since_last` verdicts compare stored history, not a live revalidation:
+fast and fresh are different axes.
+
+**A worked reading ladder** (approximate costs): search, then `toc`
+(~170 tokens for the outline), then `section` on the right part (~840
+tokens, a complete read), or `must_contain` for a yes/no (~70 tokens).
+`focus` is a convenience reducer; `toc` -> `section` is the guaranteed
+one. Truncated output resumes with `next_offset` (same URL, offset
+verbatim); a stopped crawl resumes with `resume` alone.
+
 Stack Overflow question reads use the public question API with answers and
 comments. Empty, failed or incompatible API responses retain the website
 fallback; service-declared backoff is honored. Deleted/private questions and
@@ -319,6 +338,8 @@ content. Headers and inventory metadata are separate. A capped page carries
 history baseline. Full crawl output summarizes the unfetched inventory;
 structured `map` retains the URLs. Map mode reports `mode: "map"`, `discovered`,
 and `InventoryComplete` when finished, without an empty content-page array.
+Map is sitemap-backed when the site has one; without a sitemap it falls
+back to the seed page's links.
 Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
 
 Search reports `requested_results`, `returned_results`, and `underfilled`
