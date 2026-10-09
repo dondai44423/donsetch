@@ -985,6 +985,67 @@ async fn map_mode_falls_back_to_seed_links_without_a_sitemap() {
     assert!(!hits.iter().any(|h| h.ends_with("/b")));
 }
 
+// The audit's "5 URLs from a rich site": JS-built navigation (mdBook
+// sidebars) never appears in raw HTML, so a thin static map merges one
+// rendered read of the seed through the same filter. Render failure or
+// absence keeps the static map : the browser is an enhancement, never
+// a dependency.
+#[tokio::test]
+async fn map_mode_merges_a_rendered_inventory_when_static_is_thin() {
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/a\">Page A</a><a href=\"/b\">Page B</a></article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/", 200, seed);
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    o.deadline = Duration::from_secs(120); // the render guard needs headroom
+    let rendered = "<html><body><a href=\"/c\">C</a><a href=\"/d\">D</a>\
+        <a href=\"/e\">E</a></body></html>"
+        .to_string();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in = Arc::clone(&calls);
+    o.render_html = Some(Arc::new(move |_url: String| {
+        let rendered = rendered.clone();
+        let calls = Arc::clone(&calls_in);
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some((rendered, "https://ex.com/".to_string()))
+        })
+    }));
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "one bounded render");
+    for path in ["/a", "/b", "/c", "/d", "/e"] {
+        assert!(
+            r.map.iter().any(|u| u.ends_with(path)),
+            "missing {path}: {:?}",
+            r.map
+        );
+    }
+    // The rendered read must not fetch the linked pages themselves.
+    {
+        let hits = hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!hits.iter().any(|h| h.ends_with("/c")));
+    }
+
+    // Without a renderer the static map stands unchanged.
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/", 200, seed);
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert!(r.map.iter().any(|u| u.ends_with("/a")));
+    assert!(!r.map.iter().any(|u| u.ends_with("/c")));
+}
+
 // V06: the map is relevance-ranked against the seed, not a pure
 // recency slice. A topic seed pulls its own neighborhood to the
 // front of the inventory; ranking reorders, it never filters.

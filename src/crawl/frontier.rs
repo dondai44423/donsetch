@@ -74,6 +74,25 @@ fn web_scheme(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
 }
 
+/// Canonical scheme for a map entry: a same-host plain-http URL on the
+/// default port under an https seed is upgraded to https. A site serves
+/// one canonical scheme; a mixed-scheme inventory reads as the site's
+/// shape while naming unfetchable twins. Other hosts, explicit
+/// non-default ports, and matching schemes are left exactly as
+/// authored: the map cannot know another host's truth.
+pub fn canonical_scheme(url: &Url, seed: &Url) -> Url {
+    let mut u = url.clone();
+    let default_http_port = u.port().is_none() || u.port() == Some(80);
+    if u.scheme() == "http"
+        && seed.scheme() == "https"
+        && default_http_port
+        && u.host_str() == seed.host_str()
+    {
+        let _ = u.set_scheme("https");
+    }
+    u
+}
+
 /// Known locale codes that appear as the first path segment on
 /// multi-language sites (MDN, Wikipedia, React docs, etc.).
 /// When two URLs differ ONLY in this prefix, they are translations
@@ -954,5 +973,26 @@ mod tests {
         assert!(eff.contains(&"/api/*".to_string()));
         assert!(eff.contains(&"/login*".to_string()));
         assert!(eff.contains(&"/cart*".to_string()));
+    }
+
+    #[test]
+    fn canonical_scheme_upgrades_same_host_default_http_only() {
+        let seed: Url = "https://ex.com/docs/".parse().unwrap();
+        let up = |s: &str| canonical_scheme(&s.parse().unwrap(), &seed).to_string();
+        assert_eq!(up("http://ex.com/a?b=1"), "https://ex.com/a?b=1");
+        // Other host: untouched.
+        assert_eq!(up("http://other.com/a"), "http://other.com/a");
+        // Explicit non-default port: untouched (https may not exist there).
+        assert_eq!(up("http://ex.com:8000/a"), "http://ex.com:8000/a");
+        // Explicit default port: parse normalizes it, then upgrade.
+        assert_eq!(up("http://ex.com:80/a"), "https://ex.com/a");
+        // Already https: untouched.
+        assert_eq!(up("https://ex.com/a"), "https://ex.com/a");
+        // An http seed gives no scheme evidence: untouched.
+        let http_seed: Url = "http://ex.com/".parse().unwrap();
+        assert_eq!(
+            canonical_scheme(&"https://ex.com/a".parse().unwrap(), &http_seed).to_string(),
+            "https://ex.com/a"
+        );
     }
 }

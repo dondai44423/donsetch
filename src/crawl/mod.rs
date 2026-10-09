@@ -210,6 +210,17 @@ pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>;
 pub type UnchangedFn = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// v3: (url, fingerprint, markdown, title) : the delta-crawl memory feed.
 pub type OnPageFn = std::sync::Arc<dyn Fn(&str, Option<&str>, &str, Option<&str>) + Send + Sync>;
+/// Map mode: one rendered read of the seed for thin static inventories
+/// (JS-built navigation never appears in raw HTML). Returns (rendered
+/// html, final url); None = no rendered html, keep the static map.
+pub type RenderFn = std::sync::Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct CrawlOptions {
@@ -265,6 +276,11 @@ pub struct CrawlOptions {
     pub shape_seed: Option<u64>,
     /// Map hard cap.
     pub map_cap: usize,
+    /// Map mode: called with the seed URL when the static inventory is
+    /// thin (JS-built navigation never appears in raw HTML). Returns
+    /// (rendered html, final url) or None; failures keep the static
+    /// map. At most one call per map.
+    pub render_html: Option<RenderFn>,
     /// Minimum content quality (0.0-1.0). Pages below this
     /// are skipped (still counted against page budget).
     pub min_quality: f32,
@@ -293,6 +309,7 @@ impl Default for CrawlOptions {
             delta_unchanged: None,
             on_page: None,
             map_cap: 120,
+            render_html: None,
             min_quality: 0.05,
         }
     }
@@ -814,6 +831,14 @@ impl Crawler {
             // links : a sitemap-less origin must not read as an empty
             // site while full/content read real pages from the same
             // seed (map and full have to agree on what exists).
+            //
+            // Raw HTML cannot see JS-built navigation (mdBook sidebars,
+            // SPA menus). A thin inventory gets one bounded rendered
+            // read of the seed through the caller's renderer, and its
+            // links merge through the same filter. Render failure or
+            // absence keeps the static map: the browser is an
+            // enhancement here, never a dependency.
+            let mut candidates: Vec<Url> = Vec::new();
             if map.is_empty() {
                 let buffered_seed = buffered
                     .lock()
@@ -832,39 +857,80 @@ impl Crawler {
                         .and_then(|bh| page_url_parsed.join(&bh).ok())
                         .filter(|b| matches!(b.scheme(), "http" | "https"))
                         .unwrap_or(page_url_parsed);
-                    let mut harvested_locales: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
                     for (href, _anchor) in self_harvest_static(&html, &base) {
-                        if map.len() >= opts.map_cap {
-                            break;
+                        if let Some(u) = frontier::resolve(&base, &href) {
+                            candidates.push(u);
                         }
-                        let Some(u) = frontier::resolve(&base, &href) else {
-                            continue;
-                        };
-                        if !host_ok(&u) {
-                            continue;
-                        }
-                        if !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths) {
-                            continue;
-                        }
-                        if opts.respect_robots && !robots.allows_url(&u) {
-                            continue;
-                        }
-                        if let Some(q) = &opts.focus
-                            && !score::focus_match("", u.path(), q)
-                        {
-                            continue;
-                        }
-                        let lcanon = frontier::locale_canonical(u.path());
-                        if !harvested_locales.insert(lcanon) {
-                            continue;
-                        }
-                        // Canonical fetchable form (fragment,
-                        // tracking params, default port away):
-                        // the same shape the frontier queues.
-                        map.push(frontier::normalize(&u));
                     }
                 }
+            }
+            const MAP_RENDER_FLOOR: usize = 32;
+            if map.len() + candidates.len() < MAP_RENDER_FLOOR
+                && let Some(render) = opts.render_html.as_ref()
+                && deadline_at.saturating_duration_since(Instant::now()) > Duration::from_secs(15)
+            {
+                match render(seed.clone()).await {
+                    Some((html, final_url)) => {
+                        let parsed = Url::parse(&final_url).unwrap_or_else(|_| seed_url.clone());
+                        let base = extract_base_href(&html)
+                            .and_then(|bh| parsed.join(&bh).ok())
+                            .filter(|b| matches!(b.scheme(), "http" | "https"))
+                            .unwrap_or(parsed);
+                        let before = candidates.len();
+                        for (href, _anchor) in self_harvest_static(&html, &base) {
+                            if let Some(u) = frontier::resolve(&base, &href) {
+                                candidates.push(u);
+                            }
+                        }
+                        eprintln!(
+                            "[crawl] thin static map; rendered harvest added {} candidate link(s)",
+                            candidates.len() - before
+                        );
+                    }
+                    None => {
+                        eprintln!("[crawl] thin static map; rendered harvest unavailable");
+                    }
+                }
+            }
+            let mut seen_urls: std::collections::HashSet<String> = map.iter().cloned().collect();
+            let mut seen_locales: std::collections::HashSet<String> = map
+                .iter()
+                .filter_map(|url| Url::parse(url).ok())
+                .map(|u| frontier::locale_canonical(u.path()))
+                .collect();
+            for u in &candidates {
+                if map.len() >= opts.map_cap {
+                    break;
+                }
+                if !host_ok(u) {
+                    continue;
+                }
+                if !scope_allowed(u.path(), &opts.include_paths, &opts.exclude_paths) {
+                    continue;
+                }
+                if opts.respect_robots && !robots.allows_url(u) {
+                    continue;
+                }
+                if let Some(q) = &opts.focus
+                    && !score::focus_match("", u.path(), q)
+                {
+                    continue;
+                }
+                // Scheme coherence: a same-host plain-http link under
+                // an https seed names the canonical fetchable URL;
+                // mixed twins collapse in the seen-set below.
+                let u = frontier::canonical_scheme(u, &seed_url);
+                let lcanon = frontier::locale_canonical(u.path());
+                if !seen_locales.insert(lcanon) {
+                    continue;
+                }
+                // Canonical fetchable form (fragment, tracking params,
+                // default port away): the same shape the frontier queues.
+                let normalized = frontier::normalize(&u);
+                if !seen_urls.insert(normalized.clone()) {
+                    continue;
+                }
+                map.push(normalized);
             }
             let skipped = if map.is_empty() {
                 vec![(
