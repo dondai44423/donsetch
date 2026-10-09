@@ -633,6 +633,12 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
     let object = args.as_object().ok_or("arguments must be an object")?;
     for name in object.keys() {
         if !tool.params.iter().any(|p| p.name == name) {
+            // A removed surface gets a removal note, not a bare unknown:
+            // an agent that learned `archive` from an older schema must
+            // learn it is gone (live web only), not keep retrying it.
+            if name == "archive" && tool.name == "web_fetch" {
+                return Err("archive was removed: web_fetch returns live page content only".into());
+            }
             return Err(format!(
                 "unknown parameter {name:?}; use the current tools/list schema"
             ));
@@ -1096,6 +1102,26 @@ mod tests {
             let args = json!({ "mode": bad });
             assert!(check_args(crawl_tool(), &args).is_err(), "{bad}");
         }
+    }
+
+    // The archive fallback was removed (the audit's research foot-gun:
+    // an "auto" archive served a 395-day-old snapshot). An agent that
+    // learned the parameter from an older schema gets the removal
+    // spelled out, not a generic unknown-key shrug.
+    #[test]
+    fn removed_archive_argument_gets_a_removal_note() {
+        let err = check_args(
+            fetch_tool(),
+            &json!({ "url": "https://example.com", "archive": "auto" }),
+        )
+        .expect_err("archive must not be accepted");
+        assert!(err.contains("archive was removed"), "{err}");
+        assert!(err.contains("live"), "{err}");
+        // The note is web_fetch-specific; other tools keep the generic
+        // unknown-parameter answer.
+        let err = check_args(search_tool(), &json!({ "query": "x", "archive": "auto" }))
+            .expect_err("archive is not a search parameter");
+        assert!(err.contains("unknown parameter"), "{err}");
     }
 
     #[test]
