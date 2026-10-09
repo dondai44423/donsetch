@@ -859,7 +859,11 @@ fn cli_arg(p: &ParamSpec) -> Arg {
                             variants.iter().copied(),
                         ))
                 }
-                ParamKind::ActionList => arg.value_name("JSON"),
+                ParamKind::ActionList => arg.value_name("JSON").value_parser(|value: &str| {
+                    serde_json::from_str::<Value>(value)
+                        .map(|_| value.to_owned())
+                        .map_err(|e| format!("invalid actions JSON: {e}"))
+                }),
                 ParamKind::StrList => arg
                     .value_name("GLOB")
                     .action(ArgAction::Append)
@@ -903,9 +907,9 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
                     }
                 }
                 ParamKind::ActionList => {
-                    if let Some(v) = m.get_one::<String>(p.name)
-                        && let Ok(parsed) = serde_json::from_str::<Value>(v)
-                    {
+                    if let Some(v) = m.get_one::<String>(p.name) {
+                        let parsed = serde_json::from_str::<Value>(v)
+                            .expect("action JSON was validated by clap");
                         map.insert(p.name.into(), parsed);
                     }
                 }
@@ -941,6 +945,25 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v471_cli_rejects_malformed_action_json_before_conversion() {
+        let tool = super::by_cli_cmd("fetch").unwrap();
+        for invalid in ["[", "undefined", r#"[{"do":}]"#] {
+            let error = super::cli_command(tool)
+                .try_get_matches_from(["fetch", "https://example.com", "--actions", invalid])
+                .expect_err("malformed actions must fail before a fetch can run");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+        let actions = r##"[{"do":"click","selector":"#more"}]"##;
+        let matches = super::cli_command(tool)
+            .try_get_matches_from(["fetch", "https://example.com", "--actions", actions])
+            .unwrap();
+        assert_eq!(
+            super::matches_to_json(tool, &matches)["actions"],
+            serde_json::from_str::<serde_json::Value>(actions).unwrap()
+        );
+    }
+
     #[test]
     fn report_audit_crawl_schema_permits_resume_without_a_seed() {
         let tool = TOOLS.iter().find(|t| t.name == "web_crawl").unwrap();

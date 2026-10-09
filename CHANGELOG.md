@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Malformed CLI `--actions` JSON is rejected during argument parsing before
+  any fetch starts, rather than silently running without the requested steps.
 - Missing-page search hints use readable path words with a site restriction,
   instead of returning the original URL. Credentials, query parameters,
   fragments and opaque encoded path segments are excluded; hints with no
