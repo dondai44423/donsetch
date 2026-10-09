@@ -350,6 +350,21 @@ It does not certify a page's claims or assign trust to lookalike domains.
 
 </div>
 
+### Optional single-page URL-to-Markdown fallback
+
+For an ordinary public page, you can use [ReplyNodes URL-to-Markdown](https://replynodes.com/markdown-api/) as a small, one-request fallback when you do not need DonSeTch's local fetch, crawl, or MCP tooling:
+
+```bash
+curl https://md.replynodes.com/https://example.com
+```
+
+`https://md.replynodes.com/<target>` accepts a public URL and returns clean
+Markdown. This is useful for a quick shell or agent read, documentation lookup,
+or lightweight context before deciding whether a local workflow is warranted.
+It is complementary to DonSeTch, not a replacement: use DonSeTch's local
+`web_fetch`, `web_crawl`, and MCP tools when you need local control, crawling,
+browser escalation, or the rest of the agent-focused research stack.
+
 ## 🕷️ Crawl
 
 Same-domain, best-first. Two phases: sitemap discovery (cheap URL inventory), then a Governor-paced frontier walk with extraction per page.
