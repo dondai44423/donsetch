@@ -122,7 +122,7 @@
             "type": "string"
           },
           "shot": {
-            "description": "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool.",
+            "description": "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool. Relative names resolve under the screenshots root; absolute paths must already be below it. An invalid path is refused before any fetch work.",
             "type": "string"
           },
           "since_last": {

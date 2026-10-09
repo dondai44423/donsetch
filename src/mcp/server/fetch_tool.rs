@@ -170,6 +170,38 @@ async fn record_shot(ghost: &crate::ghost::Ghost, path: &str, trace: &mut Trace)
     trace.step("2", "screenshot", &outcome, 0);
 }
 
+/// V11: the shot destination is validated when the call is parsed.
+/// `record_shot` only runs when a capture is attempted, after the
+/// fetch has already spent its work: an outside path used to be
+/// refused only then (the audit's case: after a full Cloudflare
+/// solve pass, 42s of browser work). A bad destination is a bad
+/// argument; refuse it before any network or browser work.
+fn shot_path_error(args: &Value) -> Option<Value> {
+    let shot = args.get("shot").and_then(Value::as_str)?;
+    let reason = match crate::paths::resolve_screenshot_path(shot) {
+        Ok(_) => return None,
+        Err(e) => e,
+    };
+    let root = crate::paths::screenshots_dir();
+    Some(tool_error_structured(
+        format!("fetch: shot path rejected: {reason}"),
+        "permanent",
+        Some(json!({
+            "code": "shot.invalid",
+            "shot": {
+                "requested": shot,
+                "saved_to": null,
+                "reason": format!("rejected: {reason}")
+            },
+            "allowed_root": root.display().to_string(),
+            "next_action": format!(
+                "pass a relative filename (it resolves under {}) or an absolute path already below it; drop `shot` if no capture is wanted",
+                root.display()
+            ),
+        })),
+    ))
+}
+
 pub(super) async fn fetch_tool(
     daemon: &Arc<Daemon>,
     args: &Value,
@@ -209,6 +241,12 @@ pub(super) async fn fetch_tool(
         .get("budget_tokens")
         .and_then(Value::as_u64)
         .map(|t| (t as usize).clamp(200, 500_000));
+
+    // V11: a bad shot destination is refused here, before any
+    // network or browser work (see shot_path_error).
+    if let Some(error) = shot_path_error(args) {
+        return error;
+    }
 
     if urls.len() == 1 && budget_tokens.is_none() {
         let url = match resolve_fetch_url(daemon, &urls[0]).await {
@@ -319,6 +357,58 @@ mod browser_failure_advice_tests {
     fn a_genuine_transient_keeps_the_network_advice() {
         let action = browser_failure_next_action("Unknown", false, None, 0, "transient");
         assert!(action.contains("network"), "{action}");
+    }
+}
+
+#[cfg(test)]
+mod shot_path_tests {
+    use super::shot_path_error;
+    use serde_json::json;
+
+    // V11: parse-time refusal of invalid `shot` destinations.
+    #[test]
+    fn invalid_shot_paths_are_refused_at_parse() {
+        for (shot, want) in [
+            ("/tmp/v11-outside.png", "outside"),
+            ("../evil.png", "traversal"),
+            ("", "empty"),
+            ("a\0b.png", "NUL"),
+        ] {
+            let error = shot_path_error(&json!({"shot": shot}))
+                .unwrap_or_else(|| panic!("{shot:?} must be refused"));
+            let sc = &error["structuredContent"];
+            assert_eq!(sc["code"], "shot.invalid", "{shot:?}");
+            assert_eq!(sc["ok"], false, "{shot:?}");
+            assert_eq!(error["isError"], false, "{shot:?}");
+            assert!(
+                sc["next_action"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("screenshots"),
+                "{shot:?}"
+            );
+            let text = error["content"][0]["text"].as_str().unwrap_or("");
+            assert!(text.contains(want), "{shot:?}: {text}");
+            let shot_field = &sc["shot"];
+            assert_eq!(shot_field["requested"].as_str(), Some(shot), "{shot:?}");
+            assert!(shot_field["saved_to"].is_null(), "{shot:?}");
+            assert!(
+                shot_field["reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("rejected"),
+                "{shot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_shot_paths_pass_the_parse_gate() {
+        assert!(shot_path_error(&json!({})).is_none());
+        assert!(shot_path_error(&json!({"shot": 5})).is_none());
+        assert!(shot_path_error(&json!({"shot": "v11-out.png"})).is_none());
+        let inside = crate::paths::screenshots_dir().join("sub").join("ok.png");
+        assert!(shot_path_error(&json!({"shot": inside.to_str().unwrap()})).is_none());
     }
 }
 

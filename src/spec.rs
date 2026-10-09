@@ -310,9 +310,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "File path : saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool.",
+        help: "File path : saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool. Relative names resolve under the cache's screenshots dir (default ~/.cache/donsetch/screenshots); absolute paths must already be below it, and an invalid path is refused before any fetch work.",
         mcp_help: Some(
-            "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool.",
+            "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool. Relative names resolve under the screenshots root; absolute paths must already be below it. An invalid path is refused before any fetch work.",
         ),
     },
 ];

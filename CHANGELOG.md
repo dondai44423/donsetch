@@ -111,6 +111,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   related-APIs block the page itself carries). Explicit `focus` crawls
   are unchanged.
 
+- A fetch whose `shot` destination is invalid is refused when the call
+  is parsed, before any network or browser work: the rejection used to
+  arrive only if and when a capture was attempted, after the fetch had
+  already spent its work (the audit's case: 42.1s of Cloudflare render
+  before the refusal). The refusal names the allowed screenshots root
+  and the relative-name rule in `next_action`, and the `shot` help
+  carries the same contract.
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed
