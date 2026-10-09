@@ -321,6 +321,13 @@ impl FrontierQueue {
     }
 
     /// Push a URL with a referer parent (the page that linked to it).
+    ///
+    /// A re-push of an already-seen URL normally dedups. When the URL
+    /// is still queued under a LOWER score, the new score RAISES the
+    /// entry instead: the sitemap flood queues a whole section at
+    /// recency scores before any page is read, and the seed page's
+    /// own links must be able to lift their targets above it (V10).
+    /// Fetched or pruned-away URLs stay seen and are never requeued.
     pub fn push_with_parent(
         &mut self,
         url: Url,
@@ -330,7 +337,22 @@ impl FrontierQueue {
     ) -> bool {
         let key = normalize(&url);
         if !self.seen.insert(key.clone()) {
-            return false;
+            let Some(cur) = self.heap.iter().find(|f| f.url == key).map(|f| f.score) else {
+                return false;
+            };
+            if score <= cur {
+                return false;
+            }
+            let mut items: Vec<Frontier> = std::mem::take(&mut self.heap).into_vec();
+            if let Some(f) = items.iter_mut().find(|f| f.url == key) {
+                f.score = score;
+                f.depth = f.depth.min(depth);
+                if parent.is_some() {
+                    f.parent = parent;
+                }
+            }
+            self.heap = items.into_iter().collect();
+            return true;
         }
         self.heap.push(Frontier {
             url: key,
@@ -723,6 +745,33 @@ mod tests {
         q.push(u1, 1.0, 0);
         q.push(u2, 5.0, 0);
         assert!(q.pop().unwrap().url.ends_with("/b"));
+    }
+
+    // V10: the sitemap may queue a URL before the page that links to
+    // it is read; a later, higher-scored re-push must RAISE the
+    // queued entry, not be swallowed by the seen-set. Fetched or
+    // dropped URLs must stay gone.
+    #[test]
+    fn a_higher_score_reraises_a_queued_entry() {
+        let mut q = FrontierQueue::new();
+        let u = Url::parse("https://ex.com/topic").unwrap();
+        let other = Url::parse("https://ex.com/other").unwrap();
+        // Sitemap-style push, then a better link re-pushes the same URL.
+        assert!(q.push(u.clone(), -0.75, 1));
+        assert!(q.push(other.clone(), 0.5, 1));
+        assert!(q.push_with_parent(u.clone(), 0.75, 1, Some("https://ex.com/seed".into())));
+        let first = q.pop().unwrap();
+        assert_eq!(first.url, normalize(&u));
+        assert_eq!(first.score, 0.75);
+        assert_eq!(first.parent.as_deref(), Some("https://ex.com/seed"));
+        // A lower re-push never lowers a queued entry.
+        let mut q2 = FrontierQueue::new();
+        assert!(q2.push(u.clone(), 0.75, 1));
+        assert!(!q2.push(u.clone(), -0.75, 1));
+        // Once popped (fetched), a re-push stays dropped.
+        assert_eq!(q2.pop().unwrap().url, normalize(&u));
+        assert!(!q2.push(u.clone(), 5.0, 1));
+        assert!(q2.pop().is_none());
     }
 
     fn seed_urls(n: usize) -> Vec<(Url, f64)> {

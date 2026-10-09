@@ -101,6 +101,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after; the old shape left all of that uncounted (about 9% over on
   real batches).
 
+- A crawl seeded on a topic page now reads that page's own links before
+  the sitemap's recency flood: with no `focus` set, links discovered on
+  the seed page outrank the sitemap entries in the frontier, and a URL
+  the sitemap already queued is raised to that priority instead of
+  being deduped away at its old score. MDN's WebGPU seed fetched 1 of
+  its first 8 pages on topic before, and 5 after: the fetched set now
+  follows the seed page's own references (the rest of it is the
+  related-APIs block the page itself carries). Explicit `focus` crawls
+  are unchanged.
+
 ## [4.6.0] - 2026-10-08
 
 ### Fixed

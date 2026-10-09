@@ -30,6 +30,11 @@ use frontier::{FrontierQueue, scope_allowed};
 use governor::Governor;
 use sitemap::SitemapEntry;
 
+/// Frontier score bonus for links discovered on the seed page itself
+/// (depth 0) with no focus set: the seed page's own references are
+/// the crawl's topic neighborhood (V10, crawl topic drift).
+const SEED_NEIGHBOR_BOOST: f64 = 1.5;
+
 /// A fetched page as the orchestrator sees it.
 pub struct FetchedPage {
     /// Governor assignment that produced this page, including buffered reads.
@@ -2054,12 +2059,22 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    let s = score::score_candidate_with_idf(
+                                    let mut s = score::score_candidate_with_idf(
                                         &anchor,
                                         cu.path(),
                                         focus.as_deref(),
                                         focus_idf.as_deref(),
                                     );
+                                    // V10: with no focus query there is no
+                                    // relevance signal, and the seed page's
+                                    // own links ARE the topic neighborhood.
+                                    // Boost them so they outrank the sitemap
+                                    // recency flood instead of tying it and
+                                    // losing (a WebGPU seed crawled
+                                    // RTCRtpTransceiver-class sibling nav).
+                                    if focus.is_none() && item.depth == 0 {
+                                        s += SEED_NEIGHBOR_BOOST;
+                                    }
                                     // Focus gate: when a focus query is set,
                                     // non-matching links are filtered.
                                     // Hard filter when: (a) this page has

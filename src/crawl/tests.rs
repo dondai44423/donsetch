@@ -1015,6 +1015,100 @@ async fn map_mode_ranks_seed_relevant_urls_first() {
     );
 }
 
+// V10: with no focus set, the links the seed page itself carries are
+// the crawl's topic neighborhood. Without a seed-provenance boost
+// they tie the generic sitemap flood at equal depth and lose to its
+// recency order, so a docs crawl drifted into sibling nav (the
+// audit's WebGPU seed fetched RTCRtpTransceiver-class pages first).
+#[tokio::test]
+async fn a_seeded_crawl_prefers_the_seeds_own_neighborhood() {
+    let sitemap = r#"<urlset>
+<url><loc>https://ex.com/a</loc></url>
+<url><loc>https://ex.com/b</loc></url>
+<url><loc>https://ex.com/c</loc></url>
+</urlset>"#;
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/topic/one\">Topic One</a>\
+        <a href=\"/topic/two\">Topic Two</a>\
+        </article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/", 200, seed)
+        .page(
+            "https://ex.com/topic/one",
+            200,
+            &html("One", "topic one body words for the extractor threshold"),
+        )
+        .page(
+            "https://ex.com/topic/two",
+            200,
+            &html("Two", "topic two body words for the extractor threshold"),
+        )
+        .page("https://ex.com/a", 200, &html("A", "generic a body words"))
+        .page("https://ex.com/b", 200, &html("B", "generic b body words"))
+        .page("https://ex.com/c", 200, &html("C", "generic c body words"));
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.shape = false; // exact-order semantics; jitter is tested elsewhere
+    o.max_pages = 3; // seed + 2 : the seeds own neighborhood must win
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    let urls: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        urls.contains(&"https://ex.com/topic/one") && urls.contains(&"https://ex.com/topic/two"),
+        "the seed's own neighborhood must be fetched before the sitemap flood, got {urls:?}"
+    );
+}
+
+// V10b: the sitemap often queues the seed's own links first (MDN's
+// section sitemap lists every API page), at recency scores. The
+// seed's harvest must RAISE those already-queued entries instead of
+// being swallowed by the dedup, or the boost never lands on exactly
+// the pages the flood pinned.
+#[tokio::test]
+async fn a_seed_link_raises_a_sitemap_queued_entry() {
+    let sitemap = r#"<urlset>
+<url><loc>https://ex.com/a</loc></url>
+<url><loc>https://ex.com/b</loc></url>
+<url><loc>https://ex.com/topic/one</loc></url>
+<url><loc>https://ex.com/topic/two</loc></url>
+</urlset>"#;
+    let seed = "<html><head><title>seed</title></head><body><article>\
+        <p>content words here for extraction threshold passing yes indeed</p>\
+        <a href=\"/topic/one\">Topic One</a>\
+        <a href=\"/topic/two\">Topic Two</a>\
+        </article></body></html>";
+    let site = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/", 200, seed)
+        .page(
+            "https://ex.com/topic/one",
+            200,
+            &html("One", "topic one body words for the extractor threshold"),
+        )
+        .page(
+            "https://ex.com/topic/two",
+            200,
+            &html("Two", "topic two body words for the extractor threshold"),
+        )
+        .page("https://ex.com/a", 200, &html("A", "generic a body words"))
+        .page("https://ex.com/b", 200, &html("B", "generic b body words"));
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.shape = false;
+    o.max_pages = 3;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    let urls: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        urls.contains(&"https://ex.com/topic/one") && urls.contains(&"https://ex.com/topic/two"),
+        "a seed link must raise its sitemap-queued entry above the flood, got {urls:?}"
+    );
+}
+
 // ── Basic crawl ───────────────────────────────────────────
 
 #[tokio::test]
