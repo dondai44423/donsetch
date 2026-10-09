@@ -15,11 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot open its window system ("Missing X server or $DISPLAY")
   retries once in headless mode. Tier-2 escalation and screenshots
   survive an Xvfb crash instead of failing every call in under 90 ms.
-- Revalidated fetches compare 304 validators with If-None-Match weak
-  semantics (RFC 9110): a validator that only changed its weak prefix
-  revalidates directly instead of forcing an unconditional refetch.
-  The one-shot recovery for a genuinely mismatched 304 stays, so the
-  toc-then-section read workflow works across both validator shapes.
 - Crawl map mode renders a thin static inventory once and merges the
   rendered links through the same scope, robots and dedup filters:
   JS-built navigation (mdBook-style sidebars, SPA menus) no longer

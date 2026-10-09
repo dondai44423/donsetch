@@ -88,19 +88,22 @@ impl RevalidationCache {
         // compare against, and RFC 9111 §4.3.4 makes the field metadata
         // the merge updates; only when the snapshot actually carried an
         // entity-tag does the comparison (and its rejection) apply.
-        // If-None-Match matching ignores the weak prefix (RFC 9110
-        // §13.1.2): a 304 that upgrades W/"x" to "x" — or downgrades —
-        // still identifies the stored representation, and the merge
-        // adopts the validator the origin just named. A different
+        // Equality ignores the weak prefix (RFC 9110 §13.1.2), and
+        // the strict CAS adds one rule on top: a weak -> strong upgrade
+        // is rejected. The stored bytes were only weakly coupled to
+        // their tag, and the origin's stronger claim is not evidence
+        // this client holds (stealth_v3_304_changed_validators_fail_
+        // without_merging_a_body pins the full policy). A different
         // opaque tag, an unparseable tag, or an ambiguous multi-tag
-        // answer identifies something else and is a rejected 304: the
-        // caller's bounded recovery refetches it unconditionally.
+        // answer is a rejected 304 too; the caller's bounded recovery
+        // refetches each rejected shape unconditionally.
         if let Some((_, tag)) = tags.first()
             && let Some(old) = snapshot.etag.as_deref()
             && (tags.len() != 1
                 || !valid_etag(tag)
                 || !valid_etag(old)
-                || opaque_tag(tag) != opaque_tag(old))
+                || opaque_tag(tag) != opaque_tag(old)
+                || (old.starts_with("W/") && !tag.trim().starts_with("W/")))
         {
             return Err("304 ETag does not identify the requested representation".into());
         }
@@ -998,20 +1001,20 @@ mod audit_tests {
             .unwrap();
     }
 
-    // RFC 9110 §13.1.2: If-None-Match is a weak comparison. A 304 that
-    // names the same opaque tag with a different weak prefix — either
-    // direction — identifies the stored representation and must merge;
-    // only a different opaque tag is a mismatch. (Pre-fix, the W/ ->
-    // strong upgrade was rejected, so every revalidation from such an
-    // origin paid a pointless unconditional refetch; the toc->section
-    // workflow paid it on each call.)
+    // The strict CAS as shipped: equality ignores the weak prefix
+    // (RFC 9110 §13.1.2), but a weak -> strong upgrade is rejected on
+    // top of that (the stored bytes were only weakly coupled to their
+    // tag), and so are opaque mismatches and ambiguous multi-tag
+    // answers. The caller's bounded recovery refetches every rejected
+    // shape. The integration suite pins the same policy through the
+    // full client (stealth_v3_304_changed_validators_fail_without_
+    // merging_a_body).
     #[test]
-    fn stealth_v3_304_etag_weak_comparison_ignores_the_prefix() {
+    fn stealth_v3_304_strict_upgrade_policy_is_the_cas() {
         for (stored, returned) in [
-            ("W/\"x\"", "\"x\""),   // upgrade
-            ("\"x\"", "W/\"x\""),   // downgrade
-            ("W/\"x\"", "W/\"x\""), // same
-            ("\"x\"", "\"x\""),     // strong
+            ("\"x\"", "\"x\""),     // identical
+            ("\"x\"", "W/\"x\""),   // weakening: merge, adopt the weak tag
+            ("W/\"x\"", "W/\"x\""), // identical weak
         ] {
             let mut cache = RevalidationCache::new();
             cache.store("owned", 200, &[("etag".into(), stored.into())], b"body");
@@ -1029,26 +1032,32 @@ mod audit_tests {
             );
             assert!(
                 merged.is_ok(),
-                "{stored} vs {returned} must validate (weak comparison): {merged:?}"
+                "{stored} vs {returned} must merge: {merged:?}"
             );
             assert_eq!(merged.unwrap().0.as_slice(), b"body");
         }
-        // A different opaque tag still fails closed: the stored body
-        // is not the representation the origin just described.
-        let mut cache = RevalidationCache::new();
-        cache.store("owned", 200, &[("etag".into(), "\"x\"".into())], b"body");
-        let CacheCheck::Revalidate(_, snapshot) = cache.check("owned") else {
-            panic!("validator snapshot");
-        };
-        assert!(
-            cache
-                .revalidated(
-                    "owned",
-                    &snapshot,
-                    &[("etag".into(), "\"y\"".into())],
-                    Duration::ZERO,
-                )
-                .is_err()
-        );
+        for (stored, headers) in [
+            ("W/\"x\"", vec![("etag".to_string(), "\"x\"".to_string())]),
+            ("\"x\"", vec![("etag".to_string(), "\"y\"".to_string())]),
+            (
+                "\"x\"",
+                vec![
+                    ("etag".to_string(), "\"x\"".to_string()),
+                    ("etag".to_string(), "\"x\"".to_string()),
+                ],
+            ),
+        ] {
+            let mut cache = RevalidationCache::new();
+            cache.store("owned", 200, &[("etag".into(), stored.into())], b"body");
+            let CacheCheck::Revalidate(_, snapshot) = cache.check("owned") else {
+                panic!("validator snapshot for {stored}");
+            };
+            assert!(
+                cache
+                    .revalidated("owned", &snapshot, &headers, Duration::ZERO)
+                    .is_err(),
+                "{stored} with {headers:?} must be rejected"
+            );
+        }
     }
 }
