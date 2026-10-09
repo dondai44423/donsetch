@@ -330,6 +330,26 @@ pub struct SearchOutcome {
     pub stage_ms: Vec<(&'static str, u128)>,
 }
 
+impl SearchOutcome {
+    /// Unavailable unique backends and total backends tried. A successful or
+    /// cached attempt wins over failed retries; `report` keeps every attempt.
+    pub(crate) fn engine_health(&self) -> (Vec<&EngineReport>, usize) {
+        let mut engines = std::collections::BTreeMap::new();
+        for report in &self.report {
+            let current = engines.entry(report.engine.as_str()).or_insert(report);
+            if matches!(report.status.as_str(), "ok" | "cached") {
+                *current = report;
+            }
+        }
+        let total = engines.len();
+        let failed = engines
+            .into_values()
+            .filter(|report| !matches!(report.status.as_str(), "ok" | "cached"))
+            .collect();
+        (failed, total)
+    }
+}
+
 impl Searcher {
     pub fn new(fetcher: Fetcher, pool: EgressPool) -> Self {
         Self::new_shared(fetcher, std::sync::Arc::new(pool))

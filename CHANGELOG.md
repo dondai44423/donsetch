@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A rejected conditional 304 gets one unconditional GET on the same route.
   Validator checks remain strict; a second unsolicited 304 still fails
   instead of serving an unauthorized cached body.
+- Search health counts distinct backends instead of repeated top-up
+  attempts. A successful or cached attempt keeps that backend available;
+  markdown and metadata use the same count, while diagnostics retain the
+  full attempt history.
 - Shared MCP argument validation rejects wrong types, unknown names and
   oversized capped lists before tool work, instead of silently substituting
   defaults. Schemas explicitly reject unknown properties.

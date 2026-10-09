@@ -273,11 +273,8 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
         "results": results,
         "provider": out.provider.as_deref().unwrap_or("keyless"),
     });
-    let failed = out
-        .report
-        .iter()
-        .filter(|r| !matches!(r.status.as_str(), "ok" | "cached"))
-        .count();
+    let (failed, _) = out.engine_health();
+    let failed = failed.len();
     if failed > 0 {
         item["degraded"] = json!(true);
         item["failed_engines"] = json!(failed);
@@ -1121,6 +1118,56 @@ mod search_output_contract_tests {
     use crate::search::intent::Intent;
     use crate::search::rank::Merged;
     use std::time::Duration;
+
+    #[test]
+    fn v471_search_health_counts_backends_not_topup_attempts() {
+        use crate::search::{EngineReport, render_compact_markdown, render_markdown};
+        let mut output = SearchOutcome {
+            results: Vec::new(),
+            weak: true,
+            intent: Intent::Web,
+            report: Vec::new(),
+            cached: false,
+            elapsed: Duration::ZERO,
+            provider: None,
+            reranked: false,
+            instant: None,
+            stage_ms: Vec::new(),
+        };
+        let report = |engine: &str, status: &str| EngineReport {
+            engine: engine.into(),
+            status: status.into(),
+            profile: None,
+            hits: 0,
+            ms: 0,
+            egress: "direct".into(),
+        };
+        output.report = vec![
+            report("bing", "ok"),
+            report("bing", "no-results"),
+            report("bing", "pacing-timeout"),
+            report("ddg", "blocked:403"),
+        ];
+        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
+        let compact = render_compact_markdown(&output, "Results", None, &[]);
+        assert!(compact.contains("1/2 backends available"), "{compact}");
+        let full = render_markdown(&output, "query", None, &[]);
+        assert!(full.contains("1/2 engines ok (ddg: blocked:403)"), "{full}");
+        // A successful recovery or a cached provider remains available.
+        output.report = vec![report("bing", "blocked:429"), report("bing", "cached")];
+        assert!(search_model_meta(&output, &[]).get("degraded").is_none());
+        assert!(!render_compact_markdown(&output, "Results", None, &[]).contains("Degraded"));
+        assert!(!render_markdown(&output, "query", None, &[]).contains("degraded"));
+        output.report = vec![
+            report("bing", "blocked:429"),
+            report("bing", "pacing-timeout"),
+        ];
+        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
+        assert!(
+            render_compact_markdown(&output, "Results", None, &[])
+                .contains("0/1 backends available")
+        );
+    }
 
     #[test]
     pub(super) fn search_structure_routes_without_repeating_ranked_evidence() {
