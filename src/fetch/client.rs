@@ -582,7 +582,10 @@ impl Fetcher {
                         Err(e) => {
                             // Non-web scheme: return honestly per original
                             // behavior (file://, ftp:// etc. not followed).
-                            if e.to_string().contains("non-http") {
+                            // Matched on the variant, never the text: a
+                            // rule denial must propagate as an error even
+                            // if some text happened to say "non-http".
+                            if matches!(e, FetchError::NonHttpRedirect(_)) {
                                 out.elapsed = started.elapsed();
                                 out.redirects = redirects;
                                 return Ok(out);
@@ -1715,15 +1718,23 @@ pub(crate) fn note_lane_outcome(
 /// retired every lane after N dead hosts (or N pages redirecting to
 /// one) and `pick_fetch` then fell through to direct: the fetch left
 /// on the real address with rotation configured. A policy refusal
-/// (`Ssrf`) is about the URL and a protocol error is about the
-/// origin: neither says anything about the lane either.
+/// (`Ssrf`, a local rule's `Denied`, a non-http(s) redirect) is about
+/// the URL and a protocol error is about the origin: neither says
+/// anything about the lane either.
 fn lane_note(e: &FetchError) -> Option<LaneNote> {
     let msg = e.to_string();
     match e {
         FetchError::Dns(_) | FetchError::DnsTimeout(_) => None,
         // URL-level refusals never reached a dial (policy, malformed
-        // URL, our own hop budget): no verdict about the lane.
-        FetchError::InvalidUrl(_) | FetchError::Ssrf(_) | FetchError::TooManyRedirects => None,
+        // URL, our own hop budget): no verdict about the lane. `Denied`
+        // must stay above the text arms below: a rule is operator text,
+        // and a key such as `connect.widgets.example` would read as a dead
+        // lane there if its text ever reached them.
+        FetchError::InvalidUrl(_)
+        | FetchError::Ssrf(_)
+        | FetchError::Denied { .. }
+        | FetchError::NonHttpRedirect(_)
+        | FetchError::TooManyRedirects => None,
         FetchError::Timeout => Some(LaneNote::Timeout),
         // A certificate-verify failure is the certificate the far
         // side presented, not lane health: on a SOCKS5 tunnel and a
@@ -1980,6 +1991,28 @@ mod transport_exit_tests {
             None
         );
         assert_eq!(lane_note(&FetchError::TooManyRedirects), None);
+    }
+
+    // A rule denial is a local policy decision, never lane evidence,
+    // whatever the operator wrote in the key or the message.
+    #[test]
+    fn a_rule_denial_leaves_lane_health_alone() {
+        assert_eq!(
+            lane_note(&FetchError::Denied {
+                rule: "connect.widgets.example".into(),
+                message: "connection timed out here; CONNECT -> 407 is expected".into(),
+                kind: "walled",
+                reason: None,
+                url: "https://connect.widgets.example/".into(),
+            }),
+            None
+        );
+        assert_eq!(lane_note(&FetchError::NonHttpRedirect("ftp".into())), None);
+        // The negative case: a real dial failure still benches the lane.
+        assert_eq!(
+            lane_note(&FetchError::Io(std::io::Error::other("connection refused"))),
+            Some(LaneNote::Dead)
+        );
     }
 
     // The vocabulary split: cert-verify failures are origin-side (the

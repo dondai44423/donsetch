@@ -71,6 +71,13 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
             format!("DNS lookup timed out: {msg} (transient, a retry may work)")
         }
         FetchError::Ssrf(msg) => format!("blocked: {msg}"),
+        // Agent-facing text keeps the key and the message; routed
+        // denials do not come through here (`policy_error_value` builds
+        // its own text and puts the message in next_action).
+        FetchError::Denied { rule, message, .. } => {
+            format!("blocked by a local DonSeTch rule `{rule}`: {message}")
+        }
+        FetchError::NonHttpRedirect(_) => format!("HTTP protocol error: {e}"),
     }
 }
 
@@ -261,9 +268,11 @@ fn has_standalone_digits(text: &str, needle: &str) -> bool {
 /// | cloak.suspected | tier-1 content is likely decoy |
 /// | content.notfound / content.binary / content.oversize / content.extract / content.incomplete | body |
 /// | guard.ssrf | blocked by design |
+/// | `policy.denied.<reason>` | refused by a local DonSeTch rule; `<reason>` is the rule's subcode, or `unspecified`. Always three segments: prefix-match `policy.denied`, never the whole code |
 /// | parse.encoding | charset-level failure |
 /// | deadline.hit | time budget exhausted |
 /// | crawl.seed / crawl.resume / fetch.invalid / search.invalid / crawl.invalid | input errors |
+/// | crawl.robots_disallow / crawl.robots_unreachable / crawl.seed_failed | a crawl's seed failed with nothing else to fetch, for a cause with no fetch code of its own |
 pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, str> {
     // A producer that knows its own failure type outranks the text
     // classifier. The guard KNOWS a name it could not resolve is a name
@@ -282,6 +291,13 @@ pub(super) fn error_code(msg: &str, structured: Option<&Value>) -> Cow<'static, 
         .and_then(Value::as_str)
         .unwrap_or("");
     Cow::Borrowed(match () {
+        // First, ahead of `guard.ssrf` and `network.dns`: a site that
+        // stringified a `Denied` (or a batch that joined member texts)
+        // still carries the fixed Display text, possibly behind a
+        // wrapper prefix, hence `contains`. Next to it may sit the rule
+        // key and the operator's message, which must not pick the code.
+        // Literal of `crate::rules::policy_code(None)`.
+        _ if m.contains("blocked by a local donsetch rule") => "policy.denied.unspecified",
         _ if m.contains("proxy configuration:") || m.starts_with("proxy configuration error:") => {
             "proxy.config"
         }
@@ -425,6 +441,63 @@ pub(super) fn tool_error_structured(
         v["structuredContent"] = s;
     }
     v
+}
+
+/// The one place a local rule's denial becomes a tool result.
+///
+/// For `FetchError::Denied` the text is
+/// ``blocked by a local DonSeTch rule `<rule>` (<kind phrase>)``, the
+/// rule's `kind` is the `errorKind` (top level and in
+/// `structuredContent`), and `structuredContent` carries `code`
+/// (`policy.denied.<reason>`), `url`, `rule` and the operator's
+/// message verbatim as `next_action`, plus `escalation` only when one
+/// is passed. Any other error falls back to the generic fetch error
+/// (debug builds assert instead).
+pub(super) fn policy_error_value(e: &FetchError, url: &str, escalation: Option<Value>) -> Value {
+    // Local rules: a change to this contract or its routing sites needs the
+    // same change in docs/rules-architecture.md (and docs/rules.md when
+    // operators can see it).
+    debug_assert!(
+        matches!(e, FetchError::Denied { .. }),
+        "policy_error_value called with {e:?}"
+    );
+    let FetchError::Denied {
+        rule,
+        message,
+        kind,
+        reason,
+        ..
+    } = e
+    else {
+        let mut structured = json!({ "url": url, "code": fetch_error_code(e) });
+        if let Some(trace) = escalation {
+            structured["escalation"] = trace;
+        }
+        return tool_error_structured(
+            friendly_fetch_error(e),
+            fetch_error_kind(e),
+            Some(structured),
+        );
+    };
+    let mut structured = json!({
+        "code": crate::rules::policy_code(reason.as_deref()),
+        "url": url,
+        "rule": rule,
+        // The operator's text, verbatim: donsetch does not know the
+        // escape hatch, so it adds no next_action of its own.
+        "next_action": message,
+    });
+    if let Some(trace) = escalation {
+        structured["escalation"] = trace;
+    }
+    tool_error_structured(
+        format!(
+            "blocked by a local DonSeTch rule `{rule}` ({})",
+            crate::rules::kind_phrase(kind)
+        ),
+        kind,
+        Some(structured),
+    )
 }
 
 /// Use readable path words to locate a moved page. Never echo credentials,
@@ -614,6 +687,9 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
             "tls.egress"
         }
         FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => "tls.verify",
+        // The operator chose the kind; the default below would silently
+        // turn a `walled` rule into `permanent`.
+        FetchError::Denied { kind, .. } => kind,
         _ => "permanent",
     }
 }
@@ -622,7 +698,7 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
 /// (`recent_network_failures`). The retryable kinds qualify outright;
 /// the `Http` protocol variant is the pipe itself dying mid-exchange
 /// (headers never arrived, message truncated), the same story for the
-/// caller. Policy (`Ssrf`, `InvalidUrl`), name (`Dns`) and site
+/// caller. Policy (`Ssrf`, `Denied`, `InvalidUrl`), name (`Dns`) and site
 /// (`TooManyRedirects`) failures never count: the wire delivered an
 /// answer, the answer was "no".
 pub(super) fn transport_failure_evidence(e: &FetchError) -> bool {
@@ -631,20 +707,25 @@ pub(super) fn transport_failure_evidence(e: &FetchError) -> bool {
 
 /// The stable machine code for a transport failure, taken from the
 /// error's own variant instead of its prose. `None` means the variant
-/// carries no code of its own and the text classifier decides.
+/// carries no code of its own and the text classifier decides. A
+/// `Denied` yields its runtime `policy.denied.<reason>` code, the only
+/// owned value; every other code is a borrowed literal.
 ///
 /// This exists because prose-matching is a trap (#248): the guard's DNS
 /// messages ended in "fail-closed SSRF guard", so a host that does not
 /// exist came back as `guard.ssrf`, and an agent branching on that code
 /// concluded the target was forbidden by policy.
-pub(super) fn fetch_error_code(e: &FetchError) -> Option<&'static str> {
+pub(super) fn fetch_error_code(e: &FetchError) -> Option<Cow<'static, str>> {
     match e {
         // A name that does not resolve and a resolver that does not
         // answer are both name failures; the KIND carries the retry
         // signal (DnsTimeout is transient).
-        FetchError::Dns(_) | FetchError::DnsTimeout(_) => Some("network.dns"),
-        FetchError::Ssrf(_) => Some("guard.ssrf"),
-        FetchError::ProxyConfig(_) => Some("proxy.config"),
+        FetchError::Dns(_) | FetchError::DnsTimeout(_) => Some(Cow::Borrowed("network.dns")),
+        FetchError::Ssrf(_) => Some(Cow::Borrowed("guard.ssrf")),
+        FetchError::ProxyConfig(_) => Some(Cow::Borrowed("proxy.config")),
+        FetchError::Denied { reason, .. } => {
+            Some(Cow::Owned(crate::rules::policy_code(reason.as_deref())))
+        }
         _ => None,
     }
 }
@@ -661,8 +742,11 @@ pub(super) fn transport_class(e: &FetchError) -> &'static str {
         FetchError::Ssrf(_) => "ssrf",
         FetchError::InvalidUrl(_) => "invalid_url",
         FetchError::Ghost(_) => "ghost",
-        FetchError::Http(_) => "protocol",
+        FetchError::Http(_) | FetchError::NonHttpRedirect(_) => "protocol",
         FetchError::ProxyConfig(_) => "configuration",
+        // Not a transport class: no transport failed, a local rule
+        // refused the URL before any request.
+        FetchError::Denied { .. } => "policy",
         FetchError::Tls(msg) => {
             let m = msg.to_lowercase();
             if m.contains("reset") || m.contains("eof") {
@@ -787,7 +871,7 @@ mod stitch_tests {
             !transport_failure_evidence(&error),
             "a configuration error must not teach a network failure"
         );
-        assert_eq!(fetch_error_code(&error), Some("proxy.config"));
+        assert_eq!(fetch_error_code(&error).as_deref(), Some("proxy.config"));
         let response = tool_error_structured(
             friendly_fetch_error(&error),
             fetch_error_kind(&error),
@@ -1320,6 +1404,180 @@ mod boundary_tests {
         ] {
             assert_eq!(moved_page_query(url), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    const MESSAGE: &str = "use BladeBrowser for this site (a real browser at human pace), or ask the human operator to download the file";
+
+    fn denied(rule: &str, message: &str, kind: &'static str, reason: Option<&str>) -> FetchError {
+        FetchError::Denied {
+            rule: rule.into(),
+            message: message.into(),
+            kind,
+            reason: reason.map(Into::into),
+            url: format!("https://{rule}/"),
+        }
+    }
+
+    #[test]
+    fn a_policy_error_carries_the_rule_and_the_operator_message() {
+        let url = "https://www.banned.example/publication/123_Example";
+        let e = denied("banned.example", MESSAGE, "walled", Some("ip_ban"));
+        let v = policy_error_value(&e, url, None);
+        assert_eq!(v["isError"], false);
+        assert_eq!(v["code"], "policy.denied.ip_ban");
+        assert_eq!(v["errorKind"], "walled");
+        let s = &v["structuredContent"];
+        assert_eq!(s["ok"], false);
+        assert_eq!(s["code"], "policy.denied.ip_ban");
+        assert_eq!(s["errorKind"], "walled");
+        assert_eq!(s["url"], url);
+        assert_eq!(s["rule"], "banned.example");
+        assert_eq!(s["next_action"], MESSAGE);
+        assert_eq!(s["read_status"], "walled");
+        assert_eq!(s["content_ok"], false);
+        assert!(s.get("escalation").is_none(), "no trace was passed: {v}");
+        assert!(
+            s.get("kind").is_none(),
+            "the kind travels as errorKind only: {v}"
+        );
+        // The CLI exit code reads errorKind once ok:false marks a failure.
+        assert!(is_failure(&v));
+        let text = v["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "blocked by a local DonSeTch rule `banned.example` (walled: try another source)\n\nNext action: {MESSAGE}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_permanent_rule_without_a_reason_keeps_its_kind_and_the_trace() {
+        let url = "https://intranet.example/x";
+        let e = denied(
+            "intranet.example",
+            "do not fetch this host",
+            "permanent",
+            None,
+        );
+        let trace = json!([{"tier": "1", "action": "fetch", "outcome": "denied", "ms": 0}]);
+        let v = policy_error_value(&e, url, Some(trace.clone()));
+        assert_eq!(v["code"], crate::rules::policy_code(None));
+        assert_eq!(v["code"], "policy.denied.unspecified");
+        assert_eq!(v["errorKind"], "permanent");
+        let s = &v["structuredContent"];
+        assert_eq!(s["errorKind"], "permanent");
+        assert_eq!(s["read_status"], "error");
+        assert_eq!(s["escalation"], trace);
+        assert_eq!(s["next_action"], "do not fetch this host");
+        assert!(v["content"][0]["text"].as_str().unwrap().starts_with(
+            "blocked by a local DonSeTch rule `intranet.example` (permanent: do not pursue)"
+        ));
+    }
+
+    // Operator text never picks the code: a message naming a captcha or
+    // a timeout, and a key that reads like a resolver, still code as a
+    // policy denial on every structured path.
+    #[test]
+    fn operator_text_does_not_reach_the_classifier() {
+        let message = "solve the captcha by hand; a timeout here is expected";
+        for reason in [None, Some("ip_ban")] {
+            let e = denied("dns.lookup.example", message, "walled", reason);
+            let expected = crate::rules::policy_code(reason);
+            let v = policy_error_value(&e, "https://dns.lookup.example/resolve", None);
+            assert_eq!(v["code"], expected.as_str(), "{v}");
+            assert_eq!(v["errorKind"], "walled");
+            // A site that builds its own structured value from the typed
+            // accessors gets the same code and kind.
+            let v = tool_error_structured(
+                friendly_fetch_error(&e),
+                fetch_error_kind(&e),
+                Some(json!({ "url": "https://dns.lookup.example/", "code": fetch_error_code(&e) })),
+            );
+            assert_eq!(v["code"], expected.as_str(), "{v}");
+            assert_eq!(v["errorKind"], "walled");
+            // Even the bare friendly text, classified with no code, lands
+            // in the policy namespace rather than wall.captcha/network.dns.
+            assert_eq!(
+                error_code(&friendly_fetch_error(&e), None).as_ref(),
+                "policy.denied.unspecified"
+            );
+        }
+    }
+
+    #[test]
+    fn the_typed_accessors_know_the_new_variants() {
+        let e = denied("banned.example", MESSAGE, "walled", Some("ip_ban"));
+        assert_eq!(
+            fetch_error_code(&e).as_deref(),
+            Some("policy.denied.ip_ban")
+        );
+        assert_eq!(fetch_error_kind(&e), "walled");
+        assert_eq!(
+            fetch_error_kind(&denied("x.example", "stop", "permanent", None)),
+            "permanent"
+        );
+        assert_eq!(transport_class(&e), "policy");
+        assert!(!transport_failure_evidence(&e));
+        assert_eq!(
+            friendly_fetch_error(&e),
+            format!("blocked by a local DonSeTch rule `banned.example`: {MESSAGE}")
+        );
+        // The non-web-scheme redirect keeps the Http-era classification.
+        let r = FetchError::NonHttpRedirect("ftp".into());
+        assert_eq!(fetch_error_code(&r), None);
+        assert_eq!(fetch_error_kind(&r), "permanent");
+        assert_eq!(transport_class(&r), "protocol");
+        assert_ne!(
+            error_code(&friendly_fetch_error(&r), None).as_ref(),
+            "policy.denied.unspecified"
+        );
+    }
+
+    // The fallback arm: a site that stringified a denial, behind its own
+    // prefix, or a batch that joined it with SSRF advice and a rule key,
+    // still codes as a policy denial, not guard.ssrf or network.dns.
+    #[test]
+    fn the_fixed_text_outranks_the_other_classifier_arms() {
+        let shown = denied("dns.lookup.example", MESSAGE, "walled", None).to_string();
+        for text in [
+            shown.clone(),
+            format!("browser navigation error: {shown}"),
+            format!("web_screenshot: page failed to render: {shown}"),
+            format!(
+                "fetch: all 2 urls failed\n{shown}\n\nNext action: private/loopback targets are blocked by design\nblocked by a local DonSeTch rule `dns.lookup.example` (walled: try another source)"
+            ),
+        ] {
+            assert_eq!(
+                error_code(&text, None).as_ref(),
+                "policy.denied.unspecified",
+                "{text}"
+            );
+        }
+        // The negative case: without the fixed text the old arms still win.
+        assert_eq!(
+            error_code(
+                "blocked: 10.0.0.1 is a private/loopback address : SSRF guard",
+                None
+            ),
+            "guard.ssrf"
+        );
+        assert_eq!(
+            error_code("dns: resolve failed for dns.lookup.example", None),
+            "network.dns"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "policy_error_value called with")]
+    #[cfg(debug_assertions)]
+    fn a_non_denial_is_a_caller_bug() {
+        let _ = policy_error_value(&FetchError::Timeout, "https://example.com/", None);
     }
 }
 

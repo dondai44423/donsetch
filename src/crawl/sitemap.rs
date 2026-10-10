@@ -23,6 +23,10 @@ pub struct Robots {
     /// Site-declared request delay seconds, if any: finite,
     /// non-negative, at most [`MAX_CRAWL_DELAY_SECS`].
     pub crawl_delay: Option<f64>,
+    /// True when the file could not be read (RFC 9309
+    /// "unreachable") and these rules are the complete disallow that
+    /// stands in for it, rather than rules the origin published.
+    pub unreachable: bool,
 }
 
 /// Longest `Crawl-delay` honoured. A page a minute is already a
@@ -406,7 +410,10 @@ pub fn robots_for_origin(status: u16, body: &[u8], origin: &str) -> Robots {
     } else if (400..500).contains(&status) {
         Robots::default()
     } else {
-        Robots::disallow_all()
+        Robots {
+            unreachable: true,
+            ..Robots::disallow_all()
+        }
     }
 }
 
@@ -415,15 +422,31 @@ pub fn robots_for_origin(status: u16, body: &[u8], origin: &str) -> Robots {
 /// seed host reads each origin's own file before its first request
 /// there, and each origin's `Crawl-delay` paces that origin. The seed
 /// origin is seeded from the phase-1 discovery; other origins load on
-/// first contact (a metadata probe, not a page fetch).
-#[derive(Default)]
+/// first contact (a metadata probe, not a page fetch). An origin the
+/// local rules deny is never fetched and never cached.
 pub struct RobotsCache {
     entries: std::sync::Mutex<std::collections::HashMap<String, Arc<Robots>>>,
+    rules: &'static crate::rules::RuleSet,
+}
+
+impl Default for RobotsCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RobotsCache {
+    /// A cache that honors the process ruleset (`crate::rules::rules`).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_rules(crate::rules::rules())
+    }
+
+    /// A cache that refuses to fetch for the origins `rules` deny.
+    pub fn with_rules(rules: &'static crate::rules::RuleSet) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rules,
+        }
     }
 
     /// Seed an origin's rules without a fetch (phase-1 discovery
@@ -448,10 +471,22 @@ impl RobotsCache {
     /// origin's `Crawl-delay` exactly once. Two workers racing the
     /// first contact with one origin may both fetch it; the rules are
     /// identical and both inserts carry them.
+    ///
+    /// For an origin the local rules deny, nothing is fetched or cached:
+    /// the answer is allow-all with `false`, and the origin stays unknown.
     pub async fn ensure(&self, fetch: &PageFetcher, url: &url::Url) -> (Arc<Robots>, bool) {
         let origin = origin_of(url);
         if let Some(r) = self.get(&origin) {
             return (r, false);
+        }
+        // The guard would refuse this robots.txt request, and a refused
+        // fetch reads as "unreachable", i.e. disallow-all (#351): the
+        // origin's URLs would then be counted as robots exclusions
+        // instead of reaching the crawl's rules check and its denied
+        // report. Answering allow leaves that decision to the rules.
+        let robots_url = format!("{origin}/robots.txt");
+        if self.rules.denial_for_str(&robots_url).is_some() {
+            return (Arc::new(Robots::default()), false);
         }
         let r = Arc::new(fetch_robots(fetch, &origin).await);
         self.insert(origin, Arc::clone(&r));
@@ -640,11 +675,19 @@ mod tests {
             "4xx: allow"
         );
         for status in [500u16, 503, 0] {
+            let robots = robots_for_origin(status, b"", origin);
             assert!(
-                !robots_for_origin(status, b"", origin).allows_url(&any("/x")),
+                !robots.allows_url(&any("/x")),
                 "status {status} must disallow"
             );
+            assert!(robots.unreachable, "status {status} is unreachable");
         }
+        // A published `Disallow: /` closes the site too, but it is the
+        // origin's own rule, not an outage.
+        let closed = robots_for_origin(200, b"User-agent: *\nDisallow: /\n", origin);
+        assert!(!closed.allows_url(&any("/x")));
+        assert!(!closed.unreachable);
+        assert!(!robots_for_origin(404, b"", origin).unreachable);
     }
 
     #[test]
@@ -746,6 +789,7 @@ mod tests {
                         latency: std::time::Duration::from_millis(1),
                         cached: false,
                         error_hint: None,
+                        denied: None,
                     }
                 }
                 .boxed()
@@ -860,6 +904,57 @@ mod tests {
             )),
         );
         assert!(!cache.peek_allows(&u));
+    }
+
+    // An origin the local rules deny must not have its robots.txt
+    // requested: the guard would refuse it, the status-0 page would read
+    // as unreachable (disallow-all), and every URL there would be counted
+    // as a robots exclusion instead of reaching the crawl's denied report.
+    #[tokio::test]
+    async fn robots_cache_never_fetches_a_denied_origin() {
+        let mut section = crate::rules::RulesSection::default();
+        section.url.insert(
+            "blocked.test".to_string(),
+            crate::rules::UrlRule {
+                action: crate::rules::RuleAction::Deny,
+                message: Some("get it elsewhere".into()),
+                ..Default::default()
+            },
+        );
+        let rules: &'static crate::rules::RuleSet =
+            Box::leak(Box::new(crate::rules::RuleSet::compile(&section).unwrap()));
+        let (fetch, hits) = recording_fetcher(vec![(
+            "http://open.test/robots.txt",
+            200,
+            "User-agent: *\nDisallow: /closed/\n",
+        )]);
+        let cache = RobotsCache::with_rules(rules);
+
+        let denied: url::Url = "http://www.blocked.test/x".parse().unwrap();
+        let (robots, fresh) = cache.ensure(&fetch, &denied).await;
+        assert!(robots.allows_url(&denied), "a denied origin answers allow");
+        assert!(!fresh, "nothing was fetched");
+        assert!(
+            cache.get("http://www.blocked.test").is_none(),
+            "the denied origin stays unknown"
+        );
+        assert!(cache.peek_allows(&denied));
+
+        // Negative: an allowed origin is read and cached as before.
+        let closed: url::Url = "http://open.test/closed/a".parse().unwrap();
+        let (robots, fresh) = cache.ensure(&fetch, &closed).await;
+        assert!(fresh);
+        assert!(!robots.allows_url(&closed));
+        assert!(cache.get("http://open.test").is_some());
+
+        let hits = hits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            hits.as_slice(),
+            ["http://open.test/robots.txt"],
+            "only the allowed origin's robots.txt is requested"
+        );
     }
 
     #[test]

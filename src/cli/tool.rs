@@ -262,6 +262,17 @@ async fn run_bulk_fetch(
 fn render_result(result: &Value, json_mode: bool, quiet: bool, cmd: &str) -> u8 {
     let exit = exit_code_of(result);
 
+    // Printed in every mode and even under -q: `--dataset` JSON Lines
+    // carry no denial, and -q silences only the stats line, so this is
+    // the one trace on the CLI that a rule refused part of the crawl.
+    if cmd == "crawl"
+        && let Some(notice) = result
+            .get("structuredContent")
+            .and_then(crawl_denied_notice)
+    {
+        eprintln!("{notice}");
+    }
+
     if json_mode {
         let envelope = render_json_envelope(result, "");
         println!("{envelope}");
@@ -447,6 +458,27 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
     }
 }
 
+/// The stderr line for a crawl that local rules refused URLs in, e.g.
+/// `[crawl] 16 URLs denied by local DonSeTch rules (1 rule)`, read from
+/// `denied_by_local_rules` in the crawl's structured content. `None`
+/// when nothing was denied.
+fn crawl_denied_notice(structured: &Value) -> Option<String> {
+    let denied = structured.get("denied_by_local_rules")?;
+    let count = denied.get("count").and_then(Value::as_u64)?;
+    if count == 0 {
+        return None;
+    }
+    let rules = denied
+        .get("groups")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    Some(format!(
+        "[crawl] {count} URL{} denied by local DonSeTch rules ({rules} rule{})",
+        if count == 1 { "" } else { "s" },
+        if rules == 1 { "" } else { "s" },
+    ))
+}
+
 /// Extract exit code from a call_tool result Value.
 fn exit_code_of(result: &Value) -> u8 {
     let is_error = server::is_failure(result);
@@ -574,6 +606,10 @@ pub fn print_top_help() {
         "login"
     );
     println!("  {:8} Manage proxy configuration", "proxy");
+    println!(
+        "  {:8} Explain what the local rules do with a URL (rules test <url>)",
+        "rules"
+    );
     println!("  {:8} Quick status overview", "status");
     println!(
         "  {:8} Show the adapter registry + user plugins",
@@ -655,6 +691,67 @@ mod tests {
             "structuredContent": {"ok": false}
         });
         assert_eq!(exit_code_of(&v), EXIT_PERMANENT);
+    }
+
+    // A local-rule denial reaches the exit code through the same
+    // top-level errorKind as any other failure: the rule's kind picks
+    // walled (3) or permanent (1).
+    #[test]
+    fn exit_code_follows_a_policy_denial_kind() {
+        let denial = |kind: &str| {
+            json!({
+                "content": [{"type": "text", "text": "blocked by a local DonSeTch rule `banned.example` (walled: try another source)"}],
+                "isError": true,
+                "errorKind": kind,
+                "structuredContent": {
+                    "ok": false,
+                    "errorKind": kind,
+                    "code": "policy.denied.ip_ban",
+                    "rule": "banned.example",
+                    "next_action": "use BladeBrowser"
+                }
+            })
+        };
+        assert_eq!(exit_code_of(&denial("walled")), EXIT_WALLED);
+        assert_eq!(exit_code_of(&denial("permanent")), EXIT_PERMANENT);
+    }
+
+    #[test]
+    fn crawl_denied_notice_counts_urls_and_rules() {
+        let sc = json!({
+            "pages": [],
+            "denied_by_local_rules": {
+                "count": 16,
+                "groups": [{"rule": "banned.example", "errorKind": "walled",
+                            "next_action": "x", "count": 16, "urls": []}]
+            }
+        });
+        assert_eq!(
+            crawl_denied_notice(&sc).as_deref(),
+            Some("[crawl] 16 URLs denied by local DonSeTch rules (1 rule)")
+        );
+        let sc = json!({
+            "denied_by_local_rules": {
+                "count": 1,
+                "groups": [{"count": 1}, {"count": 0}]
+            }
+        });
+        assert_eq!(
+            crawl_denied_notice(&sc).as_deref(),
+            Some("[crawl] 1 URL denied by local DonSeTch rules (2 rules)")
+        );
+    }
+
+    #[test]
+    fn crawl_denied_notice_is_none_when_nothing_was_denied() {
+        assert_eq!(
+            crawl_denied_notice(&json!({"pages": [], "stop": "FrontierEmpty"})),
+            None
+        );
+        assert_eq!(
+            crawl_denied_notice(&json!({"denied_by_local_rules": {"count": 0, "groups": []}})),
+            None
+        );
     }
 
     #[test]

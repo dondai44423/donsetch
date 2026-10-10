@@ -256,6 +256,15 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
         .iter()
         .enumerate()
         .map(|(index, result)| {
+            // Every hit is listed exactly as the search returned it, even
+            // when a local `deny` rule covers its host. A hit that matches
+            // a deny rule could carry a marker so the agent does not try
+            // to fetch it and spend a round trip on the refusal; v1 leaves
+            // that out on purpose, because the display contract (where the
+            // marker goes, its token cost, whether an annotated hit still
+            // takes a result slot) has to be settled first. Dropping such
+            // hits is ruled out: the title and any DOI are how the agent
+            // finds a mirror.
             let mut item = json!({
                 "rank": index + 1,
                 "url": result.url,
@@ -577,6 +586,15 @@ async fn byok_search_cached(
         .await
 }
 
+/// True when the winning rule for `url` pins tier "1", advisory or
+/// enforced: an `auto` fetch of it then stays off the browser, so a
+/// background browser solve has nothing to warm and must not run.
+fn rules_keep_browser_off(rules: &crate::rules::RuleSet, url: &url::Url) -> bool {
+    rules
+        .eval(url)
+        .is_some_and(|winner| winner.rule.tier == Some(crate::rules::RuleTier::One))
+}
+
 /// Predict-prefetch the walledest top result while the agent reads
 /// results: when the top URL's domain is known-walled (skip-to-solve
 /// route), start ONE background solve NOW. The agent's fetch a few
@@ -588,6 +606,9 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
     let Ok(parsed) = crate::fetch::guards::validate_url_basic(url) else {
         return;
     };
+    if rules_keep_browser_off(crate::rules::rules(), &parsed) {
+        return;
+    }
     let Some(host) = parsed.host_str() else {
         return;
     };
@@ -722,6 +743,45 @@ mod pre_solve_tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn a_tier_one_pin_keeps_the_pre_solve_off_the_browser() {
+        use crate::rules::{RuleSet, RuleTier, RulesSection, UrlRule};
+        let pin = |tier, tier_enforce| UrlRule {
+            tier: Some(tier),
+            tier_enforce,
+            ..UrlRule::default()
+        };
+        let mut section = RulesSection::default();
+        section
+            .url
+            .insert("enforced.example".into(), pin(RuleTier::One, true));
+        section
+            .url
+            .insert("advisory.example".into(), pin(RuleTier::One, false));
+        section
+            .url
+            .insert("browser.example".into(), pin(RuleTier::Two, false));
+        let rules = RuleSet::compile(&section).unwrap();
+        let url = |s: &str| url::Url::parse(s).unwrap();
+        assert!(rules_keep_browser_off(
+            &rules,
+            &url("https://www.enforced.example/a")
+        ));
+        assert!(rules_keep_browser_off(
+            &rules,
+            &url("https://advisory.example/a")
+        ));
+        // Negative: a tier "2" pin and an unmatched host leave it alone.
+        assert!(!rules_keep_browser_off(
+            &rules,
+            &url("https://browser.example/a")
+        ));
+        assert!(!rules_keep_browser_off(
+            &rules,
+            &url("https://other.example/a")
+        ));
+    }
 
     // Native Chromium, owned proxies and nextest's per-process state only.
     #[test]

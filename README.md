@@ -627,7 +627,7 @@ Every runtime knob lives in one typed config (`src/config.rs`), layered, later w
 3. **`donsetch.toml`** at `<config-dir>/donsetch/donsetch.toml`, or anywhere via `DONSETCH_CONFIG=/path/file.toml`. Unknown keys and bad values are hard errors naming the file. `DONSETCH_NO_CONFIG_FILE=1` skips the file layer (setting both is an error).
 4. **New env names**: `DONSETCH_<SECTION>__<KEY>`, so `DONSETCH_FETCH__PDF_MAX_MB=25`.
 
-Sections: `transport`, `mcp`, `paths`, `state`, `proxy`, `tls`, `persona`, `cli`, `fetch`, `bypass`, `search`, `browser`, `debug`.
+Sections: `transport`, `mcp`, `paths`, `state`, `proxy`, `tls`, `persona`, `cli`, `fetch`, `bypass`, `search`, `browser`, `debug`, `rules`.
 
 ```toml
 [fetch]
@@ -647,6 +647,23 @@ Booleans take `true`/`false`, enums take their listed spellings.
 - `donsetch config show --legacy` maps every old env name to its config key.
 - `donsetch doctor` warns about the legacy vars active in your shell, mapped to their keys.
 
+### Local rules: deny a site, or pin its tier
+
+Some sites treat any automated traffic as hostile, however well it is disguised. The block lands on your IP, sometimes on your whole network, outlasts the session that caused it, and also locks you out in your own browser. A note in the agent's instructions file ("never fetch site X") helps only if the model reads it and obeys it every time, and one forgotten turn is enough to get banned. Other sites need a particular tier every time, and the agent has no way to know that in advance. [Pick the right tool](#-pick-the-right-tool) covers which task shapes draw these blocks. Local rules enforce your answer inside DonSeTch, whatever the model decides.
+
+Per-host rules in `donsetch.toml` can refuse a URL before any request, handing the agent your own instructions in place of the page, or pin the fetch tier for a host. DonSeTch ships none; the table is empty until you write one.
+
+```toml
+[rules.url."example.org"]        # the host and every subdomain, http and https
+action  = "deny"
+reason  = "ip_ban"               # error code policy.denied.ip_ban
+message = "do not fetch this site with curl, scripts or another HTTP client: it bans our IP for automated access. Find file elsewhere, or ask the human operator to download it"
+```
+
+`web_fetch`, `web_crawl` and `web_screenshot` then refuse that site, redirects and cached copies included, and the agent reads `message` as its `Next action:`, so lead with what to do instead, and say why when the reason rules out workarounds. The most specific matching rule wins in full: a narrower rule that only sets `tier` also cancels a broader deny. `donsetch rules test <url>` shows which rule a URL gets and why, offline.
+
+Rules are a guardrail, not a security boundary: no MCP argument can switch them off, but an agent with a shell can run `donsetch fetch --ignore-rules`, set `DONSETCH_RULES__MODE=off`, or edit `donsetch.toml`. Pattern grammar, load errors, precedence, tier pins, what the agent sees and the known limits: [local rules](docs/rules.md).
+
 ## 💻 CLI
 
 Thin adapter over the same engine the MCP server uses.
@@ -664,6 +681,7 @@ Thin adapter over the same engine the MCP server uses.
 | `donsetch proxy` | Proxy management (`add`, `list`, `check`, `remove`, `clear`, `fetch on\|off`, `crawl on\|off`) |
 | `donsetch login` | Authenticated sessions for walled sites (`--list`, `--status`, `--logout`, `--import`) |
 | `donsetch config` | `show`, `--markdown`, `--legacy` |
+| `donsetch rules test <url>` | Explain what the local rules do with a URL, offline |
 | `donsetch tools` | Tool schemas as JSON, same as MCP `tools/list` |
 | `donsetch update` / `rollback` | Self-update from GitHub Releases, and revert |
 

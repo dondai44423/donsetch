@@ -10,6 +10,7 @@ pub mod keys;
 pub mod login;
 pub mod proxy;
 pub mod rollback;
+pub mod rules;
 pub mod status;
 pub mod stop;
 pub mod tool;

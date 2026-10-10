@@ -34,6 +34,17 @@ fn load_and_install_config(args: &[String]) -> &'static config::DonsetchConfig {
             }
         }
     }
+    // `--ignore-rules` is the same switch as `[rules] mode = "off"`, so
+    // the two cannot drift apart: tier pins go with the denies. Only the
+    // commands that declare the flag honor it; clap rejects it anywhere
+    // else before any work runs.
+    if args
+        .get(1)
+        .is_some_and(|cmd| donsetch::spec::IGNORE_RULES_COMMANDS.contains(&cmd.as_str()))
+        && args.iter().skip(2).any(|a| a == "--ignore-rules")
+    {
+        c.rules.mode = donsetch::rules::RulesMode::Off;
+    }
     if let Err(e) = config::install_loaded(loaded) {
         eprintln!("donsetch: {e}");
         std::process::exit(1);
@@ -223,6 +234,7 @@ async fn run() {
             }
         }
         "keys" => cli::keys::run(&args).await,
+        "rules" => cli::rules::run(&args),
 
         "login" => cli::login::run(&args).await,
         "proxy" => cli::proxy::run(&args).await,
@@ -275,6 +287,7 @@ async fn route_help(cmd: &str) {
             cli::keys::run(&["donsetch".into(), "keys".into(), "help".into()]).await;
         }
         "adapters" => cli::adapters::help(),
+        "rules" => cli::rules::help(),
         "proxy" => {
             // proxy::run is async, but print_help is sync.
             // Just call the help directly.
@@ -330,7 +343,8 @@ async fn route_help(cmd: &str) {
             println!("Usage: donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]");
             println!();
             println!("  Health checks: binary, network, TLS, browser, Xvfb, ghost profile,");
-            println!("  cache, permissions, PDFium, OCR models, rerank model, egress lanes.");
+            println!("  cache, permissions, PDFium, OCR models, rerank model, egress lanes,");
+            println!("  local rules.");
             println!("  Auto-fixes what it can. Reports issues with instructions.");
             println!("  --deep     live browser launch + proxy lane probes");
             println!("  --improve  explain the local self-improvement loop + receipts");

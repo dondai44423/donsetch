@@ -5,6 +5,95 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Local per-domain rules: a `[rules.url."<pattern>"]` table in
+  `donsetch.toml` that can refuse a URL before any request or pin the
+  fetch tier for a host. DonSeTch ships no rules. A `deny` rule refuses
+  the URL on `web_fetch`, `web_crawl` and `web_screenshot`, redirect hops
+  and adapter rewrites included, and serves no cached copy of it; the
+  agent gets a structured `ok:false` result with code
+  `policy.denied.<reason>` (`policy.denied.unspecified` without a
+  `reason`), the rule's key, its `kind` (`walled` or `permanent`) as
+  `errorKind`, and the operator's `message` verbatim as `next_action`. A
+  crawl skips denied URLs without fetching them and lists them, grouped by
+  rule with the rule's message, in a trailing "Denied by local DonSeTch
+  rules" section; a denied seed fails the crawl, and so does a seed that
+  redirects into a denied host, with the refused hop as `landing_url`. A
+  `tier` rule acts as if the call had passed that tier, and
+  `tier_enforce = true` lets it win over an explicit per-call tier;
+  `tier = "auto"` with `tier_enforce = true` makes a host ignore the tier
+  an agent asks for, and a tier `"1"` pin also keeps `web_search`'s
+  background browser solve off that host. Patterns match the host (with
+  its subdomains, or exactly with a leading `.`) and optionally the
+  scheme; an IPv4 rule also matches the address written as IPv4-mapped
+  IPv6. A key with a port, path, query, `*`, a non-normal spelling, a
+  `deny` without a message, or any other malformed rule fails the config
+  load with a message naming the key and what to write instead. Rules
+  never change search ranking: a denied search result is not prefetched
+  and keeps its place, and a search engine or vertical a rule refuses is
+  not counted as a failing engine. Rules are a guardrail, not a security
+  boundary. See [docs/rules.md](docs/rules.md).
+- `donsetch rules test <url>` explains, offline, what the rules do with
+  one URL: every matching rule in precedence order, the winner, and the
+  winner's fields with the config layer each came from. It says first
+  when rules are off, and warns when a tier `"2"` rule covers a
+  PDF-shaped URL.
+- `--ignore-rules` on `donsetch fetch`, `crawl` and `screenshot` runs the
+  command as if the rule table were empty. It is CLI only: an
+  `ignore_rules` argument over MCP is an unknown-parameter error.
+- `donsetch doctor` has a "Local rules" row with the rule count and the
+  rules mode with its origin, and warns when the mode is `off` while a
+  rule is enabled.
+- `[rules]` knobs: `rules.mode` (`enforce` or `off`, env
+  `DONSETCH_RULES__MODE`) and `rules.crawl_denied_urls_per_rule` (URLs
+  listed per rule in a crawl's denied section, 0 to 200, default 20, env
+  `DONSETCH_RULES__CRAWL_DENIED_URLS_PER_RULE`). Rules themselves come from
+  the file only; any other `DONSETCH_RULES*` environment name fails the
+  load.
+
+### Changed
+
+- A crawl whose seed failed with nothing else to fetch is now a
+  structured error instead of a zero-page result. Its code is the one
+  `web_fetch` gives the same failure (`content.notfound` with
+  `read_status: "notfound"` and a `suggested_query` for a 404 or 410,
+  `wall.*` for a wall, a challenge served as a 429 or 5xx included,
+  `network.*` for a network failure, `network.ratelimit` for a plain
+  429), or else `crawl.robots_disallow`,
+  `crawl.robots_unreachable` or `crawl.seed_failed`. The error carries
+  the seed's `status`, `verdict`, `error` and robots evidence, and
+  `landing_url` when the seed redirected. A seed robots.txt disallows
+  gets the `respect_robots=false` bypass hint; an unreachable robots.txt
+  gets none, since it is read as disallow-all on purpose. A crawl the
+  deadline cut short, and a resumed crawl, keep their zero-page result.
+- A `web_fetch` batch where every URL failed now carries the `code` and
+  `errorKind` its URLs agree on, instead of a code guessed from the joined
+  error texts and a kind of `transient` unless all were `permanent`. For
+  example three bot-walled URLs now read `wall.blocked` rather than
+  `content.extract`, and `errorKind` `walled`, the kind behind exit code
+  3, rather than `transient`, the kind behind exit code 2. Mixed codes
+  keep the old derivation, mixed kinds stay `transient`.
+- A crawl skip reason for a redirect to a non-http(s) scheme drops a
+  doubled prefix: `invalid redirect target: blocked redirect to
+  non-http(s) scheme: mailto` instead of `invalid redirect target: http:
+  blocked redirect to non-http(s) scheme: mailto`.
+
+### Fixed
+
+- `web_crawl` map mode no longer renders a seed that robots.txt
+  disallows. A map whose static inventory was thin made one browser read
+  of the seed even when robots were respected and the seed's own
+  robots.txt refused it.
+- `web_crawl` map mode no longer builds a map from the links of a seed
+  page that the browser read as a 404 or a wall. The rendered read of the
+  seed now counts only when the browser read it as content (complete or
+  still settling) with a 2xx or unknown status, as the static harvest
+  already required; a dead seed's site header and footer links used to
+  come back as a complete map. Such a seed now gets the failed-seed error.
+
 ## [4.7.4] - 2026-10-10
 
 ### Added

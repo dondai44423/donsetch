@@ -152,6 +152,19 @@ impl Searcher {
                     Ok(Err(e)) if slow_not_dead(&e) => {
                         (i, None, Some(String::new()), QualityObs::Neutral)
                     }
+                    // A local rule refused the host: the same shape a bot
+                    // wall gets. The score stays, no quality is recorded
+                    // and the hit keeps its SERP title and snippet. A deny
+                    // is a policy fact about the operator, not a fact
+                    // about the page, so it must neither halve the score
+                    // nor teach the persisted host-quality map that the
+                    // host is bad (that would outlive the rule). A later
+                    // version may add a per-rule knob that lets a deny
+                    // demote search hits; v1 never lets a rule affect
+                    // search ranking.
+                    Ok(Err(crate::error::FetchError::Denied { .. })) => {
+                        (i, None, Some(String::new()), QualityObs::Neutral)
+                    }
                     // Refused / DNS-dead / nothing recovered = dead.
                     Ok(Err(_)) => (i, None, None, QualityObs::Dead),
                     Ok(Ok(mut o)) => {
@@ -608,6 +621,90 @@ mod tests {
                 .take(&url)
                 .is_none(),
             "a wall page never enters the prewarm store"
+        );
+    }
+
+    /// A config whose rules hold one deny rule keyed `key`.
+    fn install_deny_rule(key: &str) {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.rules.url.insert(
+            key.to_string(),
+            crate::rules::UrlRule {
+                action: crate::rules::RuleAction::Deny,
+                message: Some("use another source".to_string()),
+                ..Default::default()
+            },
+        );
+        crate::config::install(config).unwrap();
+    }
+
+    /// A host a rule denies is never contacted by the prefetch, and the
+    /// denial is not a quality fact: the hit keeps its score and its place,
+    /// and the learned-quality map records nothing for its host.
+    ///
+    /// Needs nextest: it installs a process-global config, which a second
+    /// test in the same process could not do.
+    #[tokio::test]
+    async fn denied_hit_keeps_score_and_records_no_quality() {
+        install_deny_rule("127.0.0.1");
+        let (port, rx) = serve(RigMode::Reach);
+        let searcher = searcher();
+        let url = format!("http://127.0.0.1:{port}/hop");
+        let mut hits = vec![merged(&url, "denied"), merged("http://other.invalid/", "x")];
+        hits[1].score = 0.4;
+        searcher.enrich_results(&mut hits).await;
+        assert!(
+            rx.recv_timeout(Duration::from_millis(900)).is_err(),
+            "a denied host must not be contacted by the prefetch"
+        );
+        assert_eq!(hits[0].url, url, "the denied hit keeps its position");
+        assert_eq!(hits[0].score, 1.0, "a denial never demotes");
+        assert!(
+            searcher
+                .quality
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&crate::search::persist::quality_host_key("127.0.0.1"))
+                .is_none(),
+            "a denial must not teach the quality map anything about the host"
+        );
+        assert!(
+            searcher
+                .prewarms()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(&url)
+                .is_none(),
+            "nothing is parked for a denied host"
+        );
+    }
+
+    /// The negative case: a rule for another host leaves the prefetch of
+    /// this one untouched, and its clean fetch is still recorded.
+    ///
+    /// Needs nextest: it installs a process-global config.
+    #[tokio::test]
+    async fn rule_for_another_host_leaves_the_prefetch_alone() {
+        install_deny_rule("denied.invalid");
+        let (port, rx) = serve(RigMode::Reach);
+        let searcher = searcher();
+        let url = format!("http://127.0.0.1:{port}/hop");
+        let mut hits = vec![merged(
+            &url,
+            "Search title that is long enough to be replaced",
+        )];
+        searcher.enrich_results(&mut hits).await;
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("an allowed host is still prefetched");
+        assert!(
+            searcher
+                .quality
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&crate::search::persist::quality_host_key("127.0.0.1"))
+                .is_some(),
+            "a clean fetch of an allowed host is still recorded"
         );
     }
 }

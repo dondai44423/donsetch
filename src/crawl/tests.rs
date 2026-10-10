@@ -157,6 +157,7 @@ impl MockSite {
                             latency: Duration::from_millis(10),
                             cached: false,
                             error_hint: None,
+                            denied: None,
                         };
                     }
                     // Transient 500 simulation: 500 until counter burns out.
@@ -178,6 +179,7 @@ impl MockSite {
                             latency: Duration::from_millis(10),
                             cached: false,
                             error_hint: Some("transient 500".into()),
+                            denied: None,
                         };
                     }
                     let ct = content_types
@@ -196,6 +198,7 @@ impl MockSite {
                             latency: Duration::from_millis(10),
                             cached: false,
                             error_hint: None,
+                            denied: None,
                         },
                         None => FetchedPage {
                             lane: _lane,
@@ -208,6 +211,7 @@ impl MockSite {
                             latency: Duration::from_millis(10),
                             cached: false,
                             error_hint: None,
+                            denied: None,
                         },
                     }
                 }
@@ -753,6 +757,7 @@ async fn wave450_deadline_bounds_discovery_and_page_io() {
                 latency: Duration::from_secs(2),
                 cached: false,
                 error_hint: None,
+                denied: None,
             }
         }
         .boxed()
@@ -2159,14 +2164,23 @@ fn host_matches_www_equivalence() {
 
 #[tokio::test]
 async fn empty_map_returns_guidance() {
-    // No sitemap at any location → map mode returns guidance.
-    let site = MockSite::new().page("https://ex.com/robots.txt", 200, "User-agent: *\n");
+    // No sitemap at any location and a seed page without links → map
+    // mode returns guidance. (A seed whose own fetch failed is a failed
+    // seed instead: map_mode_failed_seed_replaces_the_empty_map_row.)
+    let site = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page(
+            "https://ex.com/",
+            200,
+            &html("Seed", "no links on this page"),
+        );
     let (fetch, _) = site.fetcher();
     let crawler = Crawler::new(fetch, gov());
     let mut o = opts();
     o.mode = CrawlMode::Map;
     let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
     assert!(r.map.is_empty());
+    assert!(r.seed_failure.is_none(), "the seed itself was fetched");
     assert!(
         r.skipped
             .iter()
@@ -2384,6 +2398,7 @@ fn concurrent_issues_survive_each_other() {
                     seed: format!("https://site.example/seed{i}"),
                     queue: Vec::new(),
                     seen: Vec::new(),
+                    denied: Default::default(),
                 };
                 super::resume_store_issue(&tok, &state);
                 barrier.wait();
@@ -2486,6 +2501,7 @@ async fn wave450_invalid_seed_does_not_consume_a_resume_token() {
         seed: "https://ex.com/docs/".into(),
         queue: Vec::new(),
         seen: Vec::new(),
+        denied: Default::default(),
     };
     super::resume_store_issue(token, &state);
     let site = MockSite::new();
@@ -2628,4 +2644,658 @@ async fn v471_map_keeps_scoped_seed_links() {
         .await
         .unwrap();
     assert_eq!(result.map, ["https://ex.com/read/second"]);
+}
+
+// ── Local rules: denied URLs ──────────────────────────────
+
+/// A compiled ruleset denying each `(key, reason)`. Leaked so it can
+/// be handed to `Crawler::with_rules` without installing a config:
+/// these tests run on any runner.
+fn deny_rules(keys: &[(&str, Option<&str>)]) -> &'static crate::rules::RuleSet {
+    let mut section = crate::rules::RulesSection::default();
+    for (key, reason) in keys {
+        section.url.insert(
+            key.to_string(),
+            crate::rules::UrlRule {
+                action: crate::rules::RuleAction::Deny,
+                message: Some(format!("get {key} pages from another source")),
+                reason: reason.map(str::to_string),
+                ..Default::default()
+            },
+        );
+    }
+    Box::leak(Box::new(crate::rules::RuleSet::compile(&section).unwrap()))
+}
+
+fn denial(rule: &str, reason: Option<&str>) -> crate::rules::Denial {
+    crate::rules::Denial {
+        rule: rule.to_string(),
+        message: format!("get {rule} pages from another source"),
+        kind: "walled".to_string(),
+        reason: reason.map(str::to_string),
+    }
+}
+
+/// A page with enough prose to extract, linking every href in `links`.
+fn linking_page(title: &str, links: &[&str]) -> String {
+    format!(
+        "<html><head><title>{title}</title></head><body><article>\
+         <p>content words here for extraction threshold passing yes indeed</p>{}\
+         </article></body></html>",
+        links
+            .iter()
+            .map(|l| format!("<a href=\"{l}\">{l}</a>"))
+            .collect::<String>()
+    )
+}
+
+/// Wrap `inner` so `url` answers like a refused fetch: status 0 and no
+/// body, with `denied` attached when a local rule refused it (what
+/// crawl/real.rs builds for `FetchError::Denied`), without it for a
+/// plain network failure. The inner fetcher still records the hit.
+fn refusing_fetcher(
+    inner: PageFetcher,
+    url: &'static str,
+    denied: Option<crate::rules::Denial>,
+) -> PageFetcher {
+    Arc::new(move |requested: String, lane, referer, gate| {
+        let inner = Arc::clone(&inner);
+        let denied = denied.clone();
+        async move {
+            let mut page = inner(requested.clone(), lane, referer, gate).await;
+            if requested == url {
+                page.status = 0;
+                page.route = None;
+                page.headers.clear();
+                page.body.clear();
+                page.verdict = Verdict::Blocked;
+                page.error_hint = Some(match &denied {
+                    Some(d) => super::policy_skip_reason(d),
+                    None => "network: connection reset".into(),
+                });
+                page.denied = denied;
+            }
+            page
+        }
+        .boxed()
+    })
+}
+
+fn hits_matching(hits: &Arc<Mutex<Vec<String>>>, needle: &str) -> usize {
+    hits.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|h| h.contains(needle))
+        .count()
+}
+
+#[test]
+fn denied_log_counts_every_denial_but_caps_its_urls() {
+    let mut log = super::DeniedLog::default();
+    assert!(log.is_empty());
+    let ban = denial("banned.example", Some("ip_ban"));
+    let other = crate::rules::Denial {
+        kind: "permanent".into(),
+        ..denial("internal.example", None)
+    };
+    log.record("https://banned.example/a", &ban, 2);
+    log.record("https://internal.example/x", &other, 2);
+    log.record("https://banned.example/b", &ban, 2);
+    log.record("https://www.banned.example/c", &ban, 2);
+    assert_eq!(log.total(), 4);
+    assert_eq!(log.groups.len(), 2, "one group per rule");
+    let first = &log.groups[0];
+    assert_eq!(first.rule, "banned.example", "groups keep first-seen order");
+    assert_eq!(first.kind, "walled");
+    assert_eq!(first.message, ban.message);
+    assert_eq!(first.count, 3, "the count covers every denial");
+    assert_eq!(
+        first.urls,
+        ["https://banned.example/a", "https://banned.example/b"],
+        "the URL list stops at the cap"
+    );
+    assert_eq!(log.groups[1].kind, "permanent");
+
+    // A cap of 0 lists no URL; the count still grows.
+    let mut bare = super::DeniedLog::default();
+    bare.record("https://banned.example/a", &ban, 0);
+    assert_eq!(bare.total(), 1);
+    assert!(bare.groups[0].urls.is_empty());
+}
+
+// A denied link is never queued, never fetched (its origin's
+// robots.txt included), and recorded once however many times it is
+// linked; allowed links crawl as before.
+#[tokio::test]
+async fn denied_links_are_recorded_once_and_never_contacted() {
+    let seed = linking_page(
+        "Seed",
+        &[
+            "https://blocked.example/a",
+            "https://blocked.example/a#again",
+            "https://www.blocked.example/b",
+            "/ok",
+        ],
+    );
+    let site = MockSite::new().page("https://ex.com/", 200, &seed).page(
+        "https://ex.com/ok",
+        200,
+        &linking_page("Ok", &["https://blocked.example/a"]),
+    );
+    let (fetch, hits) = site.fetcher();
+    let crawler =
+        Crawler::new(fetch, gov()).with_rules(deny_rules(&[("blocked.example", Some("ip_ban"))]));
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.same_host = false;
+    o.respect_robots = true;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+
+    assert_eq!(
+        hits_matching(&hits, "blocked.example"),
+        0,
+        "nothing on the denied host is requested, robots.txt included"
+    );
+    assert!(r.pages.iter().any(|p| p.url == "https://ex.com/ok"));
+    assert_eq!(r.denied.total(), 2, "each denied URL once: {:?}", r.denied);
+    let group = &r.denied.groups[0];
+    assert_eq!(group.rule, "blocked.example");
+    assert_eq!(group.kind, "walled");
+    assert_eq!(
+        group.message,
+        "get blocked.example pages from another source"
+    );
+    assert_eq!(
+        group.urls,
+        ["https://blocked.example/a", "https://www.blocked.example/b"]
+    );
+    assert!(
+        !r.skipped.iter().any(|(u, _)| u.contains("blocked.example")),
+        "a URL refused at queue time is not a skip row: {:?}",
+        r.skipped
+    );
+    assert_eq!(r.seed_failure, None);
+}
+
+// Negative: without a matching rule the same links are queued and
+// fetched, and nothing is reported.
+#[tokio::test]
+async fn links_no_rule_matches_are_crawled_and_nothing_is_denied() {
+    let seed = linking_page("Seed", &["https://other.example/a", "/ok"]);
+    let site = MockSite::new().page("https://ex.com/", 200, &seed).page(
+        "https://ex.com/ok",
+        200,
+        &html("Ok", "ok body"),
+    );
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov()).with_rules(deny_rules(&[("blocked.example", None)]));
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.same_host = false;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    assert!(hits_matching(&hits, "https://other.example/a") >= 1);
+    assert!(r.denied.is_empty());
+}
+
+// The rules check must not swallow the seed-neighbor boost: a sitemap
+// entry the seed page also links is still raised above the flood
+// (V10b), with a non-empty ruleset in place and a denied link beside it.
+#[tokio::test]
+async fn a_seed_link_still_raises_a_sitemap_entry_with_rules_in_place() {
+    let sitemap = r#"<urlset>
+<url><loc>https://ex.com/a</loc></url>
+<url><loc>https://ex.com/b</loc></url>
+<url><loc>https://ex.com/topic/one</loc></url>
+<url><loc>https://ex.com/topic/two</loc></url>
+</urlset>"#;
+    let seed = linking_page(
+        "seed",
+        &["/topic/one", "/topic/two", "https://blocked.example/x"],
+    );
+    let site = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/", 200, &seed)
+        .page(
+            "https://ex.com/topic/one",
+            200,
+            &html("One", "topic one body words for the extractor threshold"),
+        )
+        .page(
+            "https://ex.com/topic/two",
+            200,
+            &html("Two", "topic two body words for the extractor threshold"),
+        )
+        .page("https://ex.com/a", 200, &html("A", "generic a body words"))
+        .page("https://ex.com/b", 200, &html("B", "generic b body words"));
+    let (fetch, _) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov()).with_rules(deny_rules(&[("blocked.example", None)]));
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.shape = false;
+    o.same_host = false;
+    o.max_pages = 3;
+    let r = crawler.crawl("https://ex.com/", o, None).await.unwrap();
+    let urls: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        urls.contains(&"https://ex.com/topic/one") && urls.contains(&"https://ex.com/topic/two"),
+        "a seed link must still raise its sitemap-queued entry, got {urls:?}"
+    );
+    assert_eq!(r.denied.total(), 1);
+}
+
+// Full mode: a denied sitemap entry is left out of the map inventory
+// and reported only as a denial, and it is tested before the locale
+// dedup, so an allowed entry with the same path keeps its slot. Map
+// mode tests nothing and lists every URL unmarked (the negative case).
+#[tokio::test]
+async fn a_denied_sitemap_entry_leaves_the_full_mode_map_but_not_map_mode() {
+    let sitemap = r#"<urlset>
+<url><loc>https://blocked.example/docs/p</loc></url>
+<url><loc>https://ex.com/docs/p</loc></url>
+<url><loc>https://ex.com/a</loc></url>
+</urlset>"#;
+    let build = || {
+        MockSite::new()
+            .page("https://ex.com/sitemap.xml", 200, sitemap)
+            .page("https://ex.com/", 200, &linking_page("Seed", &[]))
+            .page("https://ex.com/docs/p", 200, &html("P", "docs page body"))
+            .page("https://ex.com/a", 200, &html("A", "a page body"))
+            .fetcher()
+    };
+    let rules = deny_rules(&[("blocked.example", None)]);
+
+    let (fetch, hits) = build();
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.same_host = false;
+    let r = Crawler::new(fetch, gov())
+        .with_rules(rules)
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    assert!(
+        !r.map.iter().any(|u| u.contains("blocked.example")),
+        "full mode: {:?}",
+        r.map
+    );
+    assert!(
+        r.map.iter().any(|u| u == "https://ex.com/docs/p"),
+        "the allowed same-path entry keeps its slot: {:?}",
+        r.map
+    );
+    assert_eq!(r.denied.total(), 1, "recorded once: {:?}", r.denied);
+    assert_eq!(r.denied.groups[0].urls, ["https://blocked.example/docs/p"]);
+    assert_eq!(hits_matching(&hits, "blocked.example"), 0);
+    assert!(hits_matching(&hits, "https://ex.com/docs/p") >= 1);
+
+    let (fetch, hits) = build();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .with_rules(rules)
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert!(
+        r.map.iter().any(|u| u == "https://blocked.example/docs/p"),
+        "map mode lists the URL unmarked: {:?}",
+        r.map
+    );
+    assert!(r.denied.is_empty(), "map mode reports no denials");
+    assert_eq!(hits_matching(&hits, "blocked.example"), 0);
+}
+
+// A page refused mid-fetch (a redirect into a denied host, or an entry
+// that never met the queue-time check) is final: one request, a policy
+// skip row naming the rule, and no denied-section entry. A plain
+// status-0 page is still retried (the negative case).
+#[tokio::test]
+async fn a_denied_fetch_is_a_final_policy_skip_row() {
+    let seed = linking_page("Seed", &["/redir", "/flaky"]);
+    let site = MockSite::new()
+        .page("https://ex.com/", 200, &seed)
+        .page("https://ex.com/redir", 200, &html("R", "redirect source"))
+        .page("https://ex.com/flaky", 200, &html("F", "flaky page"));
+    let (fetch, hits) = site.fetcher();
+    let fetch = refusing_fetcher(
+        fetch,
+        "https://ex.com/redir",
+        Some(denial("blocked.example", Some("ip_ban"))),
+    );
+    let fetch = refusing_fetcher(fetch, "https://ex.com/flaky", None);
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.respect_robots = false;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits_matching(&hits, "https://ex.com/redir"),
+        1,
+        "never retried"
+    );
+    assert!(
+        r.skipped.contains(&(
+            "https://ex.com/redir".to_string(),
+            "policy.denied.ip_ban: blocked by a local DonSeTch rule `blocked.example`".to_string()
+        )),
+        "{:?}",
+        r.skipped
+    );
+    assert!(r.denied.is_empty(), "a fetched URL is not a denial");
+    assert_eq!(
+        hits_matching(&hits, "https://ex.com/flaky"),
+        3,
+        "a network failure keeps its two retries"
+    );
+}
+
+// ── Failed seed ───────────────────────────────────────────
+
+#[tokio::test]
+async fn a_failed_seed_with_nothing_else_to_fetch_is_reported() {
+    let site = MockSite::new();
+    let (fetch, _) = site.fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.respect_robots = false;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/gone", o, None)
+        .await
+        .unwrap();
+    let failure = r.seed_failure.expect("a 404 seed with nothing else queued");
+    assert_eq!(failure.requested, "https://ex.com/gone");
+    assert_eq!(failure.status, 404);
+    assert_eq!(failure.verdict.as_deref(), Some("SoftNotFound"));
+    assert_eq!(failure.landing, None, "no redirect");
+    assert_eq!(failure.robots, None);
+    assert_eq!(failure.denial, None);
+    assert!(!failure.has_sitemap_phase, "content mode reads no sitemap");
+}
+
+// Negative cases: a failed seed is only the crawl's failure when
+// nothing else could have produced a page.
+#[tokio::test]
+async fn a_failed_seed_is_not_reported_when_the_crawl_had_more_to_fetch() {
+    // Full mode, a 404 seed, and a sitemap entry that crawls.
+    let sitemap = "<urlset><url><loc>https://ex.com/a</loc></url></urlset>";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/a", 200, &html("A", "a page body"))
+        .fetcher();
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", opts(), None)
+        .await
+        .unwrap();
+    assert!(!r.pages.is_empty());
+    assert_eq!(r.seed_failure, None);
+
+    // Content mode: a seed that was fetched but yields no page and no
+    // link has not failed; the zero-page result stands.
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/", 200, &linking_page("Seed", &[]))
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.min_quality = 1.0; // the seed is skipped as low quality, not failed
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert!(r.pages.is_empty());
+    assert!(
+        r.skipped
+            .iter()
+            .any(|(_, why)| why.starts_with("low quality")),
+        "{:?}",
+        r.skipped
+    );
+    assert_eq!(r.seed_failure, None);
+
+    // Content mode: a transient seed that recovers on its retry.
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/", 200, &html("Seed", "seed body"))
+        .transient_n("https://ex.com/", 1)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert!(!r.pages.is_empty(), "{:?}", r.skipped);
+    assert_eq!(r.seed_failure, None);
+}
+
+// A seed the origin's robots.txt refuses leaves no skip row (it is
+// filtered at dequeue); it still counts as failed, and a published
+// Disallow and an unreachable file are told apart.
+#[tokio::test]
+async fn a_robots_refused_seed_is_a_failed_seed() {
+    for (status, body, expected) in [
+        (
+            200u16,
+            "User-agent: *\nDisallow: /\n",
+            super::RobotsRefusal::Disallow,
+        ),
+        (503, "", super::RobotsRefusal::Unreachable),
+    ] {
+        let (fetch, hits) = MockSite::new()
+            .page("https://ex.com/robots.txt", status, body)
+            .page("https://ex.com/", 200, &html("Seed", "never fetched"))
+            .fetcher();
+        let mut o = opts();
+        o.mode = CrawlMode::Content;
+        o.respect_robots = true;
+        let r = Crawler::new(fetch, gov())
+            .crawl("https://ex.com/", o, None)
+            .await
+            .unwrap();
+        assert!(
+            !hits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|h| h == "https://ex.com/"),
+            "the refused seed is never fetched"
+        );
+        let failure = r.seed_failure.expect("robots refused the seed");
+        assert_eq!(failure.robots, Some(expected), "robots status {status}");
+        assert_eq!(failure.status, 0);
+        assert_eq!(failure.verdict, None);
+    }
+}
+
+// A seed that redirected into a denied host carries the typed denial,
+// so the tool can report the policy error with the operator's message.
+#[tokio::test]
+async fn a_seed_refused_by_a_rule_mid_fetch_carries_the_denial() {
+    let (fetch, _) = MockSite::new().fetcher();
+    let fetch = refusing_fetcher(
+        fetch,
+        "https://ex.com/",
+        Some(denial("blocked.example", Some("ip_ban"))),
+    );
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.respect_robots = false;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let failure = r.seed_failure.expect("the seed failed");
+    assert_eq!(failure.status, 0);
+    assert_eq!(
+        failure.denial,
+        Some(denial("blocked.example", Some("ip_ban")))
+    );
+    assert_eq!(
+        failure.error.as_deref(),
+        Some("policy.denied.ip_ban: blocked by a local DonSeTch rule `blocked.example`")
+    );
+    assert!(r.denied.is_empty());
+}
+
+// Map mode judges the seed at its empty-map exit: a failed preflight
+// replaces the "no sitemap found" row; a fetched seed that exposed
+// nothing keeps it (empty_map_returns_guidance is the negative case).
+#[tokio::test]
+async fn map_mode_failed_seed_replaces_the_empty_map_row() {
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/gone", o, None)
+        .await
+        .unwrap();
+    assert!(r.map.is_empty());
+    assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+    let failure = r.seed_failure.expect("the seed fetch failed");
+    assert_eq!(failure.status, 404);
+    assert!(failure.has_sitemap_phase);
+}
+
+// Map mode's rendered read of a thin seed honors the seed's robots
+// verdict: a seed robots.txt disallows is neither fetched nor rendered.
+// map_mode_merges_a_rendered_inventory_when_static_is_thin is the
+// negative case (robots allow, one render).
+#[tokio::test]
+async fn map_mode_never_renders_a_robots_refused_seed() {
+    let (fetch, _) = MockSite::new()
+        .page(
+            "https://ex.com/robots.txt",
+            200,
+            "User-agent: *\nDisallow: /\n",
+        )
+        .page("https://ex.com/", 200, &linking_page("Seed", &["/a"]))
+        .fetcher();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_in = Arc::clone(&calls);
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    o.deadline = Duration::from_secs(120); // the render guard needs headroom
+    o.render_html = Some(Arc::new(move |_url: String| {
+        let calls = Arc::clone(&calls_in);
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some((
+                "<html><body><a href=\"/c\">C</a></body></html>".to_string(),
+                "https://ex.com/".to_string(),
+            ))
+        })
+    }));
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "no render");
+    assert!(r.map.is_empty());
+    assert_eq!(
+        r.seed_failure.and_then(|f| f.robots),
+        Some(super::RobotsRefusal::Disallow)
+    );
+}
+
+// ── Resume and local rules ────────────────────────────────
+
+// An older token has no `denied` field and must still load.
+#[test]
+fn a_resume_state_without_denials_still_loads() {
+    let old: super::ResumeState =
+        serde_json::from_str(r#"{"seed":"https://ex.com/","queue":[],"seen":[]}"#).unwrap();
+    assert!(old.denied.is_empty());
+
+    let mut denied = super::DeniedLog::default();
+    denied.record(
+        "https://blocked.example/a",
+        &denial("blocked.example", None),
+        20,
+    );
+    let state = super::ResumeState {
+        seed: "https://ex.com/".into(),
+        queue: Vec::new(),
+        seen: Vec::new(),
+        denied: denied.clone(),
+    };
+    let back: super::ResumeState =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(back.denied, denied);
+}
+
+// A resumed crawl reports the earlier run's denials, once: the denied
+// key is in the restored seen set, so a page linking it again in run 2
+// records nothing new.
+// Uses the resume store under the per-process test cache root, so it
+// depends on nextest's process-per-test.
+#[tokio::test]
+async fn a_resumed_crawl_keeps_the_earlier_denials() {
+    let mut site = MockSite::new().page(
+        "https://ex.com/",
+        200,
+        &linking_page("Seed", &["/p0", "/p1", "/p2", "https://blocked.example/x"]),
+    );
+    for i in 0..3 {
+        site = site.page(
+            &format!("https://ex.com/p{i}"),
+            200,
+            &linking_page(&format!("P{i}"), &["https://blocked.example/x"]),
+        );
+    }
+    let (fetch, hits) = site.fetcher();
+    let crawler = Crawler::new(fetch, gov()).with_rules(deny_rules(&[("blocked.example", None)]));
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.same_host = false;
+    o.respect_robots = false;
+    o.max_pages = 1;
+    let r1 = crawler
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(r1.denied.total(), 1);
+    let token = r1.resume.expect("stopped with work queued");
+
+    o.max_pages = 10;
+    let r2 = crawler.crawl("", o, Some(&token)).await.unwrap();
+    assert!(!r2.pages.is_empty());
+    assert_eq!(r2.denied, r1.denied, "carried over, not counted again");
+    assert_eq!(r2.seed_failure, None, "a resumed crawl has no seed rule");
+    assert_eq!(hits_matching(&hits, "blocked.example"), 0);
+}
+
+// The tool checks a resumed seed before the crawl starts, so the read
+// must not consume the token. Uses the resume store under the
+// per-process test cache root, so it depends on nextest's
+// process-per-test.
+#[test]
+fn resume_store_peek_reads_the_seed_without_consuming_the_token() {
+    let token = "c0peek01";
+    let state = super::ResumeState {
+        seed: "https://ex.com/docs/".into(),
+        queue: Vec::new(),
+        seen: Vec::new(),
+        denied: Default::default(),
+    };
+    super::resume_store_issue(token, &state);
+    assert_eq!(
+        super::resume_store_peek(token).as_deref(),
+        Ok("https://ex.com/docs/")
+    );
+    assert_eq!(
+        super::resume_store_peek(token).as_deref(),
+        Ok("https://ex.com/docs/"),
+        "a peek is repeatable"
+    );
+    assert_eq!(
+        super::resume_store_take(token)
+            .expect("the token survives a peek")
+            .seed,
+        state.seed
+    );
+    // Negative: a consumed, unknown or malformed token is refused.
+    assert!(super::resume_store_peek(token).is_err());
+    assert!(super::resume_store_peek("cunknown0").is_err());
+    assert!(super::resume_store_peek("../victim").is_err());
 }

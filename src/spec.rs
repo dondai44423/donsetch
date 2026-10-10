@@ -780,9 +780,16 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
 
 // ── CLI generation ───────────────────────────────────────────
 
+/// The CLI commands that take `--ignore-rules`: the tools that fetch
+/// a caller's URL, which a local rule can deny or pin to a tier.
+pub const IGNORE_RULES_COMMANDS: &[&str] = &["fetch", "crawl", "screenshot"];
+
 /// Build the clap subcommand for one tool. `--json` and
 /// `--quiet` are CLI-adapter flags (not MCP params), appended
-/// to every tool command.
+/// to every tool command; `--ignore-rules` is one too, appended
+/// to the commands in [`IGNORE_RULES_COMMANDS`]. None of them is
+/// in the tool-arguments JSON (`matches_to_json` reads only the
+/// param table).
 pub fn cli_command(tool: &ToolSpec) -> clap::Command {
     // CLI --help speaks to a human in a terminal; the full agent
     // contract stays in the MCP description field. Same facts,
@@ -832,19 +839,37 @@ you can pass with --resume to continue later."
     for p in tool.params {
         cmd = cmd.arg(cli_arg(p));
     }
-    cmd.arg(
-        Arg::new("json")
-            .long("json")
-            .action(ArgAction::SetTrue)
-            .help("Print the full JSON envelope on stdout (content + all metadata)."),
-    )
-    .arg(
-        Arg::new("quiet")
-            .long("quiet")
-            .short('q')
-            .action(ArgAction::SetTrue)
-            .help("Suppress the stderr stats line."),
-    )
+    cmd = cmd
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .action(ArgAction::SetTrue)
+                .help("Print the full JSON envelope on stdout (content + all metadata)."),
+        )
+        .arg(
+            Arg::new("quiet")
+                .long("quiet")
+                .short('q')
+                .action(ArgAction::SetTrue)
+                .help("Suppress the stderr stats line."),
+        );
+    // The escape hatch stays out of the param table on purpose: the
+    // MCP schema is built from that table, so a model never sees the
+    // flag, and `check_args` refuses an `ignore_rules` argument as an
+    // unknown parameter. main.rs applies it by switching `[rules]
+    // mode` off before the config is installed.
+    if IGNORE_RULES_COMMANDS.contains(&tool.cli_cmd) {
+        cmd = cmd.arg(
+            Arg::new("ignore_rules")
+                .long("ignore-rules")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Run as if the local DonSeTch rules ([rules] in donsetch.toml) were empty: \
+                     no rule denies the URL or pins its tier. CLI only.",
+                ),
+        );
+    }
+    cmd
 }
 
 fn cli_arg(p: &ParamSpec) -> Arg {
@@ -1172,5 +1197,54 @@ mod tests {
                 "scroll"
             ])
         );
+    }
+
+    #[test]
+    fn ignore_rules_is_a_cli_flag_that_never_reaches_the_tool_arguments() {
+        for (name, argv) in [
+            (
+                "web_fetch",
+                ["fetch", "https://example.com", "--ignore-rules"],
+            ),
+            (
+                "web_crawl",
+                ["crawl", "https://example.com", "--ignore-rules"],
+            ),
+            (
+                "web_screenshot",
+                ["screenshot", "https://example.com", "--ignore-rules"],
+            ),
+        ] {
+            let tool = TOOLS.iter().find(|t| t.name == name).unwrap();
+            let matches = cli_command(tool)
+                .try_get_matches_from(argv)
+                .unwrap_or_else(|e| panic!("{name} must accept --ignore-rules: {e}"));
+            assert!(matches.get_flag("ignore_rules"), "{name}");
+            let args = matches_to_json(tool, &matches);
+            assert!(args.get("ignore_rules").is_none(), "{name}: {args}");
+            assert!(
+                mcp_schema(tool)["inputSchema"]["properties"]
+                    .get("ignore_rules")
+                    .is_none(),
+                "{name}: the escape hatch must stay out of the MCP schema"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_rules_is_refused_where_no_rule_applies_and_over_mcp() {
+        // search fetches no caller URL, so the flag is not declared there.
+        let err = cli_command(search_tool())
+            .try_get_matches_from(["search", "rust", "--ignore-rules"])
+            .expect_err("search must not take --ignore-rules");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        // A model that sends the key over MCP gets an unknown-parameter
+        // error, not a silent bypass.
+        let err = check_args(
+            fetch_tool(),
+            &json!({ "url": "https://example.com", "ignore_rules": true }),
+        )
+        .expect_err("ignore_rules must not be an MCP argument");
+        assert!(err.contains("unknown parameter"), "{err}");
     }
 }

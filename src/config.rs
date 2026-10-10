@@ -206,6 +206,10 @@ pub struct DonsetchConfig {
     pub search: SearchSection,
     pub browser: BrowserSection,
     pub debug: DebugSection,
+    /// `[rules]`: the mechanism's own scalars plus the operator's
+    /// `[rules.url."<pattern>"]` table. Comes from the file layer only;
+    /// env reaches the scalars and nothing else.
+    pub rules: crate::rules::RulesSection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
@@ -323,15 +327,28 @@ pub struct Loaded {
 }
 
 impl Loaded {
+    /// The origin of the leaf addressed by `segments`, one map key per
+    /// segment and any depth: `["fetch", "h3"]`, or
+    /// `["rules", "url", "example.com", "message"]` for a rule field
+    /// (a key that contains dots is one segment). Only leaves carry an
+    /// origin, so a rule is attributed per field, never per rule.
+    /// `None` when the path does not exist or its leaf has no origin.
+    pub fn origin_of_path(&self, segments: &[&str]) -> Option<&str> {
+        let (first, rest) = segments.split_first()?;
+        let mut node = self.merged.get(*first)?;
+        for segment in rest {
+            node = match &node.kind {
+                config::ValueKind::Table(inner) => inner.get(*segment)?,
+                _ => return None,
+            };
+        }
+        node.origin()
+    }
+
+    /// Origin of a two-level `section.key` knob.
     fn origin_of(&self, path: &str) -> Option<&str> {
         let (section, key) = path.split_once('.')?;
-        self.merged
-            .get(section)
-            .and_then(|value| match &value.kind {
-                config::ValueKind::Table(inner) => inner.get(key),
-                _ => None,
-            })
-            .and_then(config::Value::origin)
+        self.origin_of_path(&[section, key])
     }
 
     /// Legacy optional browser strings used presence semantics: even an
@@ -2048,6 +2065,17 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "false",
             "scorecard echo debug",
         ),
+        // rules: the scalars only. The `[rules.url."<pattern>"]` table
+        // has operator-chosen keys, which a flat (section, key) row
+        // cannot describe, so it stays out of this table.
+        ("rules", "mode", FieldKind::Str, "enforce", "enforce | off"),
+        (
+            "rules",
+            "crawl_denied_urls_per_rule",
+            FieldKind::Int,
+            "20",
+            "URLs listed per rule in a crawl's denied section; 0 = none",
+        ),
     ]
 }
 
@@ -2212,6 +2240,22 @@ fn new_env_layer_from(
         }
         let path = name["DONSETCH_".len()..].to_ascii_lowercase();
         let parts: Vec<&str> = path.split("__").collect();
+        // Rules come from the file layer only. A name under `rules` that
+        // is not one of its fieldbook scalars is an error rather than the
+        // generic "ignoring" warning: a rule the operator believes is set
+        // must not be dropped quietly. Checked before the segment count
+        // so a three-segment name gets this message, not the generic one.
+        if parts[0] == "rules"
+            && !(parts.len() == 2
+                && fieldbook()
+                    .iter()
+                    .any(|(s, k, _, _, _)| *s == "rules" && *k == parts[1]))
+        {
+            errors.push(format!(
+                "{name}: rules cannot be set through the environment.\n\nPut them in donsetch.toml as [rules.url.\"<pattern>\"]."
+            ));
+            continue;
+        }
         let (section, key) = if parts.len() == 2 {
             (parts[0], parts[1])
         } else {
@@ -2351,6 +2395,14 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if c.search.rerank_threads > 64 {
         return err("search.rerank_threads must be 0 (auto) or 1..=64".into());
+    }
+    if c.rules.crawl_denied_urls_per_rule > 200 {
+        return err("rules.crawl_denied_urls_per_rule must be 0..=200".into());
+    }
+    // Every rule key compiles here, whatever `rules.mode` says: a bad key
+    // is a fault in the file and fails the load either way.
+    if let Err(message) = crate::rules::RuleSet::compile(&c.rules) {
+        return err(message);
     }
     Ok(())
 }
@@ -4160,7 +4212,7 @@ mod tests {
         for (section, key, _, _, _) in fieldbook() {
             match *section {
                 "transport" | "mcp" | "paths" | "state" | "proxy" | "tls" | "persona" | "cli"
-                | "fetch" | "bypass" | "search" | "browser" | "debug" => {}
+                | "fetch" | "bypass" | "search" | "browser" | "debug" | "rules" => {}
                 other => panic!("unknown section {other} for {section}.{key}"),
             }
         }
@@ -4169,6 +4221,345 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         validate(&DonsetchConfig::default()).expect("defaults must pass validation");
+    }
+
+    // Read off the struct, so a scalar added to RulesSection without a
+    // fieldbook row fails here rather than as a "rules cannot be set
+    // through the environment" error for its own env name.
+    #[test]
+    fn every_rules_scalar_has_a_fieldbook_entry() {
+        let json = serde_json::to_value(crate::rules::RulesSection::default()).unwrap();
+        let fields = json
+            .as_object()
+            .expect("RulesSection serializes as a table");
+        assert!(
+            fields.get("url").is_some_and(serde_json::Value::is_object),
+            "the rule table must serialize as a table: {json}"
+        );
+        for (key, value) in fields {
+            if value.is_object() {
+                continue;
+            }
+            assert!(
+                fieldbook()
+                    .iter()
+                    .any(|(s, k, _, _, _)| *s == "rules" && *k == key.as_str()),
+                "rules.{key} has no fieldbook entry"
+            );
+        }
+        // And no fieldbook row names a field RulesSection does not have.
+        for (section, key, _, _, _) in fieldbook() {
+            if *section == "rules" {
+                assert!(
+                    fields.get(*key).is_some_and(|v| !v.is_object()),
+                    "fieldbook row rules.{key} is not a RulesSection scalar"
+                );
+            }
+        }
+    }
+
+    fn config_with_rule(key: &str, rule: crate::rules::UrlRule) -> DonsetchConfig {
+        let mut c = DonsetchConfig::default();
+        c.rules.url.insert(key.to_string(), rule);
+        c
+    }
+
+    #[test]
+    fn validate_rejects_a_deny_rule_without_a_usable_message() {
+        use crate::rules::{RuleAction, UrlRule};
+        for message in [None, Some(""), Some("  ")] {
+            let c = config_with_rule(
+                "example.com",
+                UrlRule {
+                    action: RuleAction::Deny,
+                    message: message.map(str::to_string),
+                    ..UrlRule::default()
+                },
+            );
+            match validate(&c) {
+                Err(ConfigError::Validate(text)) => assert!(
+                    text.contains("[rules.url.\"example.com\"]"),
+                    "{message:?}: the error must name the rule: {text}"
+                ),
+                other => panic!("{message:?} must fail validation, got {other:?}"),
+            }
+        }
+        // A key the compiler rejects fails validate() the same way.
+        let c = config_with_rule("example.com:8080", UrlRule::default());
+        assert!(
+            matches!(validate(&c), Err(ConfigError::Validate(_))),
+            "a key with a port must fail validation"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_an_allow_rule_without_a_message() {
+        use crate::rules::{RuleAction, UrlRule};
+        let c = config_with_rule(
+            "example.com",
+            UrlRule {
+                action: RuleAction::Allow,
+                message: None,
+                ..UrlRule::default()
+            },
+        );
+        validate(&c).expect("an allow rule needs no message");
+        let c = config_with_rule(
+            "example.com",
+            UrlRule {
+                action: RuleAction::Deny,
+                message: Some("Use the preprint copy instead.".into()),
+                ..UrlRule::default()
+            },
+        );
+        validate(&c).expect("a deny rule with a message is valid");
+    }
+
+    #[test]
+    fn crawl_denied_urls_per_rule_is_bounded() {
+        let mut c = DonsetchConfig::default();
+        for ok in [0, 20, 200] {
+            c.rules.crawl_denied_urls_per_rule = ok;
+            validate(&c).unwrap_or_else(|e| panic!("{ok} must be valid: {e}"));
+        }
+        c.rules.crawl_denied_urls_per_rule = 201;
+        match validate(&c) {
+            Err(ConfigError::Validate(text)) => {
+                assert!(text.contains("rules.crawl_denied_urls_per_rule"), "{text}")
+            }
+            other => panic!("201 must fail validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rules_env_names_other_than_its_scalars_are_errors() {
+        for name in [
+            "DONSETCH_RULES__URL__BANNED",
+            "DONSETCH_RULES__URL",
+            "DONSETCH_RULES",
+            "DONSETCH_RULES__BOGUS",
+            "DONSETCH_rules__url__example",
+        ] {
+            let (map, warnings, errors) = new_env_layer_from([(
+                std::ffi::OsString::from(name),
+                std::ffi::OsString::from("deny"),
+            )]);
+            assert!(map.is_empty(), "{name} must set nothing");
+            assert!(
+                warnings.is_empty(),
+                "{name} must not get the generic warning: {warnings:?}"
+            );
+            assert_eq!(
+                errors,
+                vec![format!(
+                    "{name}: rules cannot be set through the environment.\n\nPut them in donsetch.toml as [rules.url.\"<pattern>\"]."
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn rules_scalars_take_the_normal_env_path() {
+        let (map, warnings, errors) = new_env_layer_from([
+            (
+                std::ffi::OsString::from("DONSETCH_RULES__MODE"),
+                std::ffi::OsString::from("off"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_RULES__CRAWL_DENIED_URLS_PER_RULE"),
+                std::ffi::OsString::from("5"),
+            ),
+        ]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        let config::ValueKind::Table(rules) = &map.get("rules").expect("rules section").kind else {
+            panic!("rules must be a table");
+        };
+        assert_eq!(
+            rules["mode"].clone().into_string().unwrap(),
+            "off",
+            "rules.mode"
+        );
+        assert_eq!(rules["mode"].origin(), Some("DONSETCH_RULES__MODE"));
+        assert_eq!(
+            rules["crawl_denied_urls_per_rule"]
+                .clone()
+                .into_int()
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn origin_of_path_reaches_rule_fields_per_leaf() {
+        use config::Source as _;
+        let layer = |toml: &str, origin: &str| {
+            let mut map = config::File::from_str(toml, config::FileFormat::Toml)
+                .collect()
+                .expect("toml layer");
+            restamp_origins(&mut map, &Some(origin.to_string()));
+            MapSource(map)
+        };
+        let lower = layer(
+            "[fetch]\nh3 = true\n\n[rules.url.\"banned.example\"]\naction = \"deny\"\nmessage = \"lower\"\n",
+            "file:lower.toml",
+        );
+        let upper = layer(
+            "[rules.url.\"banned.example\"]\nmessage = \"upper\"\n",
+            "file:upper.toml",
+        );
+        let merged = config::Config::builder()
+            .add_source(lower)
+            .add_source(upper)
+            .build()
+            .expect("merge")
+            .collect()
+            .expect("collect");
+        let loaded = Loaded {
+            config: DonsetchConfig::default(),
+            warnings: Vec::new(),
+            file: None,
+            merged,
+        };
+
+        assert_eq!(
+            loaded.origin_of_path(&["rules", "url", "banned.example", "action"]),
+            Some("file:lower.toml")
+        );
+        assert_eq!(
+            loaded.origin_of_path(&["rules", "url", "banned.example", "message"]),
+            Some("file:upper.toml"),
+            "a field overridden by a higher layer carries that layer's origin"
+        );
+        assert_eq!(
+            loaded.origin_of_path(&["rules", "url", "banned.example", "tier"]),
+            None,
+            "a field no layer set has no origin"
+        );
+        assert_eq!(
+            loaded.origin_of_path(&["fetch", "h3"]),
+            Some("file:lower.toml")
+        );
+        assert_eq!(loaded.origin_of("fetch.h3"), Some("file:lower.toml"));
+        // Below a leaf, and the empty path, are no path at all.
+        assert_eq!(loaded.origin_of_path(&["fetch", "h3", "deeper"]), None);
+        assert_eq!(loaded.origin_of_path(&[]), None);
+        // The dotted spelling cannot address a rule: its key has dots.
+        assert_eq!(loaded.origin_of("rules.url.banned.example.message"), None);
+    }
+
+    // Sets DONSETCH_CONFIG, a process-wide variable: depends on
+    // nextest's process per test.
+    #[test]
+    fn a_rule_table_in_the_file_layer_loads_with_per_field_origins() {
+        use crate::rules::{DenyKind, RuleAction};
+        let guard = clean_env();
+        let path = write_cfg(
+            &std::env::temp_dir(),
+            "[rules.url.\"banned.example\"]\naction = \"deny\"\nmessage = \"Bans the IP; use another source.\"\nkind = \"permanent\"\n",
+        );
+        set_env("DONSETCH_CONFIG", &path);
+        let loaded = load().unwrap_or_else(|e| panic!("a valid rule must load: {e}"));
+        let rule = loaded
+            .config
+            .rules
+            .url
+            .get("banned.example")
+            .expect("the rule is keyed by its pattern, dots and all");
+        assert_eq!(rule.action, RuleAction::Deny);
+        assert_eq!(
+            rule.message.as_deref(),
+            Some("Bans the IP; use another source.")
+        );
+        assert_eq!(rule.kind, DenyKind::Permanent);
+        assert!(rule.enabled, "enabled defaults to true");
+
+        let file_origin = format!("file:{}", path.display());
+        for field in ["action", "message", "kind"] {
+            assert_eq!(
+                loaded.origin_of_path(&["rules", "url", "banned.example", field]),
+                Some(file_origin.as_str()),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            loaded.origin_of_path(&["rules", "url", "banned.example", "enabled"]),
+            None,
+            "a field the file did not write has no origin"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        drop(guard);
+    }
+
+    // Sets DONSETCH_CONFIG, a process-wide variable: depends on
+    // nextest's process per test.
+    #[test]
+    fn a_bad_rule_in_the_file_fails_the_load_naming_the_file() {
+        let guard = clean_env();
+        let path = write_cfg(
+            &std::env::temp_dir(),
+            "[rules.url.\"banned.example\"]\naction = \"deny\"\nmessage = \"  \"\n",
+        );
+        set_env("DONSETCH_CONFIG", &path);
+        match load() {
+            Err(ConfigError::File {
+                path: reported,
+                message,
+            }) => {
+                assert_eq!(reported, path.display().to_string());
+                assert!(
+                    message.contains("[rules.url.\"banned.example\"]"),
+                    "wrong file error: {message}"
+                );
+            }
+            Err(other) => panic!("the error must be attributed to the file, got {other}"),
+            Ok(_) => panic!("a deny rule with a blank message must fail the load"),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        drop(guard);
+    }
+
+    // Sets DONSETCH_RULES__* variables, which are process-wide: depends
+    // on nextest's process per test.
+    #[test]
+    fn rules_scalars_from_env_load_and_show_their_origin() {
+        use crate::rules::RulesMode;
+        let guard = clean_env();
+        set_env("DONSETCH_RULES__MODE", "off");
+        let loaded = load().unwrap_or_else(|e| panic!("mode=off must load: {e}"));
+        assert_eq!(loaded.config.rules.mode, RulesMode::Off);
+        let (_, _, value, origin) = origins(&loaded.merged, &loaded.config)
+            .into_iter()
+            .find(|(section, key, _, _)| *section == "rules" && *key == "mode")
+            .expect("rules.mode row");
+        assert_eq!(value, "\"off\"");
+        assert_eq!(origin, "DONSETCH_RULES__MODE");
+
+        // A cap out of range through env is a validation error.
+        set_env("DONSETCH_RULES__CRAWL_DENIED_URLS_PER_RULE", "201");
+        match load() {
+            Err(ConfigError::Validate(message)) => assert!(
+                message.contains("rules.crawl_denied_urls_per_rule"),
+                "{message}"
+            ),
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("201 must fail the load"),
+        }
+        unset_env("DONSETCH_RULES__CRAWL_DENIED_URLS_PER_RULE");
+
+        // A rule through env fails the whole load, before validation.
+        set_env("DONSETCH_RULES__URL__BANNED", "deny");
+        match load() {
+            Err(ConfigError::Env(message)) => assert!(
+                message.starts_with(
+                    "DONSETCH_RULES__URL__BANNED: rules cannot be set through the environment."
+                ),
+                "{message}"
+            ),
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("a rule set through env must fail the load"),
+        }
+        drop(guard);
     }
 
     #[test]

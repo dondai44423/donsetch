@@ -35,6 +35,7 @@ use errors::*;
 // The uniform failure predicate (v4.7 envelope) : the CLI's exit-code and
 // rendering paths branch on the same signal the wire carries.
 pub(crate) use errors::is_failure;
+pub(crate) use fetch_tool::is_pdf_url_like;
 use fetch_tool::*;
 use search_tool::*;
 

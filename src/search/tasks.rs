@@ -129,12 +129,7 @@ pub(super) async fn engine_task_with_budget(
     {
         Err(_) => return (label, Err(("timeout".into(), egress_id, true))),
         Ok(Err(e)) => {
-            let status = match &e {
-                FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout",
-                FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail",
-                FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy",
-                _ => "net",
-            };
+            let status = engine_fetch_status(&e);
             return (label, Err((status.into(), egress_id, true)));
         }
         Ok(Ok(o)) => o,
@@ -228,6 +223,14 @@ pub(super) async fn ghost_engine_task(
     let Some(url) = engines::serp_url("google_ghost", &query) else {
         return (engine, Err(("no-url".into(), "ghost".into(), true)));
     };
+    // Before the hook: it can launch a browser, and it serves a render
+    // cache hit without asking the rules.
+    if crate::rules::rules().denial_for_str(&url).is_some() {
+        return (
+            engine,
+            Err((RULE_DENIED_STATUS.into(), "ghost".into(), true)),
+        );
+    }
     // Search owns its pool policy independently of fetch's pool opt-in.
     let lane = pool.pick("google_ghost", &[], true);
     let route = lane
@@ -248,12 +251,10 @@ pub(super) async fn ghost_engine_task(
     let rendered = match tokio::time::timeout_at(deadline.into(), hook(request)).await {
         Err(_) => return (engine, Err(("ghost-timeout".into(), egress, true))),
         Ok(Err(error)) => {
-            let status = if error.contains("captcha") {
-                "blocked:captcha"
-            } else {
-                "ghost-render"
-            };
-            return (engine, Err((status.into(), egress, true)));
+            return (
+                engine,
+                Err((ghost_failure_status(&error).into(), egress, true)),
+            );
         }
         Ok(Ok(rendered)) => rendered.html,
     };
@@ -281,7 +282,10 @@ pub(super) async fn vertical_task(
     .await
     {
         Err(_) => (vertical, Err(("timeout".into(), "direct".into(), false))),
-        Ok(Err(e)) => (vertical, Err((format!("{e}"), "direct".into(), false))),
+        Ok(Err(e)) => (
+            vertical,
+            Err((vertical_failure_status(&e), "direct".into(), false)),
+        ),
         Ok(Ok(hits)) => vertical_success(vertical, hits, started.elapsed().as_millis() as u64),
     }
 }
@@ -301,9 +305,167 @@ fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (Stri
     (vertical, Ok((hits, ms, "direct".into(), false, None)))
 }
 
+/// The engine-report status for a SERP or vertical request a local rule
+/// refused; in the `invalid-config:` family, so not an engine fault.
+const RULE_DENIED_STATUS: &str = "invalid-config: blocked by a local DonSeTch rule";
+
+/// The engine-report status for a failed vertical fetch: a rule refusal
+/// gets [`RULE_DENIED_STATUS`], anything else its error text.
+fn vertical_failure_status(e: &FetchError) -> String {
+    match e {
+        FetchError::Denied { .. } => RULE_DENIED_STATUS.into(),
+        _ => format!("{e}"),
+    }
+}
+
+/// The engine-report status for a failed browser SERP render, from the
+/// ghost hook's error text.
+fn ghost_failure_status(error: &str) -> &'static str {
+    // The hook flattens errors to text; a rule refusal survives only as
+    // `FetchError::Denied`'s fixed Display text, which carries no operator
+    // string. That text appears only when the landing check after a
+    // navigation refuses the page, which is rare. The common case, a
+    // redirect the browser follows into a denied host, is blocked by the
+    // CDP request guard and arrives as "navigate failed: Chrome network
+    // error": it still reads as "ghost-render", an engine fault, until
+    // the hook's error is typed.
+    if error.contains("blocked by a local DonSeTch rule") {
+        RULE_DENIED_STATUS
+    } else if error.contains("captcha") {
+        "blocked:captcha"
+    } else {
+        "ghost-render"
+    }
+}
+
+/// The engine-report status for a failed SERP fetch.
+fn engine_fetch_status(e: &FetchError) -> &'static str {
+    match e {
+        FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout",
+        FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail",
+        FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy",
+        // A local rule refused the engine's host. That is the
+        // operator's configuration, not the engine misbehaving, so it
+        // takes the "invalid-config:" status family, which
+        // search/mod.rs already keeps out of quarantine, trust erosion
+        // and vertical retries; "net" would persist a bad score for an
+        // engine that outlives the rule.
+        FetchError::Denied { .. } => RULE_DENIED_STATUS,
+        _ => "net",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rule_denial_is_not_a_network_failure() {
+        let denied = FetchError::Denied {
+            rule: "duckduckgo.com".into(),
+            message: "use another engine".into(),
+            kind: "walled",
+            reason: None,
+            url: "https://html.duckduckgo.com/html/".into(),
+        };
+        let status = engine_fetch_status(&denied);
+        assert!(status.starts_with("invalid-config:"), "{status}");
+        assert!(!super::super::is_engine_fault(status));
+        assert!(!super::super::retry_engine_failure(status));
+    }
+
+    #[test]
+    fn transport_failures_keep_their_statuses() {
+        assert_eq!(engine_fetch_status(&FetchError::Timeout), "timeout");
+        assert_eq!(
+            engine_fetch_status(&FetchError::Http("CONNECT -> 407".into())),
+            "auth-fail"
+        );
+        assert_eq!(
+            engine_fetch_status(&FetchError::Http("CONNECT refused".into())),
+            "dead-proxy"
+        );
+        assert_eq!(engine_fetch_status(&FetchError::Dns("x".into())), "net");
+    }
+
+    #[test]
+    fn a_vertical_refused_by_a_rule_is_not_an_engine_fault() {
+        let denied = FetchError::Denied {
+            rule: "github.com".into(),
+            message: "use the local mirror".into(),
+            kind: "permanent",
+            reason: None,
+            url: "https://api.github.com/search/repositories".into(),
+        };
+        let status = vertical_failure_status(&denied);
+        assert_eq!(status, RULE_DENIED_STATUS);
+        assert!(!super::super::is_engine_fault(&status));
+        assert!(!super::super::retry_engine_failure(&status));
+        // Negative: any other failure keeps its text and stays a fault.
+        let status = vertical_failure_status(&FetchError::Http("connection reset".into()));
+        assert_eq!(status, "http: connection reset");
+        assert!(super::super::is_engine_fault(&status));
+    }
+
+    #[test]
+    fn a_browser_render_refused_by_a_rule_is_not_an_engine_fault() {
+        let status = ghost_failure_status("render: blocked by a local DonSeTch rule");
+        assert_eq!(status, RULE_DENIED_STATUS);
+        assert!(!super::super::is_engine_fault(status));
+        // Negative: render failures and captchas keep their statuses.
+        assert_eq!(
+            ghost_failure_status("render: cdp timeout: 20s"),
+            "ghost-render"
+        );
+        assert!(super::super::is_engine_fault("ghost-render"));
+        assert_eq!(
+            ghost_failure_status("rendered access gate: captcha"),
+            "blocked:captcha"
+        );
+    }
+
+    // Installs a ruleset into the process config: depends on nextest's
+    // process-per-test.
+    #[tokio::test]
+    async fn a_denied_serp_host_never_reaches_the_browser_hook() {
+        use futures_util::FutureExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.rules.url.insert(
+            "google.com".into(),
+            crate::rules::UrlRule {
+                action: crate::rules::RuleAction::Deny,
+                message: Some("use another engine".into()),
+                ..crate::rules::UrlRule::default()
+            },
+        );
+        crate::config::install(config).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let hook: crate::crawl::GhostHook = Arc::new(move |_request| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { Err("owned stop".into()) }.boxed()
+        });
+        let (engine, result) = ghost_engine_task(
+            "google_ghost".into(),
+            "owned query".into(),
+            hook,
+            &EgressPool::new(Vec::new()),
+            std::time::Duration::from_millis(250),
+        )
+        .await;
+        assert_eq!(engine, "google_ghost");
+        let (status, _egress, was_engine) = result.unwrap_err();
+        assert_eq!(status, RULE_DENIED_STATUS);
+        assert!(was_engine);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no browser, no render cache"
+        );
+    }
 
     #[tokio::test]
     async fn stealth_v3_search_browser_owns_pool_policy_and_deadline() {
