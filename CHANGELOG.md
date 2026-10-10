@@ -20,17 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `errorKind`, and the operator's `message` verbatim as `next_action`. A
   crawl skips denied URLs without fetching them and lists them, grouped by
   rule with the rule's message, in a trailing "Denied by local DonSeTch
-  rules" section; a denied seed fails the crawl. A `tier` rule acts as if
-  the call had passed that tier, and `tier_enforce = true` lets it win over
-  an explicit per-call tier; `tier = "auto"` with `tier_enforce = true`
-  makes a host ignore the tier an agent asks for. Patterns match the host (with its subdomains,
-  or exactly with a leading `.`) and optionally the scheme; a key with a
-  port, path, query, `*`, a non-normal spelling, a `deny` without a
-  message, or any other malformed rule fails the config load with a
-  message naming the key and what to write instead. Rules never change
-  search ranking: a denied search result is not prefetched and keeps its
-  place. Rules are a guardrail, not a security boundary. See
-  [docs/rules.md](docs/rules.md).
+  rules" section; a denied seed fails the crawl, and so does a seed that
+  redirects into a denied host, with the refused hop as `landing_url`. A
+  `tier` rule acts as if the call had passed that tier, and
+  `tier_enforce = true` lets it win over an explicit per-call tier;
+  `tier = "auto"` with `tier_enforce = true` makes a host ignore the tier
+  an agent asks for, and a tier `"1"` pin also keeps `web_search`'s
+  background browser solve off that host. Patterns match the host (with
+  its subdomains, or exactly with a leading `.`) and optionally the
+  scheme; an IPv4 rule also matches the address written as IPv4-mapped
+  IPv6. A key with a port, path, query, `*`, a non-normal spelling, a
+  `deny` without a message, or any other malformed rule fails the config
+  load with a message naming the key and what to write instead. Rules
+  never change search ranking: a denied search result is not prefetched
+  and keeps its place, and a search engine or vertical a rule refuses is
+  not counted as a failing engine. Rules are a guardrail, not a security
+  boundary. See [docs/rules.md](docs/rules.md).
 - `donsetch rules test <url>` explains, offline, what the rules do with
   one URL: every matching rule in precedence order, the winner, and the
   winner's fields with the config layer each came from. It says first
@@ -55,8 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structured error instead of a zero-page result. Its code is the one
   `web_fetch` gives the same failure (`content.notfound` with
   `read_status: "notfound"` and a `suggested_query` for a 404 or 410,
-  `wall.*` for a wall, `network.*` for a network failure,
-  `network.ratelimit` for a 429), or else `crawl.robots_disallow`,
+  `wall.*` for a wall, a challenge served as a 429 or 5xx included,
+  `network.*` for a network failure, `network.ratelimit` for a plain
+  429), or else `crawl.robots_disallow`,
   `crawl.robots_unreachable` or `crawl.seed_failed`. The error carries
   the seed's `status`, `verdict`, `error` and robots evidence, and
   `landing_url` when the seed redirected. A seed robots.txt disallows
