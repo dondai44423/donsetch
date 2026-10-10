@@ -416,6 +416,22 @@ jobs:
       - name: Check advisories + licenses + bans + sources
         run: cargo deny --all-features check --hide-inclusion-graph
 
+  # ── The npm wrapper's installer logic: resolution order, unwritable
+  # installs (#361), atomic landing, wrapper passthrough. npm is the
+  # primary install path, so any push touching the package keeps these
+  # green. No rust toolchain needed: plain node, seconds.
+  npm-installer:
+    name: npm-installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Run the npm installer suite
+        working-directory: npm
+        run: node --test --test-timeout=90000 tests/*.test.js
+
   # ── Heavy: the tests too slow for a per-push run (soak holds the
   # process for minutes, corpus/landmark runs parse whole fixture trees,
   # the live ones need the network) plus all five fuzz targets. Nightly

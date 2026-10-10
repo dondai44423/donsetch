@@ -179,6 +179,12 @@ t-native expression:
 tci expression:
     {{budget}} cargo nextest run --cargo-profile ci {{feat}} -E 'test({{expression}})'
 
+# npm wrapper + installer suite (node --test): resolution order, the
+# unwritable-target contract (#361), atomic landing, wrapper
+# passthrough. Runs in CI as the npm-installer job.
+npm-test:
+    node --test --test-timeout=90000 npm/tests/*.test.js
+
 # The heavy set on the ci profile: soak, corpus, landmarks, live probes.
 heavy:
     {{budget}} cargo nextest run --cargo-profile ci {{feat}} -E '{{heavy_expr}}' --no-fail-fast
