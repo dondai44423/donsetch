@@ -239,10 +239,7 @@ pub async fn run() {
                 || e.contains("access")
                 || e.contains("read-only")
             {
-                #[cfg(unix)]
-                println!("    Try: sudo donsetch -u");
-                #[cfg(windows)]
-                println!("    Try running as administrator");
+                println!("    {}", permission_advice(&exe));
             }
             let _ = std::fs::remove_dir_all(&temp_dir);
             std::process::exit(1);
@@ -271,6 +268,23 @@ fn platform_asset_name() -> Option<&'static str> {
         ("windows", "aarch64") => Some("win32-x64"),
         _ => None,
     }
+}
+
+/// The repair advice for a permission failure on the binary's own
+/// directory. An npm-installed copy lives under node_modules: sudo-ing
+/// a file npm owns is the wrong repair (the next npm operation
+/// overwrites it, and the prefix is root-owned on purpose), so those
+/// installs are pointed at npm instead.
+fn permission_advice(exe: &Path) -> String {
+    if exe.to_string_lossy().contains("node_modules") {
+        return "Update through npm instead: npm install -g donsetch@latest".to_string();
+    }
+    #[cfg(unix)]
+    return "Try: sudo donsetch -u".to_string();
+    #[cfg(windows)]
+    return "Try running as administrator".to_string();
+    #[cfg(not(any(unix, windows)))]
+    return "Check write permissions on the binary's directory".to_string();
 }
 
 /// Fetch the releases.atom feed and parse the release an install
@@ -813,6 +827,22 @@ mod tests {
         } else {
             "donsetch"
         }
+    }
+
+    // A permission failure inside an npm-managed directory gets npm
+    // advice, not sudo: sudo-ing a file npm owns breaks the next npm
+    // operation, and the package copy is meant to be managed by npm.
+    #[test]
+    fn permission_advice_points_npm_installs_at_npm() {
+        let npm = Path::new("/home/u/.npm-global/lib/node_modules/donsetch/binaries/donsetch");
+        assert_eq!(
+            permission_advice(npm),
+            "Update through npm instead: npm install -g donsetch@latest"
+        );
+        let plain = Path::new("/usr/local/bin/donsetch");
+        assert!(!permission_advice(plain).contains("npm install"));
+        #[cfg(unix)]
+        assert_eq!(permission_advice(plain), "Try: sudo donsetch -u");
     }
 
     // A release tarball ships the runtime sibling beside the binary
