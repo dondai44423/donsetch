@@ -91,6 +91,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 "State permissions",
                 "Ghost state",
                 "Config posture",
+                "Local rules",
                 "Clearance stores",
                 "Crawl stores",
                 "Legacy env vars",
@@ -385,6 +386,9 @@ pub async fn run() {
 
     // 16. Config posture: layer conflicts, missing files, redaction.
     report!("Config posture", check_config_posture());
+
+    // 16b. Local rules: how many, and whether they are enforced.
+    report!("Local rules", check_rules());
 
     // 17. Search health snapshot (local, fast): trust, quarantine,
     // quality/outcome receipts, BYOK key states, C kill switches.
@@ -1633,6 +1637,44 @@ fn check_config_posture() -> CheckResult {
     CheckResult::Pass(format!("layers: {}", layers.join(" + ")))
 }
 
+/// The local `[rules]` table: the rule count and the `mode`, with the
+/// layer `mode` came from. Warns when rules exist but `mode` is off.
+/// An uncompilable pattern never reaches this check: it fails the
+/// config load before doctor runs.
+fn check_rules() -> CheckResult {
+    // The installed config keeps no per-leaf origins, so the layers are
+    // loaded again for the mode's. Doctor applies no CLI override to
+    // `[rules]`, so both loads see the same mode.
+    let origin = match crate::config::load() {
+        Ok(loaded) => loaded
+            .origin_of_path(&["rules", "mode"])
+            .unwrap_or("default")
+            .to_string(),
+        Err(_) => "origin unknown".to_string(),
+    };
+    rules_check(&crate::config::cfg().rules, &origin)
+}
+
+fn rules_check(section: &crate::rules::RulesSection, mode_origin: &str) -> CheckResult {
+    let total = section.url.len();
+    let disabled = section.url.values().filter(|r| !r.enabled).count();
+    let plural = if total == 1 { "" } else { "s" };
+    let count = if disabled == 0 {
+        format!("{total} rule{plural}")
+    } else {
+        format!("{total} rule{plural} ({disabled} disabled)")
+    };
+    let detail = format!("{count} · mode={} ({mode_origin})", section.mode.as_str());
+    // Off with live rules is the state a forgotten
+    // DONSETCH_RULES__MODE=off leaves behind: the operator believes a
+    // protection is in place that is not.
+    if section.mode == crate::rules::RulesMode::Off && total > disabled {
+        CheckResult::Warn(format!("{detail}: no rule is enforced"))
+    } else {
+        CheckResult::Pass(detail)
+    }
+}
+
 /// Search engine + learning receipts, local-only and fast. One
 /// line an agent can trust: is the roster healthy, is learning
 /// on, are the new C kill switches armed.
@@ -2669,6 +2711,58 @@ mod doctor_ultra_tests {
             }
             other => panic!("expected Fail, got {other:?}"),
         }
+    }
+
+    fn rules_section(
+        mode: crate::rules::RulesMode,
+        enabled: &[bool],
+    ) -> crate::rules::RulesSection {
+        let mut s = crate::rules::RulesSection {
+            mode,
+            ..Default::default()
+        };
+        for (i, on) in enabled.iter().enumerate() {
+            s.url.insert(
+                format!("host{i}.example"),
+                crate::rules::UrlRule {
+                    enabled: *on,
+                    ..Default::default()
+                },
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn rules_row_warns_when_mode_is_off_with_live_rules() {
+        let s = rules_section(crate::rules::RulesMode::Off, &[true, false]);
+        match rules_check(&s, "DONSETCH_RULES__MODE") {
+            CheckResult::Warn(detail) => {
+                assert!(detail.contains("2 rules (1 disabled)"), "{detail}");
+                assert!(
+                    detail.contains("mode=off (DONSETCH_RULES__MODE)"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rules_row_passes_when_enforced_or_when_nothing_is_switched_off() {
+        let enforced = rules_section(crate::rules::RulesMode::Enforce, &[true]);
+        match rules_check(&enforced, "default") {
+            CheckResult::Pass(detail) => {
+                assert_eq!(detail, "1 rule · mode=enforce (default)");
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+        // Off with no live rule switches nothing off.
+        let empty = rules_section(crate::rules::RulesMode::Off, &[]);
+        assert!(
+            matches!(rules_check(&empty, "default"), CheckResult::Pass(_)),
+            "an empty table with mode off must not warn"
+        );
     }
 
     #[test]

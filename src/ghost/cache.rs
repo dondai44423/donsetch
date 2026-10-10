@@ -1207,8 +1207,20 @@ impl GhostState {
 
     /// Stale-walled hosts due for a background probe (v4 phase
     /// 0.2), stalest first. Only hosts with tier-2 memory AND cold
-    /// evidence older than `stale_secs` qualify.
+    /// evidence older than `stale_secs` qualify. A host whose front
+    /// page the local rules deny never qualifies, and never takes one
+    /// of the `limit` slots.
     pub fn probe_candidates(&self, stale_secs: u64, limit: usize) -> Vec<String> {
+        self.probe_candidates_under(stale_secs, limit, crate::rules::rules())
+    }
+
+    /// [`Self::probe_candidates`] against an explicit ruleset.
+    fn probe_candidates_under(
+        &self,
+        stale_secs: u64,
+        limit: usize,
+        rules: &crate::rules::RuleSet,
+    ) -> Vec<String> {
         let n = now();
         let mut stale: Vec<(&String, u64)> = self
             .profiles
@@ -1217,6 +1229,18 @@ impl GhostState {
                 p.needs_tier2
                     && n.checked_sub(p.last_cold_check)
                         .is_none_or(|age| age > stale_secs)
+            })
+            // The prober cold-fetches the front page; the guard would
+            // refuse a denied host on every pass and the host would
+            // stay a candidate forever, re-armed as inconclusive each
+            // time. The filter runs before `take(limit)` so a denied
+            // host cannot starve an allowed one of a probe slot. Only
+            // the scheme matters to a rule (a port never does), so the
+            // URL is built from the recorded scheme alone.
+            .filter(|(h, _)| {
+                let scheme = self.profile_origin(h).0;
+                let scheme = if scheme == "http" { "http" } else { "https" };
+                rules.denial_for_str(&format!("{scheme}://{h}/")).is_none()
             })
             // Invalid future evidence gets a fresh probe before dated history.
             .map(|(h, p)| {
@@ -2795,6 +2819,52 @@ mod tests {
         assert_eq!(c, vec!["staler.example", "stale.example"]);
         let one = state.probe_candidates(6 * 3600, 1);
         assert_eq!(one, vec!["staler.example"]);
+    }
+
+    #[test]
+    fn probe_candidates_skip_hosts_the_rules_deny() {
+        use crate::rules::{RuleAction, RuleSet, RulesSection, UrlRule};
+        let mut state = GhostState::default();
+        let n = now();
+        for (host, age) in [
+            ("www.walled.example", 90_000),
+            ("stale.example", 40_000),
+            ("other.example", 30_000),
+        ] {
+            state.profiles.insert(
+                host.into(),
+                DomainProfile {
+                    needs_tier2: true,
+                    last_cold_check: n - age,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut section = RulesSection::default();
+        section.url.insert(
+            "walled.example".into(),
+            UrlRule {
+                action: RuleAction::Deny,
+                message: Some("use a real browser".into()),
+                ..Default::default()
+            },
+        );
+        let rules = RuleSet::compile(&section).unwrap();
+        // The denied host is the stalest, so it would take the single
+        // slot if the filter ran after the limit.
+        assert_eq!(
+            state.probe_candidates_under(6 * 3600, 1, &rules),
+            vec!["stale.example"]
+        );
+        assert_eq!(
+            state.probe_candidates_under(6 * 3600, 3, &rules),
+            vec!["stale.example", "other.example"]
+        );
+        // The negative case: without the rule the stalest host leads.
+        assert_eq!(
+            state.probe_candidates_under(6 * 3600, 1, &RuleSet::empty()),
+            vec!["www.walled.example"]
+        );
     }
 
     #[test]

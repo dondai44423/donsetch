@@ -116,6 +116,7 @@ pub fn build(
                             latency: started.elapsed(),
                             cached: false,
                             error_hint: Some(format!("egress: lane {lane} is {reason}")),
+                            denied: None,
                         };
                     }
                     // Proxy lanes: shared jar OUT : one cookie carrying
@@ -192,6 +193,7 @@ pub fn build(
                                 latency: started.elapsed(),
                                 cached,
                                 error_hint: None,
+                                denied: None,
                             }
                         }
                         Err(e) => {
@@ -203,6 +205,16 @@ pub fn build(
                             if lane != "direct" {
                                 crate::fetch::client::note_lane_outcome(&pool, &host, &lane, &e);
                             }
+                            // A rule refusal is a policy decision, not a
+                            // network failure: carry the typed payload so
+                            // the worker can treat the page as final and
+                            // name the rule. Status stays 0, so robots and
+                            // sitemap readers see a refused fetch as before.
+                            let denied = crate::rules::Denial::from_error(&e);
+                            let error_hint = match &denied {
+                                Some(d) => super::policy_skip_reason(d),
+                                None => format!("network: {e}"),
+                            };
                             FetchedPage {
                                 lane: lane.clone(),
                                 route: None,
@@ -213,7 +225,8 @@ pub fn build(
                                 verdict: Verdict::Blocked,
                                 latency: started.elapsed(),
                                 cached: false,
-                                error_hint: Some(format!("network: {e}")),
+                                error_hint: Some(error_hint),
+                                denied,
                             }
                         }
                     }
@@ -326,6 +339,46 @@ mod tests {
         assert!(page.route.is_none());
         assert_eq!(page.status, 0);
         assert!(page.error_hint.unwrap().contains("unavailable"));
+    }
+
+    // Installs a ruleset into the process config, so it depends on
+    // nextest's process-per-test (a second install is an error).
+    #[tokio::test]
+    async fn a_rule_refusal_reaches_the_worker_typed_not_as_a_network_error() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        config.rules.url.insert(
+            "127.0.0.1".to_string(),
+            crate::rules::UrlRule {
+                action: crate::rules::RuleAction::Deny,
+                message: Some("ask the operator for this one".into()),
+                reason: Some("local_only".into()),
+                ..Default::default()
+            },
+        );
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/denied", listener.local_addr().unwrap());
+        let origin = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                .await
+                .is_ok()
+        });
+        let fetcher =
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
+        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())), None);
+        let page = (crawler.fetch)(url, "direct".into(), None, None).await;
+        assert!(!origin.await.unwrap(), "a denied URL must not be dialed");
+        assert_eq!(page.status, 0, "robots and sitemap readers keep status 0");
+        let denial = page.denied.expect("the refusal arrives typed");
+        assert_eq!(denial.rule, "127.0.0.1");
+        assert_eq!(denial.reason.as_deref(), Some("local_only"));
+        assert_eq!(
+            page.error_hint.as_deref(),
+            Some("policy.denied.local_only: blocked by a local DonSeTch rule `127.0.0.1`"),
+            "never labelled a network failure"
+        );
     }
 
     #[test]

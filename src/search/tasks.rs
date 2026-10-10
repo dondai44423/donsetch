@@ -129,12 +129,7 @@ pub(super) async fn engine_task_with_budget(
     {
         Err(_) => return (label, Err(("timeout".into(), egress_id, true))),
         Ok(Err(e)) => {
-            let status = match &e {
-                FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout",
-                FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail",
-                FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy",
-                _ => "net",
-            };
+            let status = engine_fetch_status(&e);
             return (label, Err((status.into(), egress_id, true)));
         }
         Ok(Ok(o)) => o,
@@ -301,9 +296,54 @@ fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (Stri
     (vertical, Ok((hits, ms, "direct".into(), false, None)))
 }
 
+/// The engine-report status for a failed SERP fetch.
+fn engine_fetch_status(e: &FetchError) -> &'static str {
+    match e {
+        FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout",
+        FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail",
+        FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy",
+        // A local rule refused the engine's host. That is the
+        // operator's configuration, not the engine misbehaving, so it
+        // takes the "invalid-config:" status family, which
+        // search/mod.rs already keeps out of quarantine, trust erosion
+        // and vertical retries; "net" would persist a bad score for an
+        // engine that outlives the rule.
+        FetchError::Denied { .. } => "invalid-config: blocked by a local DonSeTch rule",
+        _ => "net",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rule_denial_is_not_a_network_failure() {
+        let denied = FetchError::Denied {
+            rule: "duckduckgo.com".into(),
+            message: "use another engine".into(),
+            kind: "walled",
+            reason: None,
+        };
+        let status = engine_fetch_status(&denied);
+        assert!(status.starts_with("invalid-config:"), "{status}");
+        assert!(!super::super::is_engine_fault(status));
+        assert!(!super::super::retry_engine_failure(status));
+    }
+
+    #[test]
+    fn transport_failures_keep_their_statuses() {
+        assert_eq!(engine_fetch_status(&FetchError::Timeout), "timeout");
+        assert_eq!(
+            engine_fetch_status(&FetchError::Http("CONNECT -> 407".into())),
+            "auth-fail"
+        );
+        assert_eq!(
+            engine_fetch_status(&FetchError::Http("CONNECT refused".into())),
+            "dead-proxy"
+        );
+        assert_eq!(engine_fetch_status(&FetchError::Dns("x".into())), "net");
+    }
 
     #[tokio::test]
     async fn stealth_v3_search_browser_owns_pool_policy_and_deadline() {

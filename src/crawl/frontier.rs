@@ -501,6 +501,14 @@ impl FrontierQueue {
         self.heap.is_empty()
     }
 
+    /// Insert `key` into the seen set without touching the queue; true
+    /// when the key was new. `key` must be in `normalize` form, the
+    /// key `push_with_parent` dedups on. Unlike `mark_seen`, a key that
+    /// is already queued stays queued.
+    pub fn insert_seen(&mut self, key: String) -> bool {
+        self.seen.insert(key)
+    }
+
     /// Mark a URL as seen and remove its pending alias. Used for
     /// canonical URL resolution: when a page declares a
     /// canonical URL different from its fetched URL, the
@@ -973,6 +981,30 @@ mod tests {
         assert!(eff.contains(&"/api/*".to_string()));
         assert!(eff.contains(&"/login*".to_string()));
         assert!(eff.contains(&"/cart*".to_string()));
+    }
+
+    // The crawl's rules check records a denied URL once by inserting its
+    // key here. The insert must report a repeat, keep an already-queued
+    // entry (unlike mark_seen), and block a later push of the same URL.
+    #[test]
+    fn insert_seen_reports_new_keys_and_leaves_the_queue_alone() {
+        let mut q = FrontierQueue::new();
+        let denied: Url = "https://blocked.example/a#frag".parse().unwrap();
+        assert!(q.insert_seen(normalize(&denied)), "first insert is new");
+        assert!(!q.insert_seen(normalize(&denied)), "a repeat is not new");
+        assert!(q.is_empty(), "insert_seen never queues");
+        assert!(
+            !q.push(denied, 5.0, 1),
+            "a key already seen is never queued afterwards"
+        );
+        assert!(q.is_empty());
+
+        // Negative: a queued entry survives insert_seen of its own key.
+        let queued: Url = "https://ex.com/a".parse().unwrap();
+        assert!(q.push(queued.clone(), 1.0, 1));
+        assert!(!q.insert_seen(normalize(&queued)));
+        assert_eq!(q.len(), 1, "the queued entry stays queued");
+        assert_eq!(q.pop().map(|f| f.url), Some(normalize(&queued)));
     }
 
     #[test]

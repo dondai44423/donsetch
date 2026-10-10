@@ -150,6 +150,7 @@ pub fn shape_result(mut result: Value) -> Value {
     // crawl mode=map renders the URL inventory into the text body;
     // folding it into the meta block would double a large crawl.
     meta.remove("map");
+    reduce_crawl_denials(&mut meta);
     if meta.is_empty() {
         return result;
     }
@@ -186,6 +187,34 @@ pub fn shape_result(mut result: Value) -> Value {
         .expect("result is an object")
         .remove("structuredContent");
     result
+}
+
+/// The `[meta]` view of a crawl's `denied_by_local_rules`. In the
+/// markdown modes only `{"count"}` stays; in dataset mode (the result
+/// carries `dataset_version`) the groups stay, each without its `rule`
+/// key.
+fn reduce_crawl_denials(meta: &mut serde_json::Map<String, Value>) {
+    let dataset = meta.contains_key("dataset_version");
+    let Some(denied) = meta.get_mut("denied_by_local_rules") else {
+        return;
+    };
+    if dataset {
+        // JSON Lines have no text section, so [meta] is the only place
+        // a text-only client sees which URLs were denied. The rule key
+        // stays out of the model's context in every mode.
+        if let Some(groups) = denied.get_mut("groups").and_then(Value::as_array_mut) {
+            for group in groups {
+                if let Some(group) = group.as_object_mut() {
+                    group.remove("rule");
+                }
+            }
+        }
+    } else {
+        // The markdown document already lists the groups and URLs in a
+        // trailing section and the total under the seed; repeating them
+        // at the head of the context would only double them.
+        *denied = json!({ "count": denied.get("count").cloned().unwrap_or(Value::Null) });
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +310,81 @@ mod tests {
             shaped["content"][1]["text"],
             "fetch failed\n\nNext action: retry once"
         );
+    }
+
+    fn denied_by_local_rules() -> Value {
+        json!({
+            "count": 16,
+            "groups": [{
+                "rule": "banned.example",
+                "errorKind": "walled",
+                "next_action": "ask the human operator to download the file",
+                "count": 16,
+                "urls": ["https://www.banned.example/publication/1"],
+            }],
+        })
+    }
+
+    #[test]
+    fn markdown_crawl_denials_fold_to_the_count() {
+        let crawl = json!({
+            "content": [{ "type": "text", "text": "# Crawl" }],
+            "structuredContent": {
+                "stop": "FrontierEmpty",
+                "denied_by_local_rules": denied_by_local_rules(),
+            }
+        });
+        let meta_text = shape_result(crawl)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let meta: Value =
+            serde_json::from_str(meta_text.trim_start_matches("[meta] ").trim_end()).unwrap();
+        assert_eq!(meta["denied_by_local_rules"], json!({ "count": 16 }));
+        assert!(!meta_text.contains("banned.example"));
+        assert!(!meta_text.contains("next_action"));
+    }
+
+    #[test]
+    fn dataset_crawl_denials_keep_the_groups_without_the_rule_key() {
+        let crawl = json!({
+            "content": [{ "type": "text", "text": "{\"url\":\"https://example.com/\"}" }],
+            "structuredContent": {
+                "dataset": true,
+                "dataset_version": 1,
+                "denied_by_local_rules": denied_by_local_rules(),
+            }
+        });
+        let meta_text = shape_result(crawl)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let meta: Value =
+            serde_json::from_str(meta_text.trim_start_matches("[meta] ").trim_end()).unwrap();
+        let group = &meta["denied_by_local_rules"]["groups"][0];
+        assert!(group.get("rule").is_none(), "{meta}");
+        assert_eq!(group["errorKind"], "walled");
+        assert_eq!(
+            group["next_action"],
+            "ask the human operator to download the file"
+        );
+        assert_eq!(group["count"], 16);
+        assert_eq!(group["urls"][0], "https://www.banned.example/publication/1");
+        assert_eq!(meta["denied_by_local_rules"]["count"], 16);
+    }
+
+    #[test]
+    fn a_crawl_without_denials_folds_unchanged() {
+        let crawl = json!({
+            "content": [{ "type": "text", "text": "# Crawl" }],
+            "structuredContent": { "stop": "FrontierEmpty", "complete": true }
+        });
+        let meta = shape_result(crawl)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!meta.contains("denied_by_local_rules"));
+        assert!(meta.contains("\"complete\":true"));
     }
 
     #[test]

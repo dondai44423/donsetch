@@ -13,10 +13,21 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
 use super::Daemon;
-use super::errors::{tool_error, tool_error_structured};
+use super::errors::{policy_error_value, tool_error, tool_error_structured};
+use crate::error::FetchError;
 use crate::fetch::guards::{ensure_url_safe, validate_url_basic};
 
 const WAIT_MS_MAX: u64 = 5000;
+
+/// A guard or render error as the tool result: a rule denial keeps its
+/// rule, kind and the operator's message through `policy_error_value`;
+/// anything else is the plain text `wrap` builds from the error.
+fn fetch_failure(error: &FetchError, url: &str, wrap: impl FnOnce(&FetchError) -> String) -> Value {
+    if matches!(error, FetchError::Denied { .. }) {
+        return policy_error_value(error, url, None);
+    }
+    tool_error(wrap(error))
+}
 
 /// Viewport is the cheap default (matches CLI --full-page SetTrue:
 /// omitted flag = viewport). Omitting full_page on MCP must NOT
@@ -65,7 +76,7 @@ pub async fn web_screenshot_tool(
 
     let target = match validate_url_basic(&url_in) {
         Ok(u) => u,
-        Err(e) => return tool_error(e.to_string()),
+        Err(e) => return fetch_failure(&e, &url_in, ToString::to_string),
     };
     let host = target.host_str().unwrap_or("").to_string();
     if host.is_empty() {
@@ -79,7 +90,7 @@ pub async fn web_screenshot_tool(
         let inner: Result<serde_json::Value, serde_json::Value> = async {
             let target = ensure_url_safe(target.as_str())
                 .await
-                .map_err(|error| tool_error(error.to_string()))?;
+                .map_err(|error| fetch_failure(&error, &url_in, ToString::to_string))?;
             let (wire, route) = {
                 let mut state = daemon.state.lock().await;
                 let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
@@ -123,7 +134,9 @@ pub async fn web_screenshot_tool(
                 )
                 .await
                 .map_err(|error| {
-                    tool_error(format!("web_screenshot: page failed to render: {error}"))
+                    fetch_failure(&error, &url_in, |e| {
+                        format!("web_screenshot: page failed to render: {e}")
+                    })
                 })?;
             let ghost = read.guard;
             if wait_ms > 0 {
@@ -133,7 +146,8 @@ pub async fn web_screenshot_tool(
                 Ok(b) => b,
                 Err(e) => return Err(tool_error(format!("web_screenshot: capture failed: {e}"))),
             };
-            validate_url_basic(&document.url).map_err(|error| tool_error(error.to_string()))?;
+            validate_url_basic(&document.url)
+                .map_err(|error| fetch_failure(&error, &document.url, ToString::to_string))?;
             let filename = format!("capture-{}.png", crate::handles::random_base62(16));
             let path = crate::paths::resolve_screenshot_path(&filename).map_err(tool_error)?;
             crate::ghost::save_screenshot(&path, &png)
@@ -202,9 +216,63 @@ pub async fn web_screenshot_tool(
 
 #[cfg(test)]
 mod tests {
-    use super::{deadline_arg, full_page_arg};
+    use super::{deadline_arg, fetch_failure, full_page_arg};
+    use crate::fetch::guards::validate_url_basic_with_policy;
+    use crate::rules::{RuleAction, RuleSet, RulesSection, UrlRule};
     use serde_json::json;
     use std::time::Duration;
+
+    fn deny_example_com() -> RuleSet {
+        let mut section = RulesSection::default();
+        section.url.insert(
+            "example.com".to_string(),
+            UrlRule {
+                action: RuleAction::Deny,
+                message: Some("ask the human operator to download it".to_string()),
+                reason: Some("ip_ban".to_string()),
+                ..Default::default()
+            },
+        );
+        RuleSet::compile(&section).unwrap()
+    }
+
+    // The first guard of web_screenshot is the sync validate_url_basic.
+    // A rule denial there must reach the caller as the structured policy
+    // error (rule, code, the operator's message), not as plain text.
+    #[test]
+    fn a_denied_url_surfaces_as_the_policy_error() {
+        let rules = deny_example_com();
+        let url = "https://www.example.com/page";
+        let error = validate_url_basic_with_policy(url, false, &rules).unwrap_err();
+        let value = fetch_failure(&error, url, ToString::to_string);
+        assert_eq!(value["structuredContent"]["ok"], false);
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["code"], "policy.denied.ip_ban");
+        assert_eq!(structured["rule"], "example.com");
+        assert_eq!(
+            structured["next_action"],
+            "ask the human operator to download it"
+        );
+    }
+
+    // The negative case: a host no rule names passes the guard, and an
+    // error that is not a denial keeps the plain-text shape.
+    #[test]
+    fn other_guard_errors_stay_plain_text() {
+        let rules = deny_example_com();
+        assert!(validate_url_basic_with_policy("https://example.org/", false, &rules).is_ok());
+        let url = "ftp://example.org/";
+        let error = validate_url_basic_with_policy(url, false, &rules).unwrap_err();
+        let value = fetch_failure(&error, url, ToString::to_string);
+        assert_eq!(value["structuredContent"]["ok"], false);
+        assert!(
+            !value["structuredContent"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("policy.denied"),
+            "{value}"
+        );
+    }
 
     #[test]
     fn omitted_full_page_defaults_to_viewport_not_full_page() {

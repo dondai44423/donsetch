@@ -141,6 +141,14 @@ async fn probe_one(fetcher: &Arc<Fetcher>, state: &Arc<Mutex<GhostState>>, host:
             // the wall on real paths: inconclusive, re-arm cadence.
             _ => st.record_probe_inconclusive(host),
         },
+        // A local rule refused a redirect off the front page:
+        // `probe_candidates` already leaves out hosts whose front page
+        // itself is denied. That is a policy decision, not evidence
+        // about the host, so no failure class; but the probe told us
+        // nothing, so the cadence is re-armed like any inconclusive
+        // probe. Without it the host stays stale and is re-probed on
+        // every scan pass.
+        Ok(Err(crate::error::FetchError::Denied { .. })) => st.record_probe_inconclusive(host),
         Ok(Err(e)) => {
             let class = match &e {
                 crate::error::FetchError::Timeout
@@ -157,5 +165,51 @@ async fn probe_one(fetcher: &Arc<Fetcher>, state: &Arc<Mutex<GhostState>>, host:
             st.record_failure(host, FailClass::Network);
             st.record_probe_inconclusive(host);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ghost::cache::DomainProfile;
+
+    /// A probe a rule refuses is not a failure and leaves the wall
+    /// evidence alone, but it re-arms the probe cadence.
+    ///
+    /// Needs nextest: it installs a process-global config, which a second
+    /// test in the same process could not do.
+    #[tokio::test]
+    async fn a_denied_probe_records_no_failure_and_rearms_the_cadence() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.rules.url.insert(
+            "127.0.0.1".to_string(),
+            crate::rules::UrlRule {
+                action: crate::rules::RuleAction::Deny,
+                message: Some("use a real browser".to_string()),
+                ..Default::default()
+            },
+        );
+        crate::config::install(config).unwrap();
+        let fetcher =
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
+        let mut seeded = GhostState::default();
+        seeded.profiles.insert(
+            "127.0.0.1".into(),
+            DomainProfile {
+                needs_tier2: true,
+                last_cold_check: 5,
+                origin_scheme: "http".into(),
+                origin_port: 9,
+                ..Default::default()
+            },
+        );
+        let state = Arc::new(Mutex::new(seeded));
+        probe_one(&fetcher, &state, "127.0.0.1").await;
+        let st = state.lock().await;
+        let p = &st.profiles["127.0.0.1"];
+        assert!(p.failures.is_empty(), "a denial is not a failure class");
+        assert!(p.last_cold_check > 5, "a denial re-arms the cadence");
+        assert!(p.needs_tier2, "a denial says nothing about the wall");
     }
 }

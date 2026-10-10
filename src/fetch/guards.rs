@@ -160,18 +160,27 @@ fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 /// - scheme is http or https only
 /// - no credentials in URL (username/password)
 /// - host present and not SSRF (literal IP ranges, localhost names)
+/// - not denied by the installed local rules (`crate::rules::rules()`):
+///   a winning `deny` rule returns `FetchError::Denied`
 /// - does NOT do DNS resolution (use `ensure_url_safe` for that)
 ///
 /// Returns the parsed Url on success, or a FetchError that the
 /// caller should surface directly. This is the single sync gate
 /// used by both fetch and browser tiers.
 pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
-    validate_url_basic_with_policy(url_str, private_egress_allowed())
+    validate_url_basic_with_policy(url_str, private_egress_allowed(), crate::rules::rules())
 }
 
-fn validate_url_basic_with_policy(
+/// The sync guard core behind `validate_url_basic` and
+/// `ensure_url_safe`, with the egress policy and the ruleset passed in.
+/// Order: parse, scheme, credentials, host present, rule denial, SSRF
+/// host. Only a winning `deny` rule refuses; an `allow` winner passes
+/// the URL exactly as an empty ruleset would. `allow_private_egress`
+/// does not lift a denial.
+pub(crate) fn validate_url_basic_with_policy(
     url_str: &str,
     allow_private_egress: bool,
+    rules: &crate::rules::RuleSet,
 ) -> Result<url::Url, crate::error::FetchError> {
     let url = url::Url::parse(url_str)
         .map_err(|_| crate::error::FetchError::InvalidUrl(url_str.into()))?;
@@ -189,6 +198,13 @@ fn validate_url_basic_with_policy(
     let host = url
         .host_str()
         .ok_or_else(|| crate::error::FetchError::InvalidUrl(url_str.into()))?;
+    // The operator's rules run before the SSRF host check so a denied
+    // host reports the rule, not a private-address block, and before
+    // any DNS work in `ensure_url_safe`. Moving or changing this check
+    // needs the same change in docs/rules-architecture.md.
+    if let Some(denial) = rules.denial(&url) {
+        return Err(denial.into_error());
+    }
     if is_ssrf_host(host) && !allow_private_egress {
         return Err(crate::error::FetchError::Ssrf(format!(
             "{host} is a private/loopback address : SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)"
@@ -228,7 +244,7 @@ fn validate_url_basic_with_policy(
 /// (sync) and `ensure_url_safe` (async) where applicable.
 pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
     let allow_private_egress = private_egress_allowed();
-    let url = validate_url_basic_with_policy(url_str, allow_private_egress)?;
+    let url = validate_url_basic_with_policy(url_str, allow_private_egress, crate::rules::rules())?;
     // Deliberate opt-out: skip the DNS resolution tier entirely.
     if allow_private_egress {
         return Ok(url);
@@ -252,7 +268,10 @@ pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::Fe
 }
 
 /// Validate a redirect target URL string relative to a base URL.
-/// Rejects non-http(s) schemes and SSRF hosts. Used per redirect hop.
+/// Used per redirect hop. A non-http(s) scheme is
+/// `FetchError::NonHttpRedirect` carrying the scheme; everything else
+/// is judged by `validate_url_basic` (credentials, SSRF hosts, local
+/// rules, so a hop into a denied host is `FetchError::Denied`).
 pub fn validate_redirect_url(
     base: &url::Url,
     location: &str,
@@ -261,10 +280,9 @@ pub fn validate_redirect_url(
         .join(location)
         .map_err(|_| crate::error::FetchError::Http(format!("bad redirect target: {location}")))?;
     if !matches!(next.scheme(), "http" | "https") {
-        return Err(crate::error::FetchError::Http(format!(
-            "blocked redirect to non-http(s) scheme: {}",
-            next.scheme()
-        )));
+        return Err(crate::error::FetchError::NonHttpRedirect(
+            next.scheme().to_string(),
+        ));
     }
     // Apply centralized validation to the joined URL so missing hosts
     // and credentials are rejected consistently with direct fetches.
@@ -619,9 +637,125 @@ mod tests {
         let base = url::Url::parse("https://example.com/").unwrap();
         assert!(validate_redirect_url(&base, "http://127.0.0.1/evil").is_err());
         assert!(validate_redirect_url(&base, "http://10.0.0.1/").is_err());
-        assert!(validate_redirect_url(&base, "file:///etc/passwd").is_err());
+        assert!(matches!(
+            validate_redirect_url(&base, "file:///etc/passwd"),
+            Err(crate::error::FetchError::NonHttpRedirect(ref s)) if s == "file"
+        ));
         assert!(validate_redirect_url(&base, "https://example.com/other").is_ok());
         assert!(validate_redirect_url(&base, "/relative").is_ok());
+    }
+
+    // The non-web scheme has its own variant so the redirect loop can
+    // tell it apart without reading text; an SSRF hop keeps `Ssrf`.
+    #[test]
+    fn a_non_http_redirect_is_its_own_variant() {
+        let base = url::Url::parse("https://example.com/").unwrap();
+        assert!(matches!(
+            validate_redirect_url(&base, "mailto:someone@example.com"),
+            Err(crate::error::FetchError::NonHttpRedirect(ref s)) if s == "mailto"
+        ));
+        assert!(matches!(
+            validate_redirect_url(&base, "http://127.0.0.1/evil"),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
+    }
+
+    fn compiled_rules(section: serde_json::Value) -> crate::rules::RuleSet {
+        let section: crate::rules::RulesSection = serde_json::from_value(section).unwrap();
+        crate::rules::RuleSet::compile(&section).unwrap()
+    }
+
+    fn banned_deny() -> crate::rules::RuleSet {
+        compiled_rules(serde_json::json!({
+            "url": {
+                "banned.example": {
+                    "action": "deny",
+                    "reason": "ip_ban",
+                    "message": "use BladeBrowser for this site, or ask the human operator to download the file",
+                },
+            },
+        }))
+    }
+
+    // Pure: the ruleset is compiled locally and passed in, so this runs
+    // on any runner without installing a config.
+    #[test]
+    fn a_denied_host_is_refused_with_the_rule_payload() {
+        let rules = banned_deny();
+        for target in [
+            "https://banned.example/",
+            "https://www.banned.example/publication/123_Example",
+            "http://www.banned.example:8443/x?y=1",
+        ] {
+            let e = validate_url_basic_with_policy(target, false, &rules).unwrap_err();
+            let crate::error::FetchError::Denied {
+                rule,
+                message,
+                kind,
+                reason,
+            } = &e
+            else {
+                panic!("{target}: expected Denied, got {e:?}");
+            };
+            assert_eq!(rule, "banned.example");
+            assert!(message.starts_with("use BladeBrowser"), "{message}");
+            assert_eq!(*kind, "walled");
+            assert_eq!(reason.as_deref(), Some("ip_ban"));
+        }
+        // The private-egress opt-out lifts the SSRF guard, not a rule.
+        assert!(matches!(
+            validate_url_basic_with_policy("https://www.banned.example/", true, &rules),
+            Err(crate::error::FetchError::Denied { .. })
+        ));
+    }
+
+    #[test]
+    fn an_allowed_host_passes_a_ruleset_unchanged() {
+        let rules = banned_deny();
+        let u = validate_url_basic_with_policy("https://example.com/a?b=1", false, &rules).unwrap();
+        assert_eq!(u.as_str(), "https://example.com/a?b=1");
+        // A lookalike host is not a subdomain of the rule's host.
+        assert!(
+            validate_url_basic_with_policy("https://notbanned.example/", false, &rules).is_ok()
+        );
+        // An allow winner passes exactly as no rule would.
+        let carve_out = compiled_rules(serde_json::json!({
+            "url": {
+                "banned.example": { "action": "deny", "message": "go elsewhere" },
+                ".banned.example": { "action": "allow" },
+            },
+        }));
+        assert!(
+            validate_url_basic_with_policy("https://banned.example/", false, &carve_out).is_ok()
+        );
+        assert!(matches!(
+            validate_url_basic_with_policy("https://www.banned.example/", false, &carve_out),
+            Err(crate::error::FetchError::Denied { .. })
+        ));
+        // The empty set changes nothing.
+        let empty = crate::rules::RuleSet::empty();
+        assert!(
+            validate_url_basic_with_policy("https://www.banned.example/", false, &empty).is_ok()
+        );
+    }
+
+    // The scheme and credential checks run before the rules, and the
+    // SSRF host check still applies to hosts no rule names.
+    #[test]
+    fn the_rule_check_sits_between_the_url_checks_and_the_ssrf_check() {
+        let rules = banned_deny();
+        assert!(matches!(
+            validate_url_basic_with_policy("ftp://banned.example/", false, &rules),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
+        assert!(matches!(
+            validate_url_basic_with_policy("https://user:pw@banned.example/", false, &rules),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
+        assert!(matches!(
+            validate_url_basic_with_policy("http://127.0.0.1/", false, &rules),
+            Err(crate::error::FetchError::Ssrf(_))
+        ));
     }
 
     #[tokio::test]
@@ -728,8 +862,9 @@ mod tests {
             "http://198.18.0.25/",
             "http://[::ffff:169.254.169.254]/",
         ] {
-            assert!(validate_url_basic_with_policy(target, true).is_ok());
-            assert!(validate_url_basic_with_policy(target, false).is_err());
+            let rules = crate::rules::RuleSet::empty();
+            assert!(validate_url_basic_with_policy(target, true, &rules).is_ok());
+            assert!(validate_url_basic_with_policy(target, false, &rules).is_err());
         }
     }
 }

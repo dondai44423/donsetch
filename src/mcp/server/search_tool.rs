@@ -256,6 +256,15 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
         .iter()
         .enumerate()
         .map(|(index, result)| {
+            // Every hit is listed exactly as the search returned it, even
+            // when a local `deny` rule covers its host. A hit that matches
+            // a deny rule could carry a marker so the agent does not try
+            // to fetch it and spend a round trip on the refusal; v1 leaves
+            // that out on purpose, because the display contract (where the
+            // marker goes, its token cost, whether an annotated hit still
+            // takes a result slot) has to be settled first. Dropping such
+            // hits is ruled out: the title and any DOI are how the agent
+            // finds a mirror.
             let mut item = json!({
                 "rank": index + 1,
                 "url": result.url,
