@@ -203,7 +203,7 @@ pub(crate) fn validate_url_basic_with_policy(
     // any DNS work in `ensure_url_safe`. Moving or changing this check
     // needs the same change in docs/rules-architecture.md.
     if let Some(denial) = rules.denial(&url) {
-        return Err(denial.into_error());
+        return Err(denial.into_error(url.as_str()));
     }
     if is_ssrf_host(host) && !allow_private_egress {
         return Err(crate::error::FetchError::Ssrf(format!(
@@ -693,6 +693,7 @@ mod tests {
                 message,
                 kind,
                 reason,
+                url,
             } = &e
             else {
                 panic!("{target}: expected Denied, got {e:?}");
@@ -701,6 +702,7 @@ mod tests {
             assert!(message.starts_with("use BladeBrowser"), "{message}");
             assert_eq!(*kind, "walled");
             assert_eq!(reason.as_deref(), Some("ip_ban"));
+            assert_eq!(url, target);
         }
         // The private-egress opt-out lifts the SSRF guard, not a rule.
         assert!(matches!(

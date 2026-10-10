@@ -224,18 +224,21 @@ impl Denial {
         DenyKind::from_kind_str(&self.kind).as_str()
     }
 
-    /// The [`FetchError::Denied`] carrying this payload.
-    pub fn into_error(self) -> FetchError {
+    /// The [`FetchError::Denied`] carrying this payload, for the refused
+    /// `url`.
+    pub fn into_error(self, url: &str) -> FetchError {
         let kind = self.kind_static();
         FetchError::Denied {
             rule: self.rule,
             message: self.message,
             kind,
             reason: self.reason,
+            url: url.to_string(),
         }
     }
 
     /// The payload of a [`FetchError::Denied`]; `None` for any other error.
+    /// The refused URL is not part of the payload.
     pub fn from_error(e: &FetchError) -> Option<Denial> {
         match e {
             FetchError::Denied {
@@ -243,6 +246,7 @@ impl Denial {
                 message,
                 kind,
                 reason,
+                ..
             } => Some(Denial {
                 rule: rule.clone(),
                 message: message.clone(),
@@ -403,7 +407,15 @@ impl RuleSet {
             }
             // An address has no subdomains: both forms match it alone.
             Some(ip) => {
-                let host = ip.to_string();
+                // An IPv4-mapped IPv6 literal ([::ffff:a.b.c.d]) reaches the
+                // same IPv4 host, so it matches as that address, the way
+                // `is_ssrf_host` judges it; otherwise it would evade a deny.
+                let host = match &ip {
+                    Host::Ipv6(v6) => v6
+                        .to_ipv4_mapped()
+                        .map_or_else(|| ip.to_string(), |v4| v4.to_string()),
+                    _ => ip.to_string(),
+                };
                 for index in [&self.exact, &self.tree] {
                     if let Some(ids) = index.get(&host) {
                         hits.extend(ids);
@@ -662,6 +674,16 @@ fn parse_key(key: &str) -> Result<ParsedKey, String> {
         return err(format!(
             "IP literals take no \".\" prefix: an address has no subdomains.\n\
              Write \"{prefix}{canonical}\"."
+        ));
+    }
+    // Matching reads a mapped URL host as its IPv4 address, so a mapped key
+    // could never match: it is written as the IPv4 address instead.
+    if let Host::Ipv6(v6) = &parsed
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return err(format!(
+            "IPv4-mapped IPv6 literals are not supported in rule patterns.\n\
+             Write the IPv4 address \"{prefix}{v4}\": it matches both spellings."
         ));
     }
     if canonical != bare {
@@ -1191,6 +1213,38 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv4_mapped_url_host_matches_its_ipv4_rule() {
+        let set = compile(vec![("1.2.3.4", deny("no"))]);
+        // Both spellings of the mapped address, dotted and hex.
+        assert!(set.denial_for_str("http://[::ffff:1.2.3.4]/x").is_some());
+        assert!(
+            set.denial_for_str("https://[::ffff:102:304]:8443/")
+                .is_some()
+        );
+        // Negative: another mapped address, and an IPv4-compatible or
+        // plain IPv6 address with the same low bits, stay unmatched.
+        assert!(set.denial_for_str("http://[::ffff:1.2.3.5]/").is_none());
+        assert!(set.denial_for_str("http://[::102:304]/").is_none());
+        assert!(set.denial_for_str("http://[2001:db8::102:304]/").is_none());
+    }
+
+    #[test]
+    fn an_ipv4_mapped_key_asks_for_the_ipv4_address() {
+        for key in [
+            "[::ffff:1.2.3.4]",
+            "[::ffff:102:304]",
+            "https://[::ffff:1.2.3.4]",
+        ] {
+            let e = key_err(key);
+            assert!(e.contains("IPv4-mapped"), "{key}: {e}");
+            assert!(
+                e.contains("1.2.3.4\": it matches both spellings"),
+                "{key}: {e}"
+            );
+        }
+    }
+
+    #[test]
     fn disabled_rule_falls_through_to_the_broader_rule() {
         let off = UrlRule {
             enabled: false,
@@ -1311,8 +1365,9 @@ mod tests {
             kind: "permanent".into(),
             reason: Some("licensing".into()),
         };
-        let e = d.clone().into_error();
+        let e = d.clone().into_error("https://example.com/x");
         assert_eq!(Denial::from_error(&e), Some(d));
+        assert!(matches!(&e, FetchError::Denied { url, .. } if url == "https://example.com/x"));
         assert_eq!(Denial::from_error(&FetchError::Timeout), None);
     }
 

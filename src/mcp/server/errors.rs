@@ -466,6 +466,7 @@ pub(super) fn policy_error_value(e: &FetchError, url: &str, escalation: Option<V
         message,
         kind,
         reason,
+        ..
     } = e
     else {
         let mut structured = json!({ "url": url, "code": fetch_error_code(e) });
@@ -1418,6 +1419,7 @@ mod policy_tests {
             message: message.into(),
             kind,
             reason: reason.map(Into::into),
+            url: format!("https://{rule}/"),
         }
     }
 

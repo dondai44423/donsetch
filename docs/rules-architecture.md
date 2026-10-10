@@ -12,7 +12,7 @@ decisions hold the design together, and what was left for later.
 | compiler | `RuleSet::compile` | pure; every load error comes from here |
 | matcher | `RuleSet::eval`, `matches`, `denial` | pure; normalizes the URL, picks one winner |
 | process ruleset | `rules()` | `OnceLock`, filled from `cfg().rules`; empty when `mode = "off"` |
-| the refusal | `FetchError::Denied` (`src/error.rs`) | self-contained payload: rule key, message, kind, reason |
+| the refusal | `FetchError::Denied` (`src/error.rs`) | self-contained payload: rule key, message, kind, reason, refused URL |
 | guard core | `validate_url_basic_with_policy` (`src/fetch/guards.rs`) | where `Denied` is produced |
 | formatter | `policy_error_value` (`src/mcp/server/errors.rs`) | the one place a denial becomes a tool result |
 
@@ -33,7 +33,9 @@ detection runs on the compiled form, as a backstop for any gap in those
 checks.
 
 The URL side is normalized once, inside `eval`: the host from `url::Url`
-(already lowercase and punycode) with every trailing dot stripped. `rules
+(already lowercase and punycode) with every trailing dot stripped, and an
+IPv4-mapped IPv6 address read as its IPv4 address, as `is_ssrf_host` reads
+it. A mapped key is a load error for the same reason: it could never match. `rules
 test` and every guard see the same form.
 
 Precedence is winner-takes-all, never a per-field cascade: more host labels
@@ -85,7 +87,9 @@ The guard core only refuses. A tier pin needs its own lookup:
 hands `fetch_single_inner` a clone of the arguments with `tier` replaced, so
 a rule's tier is indistinguishable from a tier the caller passed (adapter
 rewrite gate and routing included). Fallbacks inherit that pin and are not
-re-evaluated. `rule_tier` holds the precedence table.
+re-evaluated. `rule_tier` holds the precedence table. The only other
+runtime reader of tier pins is search's background pre-solve (`maybe_pre_solve`), which
+skips a host whose winning rule pins tier `"1"` (`rules_keep_browser_off`).
 
 ## The error contract
 
@@ -224,8 +228,11 @@ Each is additive: no v1 key or output changes meaning when it arrives.
 - **`warn` rules.** Fetch, but tell the agent; including warnings for
   intermediate redirect hops. Needs a delivery contract the agent reads.
 - **Rules on document requests only, in the browser.** Today the CDP guard
-  blocks every request to a denied host, images and scripts on allowed
-  pages included. `Fetch.requestPaused` carries `resourceType`, so the rule
+  blocks every request to a denied host that the page session's `Fetch`
+  domain pauses, images and scripts on allowed pages included. It sees no
+  WebSocket, DNS prefetch or preconnect, and probably no request from a
+  cross-site iframe or a worker (`Fetch.enable` runs on the page session
+  only, with no auto-attach; not verified with a real browser). `Fetch.requestPaused` carries `resourceType`, so the rule
   half of the guard could skip subresources while the SSRF half keeps
   applying to everything. Revisit if a deny breaks pages nobody named.
 - **Typed browser denials.** Store the `Denied` the CDP guard saw for a

@@ -2003,6 +2003,7 @@ mod transport_exit_tests {
                 message: "connection timed out here; CONNECT -> 407 is expected".into(),
                 kind: "walled",
                 reason: None,
+                url: "https://connect.widgets.example/".into(),
             }),
             None
         );

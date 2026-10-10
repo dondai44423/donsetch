@@ -26,13 +26,16 @@ pub enum FetchError {
     /// URL before any request. Self-contained: `rule` is the pattern
     /// key, `message` the operator's guidance verbatim, `kind` is
     /// `"walled"` or `"permanent"`, and `reason` the optional subcode
-    /// of the `policy.denied.<reason>` code. `Display` prints only a
-    /// fixed text, never `rule` or `message`.
+    /// of the `policy.denied.<reason>` code, and `url` the URL the rule
+    /// refused: a redirect hop's target when the refusal came mid-chain.
+    /// `Display` prints only a fixed text, never `rule`, `message` or
+    /// `url`.
     Denied {
         rule: String,
         message: String,
         kind: &'static str,
         reason: Option<String>,
+        url: String,
     },
     /// A redirect `Location` with a scheme other than http(s); carries
     /// that scheme. The redirect is not followed.
@@ -97,6 +100,7 @@ mod tests {
             message: "solve the captcha by hand; a timeout here is expected".into(),
             kind: "walled",
             reason: Some("ip_ban".into()),
+            url: "https://connect.widgets.example/captcha".into(),
         };
         let shown = e.to_string();
         assert_eq!(shown, "blocked by a local DonSeTch rule");

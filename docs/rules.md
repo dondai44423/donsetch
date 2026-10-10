@@ -129,7 +129,9 @@ query, no port.
 - A leading `.` means that host only. It is the only prefix.
 - The scheme form takes `http` or `https`.
 - An IP literal (`127.0.0.1`, `[2001:db8::1]`) matches that address only.
-  IPv6 goes in brackets.
+  IPv6 goes in brackets. An IPv4 rule also matches the address written as
+  IPv4-mapped IPv6 (`[::ffff:127.0.0.1]`), so that spelling cannot get past
+  it.
 - A dotless name such as `localhost` is a valid key.
 - Every port and every path match. A deny on `example.org` cannot be
   evaded with `example.org:8443`.
@@ -216,6 +218,7 @@ printed as `donsetch: invalid config file <path>: ` followed by the message.
 | `0x7f.1` | `IP literals must be in canonical form in rule patterns.`<br>`Write "127.0.0.1".` |
 | `2001:db8::1` | `IPv6 literals must be in brackets in rule patterns.`<br>`Write "[2001:db8::1]".` |
 | `.127.0.0.1` | `IP literals take no "." prefix: an address has no subdomains.`<br>`Write "127.0.0.1".` |
+| `[::ffff:127.0.0.1]` | `IPv4-mapped IPv6 literals are not supported in rule patterns.`<br>`Write the IPv4 address "127.0.0.1": it matches both spellings.` |
 | `glob:…`, `re:…` | `"glob:" patterns are reserved and not yet supported.` (or `"re:"`)<br>`Write a host, e.g. "example.com": rules match the host and the scheme only.` |
 
 Every message in the table starts with `config error in
@@ -350,7 +353,8 @@ The same check guards every request DonSeTch sends, so it also covers:
 - **adapter rewrites**: when an adapter moves the request to another host
   (`npmjs.com` to `registry.npmjs.org`, `old.reddit.com` to `www.reddit.com`),
   a deny on the target host applies;
-- **the browser**: navigations and the requests a page makes;
+- **the browser**: navigations and the HTTP requests of the page itself
+  (see [Known limits](#known-limits) for the connections this misses);
 - **DonSeTch's own traffic**: the keyless search engines, the search result
   prefetch and pre-solve, the background route prober, and crawl `robots.txt`
   and sitemap requests. The BYOK search providers are the exception: their API
@@ -516,7 +520,9 @@ Things to know before pinning a host:
 - **Tier `"1"` never escalates.** A host pinned to tier `"1"` fails with a
   walled error on a bot wall, even one DonSeTch detected, rather than opening
   the browser or the unlocker. With `tier_enforce = true` that is "never use
-  the browser on this host".
+  the browser on this host". A tier `"1"` pin, advisory or enforced, also
+  keeps the browser solve that `web_search` starts in the background for a
+  walled top result off that host.
 - **The result does not say a rule chose the tier.** `tier_used` and the CLI
   stats report the effective tier, and a tier learned from earlier walls
   looks the same. `donsetch rules test <url>` tells them apart.
@@ -637,6 +643,14 @@ and origins, like every other knob. The rule table itself is not listed; use
   on its own after loading (a script or meta refresh) is blocked the same way
   and surfaces as a failed page. A subresource from a denied host (an image, a
   script) is dropped silently from any page the browser renders.
+- **The browser check sees only the page's own HTTP requests.** It intercepts
+  the requests Chrome pauses for the page through the DevTools `Fetch`
+  domain. A WebSocket and a preconnect hint are not checked, so a page on an
+  allowed host can still make the browser open a connection to a denied host;
+  a DNS prefetch hint only looks up the host's name. Requests made inside a
+  cross-site iframe or by a worker the page starts are probably not checked
+  either. This list is read from the code and from how Chrome's DevTools
+  protocol works, not from a test with a real browser.
 - **Changing rules does not rewrite a resumable crawl.** After you remove or
   narrow a rule, a resumed crawl neither fetches the URLs the earlier run
   denied nor stops listing them: they stay in the crawl's seen set and in its

@@ -331,7 +331,11 @@ fn seed_guard_error(seed: &str) -> Option<Value> {
             // host is refused like a directly denied one.
             let (rewritten, _via) = crate::adapters::rewrite(&parsed)?;
             let denial = crate::rules::rules().denial_for_str(&rewritten)?;
-            Some(policy_error_value(&denial.into_error(), seed, None))
+            Some(policy_error_value(
+                &denial.into_error(&rewritten),
+                seed,
+                None,
+            ))
         }
     }
 }
@@ -353,11 +357,9 @@ fn seed_failure_error(failure: &crate::crawl::SeedFailure, escalation: Option<Va
         .as_deref()
         .filter(|landing| *landing != failure.requested);
     if let Some(denial) = &failure.denial {
-        let mut value = policy_error_value(
-            &denial.clone().into_error(),
-            landing.unwrap_or(&failure.requested),
-            escalation,
-        );
+        let refused = landing.unwrap_or(&failure.requested);
+        let mut value =
+            policy_error_value(&denial.clone().into_error(refused), refused, escalation);
         value["structuredContent"]["requested_url"] = json!(failure.requested);
         if let Some(landing) = landing {
             value["structuredContent"]["landing_url"] = json!(landing);
@@ -367,9 +369,9 @@ fn seed_failure_error(failure: &crate::crawl::SeedFailure, escalation: Option<Va
 
     let status = failure.status;
     let verdict = failure.verdict.as_deref().unwrap_or("");
-    let is_wall = verdict.starts_with("Challenge")
-        || matches!(verdict, "Blocked" | "AuthWall" | "Paywall")
-        || matches!(status, 401 | 403);
+    // The verdicts web_fetch calls walled on any status (`verdict_kind`).
+    let hard_wall = verdict.starts_with("Challenge") || matches!(verdict, "AuthWall" | "Paywall");
+    let is_wall = hard_wall || verdict == "Blocked" || matches!(status, 401 | 403);
     // The code is the one web_fetch gives the same failure, so a 404 seed
     // also gets `read_status: "notfound"` and a `suggested_query` from
     // tool_error_structured. The crawl codes cover only causes web_fetch
@@ -423,8 +425,9 @@ fn seed_failure_error(failure: &crate::crawl::SeedFailure, escalation: Option<Va
         ),
         // Ahead of the walls: a 429 or 503 carries a Blocked verdict, and
         // web_fetch reads Blocked on those statuses as transient
-        // (`verdict_kind`), not as a wall.
-        None if status == 429 || status >= 500 => (
+        // (`verdict_kind`), not as a wall. A challenge served as 503 or
+        // 429 (Cloudflare, DataDome) stays a wall there, and here.
+        None if (status == 429 || status >= 500) && !hard_wall => (
             "transient",
             Cow::Borrowed(if status == 429 {
                 "network.ratelimit"
@@ -1411,6 +1414,13 @@ mod crawl_output_contract_tests {
         let down = super::seed_failure_error(&seed_failure(503, Some("Blocked")), None);
         assert_eq!(down["structuredContent"]["code"], "crawl.seed_failed");
         assert_eq!(down["errorKind"], "transient");
+        // Negative: a challenge served as 503 or 429 is a wall, as in
+        // web_fetch, not an outage to wait out.
+        for (status, verdict) in [(503, "Challenge(Cloudflare)"), (429, "Challenge(DataDome)")] {
+            let challenged = super::seed_failure_error(&seed_failure(status, Some(verdict)), None);
+            assert_eq!(challenged["errorKind"], "walled", "{status} {verdict}");
+            assert_eq!(challenged["structuredContent"]["code"], "wall.challenge");
+        }
 
         // A fetch error arrives as status 0 with a Blocked verdict: it is
         // a network failure, not a wall.

@@ -5380,6 +5380,7 @@ mod rules_tests {
             message: MESSAGE.into(),
             kind,
             reason: Some("ip_ban".into()),
+            url: "https://www.banned.example/".into(),
         }
     }
 
@@ -5791,6 +5792,14 @@ mod rules_tests {
             "{}",
             results[1]
         );
+        // The tier that ran, not just a success: a browser on the runner
+        // could serve call 1 even with the pin ignored.
+        for result in &results {
+            assert_eq!(
+                result["_meta"]["com.donsetch/fetch-debug"]["tier"], "1",
+                "{result}"
+            );
+        }
         assert!(
             targets.iter().any(|t| t.contains("enforced.example")),
             "{targets:?}"

@@ -41,7 +41,8 @@ pub struct FetchedPage {
     pub lane: String,
     /// The actual HTTP policy; absent when no request produced a response.
     pub route: Option<crate::transport::request_route::RequestRoute>,
-    /// Final URL after redirects.
+    /// Final URL after redirects; for a rule refusal, the refused URL
+    /// (a redirect hop's target when the refusal came mid-chain).
     pub url: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,

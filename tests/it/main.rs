@@ -73,6 +73,7 @@ mod ghost_state_boundaries;
 mod mcp_tool_call_does_not_abort;
 mod request_class;
 mod revalidate_redirect;
+mod rules_off_switch;
 mod secure_cookie_leak;
 mod soak;
 mod state_sandbox;
