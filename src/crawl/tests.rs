@@ -270,7 +270,10 @@ async fn stealth_v3_short_browser_handoffs_use_one_original_deadline() {
             let fetch: PageFetcher = Arc::new(move |url, lane, referer, gate| {
                 let fetch = Arc::clone(&fetch);
                 async move {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    // 250ms, not 40ms: this read is the renewed-budget
+                    // signal the deadline assert below must see over
+                    // any runner's scheduling noise.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                     fetch(url, lane, referer, gate).await
                 }
                 .boxed()
@@ -280,7 +283,7 @@ async fn stealth_v3_short_browser_handoffs_use_one_original_deadline() {
             let cancelled = Arc::new(Mutex::new(None));
             let cancelled_hook = Arc::clone(&cancelled);
             let started = std::time::Instant::now();
-            let budget = Duration::from_millis(250);
+            let budget = Duration::from_millis(800);
             let hook: super::GhostHook = Arc::new(move |request| {
                 let reached = Arc::clone(&reached);
                 let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
@@ -288,9 +291,14 @@ async fn stealth_v3_short_browser_handoffs_use_one_original_deadline() {
                 async move {
                     let _held_until_cancelled = sender;
                     reached.fetch_add(1, Ordering::SeqCst);
-                    // Account for synchronous setup before crawl starts, while
-                    // rejecting a renewed budget after the 40ms HTTP read.
-                    assert!(request.deadline <= started + budget + Duration::from_millis(10));
+                    // Account for synchronous setup before crawl starts,
+                    // while rejecting a renewed budget captured after the
+                    // HTTP read. The 100ms slack swallows a loaded
+                    // runner's scheduling noise (a 10ms slack was crossed
+                    // on the Windows CI runner); the 250ms read keeps the
+                    // renewed-budget signal comfortably above it, so the
+                    // rejection stays armed.
+                    assert!(request.deadline <= started + budget + Duration::from_millis(100));
                     if stalled {
                         futures_util::future::pending::<()>().await;
                     }
