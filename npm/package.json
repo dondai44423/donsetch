@@ -49,10 +49,12 @@
     "donsetch": "bin/donsetch.js"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test --test-timeout=90000 tests/*.test.js"
   },
   "files": [
     "install.js",
+    "resolve-binary.js",
     "bin/donsetch.js",
     "pi-extension.ts",
     "README.md",

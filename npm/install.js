@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { findExistingBinary, targetWritable } = require('./resolve-binary.js');
 const { pipeline } = require('stream/promises');
 
 const REPO = 'dondai44423/donsetch';
@@ -269,12 +270,26 @@ async function download(url, dest) {
 }
 
 async function main() {
-  const tarball = path.join(binDir, plat.asset);
-  const checksumFile = path.join(binDir, 'checksum.sha256');
+  // Per-pid temp names: two first runs racing (two MCP clients
+  // starting together) must never share a write target. The renames
+  // that land the files are atomic; the temps are invisible until then.
+  const tarball = path.join(binDir, `${plat.asset}.tmp-${process.pid}`);
+  const checksumFile = path.join(binDir, `checksum.sha256.tmp-${process.pid}`);
+  const extractDir = path.join(binDir, `extract.tmp-${process.pid}`);
 
-  // Inside main() so an unwritable install dir gets the curated
-  // error below, not a raw Node stack trace from a top-level throw.
-  fs.mkdirSync(binDir, { recursive: true });
+  // The unwritable install dir (#361: a system-wide npm package under
+  // a root-owned prefix, run by an unprivileged user) is decided
+  // BEFORE any download, so the failure names the directory and the
+  // ways out instead of dying after 19MB of network.
+  try {
+    fs.mkdirSync(binDir, { recursive: true });
+  } catch (err) {
+    settleUnwritable(err);
+  }
+  if (!targetWritable(__dirname)) {
+    settleUnwritable(new Error(`${binDir} is not writable`));
+  }
+  cleanupStaleTemps();
 
   if (process.platform === 'win32') {
     try {
@@ -300,11 +315,22 @@ async function main() {
     }
 
     console.log('donsetch: extracting...');
-    execFileSync('tar', ['xzf', tarball, '-C', binDir], { stdio: 'inherit' });
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.mkdirSync(extractDir, { recursive: true });
+    execFileSync('tar', ['xzf', tarball, '-C', extractDir], { stdio: 'inherit' });
 
-    if (!fs.existsSync(binaryPath)) {
+    const entries = fs.readdirSync(extractDir);
+    if (!entries.includes(plat.binary)) {
       throw new Error(`expected ${plat.binary} not found after extraction in ${binDir}`);
     }
+    // Land each entry with a rename inside binDir: a rename is atomic,
+    // so a concurrent first run can only ever replace a complete file,
+    // never expose a half-written one. The stamp goes last: a crash
+    // before it leaves no stamp, and the next run re-downloads.
+    for (const name of entries) {
+      fs.renameSync(path.join(extractDir, name), path.join(binDir, name));
+    }
+    fs.rmSync(extractDir, { recursive: true, force: true });
     if (process.platform !== 'win32') fs.chmodSync(binaryPath, 0o755);
     fs.writeFileSync(stampPath, `${VERSION}\n`);
     console.log(`donsetch: installed ${plat.binary} to ${binaryPath}`);
@@ -314,13 +340,80 @@ async function main() {
     // and checksum sitting in ./binaries/ forever.
     try { fs.unlinkSync(tarball); } catch (_) {}
     try { fs.unlinkSync(checksumFile); } catch (_) {}
+    try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch (_) {}
+  }
+}
+
+// One existing-binary lookup for the failure paths: an install that
+// cannot succeed must not take a working donsetch down with it (#361).
+// Returns false when there is nothing to fall back on.
+function ackExisting(detail) {
+  let existing = null;
+  try {
+    existing = findExistingBinary({ pkgDir: __dirname });
+  } catch (_) {
+    return false;
+  }
+  if (!existing) return false;
+  console.log(`donsetch: install failed: ${detail}`);
+  console.log(`donsetch: an existing binary was found and will be used: ${existing.path}`);
+  process.exit(0);
+}
+
+// The unwritable install dir: acknowledge an existing binary when one
+// is findable (npm install / postinstall stays green), otherwise fail
+// with every way out named.
+function settleUnwritable(cause) {
+  const detail = cause && cause.message ? cause.message : 'directory is not writable';
+  if (ackExisting(detail)) return;
+  console.error(
+    `donsetch: cannot install into ${binDir} (${detail}) and no existing donsetch binary was found.`
+  );
+  console.error('');
+  console.error('Options:');
+  console.error('  - install under a user-writable prefix:');
+  console.error('      npm config set prefix ~/.npm-global && npm install -g donsetch');
+  console.error('  - point at a donsetch binary you already have:');
+  console.error('      DONSETCH_BINARY=/path/to/donsetch');
+  console.error('  - build from source:');
+  console.error(`      git clone https://github.com/${REPO} && cd donsetch && cargo build --release`);
+  process.exit(1);
+}
+
+// Temp leftovers from crashed runs (this installer is the only writer
+// of `.tmp-<pid>` / `extract.tmp-<pid>` names in binDir). A pid that
+// is still alive keeps its workspace.
+function cleanupStaleTemps() {
+  let names;
+  try {
+    names = fs.readdirSync(binDir);
+  } catch (_) {
+    return;
+  }
+  for (const name of names) {
+    const m = /\.tmp-(\d+)$/.exec(name);
+    if (!m || Number(m[1]) === process.pid) continue;
+    let alive = false;
+    try {
+      process.kill(Number(m[1]), 0);
+      alive = true;
+    } catch (_) {/* not running (or not ours): its temps are stale */}
+    if (!alive) {
+      try { fs.rmSync(path.join(binDir, name), { recursive: true, force: true }); } catch (_) {}
+    }
   }
 }
 
 main().catch((error) => {
+  if (ackExisting(error.message)) return;
   console.error(`donsetch: install failed: ${error.message}`);
   console.error('');
-  console.error('You can build from source:');
+  console.error('Options:');
+  console.error('  - install under a user-writable prefix:');
+  console.error('      npm config set prefix ~/.npm-global && npm install -g donsetch');
+  console.error('  - point at a donsetch binary you already have:');
+  console.error('      DONSETCH_BINARY=/path/to/donsetch');
+  console.error('  - build from source:');
   console.error(`  git clone https://github.com/${REPO} && cd donsetch && cargo build --release`);
   process.exit(1);
 });

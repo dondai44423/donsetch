@@ -2062,6 +2062,7 @@ const RESERVED_VARS: &[&str] = &[
     "DONSETCH_INSTALL_TAG",
     "DONSETCH_RELEASES_BASE",
     "DONSETCH_SKIP_DOWNLOAD",
+    "DONSETCH_BINARY",
     "DONSETCH_FORCE_GLIBC",
     "BLESS_MCP_FIXTURES",
     // Build metadata baked by build.rs. cargo passes these in the env it

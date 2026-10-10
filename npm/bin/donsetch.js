@@ -1,48 +1,44 @@
 #!/usr/bin/env node
 'use strict';
 
-// donsetch CLI wrapper: spawn the native binary with forwarded stdio.
+// donsetch CLI wrapper: resolve the binary and spawn it with
+// forwarded stdio.
 //
 // For MCP server usage (`donsetch mcp`), the MCP client spawns this
 // wrapper as a subprocess and communicates via stdin/stdout (JSON-RPC).
 // stdio: 'inherit' pipes the native binary's stdio directly to the
 // parent process, so the MCP protocol passes through unmodified.
 //
+// Resolution goes through resolve-binary.js: package-local binary
+// first, install.js when it can run, then an existing donsetch on
+// PATH / $CARGO_HOME / ~/.cargo/bin (#361: a system-wide package
+// under a root-owned prefix must not kill a working install). All
+// installer chatter and notices go to stderr: stdout belongs to the
+// protocol.
+//
 // Signal forwarding: when the MCP client sends SIGTERM/SIGINT to this
 // wrapper, we forward it to the native binary so it can clean up
 // (close connections, save ghost state, etc.) before exiting.
 
-const { spawn, execFileSync } = require('child_process');
-const { existsSync } = require('fs');
+const { spawn } = require('child_process');
 const { join } = require('path');
+const { resolveBinary } = require('../resolve-binary.js');
 
 // ── resolve binary path ─────────────────────────────────────────
-const binaryName = process.platform === 'win32' ? 'donsetch.exe' : 'donsetch';
-const binDir = join(__dirname, '..', 'binaries');
-const binaryPath = join(binDir, binaryName);
-
-if (!existsSync(binaryPath)) {
-  const installScript = join(__dirname, '..', 'install.js');
-  try {
-    execFileSync(process.execPath, [installScript], {
-      stdio: 'inherit',
-      cwd: join(__dirname, '..'),
-    });
-  } catch (_) {
-    process.stderr.write(
-      `donsetch: native binary missing and download failed. Retry with network access, ` +
-      `or run node ${installScript}; pnpm users: pnpm approve-builds then reinstall.\n`
-    );
-    process.exit(1);
-  }
-  if (!existsSync(binaryPath)) {
-    process.stderr.write(
-      `donsetch: native binary missing and download failed. Retry with network access, ` +
-      `or run node ${installScript}; pnpm users: pnpm approve-builds then reinstall.\n`
-    );
-    process.exit(1);
-  }
+let resolved;
+try {
+  resolved = resolveBinary({
+    pkgDir: join(__dirname, '..'),
+    self: __filename,
+    onOutput: (chunk) => process.stderr.write(chunk),
+  });
+} catch (err) {
+  process.stderr.write(`donsetch: ${err.message || err}\n`);
+  process.exit(1);
 }
+if (resolved.notice) process.stderr.write(resolved.notice + '\n');
+
+const binaryPath = resolved.path;
 
 // ── spawn native binary ─────────────────────────────────────────
 const child = spawn(binaryPath, process.argv.slice(2), {
