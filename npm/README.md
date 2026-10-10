@@ -59,6 +59,7 @@ Downloads the prebuilt binary for your platform from [GitHub Releases](https://g
 
 - **pnpm or bun:** the postinstall needs approval. `pnpm approve-builds` (or the bun equivalent), then reinstall. If scripts were blocked, `npx donsetch` runs the self-healing shim.
 - **`--ignore-scripts`:** postinstall is intentionally skipped. Run `node node_modules/donsetch/install.js`, or use `npx donsetch` to download the binary when network access is available.
+- **System-wide installs:** if the npm prefix is root-owned (for example `/usr/local/lib/node_modules`) and you run donsetch as a normal user, the package copy cannot be written there. donsetch then uses an existing binary from `PATH` or `~/.cargo/bin` automatically; `DONSETCH_BINARY=/path/to/donsetch` points at one explicitly. To keep the package copy instead: `npm config set prefix ~/.npm-global && npm install -g donsetch`.
 - **Proxy:** set `HTTPS_PROXY` (or `https_proxy`, `HTTP_PROXY`, `http_proxy`) to an HTTP CONNECT proxy.
 - **Release mirror:** set `DONSETCH_RELEASES_BASE` to a mirror serving `<tag>/<asset>` paths, for example `https://mirror.example/donsetch/releases`.
 - **Windows:** the installer needs `tar`, included since Windows 10 1803.

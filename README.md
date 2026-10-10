@@ -147,6 +147,7 @@ donsetch doctor --mcp    # detects clients and prints absolute-path registration
 - **Linux prebuilts:** glibc >= 2.35 (Ubuntu 22.04 LTS and newer). The bundled ONNX lib keeps its own 2.27 floor, so OCR and rerank work on all of those.
 - **pnpm or bun:** approve the build script (`pnpm approve-builds`, or the bun equivalent), then reinstall. If scripts were blocked, `npx donsetch` invokes the self-healing shim.
 - **`--ignore-scripts`:** postinstall is intentionally skipped. Run `node node_modules/donsetch/install.js`, or `npx donsetch` to download the binary when network is available.
+- **System-wide npm installs:** a root-owned npm prefix (`/usr/local/lib/node_modules`) cannot receive the binary when you run as a normal user. donsetch falls back to an existing binary on `PATH` or in `~/.cargo/bin`; `DONSETCH_BINARY=/path/to/donsetch` points at one explicitly. Keep the package copy with `npm config set prefix ~/.npm-global && npm install -g donsetch`.
 - **Proxy:** set `HTTPS_PROXY` (or `https_proxy`, `HTTP_PROXY`, `http_proxy`) to an HTTP CONNECT proxy.
 - **Release mirror:** set `DONSETCH_RELEASES_BASE` to a mirror holding `<tag>/<asset>` paths.
 - **Windows:** the installer needs `tar`, included since Windows 10 1803.

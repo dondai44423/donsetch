@@ -5,6 +5,42 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.4] - 2026-10-10
+
+### Added
+
+- `DONSETCH_BINARY=/path/to/donsetch` overrides binary resolution for
+  the npm wrapper and the pi extension on every platform.
+- The npm package ships its installer test suite (21 cases: resolution
+  order, unwritable targets, atomic landing, wrapper passthrough). CI
+  runs it on every push; `just npm-test` runs it locally.
+
+### Fixed
+
+- A system-wide npm install under a root-owned prefix (for example
+  `/usr/local/lib/node_modules`) no longer kills the run when its own
+  copy of the binary cannot be installed. The wrapper, the pi extension
+  and the postinstall now fall back to an existing `donsetch` on
+  `PATH`, in `$CARGO_HOME/bin` or in `~/.cargo/bin` instead of dying
+  with `EACCES` while a working binary sits on the same machine (issue
+  #361). Resolution order: `DONSETCH_BINARY`, the package copy, the
+  installer, then an existing binary; a run that lands on the fallback
+  says which binary it is using on stderr.
+- An unwritable package directory is detected before any download: the
+  failure names the directory and every way out (user-writable npm
+  prefix, `DONSETCH_BINARY`, building from source) instead of dying
+  after pulling the full tarball. A postinstall that cannot install
+  acknowledges an existing binary and exits 0, so `npm install -g` no
+  longer fails on a machine that already works.
+- The installer lands extracted files with atomic renames under
+  per-run temp names, so two first runs racing (two MCP clients
+  starting together) can only ever expose a complete binary. Installer
+  progress and notices now go to stderr, keeping an MCP stdio
+  session's stdout clean.
+- `donsetch -u` hitting a permission failure inside an npm-managed
+  directory now points at npm (`npm install -g donsetch@latest`)
+  instead of suggesting `sudo`.
+
 ## [4.7.3] - 2026-10-09
 
 ### Fixed
