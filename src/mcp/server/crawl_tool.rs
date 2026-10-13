@@ -1223,18 +1223,24 @@ mod crawl_output_contract_tests {
 
     #[test]
     fn denied_urls_get_a_head_counter_and_a_trailing_section_without_the_rule_key() {
+        // Both the positive assertions and the negative ones below read the
+        // section's name from here, so a rewording fails the positive ones
+        // loudly instead of leaving the negatives matching a string nothing
+        // emits any more.
+        const HEADING: &str = "Excluded by the operator's local DonSeTch rules";
+
         let mut result = dataset_fixture();
         result.denied = denied_fixture();
         let out = render_crawl_result(&result, CrawlMode::Full, false);
         let text = out["content"][0]["text"].as_str().unwrap();
         let counter = text
-            .find("Excluded by the operator's local DonSeTch rules: 19 URLs, listed at the end.")
+            .find(&format!("{HEADING}: 19 URLs, listed at the end."))
             .expect(text);
         let first_page = text.find("## [1]").unwrap();
         let section = text
-            .find(
-                "## Excluded by the operator's local DonSeTch rules (not fetched; web_fetch returns the same)",
-            )
+            .find(&format!(
+                "## {HEADING} (not fetched; web_fetch returns the same)"
+            ))
             .expect(text);
         assert!(counter < first_page && first_page < section, "{text}");
         let tail = &text[section..];
@@ -1275,7 +1281,7 @@ mod crawl_output_contract_tests {
             !data["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("Denied by local"),
+                .contains(HEADING),
             "JSON Lines stay rows only"
         );
 
@@ -1291,7 +1297,7 @@ mod crawl_output_contract_tests {
                 !clean["content"][0]["text"]
                     .as_str()
                     .unwrap()
-                    .contains("Denied by local")
+                    .contains(HEADING)
             );
         }
     }
