@@ -37,6 +37,9 @@ impl JsMode {
 
 pub struct Outcome {
     pub status: u16,
+    /// The final response's headers — the response whose body became the
+    /// output — so a product reads content-type etc. without a second call.
+    pub headers: Vec<(String, String)>,
     pub url: String,
     pub label: String,
     pub html: String,
@@ -257,6 +260,7 @@ impl Engine {
             .map_err(|e| format!("wire: {e}"))?;
         let mut cache: Option<CacheOutcome> = docf.cache;
         let doc = docf.resp;
+        let mut final_headers = doc.headers.clone();
         phases.push((docf.phase, doc.ms));
         let mut status = doc.status;
         let final_url = doc.final_url.clone();
@@ -467,6 +471,7 @@ impl Engine {
                             let d = df.resp;
                             if (200..400).contains(&d.status) && !challenge_detected(&d.body) {
                                 current_html = d.body;
+                                final_headers = d.headers;
                                 label = "wire+js+nav".into();
                                 break;
                             }
@@ -550,6 +555,7 @@ impl Engine {
                     if (200..400).contains(&b2.status) && !challenge_detected(&b2.body) {
                         status = b2.status;
                         current_html = b2.body;
+                        final_headers = b2.headers;
                         label = "wire+js+clearance".into();
                     }
                 }
@@ -627,6 +633,7 @@ impl Engine {
         let jar_len = self.wire.jar.lock().unwrap().len();
         Ok(Outcome {
             status,
+            headers: final_headers,
             url: final_url,
             label,
             html: current_html,

@@ -207,6 +207,13 @@ fn fetch(args: &[String]) {
                 o.net_calls,
                 o.jar_len
             );
+            let ctype = o
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("-");
+            println!("headers:  {} (content-type {})", o.headers.len(), ctype);
             println!("total:    {} ms", o.ms_total);
             if std::env::var("DONCORE_DEBUG").is_ok() {
                 let jar = engine.wire.jar.lock().unwrap_or_else(|p| p.into_inner());
