@@ -1014,6 +1014,8 @@ struct DiskCookie {
     value: String,
     domain: String,
     #[serde(default)]
+    secure: bool,
+    #[serde(default)]
     expires: Option<u64>,
     #[serde(default)]
     created: u64,
@@ -1068,6 +1070,7 @@ impl JarStore {
                 name: c.name,
                 value: c.value,
                 domain: c.domain,
+                secure: c.secure,
                 expires: c.expires,
                 created: c.created,
                 updated: c.updated,
@@ -1129,6 +1132,7 @@ impl JarStore {
                 name: c.name.clone(),
                 value: c.value.clone(),
                 domain: c.domain.clone(),
+                secure: c.secure,
                 expires: c.expires,
                 created: c.created,
                 updated: c.updated,

@@ -17,6 +17,8 @@ pub enum ReqKind {
     #[default]
     Document,
     Script,
+    Style,
+    Font,
     Xhr,
     Image,
 }
@@ -46,6 +48,11 @@ pub struct WireReq {
     /// 3xx and returns it as the response — the product's per-hop loops
     /// (crawl scope / robots gates) decide each hop themselves.
     pub follow_redirects: Option<bool>,
+    /// Presentation as a legacy client (the product's old-UA lane): the
+    /// client carrying this request keeps no client-hint or fetch-metadata
+    /// headers (`sec-ch-ua*`, `sec-fetch-*`, `upgrade-insecure-requests`),
+    /// so a swapped User-Agent reads coherent, not bot-mixed.
+    pub legacy_identity: bool,
 }
 
 /// Default response byte cap. A hostile or careless server must never be able
@@ -148,14 +155,18 @@ struct Job {
 // ── the one jar ──────────────────────────────────────────────────────────
 
 /// One cookie with the lifetime state a persistent session needs. Storage is
-/// flat: identity = name+domain (Path/Secure/SameSite are not modeled — the
-/// documented tier-1 approximation), and every cookie the wire keeps is a
-/// cookie the runtime sees (one jar, no quarantine).
+/// flat: identity = name+domain (Path/SameSite are not modeled — the
+/// documented tier-1 approximation; Secure is modeled as an attach gate),
+/// and every cookie the wire keeps is a cookie the runtime sees (one jar,
+/// no quarantine).
 #[derive(Clone, Debug)]
 pub struct Cookie {
     pub name: String,
     pub value: String,
     pub domain: String,
+    /// Set when a Secure attribute was present: the cookie is never
+    /// attached to a plain-HTTP request (the product's replay contract).
+    pub secure: bool,
     /// unix seconds; `None` = session cookie (no Max-Age/Expires given)
     pub expires: Option<u64>,
     pub created: u64,
@@ -209,6 +220,7 @@ struct ParsedCookie {
     domain: String,
     delete: bool,
     expires: Option<u64>,
+    secure: bool,
 }
 
 /// One Set-Cookie / document.cookie string → a cookie operation (upsert or
@@ -229,8 +241,14 @@ fn parse_cookie(sc: &str, host: &str) -> Option<ParsedCookie> {
     let mut dom = host.to_string();
     let mut max_age: Option<i64> = None;
     let mut expires_at: Option<u64> = None;
+    let mut secure = false;
     for p in parts {
         let Some((k, val)) = p.split_once('=') else {
+            // Bare-flag attributes: Secure matters (it gates the plain-HTTP
+            // attach); the rest stay unmodeled.
+            if p.eq_ignore_ascii_case("secure") {
+                secure = true;
+            }
             continue;
         };
         let val = val.trim();
@@ -280,6 +298,7 @@ fn parse_cookie(sc: &str, host: &str) -> Option<ParsedCookie> {
         domain: dom,
         delete,
         expires,
+        secure,
     })
 }
 
@@ -396,19 +415,23 @@ impl Jar {
             .find(|c| c.name == p.name && c.domain == p.domain)
         {
             let created = c.created;
+            let secure = p.secure;
             *c = Cookie {
                 name: p.name,
                 value: p.value,
                 domain: p.domain,
+                secure,
                 expires: p.expires,
                 created,
                 updated: now,
             };
         } else {
+            let secure = p.secure;
             self.cookies.push(Cookie {
                 name: p.name,
                 value: p.value,
                 domain: p.domain,
+                secure,
                 expires: p.expires,
                 created: now,
                 updated: now,
@@ -493,14 +516,23 @@ impl Jar {
     }
 
     pub fn header_for(&self, url: &str) -> Option<String> {
-        let host = url::Url::parse(url)
-            .ok()
+        let parsed = url::Url::parse(url).ok();
+        let host = parsed
+            .as_ref()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
             .unwrap_or_default();
+        let secure_channel = parsed.as_ref().is_some_and(|u| u.scheme() == "https");
+        let now = now_secs();
         let pairs: Vec<String> = self
-            .all(Some(&host))
+            .cookies
             .iter()
-            .map(|(n, v)| format!("{n}={v}"))
+            .filter(|c| c.expires.map(|e| e > now).unwrap_or(true))
+            .filter(|c| dom_match(&c.domain, &host))
+            // A Secure cookie never travels over plain HTTP (RFC 6265 §5.4;
+            // the product's 4.9.0 replay contract). An unparseable URL
+            // counts as insecure: fail closed.
+            .filter(|c| !c.secure || secure_channel)
+            .map(|c| format!("{}={}", c.name, c.value))
             .collect();
         if pairs.is_empty() {
             None
@@ -587,6 +619,50 @@ pub fn tune_emulation(mut emu: wreq::Emulation) -> wreq::Emulation {
     emu
 }
 
+/// Which identity the emulation carries for one request's class.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityStrip {
+    /// The full Chrome identity (documents).
+    Full,
+    /// A subresource: Chrome sends neither `upgrade-insecure-requests` nor
+    /// `sec-fetch-user` outside navigations.
+    Subresource,
+    /// A legacy client (the product's old-UA lane): no client hints, no
+    /// fetch metadata, no upgrade-insecure-requests.
+    Legacy,
+}
+
+impl IdentityStrip {
+    fn strip(self, mut emu: wreq::Emulation) -> wreq::Emulation {
+        if self == IdentityStrip::Full {
+            return emu;
+        }
+        let doomed: Vec<wreq::header::HeaderName> = emu
+            .headers
+            .keys()
+            .filter(|n| {
+                let n = n.as_str();
+                match self {
+                    IdentityStrip::Subresource => {
+                        n == "upgrade-insecure-requests" || n == "sec-fetch-user"
+                    }
+                    IdentityStrip::Legacy => {
+                        n.starts_with("sec-ch-ua")
+                            || n.starts_with("sec-fetch-")
+                            || n == "upgrade-insecure-requests"
+                    }
+                    IdentityStrip::Full => false,
+                }
+            })
+            .cloned()
+            .collect();
+        for n in doomed {
+            emu.headers.remove(&n);
+        }
+        emu
+    }
+}
+
 /// Lazily built wreq clients — one per egress: the direct client plus one per
 /// proxy URL. A proxied client is never shared with the direct lane, and a
 /// proxy URL the builder rejects fails that request only.
@@ -605,13 +681,26 @@ impl ClientCache {
         }
     }
 
-    fn get(&mut self, proxy: Option<&str>, follow: bool) -> Result<Arc<wreq::Client>, String> {
-        let key = format!("{follow}|{}", proxy.unwrap_or(""));
+    fn get(
+        &mut self,
+        proxy: Option<&str>,
+        follow: bool,
+        identity: IdentityStrip,
+    ) -> Result<Arc<wreq::Client>, String> {
+        let key = format!(
+            "{}|{follow}|{}",
+            match identity {
+                IdentityStrip::Full => "full",
+                IdentityStrip::Subresource => "sub",
+                IdentityStrip::Legacy => "legacy",
+            },
+            proxy.unwrap_or("")
+        );
         if let Some(c) = self.map.get(&key) {
             return Ok(Arc::clone(c));
         }
         let mut builder = wreq::Client::builder()
-            .emulation(self.emulation.clone())
+            .emulation(identity.strip(self.emulation.clone()))
             .redirect(if follow {
                 wreq::redirect::Policy::limited(10)
             } else {
@@ -669,6 +758,13 @@ impl Wire {
                         let client = match clients.lock().unwrap_or_else(|p| p.into_inner()).get(
                             job.req.proxy.as_deref(),
                             job.req.follow_redirects != Some(false),
+                            if job.req.legacy_identity {
+                                IdentityStrip::Legacy
+                            } else if matches!(job.req.kind, ReqKind::Document) {
+                                IdentityStrip::Full
+                            } else {
+                                IdentityStrip::Subresource
+                            },
                         ) {
                             Ok(c) => c,
                             Err(e) => {
@@ -742,15 +838,33 @@ async fn do_request(
         ReqKind::Script => {
             builder = builder
                 .header("Sec-Fetch-Dest", "script")
+                .header("Sec-Fetch-Mode", "no-cors")
+                .header("Accept", "*/*");
+        }
+        ReqKind::Style => {
+            builder = builder
+                .header("Sec-Fetch-Dest", "style")
+                .header("Sec-Fetch-Mode", "no-cors")
+                .header("Accept", "text/css,*/*;q=0.1");
+        }
+        ReqKind::Font => {
+            builder = builder
+                .header("Sec-Fetch-Dest", "font")
+                .header("Sec-Fetch-Mode", "cors")
                 .header("Accept", "*/*");
         }
         ReqKind::Xhr => {
             builder = builder
                 .header("Sec-Fetch-Dest", "empty")
+                .header("Sec-Fetch-Mode", "cors")
                 .header("Accept", "*/*");
         }
         ReqKind::Image => {
             builder = builder.header("Sec-Fetch-Dest", "image").header(
+                "Sec-Fetch-Mode",
+                "no-cors",
+            )
+            .header(
                 "Accept",
                 "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             );
@@ -951,6 +1065,7 @@ mod tests {
             no_cookies: opts.no_cookies,
             proxy: None,
             follow_redirects: None,
+            legacy_identity: false,
         })
         .expect("fetch")
     }
@@ -1181,6 +1296,7 @@ mod tests {
             Cookie {
                 name: "sid".into(),
                 value: "1".into(),
+                secure: true,
                 domain: ".Example.COM".into(),
                 expires: None,
                 created: 0,
@@ -1189,6 +1305,7 @@ mod tests {
             Cookie {
                 name: "keep".into(),
                 value: "k".into(),
+                secure: false,
                 domain: "other.test".into(),
                 expires: None,
                 created: 0,
@@ -1197,6 +1314,7 @@ mod tests {
             Cookie {
                 name: "dead".into(),
                 value: "x".into(),
+                secure: false,
                 domain: "exp.test".into(),
                 expires: Some(now.saturating_sub(10)),
                 created: 0,
@@ -1228,8 +1346,137 @@ mod tests {
             expires: None,
             created: 0,
             updated: 0,
+            secure: true,
         }]);
         assert_eq!(jar.all(None).len(), 1, "upsert replaces, never duplicates");
         assert_eq!(jar.get("keep").as_deref(), Some("k2"));
+        assert!(
+            jar.header_for("http://other.test/").is_none(),
+            "an upserted Secure cookie must not attach over plain HTTP"
+        );
+        assert_eq!(
+            jar.header_for("https://other.test/").as_deref(),
+            Some("keep=k2")
+        );
+    }
+
+    #[test]
+    fn a_secure_cookie_never_replays_over_plain_http() {
+        use std::io::{BufRead, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for i in 0..2 {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                let mut r = BufReader::new(s.try_clone().expect("clone"));
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                seen2.lock().unwrap_or_else(|p| p.into_inner()).push(head);
+                let extra = if i == 0 {
+                    "Set-Cookie: sess=SECRET; Secure; Path=/\r\n"
+                } else {
+                    ""
+                };
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n{extra}Connection: close\r\n\r\nok"
+                    )
+                    .as_bytes(),
+                );
+                let _ = s.flush();
+            }
+        });
+        let w = wire();
+        let url = format!("http://127.0.0.1:{port}/");
+        for _ in 0..2 {
+            let _ = w
+                .fetch(WireReq {
+                    method: "GET".into(),
+                    url: url.clone(),
+                    kind: ReqKind::Document,
+                    ..Default::default()
+                })
+                .expect("fetch");
+        }
+        let log = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(log.len(), 2);
+        assert!(
+            !log[1].to_lowercase().contains("cookie"),
+            "the Secure cookie replayed over plain HTTP: {}",
+            log[1]
+        );
+        assert_eq!(
+            w.jar
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .all(None)
+                .len(),
+            1,
+            "the cookie is still stored (it just never rides http)"
+        );
+    }
+
+    #[test]
+    fn a_legacy_identity_request_keeps_no_hints_or_fetch_metadata() {
+        let (url, log) = serve(b"ok", "text/plain");
+        let w = wire();
+        let resp = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url,
+                kind: ReqKind::Document,
+                extra_headers: vec![(
+                    "user-agent".into(),
+                    "Googlebot/2.1 (+http://www.google.com/bot.html)".into(),
+                )],
+                legacy_identity: true,
+                ..Default::default()
+            })
+            .expect("fetch");
+        assert_eq!(resp.status, 200);
+        let head = log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n")
+            .to_lowercase();
+        assert!(head.contains("user-agent: googlebot/2.1"), "{head}");
+        assert!(!head.contains("sec-ch-ua"), "{head}");
+        assert!(!head.contains("sec-fetch-"), "{head}");
+        assert!(!head.contains("upgrade-insecure-requests"), "{head}");
+    }
+
+    #[test]
+    fn a_subresource_request_carries_chromes_subresource_fetch_metadata() {
+        let (url, log) = serve(b"body{}", "text/css");
+        let w = wire();
+        let resp = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url,
+                kind: ReqKind::Style,
+                ..Default::default()
+            })
+            .expect("fetch");
+        assert_eq!(resp.status, 200);
+        let head = log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n")
+            .to_lowercase();
+        assert!(head.contains("sec-fetch-dest: style"), "{head}");
+        assert!(head.contains("sec-fetch-mode: no-cors"), "{head}");
+        assert!(head.contains("accept: text/css"), "{head}");
+        assert!(!head.contains("upgrade-insecure-requests"), "{head}");
+        assert!(!head.contains("sec-fetch-user"), "{head}");
     }
 }
