@@ -553,7 +553,7 @@ fn walk_outlines(doc: FpdfDocument) -> Vec<OutlineItem> {
 }
 
 /// What beyond raw chars a load should gather per page.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct LoadOpts {
     /// Rasterize each page (96dpi + annotation layer) for the pixel
     /// engine. Lazy callers (raw dumps) keep this off.
@@ -564,6 +564,19 @@ pub struct LoadOpts {
     pub dpi: f32,
     /// Pages read per document; `MAX_PAGES` unless a test says less.
     pub max_pages: usize,
+}
+
+impl Default for LoadOpts {
+    fn default() -> Self {
+        Self {
+            want_pixels: false,
+            want_forms: false,
+            dpi: 0.0,
+            // A derived default would read NOTHING (`max_pages: 0`); the
+            // documented default reads the full document.
+            max_pages: MAX_PAGES,
+        }
+    }
 }
 
 /// The per-page bundle the sink receives. Pixel/form extras empty unless
