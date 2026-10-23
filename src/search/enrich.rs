@@ -85,7 +85,7 @@ impl Searcher {
     /// from the actual page HTML : richer than any SERP
     /// snippet. Dead links (404/timeout) get demoted 50%.
     /// Pages behind bot walls are left untouched (still
-    /// valid results, agent fetches via tier 2).
+    /// valid results, no demotion).
     ///
     /// This is what makes our search better than any
     /// individual engine: results carry the page's own
@@ -598,7 +598,7 @@ mod tests {
     }
 
     /// Bot walls (200 but not ContentOk) leave the result neutral:
-    /// no demotion (still valid for tier 2), no parked body.
+    /// no demotion (still a valid result), no parked body.
     #[tokio::test]
     async fn wall_leg_neutral_no_park() {
         unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };

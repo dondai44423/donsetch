@@ -44,7 +44,7 @@ both, then the key string as a tie-break. `enabled = false` removes a rule
 from the candidates. A cascade was rejected because it needs every field to
 stay optional through the merge, and a missed "absent vs default" turns into
 a silent `action = "allow"` override. The cost of winner-takes-all is
-documented for operators: a narrow tier-only rule cancels a broader deny.
+documented for operators: a narrow allow rule cancels a broader deny.
 
 The index is an exact-host map plus a tree map looked up once per suffix of
 the URL's host, so a lookup is a few hash probes, not a scan.
@@ -58,10 +58,9 @@ redirect and rewrite:
 flowchart TD
     A["web_fetch url"] --> B["fetch_input: Denied arm"]
     B -->|denied| E["policy_error_value"]
-    B --> P["rule_pinned_args: tier pin"]
-    P --> I["fetch_single_inner"]
+    B --> I["fetch_single_inner"]
     I --> R["adapter rewrite"]
-    I --> T1["tier-1 redirect loop, every hop"]
+    I --> T1["local redirect loop, every hop"]
     I --> T2["browser: navigate + CDP request guard"]
     R --> G["guard core: validate_url_basic_with_policy"]
     T1 --> G
@@ -71,25 +70,16 @@ flowchart TD
 
 1. **Primary**: `web_fetch`'s `fetch_input` guard check. It runs first in
    `fetch_single`, before persona and lane setup and before every cache
-   (search prewarm, render cache, unlocker cache), and again on each
+   (search prewarm, unlocker cache), and again on each
    fallback re-entry. It must match `Denied` before its `guard.ssrf` arm,
    because an explicit code outranks the text classifier.
 2. **Backstop**: the guard core that both `validate_url_basic` and
-   `ensure_url_safe` call. That one place covers the tier-1 redirect loop
+   `ensure_url_safe` call. That one place covers the local fetch's redirect loop
    (`validate_redirect_url` on every hop), adapter rewrites, the browser
    lane's navigation checks and its CDP request guard, search's engine
    queries and prefetch, and doctor. The rule check sits after the
    scheme, credential and host checks and before the SSRF check, so a deny
    holds even with `fetch.allow_private_egress`.
-
-The guard core only refuses. A tier pin needs its own lookup:
-`rule_pinned_args` in `fetch_single` evaluates the caller's URL once and
-hands `fetch_single_inner` a clone of the arguments with `tier` replaced, so
-a rule's tier is indistinguishable from a tier the caller passed (adapter
-rewrite gate and routing included). Fallbacks inherit that pin and are not
-re-evaluated. `rule_tier` holds the precedence table. The only other
-runtime reader of tier pins is search's background pre-solve (`maybe_pre_solve`), which
-skips a host whose winning rule pins tier `"1"` (`rules_keep_browser_off`).
 
 ## The error contract
 
@@ -103,10 +93,9 @@ skips a host whose winning rule pins tier `"1"` (`rules_keep_browser_off`).
   `network.timeout`, a key like `connect.example` read as a dead proxy lane.
   Adding the key back reopens that.
 - **Every routing site calls `policy_error_value`** before the error turns
-  into text: `fetch_input`, the rewritten-URL guard, the tier-1 `Err` arm
-  (above its adapter branch), `fetch_with_actions`, `ghost_escalate` (which
-  returns `GhostFailure::Denied` so a denial never reaches the
-  `kind == "walled"` → paid unlocker gate), `web_screenshot`'s four sites,
+  into text: `fetch_input`, the rewritten-URL guard, the transport `Err` arm
+  (above its adapter branch), `fetch_with_actions`, `web_screenshot`'s four
+  sites,
   and the crawl's seed guard. A missed site degrades rather than lies:
   `error_code` has a first arm on the fixed text that yields
   `policy.denied.unspecified`.
@@ -165,7 +154,7 @@ flowchart LR
   `404`.
 - **A failed seed with nothing else to fetch is a hard error**, judged when
   the result is assembled (`SeedFailure`), not before the workers run,
-  because retries and the browser hook rescue seeds today. Its code follows
+  because retries can still rescue seeds today. Its code follows
   `web_fetch` per cause. Resumed seeds are guarded at the tool entry through
   `resume_store_peek`, which reads the token without consuming it.
 
@@ -239,7 +228,6 @@ Each is additive: no v1 key or output changes meaning when it arrives.
   browser-followed redirect reports the rule.
 - **A second config file layer** (project-level). The map shape already
   merges per key. Then the duplicate-key error should name each key's layer
-  (`Loaded::origin_of_path` exists for it), and `tier = "auto"` becomes the
-  way to cancel a lower layer's pin.
+  (`Loaded::origin_of_path` exists for it).
 - **A denial sink before the page loop**, so a rule that blocks a robots or
   sitemap fetch is reported instead of silently shrinking discovery.

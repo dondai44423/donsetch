@@ -10,14 +10,7 @@ use std::fmt::Write as _;
 
 use crate::cli::tool::{EXIT_PERMANENT, EXIT_WALLED};
 use crate::config;
-use crate::rules::{
-    CompiledRule, DenyKind, RuleAction, RuleSet, RuleTier, RulesMode, RulesSection,
-};
-
-/// The warning `rules test` prints when the winning rule pins tier
-/// `"2"` on a PDF-shaped URL.
-const PDF_TIER2_WARNING: &str = "warning: tier \"2\" turns off the cookie retry that recovers \
-walled PDFs; this URL may come back as Chrome's PDF viewer, not the document";
+use crate::rules::{CompiledRule, DenyKind, RuleAction, RuleSet, RulesMode, RulesSection};
 
 /// Run `donsetch rules <subcommand>`. `args` is the full argv
 /// (`args[1]` is `rules`). Exits the process with 1 on a usage, config
@@ -155,13 +148,13 @@ fn render_test(
         );
         return out;
     };
-    render_winner(&mut out, url, winner, origin);
+    render_winner(&mut out, winner, origin);
     out
 }
 
 /// The winning rule's fields, each with its layer, and what the rule
 /// does to a fetch of `url`.
-fn render_winner(out: &mut String, url: &url::Url, winner: &CompiledRule, origin: &Origin<'_>) {
+fn render_winner(out: &mut String, winner: &CompiledRule, origin: &Origin<'_>) {
     let key = winner.key.as_str();
     let rule = &winner.rule;
     let _ = writeln!(out, "Winning rule: [rules.url.\"{key}\"]");
@@ -198,56 +191,7 @@ fn render_winner(out: &mut String, url: &url::Url, winner: &CompiledRule, origin
         }
         RuleAction::Allow => {
             field(out, "action", "allow");
-            field(
-                out,
-                "tier",
-                rule.tier.map(|t| t.as_str()).unwrap_or("(none)"),
-            );
-            field(
-                out,
-                "tier_enforce",
-                if rule.tier_enforce { "true" } else { "false" },
-            );
-            match rule.tier {
-                None => {
-                    let _ = writeln!(out, "Effect: allowed; no tier pin.");
-                }
-                Some(RuleTier::Auto) if rule.tier_enforce => {
-                    let _ = writeln!(
-                        out,
-                        "Effect: allowed; tier \"auto\" is enforced: a per-call tier is ignored and DonSeTch's own escalation decides."
-                    );
-                }
-                // An advisory "auto" only fills an absent tier with auto,
-                // which is what an absent tier means anyway.
-                Some(RuleTier::Auto) => {
-                    let _ = writeln!(
-                        out,
-                        "Effect: allowed; no tier pin (an advisory tier \"auto\" leaves every call's tier as asked)."
-                    );
-                }
-                Some(tier) if rule.tier_enforce => {
-                    let _ = writeln!(
-                        out,
-                        "Effect: allowed; tier \"{}\" is enforced and wins over a per-call tier.",
-                        tier.as_str()
-                    );
-                }
-                Some(tier) => {
-                    let _ = writeln!(
-                        out,
-                        "Effect: allowed; tier \"{}\" applies unless the call passes an explicit tier.",
-                        tier.as_str()
-                    );
-                }
-            }
-            // A deny never fetches, so the PDF caveat is for allow rules
-            // only.
-            if rule.tier == Some(RuleTier::Two) && crate::mcp::server::is_pdf_url_like(url.as_str())
-            {
-                out.push('\n');
-                let _ = writeln!(out, "{PDF_TIER2_WARNING}");
-            }
+            let _ = writeln!(out, "Effect: allowed.");
         }
     }
 }
@@ -280,13 +224,6 @@ mod tests {
         s
     }
 
-    fn tier2() -> UrlRule {
-        UrlRule {
-            tier: Some(RuleTier::Two),
-            ..UrlRule::default()
-        }
-    }
-
     fn deny(message: &str) -> UrlRule {
         UrlRule {
             action: RuleAction::Deny,
@@ -303,21 +240,6 @@ mod tests {
     fn render_with(url: &str, section: &RulesSection, origin: &Origin<'_>) -> String {
         let set = RuleSet::compile(section).expect("test rules compile");
         render_test(&url::Url::parse(url).unwrap(), section, &set, origin)
-    }
-
-    #[test]
-    fn tier2_winner_on_a_pdf_shaped_url_warns() {
-        let s = section(&[("papers.example", tier2())]);
-        let out = render("https://papers.example/pdf/2401.00001.pdf", &s);
-        assert!(out.contains(PDF_TIER2_WARNING), "{out}");
-    }
-
-    #[test]
-    fn tier2_winner_on_an_html_url_of_the_same_host_does_not_warn() {
-        let s = section(&[("papers.example", tier2())]);
-        let out = render("https://papers.example/abs/2401.00001", &s);
-        assert!(out.contains("* papers.example"), "{out}");
-        assert!(!out.contains("warning:"), "{out}");
     }
 
     #[test]
@@ -353,7 +275,7 @@ mod tests {
         };
         let s = section(&[
             ("example.com", deny("the whole tree")),
-            ("www.example.com", tier2()),
+            ("www.example.com", UrlRule::default()),
             ("https://www.example.com", disabled),
             ("other.org", deny("never matches")),
         ]);
@@ -386,9 +308,9 @@ mod tests {
 
     #[test]
     fn winner_fields_name_the_layer_each_came_from() {
-        let s = section(&[("www.example.com", tier2())]);
+        let s = section(&[("www.example.com", UrlRule::default())]);
         let out = render_with("https://www.example.com/", &s, &|path| {
-            (path == ["rules", "url", "www.example.com", "tier"])
+            (path == ["rules", "url", "www.example.com", "action"])
                 .then(|| "file:/etc/donsetch.toml".to_string())
         });
         let line = |name: &str| {
@@ -398,10 +320,9 @@ mod tests {
                 .to_string()
         };
         assert!(
-            line("tier ").ends_with("(file:/etc/donsetch.toml)"),
+            line("action").ends_with("(file:/etc/donsetch.toml)"),
             "{out}"
         );
-        assert!(line("tier_enforce").ends_with("(default)"), "{out}");
     }
 
     #[test]

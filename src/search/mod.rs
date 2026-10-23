@@ -1485,7 +1485,7 @@ mod tests {
             // The mock proxy terminates the tunnel with a self-signed cert
             // for api.ipify.org; the client trusts it through SSL_CERT_FILE
             // (the engine's BoringSSL reads default verify paths from
-            // SSL_CERT_FILE/SSL_CERT_DIR, same as the old tier did).
+            // SSL_CERT_FILE/SSL_CERT_DIR, same as the old transport did).
             let cert = rcgen::generate_simple_self_signed(vec!["api.ipify.org".into()]).unwrap();
             let bundle = crate::paths::cache_dir().join("owned-probe-ca.pem");
             std::fs::write(&bundle, cert.cert.pem()).unwrap();

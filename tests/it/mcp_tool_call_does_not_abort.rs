@@ -94,7 +94,7 @@ fn mcp_fetch_answers_instead_of_aborting() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cli","version":"2.0.16"}}}"#.to_string(),
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
         format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"web_fetch","arguments":{{"url":"{url}","tier":"1","max_chars":600}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"web_fetch","arguments":{{"url":"{url}","max_chars":600}}}}}}"#
         ),
     ] {
         stdin.write_all(msg.as_bytes()).unwrap();

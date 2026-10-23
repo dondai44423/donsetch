@@ -4,12 +4,12 @@
 //! targets, and integration tests):
 //!
 //! - [`extract`] : DonSift: HTML/PDF bytes → agent-native markdown
-//! - [`fetch`] : DonShadow: the tier-1 stealthy HTTP client
-//! - [`ghost`] : DonGhost: tier-2 headless-Chromium escalation
+//! - [`fetch`] : the fetch pipeline riding the in-tree engine
+//! - [`ghost`] : the managed browser (screenshot and actions runs)
 //! - [`search`] : DonSeek: keyless multi-engine search
 //! - [`crawl`] : DonTread: sitemap-aware site walking
 //! - [`detect`] : wall/bot detection verdicts
-//! - [`rules`] : the operator's per-domain rules (deny, tier pin)
+//! - [`rules`] : the operator's per-domain rules (deny)
 //! - [`mcp`] : the stdio MCP daemon + tool dispatch
 //! - [`spec`] : the tool spec table (MCP + CLI are generated from it)
 //!

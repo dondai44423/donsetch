@@ -1,9 +1,9 @@
 //! `web_screenshot` MCP tool (issue #171).
 //!
-//! A rendered PNG of a page, via the same tier-2 browser the fetch
-//! tool escalates to. No new trust surface: the URL passes the same
-//! guards, the browser is the same pool, the bytes stay in this
-//! process for the caller's token budget to decide on.
+//! A rendered PNG of a page, via DonSeTch's browser. No new trust
+//! surface: the URL passes the same guards, the browser is the
+//! same pool, the bytes stay in this process for the caller's
+//! token budget to decide on.
 
 use std::sync::Arc;
 use std::time::Duration;

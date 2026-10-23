@@ -43,24 +43,6 @@ fn html_server() -> String {
     format!("http://{addr}/")
 }
 
-/// A PATH that resolves `which` and nothing else: `which Xvfb` then fails,
-/// which is how the ghost tier decides Xvfb is not installed.
-#[cfg(target_os = "linux")]
-fn path_without_xvfb() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("donsetch-noxvfb-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let link = dir.join("which");
-    if !link.exists() {
-        let real = ["/usr/bin/which", "/bin/which"]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists());
-        if let Some(real) = real {
-            let _ = std::os::unix::fs::symlink(real, &link);
-        }
-    }
-    dir
-}
-
 fn child(env_path: Option<PathBuf>) -> Child {
     let dir = std::env::temp_dir().join(format!("donsetch-364-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -118,7 +100,7 @@ fn drive(child: &mut Child, url: &str, stderr_closed: bool) -> (Option<String>, 
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}"#.to_string(),
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
         format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"web_fetch","arguments":{{"url":"{url}","tier":"2","max_chars":600}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"web_fetch","arguments":{{"url":"{url}","max_chars":600}}}}}}"#
         ),
     ] {
         let _ = stdin.write_all(msg.as_bytes());
@@ -157,38 +139,6 @@ fn mcp_startup_survives_a_closed_stderr_pipe() {
     assert!(
         status.code().is_some(),
         "the daemon was killed by a signal at startup: {status:?}"
-    );
-}
-
-/// The reported line: with Xvfb invisible to `which`, the ghost tier
-/// writes its install hint. The open-stderr control proves the write
-/// really happens in this configuration; the closed-stderr run then
-/// proves it cannot kill the session, work included.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_missing_xvfb_hint_cannot_kill_a_closed_stderr_session() {
-    let url = html_server();
-    let no_xvfb = path_without_xvfb();
-
-    let mut control = child(Some(no_xvfb.clone()));
-    let (control_answer, err_text) = drive(&mut control, &url, false);
-    let control_status = wait(&mut control);
-    assert!(
-        err_text.contains("[ghost] Xvfb not found"),
-        "the control run must reach the hint, or the closed-stderr case below \
-         proves nothing; stderr was: {err_text:?} ({control_status:?}, answer: {control_answer:?})"
-    );
-
-    let mut c = child(Some(no_xvfb));
-    let (answer, _) = drive(&mut c, &url, true);
-    let status = wait(&mut c);
-    assert!(
-        answer.is_some(),
-        "no answer with the hint line on a closed stderr: {status:?}"
-    );
-    assert!(
-        status.code().is_some(),
-        "the daemon was killed by a signal on the hint write: {status:?}"
     );
 }
 

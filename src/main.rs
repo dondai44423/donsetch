@@ -35,7 +35,7 @@ fn load_and_install_config(args: &[String]) -> &'static config::DonsetchConfig {
         }
     }
     // `--ignore-rules` is the same switch as `[rules] mode = "off"`, so
-    // the two cannot drift apart: tier pins go with the denies. Only the
+    // the two cannot drift apart. Only the
     // commands that declare the flag honor it; clap rejects it anywhere
     // else before any work runs.
     if args

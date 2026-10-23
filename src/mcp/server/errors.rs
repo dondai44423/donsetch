@@ -101,17 +101,13 @@ pub(super) fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String 
                 _ => format!("blocked: {url} returned HTTP {status}"),
             }
         }
-        Verdict::Challenge(v) => format!(
-            "bot wall: {url} is protected by {:?} (try fetch with tier=2 for headless browser)",
-            v
-        ),
+        Verdict::Challenge(v) => format!("bot wall: {url} is protected by {:?}", v),
         Verdict::ContentOk => format!("unexpected error: {url} (status {status})"),
     }
 }
 
-/// The fetch tool: tier 1 → verdict → ghost solve/render
-/// → DonSift. Ports the CLI escalation into the daemon,
-/// with warm-start and render cache.
+/// The fetch tool's deadline envelope: the call exceeded
+/// `deadline_ms`; the folded trace shows what was attempted.
 #[allow(clippy::field_reassign_with_default)]
 pub(super) fn deadline_error(url: &str) -> Value {
     let mut trace = Trace::default();
@@ -122,7 +118,7 @@ pub(super) fn deadline_error(url: &str) -> Value {
         Some(json!({
             "url": url,
             "escalation": trace.value(),
-            "next_action": "retry with a higher deadline_ms, or tier=1 (skips browser escalation : the usual deadline eater on walled sites)",
+            "next_action": "retry with a higher deadline_ms",
         })),
     )
 }
@@ -259,7 +255,6 @@ fn has_standalone_digits(text: &str, needle: &str) -> bool {
 /// | network.dns / network.timeout / network.ratelimit | transport |
 /// | browser.transport / browser.timeout | browser automation |
 /// | wall.challenge / wall.challenge_unsolved / wall.empty_shell / wall.captcha / wall.paywall / wall.auth | blocked |
-/// | cloak.suspected | tier-1 content is likely decoy |
 /// | content.notfound / content.binary / content.oversize / content.extract / content.incomplete | body |
 /// | guard.ssrf | blocked by design |
 /// | `policy.denied.<reason>` | excluded by the operator's local DonSeTch rules; `<reason>` is the rule's subcode, or `unspecified`. Always three segments: prefix-match `policy.denied`, never the whole code |
@@ -561,10 +556,10 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
             "verify the URL (typo? deleted page?) : or web_search the page title to find the moved copy".into()
         }
         Some(Verdict::Challenge(_)) if kind == "walled" => {
-            "interactive verification needed; no automated captcha-solving path (by design DonSeTch does not solve captchas)".into()
+            "interactive verification needed : the local system does not solve interactive captchas".into()
         }
         Some(Verdict::Challenge(_)) => {
-            "retry with tier=2 (or tier=auto) : the headless browser solves most JS/cookie challenges".into()
+            "retry later : this challenge may clear on its own".into()
         }
         Some(Verdict::Blocked) => match status {
             429 => "rate limited : wait 30-60s and retry".into(),
@@ -575,7 +570,7 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
             "network failure : a retry may work; if repeated, check this host from another network or choose another source".into()
         }
         _ if kind == "walled" => {
-            "no extractable content behind the wall : use an interactive agent browser for this site".into()
+            "no extractable content behind the wall : use an interactive browser session for this site".into()
         }
         _ if kind == "tls.verify" => {
             "the interception CA is not trusted: export SSL_CERT_FILE pointing at the network's CA bundle and retry (donsetch doctor reports both trust stores)".into()
@@ -601,8 +596,8 @@ pub(super) fn transport_next_action(e: &FetchError, kind: &str) -> String {
     }
 }
 
-/// Escalation trace: the ordered record of what DonSeTch tried :
-/// HTTP → browser → OCR-style fallbacks : with tier, action,
+/// The fetch trace: the ordered record of what DonSeTch tried :
+/// route → local fetch → wall handling : with stage, action,
 /// outcome and per-step latency. Successes expose it through client-only
 /// `_meta`; errors retain actionable state on the model surface.
 #[derive(Default)]
@@ -622,7 +617,7 @@ impl Trace {
     pub(super) fn observe_browser(&mut self, document: &crate::ghost::document::Document) {
         self.browser_document = Some(document.clone());
         self.step(
-            "2",
+            "browser",
             "browser-document",
             &format!(
                 "generation={} status={}",
@@ -635,9 +630,9 @@ impl Trace {
             0,
         );
     }
-    pub(super) fn step(&mut self, tier: &str, action: &str, outcome: &str, ms: u128) {
+    pub(super) fn step(&mut self, stage: &str, action: &str, outcome: &str, ms: u128) {
         let step = json!({
-            "tier": tier,
+            "stage": stage,
             "action": action,
             "outcome": outcome,
             "ms": ms,
@@ -1181,7 +1176,7 @@ mod error_code_tests {
         let wall = json!({"verdict": "Challenge(Cloudflare)", "status": 403});
         assert_eq!(
             error_code(
-                "bot wall: http://127.0.0.1:42945/wall is protected by Cloudflare (try fetch with tier=2 for headless browser)",
+                "bot wall: http://127.0.0.1:42945/wall is protected by Cloudflare",
                 Some(&wall)
             ),
             "wall.challenge"
@@ -1228,17 +1223,14 @@ mod error_code_tests {
     #[test]
     pub(super) fn off_list_enum_args_are_a_tool_error() {
         let args = json!({ "url": "https://example.com", "tier": "3" });
-        let v = invalid_args_error("web_fetch", &args).expect("tier=3 must be refused");
+        let v = invalid_args_error("web_fetch", &args).expect("tier must be refused");
         assert_eq!(v["isError"], false);
         assert_eq!(v["structuredContent"]["ok"], false);
         assert_eq!(v["errorKind"], "permanent");
         assert_eq!(v["code"], "fetch.invalid");
         assert_eq!(v["structuredContent"]["code"], "fetch.invalid");
         let text = v["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.starts_with(r#"fetch: tier must be one of "auto", "1", "2"; got "3""#),
-            "{text}"
-        );
+        assert!(text.starts_with("fetch: tier was removed"), "{text}");
         assert!(text.contains("Next action:"), "{text}");
 
         let args = json!({ "url": "https://example.com", "mode": "asdf" });
@@ -1275,8 +1267,8 @@ mod error_code_tests {
 
     #[test]
     pub(super) fn listed_enum_args_and_unknown_tools_pass_through() {
-        let args = json!({ "url": "https://example.com", "tier": "2" });
-        assert!(invalid_args_error("web_fetch", &args).is_none());
+        let args = json!({ "query": "x", "intent": "web" });
+        assert!(invalid_args_error("web_search", &args).is_none());
         assert!(
             invalid_args_error("web_fetch", &json!({ "url": "https://example.com" })).is_none()
         );
@@ -1500,7 +1492,7 @@ mod policy_tests {
             "permanent",
             None,
         );
-        let trace = json!([{"tier": "1", "action": "fetch", "outcome": "denied", "ms": 0}]);
+        let trace = json!([{"stage": "local", "action": "fetch", "outcome": "denied", "ms": 0}]);
         let v = policy_error_value(&e, url, Some(trace.clone()));
         assert_eq!(v["code"], crate::rules::policy_code(None));
         assert_eq!(v["code"], "policy.denied.unspecified");

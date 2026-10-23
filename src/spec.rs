@@ -233,7 +233,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Probe mode: verify the page mentions a string/pattern WITHOUT loading it into context. Output = MATCH/NO-MATCH verdict + up to 3 short context excerpts. Case-insensitive substring, or /regex/ (e.g. \"/CVE-2026-\\d+/\"). Full fetch still happens (tiers, walls, PDFs) : only the output collapses. For verification questions, not reading.",
+        help: "Probe mode: verify the page mentions a string/pattern WITHOUT loading it into context. Output = MATCH/NO-MATCH verdict + up to 3 short context excerpts. Case-insensitive substring, or /regex/ (e.g. \"/CVE-2026-\\d+/\"). Full fetch still happens (walls, PDFs) : only the output collapses. For verification questions, not reading.",
         mcp_help: Some(
             "Case-insensitive string or /regex/ presence check. Returns MATCH/NO-MATCH and up to 3 excerpts instead of the full page; use for verification, not general reading.",
         ),
@@ -247,17 +247,6 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         help: "CSS selector : extract only from matching elements. Narrows scope precisely.",
         mcp_help: Some(
             "CSS selector for extracting only matching elements. Set only when the selector is known; focus may filter passages inside that region.",
-        ),
-    },
-    ParamSpec {
-        name: "tier",
-        flag: "tier",
-        kind: ParamKind::Enum(&["auto", "1", "2"]),
-        cli: CliKind::Flag,
-        required: false,
-        help: "auto (default, always use for real work): HTTP first, auto-escalates to headless browser on bot-walls/JS-shells, auto-detects and parses PDFs. \"1\" (testing): HTTP only, no browser : fails on JS sites. \"2\" (testing): browser directly : slower, skips HTTP entirely.",
-        mcp_help: Some(
-            "auto (default): HTTP first, escalating to a browser on bot-walls/JS-shells; parses PDFs. \"1\": HTTP only, no browser (fails on JS sites). \"2\": browser directly, skips HTTP (slower).",
         ),
     },
     ParamSpec {
@@ -288,9 +277,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::ActionList,
         cli: CliKind::Flag,
         required: false,
-        help: "Browser steps to run BEFORE extraction : page control inside fetch: [{\"do\":\"click\",\"selector\":\"#load-more\"},{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"query\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]. Steps: wait {ms}, wait_selector {selector,timeout_ms}, wait_text {text,timeout_ms}, click {selector OR text}, hover, type {selector?,text}, press {key: Enter|Tab|Escape|Backspace|ArrowDown|...}, scroll {to: top|bottom|down | px}. Max 16 steps. Actions run in the headless browser (tier auto/2, never 1); after them the page is extracted normally : focus/section/toc still apply. First failing step aborts honestly with per-step results in structuredContent.actions; fix that step and re-run.",
+        help: "Browser steps to run BEFORE extraction : page control inside fetch: [{\"do\":\"click\",\"selector\":\"#load-more\"},{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"query\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]. Steps: wait {ms}, wait_selector {selector,timeout_ms}, wait_text {text,timeout_ms}, click {selector OR text}, hover, type {selector?,text}, press {key: Enter|Tab|Escape|Backspace|ArrowDown|...}, scroll {to: top|bottom|down | px}. Max 16 steps. Actions run in a browser; after them the page is extracted normally : focus/section/toc still apply. First failing step aborts honestly with per-step results in structuredContent.actions; fix that step and re-run.",
         mcp_help: Some(
-            "Any action routes the fetch through the browser tier; omit for static reads. Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported.",
+            "Any action routes the fetch through a browser; omit for static reads. Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported.",
         ),
     },
     ParamSpec {
@@ -572,9 +561,9 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_fetch",
         cli_cmd: "fetch",
-        summary: "Fetch a URL as clean markdown (auto bot-wall bypass, PDF, JS render)",
-        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay plain HTTP at any tier; bot walls auto-escalate to a headless browser, solve, and hand back to fast HTTP; known-walled sites that return decoy content to plain HTTP get an equivalence check (decoy_suspected flag). At tier=auto, JS-only pages can escalate to the browser; use actions only when page interaction is needed. Any action forces the browser tier. Deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, cloak warning, thin (present only when the read is a suspected shell), and error code/next_action. Transport tier, timing, quality, adapter and escalation diagnostics live in _meta.",
-        mcp_description: "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints at every tier; HTML may escalate to a browser and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
+        summary: "Fetch a URL as clean markdown (in-process JS, PDF, honest failures)",
+        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay at the local fetch; bot walls fail honestly and fast (a configured unlocker gets one try); a JS-only page runs its scripts in the in-process engine before it is given up on. Use actions only when page interaction is needed; any action routes the fetch through a browser. Deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, thin (present only when the read is a suspected shell), and error code/next_action. Fetch mode, timing, quality, adapter and escalation diagnostics live in _meta.",
+        mcp_description: "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints locally; pages run their scripts in-process and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
         params: FETCH_PARAMS,
         examples: &[
             "donsetch fetch https://example.com/article",
@@ -616,7 +605,7 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_screenshot",
         cli_cmd: "screenshot",
         summary: "Open a URL in a real browser, return the page as PNG",
-        description: "A rendered PNG of a page: DonSeTch opens the URL in the same tier-2 browser it already keeps for challenge walls, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport. The result carries the PNG inline plus [meta] JSON {path, bytes}; the path is server-local, under the screenshots dir of the cache root, and full-page captures can run several MB.",
+        description: "A rendered PNG of a page: DonSeTch opens the URL in its browser, waits for the load, and returns the capture as PNG bytes. Deeper truth for any page that lies without JavaScript, and a visual receipt for scripts and logins. The capture is in-process only (nothing posted anywhere); the caller decides whether the pixels are worth their tokens. full_page asks the browser to capture beyond the viewport. The result carries the PNG inline plus [meta] JSON {path, bytes}; the path is server-local, under the screenshots dir of the cache root, and full-page captures can run several MB.",
         mcp_description: "Capture a URL as a rendered PNG in the browser. Returns an image content block and [meta] JSON with path and bytes. The path is server-local; use the inline image on remote clients. Full-page captures can be several MB. Private/loopback URLs are blocked like fetch. Failures return ok:false, code and next_action.",
         params: SCREENSHOT_PARAMS,
         examples: &[
@@ -647,6 +636,12 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
             // learn it is gone (live web only), not keep retrying it.
             if name == "archive" && tool.name == "web_fetch" {
                 return Err("archive was removed: web_fetch returns live page content only".into());
+            }
+            if name == "tier" && tool.name == "web_fetch" {
+                return Err(
+                    "tier was removed: every web_fetch runs the local engine, with no browser tier"
+                        .into(),
+                );
             }
             return Err(format!(
                 "unknown parameter {name:?}; use the current tools/list schema"
@@ -790,7 +785,7 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
 // ── CLI generation ───────────────────────────────────────────
 
 /// The CLI commands that take `--ignore-rules`: the tools that fetch
-/// a caller's URL, which a local rule can deny or pin to a tier.
+/// a caller's URL, which a local rule can deny.
 pub const IGNORE_RULES_COMMANDS: &[&str] = &["fetch", "crawl", "screenshot"];
 
 /// Build the clap subcommand for one tool. `--json` and
@@ -806,13 +801,13 @@ pub fn cli_command(tool: &ToolSpec) -> clap::Command {
     let cli_long = match tool.cli_cmd {
         "fetch" => {
             "Fetch one URL (or several) as clean markdown. \
-Redirects, bot walls and JS-shells escalate automatically through two \
-tiers; the output tells you what happened at every step. \
+Redirects, bot walls and JS-shells are handled in one local engine; \
+the output tells you what happened at every step. \
 Use --focus to narrow the content, --must-contain for a cheap \
 probe, or pass a URL from donsetch search to fetch that result. \
 MCP search handles belong to their server session and cannot be reused \
 in a separate CLI invocation. \
---actions sends clicks/typing to a headless browser for \
+--actions sends clicks/typing to a browser for \
 sites that need interaction."
         }
         "search" => {
@@ -875,7 +870,7 @@ you can pass with --resume to continue later."
                 .action(ArgAction::SetTrue)
                 .help(
                     "Run as if the local DonSeTch rules ([rules] in donsetch.toml) were empty: \
-                     no rule denies the URL or pins its tier. CLI only.",
+                     no rule denies the URL. CLI only.",
                 ),
         );
     }
@@ -1104,31 +1099,6 @@ mod tests {
 
     #[test]
     fn enum_args_outside_the_spec_are_refused() {
-        let fetch = fetch_tool();
-        let bad_values = [
-            json!("3"),
-            json!("asdf"),
-            json!("browser"),
-            json!(""),
-            json!("AUTO"),
-            json!(" auto"),
-            json!(2),
-            json!(true),
-            json!(["auto"]),
-            json!({ "tier": "auto" }),
-        ];
-        for bad in &bad_values {
-            let args = json!({ "url": "https://example.com", "tier": bad });
-            let err = check_args(fetch, &args).expect_err("off-list tier accepted");
-            assert!(
-                err.contains(r#"tier must be one of "auto", "1", "2""#),
-                "{err}"
-            );
-        }
-        assert_eq!(
-            check_args(fetch, &json!({ "tier": "3" })),
-            Err(r#"tier must be one of "auto", "1", "2"; got "3""#.to_string())
-        );
         for bad in ["asdf", "images", "Code"] {
             let args = json!({ "intent": bad });
             assert!(check_args(search_tool(), &args).is_err(), "{bad}");
@@ -1157,6 +1127,20 @@ mod tests {
         let err = check_args(search_tool(), &json!({ "query": "x", "archive": "auto" }))
             .expect_err("archive is not a search parameter");
         assert!(err.contains("unknown parameter"), "{err}");
+    }
+
+    // The tier argument was removed with the browser tier (v5): every
+    // fetch runs the one local engine. A learned `tier` gets the
+    // removal spelled out, like `archive`.
+    #[test]
+    fn removed_tier_argument_gets_a_removal_note() {
+        let err = check_args(
+            fetch_tool(),
+            &json!({ "url": "https://example.com", "tier": "1" }),
+        )
+        .expect_err("tier must not be accepted");
+        assert!(err.contains("tier was removed"), "{err}");
+        assert!(err.contains("local engine"), "{err}");
     }
 
     #[test]
@@ -1190,9 +1174,11 @@ mod tests {
         let schema = mcp_schema(fetch_tool());
         let actions = &schema["inputSchema"]["properties"]["actions"];
         let help = actions["description"].as_str().unwrap();
-        assert!(help.starts_with(
-            "Any action routes the fetch through the browser tier; omit for static reads."
-        ));
+        assert!(
+            help.starts_with(
+                "Any action routes the fetch through a browser; omit for static reads."
+            )
+        );
         assert!(
             !schema["inputSchema"]["required"]
                 .as_array()

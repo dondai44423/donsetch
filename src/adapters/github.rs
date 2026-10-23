@@ -317,9 +317,7 @@ fn render_thread_modern(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
     // Comments stream via JS : say so instead of silently
     // omitting the discussion.
     if doc.select(&skeleton_sel).next().is_some() {
-        md.push_str(
-            "*(comments load dynamically : re-fetch with tier=2 to read the discussion)*\n",
-        );
+        md.push_str("*(comments load dynamically : not part of this read)*\n");
     }
     Some(md.trim_end().to_string())
 }

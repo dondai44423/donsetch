@@ -416,7 +416,7 @@ fn logout_wipes_the_tier1_echo() {
     isolate_state();
     let mut reg = AuthRegistry::load();
     let _ = reg.remove("alpha.test");
-    // Keep this hermetic: no tier-2 browser, just sync the jar
+    // Keep this hermetic: no browser, just sync the jar
     // records the same way sync_warm_cookies would.
     {
         let mut state = GhostState::load();

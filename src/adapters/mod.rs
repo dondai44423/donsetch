@@ -4,7 +4,7 @@
 //! Two hooks, one registry:
 //! - [`rewrite`] : fetch-level: some pages have a *better* URL
 //!   (the site's own public JSON endpoint). Rewriting gets
-//!   structured truth in ONE cheap tier-1 request and often
+//!   structured truth in ONE cheap local request and often
 //!   skips the wall entirely (registry CDNs don't challenge).
 //! - [`extract_json`] / [`extract_html`] : extract-level: pages
 //!   whose HTML the generic pipeline mangles (GitHub issues,

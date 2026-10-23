@@ -1,8 +1,8 @@
 //! Per-domain rules: the operator's `[rules.url."<pattern>"]` table.
 //!
 //! A rule is keyed by a host pattern and can refuse a fetch with the
-//! operator's own message, or pin the tier for that host. DonSeTch ships no
-//! rules of its own: the table is empty unless the operator writes one.
+//! operator's own message. DonSeTch ships no rules of its own: the table
+//! is empty unless the operator writes one.
 //!
 //! v1 keys match the host and the scheme, nothing else:
 //!
@@ -34,8 +34,7 @@ use crate::error::FetchError;
 // Config types (deserialized from [rules] in donsetch.toml)
 // ---------------------------------------------------------------------------
 
-/// The switch on the whole mechanism. `Off` runs as if the table were empty,
-/// tier pins included.
+/// The switch on the whole mechanism. `Off` runs as if the table were empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RulesMode {
@@ -130,32 +129,6 @@ pub fn kind_phrase(kind: &str) -> &'static str {
     DenyKind::from_kind_str(kind).phrase()
 }
 
-/// The tier a rule asks for, spelled like the `tier` tool argument.
-///
-/// `Auto` with `tier_enforce` makes the host ignore a per-call tier.
-/// Without `tier_enforce` it changes nothing, and is accepted so that a
-/// higher config layer can cancel a lower layer's pin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum RuleTier {
-    #[serde(rename = "auto")]
-    Auto,
-    #[serde(rename = "1")]
-    One,
-    #[serde(rename = "2")]
-    Two,
-}
-
-impl RuleTier {
-    /// The tool-argument spelling: `"auto"`, `"1"` or `"2"`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::One => "1",
-            Self::Two => "2",
-        }
-    }
-}
-
 /// One `[rules.url."<pattern>"]` entry, after layer merging.
 ///
 /// Fields that do not apply to `action` are ignored, not rejected:
@@ -174,10 +147,6 @@ pub struct UrlRule {
     /// Subcode of the denial's error code, `[a-z0-9_]+`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tier: Option<RuleTier>,
-    /// `true` makes `tier` win over an explicit per-call `tier` argument.
-    pub tier_enforce: bool,
 }
 
 impl Default for UrlRule {
@@ -188,8 +157,6 @@ impl Default for UrlRule {
             message: None,
             kind: DenyKind::Walled,
             reason: None,
-            tier: None,
-            tier_enforce: false,
         }
     }
 }
@@ -1077,29 +1044,19 @@ mod tests {
         assert!(e.is_err());
         let e = serde_json::from_value::<RulesSection>(serde_json::json!({"rule": {}}));
         assert!(e.is_err());
-        let e = serde_json::from_value::<UrlRule>(serde_json::json!({"tier": "3"}));
+        // A retired field is a load error, not a silent no-op.
+        let e = serde_json::from_value::<UrlRule>(serde_json::json!({"tier": "2"}));
         assert!(e.is_err());
         // The negative case: every known field, spelled as in the TOML.
         let r: UrlRule = serde_json::from_value(serde_json::json!({
             "enabled": true, "action": "deny", "message": "m", "kind": "permanent",
-            "reason": "ip_ban", "tier": "2", "tier_enforce": true
+            "reason": "ip_ban"
         }))
         .unwrap();
-        assert_eq!(r.tier, Some(RuleTier::Two));
         assert_eq!(r.kind, DenyKind::Permanent);
         let s: RulesSection = serde_json::from_value(serde_json::json!({"mode": "off"})).unwrap();
         assert_eq!(s.mode, RulesMode::Off);
         assert_eq!(s.crawl_denied_urls_per_rule, 20);
-        // "auto" is a valid tier, advisory or enforced.
-        let r: UrlRule = serde_json::from_value(serde_json::json!({"tier": "auto"})).unwrap();
-        assert_eq!(r.tier, Some(RuleTier::Auto));
-        assert!(
-            RuleSet::compile(&RulesSection {
-                url: [("example.com".to_string(), r)].into_iter().collect(),
-                ..Default::default()
-            })
-            .is_ok()
-        );
     }
 
     #[test]
@@ -1112,7 +1069,6 @@ mod tests {
         assert!(r.enabled);
         assert_eq!(r.action, RuleAction::Allow);
         assert_eq!(r.kind, DenyKind::Walled);
-        assert!(!r.tier_enforce);
         assert!(RuleSet::compile(&s).unwrap().is_empty());
     }
 
@@ -1274,19 +1230,15 @@ mod tests {
     }
 
     #[test]
-    fn narrow_tier_only_rule_replaces_a_broader_deny() {
-        let tier_only = UrlRule {
-            tier: Some(RuleTier::Two),
-            ..UrlRule::default()
-        };
+    fn narrow_allow_rule_replaces_a_broader_deny() {
+        let allow_rule = UrlRule::default();
         let set = compile(vec![
             ("banned.example", deny("use a browser")),
-            ("www.banned.example", tier_only),
+            ("www.banned.example", allow_rule),
         ]);
         let won = set.eval(&url("https://www.banned.example/x")).unwrap();
         assert_eq!(won.key, "www.banned.example");
         assert_eq!(won.rule.action, RuleAction::Allow);
-        assert_eq!(won.rule.tier, Some(RuleTier::Two));
         assert_eq!(set.denial(&url("https://www.banned.example/x")), None);
         // The negative case: the apex is still denied.
         assert!(set.denial(&url("https://banned.example/x")).is_some());
@@ -1394,7 +1346,5 @@ mod tests {
             "another source may have this content"
         );
         assert_eq!(RulesMode::Off.as_str(), "off");
-        assert_eq!(RuleTier::One.as_str(), "1");
-        assert_eq!(RuleTier::Auto.as_str(), "auto");
     }
 }

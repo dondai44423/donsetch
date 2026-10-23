@@ -1032,10 +1032,10 @@ fn downstream(
         focus_omitted = false;
         kept = all_blocks.iter().collect();
     }
-    // JS-shell warning: agent must know the content
-    // below is likely incomplete. On tier=auto the MCP
-    // fetch escalates to the browser itself : this note
-    // only surfaces on an explicit tier=1 request.
+    // JS-shell warning: the agent must know the content
+    // below is likely incomplete : the local engine could
+    // not hydrate this page. Thin reads keep the note;
+    // the fetch tool fails this class honestly instead.
     //
     // Thinness: the extraction yield is the truth. Any page over
     // 5KB that yields < 800 chars is a shell (the 27KB-challenge-
@@ -1079,7 +1079,7 @@ fn downstream(
             || is_shell);
     if thin {
         full = format!(
-            "*[note: large page rendered almost no content : likely JS-rendered (SPA). Content below may be a shell; use tier=auto to render with a real browser.]*\n\n{full}"
+            "*[note: large page rendered almost no content : likely JS-rendered (SPA). Content below may be a shell.]*\n\n{full}"
         );
     }
     let (slice, next) = paginate(&full, opts.offset, max_chars);

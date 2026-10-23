@@ -25,7 +25,7 @@ pub enum Verdict {
     /// Bot-wall challenge page (maybe JS-less cookie challenge, maybe
     /// full JS challenge). Vendor identified when possible.
     Challenge(Vendor),
-    /// Hard block page (no path forward at this tier).
+    /// Hard block page (no path forward).
     Blocked,
     /// Login required.
     AuthWall,
@@ -50,8 +50,8 @@ pub fn human_verification_wall(body: &[u8], verdict: Verdict) -> bool {
     doc.select(&selector).next().is_some()
 }
 
-/// Whether an HTTP denial warrants a browser observation. Explicit tier and
-/// deadline checks belong to the caller; this policy is shared by fetch/crawl.
+/// Whether an HTTP denial warrants a browser observation. Deadline checks
+/// belong to the caller.
 pub fn browser_recovery(
     status: u16,
     headers: &[(String, String)],
@@ -1515,8 +1515,8 @@ mod tests {
     /// glassdoor 2026-09 golden fixture: CF block pages put EVERY
     /// challenge marker past the 64KB narrow window (nearest at
     /// byte ~126k inside a 241KB bilingual shell). The 403 must be
-    /// a Challenge, never a Blocked (Blocked skips escalation and
-    /// the fetch dies on tier 1 alone).
+    /// a Challenge, never a Blocked (Blocked reads as a terminal block,
+    /// not a wall class).
     #[test]
     fn glassdoor_cf_block_markers_beyond_64k() {
         let mut body = vec![b' '; 150_000]; // bilingual shell padding
@@ -1544,7 +1544,7 @@ mod tests {
 
 // Reddit's 2026 JS-challenge: a nonce form auto-submitting
 // itself with essentially no prose (live case: the whole
-// r/technology shell scored ContentOk at tier 1).
+// r/technology shell scored ContentOk on the local fetch).
 #[test]
 fn reddit_nonce_form_shell_is_challenge() {
     let body = "<!doctype html><html><head><title>Reddit</title></head><body><form><input type=hidden name=nonce value=a4e5c47fd8fd981e></form><script>document.forms[0].submit()</script></body></html>";

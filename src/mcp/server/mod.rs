@@ -32,7 +32,6 @@ use crate::search::{self, Searcher};
 use errors::*;
 // The uniform failure predicate (v4.7 envelope) : the CLI's exit-code and
 // rendering paths branch on the same signal the wire carries.
-pub(crate) use crate::fetch::guards::is_pdf_url_like;
 pub(crate) use errors::is_failure;
 use fetch_tool::*;
 

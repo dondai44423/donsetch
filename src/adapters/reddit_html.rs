@@ -48,7 +48,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     } else {
         // Listings, and any other page carrying posts (search
         // results, a ghost-rendered profile feed). Profile pages
-        // as served at tier 1 carry their pinned/recent items and
+        // as served locally carry their pinned/recent items and
         // stream the rest; the card keys on the user, not the
         // feed item's "u_<name>" prefixed label.
         render_listing(&doc, html).map(|(md, mut title, n)| {

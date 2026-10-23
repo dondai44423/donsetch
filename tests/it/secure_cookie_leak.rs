@@ -1,7 +1,7 @@
 //! Live regression: a cookie jar that honors the `Secure`
 //! attribute, end to end.
 //!
-//! The report (GHSA draft, mnaza) observed the tier-1 jar drops the
+//! The report (GHSA draft, mnaza) observed the jar drops the
 //! secure flag when it parses Set-Cookie and when it imports
 //! harvested cookies, so a Secure cookie replays over plain HTTP.
 //! This test runs a real TCP server and a real Fetcher: /set hands
