@@ -582,9 +582,9 @@ fn prune_hosts(hosts: &mut HashMap<String, HostPenalty>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::proxy::Proxy;
     use crate::fetch::client::Fetcher;
     use crate::search::egress::EgressPool;
-    use crate::transport::proxy::Proxy;
     use std::sync::Arc;
 
     async fn owned_status_crawl(

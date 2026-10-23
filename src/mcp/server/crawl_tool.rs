@@ -1684,7 +1684,7 @@ mod crawl_output_contract_tests {
                     };
                     FetchedPage {
                         lane,
-                        route: Some(crate::transport::request_route::RequestRoute::direct()),
+                        route: Some(crate::egress::request_route::RequestRoute::direct()),
                         url,
                         status,
                         headers: vec![("content-type".into(), "text/html".into())],

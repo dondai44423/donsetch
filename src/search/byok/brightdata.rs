@@ -159,7 +159,7 @@ pub(crate) async fn search(
 async fn read_serp_body(mut resp: reqwest::Response) -> Result<String, KeyError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(KeyError::from_transport)? {
-        if bytes.len() + chunk.len() > crate::transport::MAX_BODY {
+        if bytes.len() + chunk.len() > crate::egress::MAX_BODY {
             return Err(KeyError::UnknownError(
                 "SERP response exceeded the body cap".into(),
             ));

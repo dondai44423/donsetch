@@ -6,7 +6,7 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::transport::request_route::RequestRoute;
+use crate::egress::request_route::RequestRoute;
 
 /// The caller's whole-call budget, carried into the browser helpers so a
 /// single pass can be sized against what is left of it.
@@ -1481,7 +1481,7 @@ async fn fetch_single_inner(
         },
     };
     if !actions.is_empty() {
-        if is_pdf_url_like(&url) {
+        if crate::fetch::guards::is_pdf_url_like(&url) {
             return tool_error(
                 "fetch: actions cannot run on PDFs : fetch the PDF directly instead",
             );
@@ -1506,7 +1506,7 @@ async fn fetch_single_inner(
     // Uses the SAME helper as the actions guard : covers both the
     // `.pdf` suffix and the `/pdf/` path convention (arXiv serves
     // PDFs at /pdf/1706.03762 with no extension).
-    let is_pdf_url = is_pdf_url_like(&url);
+    let is_pdf_url = crate::fetch::guards::is_pdf_url_like(&url);
     // v4.7 V03: JSON data endpoints (`reddit .json`, API dumps) are
     // terminal at the HTTP tier : a browser cannot improve a
     // structured payload. Same class PDFs and adapter endpoints
@@ -2820,7 +2820,7 @@ pub(super) async fn ghost_escalate(
     shot: Option<&str>,
     trace: &mut Trace,
     budget: Budget,
-    route: &crate::transport::request_route::RequestRoute,
+    route: &crate::egress::request_route::RequestRoute,
     accept_language: Option<&str>,
     session_stamp: &str,
 ) -> Result<(extract::Extracted, &'static str, u16, String, String), GhostFailure> {
@@ -3383,10 +3383,6 @@ pub(super) async fn ghost_escalate(
     ))
 }
 
-/// PDF-shaped URL check for the actions guard (before the main
-/// flow computes its own is_pdf_url). Covers both the .pdf
-/// suffix convention and the /pdf/ path convention (arXiv:
-/// arxiv.org/pdf/1706.03762 serves a PDF with no extension).
 /// Short, sentence-free, identifier-dominated extraction = a
 /// framework shell (React server dumps leak identifiers as DOM
 /// text nodes). Real prose has sentences.
@@ -3470,25 +3466,6 @@ fn content_fail(
         ));
     }
     None
-}
-
-/// Whether the URL is PDF-shaped: its path (query stripped,
-/// case-insensitive) ends in `.pdf`, has a `pdf` segment, or ends in
-/// `/pdf`. `fetch_route` routes such URLs Cold.
-pub(crate) fn is_pdf_url_like(url: &str) -> bool {
-    let path = url.split('?').next().unwrap_or(url).to_lowercase();
-    if path.ends_with(".pdf") {
-        return true;
-    }
-    // Path-segment "/pdf/" or trailing "/pdf" (arXiv, IACR,
-    // many journal endpoints).
-    let no_scheme = path
-        .strip_prefix("https://")
-        .or_else(|| path.strip_prefix("http://"))
-        .unwrap_or(&path);
-    let path_part = no_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
-    let segs: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
-    segs.contains(&"pdf") || path_part.ends_with("/pdf")
 }
 
 /// v4.7 V03: JSON data-endpoint URL check : the path names a `.json`
@@ -5140,7 +5117,7 @@ mod adapter_hop_tests {
                     let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let proxies = [&a, &b].map(|listener| {
-                        crate::transport::proxy::Proxy::parse(&format!(
+                        crate::egress::proxy::Proxy::parse(&format!(
                             "http://{}", listener.local_addr().unwrap()
                         )).unwrap()
                     });
@@ -5690,7 +5667,7 @@ mod rules_tests {
                     let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let proxies = [&a, &b].map(|listener| {
-                        crate::transport::proxy::Proxy::parse(&format!(
+                        crate::egress::proxy::Proxy::parse(&format!(
                             "http://{}",
                             listener.local_addr().unwrap()
                         ))

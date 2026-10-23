@@ -430,11 +430,11 @@ impl BypassFail {
 ///
 /// The unlocker answers with the target page inside a JSON string,
 /// so its body is the page plus quoting. Every other transport stops
-/// at `transport::MAX_BODY`; reqwest's `bytes()` has no cap, and a
+/// at `egress::MAX_BODY`; reqwest's `bytes()` has no cap, and a
 /// page that large was then copied twice more (the decoded body and
 /// the base64 cache line). Read in chunks and stop at the same cap.
 async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, BypassFail> {
-    let cap = crate::transport::MAX_BODY;
+    let cap = crate::egress::MAX_BODY;
     let mut out = Vec::new();
     loop {
         let chunk = resp
@@ -1184,7 +1184,7 @@ mod tests {
             // Consume the request head before answering.
             let mut buf = [0u8; 4096];
             let _ = std::io::Read::read(&mut sock, &mut buf);
-            let total = crate::transport::MAX_BODY + (1 << 20);
+            let total = crate::egress::MAX_BODY + (1 << 20);
             let _ = write!(
                 sock,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"

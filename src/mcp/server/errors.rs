@@ -600,7 +600,7 @@ pub(super) fn transport_next_action(e: &FetchError, kind: &str) -> String {
     match e {
         // Still kind tls.verify, but its advice (trust another CA
         // bundle) is the one thing that must not be done here.
-        FetchError::Tls(msg) if crate::transport::tls::is_blocked_ca_failure(msg) => {
+        FetchError::Tls(msg) if crate::error::is_blocked_ca_failure(msg) => {
             "the server's certificate chain uses a CA key known to be compromised: do not retry or change the trust store; choose another source".into()
         }
         _ => next_action_for(None, 0, kind),
@@ -702,7 +702,7 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
         {
             "tls.egress"
         }
-        FetchError::Tls(msg) if crate::transport::tls::is_cert_verify_failure(msg) => "tls.verify",
+        FetchError::Tls(msg) if crate::error::is_cert_verify_failure(msg) => "tls.verify",
         // The operator chose the kind; the default below would silently
         // turn a `walled` rule into `permanent`.
         FetchError::Denied { kind, .. } => kind,
@@ -812,9 +812,8 @@ mod stitch_tests {
             }
         }
         impl std::error::Error for E {}
-        let classified = |raw: &'static str| {
-            FetchError::Tls(crate::transport::tls::classify_handshake_error(&E(raw)))
-        };
+        let classified =
+            |raw: &'static str| FetchError::Tls(crate::error::classify_handshake_error(&E(raw)));
         // Middlebox kills the handshake: reset / early EOF.
         assert_eq!(
             fetch_error_kind(&classified("connection reset by peer")),
@@ -841,7 +840,7 @@ mod stitch_tests {
     // advice to trust another bundle.
     #[test]
     fn blocked_ca_failure_keeps_tls_verify_but_not_its_advice() {
-        let blocked = FetchError::Tls(crate::transport::tls::BLOCKED_CA_FAILURE.into());
+        let blocked = FetchError::Tls(crate::error::BLOCKED_CA_FAILURE.into());
         assert_eq!(fetch_error_kind(&blocked), "tls.verify");
         let message = friendly_fetch_error(&blocked);
         assert!(
@@ -853,7 +852,7 @@ mod stitch_tests {
         assert!(advice.contains("compromised"), "{advice}");
         assert!(!advice.contains("export SSL_CERT_FILE"), "{advice}");
 
-        let untrusted = FetchError::Tls(crate::transport::tls::classify_handshake_error(
+        let untrusted = FetchError::Tls(crate::error::classify_handshake_error(
             &std::io::Error::other("certificate verify failed: unknown ca"),
         ));
         assert_eq!(
@@ -908,7 +907,7 @@ mod stitch_tests {
             std::env::set_var("NO_PROXY", "");
             std::env::remove_var("no_proxy");
         }
-        let error = crate::transport::proxy::from_env_for("http://example.com/").unwrap_err();
+        let error = crate::egress::proxy::from_env_for("http://example.com/").unwrap_err();
         assert!(
             !transport_failure_evidence(&error),
             "a configuration error must not teach a network failure"

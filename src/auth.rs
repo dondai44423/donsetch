@@ -390,11 +390,46 @@ pub fn probe_domain(
     } else {
         format!("{scheme}://{display_host}") + &format!(":{port}/")
     };
-    let mut jar = crate::fetch::cookies::CookieJar::new();
-    for cookie in cookies {
-        jar.store_raw(cookie);
-    }
-    let cookie_header = jar.header_for(&host, "/", !loopback).unwrap_or_default();
+    // The old shared jar lived here for one header; the wire is the engine
+    // now, so the probe formats its Cookie header directly. Same rules: the
+    // host's non-expired root-scoped cookies, a leading dot meaning a
+    // domain cookie (subdomains included), and a Secure cookie never riding
+    // the plain-HTTP (loopback) probe.
+    let cookie_header = {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let host_l = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let mut pairs: Vec<String> = Vec::new();
+        for c in cookies {
+            if c.expires_at.is_some_and(|e| e <= now) {
+                continue;
+            }
+            if c.secure && loopback {
+                continue;
+            }
+            let is_domain_cookie = c.domain.trim().starts_with('.');
+            let domain = c.domain.trim().trim_start_matches('.').to_ascii_lowercase();
+            if domain.is_empty() {
+                continue;
+            }
+            let domain_ok = if is_domain_cookie {
+                domain == host_l || host_l.ends_with(&format!(".{domain}"))
+            } else {
+                domain == host_l
+            };
+            if !domain_ok {
+                continue;
+            }
+            // The probe targets "/": root-scoped cookies only.
+            if !c.path.is_empty() && c.path != "/" {
+                continue;
+            }
+            pairs.push(format!("{}={}", c.name, c.value));
+        }
+        pairs.join("; ")
+    };
 
     // Dedicated plain thread: `reqwest::blocking` panics when built or
     // dropped on a thread that already has a tokio runtime context,

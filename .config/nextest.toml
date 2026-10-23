@@ -23,3 +23,11 @@ fail-fast = false
 # time, not wedge it until the workflow timeout. 30s per test
 # then hard-terminate.
 slow-timeout = { period = "30s", terminate-after = 1 }
+
+# The progit corpus book (501 pages) parses in ~57s on this box: inside
+# the 60s default only when the box is idle; under full-suite parallelism
+# it crosses and would be terminated although it is healthy. Corpus PDFs
+# are not committed, so CI skips this test and its profile stays untouched.
+[[profile.default.overrides]]
+filter = 'test(pdf::tests::progit_book)'
+slow-timeout = { period = "120s", terminate-after = 1 }

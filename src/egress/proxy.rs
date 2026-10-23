@@ -650,7 +650,23 @@ impl Proxy {
     /// Reconstruct the proxy URL string from parsed fields.
     /// Handles IPv6 bracketing. Used for config-file round-trip.
     pub fn to_url(&self) -> String {
-        let scheme = scheme_str(self.scheme);
+        self.url_with_scheme(scheme_str(self.scheme))
+    }
+
+    /// The URL the v5 engine takes for this lane. SOCKS5 hands the TARGET
+    /// NAME to the proxy (`socks5h` = remote resolve — what the old
+    /// transport sent too: ATYP=3 domain), so the egress lane resolves and
+    /// the host is never leaked to the local resolver. `to_url` stays the
+    /// config/display form.
+    pub fn wire_url(&self) -> String {
+        let scheme = match self.scheme {
+            ProxyScheme::Http => "http",
+            ProxyScheme::Socks5 => "socks5h",
+        };
+        self.url_with_scheme(scheme)
+    }
+
+    fn url_with_scheme(&self, scheme: &str) -> String {
         let host = bracketed_host(&self.host);
         // user-or-pass: a token-only password must survive the
         // save/load round trip instead of being dropped silently.
@@ -1165,6 +1181,24 @@ mod tests {
         let p2 = Proxy::parse(&url).unwrap();
         assert_eq!(p.host, p2.host);
         assert_eq!(p.port, p2.port);
+    }
+
+    #[test]
+    fn wire_url_hands_socks5_names_to_the_proxy() {
+        // The engine URL keeps SOCKS5 remote-DNS (`socks5h`): the lane
+        // resolves the target, the host never leaks to the local resolver —
+        // exactly what the old transport sent (ATYP=3 domain).
+        let p = Proxy::parse("socks5://u:p@5.6.7.8:1080").unwrap();
+        assert_eq!(p.wire_url(), "socks5h://u:p@5.6.7.8:1080");
+        assert_eq!(
+            p.to_url(),
+            "socks5://u:p@5.6.7.8:1080",
+            "the config/display form stays socks5"
+        );
+        let h = Proxy::parse("http://1.2.3.4:8080").unwrap();
+        assert_eq!(h.wire_url(), "http://1.2.3.4:8080");
+        let v6 = Proxy::parse("socks5://[::1]:1080").unwrap();
+        assert_eq!(v6.wire_url(), "socks5h://[::1]:1080");
     }
 
     #[test]

@@ -522,8 +522,8 @@ async fn stealth_v3_invalid_ambient_proxy_keeps_explicit_bypass_and_lane_control
         b"explicit direct bypass"
     );
     unsafe { std::env::set_var("NO_PROXY", "") };
-    let proxy = donsetch::transport::proxy::Proxy::parse(&format!("http://alice:secret@{address}"))
-        .unwrap();
+    let proxy =
+        donsetch::egress::proxy::Proxy::parse(&format!("http://alice:secret@{address}")).unwrap();
     assert_eq!(
         fetcher
             .fetch_via_jar_ref(&url, Some(&proxy), true, None)
@@ -540,8 +540,8 @@ async fn stealth_v3_invalid_ambient_proxy_keeps_explicit_bypass_and_lane_control
 
 #[tokio::test]
 async fn stealth_v3_selected_route_keeps_lane_health_for_the_next_call() {
+    use donsetch::egress::proxy::Proxy;
     use donsetch::search::egress::EgressPool;
-    use donsetch::transport::proxy::Proxy;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     crate::sandbox();
     unsafe {

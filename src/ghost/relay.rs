@@ -99,12 +99,12 @@ const STRIKE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 impl Relay {
     /// Bind a loopback listener and own the bounded tunnel tasks.
     /// Bind failures propagate; callers must retain the selected route.
-    pub async fn spawn(proxy: Arc<crate::transport::proxy::Proxy>) -> std::io::Result<Relay> {
+    pub async fn spawn(proxy: Arc<crate::egress::proxy::Proxy>) -> std::io::Result<Relay> {
         Self::spawn_with_bypass(proxy, String::new()).await
     }
 
     pub(crate) async fn spawn_with_bypass(
-        proxy: Arc<crate::transport::proxy::Proxy>,
+        proxy: Arc<crate::egress::proxy::Proxy>,
         bypass: String,
     ) -> std::io::Result<Relay> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -137,7 +137,7 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 
 async fn accept_loop(
     listener: TcpListener,
-    proxy: Arc<crate::transport::proxy::Proxy>,
+    proxy: Arc<crate::egress::proxy::Proxy>,
     bypass: Arc<String>,
 ) {
     let strikes = std::sync::Arc::new(std::sync::Mutex::new(StrikeCache::default()));
@@ -166,7 +166,7 @@ async fn accept_loop(
 
 async fn serve_socks5_client(
     mut client: TcpStream,
-    proxy: Arc<crate::transport::proxy::Proxy>,
+    proxy: Arc<crate::egress::proxy::Proxy>,
     strikes: std::sync::Arc<std::sync::Mutex<StrikeCache>>,
     bypass: Arc<String>,
 ) -> std::io::Result<()> {
@@ -196,8 +196,13 @@ async fn serve_socks5_client(
         return Ok(());
     }
 
-    let connected = if crate::transport::proxy::no_proxy_match_value(&host, &bypass) {
-        crate::transport::tcp::happy_connect(&host, port).await
+    let connected = if crate::egress::proxy::no_proxy_match_value(&host, &bypass) {
+        // Direct branch. The old tier raced A/AAAA here (Happy Eyeballs);
+        // the wire is the engine now and this relay tunnel is ghost-side
+        // (Phase B retires it), so a plain connect stands.
+        tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(crate::error::FetchError::from)
     } else {
         proxy.connect(&host, port).await
     };
@@ -343,7 +348,7 @@ mod relay_tests {
         });
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = Arc::new(
-            crate::transport::proxy::Proxy::parse(&format!(
+            crate::egress::proxy::Proxy::parse(&format!(
                 "http://{}",
                 upstream.local_addr().unwrap()
             ))
@@ -415,7 +420,7 @@ mod relay_tests {
     async fn stealth_v3_relay_connected_tunnel_clears_strikes_before_close() {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = Arc::new(
-            crate::transport::proxy::Proxy::parse(&format!(
+            crate::egress::proxy::Proxy::parse(&format!(
                 "http://{}",
                 upstream.local_addr().unwrap()
             ))
@@ -488,7 +493,7 @@ mod relay_tests {
     async fn stealth_v3_relay_malformed_targets_never_dial_upstream() {
         let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy =
-            crate::transport::proxy::Proxy::parse(&format!("http://{}", up.local_addr().unwrap()))
+            crate::egress::proxy::Proxy::parse(&format!("http://{}", up.local_addr().unwrap()))
                 .unwrap();
         let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
         let mut invalid = vec![
@@ -540,7 +545,7 @@ mod relay_tests {
 
     #[tokio::test]
     async fn stealth_v3_relay_stalled_negotiation_expires() {
-        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:809").unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse("http://127.0.0.1:809").unwrap();
         let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
         let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
         client.write_all(&[5, 1, 0]).await.unwrap();
@@ -564,7 +569,7 @@ mod relay_tests {
 
     #[tokio::test]
     async fn stealth_v3_relay_never_selects_an_unoffered_auth_method() {
-        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:809").unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse("http://127.0.0.1:809").unwrap();
         let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
         let mut client = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
         client.write_all(&[5, 1, 2]).await.unwrap();
@@ -580,7 +585,7 @@ mod relay_tests {
     #[tokio::test]
     async fn stealth_v3_relay_drop_closes_actual_active_tunnel() {
         let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = crate::transport::proxy::Proxy::parse(&format!(
+        let proxy = crate::egress::proxy::Proxy::parse(&format!(
             "http://alice:secret@{}",
             up.local_addr().unwrap()
         ))
@@ -650,7 +655,7 @@ mod relay_tests {
     async fn stealth_v3_relay_bounds_stalled_clients_and_releases_them() {
         let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy =
-            crate::transport::proxy::Proxy::parse(&format!("http://{}", up.local_addr().unwrap()))
+            crate::egress::proxy::Proxy::parse(&format!("http://{}", up.local_addr().unwrap()))
                 .unwrap();
         let relay = Relay::spawn(Arc::new(proxy)).await.unwrap();
         let mut clients = Vec::new();
@@ -730,7 +735,7 @@ mod relay_tests {
             serve_required_auth_upstream(s).await;
         });
 
-        let proxy = crate::transport::proxy::Proxy::parse(&format!(
+        let proxy = crate::egress::proxy::Proxy::parse(&format!(
             "socks5://laneuser:lanepass@127.0.0.1:{up_port}"
         ))
         .expect("authed socks5 lane parses");

@@ -45,7 +45,7 @@ pub(super) async fn engine_task(
     engine: String,
     query: String,
     egress_id: String,
-    proxy: Option<crate::transport::proxy::Proxy>,
+    proxy: Option<crate::egress::proxy::Proxy>,
     context: EngineContext<'_>,
 ) -> (String, EngineResult) {
     engine_task_with_budget(
@@ -65,7 +65,7 @@ pub(super) async fn engine_task_with_budget(
     engine: String,
     query: String,
     egress_id: String,
-    proxy: Option<crate::transport::proxy::Proxy>,
+    proxy: Option<crate::egress::proxy::Proxy>,
     context: EngineContext<'_>,
     budget: std::time::Duration,
     previous: Option<(&str, &str)>,
@@ -105,7 +105,7 @@ pub(super) async fn engine_task_with_budget(
     // unreachable on any host whose only route out is a forward proxy.
     // Same convention as every other request path.
     let env_proxy = if proxy.is_none() {
-        match crate::transport::proxy::from_env_for(&url) {
+        match crate::egress::proxy::from_env_for(&url) {
             Ok(proxy) => proxy,
             Err(error) => {
                 return (
@@ -236,8 +236,8 @@ pub(super) async fn ghost_engine_task(
     let route = lane
         .as_ref()
         .and_then(|lane| lane.proxy.clone())
-        .map(crate::transport::request_route::RequestRoute::pinned)
-        .unwrap_or_else(crate::transport::request_route::RequestRoute::configured);
+        .map(crate::egress::request_route::RequestRoute::pinned)
+        .unwrap_or_else(crate::egress::request_route::RequestRoute::configured);
     let egress = lane
         .filter(|lane| lane.proxy.is_some())
         .map(|lane| lane.id)
@@ -272,7 +272,7 @@ pub(super) async fn vertical_task(
     vertical: String,
     query: String,
     fetcher: &Fetcher,
-    proxy: Option<crate::transport::proxy::Proxy>,
+    proxy: Option<crate::egress::proxy::Proxy>,
 ) -> (String, EngineResult) {
     let started = Instant::now();
     match tokio::time::timeout(
@@ -476,7 +476,7 @@ mod tests {
         config.proxy.fetch_rotate = false;
         config.proxy.from_environment = false;
         crate::config::install(config).unwrap();
-        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:8080").unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse("http://127.0.0.1:8080").unwrap();
         let pool = EgressPool::new(vec![proxy.clone()]);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
@@ -515,7 +515,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:8080").unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse("http://127.0.0.1:8080").unwrap();
         let pool = EgressPool::new(vec![proxy.clone()]);
         let polls = Arc::new(AtomicUsize::new(0));
         let reached = Arc::clone(&polls);

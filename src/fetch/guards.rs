@@ -217,31 +217,26 @@ pub(crate) fn validate_url_basic_with_policy(
 /// Async URL safety check that includes DNS resolution.
 ///
 /// Does everything `validate_url_basic` does, plus:
-/// - resolves the hostname via tokio::net::lookup_host
+/// - resolves the hostname via the shared resolver cache (`egress::dns`)
 /// - rejects if ANY resolved address is SSRF (private/loopback/etc.)
 /// - **fail-closed** on DNS resolution failure/timeout for
 ///   network/browser navigation (the `ensure_url_safe` path).
 ///   The synchronous `validate_url_basic` is the explicitly
 ///   justified offline-only path (no DNS, no network) and is used
-///   by the fetch tier's initial literal check and by callers
-///   that deliberately defer DNS to the transport layer
-///   (`transport::tcp::happy_connect` re-validates at connect).
+///   by the fetch tier's initial literal check.
 ///
 /// # DNS rebinding / TOCTOU limitation
 ///
 /// This is a point-in-time check. DNS can change between this
 /// validation and the actual TCP connect (DNS rebinding / TOCTOU).
-/// The transport layer (`transport::tcp::happy_connect`) re-validates
-/// resolved addresses at connect time and filters private IPs, so
-/// an attacker that returns public at validation and private at
-/// connect is still blocked at connect. Both sides now resolve through
-/// `transport::dns`, so inside the cache TTL they see the SAME answer,
-/// which narrows the window to one answer per TTL instead of one per
-/// step; outside it, the window between the two resolutions remains.
-/// Full DNS pinning (forcing the dial onto the validated addresses) is
-/// still not implemented.
-/// Redirects are re-validated per hop via `validate_redirect_url`
-/// (sync) and `ensure_url_safe` (async) where applicable.
+/// The old transport re-validated resolved addresses at connect time;
+/// that layer is gone (the wire is the engine, which resolves on its
+/// own), so the guard is the app-side DNS check. Full DNS pinning
+/// (forcing the dial onto the validated addresses) is still not
+/// implemented. Redirect targets ARE re-validated before they are dialed:
+/// on the app's own hop loop per hop via `validate_redirect_url` (sync),
+/// and on engine-followed chains via the hop consult that re-runs the same
+/// sync gate (`fetch::client::doc_fetch` / `wire_once`).
 pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
     let allow_private_egress = private_egress_allowed();
     let url = validate_url_basic_with_policy(url_str, allow_private_egress, crate::rules::rules())?;
@@ -252,11 +247,10 @@ pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::Fe
     let host: String = url.host_str().unwrap_or("").to_owned();
     // Literal IP already blocked by validate_url_basic; only hostnames need DNS.
     // Fail closed on resolution errors for browser/network navigation.
-    // Resolved through the shared cache (transport::dns): the connect that
-    // follows this check asks for the same name, and the resolver is a
-    // network round trip on a box with no local caching daemon.
+    // The shared resolver cache (`egress::dns`) keeps repeat checks cheap on
+    // a box with no local caching daemon.
     let port = url.port_or_known_default().unwrap_or(443);
-    for addr in crate::transport::dns::resolve(&host, port).await? {
+    for addr in crate::egress::dns::resolve(&host, port).await? {
         if is_ssrf_resolved_ip(&addr.ip()) {
             return Err(crate::error::FetchError::Ssrf(format!(
                 "{host} resolves to private/loopback address {} : SSRF guard (set DONSETCH_ALLOW_PRIVATE_EGRESS to override)",
@@ -332,6 +326,25 @@ pub fn is_binary_content_type(ct: &str) -> bool {
 
 pub fn is_pdf(body: &[u8], content_type: &str) -> bool {
     (body.len() >= 5 && body.starts_with(b"%PDF-")) || content_type.to_lowercase().contains("pdf")
+}
+
+/// Whether the URL is PDF-shaped: its path (query stripped,
+/// case-insensitive) ends in `.pdf`, has a `pdf` segment, or ends in
+/// `/pdf` (arXiv, IACR, many journal endpoints). The document fetch and
+/// the tool's routing both use this shape.
+pub(crate) fn is_pdf_url_like(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url).to_lowercase();
+    if path.ends_with(".pdf") {
+        return true;
+    }
+    // Path-segment "/pdf/" or trailing "/pdf".
+    let no_scheme = path
+        .strip_prefix("https://")
+        .or_else(|| path.strip_prefix("http://"))
+        .unwrap_or(&path);
+    let path_part = no_scheme.split_once('/').map(|(_, p)| p).unwrap_or("");
+    let segs: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
+    segs.contains(&"pdf") || path_part.ends_with("/pdf")
 }
 
 pub fn is_binary_body(body: &[u8]) -> bool {

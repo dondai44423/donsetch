@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::transport::proxy::Proxy;
+use crate::egress::proxy::Proxy;
 
 type PaceGate = Arc<tokio::sync::Mutex<Option<Instant>>>;
 
@@ -210,7 +210,7 @@ impl EgressPool {
     }
 
     pub fn from_env() -> Self {
-        Self::new(crate::transport::proxy::load_all())
+        Self::new(crate::egress::proxy::load_all())
     }
 
     /// Load persisted (engine,egress) health and dead-lane benches so a

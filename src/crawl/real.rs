@@ -28,7 +28,7 @@ use super::{Crawler, FetchedPage, PageFetcher};
 /// lanes only while crawl pool use is on (`proxy.crawl_rotate`,
 /// default true; `donsetch proxy crawl off` opts out, leaving every
 /// crawl request on the home IP).
-fn pool_lanes(proxies: &[crate::transport::proxy::Proxy], rotate: bool) -> Vec<Lane> {
+fn pool_lanes(proxies: &[crate::egress::proxy::Proxy], rotate: bool) -> Vec<Lane> {
     let mut lanes = vec![Lane {
         id: "direct".into(),
         kind: LaneKind::Direct,
@@ -255,7 +255,7 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::proxy::Proxy;
+    use crate::egress::proxy::Proxy;
 
     #[tokio::test]
     async fn stealth_v3_buffered_seed_feedback_charges_the_actual_lane() {

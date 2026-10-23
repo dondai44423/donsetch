@@ -820,7 +820,7 @@ mod pre_solve_tests {
                         let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                         let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                         let proxies = [&a, &b].map(|listener| {
-                            crate::transport::proxy::Proxy::parse(&format!(
+                            crate::egress::proxy::Proxy::parse(&format!(
                                 "http://{}", listener.local_addr().unwrap()
                             )).unwrap()
                         });
@@ -971,7 +971,7 @@ mod crawl_route_tests {
     #[tokio::test]
     async fn stealth_v3_expired_browser_handoff_cannot_return_cached_content() {
         let profile = BrowserProfile::host_default();
-        let route = crate::transport::request_route::RequestRoute::direct();
+        let route = crate::egress::request_route::RequestRoute::direct();
         let wire = crate::ghost::GhostWire {
             route: Some(route.clone()),
             ..Default::default()
@@ -1041,7 +1041,7 @@ mod crawl_route_tests {
                 let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let url = format!("http://{}/owned-crawl", origin.local_addr().unwrap());
-                let proxy = (crate::transport::proxy::Proxy::parse(&format!("http://{}",proxy.local_addr().unwrap())).unwrap(), proxy);
+                let proxy = (crate::egress::proxy::Proxy::parse(&format!("http://{}",proxy.local_addr().unwrap())).unwrap(), proxy);
                 let pool = Arc::new(EgressPool::new(vec![proxy.0.clone()]));
                 let events = Arc::new(std::sync::Mutex::new(Vec::new()));
                 let (stop, stopped) = tokio::sync::watch::channel(false);

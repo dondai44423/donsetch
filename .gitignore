@@ -51,3 +51,7 @@ bench/regression-results.json
 # The engine crate carries its own workspace + target until the swap links it
 # into the app graph (its vendored BoringSSL cannot share the app's).
 /doncore/target/
+
+# Engine debug dumps (DONCORE_DEBUG wire forensics land in scratch/ under the cwd)
+/scratch/
+/doncore/scratch/

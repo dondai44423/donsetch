@@ -2,11 +2,11 @@
 //! debugging, raw fetch probes, TLS fingerprint checks, ghost
 //! browser operations. Not part of the agent surface.
 
+use crate::egress::proxy;
 use crate::extract;
 use crate::fetch::client::Fetcher;
 use crate::ghost;
 use crate::profile::BrowserProfile;
-use crate::transport::proxy;
 
 pub async fn dispatch(args: &[String]) {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("help");

@@ -2583,15 +2583,15 @@ mod tests {
     fn stealth_v3_render_context_tracks_wire_build_and_persona_changes() {
         let profile = crate::profile::BrowserProfile::host_default();
         let wire = crate::ghost::GhostWire {
-            route: Some(crate::transport::request_route::RequestRoute::direct()),
+            route: Some(crate::egress::request_route::RequestRoute::direct()),
             ..Default::default()
         };
         let context = render_context(&profile, &wire, Some((3, 17)));
         assert_eq!(context.len(), 64);
         assert_eq!(context, render_context(&profile, &wire, Some((3, 17))));
         let mut changed = wire.clone();
-        changed.route = Some(crate::transport::request_route::RequestRoute::pinned(
-            crate::transport::proxy::Proxy::parse("http://owned:secret@127.0.0.1:8080").unwrap(),
+        changed.route = Some(crate::egress::request_route::RequestRoute::pinned(
+            crate::egress::proxy::Proxy::parse("http://owned:secret@127.0.0.1:8080").unwrap(),
         ));
         assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
         changed = wire.clone();

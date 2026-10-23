@@ -3,18 +3,11 @@ name = "donsetch"
 version = "4.10.2"
 edition = "2024"
 license = "AGPL-3.0-only"
-description = "Web fetch, search and crawl for AI agents. Custom stealthy HTTP fetch tier on BoringSSL."
+description = "Web fetch, search and crawl for AI agents. Custom stealthy fetch tier: the in-tree doncore engine."
 
 [dependencies]
-boring = { version = "5", features = ["mlkem"] }
-boring-sys = "5"
-foreign-types = "0.5"
-tokio-boring = "5"
-# QUIC + HTTP/3 (phase 5.1). Donsetch fork of quiche 0.29.3 with the boring
-# dep raised to ^5 so the QUIC handshake forges share one boringssl build
-# (boring/boring-sys 5.2) with tier-1 h1/h2. Upstream tag: 0.29.3; fork tag
-# donsetch-v0.29.3-1 = "quiche + boring 5" only.
-quiche = { git = "https://github.com/dondai44423/quiche", tag = "donsetch-v0.29.3-1", default-features = false, features = ["boringssl-boring-crate"] }
+# The fetching engine (one wire: identity, TLS, cache, JS) — in-tree.
+doncore = { path = "doncore" }
 tokio = { version = "1", features = ["full"] }
 url = "2"
 brotli = "9"
@@ -188,3 +181,16 @@ codegen-units = 256
 # stay honest. Test binaries run on opt-1 dep object code only.
 [profile.ci.package."*"]
 opt-level = 1
+
+# The in-tree engine's vendored forks: patches apply from the workspace
+# ROOT, so they live here now that doncore is linked into the app graph
+# (doncore keeps its own copy for standalone builds: engine tests, the
+# harness under v5/doncore/tools/).
+#  wreq/btls-sys: Chrome ClientHello parity (trust_anchors extension +
+#  signature-algorithm list) that the published presets cannot express.
+#  rquickjs-sys: native Function.prototype.toString in V8's single-line
+#  shape.
+[patch.crates-io]
+wreq = { path = "doncore/vendor/wreq" }
+btls-sys = { path = "doncore/vendor/btls-sys" }
+rquickjs-sys = { path = "doncore/vendor/rquickjs-sys" }

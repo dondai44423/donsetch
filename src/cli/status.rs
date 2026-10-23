@@ -13,10 +13,10 @@
 
 use crate::DISPLAY_NAME;
 use crate::cli;
+use crate::egress::proxy;
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
 use crate::search::byok::store::ByokConfig;
-use crate::transport::proxy;
 use serde_json::json;
 
 const REPO: &str = "dondai44423/donsetch";

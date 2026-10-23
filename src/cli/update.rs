@@ -143,7 +143,13 @@ pub async fn run(args: &[String]) {
     // ── Download tarball ─────────────────────────────────────
 
     let spinner = cli::Spinner::new(&format!("downloading {asset_label}"));
-    let tarball = match fetcher.fetch(&tarball_url).await {
+    // Opaque bytes (a gzip): the one-shot wire read carries them verbatim
+    // and follows the release-asset redirect; the document path would
+    // decode them as text and corrupt the archive.
+    let tarball = match fetcher
+        .fetch_once_via(&tarball_url, &[], None, false, None)
+        .await
+    {
         Ok(out) if out.status == 200 => out.body,
         Ok(out) => {
             spinner.stop();

@@ -166,7 +166,7 @@ async fn shadow_burst(
     fetcher: &Arc<Fetcher>,
     page_url: &str,
     assets: Vec<(String, RequestClass)>,
-    route: &crate::transport::request_route::RequestRoute,
+    route: &crate::egress::request_route::RequestRoute,
 ) -> usize {
     use futures_util::stream::{self, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::DISPLAY_NAME;
 use crate::cli;
-use crate::transport::proxy::{self, Proxy, ProxyScheme};
+use crate::egress::proxy::{self, Proxy, ProxyScheme};
 
 const PROBE_HOST: &str = "api.ipify.org";
 const PROBE_PORT: u16 = 80;

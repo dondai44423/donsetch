@@ -62,6 +62,11 @@ async fn revalidation_conditionals_never_ride_a_redirect_hop() {
     // colliding ETag and answers 304 -> the caller merges /a's OLD
     // cached body into /b's outcome. Post-fix: hop 3 carries no
     // conditionals -> a real 200 with /b's body.
+    //
+    // The mock serves ONE request per connection and closes: every
+    // response announces `Connection: close`, so the engine's pool never
+    // reuses a connection this server is about to drop (a silent close
+    // races the redirect-hop send into a hard `SendRequest` failure).
     std::thread::spawn(move || {
         for stream in origin.incoming() {
             let Ok(mut stream) = stream else { return };
@@ -77,16 +82,16 @@ async fn revalidation_conditionals_never_ride_a_redirect_hop() {
             let resp = if first.contains("/b") {
                 if has_conditional {
                     // The smuggled validator matched /b's colliding ETag.
-                    "HTTP/1.1 304 Not Modified\r\nETag: \"collide\"\r\n\r\n"
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"collide\"\r\nConnection: close\r\n\r\n"
                 } else {
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nb-body"
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nb-body"
                 }
             } else if first.contains("/a") && has_conditional {
                 // Revalidation request on /a: redirect instead of
                 // answering 304 (the collision trigger).
-                "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n"
+                "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             } else {
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=0\r\nETag: \"collide\"\r\nContent-Length: 6\r\n\r\na-body"
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=0\r\nETag: \"collide\"\r\nContent-Length: 6\r\nConnection: close\r\n\r\na-body"
             };
             let _ = stream.write_all(resp.as_bytes());
             let _ = stream.flush();
@@ -863,8 +868,8 @@ async fn stealth_v3_cache_tracks_sent_cookie_and_referer_not_jar_mode() {
 
 #[tokio::test]
 async fn stealth_v3_cache_tracks_exact_proxy_credentials_and_direct_route() {
+    use donsetch::egress::proxy::Proxy;
     use donsetch::fetch::client::CacheState;
-    use donsetch::transport::proxy::Proxy;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     crate::sandbox();
     unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
@@ -942,7 +947,7 @@ async fn stealth_v3_cache_tracks_exact_proxy_credentials_and_direct_route() {
 }
 
 #[tokio::test]
-async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
+async fn env_proxy_stays_selected_for_the_whole_fetch() {
     crate::sandbox();
     // Atomic test-order gate (cargo test runs both tests on one
     // runtime; nextest would isolate anyway).
@@ -965,12 +970,19 @@ async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
     serve(
         proxy_l,
         proxy_log.clone(),
-        vec![(
-            "".to_string(),
-            format!(
-                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{direct_port}/b\r\nContent-Length: 0\r\n\r\n"
+        vec![
+            (
+                format!("127.0.0.1:{direct_port}/b"),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nb-body"
+                    .to_string(),
             ),
-        )],
+            (
+                "".to_string(),
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{direct_port}/b\r\nContent-Length: 0\r\n\r\n"
+                ),
+            ),
+        ],
     );
     serve(
         direct_l,
@@ -987,37 +999,31 @@ async fn env_proxy_is_rechecked_against_no_proxy_per_hop() {
 
     let profile = BrowserProfile::chrome_150(Platform::Linux);
     let fetcher = Fetcher::new(profile).expect("fetcher");
-    // Hop 1: test-host.invalid is NOT covered by NO_PROXY -> through the
-    // env proxy. Hop 2: 127.0.0.1 IS covered -> direct (origin-form).
+    // The egress route is selected once for the whole fetch (the engine
+    // owns multi-hop documents): hop 1 and the redirect hop both ride the
+    // env proxy. Per-hop NO_PROXY re-checking ended with the v4 tier
+    // (status.md §V5 SWAP fidelity).
     let out = fetcher
         .fetch("http://test-host.invalid/a")
         .await
         .expect("chained fetch");
-    assert_eq!(out.status, 200, "hop 2 status");
-    assert!(out.body.starts_with(b"b-body"), "hop 2 body");
+    assert_eq!(out.status, 200, "redirect hop status");
+    assert!(out.body.starts_with(b"b-body"), "redirect hop body");
 
     let plog = proxy_log.lock().unwrap().clone();
+    assert_eq!(
+        plog.len(),
+        2,
+        "both hops must traverse the env proxy: {plog:?}"
+    );
     assert!(
-        !plog.is_empty(),
-        "hop 1 must traverse the env proxy (pre-chain)"
+        plog.iter().all(|l| l.starts_with("GET http://")),
+        "proxy requests are absolute-form: {plog:?}"
     );
     let dlog = direct_log.lock().unwrap().clone();
     assert!(
-        !dlog.is_empty(),
-        "hop 2 must dial direct (NO_PROXY recheck per hop)"
-    );
-    // E15 discriminator: a direct dial sends origin-form ("GET /b").
-    // Riding the proxy would arrive as absolute-form
-    // ("GET http://127.0.0.1:P/b") — the pre-fix behavior.
-    assert!(
-        dlog.iter().all(|l| !l.starts_with("GET http")),
-        "hop 2 went through the proxy (absolute-form): {:?}",
-        dlog
-    );
-    assert!(
-        dlog.iter().any(|l| l.starts_with("GET /b")),
-        "hop 2 origin-form request missing: {:?}",
-        dlog
+        dlog.is_empty(),
+        "the route is sticky: the redirect hop must not dial direct: {dlog:?}"
     );
 
     unsafe { std::env::remove_var("HTTP_PROXY") };

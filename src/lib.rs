@@ -27,6 +27,7 @@ pub mod diag;
 // Also read verbatim by build.rs : see the file.
 mod display_name;
 pub use display_name::DISPLAY_NAME;
+pub mod egress;
 pub mod error;
 pub mod extract;
 pub mod fetch;
@@ -42,4 +43,6 @@ pub mod profile;
 pub mod rules;
 pub mod search;
 pub mod spec;
-pub mod transport;
+
+#[cfg(test)]
+pub(crate) mod test_support;

@@ -41,7 +41,7 @@ pub struct FetchedPage {
     /// Governor assignment that produced this page, including buffered reads.
     pub lane: String,
     /// The actual HTTP policy; absent when no request produced a response.
-    pub route: Option<crate::transport::request_route::RequestRoute>,
+    pub route: Option<crate::egress::request_route::RequestRoute>,
     /// Final URL after redirects; for a rule refusal, the refused URL
     /// (a redirect hop's target when the refusal came mid-chain).
     pub url: String,
@@ -321,7 +321,7 @@ pub struct GhostRender {
 #[derive(Clone, Debug)]
 pub struct GhostRequest {
     pub url: String,
-    pub route: crate::transport::request_route::RequestRoute,
+    pub route: crate::egress::request_route::RequestRoute,
     pub deadline: Instant,
 }
 

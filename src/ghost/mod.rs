@@ -228,7 +228,7 @@ pub struct GhostWire {
     /// An explicit direct override changes routing and therefore pool identity.
     pub direct: bool,
     /// Selected immutable HTTP/browser policy; absent only for legacy callers.
-    pub route: Option<crate::transport::request_route::RequestRoute>,
+    pub route: Option<crate::egress::request_route::RequestRoute>,
 }
 
 impl Default for GhostWire {
@@ -998,9 +998,9 @@ impl Ghost {
     ) -> Result<Self, FetchError> {
         let mut selected_wire = wire.clone();
         if selected_wire.direct {
-            selected_wire.route = Some(crate::transport::request_route::RequestRoute::direct());
+            selected_wire.route = Some(crate::egress::request_route::RequestRoute::direct());
         } else if selected_wire.route.is_none() {
-            selected_wire.route = Some(crate::transport::request_route::RequestRoute::configured());
+            selected_wire.route = Some(crate::egress::request_route::RequestRoute::configured());
         }
         let wire = &selected_wire;
         let (http_proxy, https_proxy, bypass) = wire

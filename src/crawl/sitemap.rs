@@ -836,7 +836,7 @@ mod tests {
                     let (status, body) = entry.unwrap_or((404, "not found".to_string()));
                     crate::crawl::FetchedPage {
                         lane: _lane,
-                        route: Some(crate::transport::request_route::RequestRoute::direct()),
+                        route: Some(crate::egress::request_route::RequestRoute::direct()),
                         url,
                         status,
                         headers: vec![],

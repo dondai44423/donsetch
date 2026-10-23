@@ -34,8 +34,8 @@ use crate::search::{self, Searcher};
 use errors::*;
 // The uniform failure predicate (v4.7 envelope) : the CLI's exit-code and
 // rendering paths branch on the same signal the wire carries.
+pub(crate) use crate::fetch::guards::is_pdf_url_like;
 pub(crate) use errors::is_failure;
-pub(crate) use fetch_tool::is_pdf_url_like;
 use fetch_tool::*;
 use search_tool::*;
 
@@ -662,7 +662,7 @@ mod preflight_lifecycle_tests {
         crate::config::install(config).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         std::fs::write(
-            crate::transport::proxy::config_path(),
+            crate::egress::proxy::config_path(),
             format!("http://{}\n", listener.local_addr().unwrap()),
         )
         .unwrap();

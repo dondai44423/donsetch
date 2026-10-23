@@ -129,7 +129,7 @@ impl Searcher {
                 // route out, a direct dial here failed and the result was
                 // scored QualityObs::Dead: live search results got demoted
                 // as dead links because of the egress, not the page.
-                let route = crate::transport::request_route::RequestRoute::configured();
+                let route = crate::egress::request_route::RequestRoute::configured();
                 let env_proxy = match route.proxy_for(&url) {
                     Ok(proxy) => proxy,
                     // An unusable client route is not evidence that the page died.

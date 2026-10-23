@@ -1549,34 +1549,37 @@ mod tests {
         let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxies = [&a, &b].map(|listener| {
-            crate::transport::proxy::Proxy::parse(&format!(
+            crate::egress::proxy::Proxy::parse(&format!(
                 "http://{}",
                 listener.local_addr().unwrap()
             ))
             .unwrap()
         });
         let acceptor = if matches!(case, ProbeCase::Healthy) {
-            use boring::ssl::{SslAcceptor, SslMethod};
+            // The mock proxy terminates the tunnel with a self-signed cert
+            // for api.ipify.org; the client trusts it through SSL_CERT_FILE
+            // (the engine's BoringSSL reads default verify paths from
+            // SSL_CERT_FILE/SSL_CERT_DIR, same as the old tier did).
             let cert = rcgen::generate_simple_self_signed(vec!["api.ipify.org".into()]).unwrap();
             let bundle = crate::paths::cache_dir().join("owned-probe-ca.pem");
             std::fs::write(&bundle, cert.cert.pem()).unwrap();
             // Nextest gives this owned trust bundle its own process.
             unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
-            let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-            acceptor
-                .set_certificate(&boring::x509::X509::from_der(cert.cert.der()).unwrap())
-                .unwrap();
-            acceptor
-                .set_private_key(
-                    &boring::pkey::PKey::private_key_from_der(&cert.signing_key.serialize_der())
-                        .unwrap(),
+            let mut config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![rustls_pki_types::CertificateDer::from(
+                        cert.cert.der().to_vec(),
+                    )],
+                    rustls_pki_types::PrivateKeyDer::Pkcs8(
+                        rustls_pki_types::PrivatePkcs8KeyDer::from(
+                            cert.signing_key.serialize_der(),
+                        ),
+                    ),
                 )
                 .unwrap();
-            acceptor.set_alpn_select_callback(|_, peer| {
-                boring::ssl::select_next_proto(b"\x08http/1.1", peer)
-                    .ok_or(boring::ssl::AlpnError::NOACK)
-            });
-            Some(Arc::new(acceptor.build()))
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(config))))
         } else {
             None
         };
@@ -1613,7 +1616,7 @@ mod tests {
                     release.notified().await;
                     if let Some(acceptor) = acceptor {
                         socket.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
-                        let mut tls = tokio_boring::accept(&acceptor, socket).await.unwrap();
+                        let mut tls = acceptor.accept(socket).await.unwrap();
                         let mut request = Vec::new();
                         while !request.ends_with(b"\r\n\r\n") {
                             assert!(request.len() < 16384);
@@ -1721,7 +1724,7 @@ mod tests {
         for _ in 0..8 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             proxies.push(
-                crate::transport::proxy::Proxy::parse(&format!(
+                crate::egress::proxy::Proxy::parse(&format!(
                     "http://{}",
                     listener.local_addr().unwrap()
                 ))
@@ -1929,7 +1932,7 @@ mod tests {
 
     #[test]
     fn regression_unavailable_google_does_not_stop_other_assignments() {
-        let proxy = crate::transport::proxy::Proxy::parse("http://127.0.0.1:12345").unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse("http://127.0.0.1:12345").unwrap();
         let id = proxy.id();
         let pool = EgressPool::new(vec![proxy]);
         pool.report_blocked("google", &id);
@@ -1950,7 +1953,7 @@ mod tests {
     #[test]
     fn assignments_preserve_proxy_spreading_and_shared_direct_lane() {
         let proxies = ["http://127.0.0.1:12345", "http://127.0.0.1:12346"]
-            .map(|url| crate::transport::proxy::Proxy::parse(url).unwrap())
+            .map(|url| crate::egress::proxy::Proxy::parse(url).unwrap())
             .to_vec();
         let pool = EgressPool::new(proxies);
         let assignments = ["bing", "yahoo", "brave", "ddg"]

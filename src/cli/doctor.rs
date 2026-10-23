@@ -591,7 +591,7 @@ fn check_fetch_egress() -> CheckResult {
     // unconditionally so the doctor's view matches the daemon's
     // (a TOML proxy with from_environment = false used to be
     // reported as direct egress).
-    let resolved = match crate::transport::proxy::from_env_for("https://example.com") {
+    let resolved = match crate::egress::proxy::from_env_for("https://example.com") {
         Ok(proxy) => proxy,
         Err(error) => {
             return CheckResult::Fail(
@@ -600,7 +600,7 @@ fn check_fetch_egress() -> CheckResult {
             );
         }
     };
-    let (sys_roots, env_roots) = crate::transport::tls::trust_store_report();
+    let (sys_roots, env_roots) = crate::egress::trust::trust_store_report();
     let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
 
     let mut bits = Vec::new();
@@ -647,9 +647,9 @@ fn check_proxy_pool() -> CheckResult {
     // added proxies with the CLI "pool empty ... direct-only egress" while
     // their lanes were live and in use, and left the all-benched warning
     // below unable to fire for them at all.
-    let (file_proxies, file_skipped) = crate::transport::proxy::load_config_verbose();
+    let (file_proxies, file_skipped) = crate::egress::proxy::load_config_verbose();
     let from_config_n = proxy.pool.iter().filter(|s| !s.trim().is_empty()).count();
-    let lane_n = crate::transport::proxy::load_all().len();
+    let lane_n = crate::egress::proxy::load_all().len();
     let persist = proxy.egress_persist && !crate::config::cfg().state.no_disk_state;
     let mut bits = Vec::new();
     if lane_n == 0 {
@@ -661,7 +661,7 @@ fn check_proxy_pool() -> CheckResult {
         bits.push(format!(
             "{lane_n} proxy lane(s) ({} from {}, {from_config_n} from [proxy] pool/DONSEEK_PROXIES)",
             file_proxies.len(),
-            crate::transport::proxy::config_path().display()
+            crate::egress::proxy::config_path().display()
         ));
     }
     // A file line that did not parse is a proxy the user believes is
@@ -2770,7 +2770,7 @@ mod doctor_ultra_tests {
         // part of the pool: doctor must not call the pool empty while the CLI
         // says "3 proxies configured" (and its all-benched warning has to be
         // able to fire for a file-configured pool).
-        let path = crate::transport::proxy::config_path();
+        let path = crate::egress::proxy::config_path();
         std::fs::write(
             &path,
             "socks5://127.0.0.1:1080\nhttp://user:pass@proxy.example:3128\n",

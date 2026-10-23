@@ -148,7 +148,7 @@ impl MockSite {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
                             lane: _lane.clone(),
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: 429,
                             headers: vec![],
@@ -170,7 +170,7 @@ impl MockSite {
                         c.fetch_sub(1, Ordering::SeqCst);
                         return FetchedPage {
                             lane: _lane.clone(),
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: 500,
                             headers: vec![],
@@ -189,7 +189,7 @@ impl MockSite {
                     match pages.get(&url) {
                         Some((status, body)) => FetchedPage {
                             lane: _lane.clone(),
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: *status,
                             headers: vec![("content-type".into(), ct)],
@@ -202,7 +202,7 @@ impl MockSite {
                         },
                         None => FetchedPage {
                             lane: _lane,
-                            route: Some(crate::transport::request_route::RequestRoute::direct()),
+                            route: Some(crate::egress::request_route::RequestRoute::direct()),
                             url,
                             status: 404,
                             headers: vec![],
@@ -754,7 +754,7 @@ async fn wave450_deadline_bounds_discovery_and_page_io() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             FetchedPage {
                 lane,
-                route: Some(crate::transport::request_route::RequestRoute::direct()),
+                route: Some(crate::egress::request_route::RequestRoute::direct()),
                 url,
                 status: 200,
                 headers: vec![],

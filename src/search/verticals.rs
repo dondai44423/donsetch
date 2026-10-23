@@ -92,7 +92,7 @@ pub async fn run(
     fetcher: &Fetcher,
     vertical: &str,
     query: &str,
-    proxy: Option<&crate::transport::proxy::Proxy>,
+    proxy: Option<&crate::egress::proxy::Proxy>,
 ) -> Result<Vec<Hit>, FetchError> {
     let Some(url) = endpoint(vertical, query) else {
         return Ok(Vec::new());

@@ -435,7 +435,7 @@ impl GhostManager {
         mut wire: crate::ghost::GhostWire,
     ) -> Result<GhostGuard, FetchError> {
         if wire.direct {
-            wire.route = Some(crate::transport::request_route::RequestRoute::direct());
+            wire.route = Some(crate::egress::request_route::RequestRoute::direct());
         } else if wire.route.is_none() {
             let proxy = if crate::config::cfg().proxy.fetch_rotate {
                 crate::search::egress::global()
@@ -446,8 +446,8 @@ impl GhostManager {
             };
             wire.route = Some(
                 proxy
-                    .map(crate::transport::request_route::RequestRoute::pinned)
-                    .unwrap_or_else(crate::transport::request_route::RequestRoute::configured),
+                    .map(crate::egress::request_route::RequestRoute::pinned)
+                    .unwrap_or_else(crate::egress::request_route::RequestRoute::configured),
             );
         }
         // Configuration fails before slot reservation or display/browser startup.
@@ -1449,7 +1449,7 @@ mod pool_tests {
             viewport: (1280, 800),
             locale: "fr-FR".into(),
             direct: true,
-            route: Some(crate::transport::request_route::RequestRoute::direct()),
+            route: Some(crate::egress::request_route::RequestRoute::direct()),
             ..Default::default()
         };
         let guard = manager
@@ -1684,15 +1684,14 @@ mod pool_tests {
         different.locale = "de-DE".into();
         assert_ne!(original, persona_key(&profile, &different));
         different = wire.clone();
-        different.route = Some(crate::transport::request_route::RequestRoute::pinned(
-            crate::transport::proxy::Proxy::parse("http://alice:owned-secret@proxy.example:8080")
+        different.route = Some(crate::egress::request_route::RequestRoute::pinned(
+            crate::egress::proxy::Proxy::parse("http://alice:owned-secret@proxy.example:8080")
                 .unwrap(),
         ));
         let routed = persona_key(&profile, &different);
         assert_ne!(original, routed);
-        different.route = Some(crate::transport::request_route::RequestRoute::pinned(
-            crate::transport::proxy::Proxy::parse("http://alice:changed@proxy.example:8080")
-                .unwrap(),
+        different.route = Some(crate::egress::request_route::RequestRoute::pinned(
+            crate::egress::proxy::Proxy::parse("http://alice:changed@proxy.example:8080").unwrap(),
         ));
         assert_ne!(routed, persona_key(&profile, &different));
         different = wire;
