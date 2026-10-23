@@ -99,6 +99,9 @@ pub struct FetchOpts {
     /// Extra request headers merged ahead of any conditionals (referer,
     /// persona accept-language, a legacy UA).
     pub extra_headers: Vec<(String, String)>,
+    /// Per-hop redirect consult for the document GETs: the product's
+    /// rules/SSRF gate runs BEFORE each hop target is dialed.
+    pub hop_consult: Option<crate::wire::HopConsult>,
 }
 
 struct DocFetch {
@@ -137,8 +140,24 @@ impl Engine {
         // The product's headers lead; a caller's own extras follow.
         let extra: Vec<(String, String)> =
             opts.extra_headers.iter().cloned().chain(extra).collect();
+        // The stored representation belongs to the exact request context
+        // (v4 semantics): URL, egress route with credentials, and the
+        // cookie/header identity actually sent — never the URL alone.
+        let cookie = if opts.no_cookies {
+            None
+        } else {
+            let jar = self.wire.jar.lock().unwrap_or_else(|p| p.into_inner());
+            jar.header_for(url)
+        };
+        let key = crate::state::representation_key(
+            url,
+            opts.proxy.as_deref(),
+            opts.no_cookies,
+            &extra,
+            cookie.as_deref(),
+        );
         if let Some(c) = &self.cache {
-            match c.check(url) {
+            match c.check(&key) {
                 Check::Fresh(hit) => {
                     return Ok(DocFetch {
                         resp: WireResp {
@@ -167,15 +186,20 @@ impl Engine {
                         body: None,
                         no_cookies: opts.no_cookies,
                         proxy: opts.proxy.clone(),
+                        hop_consult: opts.hop_consult.clone(),
                         ..Default::default()
                     })?;
-                    if r.status == 304 {
-                        if let Some(body) = c.commit(&snap, &r.headers, r.ms) {
+                    // Only a 304 to the entry's own URL can validate it:
+                    // one reached through a redirect hop answers for the
+                    // hop's target, which has no snapshot here (v4
+                    // semantics: conditionals are first-hop only).
+                    if r.status == 304 && r.final_url == url {
+                        if let Some((body, headers)) = c.commit(&snap, &r.headers, r.ms) {
                             return Ok(DocFetch {
                                 resp: WireResp {
                                     status: 200,
                                     final_url: snap.final_url.clone(),
-                                    headers: snap.headers.clone(),
+                                    headers,
                                     body,
                                     ms: r.ms,
                                     ..Default::default()
@@ -195,10 +219,11 @@ impl Engine {
                             body: None,
                             no_cookies: opts.no_cookies,
                             proxy: opts.proxy.clone(),
+                            hop_consult: opts.hop_consult.clone(),
                             ..Default::default()
                         })?;
                         if r2.status == 200 {
-                            c.store(url, &r2);
+                            c.store(&key, url, &r2);
                         }
                         return Ok(DocFetch {
                             resp: r2,
@@ -210,7 +235,7 @@ impl Engine {
                         });
                     }
                     if r.status == 200 {
-                        c.store(url, &r);
+                        c.store(&key, url, &r);
                         let detail = format!("updated ({}ms)", r.ms);
                         return Ok(DocFetch {
                             resp: r,
@@ -221,7 +246,7 @@ impl Engine {
                             phase: "wire".into(),
                         });
                     }
-                    c.remove(url);
+                    c.remove(&key);
                     return Ok(DocFetch {
                         resp: r,
                         cache: Some(CacheOutcome {
@@ -242,11 +267,12 @@ impl Engine {
             body: None,
             no_cookies: opts.no_cookies,
             proxy: opts.proxy.clone(),
+            hop_consult: opts.hop_consult.clone(),
             ..Default::default()
         })?;
         if let Some(c) = &self.cache {
             if r.status == 200 {
-                let stored = c.store(url, &r);
+                let stored = c.store(&key, url, &r);
                 let (state, detail) = if stored {
                     (
                         CacheState::Stored,
@@ -261,7 +287,7 @@ impl Engine {
                     phase: "wire".into(),
                 });
             }
-            c.remove(url);
+            c.remove(&key);
         }
         let net = if self.cache.is_some() {
             Some(CacheOutcome {
@@ -296,9 +322,22 @@ impl Engine {
         let host_key = host_key_of(url);
 
         // 1. wire (through the state plane's cache when enabled)
+        let jar_rev_start = self
+            .wire
+            .jar
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revision();
         let docf = self
             .fetch_doc(url, opts, Vec::new())
             .map_err(|e| format!("wire: {e}"))?;
+        let jar_gained = self
+            .wire
+            .jar
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .revision()
+            != jar_rev_start;
         let mut cache: Option<CacheOutcome> = docf.cache;
         let doc = docf.resp;
         let mut final_headers = doc.headers.clone();
@@ -613,6 +652,24 @@ impl Engine {
             }
         } else if run_js {
             errors.push(format!("js skipped: status {status}"));
+        } else if challenge && !current_html.is_empty() && jar_gained {
+            // A strict challenge that isn't shaped like a document gets no
+            // runtime cycle, but it did earn a cookie: one warm re-GET,
+            // browser-style (the reload carries the new cookie). A 304 to
+            // it surfaces as-is — the contract layer rejects an
+            // unsolicited conditional-less 304 (never an empty wall).
+            let t2 = Instant::now();
+            if let Ok(df) = self.fetch_doc(url, opts, Vec::new()) {
+                cache = df.cache;
+                let b2 = df.resp;
+                phases.push(("bounce".into(), t2.elapsed().as_millis()));
+                if (200..400).contains(&b2.status) && !challenge_detected(&b2.body) {
+                    status = b2.status;
+                    current_html = b2.body;
+                    final_headers = b2.headers;
+                    label = "wire+clearance".into();
+                }
+            }
         }
 
         // ST-7 queue item (5), measured 2026-10-20: a wall the engine rendered

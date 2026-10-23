@@ -4,9 +4,9 @@
 //!   doncore fetch <url> [--js auto|always|never] [--budget ms] [--dump path]
 //!                        [--harvest] [--full]
 
-use doncore::{rt, state};
 use doncore::engine::{floor_char_boundary, Engine, JsMode};
 use doncore::state::{Cache, HostStore, JarStore};
+use doncore::{rt, state};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -83,7 +83,10 @@ fn info() {
     println!("UA: {}", ident.ua);
     println!("chrome major: {}", ident.chrome_major);
     println!("locale: {} langs: {:?}", ident.locale, ident.languages);
-    println!("tz: {} cores: {} mem: {}GB", ident.tz, ident.cores, ident.memory_gb);
+    println!(
+        "tz: {} cores: {} mem: {}GB",
+        ident.tz, ident.cores, ident.memory_gb
+    );
     println!(
         "screen: {}x{} avail {}x{} outer_h {} dpr {}",
         ident.screen_w, ident.screen_h, ident.avail_w, ident.avail_h, ident.outer_h, ident.dpr
@@ -132,10 +135,7 @@ fn fetch(args: &[String]) {
             }
             "--budget" => {
                 i += 1;
-                budget_ms = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(2500);
+                budget_ms = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(2500);
             }
             "--dump" => {
                 i += 1;
@@ -227,7 +227,8 @@ fn fetch(args: &[String]) {
                 }
             }
             if !o.errors.is_empty() {
-                let trace = std::env::var("DONCORE_TRACE").is_ok() || std::env::var("DONCORE_DEBUG").is_ok();
+                let trace = std::env::var("DONCORE_TRACE").is_ok()
+                    || std::env::var("DONCORE_DEBUG").is_ok();
                 let show = if trace { o.errors.len() } else { 3 };
                 println!("warnings: {} (last {show})", o.errors.len());
                 let skip = o.errors.len().saturating_sub(show);
@@ -245,7 +246,11 @@ fn fetch(args: &[String]) {
                 }
             }
             println!("── text ({} chars) ──", o.text.len());
-            let show = if full { o.text.len() } else { o.text.len().min(1500) };
+            let show = if full {
+                o.text.len()
+            } else {
+                o.text.len().min(1500)
+            };
             println!("{}", &o.text[..floor_char_boundary(&o.text, show)]);
             if let Some(path) = dump {
                 match std::fs::write(&path, o.html.as_bytes()) {
@@ -262,7 +267,6 @@ fn fetch(args: &[String]) {
         }
     }
 }
-
 
 fn cache_cmd(args: &[String]) {
     let op = args.first().map(String::as_str).unwrap_or("stats");

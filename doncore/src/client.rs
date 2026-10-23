@@ -142,7 +142,11 @@ pub fn open(persona: &str, resolve: Vec<(String, SocketAddr)>, features: Feature
         }
     }
     let cache = if features.cache { Cache::open() } else { None };
-    let hosts = if features.hosts { HostStore::open() } else { None };
+    let hosts = if features.hosts {
+        HostStore::open()
+    } else {
+        None
+    };
     let engine = Engine::new(wire, ident, cache, hosts);
     if let Some(c) = &engine.cache {
         c.prune_if_due();

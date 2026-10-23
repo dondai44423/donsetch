@@ -131,6 +131,12 @@ where
                     }
                 };
 
+                // DonSeTch: revalidation conditionals identify one specific
+                // stored representation; a redirect target has no matching
+                // snapshot. Never re-send them on a hop (v4 semantics:
+                // conditionals are first-hop only).
+                drop_conditional_headers(request.headers_mut());
+
                 // Extract the request body for potential reuse
                 let Some(body) = body_repr.take() else {
                     return Poll::Ready(Ok(res));
@@ -208,6 +214,15 @@ fn drop_payload_headers(headers: &mut HeaderMap) {
         CONTENT_ENCODING,
         TRANSFER_ENCODING,
     ] {
+        headers.remove(header);
+    }
+}
+
+/// DonSeTch: conditional request headers must not ride a redirect hop.
+/// The 304 they solicit could otherwise be matched against a stored body
+/// the hop had nothing to do with.
+fn drop_conditional_headers(headers: &mut HeaderMap) {
+    for header in ["if-none-match", "if-modified-since", "if-range"] {
         headers.remove(header);
     }
 }

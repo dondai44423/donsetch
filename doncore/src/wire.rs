@@ -53,6 +53,15 @@ pub struct WireReq {
     /// headers (`sec-ch-ua*`, `sec-fetch-*`, `upgrade-insecure-requests`),
     /// so a swapped User-Agent reads coherent, not bot-mixed.
     pub legacy_identity: bool,
+    /// Cooperative cancellation: the worker aborts this request once the
+    /// receiver flips `true` (the async caller dropped the job — task
+    /// abort, daemon shutdown). A pending dial or read is torn down
+    /// instead of holding the connection open.
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Per-hop redirect consult (the product's rules/SSRF gate): when set
+    /// and this request follows redirects, every hop target is offered to
+    /// the callback BEFORE the next dial.
+    pub hop_consult: Option<HopConsult>,
 }
 
 /// Default response byte cap. A hostile or careless server must never be able
@@ -72,12 +81,63 @@ pub struct WireResp {
     pub truncated: bool,
 }
 
+// ── the redirect consult ─────────────────────────────────────────────────
+
+/// One hop verdict from a caller's redirect consult.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HopDecision {
+    /// Dial the next target and continue following.
+    Follow,
+    /// Stop following: the 3xx response itself becomes the outcome.
+    Stop,
+    /// Refuse the hop: the fetch fails as `denied:` carrying this URL.
+    Deny(String),
+}
+
+/// A caller-supplied per-hop consult for the engine's redirect following:
+/// called with (previous URL, resolved next URL) BEFORE the next target is
+/// dialed. The product's rules/SSRF gate lives here — a redirect target
+/// is never dialed un-validated.
+#[derive(Clone)]
+pub struct HopConsult(std::sync::Arc<dyn Fn(&str, &str) -> HopDecision + Send + Sync>);
+
+impl HopConsult {
+    pub fn new(f: impl Fn(&str, &str) -> HopDecision + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    fn decide(&self, previous: &str, next: &str) -> HopDecision {
+        (self.0)(previous, next)
+    }
+}
+
+impl std::fmt::Debug for HopConsult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HopConsult")
+    }
+}
+
+/// The refusal a consult returned (`HopDecision::Deny`): boxed into the
+/// request failure so `do_request` lifts it to the `denied:` class with the
+/// refused URL before any generic class derivation sees the redirect wrapper.
+#[derive(Debug)]
+struct DeniedHop(String);
+
+impl std::fmt::Display for DeniedHop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "hop denied: {}", self.0)
+    }
+}
+
+impl std::error::Error for DeniedHop {}
+
 // ── errors: classified at the source ─────────────────────────────────────
 //
 // A failed request returns one string, and its CLASS is a machine-readable
 // prefix (`dns:`, `dns-timeout:`, `timeout:`, `tls:`, `connect:`, `proxy:`,
-// `body:`, `redirect:`, `request:`, `internal:`) derived from wreq's typed
-// predicates — never by matching message text. The product maps the prefix
+// `body:`, `redirect:`, `request:`, `internal:`, `denied:`) derived from
+// wreq's typed predicates — never by matching message text (the one lift is
+// the caller's own typed consult refusal). The product maps the prefix
 // back to its own taxonomy, so a dead name, a blackhole and a refused port
 // stay three different honest answers (measured 2026-10-23: before this they
 // all read `client error (Connect)`).
@@ -95,6 +155,8 @@ pub enum ErrorClass {
     Redirect,
     Request,
     Internal,
+    /// A hop the caller's redirect consult refused — detail is the URL.
+    Denied,
 }
 
 impl ErrorClass {
@@ -111,6 +173,7 @@ impl ErrorClass {
             ErrorClass::Redirect => "redirect",
             ErrorClass::Request => "request",
             ErrorClass::Internal => "internal",
+            ErrorClass::Denied => "denied",
         }
     }
 
@@ -126,7 +189,7 @@ impl ErrorClass {
             }
         } else if e.is_proxy_connect() {
             ErrorClass::Proxy
-        } else if e.is_tls() {
+        } else if e.is_tls() || chain_names_tls(e) {
             ErrorClass::Tls
         } else if e.is_timeout() {
             ErrorClass::Timeout
@@ -145,6 +208,102 @@ impl ErrorClass {
 /// One diagnostic line with its class in front: `<class>: <detail>`.
 pub fn wire_err(class: ErrorClass, detail: impl std::fmt::Display) -> String {
     format!("{}: {detail}", class.as_str())
+}
+
+/// True when the failure's message or source chain names a TLS cause.
+/// Certificate and handshake failures arrive wrapped in a connect-phase
+/// error, so the top-level kind (`wreq::Error::is_tls`) misses them; the
+/// product's honest-failure surfaces need the real class.
+fn chain_names_tls(e: &wreq::Error) -> bool {
+    const MARKERS: [&str; 7] = [
+        "certificate",
+        "unknown ca",
+        "handshake",
+        "self-signed",
+        "self signed",
+        "verify failed",
+        "untrusted",
+    ];
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut hops = 0;
+    while let Some(cur) = next {
+        hops += 1;
+        if hops > 8 {
+            break;
+        }
+        let text = cur.to_string().to_ascii_lowercase();
+        if MARKERS.iter().any(|m| text.contains(m)) {
+            return true;
+        }
+        next = cur.source();
+    }
+    false
+}
+
+/// The failure's whole source chain, one ` | `-separated line per cause:
+/// the top Display alone hides the TLS cause under its connect wrapper.
+fn describe_chain(e: &wreq::Error) -> String {
+    let mut out = e.to_string();
+    let mut next = std::error::Error::source(e);
+    let mut hops = 0;
+    while let Some(cause) = next {
+        hops += 1;
+        if hops > 8 {
+            break;
+        }
+        let text = cause.to_string();
+        if !text.is_empty() {
+            out.push_str(" | ");
+            out.push_str(&text);
+        }
+        next = cause.source();
+    }
+    out
+}
+
+/// True when the failure's source chain names a proxy-auth (407) tunnel
+/// refusal. The tunnel error displays "proxy authorization required" and
+/// carries no status anywhere, so the class detail must add the 407 marker
+/// the product's lane health keys on.
+fn chain_names_proxy_auth(e: &wreq::Error) -> bool {
+    const MARKERS: [&str; 2] = [
+        "proxy authorization required",
+        "proxy authentication required",
+    ];
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut hops = 0;
+    while let Some(cur) = next {
+        hops += 1;
+        if hops > 8 {
+            break;
+        }
+        let text = cur.to_string().to_ascii_lowercase();
+        if MARKERS.iter().any(|m| text.contains(m)) {
+            return true;
+        }
+        next = cur.source();
+    }
+    false
+}
+
+/// The consult refusal inside a failed request, when there is one: lifted
+/// to the `denied:` class (carrying the refused URL) before kind
+/// derivation — the redirect wrapper would otherwise read as a generic
+/// redirect failure.
+fn chain_denied_hop(e: &wreq::Error) -> Option<&str> {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut hops = 0;
+    while let Some(cur) = next {
+        hops += 1;
+        if hops > 8 {
+            break;
+        }
+        if let Some(d) = cur.downcast_ref::<DeniedHop>() {
+            return Some(&d.0);
+        }
+        next = cur.source();
+    }
+    None
 }
 
 struct Job {
@@ -860,14 +1019,13 @@ async fn do_request(
                 .header("Accept", "*/*");
         }
         ReqKind::Image => {
-            builder = builder.header("Sec-Fetch-Dest", "image").header(
-                "Sec-Fetch-Mode",
-                "no-cors",
-            )
-            .header(
-                "Accept",
-                "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            );
+            builder = builder
+                .header("Sec-Fetch-Dest", "image")
+                .header("Sec-Fetch-Mode", "no-cors")
+                .header(
+                    "Accept",
+                    "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                );
         }
     }
     for (k, v) in &req.extra_headers {
@@ -875,6 +1033,29 @@ async fn do_request(
     }
     if let Some(ms) = req.timeout_ms {
         builder = builder.timeout(std::time::Duration::from_millis(ms));
+    }
+    // Per-hop consult (the product's rules/SSRF gate): the client's
+    // redirect policy is per-request, so a custom policy replicating
+    // `limited(10)` can ask the caller before each hop is dialed.
+    if let Some(consult) = req.hop_consult.clone() {
+        if req.follow_redirects != Some(false) {
+            builder = builder.redirect(wreq::redirect::Policy::custom(move |attempt| {
+                if attempt.previous.len() > 10 {
+                    return attempt.error("too many redirects");
+                }
+                let prev = attempt
+                    .previous
+                    .last()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default();
+                let next = attempt.uri.to_string();
+                match consult.decide(&prev, &next) {
+                    HopDecision::Follow => attempt.follow(),
+                    HopDecision::Stop => attempt.stop(),
+                    HopDecision::Deny(url) => attempt.error(DeniedHop(url)),
+                }
+            }));
+        }
     }
     let cookie = if req.no_cookies {
         None
@@ -888,13 +1069,18 @@ async fn do_request(
             .map(|d| d.as_millis())
             .unwrap_or(0);
         eprintln!(
-            "[wire] t={t_ms} {} {} cookie={:?}",
+            "[wire] t={t_ms} {} {} cookie={:?} legacy={} extras={:?}",
             req.method,
             &req.url[..floor_char_boundary(&req.url, req.url.len().min(90))],
             cookie
                 .as_deref()
                 .map(|c| &c[floor_char_boundary(c, c.len().saturating_sub(60))..])
-                .unwrap_or("-")
+                .unwrap_or("-"),
+            req.legacy_identity,
+            req.extra_headers
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
         );
     }
     if let Some(c) = cookie {
@@ -903,10 +1089,37 @@ async fn do_request(
     if let Some(body) = &req.body {
         builder = builder.body(body.clone());
     }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| wire_err(ErrorClass::of(&e), e))?;
+    let send = builder.send();
+    let resp = match req.cancel.clone() {
+        Some(mut rx) => {
+            if *rx.borrow() {
+                return Err(wire_err(ErrorClass::Request, "cancelled: caller went away"));
+            }
+            tokio::select! {
+                r = send => r,
+                _ = rx.changed() => {
+                    return Err(wire_err(
+                        ErrorClass::Request,
+                        "cancelled: caller went away",
+                    ));
+                }
+            }
+        }
+        None => send.await,
+    }
+    .map_err(|e| {
+        if let Some(url) = chain_denied_hop(&e) {
+            return wire_err(ErrorClass::Denied, url);
+        }
+        let class = ErrorClass::of(&e);
+        if matches!(class, ErrorClass::Tls) {
+            wire_err(class, describe_chain(&e))
+        } else if matches!(class, ErrorClass::Proxy) && chain_names_proxy_auth(&e) {
+            wire_err(class, format!("{e} | 407 proxy authorization required"))
+        } else {
+            wire_err(class, &e)
+        }
+    })?;
     let status = resp.status().as_u16();
     let final_url = resp.uri().to_string();
     if std::env::var("DONCORE_DEBUG").is_ok() {
@@ -1056,16 +1269,11 @@ mod tests {
         w.fetch(WireReq {
             method: "GET".into(),
             url,
-            kind: ReqKind::Document,
-            extra_headers: Vec::new(),
-            body: None,
             timeout_ms: opts.timeout_ms,
             max_bytes: opts.max_bytes,
             bytes: opts.bytes,
             no_cookies: opts.no_cookies,
-            proxy: None,
-            follow_redirects: None,
-            legacy_identity: false,
+            ..Default::default()
         })
         .expect("fetch")
     }
@@ -1449,6 +1657,15 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .join("\n")
             .to_lowercase();
+        let ua_lines: Vec<&str> = head
+            .lines()
+            .filter(|l| l.starts_with("user-agent:"))
+            .collect();
+        assert_eq!(
+            ua_lines,
+            vec!["user-agent: googlebot/2.1 (+http://www.google.com/bot.html)"],
+            "exactly one UA, the caller's: {head}"
+        );
         assert!(head.contains("user-agent: googlebot/2.1"), "{head}");
         assert!(!head.contains("sec-ch-ua"), "{head}");
         assert!(!head.contains("sec-fetch-"), "{head}");
@@ -1478,5 +1695,197 @@ mod tests {
         assert!(head.contains("accept: text/css"), "{head}");
         assert!(!head.contains("upgrade-insecure-requests"), "{head}");
         assert!(!head.contains("sec-fetch-user"), "{head}");
+    }
+
+    /// One-shot redirect server on loopback: answers every request with a
+    /// 302 to `location`; returns its base URL.
+    fn redirect_once(location: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let location = location.clone();
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().expect("clone"));
+                    let mut line = String::new();
+                    let _ = r.read_line(&mut line);
+                    loop {
+                        let mut l = String::new();
+                        if r.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" || l == "\n" {
+                            break;
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    let _ = s.flush();
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/start")
+    }
+
+    #[test]
+    fn a_consult_denies_a_hop_before_the_dial() {
+        // A redirects to B; the consult denies B. B must never receive a
+        // request, and the failure carries the refused URL as `denied:`.
+        let (b_url, b_log) = serve(b"B-SHOULD-NOT-BE-REACHED", "text/plain");
+        let a_url = redirect_once(b_url.clone());
+        let w = wire();
+        let deny = b_url.clone();
+        let err = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: a_url,
+                kind: ReqKind::Document,
+                hop_consult: Some(HopConsult::new(move |_prev, next| {
+                    if next == deny.as_str() {
+                        HopDecision::Deny(next.to_string())
+                    } else {
+                        HopDecision::Follow
+                    }
+                })),
+                ..Default::default()
+            })
+            .expect_err("the refused hop must fail the fetch");
+        assert!(err.starts_with("denied:"), "{err}");
+        assert!(err.contains(&b_url), "{err}");
+        assert_eq!(
+            b_log.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            0,
+            "the denied hop was dialed"
+        );
+    }
+
+    #[test]
+    fn a_consult_stop_returns_the_redirect_itself() {
+        // A redirects to B; the consult declines to follow. The 3xx itself
+        // is the outcome (v4 semantics) and B is never dialed.
+        let (b_url, b_log) = serve(b"B-SHOULD-NOT-BE-REACHED", "text/plain");
+        let a_url = redirect_once(b_url);
+        let w = wire();
+        let resp = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: a_url.clone(),
+                kind: ReqKind::Document,
+                hop_consult: Some(HopConsult::new(|_, _| HopDecision::Stop)),
+                ..Default::default()
+            })
+            .expect("stop must return the 3xx, not an error");
+        assert_eq!(resp.status, 302);
+        assert_eq!(resp.final_url, a_url, "no hop was taken");
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("location")));
+        assert_eq!(
+            b_log.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            0,
+            "a stopped hop was dialed"
+        );
+    }
+
+    #[test]
+    fn a_consult_follow_keeps_the_chain() {
+        let (b_url, _b_log) = serve(b"landed", "text/plain");
+        let a_url = redirect_once(b_url.clone());
+        let w = wire();
+        let resp = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: a_url,
+                kind: ReqKind::Document,
+                hop_consult: Some(HopConsult::new(|_, _| HopDecision::Follow)),
+                ..Default::default()
+            })
+            .expect("follow");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, "landed");
+        assert_eq!(resp.final_url, b_url, "the chain landed on B");
+    }
+
+    #[test]
+    fn a_consult_cannot_widen_the_hop_cap() {
+        // Every request redirects to itself; a follow-forever consult must
+        // still stop at the ten-hop cap (the custom policy replicates
+        // `limited(10)`).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().expect("clone"));
+                    let mut line = String::new();
+                    let _ = r.read_line(&mut line);
+                    loop {
+                        let mut l = String::new();
+                        if r.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" || l == "\n" {
+                            break;
+                        }
+                    }
+                    let _ = s.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = s.flush();
+                });
+            }
+        });
+        let w = wire();
+        let err = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: format!("http://127.0.0.1:{port}/loop"),
+                kind: ReqKind::Document,
+                hop_consult: Some(HopConsult::new(|_, _| HopDecision::Follow)),
+                ..Default::default()
+            })
+            .expect_err("the cap must stop a follow-forever consult");
+        assert!(err.contains("too many redirects"), "{err}");
+        assert!(err.starts_with("redirect:"), "{err}");
+    }
+
+    #[test]
+    fn a_proxy_connect_407_names_the_auth_requirement() {
+        // A CONNECT proxy demanding credentials: the lane health needs the
+        // 407 named, but the tunnel chain text carries only "proxy
+        // authorization required" — the class detail must add the marker.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().expect("clone"));
+                    let mut line = String::new();
+                    let _ = r.read_line(&mut line); // CONNECT host:port HTTP/1.1
+                    loop {
+                        let mut l = String::new();
+                        if r.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" || l == "\n" {
+                            break;
+                        }
+                    }
+                    let _ = s.write_all(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = s.flush();
+                });
+            }
+        });
+        let w = wire();
+        let err = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: "https://console.example/".into(),
+                kind: ReqKind::Document,
+                proxy: Some(format!("http://127.0.0.1:{port}")),
+                ..Default::default()
+            })
+            .expect_err("a 407 CONNECT must fail");
+        assert!(err.starts_with("proxy:"), "{err}");
+        assert!(err.contains("407"), "{err}");
     }
 }

@@ -88,6 +88,10 @@ pub struct FreshHit {
 pub struct Snap {
     pub final_url: String,
     pub headers: Vec<(String, String)>,
+    /// The stored body as it was at check time. A concurrent replacement
+    /// must not change what this snapshot's 304 validates (v4 semantics:
+    /// the answer describes the exact bytes sent in its precondition).
+    body: String,
     meta: Meta,
     meta_path: PathBuf,
     body_path: PathBuf,
@@ -198,6 +202,7 @@ impl Cache {
                 snap: Snap {
                     final_url: meta.final_url.clone(),
                     headers: meta.headers.clone(),
+                    body,
                     meta,
                     meta_path: mp,
                     body_path: bp,
@@ -211,8 +216,8 @@ impl Cache {
     /// Decides cacheability from the measured rules and writes the entry.
     /// Returns true when an entry was stored. Any non-200 network outcome
     /// evicts a stale entry for this URL (the origin speaks now).
-    pub fn store(&self, url: &str, resp: &WireResp) -> bool {
-        let (mp, bp) = self.entry_paths(url);
+    pub fn store(&self, key: &str, url: &str, resp: &WireResp) -> bool {
+        let (mp, bp) = self.entry_paths(key);
         if resp.status != 200 {
             self.drop_entry(&mp, &bp);
             return false;
@@ -223,7 +228,11 @@ impl Cache {
         }
         let headers = stored_headers(&resp.headers);
         if headers.len() > MAX_HEADER_FIELDS
-            || headers.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() > MAX_HEADER_BYTES
+            || headers
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                > MAX_HEADER_BYTES
         {
             self.drop_entry(&mp, &bp);
             return false;
@@ -254,7 +263,7 @@ impl Cache {
         } else {
             expires_lifetime(&headers, now)
         };
-        let mut fresh_until = if cc.validate {
+        let fresh_until = if cc.validate {
             None
         } else {
             match (lifetime, ia) {
@@ -262,10 +271,8 @@ impl Cache {
                 _ => None,
             }
         };
-        if vk == VaryKind::Cookie {
-            fresh_until = None;
-        }
-        let useful = fresh_until.map(|f| f > now).unwrap_or(false) || etag.is_some() || lm.is_some();
+        let useful =
+            fresh_until.map(|f| f > now).unwrap_or(false) || etag.is_some() || lm.is_some();
         if !useful {
             self.drop_entry(&mp, &bp);
             return false;
@@ -279,7 +286,7 @@ impl Cache {
             fresh_until,
             etag,
             lm,
-            reval_only: cc.validate || vk == VaryKind::Cookie,
+            reval_only: cc.validate,
             hits: 0,
             last_used: now,
             body_len: resp.body.len() as u64,
@@ -305,10 +312,18 @@ impl Cache {
     /// the shipped v4 policy: opaque-tag equality ignoring `W/`, weak→strong
     /// upgrade rejected, ambiguous multi-tag rejected, LM-only answers must
     /// match the stored date, a fresh ETag over an LM-only snapshot is
-    /// adopted. Returns the body to serve, or None when the 304 is rejected
-    /// (bounded recovery = one unconditional refetch by the caller).
-    pub fn commit(&self, snap: &Snap, headers304: &[(String, String)], delay_ms: u128) -> Option<String> {
-        let body = fs::read_to_string(&snap.body_path).ok()?;
+    /// adopted. Returns the body to serve together with the merged headers,
+    /// or None when the 304 is rejected (bounded recovery = one
+    /// unconditional refetch by the caller). A concurrent replacement stays
+    /// authoritative: the merge lands only while the stored entry still is
+    /// this snapshot's.
+    pub fn commit(
+        &self,
+        snap: &Snap,
+        headers304: &[(String, String)],
+        delay_ms: u128,
+    ) -> Option<(String, Vec<(String, String)>)> {
+        let body = snap.body.clone();
         if body.len() as u64 != snap.meta.body_len {
             self.drop_entry(&snap.meta_path, &snap.body_path);
             return None;
@@ -358,7 +373,9 @@ impl Cache {
                 && !k.eq_ignore_ascii_case("date")
         });
         for (k, v) in &h {
-            if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("content-encoding") {
+            if k.eq_ignore_ascii_case("content-length")
+                || k.eq_ignore_ascii_case("content-encoding")
+            {
                 continue;
             }
             merged.retain(|(mk, _)| !mk.eq_ignore_ascii_case(k));
@@ -369,10 +386,9 @@ impl Cache {
             merged.push(("date".into(), httpdate::fmt_http_date(to_systime(now))));
         }
         let cc2 = parse_cache_control(&merged);
-        let vk2 = vary_kind(&merged);
         if cc2.no_store {
             self.drop_entry(&snap.meta_path, &snap.body_path);
-            return Some(body);
+            return Some((body, merged));
         }
         let etag2 = unique(&merged, "etag")
             .filter(|t| valid_etag(t))
@@ -388,7 +404,7 @@ impl Cache {
         } else {
             expires_lifetime(&merged, now)
         };
-        let mut fresh_until = if cc2.validate {
+        let fresh_until = if cc2.validate {
             None
         } else {
             match (lifetime2, ia2) {
@@ -396,14 +412,11 @@ impl Cache {
                 _ => None,
             }
         };
-        if vk2 == VaryKind::Cookie {
-            fresh_until = None;
-        }
         let useful =
             fresh_until.map(|f| f > now).unwrap_or(false) || etag2.is_some() || lm2.is_some();
         if !useful {
             self.drop_entry(&snap.meta_path, &snap.body_path);
-            return Some(body);
+            return Some((body, merged));
         }
         let m = Meta {
             v: 1,
@@ -414,15 +427,22 @@ impl Cache {
             fresh_until,
             etag: etag2,
             lm: lm2,
-            reval_only: cc2.validate || vk2 == VaryKind::Cookie,
+            reval_only: cc2.validate,
             hits: snap.meta.hits + 1,
             last_used: now,
             body_len: snap.meta.body_len,
             body_sha: snap.meta.body_sha.clone(),
-            headers: merged,
+            headers: merged.clone(),
         };
-        let _ = write_meta(&snap.meta_path, &m);
-        Some(body)
+        // Concurrent replacement stays authoritative (v4 semantics): the
+        // merge lands only while the stored entry still is this snapshot's.
+        let unchanged = read_meta(&snap.meta_path).is_some_and(|cur| {
+            cur.stored_at == snap.meta.stored_at && cur.body_sha == snap.meta.body_sha
+        });
+        if unchanged {
+            let _ = write_meta(&snap.meta_path, &m);
+        }
+        Some((body, merged))
     }
 
     /// Evicts any entry for this URL (a revalidation answered with anything
@@ -507,7 +527,8 @@ impl Cache {
                                 freed += m.body_len;
                                 continue;
                             }
-                            if self.idle_secs > 0 && now.saturating_sub(m.last_used) > self.idle_secs
+                            if self.idle_secs > 0
+                                && now.saturating_sub(m.last_used) > self.idle_secs
                             {
                                 let _ = fs::remove_file(&p);
                                 let _ = fs::remove_file(&bp);
@@ -650,7 +671,11 @@ impl Cache {
 /// per-OS default below — so the swap re-points the engine at donsetch's
 /// cache dir with no code change. Tests isolate with DONCORE_STATE_DIR.
 pub fn state_root() -> Option<PathBuf> {
-    for var in ["DONCORE_STATE_DIR", "DONCORE_CACHE_DIR", "DONSETCH_CACHE_DIR"] {
+    for var in [
+        "DONCORE_STATE_DIR",
+        "DONCORE_CACHE_DIR",
+        "DONSETCH_CACHE_DIR",
+    ] {
         if let Ok(d) = std::env::var(var) {
             if !d.is_empty() {
                 return Some(PathBuf::from(d));
@@ -677,9 +702,12 @@ fn default_root() -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn default_root() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library").join("Caches").join("doncore"))
+    std::env::var("HOME").ok().map(|h| {
+        PathBuf::from(h)
+            .join("Library")
+            .join("Caches")
+            .join("doncore")
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -698,8 +726,41 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The request-context key for a cache entry (v4 semantics): a stored
+/// representation belongs to the exact request identity — URL, egress
+/// route (credentials included), and the header/cookie context actually
+/// sent — never the URL alone and never "jar mode".
+pub fn representation_key(
+    url: &str,
+    proxy: Option<&str>,
+    no_cookies: bool,
+    extra: &[(String, String)],
+    cookie: Option<&str>,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update([u8::from(no_cookies)]);
+    for field in std::iter::once(url)
+        .chain(std::iter::once(proxy.unwrap_or("direct")))
+        .chain(
+            extra
+                .iter()
+                .flat_map(|(name, value)| [name.as_str(), value.as_str()]),
+        )
+        .chain(cookie)
+    {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub(crate) fn to_unix(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn to_systime(s: u64) -> SystemTime {
@@ -823,9 +884,7 @@ fn valid_etag(tag: &str) -> bool {
 }
 
 fn unique<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    let mut it = headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case(name));
+    let mut it = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name));
     let v = it.next()?.1.trim();
     it.next().is_none().then_some(v)
 }
@@ -936,7 +995,10 @@ enum VaryKind {
 
 fn vary_kind(headers: &[(String, String)]) -> VaryKind {
     let mut cookie = false;
-    for (_, value) in headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("vary")) {
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+    {
         for field in value.split(',') {
             let field = field.trim();
             if field.is_empty() {

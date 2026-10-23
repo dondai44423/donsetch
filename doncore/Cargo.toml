@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 httpdate = "1"
 sha2 = "0.11"
-wreq = { version = "6.0.0-rc.31", features = ["gzip", "brotli", "zstd", "deflate", "charset", "cookies", "stream"] }
+wreq = { version = "6.0.0-rc.31", default-features = false, features = ["tokio-rt", "gzip", "brotli", "zstd", "deflate", "charset", "cookies", "stream", "socks"] }
 wreq-util = "3.0.0-rc.14"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 scraper = { version = "0.24", features = ["deterministic"] }

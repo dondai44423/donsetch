@@ -152,15 +152,13 @@ fn read_mem_gb() -> u32 {
 
 #[cfg(target_os = "linux")]
 fn read_mem_bytes() -> Option<u64> {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-                .map(|kb| kb * 1024)
-        })
+    std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
+        s.lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb * 1024)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -169,7 +167,12 @@ fn read_mem_bytes() -> Option<u64> {
         .args(["-n", "hw.memsize"])
         .output()
         .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
 }
 
 #[cfg(target_os = "windows")]
@@ -310,7 +313,12 @@ fn read_locale() -> String {
         }
     }
     Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", "(Get-Culture).Name"])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Culture).Name",
+        ])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

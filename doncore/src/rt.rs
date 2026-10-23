@@ -92,10 +92,7 @@ const QBC_PRELUDE: &[u8] = include_bytes!("../assets/qbc/prelude.qbc");
 /// on drop; a Ctx stored in heap-closure state keeps its context alive past
 /// JS_FreeRuntime and trips the gc_obj_list assertion) and never a JS value.
 /// The context is taken at call time off the function object itself.
-fn native_wrap<'js>(
-    ctx: rquickjs::Ctx<'js>,
-    id: usize,
-) -> rquickjs::Result<Function<'js>> {
+fn native_wrap<'js>(ctx: rquickjs::Ctx<'js>, id: usize) -> rquickjs::Result<Function<'js>> {
     Function::new(
         ctx,
         move |fself: rquickjs::function::FuncArg<Function<'js>>,
@@ -112,8 +109,7 @@ fn native_wrap<'js>(
 
 const PROBE_SNIPPET: &str = r#";try{globalThis.__AJDUMP=(function(){try{var F=(typeof globalThis.__AJ2==='function')?globalThis.__AJ2:((typeof aj==='function')?aj:null);if(!F){return 'NO-AJ'}var o={};for(var i=0;i<6000;i++){try{var v=F(i);if(typeof v!=='undefined'){o[i]=String(v).slice(0,90)}}catch(e){}}return JSON.stringify(o)}catch(e){return 'ERR:'+e}})()}catch(e){}"#;
 const PROBE2_SNIPPET: &str = r#";try{globalThis.__PROBE2=JSON.stringify({wd:typeof window.document,gd:typeof document,same:(typeof window.document!=='undefined')&&window.document===document,we:typeof window.event,loc:typeof window.location,topEq:window.top===window,wt:typeof window.top,docBody:typeof document.body,gebi:typeof document.getElementById,dqs:typeof document.querySelector,bqs:typeof (document.body&&document.body.querySelector),gn:typeof globalThis,mk:typeof MkvrI5,mkw:typeof window.MkvrI5,mkp:Object.getOwnPropertyNames(window).filter(function(n){return /kvr|Mkv/.test(n)}).slice(0,30)})}catch(e){globalThis.__PROBE2='ERR:'+e}"#;
-const PENDING_SCRIPTS_EXPR: &str =
-    "__DCI.pendingScripts ? __DCI.pendingScripts.length : 0";
+const PENDING_SCRIPTS_EXPR: &str = "__DCI.pendingScripts ? __DCI.pendingScripts.length : 0";
 
 /// How much text the document body holds — the content-presence sample for
 /// the content-stable early-out. This is the HIDDEN-text view (script/style
@@ -234,7 +230,9 @@ impl StallWatch {
         }
         self.sampled_at = Instant::now();
         let adv: i64 = ctx
-            .with(|ctx| ctx.eval::<i64, _>("(typeof __DCI.pmAdv === \"function\") ? __DCI.pmAdv() : -1"))
+            .with(|ctx| {
+                ctx.eval::<i64, _>("(typeof __DCI.pmAdv === \"function\") ? __DCI.pmAdv() : -1")
+            })
             .unwrap_or(-1);
         let net = harvest.borrow().len();
         let jlen = jar.lock().unwrap_or_else(|p| p.into_inner()).len();
@@ -377,7 +375,15 @@ pub fn run_document(
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn_scoped(scope, || {
-                run_document_inner(identity_json, page_url, tree_json, scripts, wire, budget_ms, challenge)
+                run_document_inner(
+                    identity_json,
+                    page_url,
+                    tree_json,
+                    scripts,
+                    wire,
+                    budget_ms,
+                    challenge,
+                )
             })
             .map_err(|e| format!("js thread spawn: {e}"))?
             .join()
@@ -749,12 +755,18 @@ fn run_document_inner(
     // runtime loader) instead of global eval.
     let mut ordered: Vec<&ScriptSlot> = Vec::with_capacity(scripts.len());
     for slot in scripts.iter() {
-        if !matches!(slot, ScriptSlot::InlineModule(_) | ScriptSlot::ExternalModule(_)) {
+        if !matches!(
+            slot,
+            ScriptSlot::InlineModule(_) | ScriptSlot::ExternalModule(_)
+        ) {
             ordered.push(slot);
         }
     }
     for slot in scripts.iter() {
-        if matches!(slot, ScriptSlot::InlineModule(_) | ScriptSlot::ExternalModule(_)) {
+        if matches!(
+            slot,
+            ScriptSlot::InlineModule(_) | ScriptSlot::ExternalModule(_)
+        ) {
             ordered.push(slot);
         }
     }
@@ -772,7 +784,10 @@ fn run_document_inner(
         if timed_out.get() {
             break;
         }
-        if matches!(slot, ScriptSlot::InlineModule(_) | ScriptSlot::ExternalModule(_)) {
+        if matches!(
+            slot,
+            ScriptSlot::InlineModule(_) | ScriptSlot::ExternalModule(_)
+        ) {
             mod_seq += 1;
             let (src, name) = match slot {
                 ScriptSlot::InlineModule(s) => (s.clone(), format!("{page_url}#mod{mod_seq}")),
@@ -924,8 +939,12 @@ fn run_document_inner(
                     Ok(d) => d,
                     Err(_) => return,
                 };
-                if dci.set("CUR_KEY", key.clone()).is_err() { return; }
-                if dci.set("CUR_MODE", mode).is_err() { return; }
+                if dci.set("CUR_KEY", key.clone()).is_err() {
+                    return;
+                }
+                if dci.set("CUR_MODE", mode).is_err() {
+                    return;
+                }
                 let _ = ctx.eval::<(), _>("__DCI.curBeginKey(__DCI.CUR_KEY, __DCI.CUR_MODE)");
             });
         }
@@ -964,8 +983,16 @@ fn run_document_inner(
     // Timers are honored up to a horizon (a browser never exits with a due timer);
     // waits are sliced so the interrupt deadline stays live.
     // Challenge stall watchdog state (None for non-challenge pages).
-    let mut stall_watch: Option<StallWatch> = if challenge { Some(StallWatch::new()) } else { None };
-    let mut idle_watch: Option<IdleWatch> = if challenge { None } else { Some(IdleWatch::new()) };
+    let mut stall_watch: Option<StallWatch> = if challenge {
+        Some(StallWatch::new())
+    } else {
+        None
+    };
+    let mut idle_watch: Option<IdleWatch> = if challenge {
+        None
+    } else {
+        Some(IdleWatch::new())
+    };
     let mut challenge_stalled = false;
     let mut stalled_ms: u128 = 0;
     let mut idle_stop_ms: u128 = 0;
@@ -1042,7 +1069,10 @@ fn run_document_inner(
         }
         if fired == 0 {
             if std::env::var("DONCORE_TRACE").is_ok() {
-                eprintln!("[loop] s1 idle (fired=0) t={}ms", settle_t0.elapsed().as_millis());
+                eprintln!(
+                    "[loop] s1 idle (fired=0) t={}ms",
+                    settle_t0.elapsed().as_millis()
+                );
             }
             break;
         }
@@ -1056,7 +1086,11 @@ fn run_document_inner(
             let pending: i32 = ctx
                 .with(|ctx| ctx.eval::<i32, _>(PENDING_SCRIPTS_EXPR).unwrap_or(0))
                 .max(0);
-            if pending > 0 { 300 } else { 3000 }
+            if pending > 0 {
+                300
+            } else {
+                3000
+            }
         };
         if w > horizon {
             if std::env::var("DONCORE_TRACE").is_ok() {
@@ -1084,8 +1118,7 @@ fn run_document_inner(
         let batch_json: String = ctx
             .with(|ctx| ctx.eval::<String, _>("__DCI.takeScripts()"))
             .unwrap_or_else(|_| "[]".to_string());
-        let items: Vec<serde_json::Value> =
-            serde_json::from_str(&batch_json).unwrap_or_default();
+        let items: Vec<serde_json::Value> = serde_json::from_str(&batch_json).unwrap_or_default();
         if items.is_empty() {
             break;
         }
@@ -1134,7 +1167,10 @@ fn run_document_inner(
                     eprintln!("dyn-fetch: {resolved}");
                 }
                 let dup_ok = if is_mod {
-                    mod_done.iter().find(|(m, _)| m == &resolved_url).map(|(_, ok)| *ok)
+                    mod_done
+                        .iter()
+                        .find(|(m, _)| m == &resolved_url)
+                        .map(|(_, ok)| *ok)
                 } else {
                     None
                 };
@@ -1143,7 +1179,11 @@ fn run_document_inner(
                         eprintln!("dyn-mod-dup: {resolved}");
                     }
                     let _ = ctx.with(|ctx| {
-                        ctx.eval::<bool, _>(if dok { "__DCI.dynDone(1)" } else { "__DCI.dynDone(0)" })
+                        ctx.eval::<bool, _>(if dok {
+                            "__DCI.dynDone(1)"
+                        } else {
+                            "__DCI.dynDone(0)"
+                        })
                     });
                     continue;
                 }
@@ -1164,7 +1204,9 @@ fn run_document_inner(
                     Ok(r) => {
                         report.scripts_failed += 1;
                         if report.errors.len() < 40 {
-                            report.errors.push(format!("{resolved}: status {}", r.status));
+                            report
+                                .errors
+                                .push(format!("{resolved}: status {}", r.status));
                         }
                         let _ = ctx.with(|ctx| ctx.eval::<bool, _>("__DCI.dynDone(0)"));
                         continue;
@@ -1214,7 +1256,9 @@ fn run_document_inner(
                 let _ = std::fs::write(format!("scratch/dyn-run-{dyn_dump_seq}.js"), &body);
             }
             let origin_label = src;
-            if std::env::var("DONCORE_TRACE").is_ok() && body.contains("case\"requestExtraParams\":{") {
+            if std::env::var("DONCORE_TRACE").is_ok()
+                && body.contains("case\"requestExtraParams\":{")
+            {
                 // api.js boot beacon: surface what the loader resolved
                 let from = "Pe=V.params.get(\"onload\")";
                 let to = "Pe=V.params.get(\"onload\"),(__DCI.t.WLOG=__DCI.t.WLOG||[]).push('PeV='+String(Pe)+' src='+String(V&&V.src).slice(0,80))";
@@ -1331,13 +1375,15 @@ fn run_document_inner(
             }
             if std::env::var("DONCORE_PROBE_DYN").is_ok() {
                 let d: String = ctx.with(|ctx| {
-                    ctx.eval::<String, _>("globalThis.__AJDUMP || ''").unwrap_or_default()
+                    ctx.eval::<String, _>("globalThis.__AJDUMP || ''")
+                        .unwrap_or_default()
                 });
                 if !d.is_empty() {
                     let _ = std::fs::write("scratch/ajdump.json", &d);
                 }
                 let d2: String = ctx.with(|ctx| {
-                    ctx.eval::<String, _>("globalThis.__PROBE2 || ''").unwrap_or_default()
+                    ctx.eval::<String, _>("globalThis.__PROBE2 || ''")
+                        .unwrap_or_default()
                 });
                 if !d2.is_empty() {
                     let _ = std::fs::write("scratch/probe2.json", &d2);
@@ -1363,7 +1409,9 @@ fn run_document_inner(
                         )
                         .unwrap_or_default()
                     });
-                    report.errors.push(format!("dyn-script: {cut} {snip} lastcall={last}"));
+                    report
+                        .errors
+                        .push(format!("dyn-script: {cut} {snip} lastcall={last}"));
                 }
             }
             // element events (measured vs Chromium 154 same-hour: dyn-sl2..sl6,
@@ -1378,7 +1426,11 @@ fn run_document_inner(
                 }
             }
             let ev_ok = if is_mod { mod_ok } else { true };
-            let fire = if is_mod && resolved_url.is_empty() { 0 } else { 1 };
+            let fire = if is_mod && resolved_url.is_empty() {
+                0
+            } else {
+                1
+            };
             let _ = ctx.with(|ctx| {
                 ctx.eval::<bool, _>(if fire == 0 {
                     "__DCI.dynDone(1, 0)"
@@ -1644,7 +1696,12 @@ pub fn write_asset_qbc(in_path: &str, out_path: &str) -> Result<(), String> {
                 return Err("compile failed (exception pending)".into());
             }
             let mut sz: u64 = 0;
-            let buf = qjs::JS_WriteObject(raw, &mut sz, fun, qjs::JS_WRITE_OBJ_BYTECODE as std::ffi::c_int);
+            let buf = qjs::JS_WriteObject(
+                raw,
+                &mut sz,
+                fun,
+                qjs::JS_WRITE_OBJ_BYTECODE as std::ffi::c_int,
+            );
             qjs::JS_FreeValue(raw, fun);
             if buf.is_null() || sz == 0 {
                 return Err("write_object returned no buffer".into());
@@ -1656,7 +1713,8 @@ pub fn write_asset_qbc(in_path: &str, out_path: &str) -> Result<(), String> {
             {
                 let _ = ctx.eval::<(), _>("let __DCI = {};");
                 let raw2 = ctx.as_raw().as_ptr();
-                let f2 = qjs::JS_ReadObject(raw2, buf, sz, qjs::JS_READ_OBJ_BYTECODE as std::ffi::c_int);
+                let f2 =
+                    qjs::JS_ReadObject(raw2, buf, sz, qjs::JS_READ_OBJ_BYTECODE as std::ffi::c_int);
                 if qjs::JS_HasException(raw2) {
                     eprintln!("qbc-selfcheck: read failed: {}", qjs_exc_string(raw2));
                 } else {
@@ -1792,7 +1850,8 @@ impl rquickjs::loader::Resolver for ModResolver {
         name: &str,
         _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
-        if name.starts_with("http://") || name.starts_with("https://") || name.starts_with("data:") {
+        if name.starts_with("http://") || name.starts_with("https://") || name.starts_with("data:")
+        {
             return Ok(name.to_string());
         }
         if name.starts_with('/') || name.starts_with("./") || name.starts_with("../") {
@@ -1851,7 +1910,7 @@ impl rquickjs::loader::Loader for ModLoader {
                     "module",
                     "Network",
                     format!("Failed to load module {name}: HTTP {}", r.status),
-                ))
+                ));
             }
             Err(e) => {
                 self.netfail.set(true);
@@ -1859,7 +1918,7 @@ impl rquickjs::loader::Loader for ModLoader {
                     "module",
                     "Network",
                     format!("Failed to load module {name}: {e}"),
-                ))
+                ));
             }
         };
         rquickjs::Module::declare(ctx.clone(), name.as_bytes().to_vec(), body.into_bytes())
@@ -1899,7 +1958,9 @@ fn patch_calltracer(src: &str) -> String {
             let is_id_start = |c: char| c.is_ascii_alphabetic() || c == '_' || c == '$';
             if j < cs.len() && is_id_start(cs[j]) {
                 j += 1;
-                while j < cs.len() && (cs[j].is_ascii_alphanumeric() || cs[j] == '_' || cs[j] == '$') {
+                while j < cs.len()
+                    && (cs[j].is_ascii_alphanumeric() || cs[j] == '_' || cs[j] == '$')
+                {
                     j += 1;
                 }
                 if j + 1 < cs.len() && cs[j] == ']' && cs[j + 1] == '(' {
@@ -1916,11 +1977,7 @@ fn patch_calltracer(src: &str) -> String {
                     }
                     let obj: String = cs[k..i].iter().collect();
                     let obj_ok = !obj.is_empty()
-                        && obj
-                            .chars()
-                            .next()
-                            .map(|c| is_id_start(c))
-                            .unwrap_or(false);
+                        && obj.chars().next().map(|c| is_id_start(c)).unwrap_or(false);
                     if obj_ok {
                         out.push_str("(globalThis.__CT2(");
                         out.push_str(&ident);
@@ -1982,7 +2039,8 @@ fn err_snippet(msg: &str, body: &str) -> String {
                                 let a = c.saturating_sub(300);
                                 let z = (c + 300).min(lc.len());
                                 let left: String = lc[a..c.saturating_sub(1)].iter().collect();
-                                let mark: String = lc.get(c - 1).map(|ch| ch.to_string()).unwrap_or_default();
+                                let mark: String =
+                                    lc.get(c - 1).map(|ch| ch.to_string()).unwrap_or_default();
                                 let right: String = lc[c.min(lc.len())..z].iter().collect();
                                 return format!("[{l}:{c}] ...{left}«{mark}»{right}...");
                             }
