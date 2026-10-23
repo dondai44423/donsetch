@@ -195,7 +195,7 @@ pub async fn run(args: &[String]) {
         (
             "warn",
             format!(
-                "{} browser unavailable: tier 2 unavailable",
+                "{} browser unavailable: screenshot, actions and login will not work",
                 cli::red("warn")
             ),
         )

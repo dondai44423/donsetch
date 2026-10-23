@@ -1,8 +1,8 @@
 # Bright Data setup
 
 Bright Data is optional. Search and fetch work without an account or key.
-SERP API serves searches; Web Unlocker is the paid fallback when local fetch
-and the browser cannot get through a bot wall. They require separate zones.
+SERP API serves searches; Web Unlocker is the paid fallback when a local fetch
+cannot get through a bot wall. They require separate zones.
 
 ## Create the zones and key
 
@@ -52,8 +52,8 @@ Search uses the configured provider chain. To prefer keyless search while
 keeping the paid search providers as fallback, run `donsetch keys default local`.
 Unlocker is fetch-only: adding it does not change the search default.
 The example fetch normally succeeds locally and spends no Unlocker credit.
-Unlocker runs automatically on the wall fallback; `--tier 1` prevents escalation.
-There is no `--tier 3` command.
+Unlocker runs automatically when a local fetch ends on a wall; the local
+attempt always comes first.
 
 ## Costs and limits
 

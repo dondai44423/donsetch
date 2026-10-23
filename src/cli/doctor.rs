@@ -7,8 +7,8 @@
 //!
 //! The browser path must be BORING to install (50-case report):
 //! doctor proves Chromium presence, Xvfb, a REAL browser launch
-//! with fingerprint selftest, and model availability. A tier-2
-//! feature that only works when the user guesses a hidden
+//! with fingerprint selftest, and model availability. A feature that
+//! only works when the user guesses a hidden
 //! prerequisite is not finished, and doctor is where that
 //! prerequisite surfaces.
 
@@ -275,7 +275,7 @@ pub async fn run(args: &[String]) {
 
     // --stealth / --stealth-record: the drift scorecard (v4 phase
     // 0.4). Standalone mode: skips the general check battery.
-    // --parity (with --stealth, v4 phase 1.1): diff tier-1 against
+    // --parity (with --stealth, v4 phase 1.1): diff the local fetch against
     // the REAL local browser instead of the fixture.
     if stealth || stealth_record {
         let code = stealth_scorecard(stealth_record, json, parity).await;
@@ -555,7 +555,7 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
         }
     };
     // The tool lane is a SEPARATE call chain into the same dialer:
-    // fetch_persona, the tier-1 navigation identity that every MCP
+    // fetch_persona, the navigation identity that every MCP
     // web_fetch and CLI fetch rides. Probing it here is what makes this
     // line a prediction of tool behaviour instead of a prediction of the
     // update check: a bug that broke only the persona lane once had this
@@ -728,7 +728,7 @@ fn print_improve_loop() {
     println!("  Nothing leaves the box. No telemetry, no cloud model.");
     println!();
     println!("  What it remembers");
-    println!("    · per-host walls, cookie freshness, solve cooldowns");
+    println!("    · per-host walls, cookie freshness, wall cooldowns");
     println!("    · per-(engine, intent) search trust EWMAs");
     println!("    · domain quality from enrich success (tiny rank prior)");
     println!("    · agent-outcome demotes (must_contain miss / thin pages)");
@@ -736,12 +736,12 @@ fn print_improve_loop() {
     println!("    · crawl host ladders (429 storms, robots delays)");
     println!();
     println!("  What it does with that");
-    println!("    · skips doomed tier-1 hits and dead egress lanes");
+    println!("    · skips doomed retries and dead egress lanes");
     println!("    · orders engines by what worked for THIS intent");
     println!("    · nudges ranking toward hosts that historically enrich clean");
     println!("    · soft-demotes hosts that failed your own verification");
     println!("    · warms top results so your next web_fetch is near-instant");
-    println!("    · fails fast (honest) instead of burning a browser cycle");
+    println!("    · fails fast (honest) when a wall cannot be passed");
     println!();
     let state = crate::ghost::cache::GhostState::load();
     let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
@@ -962,7 +962,7 @@ async fn check_chrome() -> CheckResult {
 }
 
 /// Xvfb: the Linux headful-stealth prerequisite. Missing Xvfb
-/// does NOT disable tier 2 : ghost falls back to off-screen
+/// does NOT disable the browser : ghost falls back to off-screen
 /// headful on the real display (a window may flash briefly) or
 /// headless on Wayland-only sessions (more detectable). Warn,
 /// not fail : but the user deserves to know.
@@ -991,7 +991,8 @@ fn check_xvfb() -> CheckResult {
             })
         } else {
             CheckResult::Warn(
-                "not installed : tier 2 falls back to headless/off-screen (less stealthy)".into(),
+                "not installed : the browser falls back to headless/off-screen (less stealthy)"
+                    .into(),
             )
         }
     }
@@ -1000,7 +1001,7 @@ fn check_xvfb() -> CheckResult {
         CheckResult::Pass("not needed on this platform".into())
     }
 }
-/// The REAL browser test: launch Chromium exactly as tier 2
+/// The REAL browser test: launch Chromium exactly as the ghost
 /// would (same flags, same Xvfb dance), run the fingerprint
 /// selftest page, kill. Bounded to 40s. This is what turns
 /// the 50-case report's "a feature that works only when the
@@ -1015,7 +1016,7 @@ async fn check_browser_launch() -> CheckResult {
             Err(e) => {
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
-                    "Tier 2 browser fallback will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
+                    "Browser-backed features (screenshot, actions, login) will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
                 );
             }
         };
@@ -1983,7 +1984,7 @@ fn check_bypass(deep: bool) -> CheckResult {
     let bc = crate::fetch::bypass::BypassConfig::from_env();
     if !bc.enabled {
         return CheckResult::Warn(
-            "integration disabled by DONSETCH_BYPASS=0 : walled sites will end on the tier-2 path instead of the solver"
+            "integration disabled by DONSETCH_BYPASS=0 : walled sites will fail honestly instead of reaching the unlocker"
                 .to_string(),
         );
     }
@@ -2422,7 +2423,7 @@ fn apply_fixes(collected: &mut [(String, String, String, String)]) {
 /// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
 /// layers match the baseline, 1 drift or capture failure
 /// (--stealth-record writes the fixture and exits 0 on success).
-/// --parity (v4 phase 1.1) instead diffs the live tier-1 capture
+/// --parity (v4 phase 1.1) instead diffs the live local fetch
 /// against the REAL local browser (ghost): the evergreen check,
 /// no fixture involved. It cannot go stale; it fails when the
 /// profile and the floor diverge.
@@ -2454,19 +2455,19 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
             Ok(ghost) => {
                 let report = scorecard::diff(&ghost, &live);
                 let bad = report.iter().filter(|v| !v.same).count();
-                println!("  parity scope: tier-1 vs LOCAL BROWSER (fixtureless, evergreen)");
+                println!("  parity scope: local fetch vs LOCAL BROWSER (fixtureless, evergreen)");
                 println!();
                 for v in &report {
                     let mark = if v.same { "ok  " } else { "DIFF" };
                     println!("  [{mark}] {:<8}", v.layer);
                     if !v.same {
-                        println!("       tier1:   {}", v.live);
+                        println!("       fetch:   {}", v.live);
                         println!("       browser: {}", v.baseline);
                     }
                 }
                 println!();
                 if bad == 0 {
-                    println!("  parity: tier 1 matches the local browser. Evergreen.");
+                    println!("  parity: local fetch matches the local browser. Evergreen.");
                     0
                 } else {
                     crate::diag!("  {bad} layer(s) diverged from the local browser.");

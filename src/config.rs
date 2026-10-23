@@ -1531,7 +1531,7 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "cookie_vault",
             FieldKind::Bool,
             "true",
-            "persist tier-1/tier-2 clearance cookies",
+            "persist clearance cookies",
         ),
         // proxy
         (
@@ -1669,7 +1669,7 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "shadow_fetch",
             FieldKind::Str,
             "auto",
-            "auto | always | never: tier-1 shadow fetch lane",
+            "auto | always | never: page-realism shadow fetch",
         ),
         (
             "fetch",
