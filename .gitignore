@@ -30,7 +30,8 @@ bench/battle-corpus/
 bench/improve/out/
 
 # Vendored PDFium static libraries (build.rs auto-downloads)
-vendor/
+# Root-anchored: the engine's own vendor/ tree (doncore/vendor) is committed.
+/vendor/
 
 # PDF corpus binaries (download via scripts/download-corpus.sh)
 tests/pdf-corpus/*.pdf
@@ -46,3 +47,7 @@ npm/LICENSE
 *.tgz
 bench/regression-results.json
 /libonnxruntime.so
+
+# The engine crate carries its own workspace + target until the swap links it
+# into the app graph (its vendored BoringSSL cannot share the app's).
+/doncore/target/
