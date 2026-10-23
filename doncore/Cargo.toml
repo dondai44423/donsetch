@@ -2,6 +2,10 @@
 name = "doncore"
 version = "0.1.0"
 edition = "2021"
+# The engine ships as part of donsetch — never on its own.
+publish = false
+description = "The v5 fetching engine: one wire, one jar, one cache, one JS runtime"
+license = "AGPL-3.0-only"
 
 [workspace]
 
