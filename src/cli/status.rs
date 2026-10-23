@@ -172,7 +172,7 @@ pub async fn run(args: &[String]) {
     let ghost_state = cache.join("ghost-state.json");
     let has_state = ghost_state.exists();
     let domains = if has_state {
-        crate::ghost::cache::GhostState::load().profiles.len()
+        crate::state::GhostState::load().profiles.len()
     } else {
         0
     };
@@ -207,7 +207,7 @@ pub async fn run(args: &[String]) {
         crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off;
     let route_read_only =
         crate::config::cfg().state.route_memory == crate::config::RouteMemory::ReadOnly;
-    let state = crate::ghost::cache::GhostState::load();
+    let state = crate::state::GhostState::load();
     let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
     let route_line = if route_memory_off {
         "off (state.route_memory = off)".to_string()

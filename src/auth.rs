@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::ghost::cache::{CookieRecord, is_session_usable, now, store_login_cookies};
+use crate::state::{CookieRecord, is_session_usable, now, store_login_cookies};
 
 /// Metadata for one authenticated domain. Deliberately free of any
 /// cookie value: serialization of this struct must never leak a
@@ -157,7 +157,7 @@ impl AuthRegistry {
     }
 
     pub fn remove_checked(&mut self, domain: &str) -> Result<bool, String> {
-        let removed_vault = crate::ghost::cache::clear_session_cookies_for_checked(domain)?;
+        let removed_vault = crate::state::clear_session_cookies_for_checked(domain)?;
         let existed = self.domains.remove(domain).is_some();
         if existed {
             self.save_checked()?;
@@ -529,7 +529,7 @@ pub fn commit_login(
     }
     let mut domains = Vec::new();
     let mut probes = Vec::new();
-    let vaulted = crate::ghost::cache::load_session_cookies();
+    let vaulted = crate::state::load_session_cookies();
     for (domain, _) in by_domain {
         let dom_cookies: Vec<_> = vaulted
             .iter()

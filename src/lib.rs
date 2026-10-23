@@ -43,6 +43,7 @@ pub mod profile;
 pub mod rules;
 pub mod search;
 pub mod spec;
+pub mod state;
 
 #[cfg(test)]
 pub(crate) mod test_support;

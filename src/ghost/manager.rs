@@ -537,7 +537,7 @@ impl GhostManager {
             }
             // Warm slot served the job: pool receipt. The kill switch
             // does not silence the counter: a single slot may warm-reuse.
-            let mut st = crate::ghost::cache::GhostState::load();
+            let mut st = crate::state::GhostState::load();
             st.note_pool_served();
         }
         if let Some(ghost) = guard.ghost.as_mut()

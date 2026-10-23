@@ -16,7 +16,7 @@ use std::io::{IsTerminal, Write};
 use tokio::io::AsyncBufReadExt;
 
 use crate::auth::{self, AuthRegistry};
-use crate::ghost::cache::CookieRecord;
+use crate::state::CookieRecord;
 
 pub async fn run(args: &[String]) -> Result<(), String> {
     // Validation first: an unknown flag must not open a browser.
@@ -160,7 +160,7 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
         return Err("login requires disk state; state.no_disk_state is enabled".into());
     }
     AuthRegistry::load_checked()?;
-    crate::ghost::cache::validate_login_vault()?;
+    crate::state::validate_login_vault()?;
     // The other branches of `login` (`--list`, `--status`, `--logout`,
     // `--import`) are non-interactive on purpose; only this one needs a
     // human. Without a terminal it used to launch a real browser first and
@@ -272,7 +272,7 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
     let ws = retrieve_ws(&endpoint, 30_000).await?;
 
     // Compare against the vault; never attach CDP while credentials are typed.
-    let baseline_res = crate::ghost::cache::load_session_cookies();
+    let baseline_res = crate::state::load_session_cookies();
     println!("Log in now. Come back here and press Enter to save the session.");
     if site.is_none() {
         println!("(multi-site mode: every NEW session you create gets saved)");
@@ -481,7 +481,7 @@ fn print_status(domain: &str) {
             // Still worth checking the vault directly: login without
             // registry can happen after a manual import of an old
             // release.
-            let vaulted = crate::ghost::cache::load_session_cookies()
+            let vaulted = crate::state::load_session_cookies()
                 .into_iter()
                 .filter(|c| auth::cookie_belongs_to(&key, c.domain.trim_start_matches('.')))
                 .count();

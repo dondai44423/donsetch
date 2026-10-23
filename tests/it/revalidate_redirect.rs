@@ -808,7 +808,7 @@ async fn stealth_v3_cache_tracks_sent_cookie_and_referer_not_jar_mode() {
     let anonymous = fetcher.fetch(&url).await.unwrap();
     assert_eq!(anonymous.body, b"anonymous representation");
     assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
-    let cookie = donsetch::ghost::cache::CookieRecord {
+    let cookie = donsetch::state::CookieRecord {
         name: "session".into(),
         value: "alice".into(),
         domain: "127.0.0.1".into(),
@@ -826,7 +826,7 @@ async fn stealth_v3_cache_tracks_sent_cookie_and_referer_not_jar_mode() {
     );
     assert_eq!(fetcher.fetch(&url).await.unwrap().cache, CacheState::Fresh);
     // Unsent cookies must not invalidate this origin's fresh representation.
-    let unrelated = donsetch::ghost::cache::CookieRecord {
+    let unrelated = donsetch::state::CookieRecord {
         domain: "other.invalid".into(),
         ..cookie.clone()
     };

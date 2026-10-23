@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::detect::walls::{self, Verdict};
 use crate::error::FetchError;
-use crate::ghost::cache::CookieRecord;
+use crate::state::CookieRecord;
 
 use super::Ghost;
 

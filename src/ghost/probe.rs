@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 use crate::detect::walls::Verdict;
 use crate::fetch::client::Fetcher;
 
-use super::cache::{FailClass, GhostState};
+use crate::state::{FailClass, GhostState};
 
 /// How often the prober scans for stale walled hosts.
 const SCAN_INTERVAL_SECS: u64 = 120;
@@ -171,7 +171,7 @@ async fn probe_one(fetcher: &Arc<Fetcher>, state: &Arc<Mutex<GhostState>>, host:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ghost::cache::DomainProfile;
+    use crate::state::DomainProfile;
 
     /// A probe a rule refuses is not a failure and leaves the wall
     /// evidence alone, but it re-arms the probe cadence.

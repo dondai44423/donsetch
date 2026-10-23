@@ -18,8 +18,8 @@ use futures_util::FutureExt;
 
 use crate::detect::walls::Verdict;
 use crate::fetch::client::{CacheState, Fetcher};
-use crate::ghost::cache::GhostState;
 use crate::search::egress::EgressPool;
+use crate::state::GhostState;
 
 use super::governor::{Governor, Lane, LaneKind};
 use super::{Crawler, FetchedPage, PageFetcher};

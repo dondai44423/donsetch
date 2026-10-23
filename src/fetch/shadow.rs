@@ -28,8 +28,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::ghost::cache::GhostState;
 use crate::profile::RequestClass;
+use crate::state::GhostState;
 
 use super::client::Fetcher;
 

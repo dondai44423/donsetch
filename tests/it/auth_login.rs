@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 
 use donsetch::auth::{self, AuthRegistry};
-use donsetch::ghost::cache::{
+use donsetch::state::{
     CookieRecord, GhostState, clear_session_cookies_for, is_session_worthy, load_session_cookies,
     store_session_cookies,
 };
@@ -672,7 +672,7 @@ fn unreadable_vault_refuses_login_before_launch_and_preserves_existing_bytes() {
 #[test]
 fn explicit_relogin_blocks_old_browser_harvest_and_accepts_new_rotation() {
     isolate_state();
-    use donsetch::ghost::cache::store_login_cookies;
+    use donsetch::state::store_login_cookies;
     let original = cookie(".relogin.test", "xs", "first", None);
     store_login_cookies(std::slice::from_ref(&original)).unwrap();
     let first = GhostState::load();
@@ -695,7 +695,7 @@ fn explicit_relogin_blocks_old_browser_harvest_and_accepts_new_rotation() {
 #[test]
 fn cached_account_document_cannot_survive_or_resurrect_after_relogin() {
     isolate_state();
-    use donsetch::ghost::cache::store_login_cookies;
+    use donsetch::state::store_login_cookies;
     let mut c = cookie(".account.test", "xs", "first", None);
     store_login_cookies(std::slice::from_ref(&c)).unwrap();
     let mut old = GhostState::load();

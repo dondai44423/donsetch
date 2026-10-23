@@ -14,7 +14,6 @@
 //! warmth across restarts.
 
 pub mod actions;
-pub mod cache;
 pub mod cdp;
 pub mod cloak;
 pub mod document;
@@ -1637,7 +1636,7 @@ impl Ghost {
             target,
             frozen: false,
             last_used: Instant::now(),
-            launched_epoch: crate::ghost::cache::disk_epoch_now(),
+            launched_epoch: crate::state::disk_epoch_now(),
             session_stamp: String::new(),
             auth_revision: String::new(),
             applied_auth_epoch: 0,
@@ -1782,8 +1781,8 @@ impl Ghost {
             // domains: only cookies a browser launched at
             // `launched_epoch` may still claim survive the filter, so
             // this reap cannot re-vault a dead session.
-            let list = cache::session_cookies_since(&list, self.launched_epoch);
-            cache::store_session_cookies(&list);
+            let list = crate::state::session_cookies_since(&list, self.launched_epoch);
+            crate::state::store_session_cookies(&list);
         }
         let cdp = self.cdp.clone();
         let _ = tokio::time::timeout(
@@ -1963,7 +1962,7 @@ impl Ghost {
     /// Parse the `cookies` array of a Storage.getCookies CDP response
     /// into vault records. Shared by Ghost::cookies and the interactive
     /// login harvest (both paths must store identical shapes).
-    pub fn parse_cdp_cookies(res: &Value) -> Vec<cache::CookieRecord> {
+    pub fn parse_cdp_cookies(res: &Value) -> Vec<crate::state::CookieRecord> {
         let mut out = Vec::new();
         if let Some(arr) = res.get("cookies").and_then(Value::as_array) {
             for c in arr {
@@ -1976,7 +1975,7 @@ impl Ghost {
                     .filter(|&e| e > 0.0)
                     .map(|e| e as u64);
                 if !name.is_empty() {
-                    out.push(cache::CookieRecord {
+                    out.push(crate::state::CookieRecord {
                         name: name.to_string(),
                         value: value.to_string(),
                         domain: domain.to_string(),
@@ -2003,7 +2002,7 @@ impl Ghost {
     /// All browser cookies with real expiry (browser-level Storage
     /// domain). CDP's `expires` is a Unix timestamp in seconds
     /// (float); -1 or 0 means session cookie → None.
-    pub async fn cookies(&self) -> Result<Vec<cache::CookieRecord>, FetchError> {
+    pub async fn cookies(&self) -> Result<Vec<crate::state::CookieRecord>, FetchError> {
         let res = self.cdp.call(None, "Storage.getCookies", json!({})).await?;
         Ok(Self::parse_cdp_cookies(&res))
     }
@@ -2015,7 +2014,7 @@ impl Ghost {
     /// ends with exactly the vault's fresh set. Best-effort: a cookie
     /// that refuses to delete must never fail a launch.
     async fn purge_cleared_session_cookies(cdp: &cdp::Cdp) {
-        let state = crate::ghost::cache::GhostState::load();
+        let state = crate::state::GhostState::load();
         let cleared: Vec<String> = state
             .profiles
             .iter()
@@ -2101,7 +2100,7 @@ impl Ghost {
     /// per-cookie stable path as fallback (older/different builds
     /// ship Storage.setCookies behind different rpc versions).
     async fn restore_session_cookies(cdp: &cdp::Cdp) {
-        let list = crate::ghost::cache::load_session_cookies();
+        let list = crate::state::load_session_cookies();
         if list.is_empty() {
             return;
         }
@@ -2170,13 +2169,13 @@ impl Ghost {
         &mut self,
         host: Option<&str>,
     ) -> Result<(), FetchError> {
-        let Some(stamp) = cache::disk_session_stamp() else {
+        let Some(stamp) = crate::state::disk_session_stamp() else {
             return Ok(());
         };
         if self.session_stamp == stamp && self.session_host.as_deref() == host {
             return Ok(());
         }
-        let state = cache::GhostState::load();
+        let state = crate::state::GhostState::load();
         let consent_changed = self.auth_revision != state.auth_revision;
         if consent_changed || self.session_stamp.is_empty() {
             let cleared: Vec<_> = state
@@ -2212,7 +2211,7 @@ impl Ghost {
                     .iter()
                     .map(move |c| (c, p.session_explicit))
             })
-            .filter(|(c, _)| cache::is_session_usable(c))
+            .filter(|(c, _)| crate::state::is_session_usable(c))
             .collect();
         let batch: Vec<_> = selected
             .iter()
@@ -2277,7 +2276,7 @@ impl Ghost {
         Ok(())
     }
 
-    fn session_cookie_applies(c: &cache::CookieRecord, host: &str) -> bool {
+    fn session_cookie_applies(c: &crate::state::CookieRecord, host: &str) -> bool {
         let domain = c.domain.trim_start_matches('.').trim_matches(['[', ']']);
         let host = host.trim_matches(['[', ']']);
         host.eq_ignore_ascii_case(domain)
@@ -2287,7 +2286,7 @@ impl Ghost {
                     .ends_with(&format!(".{}", domain.to_ascii_lowercase())))
     }
 
-    fn session_cookie_params(c: &cache::CookieRecord) -> Value {
+    fn session_cookie_params(c: &crate::state::CookieRecord) -> Value {
         let mut value = json!({
             "name": c.name, "value": c.value,
             "path": if c.path.is_empty() { "/" } else { &c.path },

@@ -743,7 +743,7 @@ fn print_improve_loop() {
     println!("    · warms top results so your next web_fetch is near-instant");
     println!("    · fails fast (honest) when a wall cannot be passed");
     println!();
-    let state = crate::ghost::cache::GhostState::load();
+    let state = crate::state::GhostState::load();
     let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
     let (t, ti, f) = crate::search::persist_load_for_status();
     let low = t.values().filter(|&&x| x < 0.5).count() + ti.values().filter(|&&x| x < 0.5).count();
@@ -1336,7 +1336,7 @@ fn check_auth_sessions() -> CheckResult {
             "no stored logins (use `donsetch login <domain>` to fetch gated sites)".into(),
         );
     }
-    let t = crate::ghost::cache::now();
+    let t = crate::state::now();
     let mut unverified = Vec::new();
     let mut expiring = Vec::new();
     for (d, s) in &reg.domains {
@@ -1568,7 +1568,7 @@ fn check_ghost_state() -> CheckResult {
     if path.exists() {
         match std::fs::read(&path) {
             Ok(body) => {
-                if let Err(e) = serde_json::from_slice::<crate::ghost::cache::GhostState>(&body) {
+                if let Err(e) = serde_json::from_slice::<crate::state::GhostState>(&body) {
                     return CheckResult::Fail(format!("invalid state: {e}"), "Run `donsetch doctor --fix` to preserve the corrupt file as a backup and rebuild route memory.".into());
                 }
             }
@@ -1580,7 +1580,7 @@ fn check_ghost_state() -> CheckResult {
             }
         }
     }
-    let state = crate::ghost::cache::GhostState::load();
+    let state = crate::state::GhostState::load();
     let domains = state.profiles.len();
     let renders = state.renders.len();
     CheckResult::Pass(format!("{domains} domains, {renders} renders cached"))
@@ -2379,8 +2379,7 @@ fn apply_fixes(collected: &mut [(String, String, String, String)]) {
                 let corrupt = std::fs::read(&path)
                     .map_err(|e| e.to_string())
                     .and_then(|bytes| {
-                        if serde_json::from_slice::<crate::ghost::cache::GhostState>(&bytes).is_ok()
-                        {
+                        if serde_json::from_slice::<crate::state::GhostState>(&bytes).is_ok() {
                             Err("state is valid; repair its access permissions manually".into())
                         } else {
                             Ok(())

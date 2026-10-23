@@ -29,8 +29,8 @@ use crate::detect::walls::{self, Verdict};
 use crate::egress::proxy;
 use crate::egress::request_route::RequestRoute;
 use crate::error::FetchError;
-use crate::ghost::cache::CookieRecord;
 use crate::profile::{BrowserProfile, RequestClass};
+use crate::state::CookieRecord;
 
 const MAX_REDIRECTS: u8 = 10;
 

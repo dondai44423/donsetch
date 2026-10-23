@@ -1019,8 +1019,7 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     let call = FetchCall {
         route,
         budget,
-        session_stamp: crate::ghost::cache::disk_session_stamp()
-            .unwrap_or_else(|| "legacy:0".into()),
+        session_stamp: crate::state::disk_session_stamp().unwrap_or_else(|| "legacy:0".into()),
     };
     Box::pin(fetch_single_inner(daemon, args, url, &call)).await
 }
@@ -1100,7 +1099,7 @@ fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) ->
 // v4.7 V03: JSON data endpoints (reddit `.json`, API dumps) are always Cold:
 // like PDFs, rendering cannot improve a raw payload.
 fn fetch_route(
-    state: &crate::ghost::cache::GhostState,
+    state: &crate::state::GhostState,
     host: &str,
     is_pdf_url: bool,
     is_json_url: bool,
@@ -1597,7 +1596,7 @@ async fn fetch_single_inner(
                 let kind = fetch_error_kind(&e);
                 let failures = if transport_failure_evidence(&e) {
                     let mut state = daemon.state.lock().await;
-                    state.record_failure(&host, crate::ghost::cache::FailClass::Network);
+                    state.record_failure(&host, crate::state::FailClass::Network);
                     state.recent_network_failures(&host)
                 } else {
                     0
@@ -1664,7 +1663,7 @@ async fn fetch_single_inner(
                 // nothing about the human-facing pages.
                 Verdict::Challenge(_) if adapter_host || is_json_url || is_json_endpoint(o) => {}
                 Verdict::Challenge(_) => {
-                    state.record_failure(&host, crate::ghost::cache::FailClass::Block);
+                    state.record_failure(&host, crate::state::FailClass::Block);
                     if is_warm {
                         // Warm cookies went stale : learn the real lifetime.
                         state.record_warm_stale(&host);
@@ -2805,9 +2804,9 @@ async fn fetch_with_actions(
         // A pooled browser can predate a logout for one of its
         // domains: a dead session must not ride back into the jar
         // or the vault.
-        let cookies = crate::ghost::cache::session_cookies_since(&cookies, g.launched_epoch);
+        let cookies = crate::state::session_cookies_since(&cookies, g.launched_epoch);
         daemon.fetcher.import_vault_cookies(&cookies).await;
-        crate::ghost::cache::store_session_cookies(&cookies);
+        crate::state::store_session_cookies(&cookies);
         if page.vendor.is_some() {
             daemon
                 .state
@@ -4155,7 +4154,7 @@ mod adapter_hop_tests {
 
     #[test]
     fn recovery_retries_recheck_http_despite_saved_wall_routes() {
-        use crate::ghost::cache::{DomainProfile, GhostState};
+        use crate::state::{DomainProfile, GhostState};
         let host = "www.reddit.com";
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

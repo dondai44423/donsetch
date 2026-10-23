@@ -1,7 +1,7 @@
 //! Persisted learning boundaries use the actual library's disk writes, not
 //! the unit build's no-op save. Depends on nextest's per-test process sandbox.
 
-use donsetch::ghost::cache::{GhostState, RouteDecision, cookies_fresh_at, now};
+use donsetch::state::{GhostState, RouteDecision, cookies_fresh_at, now};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -157,7 +157,7 @@ fn persisted_render_context_rejects_other_routes_and_legacy_entries() {
     );
     assert!(state.render_for_context(URL, "owned-route-b").is_none());
     assert!(state.render_for(URL).is_none());
-    assert!(donsetch::ghost::cache::clear_session_cookies_for(HOST));
+    assert!(donsetch::state::clear_session_cookies_for(HOST));
     assert!(
         GhostState::load()
             .render_for_context(URL, "owned-route-a")

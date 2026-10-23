@@ -588,10 +588,9 @@ pub(crate) fn maybe_pre_solve(daemon: &Arc<Daemon>, top_url: Option<&str>) {
             // A pooled browser can predate a logout for one of its
             // domains: a dead session must not ride back into the
             // jar or the vault.
-            let cookies =
-                crate::ghost::cache::session_cookies_since(&page.cookies, _guard.launched_epoch);
+            let cookies = crate::state::session_cookies_since(&page.cookies, _guard.launched_epoch);
             d.fetcher.import_vault_cookies(&cookies).await;
-            crate::ghost::cache::store_session_cookies(&cookies);
+            crate::state::store_session_cookies(&cookies);
             // Honest replay_ok: only verified tier-1 replay earns
             // warm routing.
             let replay_ok = matches!(
@@ -750,13 +749,13 @@ worker.onmessage = event => {report('worker', event.data);worker.terminate();};
                         }
                         let mut daemon = Daemon::new().await.unwrap();
                         daemon.fetcher = Arc::new(Fetcher::new(daemon.profile.clone()).unwrap().with_egress(Arc::clone(&pool)));
-                        daemon.state.lock().await.profiles.insert("example.com".into(), crate::ghost::cache::DomainProfile {
+                        daemon.state.lock().await.profiles.insert("example.com".into(), crate::state::DomainProfile {
                             needs_tier2: true,
                             ..Default::default()
                         });
                         let mut persona = crate::persona::Persona::mint(
                             "example.com", &crate::persona::PersonaCaps::from_profile(&daemon.profile),
-                            1, crate::ghost::cache::now());
+                            1, crate::state::now());
                         persona.locale = "fr-FR".into();
                         daemon.state.lock().await.personas.insert("example.com".into(), persona);
                         let daemon = Arc::new(daemon);

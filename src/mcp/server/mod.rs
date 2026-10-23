@@ -21,7 +21,6 @@ use crate::detect::walls::{Vendor, Verdict};
 use crate::error::FetchError;
 use crate::extract::{self, ExtractOptions};
 use crate::fetch::client::Fetcher;
-use crate::ghost::cache::{CookieRecord, GhostState, RouteDecision};
 use crate::ghost::manager::GhostManager;
 use crate::ghost::ops;
 use crate::profile::BrowserProfile;
@@ -29,6 +28,7 @@ use crate::search::byok::ByokSearcher;
 use crate::search::egress::EgressPool;
 use crate::search::intent::Intent;
 use crate::search::{self, Searcher};
+use crate::state::{CookieRecord, GhostState, RouteDecision};
 use errors::*;
 // The uniform failure predicate (v4.7 envelope) : the CLI's exit-code and
 // rendering paths branch on the same signal the wire carries.
@@ -77,7 +77,7 @@ impl Daemon {
         let fetcher =
             Arc::new(Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)));
         let ghost_mgr = GhostManager::new().await;
-        crate::ghost::cache::ensure_session_identity();
+        crate::state::ensure_session_identity();
         let state = Arc::new(Mutex::new(GhostState::load()));
 
         // Tier 1 starts the session with the vault too: a domain
@@ -85,7 +85,7 @@ impl Daemon {
         // fetch on the very first request after a restart, not
         // only after the browser has visited it once.
         {
-            let sessions = crate::ghost::cache::load_session_cookies();
+            let sessions = crate::state::load_session_cookies();
             // Tier-1 jar persistence (v4 phase 1.4), kill-switched.
             // The vault outranks the jar echo for a key both hold: a
             // logged-out render can write anonymous values for a
@@ -96,7 +96,7 @@ impl Daemon {
             } else {
                 Vec::new()
             };
-            let replay = crate::ghost::cache::vault_over_jar(&sessions, &jar);
+            let replay = crate::state::vault_over_jar(&sessions, &jar);
             fetcher.import_vault_cookies(&replay).await;
         }
 
@@ -192,7 +192,7 @@ impl Daemon {
     /// Resync the tier-1 cookie jar after login/logout/rotation. The
     /// hot path reads a bounded trailer; parse only after a real cookie change.
     pub async fn refresh_vault(&self) {
-        let Some(sig) = crate::ghost::cache::disk_session_stamp() else {
+        let Some(sig) = crate::state::disk_session_stamp() else {
             return;
         };
         let mut seen = self.vault_seen.lock().await;
@@ -203,7 +203,7 @@ impl Daemon {
                 .profiles
                 .values()
                 .flat_map(|p| &p.session_cookies)
-                .filter(|c| crate::ghost::cache::is_session_usable(c))
+                .filter(|c| crate::state::is_session_usable(c))
                 .cloned()
                 .collect();
             self.state.lock().await.merge_vault_from_disk(&disk);
@@ -212,7 +212,7 @@ impl Daemon {
             } else {
                 Vec::new()
             };
-            let cookies = crate::ghost::cache::vault_over_jar(&sessions, &jar);
+            let cookies = crate::state::vault_over_jar(&sessions, &jar);
             self.fetcher.reset_to(&cookies).await;
             *seen = Some(stamp);
         }
