@@ -42,6 +42,10 @@ pub struct WireReq {
     pub no_cookies: bool,
     /// Egress override: an http(s) proxy URL used for this request only.
     pub proxy: Option<String>,
+    /// Follow redirects (the default). `Some(false)` stops at the first
+    /// 3xx and returns it as the response — the product's per-hop loops
+    /// (crawl scope / robots gates) decide each hop themselves.
+    pub follow_redirects: Option<bool>,
 }
 
 /// Default response byte cap. A hostile or careless server must never be able
@@ -181,6 +185,13 @@ fn dom_match(dom: &str, host: &str) -> bool {
 }
 
 /// True when a host is an IP literal (v4/v6; brackets tolerated).
+/// The flat store's domain form: lowercase, no leading dot (the product
+/// carries `.domain` for domain cookies; the jar keeps the bare suffix).
+fn norm_dom(dom: &str) -> String {
+    dom.trim().trim_start_matches('.').to_ascii_lowercase()
+}
+
+/// True when a host is an IP literal (v4/v6; brackets tolerated).
 fn is_ip_host(host: &str) -> bool {
     let h = host.trim_start_matches('[').trim_end_matches(']');
     h.parse::<std::net::IpAddr>().is_ok()
@@ -298,6 +309,77 @@ impl Jar {
         if let Some(p) = parse_cookie(v, host) {
             self.apply(p);
         }
+    }
+
+    /// Bulk upsert for the product's session flows (vault replay, warm
+    /// handoff): each record replaces the cookie with the same name+domain.
+    /// Domains arrive with the product's optional leading dot (a domain
+    /// cookie); the flat store keeps the bare lowercase form.
+    pub fn upsert(&mut self, cookies: Vec<Cookie>) {
+        let now = now_secs();
+        for mut c in cookies {
+            c.domain = norm_dom(&c.domain);
+            if c.domain.is_empty() || c.name.is_empty() {
+                continue;
+            }
+            if c.name.len() + c.value.len() > MAX_PAIR_BYTES {
+                continue;
+            }
+            if c.expires.is_some_and(|e| e <= now) {
+                continue;
+            }
+            c.updated = now;
+            match self
+                .cookies
+                .iter_mut()
+                .find(|x| x.name == c.name && x.domain == c.domain)
+            {
+                Some(x) => {
+                    c.created = x.created;
+                    *x = c;
+                }
+                None => {
+                    c.created = now;
+                    self.cookies.push(c);
+                }
+            }
+            self.revision += 1;
+            self.dirty = true;
+        }
+        cap_cookies(&mut self.cookies);
+        self.persist_if_dirty(false);
+    }
+
+    /// Drops every cookie on `domains` (normalized) and tombstones them so
+    /// the removal survives the merge-on-save. The product's vault rebuilds
+    /// (login / logout) use this; clearances on other domains stay — a vault
+    /// rewrite must never collateral-clear a live solve.
+    pub fn remove_domains(&mut self, domains: &[String]) -> usize {
+        let set: std::collections::HashSet<String> = domains
+            .iter()
+            .map(|d| norm_dom(d))
+            .filter(|d| !d.is_empty())
+            .collect();
+        if set.is_empty() {
+            return 0;
+        }
+        let mut removed_pairs: Vec<(String, String)> = Vec::new();
+        self.cookies.retain(|c| {
+            if set.contains(&c.domain) {
+                removed_pairs.push((c.name.clone(), c.domain.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        let removed = removed_pairs.len();
+        if removed > 0 {
+            self.deleted.extend(removed_pairs);
+            self.revision += 1;
+            self.dirty = true;
+            self.persist_if_dirty(false);
+        }
+        removed
     }
 
     fn apply(&mut self, p: ParsedCookie) {
@@ -465,14 +547,24 @@ pub const SEC_CH_UA_154: &str = "\"Not A(Brand\";v=\"99\", \"Chromium\";v=\"154\
 /// order. TLS/H2 settings stay from the preset (no newer preset exists).
 pub fn tune_emulation(mut emu: wreq::Emulation) -> wreq::Emulation {
     use wreq::header::{HeaderValue, OrigHeaderMap};
-    emu.headers.insert("user-agent", HeaderValue::from_static(UA_154));
-    emu.headers.insert("sec-ch-ua", HeaderValue::from_static(SEC_CH_UA_154));
-    emu.headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
-    emu.headers.insert("sec-ch-ua-platform", HeaderValue::from_static("\"Linux\""));
-    emu.headers.insert("upgrade-insecure-requests", HeaderValue::from_static("1"));
-    emu.headers.insert("sec-fetch-user", HeaderValue::from_static("?1"));
-    emu.headers.insert("accept-encoding", HeaderValue::from_static("gzip, deflate, br, zstd"));
-    emu.headers.insert("priority", HeaderValue::from_static("u=0, i"));
+    emu.headers
+        .insert("user-agent", HeaderValue::from_static(UA_154));
+    emu.headers
+        .insert("sec-ch-ua", HeaderValue::from_static(SEC_CH_UA_154));
+    emu.headers
+        .insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
+    emu.headers
+        .insert("sec-ch-ua-platform", HeaderValue::from_static("\"Linux\""));
+    emu.headers
+        .insert("upgrade-insecure-requests", HeaderValue::from_static("1"));
+    emu.headers
+        .insert("sec-fetch-user", HeaderValue::from_static("?1"));
+    emu.headers.insert(
+        "accept-encoding",
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
+    );
+    emu.headers
+        .insert("priority", HeaderValue::from_static("u=0, i"));
     let mut orig = OrigHeaderMap::new();
     for name in [
         "sec-ch-ua",
@@ -513,14 +605,18 @@ impl ClientCache {
         }
     }
 
-    fn get(&mut self, proxy: Option<&str>) -> Result<Arc<wreq::Client>, String> {
-        let key = proxy.unwrap_or("").to_string();
+    fn get(&mut self, proxy: Option<&str>, follow: bool) -> Result<Arc<wreq::Client>, String> {
+        let key = format!("{follow}|{}", proxy.unwrap_or(""));
         if let Some(c) = self.map.get(&key) {
             return Ok(Arc::clone(c));
         }
         let mut builder = wreq::Client::builder()
             .emulation(self.emulation.clone())
-            .redirect(wreq::redirect::Policy::limited(10))
+            .redirect(if follow {
+                wreq::redirect::Policy::limited(10)
+            } else {
+                wreq::redirect::Policy::none()
+            })
             // Unreachable/blackholed hosts must fail at the structural pace,
             // not the OS SYN pace: the 25s total stays the outer bound,
             // connect (TCP+TLS) gets 3s — draw #2 burned 25s in connect on
@@ -534,7 +630,11 @@ impl ClientCache {
         for (host, addr) in &self.resolve {
             builder = builder.resolve(host.clone(), *addr);
         }
-        let client = Arc::new(builder.build().map_err(|e| wire_err(ErrorClass::Internal, e))?);
+        let client = Arc::new(
+            builder
+                .build()
+                .map_err(|e| wire_err(ErrorClass::Internal, e))?,
+        );
         self.map.insert(key, Arc::clone(&client));
         Ok(client)
     }
@@ -542,10 +642,7 @@ impl ClientCache {
 
 impl Wire {
     /// Spawns the worker thread. `emulation` is the tuned wreq emulation.
-    pub fn new(
-        emulation: wreq::Emulation,
-        resolve: Vec<(String, std::net::SocketAddr)>,
-    ) -> Self {
+    pub fn new(emulation: wreq::Emulation, resolve: Vec<(String, std::net::SocketAddr)>) -> Self {
         let jar = Arc::new(Mutex::new(Jar::default()));
         let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Job>();
         let jar_worker = Arc::clone(&jar);
@@ -569,11 +666,10 @@ impl Wire {
                     let sem = Arc::clone(&sem);
                     tokio::spawn(async move {
                         let _permit = sem.acquire_owned().await.ok();
-                        let client = match clients
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .get(job.req.proxy.as_deref())
-                        {
+                        let client = match clients.lock().unwrap_or_else(|p| p.into_inner()).get(
+                            job.req.proxy.as_deref(),
+                            job.req.follow_redirects != Some(false),
+                        ) {
                             Ok(c) => c,
                             Err(e) => {
                                 let _ = job.reply.send(Err(e));
@@ -609,9 +705,9 @@ impl Wire {
             .into_iter()
             .map(|r| -> Result<WireResp, String> {
                 match r {
-                    Some(rrx) => rrx
-                        .recv()
-                        .map_err(|_| wire_err(ErrorClass::Internal, "wire worker dropped the job"))?,
+                    Some(rrx) => rrx.recv().map_err(|_| {
+                        wire_err(ErrorClass::Internal, "wire worker dropped the job")
+                    })?,
                     None => Err("wire worker gone".to_string()),
                 }
             })
@@ -624,7 +720,8 @@ impl Wire {
         self.tx
             .send(Job { req, reply: rtx })
             .map_err(|_| wire_err(ErrorClass::Internal, "wire worker gone"))?;
-        rrx.recv().map_err(|_| wire_err(ErrorClass::Internal, "wire worker dropped the job"))?
+        rrx.recv()
+            .map_err(|_| wire_err(ErrorClass::Internal, "wire worker dropped the job"))?
     }
 }
 
@@ -648,12 +745,15 @@ async fn do_request(
                 .header("Accept", "*/*");
         }
         ReqKind::Xhr => {
-            builder = builder.header("Sec-Fetch-Dest", "empty").header("Accept", "*/*");
+            builder = builder
+                .header("Sec-Fetch-Dest", "empty")
+                .header("Accept", "*/*");
         }
         ReqKind::Image => {
-            builder = builder
-                .header("Sec-Fetch-Dest", "image")
-                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8");
+            builder = builder.header("Sec-Fetch-Dest", "image").header(
+                "Accept",
+                "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            );
         }
     }
     for (k, v) in &req.extra_headers {
@@ -677,7 +777,10 @@ async fn do_request(
             "[wire] t={t_ms} {} {} cookie={:?}",
             req.method,
             &req.url[..floor_char_boundary(&req.url, req.url.len().min(90))],
-            cookie.as_deref().map(|c| &c[floor_char_boundary(c, c.len().saturating_sub(60))..]).unwrap_or("-")
+            cookie
+                .as_deref()
+                .map(|c| &c[floor_char_boundary(c, c.len().saturating_sub(60))..])
+                .unwrap_or("-")
         );
     }
     if let Some(c) = cookie {
@@ -686,7 +789,10 @@ async fn do_request(
     if let Some(body) = &req.body {
         builder = builder.body(body.clone());
     }
-    let resp = builder.send().await.map_err(|e| wire_err(ErrorClass::of(&e), e))?;
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| wire_err(ErrorClass::of(&e), e))?;
     let status = resp.status().as_u16();
     let final_url = resp.uri().to_string();
     if std::env::var("DONCORE_DEBUG").is_ok() {
@@ -844,6 +950,7 @@ mod tests {
             bytes: opts.bytes,
             no_cookies: opts.no_cookies,
             proxy: None,
+            follow_redirects: None,
         })
         .expect("fetch")
     }
@@ -1020,5 +1127,109 @@ mod tests {
             })
             .expect_err("the proxy hop is refused");
         assert!(err.starts_with("proxy"), "{err}");
+    }
+
+    #[test]
+    fn a_no_follow_request_returns_the_redirect_itself() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().expect("clone"));
+                    let mut line = String::new();
+                    let _ = r.read_line(&mut line);
+                    loop {
+                        let mut l = String::new();
+                        if r.read_line(&mut l).unwrap_or(0) == 0 || l == "\r\n" || l == "\n" {
+                            break;
+                        }
+                    }
+                    let _ = s.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = s.flush();
+                });
+            }
+        });
+        let w = wire();
+        let url = format!("http://127.0.0.1:{port}/start");
+        let resp = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: url.clone(),
+                kind: ReqKind::Document,
+                follow_redirects: Some(false),
+                ..Default::default()
+            })
+            .expect("fetch");
+        assert_eq!(resp.status, 302, "the redirect returns un-followed");
+        assert_eq!(resp.final_url, url, "no hop was taken");
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("location") && v == "/moved"));
+    }
+
+    #[test]
+    fn jar_upsert_and_remove_domains_roundtrip() {
+        let mut jar = Jar::default();
+        let now = now_secs();
+        jar.upsert(vec![
+            Cookie {
+                name: "sid".into(),
+                value: "1".into(),
+                domain: ".Example.COM".into(),
+                expires: None,
+                created: 0,
+                updated: 0,
+            },
+            Cookie {
+                name: "keep".into(),
+                value: "k".into(),
+                domain: "other.test".into(),
+                expires: None,
+                created: 0,
+                updated: 0,
+            },
+            Cookie {
+                name: "dead".into(),
+                value: "x".into(),
+                domain: "exp.test".into(),
+                expires: Some(now.saturating_sub(10)),
+                created: 0,
+                updated: 0,
+            },
+        ]);
+        assert!(
+            jar.all(Some("sub.example.com"))
+                .iter()
+                .any(|(n, v)| n == "sid" && v == "1"),
+            "the dotted/cased domain normalizes and matches subdomains"
+        );
+        assert!(
+            jar.all(Some("exp.test")).is_empty(),
+            "expired records are not stored"
+        );
+        let removed = jar.remove_domains(&["example.com".to_string()]);
+        assert_eq!(removed, 1);
+        assert!(jar.all(Some("sub.example.com")).is_empty());
+        assert_eq!(
+            jar.all(None).len(),
+            1,
+            "other domains survive a vault rebuild"
+        );
+        jar.upsert(vec![Cookie {
+            name: "keep".into(),
+            value: "k2".into(),
+            domain: "other.test".into(),
+            expires: None,
+            created: 0,
+            updated: 0,
+        }]);
+        assert_eq!(jar.all(None).len(), 1, "upsert replaces, never duplicates");
+        assert_eq!(jar.get("keep").as_deref(), Some("k2"));
     }
 }

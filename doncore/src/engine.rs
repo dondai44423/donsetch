@@ -86,6 +86,21 @@ impl std::fmt::Display for CacheOutcome {
     }
 }
 
+/// The product's knobs for one document fetch. Defaults keep the runtime's
+/// path byte-identical; the swap threads its lanes and session flows here.
+#[derive(Clone, Debug, Default)]
+pub struct FetchOpts {
+    /// Egress override: the document GETs ride this http(s) proxy. (The JS
+    /// phase's subresource fetches follow once their plumbing lands.)
+    pub proxy: Option<String>,
+    /// Suppress the jar on the document GETs (cold probes: send none,
+    /// store none). The runtime path always rides the jar.
+    pub no_cookies: bool,
+    /// Extra request headers merged ahead of any conditionals (referer,
+    /// persona accept-language, a legacy UA).
+    pub extra_headers: Vec<(String, String)>,
+}
+
 struct DocFetch {
     resp: WireResp,
     cache: Option<CacheOutcome>,
@@ -113,7 +128,15 @@ impl Engine {
     /// revalidate (304 → serve, 200 → replace, other → evict + serve);
     /// a strict-CAS mismatch falls back to one unconditional refetch.
     /// Any cache trouble is a miss — the cache cannot fail a fetch.
-    fn fetch_doc(&self, url: &str, extra: Vec<(String, String)>) -> Result<DocFetch, String> {
+    fn fetch_doc(
+        &self,
+        url: &str,
+        opts: &FetchOpts,
+        extra: Vec<(String, String)>,
+    ) -> Result<DocFetch, String> {
+        // The product's headers lead; a caller's own extras follow.
+        let extra: Vec<(String, String)> =
+            opts.extra_headers.iter().cloned().chain(extra).collect();
         if let Some(c) = &self.cache {
             match c.check(url) {
                 Check::Fresh(hit) => {
@@ -142,6 +165,8 @@ impl Engine {
                         kind: ReqKind::Document,
                         extra_headers: hdrs,
                         body: None,
+                        no_cookies: opts.no_cookies,
+                        proxy: opts.proxy.clone(),
                         ..Default::default()
                     })?;
                     if r.status == 304 {
@@ -168,6 +193,8 @@ impl Engine {
                             kind: ReqKind::Document,
                             extra_headers: extra,
                             body: None,
+                            no_cookies: opts.no_cookies,
+                            proxy: opts.proxy.clone(),
                             ..Default::default()
                         })?;
                         if r2.status == 200 {
@@ -213,6 +240,8 @@ impl Engine {
             kind: ReqKind::Document,
             extra_headers: extra,
             body: None,
+            no_cookies: opts.no_cookies,
+            proxy: opts.proxy.clone(),
             ..Default::default()
         })?;
         if let Some(c) = &self.cache {
@@ -250,13 +279,25 @@ impl Engine {
     }
 
     pub fn fetch(&self, url: &str, js: JsMode, budget_ms: u64) -> Result<Outcome, String> {
+        self.fetch_with(url, js, budget_ms, &FetchOpts::default())
+    }
+
+    /// As `fetch`, with the product's per-fetch options (egress lane, jar
+    /// suppression, caller headers) threaded into the document GETs.
+    pub fn fetch_with(
+        &self,
+        url: &str,
+        js: JsMode,
+        budget_ms: u64,
+        opts: &FetchOpts,
+    ) -> Result<Outcome, String> {
         let t0 = Instant::now();
         let mut phases: Vec<(String, u128)> = Vec::new();
         let host_key = host_key_of(url);
 
         // 1. wire (through the state plane's cache when enabled)
         let docf = self
-            .fetch_doc(url, Vec::new())
+            .fetch_doc(url, opts, Vec::new())
             .map_err(|e| format!("wire: {e}"))?;
         let mut cache: Option<CacheOutcome> = docf.cache;
         let doc = docf.resp;
@@ -465,7 +506,8 @@ impl Engine {
                         break;
                     }
                     phases.push((format!("nav{round}:{kind}"), 0));
-                    match self.fetch_doc(nav_url, vec![("referer".into(), page_url.clone())]) {
+                    match self.fetch_doc(nav_url, opts, vec![("referer".into(), page_url.clone())])
+                    {
                         Ok(df) => {
                             cache = df.cache.clone();
                             let d = df.resp;
@@ -542,7 +584,7 @@ impl Engine {
             let jar_after = self.wire.jar.lock().unwrap().revision();
             if challenge && jar_after != jar_before && !current_html.is_empty() {
                 let t2 = Instant::now();
-                if let Ok(df) = self.fetch_doc(url, Vec::new()) {
+                if let Ok(df) = self.fetch_doc(url, opts, Vec::new()) {
                     cache = df.cache;
                     let b2 = df.resp;
                     phases.push(("bounce".into(), t2.elapsed().as_millis()));
@@ -671,13 +713,28 @@ fn wall_evidence(html: &str) -> Option<&'static str> {
     }
     let l = html.to_lowercase();
     const TEXT: [(&str, &str); 9] = [
-        ("prove your humanity", "human-verification text (\"prove your humanity\")"),
-        ("confirm you are human", "human-verification text (\"confirm you are human\")"),
-        ("prove you are human", "human-verification text (\"prove you are human\")"),
-        ("performing security verification", "vendor security-verification page"),
+        (
+            "prove your humanity",
+            "human-verification text (\"prove your humanity\")",
+        ),
+        (
+            "confirm you are human",
+            "human-verification text (\"confirm you are human\")",
+        ),
+        (
+            "prove you are human",
+            "human-verification text (\"prove you are human\")",
+        ),
+        (
+            "performing security verification",
+            "vendor security-verification page",
+        ),
         ("checking your browser", "browser-check interstitial"),
         ("just a moment", "browser-check interstitial"),
-        ("enable javascript and cookies to continue", "browser-check interstitial"),
+        (
+            "enable javascript and cookies to continue",
+            "browser-check interstitial",
+        ),
         ("attention required", "vendor block page"),
         ("verify you are human", "human-verification text"),
     ];
@@ -690,7 +747,10 @@ fn wall_evidence(html: &str) -> Option<&'static str> {
         ("recaptcha/api.js", "reCAPTCHA challenge embed"),
         ("g-recaptcha", "reCAPTCHA challenge embed"),
         ("hcaptcha.com/1/api.js", "hCaptcha challenge embed"),
-        ("challenges.cloudflare.com/turnstile", "turnstile challenge embed"),
+        (
+            "challenges.cloudflare.com/turnstile",
+            "turnstile challenge embed",
+        ),
     ];
     for (needle, kind) in EMBED {
         if l.contains(needle) {
@@ -758,11 +818,15 @@ pub fn collect_scripts(html: &str, base_url: &str) -> Vec<ScriptSlot> {
     let mut pos = 0usize;
     while let Some(off) = lower[pos..].find("<script") {
         let start = pos + off;
-        let Some(gt_off) = lower[start..].find('>') else { break };
+        let Some(gt_off) = lower[start..].find('>') else {
+            break;
+        };
         let gt = start + gt_off;
         let tag = &html[start..gt];
         let after = &lower[gt..];
-        let Some(close_off) = after.find("</script") else { break };
+        let Some(close_off) = after.find("</script") else {
+            break;
+        };
         let close = gt + close_off;
         let content = &html[gt + 1..close];
         pos = close + 9;
@@ -903,7 +967,9 @@ pub fn html_to_tree_json(html: &str) -> String {
     }
     // the doctype rides the root node (the runtime puts it at
     // document.childNodes[0], the only place a browser keeps it)
-    let mut tree = candidate.unwrap_or_else(|| serde_json::json!({"t":"element","tag":"html","attrs":{},"children":[]}));
+    let mut tree = candidate.unwrap_or_else(
+        || serde_json::json!({"t":"element","tag":"html","attrs":{},"children":[]}),
+    );
     if let Some(dt) = doctype {
         if let Some(obj) = tree.as_object_mut() {
             obj.insert("doctype".to_string(), dt);
@@ -1030,10 +1096,17 @@ pub fn crude_text(html: &str) -> String {
             out.push_str(&html[pos..tag_start]);
             let rest = &lower[tag_start..];
             if rest.starts_with("<script") || rest.starts_with("<style") {
-                let end_tag = if rest.starts_with("<script") { "</script" } else { "</style" };
+                let end_tag = if rest.starts_with("<script") {
+                    "</script"
+                } else {
+                    "</style"
+                };
                 if let Some(eoff) = lower[tag_start..].find(end_tag) {
                     let e = tag_start + eoff;
-                    let g = lower[e..].find('>').map(|x| e + x + 1).unwrap_or(lower.len());
+                    let g = lower[e..]
+                        .find('>')
+                        .map(|x| e + x + 1)
+                        .unwrap_or(lower.len());
                     pos = g;
                     continue;
                 } else {
