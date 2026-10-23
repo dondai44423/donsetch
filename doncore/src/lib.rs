@@ -10,6 +10,7 @@
 //! private lab harness (`v5/doncore/tools/`) drives it. The product (donsetch)
 //! links this library.
 
+pub mod client;
 pub mod engine;
 pub mod identity;
 pub mod rt;

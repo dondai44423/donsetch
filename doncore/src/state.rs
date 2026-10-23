@@ -646,10 +646,11 @@ impl Cache {
 
 /// The state root shared by every state-plane tenant (the cache, the warm
 /// jar, the learned hosts): DONCORE_STATE_DIR, the phase-1
-/// DONCORE_CACHE_DIR alias, then the per-OS default below. The swap
-/// re-points it; tests isolate with DONCORE_STATE_DIR.
+/// DONCORE_CACHE_DIR alias, the product's own DONTSETCH_CACHE_DIR, then the
+/// per-OS default below — so the swap re-points the engine at donsetch's
+/// cache dir with no code change. Tests isolate with DONCORE_STATE_DIR.
 pub fn state_root() -> Option<PathBuf> {
-    for var in ["DONCORE_STATE_DIR", "DONCORE_CACHE_DIR"] {
+    for var in ["DONCORE_STATE_DIR", "DONCORE_CACHE_DIR", "DONSETCH_CACHE_DIR"] {
         if let Ok(d) = std::env::var(var) {
             if !d.is_empty() {
                 return Some(PathBuf::from(d));

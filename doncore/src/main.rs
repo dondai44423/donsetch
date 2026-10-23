@@ -4,14 +4,9 @@
 //!   doncore fetch <url> [--js auto|always|never] [--budget ms] [--dump path]
 //!                        [--harvest] [--full]
 
-use doncore::{rt, state, wire};
+use doncore::{rt, state};
 use doncore::engine::{floor_char_boundary, Engine, JsMode};
-use doncore::identity::Identity;
 use doncore::state::{Cache, HostStore, JarStore};
-use doncore::wire::Wire;
-
-use wreq::IntoEmulation;
-use wreq_util::{Emulation as UtilEmulation, Platform, Profile};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -46,104 +41,45 @@ fn main() {
     }
 }
 
-// ── the engine claims the platform it actually runs on: one coherent story
-// for the wire preset + the JS identity on Linux/macOS/Windows (DECIDED
-// cross-platform, 2026-10-18). Per-OS paths compile on each target; mac/win
-// runtime qualification owed (no host). Never hardcode this box for others.
-fn host_platform() -> Platform {
-    #[cfg(target_os = "linux")]
-    {
-        Platform::Linux
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Platform::MacOS
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Platform::Windows
-    }
-}
-
-// Fallback UAs only — the emulation preset supplies the real strings; these
-// exist so a missing header never fabricates a wrong-platform UA.
-fn default_ua() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-    }
-    #[cfg(target_os = "windows")]
-    {
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-    }
-}
-
-// sec-ch-ua-platform-version fallback per OS (kernel / product / NT version);
-// the Phase-1 oracle replaces it with this machine's measured value.
-fn default_platform_version() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "6.6.0"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "14.0.0"
-    }
-    #[cfg(target_os = "windows")]
-    {
-        "10.0.0"
-    }
-}
-
-fn build_client(persona: &str, resolves: &[String]) -> (Wire, Identity) {
-    let util_em = UtilEmulation::builder()
-        .profile(Profile::Chrome149)
-        .platform(host_platform())
-        .build();
-    let full = if persona == "154" {
-        wire::tune_emulation(util_em.into_emulation())
-    } else {
-        util_em.into_emulation()
-    };
-    let ua = full
-        .headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(default_ua())
-        .to_string();
-    let platform_ver = full
-        .headers
-        .get("sec-ch-ua-platform-version")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(default_platform_version())
-        .trim_matches('"')
-        .to_string();
-    let ident = Identity::detect(&ua, &platform_ver);
-    let mut resolve_map: Vec<(String, std::net::SocketAddr)> = Vec::new();
+/// `--resolve host:port:ip` → the wire's pin map. An IPv6 address is
+/// bracketed (`host:port:[::1]`) — this box's DNS answers IPv6 first, so the
+/// bare form would be the common case, not the exotic one. Bad entries are
+/// named and skipped (a typo must not silently change egress).
+fn parse_resolves(resolves: &[String]) -> Vec<(String, std::net::SocketAddr)> {
+    let mut map: Vec<(String, std::net::SocketAddr)> = Vec::new();
     for r in resolves {
-        if let Some((host_port, ip)) = r.rsplit_once(':') {
-            if let Some((host, port)) = host_port.rsplit_once(':') {
-                match format!("{ip}:{port}").parse::<std::net::SocketAddr>() {
-                    Ok(addr) => resolve_map.push((host.to_string(), addr)),
-                    Err(_) => eprintln!("doncore: bad --resolve addr: {r}"),
+        let bad = |why: &str| eprintln!("doncore: bad --resolve ({why}): {r}");
+        let (host_port, ip) = if let Some(inner) = r.strip_suffix(']') {
+            match inner.rsplit_once('[') {
+                Some((hp, ip)) => (hp.strip_suffix(':').unwrap_or(hp), format!("[{ip}]")),
+                None => {
+                    bad("unclosed address");
+                    continue;
                 }
-            } else {
-                eprintln!("doncore: bad --resolve (want host:port:ip): {r}");
             }
         } else {
-            eprintln!("doncore: bad --resolve (want host:port:ip): {r}");
+            match r.rsplit_once(':') {
+                Some((hp, ip)) => (hp, ip.to_string()),
+                None => {
+                    bad("want host:port:ip");
+                    continue;
+                }
+            }
+        };
+        let Some((host, port)) = host_port.rsplit_once(':') else {
+            bad("want host:port:ip");
+            continue;
+        };
+        match format!("{ip}:{port}").parse::<std::net::SocketAddr>() {
+            Ok(addr) => map.push((host.to_string(), addr)),
+            Err(_) => bad("addr"),
         }
     }
-    let wire = Wire::new(full, resolve_map);
-    (wire, ident)
+    map
 }
 
 fn info() {
-    let (_, ident) = build_client("154", &[]);
+    let (_, ident) = doncore::client::chrome("154", Vec::new());
     println!("UA: {}", ident.ua);
     println!("chrome major: {}", ident.chrome_major);
     println!("locale: {} langs: {:?}", ident.locale, ident.languages);
@@ -235,21 +171,15 @@ fn fetch(args: &[String]) {
         std::process::exit(2);
     };
 
-    let (wire, ident) = build_client(&persona, &resolves);
-    if !no_jar {
-        if let Some(st) = JarStore::open() {
-            wire.jar
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .attach_store(st);
-        }
-    }
-    let cache = if no_cache { None } else { Cache::open() };
-    let hosts = if no_hosts { None } else { HostStore::open() };
-    let engine = Engine::new(wire, ident, cache, hosts);
-    if let Some(c) = &engine.cache {
-        c.prune_if_due();
-    }
+    let engine = doncore::client::open(
+        &persona,
+        parse_resolves(&resolves),
+        doncore::client::Features {
+            cache: !no_cache,
+            jar: !no_jar,
+            hosts: !no_hosts,
+        },
+    );
     match engine.fetch(&url, js, budget_ms) {
         Ok(o) => {
             flush_jar(&engine);
