@@ -12,7 +12,7 @@
 //!   against the committed baseline fixture. Any layer that moved
 //!   without a deliberate profile change = alarm.
 //! - When a local Chrome is available, the same endpoint is ALSO
-//!   captured through the ghost (a real browser): tier-1 vs real
+//!   captured through the ghost (a real browser): local fetch vs real
 //!   Chrome parity is the strongest stealth statement available,
 //!   computed live with no fixture maintenance.
 //! - CI runs the fixture diff weekly; a drift reds the pipeline
@@ -36,7 +36,7 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FingerprintSnapshot {
     /// Free-text provenance: what produced this snapshot
-    /// ("tier1 fetcher, profile chrome-151, linux", or the ghost
+    /// ("local fetcher, profile chrome-151, linux", or the ghost
     /// chrome version). For human review of the fixture.
     /// Defaulted: raw echo endpoints do not carry it; capture()
     /// stamps it. Ghost-parsed snapshots carry it too.
@@ -74,7 +74,7 @@ pub async fn capture(fetcher: &Fetcher) -> Result<FingerprintSnapshot, String> {
     // in /tmp/ for offline diffing against the evergreen ghost
     // capture (/tmp/ghost-echo-blob.json). Off by default.
     if crate::config::cfg().debug.echo_scorecard {
-        let _ = std::fs::write("/tmp/tier1-echo-raw.json", &out.body);
+        let _ = std::fs::write("/tmp/fetch-echo-raw.json", &out.body);
     }
     parse_echo(&out.body, &fetcher.profile().name)
 }
@@ -92,7 +92,7 @@ pub fn parse_echo(body: &[u8], profile_name: &str) -> Result<FingerprintSnapshot
             .ok_or_else(|| format!("echo payload missing {key}"))
     };
     Ok(FingerprintSnapshot {
-        source: "tier1 fetcher".to_string(),
+        source: "local fetcher".to_string(),
         captured_at: String::new(),
         user_agent: get(&v["http"], "user_agent")
             .or_else(|_| get(&v, "user_agent"))
@@ -192,7 +192,7 @@ pub fn parse_fixture_str(s: &str) -> Result<FingerprintSnapshot, String> {
 
 /// Echo capture through the REAL local browser (ghost): the
 /// always-current reference for `doctor --stealth --parity`. No
-/// fixture involved: the comparison is tier-1 vs the browser on
+/// fixture involved: the comparison is the local fetch vs the browser on
 /// the floor, and it cannot go stale. The echo JSON arrives
 /// rendered in a <pre> block; carve the first JSON object out and
 /// parse. `None` when no usable local Chrome exists (doctor says

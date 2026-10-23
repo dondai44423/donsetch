@@ -2486,7 +2486,7 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
     if record {
         let mut fixture = live.clone();
         fixture.source = format!(
-            "tier1 fetcher, profile {}, recorded via --stealth-record",
+            "local fetcher, profile {}, recorded via --stealth-record",
             fetcher.profile().name
         );
         fixture.captured_at = "operator-recorded".to_string();

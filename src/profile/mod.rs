@@ -89,10 +89,10 @@ impl BrowserProfile {
 
     /// Chrome `major` on the given platform. The TLS/H2 tables are
     /// the Chrome 150 capture (stable across adjacent versions);
-    /// the UA and client hints carry the real version so the ghost
-    /// browser and tier 1 advertise the SAME identity : clearance
-    /// cookies are bound to it, and a ghost solving on Chromium 151
-    /// while tier 1 claims 150 gets its replays rejected.
+    /// the UA and client hints carry the real version so the browser
+    /// and the local fetch advertise the SAME identity : clearance
+    /// cookies are bound to it, and mismatched identity claims get
+    /// their replays rejected.
     ///
     /// `branded` = the host binary is Google-Chrome-branded (it has a
     /// third Sec-CH-UA brand). Distro Chromium sends only
@@ -149,8 +149,8 @@ impl BrowserProfile {
 
     /// Default: host-coherent identity (a Windows agent looks like Windows Chrome).
     /// The major version AND the brand set (distro Chromium vs Google Chrome)
-    /// are probed from the INSTALLED browser (ghost + tier 1 must claim the
-    /// same version and brand list).
+    /// are probed from the INSTALLED browser (the local fetch must claim
+    /// the same version and brand list).
     pub fn host_default() -> Self {
         let (major, branded) = match probe_installed() {
             Some((m, b)) => (Some(m), b),
@@ -342,13 +342,13 @@ pub fn accept_language_with_persona(_host: &str, _path: &str, persona_locale: &s
 ///    their own version under `HKCU\Software\<Name>\BLBeacon\version`
 ///    (Google Chrome, Chromium, Microsoft Edge, Thorium, …). Reading
 ///    it costs zero browser launches : no window, no hang, no orphaned
-///    processes. This is the tier-1-friendly path: tier 1 never needs
+///    processes. This is the local-fetch-friendly path: the local fetch never needs
 ///    to spawn a real browser just to know what version to claim.
 /// 2. **Spawned `--version` probe, hard timeboxed.** Only reached
 ///    when the registry has nothing (custom forks with no BLBeacon
 ///    entry). The child is killed : whole tree on Windows : if it
 ///    does not answer within `PROBE_SPAWN_TIMEOUT`, so a wedged
-///    browser can never block tier 1 startup or leave processes behind.
+///    browser can never block local fetch startup or leave processes behind.
 ///
 /// The result is cached in a `OnceLock` so the probe runs at most
 /// once per process.
@@ -356,7 +356,7 @@ static PROBED: std::sync::OnceLock<Option<(u32, bool)>> = std::sync::OnceLock::n
 
 /// Hard cap on the spawned `--version` probe. Chrome 129 on Windows
 /// is known to hang (or crash-loop its network/GPU services) under
-/// `--headless=new`; without this cap tier 1 blocks forever at boot.
+/// `--headless=new`; without this cap the local fetch blocks forever at boot.
 const PROBE_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// (major, google-chrome-branded).

@@ -1,5 +1,5 @@
 {
-  "source": "tier1 fetcher, profile chrome-150, recorded via --stealth-record",
+  "source": "local fetcher, profile chrome-150, recorded via --stealth-record",
   "captured_at": "operator-recorded",
   "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
   "ja3": "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-13-23-5-51-27-45-18-65037-17613-16-35-43-10-65281-11,4588-29-23-24,0",
