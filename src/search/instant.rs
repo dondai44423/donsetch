@@ -93,7 +93,7 @@ pub fn parse_instant_doc(engine: &str, doc: &Html) -> Option<InstantAnswer> {
         "bing" => parse_bing_instant(doc, engine),
         "brave" => parse_brave_instant(doc, engine),
         "yahoo" => parse_yahoo_instant(doc, engine),
-        "google" | "google_ghost" => parse_google_instant(doc, engine),
+        "google" => parse_google_instant(doc, engine),
         "mojeek" => parse_mojeek_instant(doc, engine),
         _ => None,
     }

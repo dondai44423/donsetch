@@ -312,11 +312,11 @@ pub fn render_compact_markdown(
 }
 
 /// structuredContent metadata.
-/// The egress label for the machine meta: the known trio pass
-/// through, anything else is a proxy chain.
+/// The egress label for the machine meta: the known labels
+/// pass through, anything else is a proxy chain.
 fn egress_label(raw: &str) -> String {
     match raw {
-        "direct" | "byok" | "ghost" => raw.to_string(),
+        "direct" | "byok" => raw.to_string(),
         _ => "proxy".to_string(),
     }
 }

@@ -27,11 +27,9 @@ Set it before startup; unknown/empty values fail only the Google lane.
   parsing is not preemptible. Retry timeouts remain visible in reports.
 - All Google failures, including CAPTCHA, follow normal engine/egress health,
   quarantine and direct-fallback rules. A circular cursor cannot override them.
-  `google_http_v1` isolates native health from legacy browser records.
-  Browser health stays `google_ghost`; both count as one Google ranking family.
+  `google_http_v1` keeps native Google health on its own engine key.
 - Reports optionally expose the attempted `profile`. Cached IDs are historical
   evidence, never restored profile preferences. Old cache records remain readable.
-  Native success suppresses the automatic browser cascade unless explicitly forced.
 
 ## Code ownership
 

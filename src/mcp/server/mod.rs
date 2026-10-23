@@ -9,8 +9,6 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
-use futures_util::FutureExt;
-
 mod crawl_tool;
 mod errors;
 mod fetch_tool;
@@ -37,7 +35,6 @@ use errors::*;
 pub(crate) use crate::fetch::guards::is_pdf_url_like;
 pub(crate) use errors::is_failure;
 use fetch_tool::*;
-use search_tool::*;
 
 use super::tools;
 
@@ -104,42 +101,16 @@ impl Daemon {
             fetcher.import_vault_cookies(&replay).await;
         }
 
-        // Build ghost escalation hook for the crawl: renders
-        // JS-only pages in the headless browser so SPA sites
-        // yield real content instead of empty shells. Capped at
-        // 3 per crawl by the orchestrator. The search clone runs
-        // the SAME machinery but never serves from the render
-        // cache: a cached walled SERP would replay as "no
-        // results" forever inside one TTL window.
-        let ghost_hook = make_ghost_hook(
-            Arc::clone(&ghost_mgr),
-            profile.clone(),
-            Arc::clone(&fetcher),
-            Arc::clone(&state),
-            false,
-        );
-        let search_ghost = make_ghost_hook(
-            Arc::clone(&ghost_mgr),
-            profile.clone(),
-            Arc::clone(&fetcher),
-            Arc::clone(&state),
-            true,
-        );
-
         let (crawler, _gov) = crawl_real::build(
             Arc::clone(&fetcher),
             std::sync::Arc::clone(&egress),
             Some(Arc::clone(&state)),
         );
-        let crawler = crawler.with_ghost(ghost_hook);
 
-        let searcher = Arc::new(
-            Searcher::new_shared(
-                Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)),
-                egress,
-            )
-            .with_ghost(search_ghost),
-        );
+        let searcher = Arc::new(Searcher::new_shared(
+            Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)),
+            egress,
+        ));
         let preflight_task = searcher.preflight();
 
         Ok(Self {

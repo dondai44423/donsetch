@@ -150,7 +150,6 @@ pub fn parse_with_instant(
     let mut hits = match engine {
         "brave" => parse_brave(&doc),
         "google" => google_wml::parse(&doc),
-        "google_ghost" => parse_google(&doc),
         "bing" => parse_bing(&doc),
         // DDG primary is now lite : the html endpoint serves a
         // CAPTCHA challenge to proxy IPs.  parse_ddg (html parser)
@@ -177,143 +176,6 @@ pub fn parse_with_instant(
         );
     }
     (hits, instant)
-}
-
-/// Google URL unwrapping: Google wraps result URLs in
-/// /url?q=REAL_URL&sa=U&ved=... : extract and decode the
-/// real URL. Direct http(s) links pass through unchanged.
-fn decode_google(href: &str) -> String {
-    if let Some((_, q)) = href.split_once("/url?") {
-        let q = q.split('&').next().unwrap_or(q);
-        if let Some(raw) = q.strip_prefix("q=")
-            && let Ok(decoded) = urlencoding_decode(raw)
-            && decoded.starts_with("http")
-        {
-            return decoded;
-        }
-    }
-    href.to_string()
-}
-
-/// Google SERP parser. Google's HTML changes frequently, so
-/// this uses layered selectors: primary (div.g), fallback
-/// (div[data-ved]), and a shotgun mode (any a with h3 sibling).
-fn parse_google(doc: &Html) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Primary: div.g blocks (the classic Google result container).
-    let g_blocks = sel("div.g, div.tF2Cxc");
-    let link_sel = sel("a[href]");
-    let h3 = sel("h3");
-    let snip_sel = sel("span.aCOpRe, div[data-sncf], span.st, div.VwiEFb, div.IsZrdc");
-
-    for block in doc.select(&g_blocks) {
-        let Some(a) = block.select(&link_sel).next() else {
-            continue;
-        };
-        let raw_href = a.value().attr("href").unwrap_or("");
-        let url = decode_google(raw_href);
-        if !url.starts_with("http") || url.contains("google.com/") {
-            continue;
-        }
-        let key = url.split('&').next().unwrap_or(&url).to_string();
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        let title = block
-            .select(&h3)
-            .next()
-            .map(text)
-            .unwrap_or_else(|| text(a));
-        if title.is_empty() {
-            continue;
-        }
-        let snippet = block.select(&snip_sel).next().map(text).unwrap_or_default();
-        hits.push(Hit {
-            title,
-            url,
-            snippet,
-            rank: hits.len(),
-            published: None,
-        });
-    }
-
-    if hits.len() >= 3 {
-        return hits;
-    }
-
-    // Fallback: any div[data-ved] with a link + h3.
-    let ved_blocks = sel("div[data-ved]");
-    for block in doc.select(&ved_blocks) {
-        let Some(a) = block.select(&link_sel).next() else {
-            continue;
-        };
-        let raw_href = a.value().attr("href").unwrap_or("");
-        let url = decode_google(raw_href);
-        if !url.starts_with("http") || url.contains("google.com/") {
-            continue;
-        }
-        let key = url.split('&').next().unwrap_or(&url).to_string();
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        let title = block.select(&h3).next().map(text);
-        if title.is_none() {
-            continue;
-        }
-        let title = title.unwrap();
-        if title.is_empty() {
-            continue;
-        }
-        let snippet = block.select(&snip_sel).next().map(text).unwrap_or_default();
-        hits.push(Hit {
-            title,
-            url,
-            snippet,
-            rank: hits.len(),
-            published: None,
-        });
-    }
-
-    if hits.len() >= 3 {
-        return hits;
-    }
-
-    // Shotgun: any <a> with an <h3> ancestor and an http href.
-    for a in doc.select(&link_sel) {
-        let raw_href = a.value().attr("href").unwrap_or("");
-        let url = decode_google(raw_href);
-        if !url.starts_with("http") || url.contains("google.com/") {
-            continue;
-        }
-        let key = url.split('&').next().unwrap_or(&url).to_string();
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        // Check for h3 in the ancestor chain.
-        let mut title = String::new();
-        for ancestor in a.ancestors() {
-            if let Some(el_ref) = scraper::ElementRef::wrap(ancestor)
-                && let Some(h3_el) = el_ref.select(&h3).next()
-            {
-                title = text(h3_el);
-                break;
-            }
-        }
-        if title.is_empty() {
-            continue;
-        }
-        hits.push(Hit {
-            title,
-            url,
-            snippet: String::new(),
-            rank: hits.len(),
-            published: None,
-        });
-    }
-
-    hits
 }
 
 fn parse_brave(doc: &Html) -> Vec<Hit> {
@@ -572,9 +434,6 @@ pub fn serp_url(engine: &str, query: &str) -> Option<String> {
     let q = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
     match engine {
         "google" => Some(google_wml::url(query)),
-        "google_ghost" => Some(format!(
-            "https://www.google.com/search?q={q}&hl=en&gl=us&num=15&ie=utf-8&oe=utf-8"
-        )),
         "brave" => Some(format!("https://search.brave.com/search?q={q}")),
         "bing" => Some(format!("https://www.bing.com/search?q={q}&count=15")),
         // DDG primary: lite endpoint (html endpoint serves CAPTCHA to proxy IPs).
@@ -592,16 +451,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn google_http_and_browser_keep_distinct_endpoints_and_parsers() {
+    fn google_serp_url_targets_the_wml_endpoint() {
         assert!(serp_url("google", "rust").unwrap().contains("/wml/search?"));
-        assert!(
-            serp_url("google_ghost", "rust")
-                .unwrap()
-                .contains("/search?")
-        );
-        assert!(!serp_url("google_ghost", "rust").unwrap().contains("/wml/"));
+        // The WML parser must not claim desktop-layout SERP HTML.
         let desktop = r#"<div class="g"><a href="https://example.org/"><h3>Title</h3></a><div class="VwiEFb">Snippet</div></div>"#;
-        assert_eq!(parse("google_ghost", desktop).len(), 1);
         assert!(parse("google", desktop).is_empty());
     }
 

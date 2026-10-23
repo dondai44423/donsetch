@@ -140,7 +140,6 @@ section!(BypassSection {
 
 section!(SearchSection {
     google_profile: String = String::new(),
-    ghost_lane: GhostLane = GhostLane::Auto,
     rerank_topup: bool = true,
     rerank_threads: u32 = 0,
     brightdata_zone: String = String::new(),
@@ -234,15 +233,6 @@ pub enum RouteMemory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ShadowFetch {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum GhostLane {
     #[default]
     Auto,
     Always,
@@ -1084,22 +1074,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "DONSETCH_GOOGLE_PROFILE",
         );
     }
-    if std::env::var_os("DONSEEK_FORCE_GHOST_LANE").is_some() {
-        put(
-            &mut m,
-            "search.ghost_lane",
-            "always".into(),
-            "DONSEEK_FORCE_GHOST_LANE",
-        );
-    }
-    if std::env::var_os("DONSEEK_NO_GHOST_LANES").is_some() {
-        put(
-            &mut m,
-            "search.ghost_lane",
-            "never".into(),
-            "DONSEEK_NO_GHOST_LANES",
-        );
-    }
     if std::env::var_os("DONSEEK_NO_TOPUP").is_some() {
         put(
             &mut m,
@@ -1848,13 +1822,6 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "search",
-            "ghost_lane",
-            FieldKind::Str,
-            "auto",
-            "auto | always | never: ghost lane for search results",
-        ),
-        (
-            "search",
             "rerank_topup",
             FieldKind::Bool,
             "true",
@@ -2150,8 +2117,6 @@ const LEGACY_VARS: &[&str] = &[
     "DONSETCH_BYPASS_CACHE_TTL_SECS",
     "DONSETCH_BYPASS_CACHE_MAX_ENTRIES",
     "DONSETCH_GOOGLE_PROFILE",
-    "DONSEEK_FORCE_GHOST_LANE",
-    "DONSEEK_NO_GHOST_LANES",
     "DONSEEK_NO_TOPUP",
     "DONSEEK_RERANK_THREADS",
     "DONSETCH_BRIGHTDATA_ZONE",
@@ -2682,8 +2647,6 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSETCH_BYPASS_CACHE_TTL_SECS" => ("bypass", "cache_ttl_secs"),
         "DONSETCH_BYPASS_CACHE_MAX_ENTRIES" => ("bypass", "cache_max_entries"),
         "DONSETCH_GOOGLE_PROFILE" => ("search", "google_profile"),
-        "DONSEEK_FORCE_GHOST_LANE" => ("search", "ghost_lane"),
-        "DONSEEK_NO_GHOST_LANES" => ("search", "ghost_lane"),
         "DONSEEK_NO_TOPUP" => ("search", "rerank_topup"),
         "DONSEEK_RERANK_THREADS" => ("search", "rerank_threads"),
         "DONSETCH_BRIGHTDATA_ZONE" => ("search", "brightdata_zone"),

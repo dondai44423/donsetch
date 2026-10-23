@@ -1,6 +1,5 @@
 //! Explicit live probe: cargo run --profile ci --example google_wml_probe -- "rust programming language"
 //! One direct HTTP request per query, no browser, proxy, API key or persisted search state.
-//! Optional GOOGLE_PROBE_BASELINE=1 also tests the ordinary desktop endpoint.
 //! GOOGLE_PROBE_USER_AGENT overrides only this experiment's WML identity.
 use donsetch::{fetch::client::Fetcher, profile::BrowserProfile, search::engines};
 use std::time::{Duration, Instant};
@@ -20,23 +19,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut failed = false;
     for query in queries {
-        let modes = if std::env::var_os("GOOGLE_PROBE_BASELINE").is_some() {
-            vec!["google", "google_ghost"]
-        } else {
-            vec!["google"]
-        };
+        let modes = vec!["google"];
         for mode in modes {
             let started = Instant::now();
             let url = engines::serp_url(mode, &query).unwrap();
             let response = tokio::time::timeout(Duration::from_secs(8), async {
-                if mode == "google" {
-                    fetcher
-                        .fetch_once_via_user_agent(&url, None, &user_agent)
-                        .await
-                } else {
-                    // Desktop endpoint over HTTP only; no ghost browser is started.
-                    fetcher.fetch_once_via(&url, &[], None, false, None).await
-                }
+                fetcher
+                    .fetch_once_via_user_agent(&url, None, &user_agent)
+                    .await
             })
             .await;
             match response {
@@ -60,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "{}",
                         serde_json::json!({
                             "query":query, "mode":mode, "browser":false, "status":out.status,
-                            "user_agent":if mode == "google" { &user_agent } else { &fetcher.profile().user_agent },
+                            "user_agent": &user_agent,
                             "alpn":out.alpn, "bytes":out.body.len(), "ms":started.elapsed().as_millis(),
                             "verdict":format!("{:?}",out.verdict), "error":error,
                             "hits":hits.len(), "ok":ok,

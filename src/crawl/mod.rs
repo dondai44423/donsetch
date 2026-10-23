@@ -308,58 +308,6 @@ fn rule_denial(rules: &crate::rules::RuleSet, url: &Url) -> Option<crate::rules:
     })
 }
 
-/// Ghost-rendered page from tier-2 browser escalation.
-/// The orchestrator stays ghost-agnostic : this is the
-/// payload the injected `GhostHook` returns.
-pub struct GhostRender {
-    pub html: String,
-    /// The native main-document receipt (original observation for cached renders).
-    pub document: crate::ghost::document::Document,
-}
-
-/// One browser handoff with the caller's selected route and absolute deadline.
-#[derive(Clone, Debug)]
-pub struct GhostRequest {
-    pub url: String,
-    pub route: crate::egress::request_route::RequestRoute,
-    pub deadline: Instant,
-}
-
-impl FetchedPage {
-    fn apply_render(&mut self, rendered: GhostRender) {
-        self.url = rendered.document.url;
-        self.status = rendered.document.status.unwrap_or(0);
-        self.headers = vec![(
-            "content-type".into(),
-            crate::extract::charset::GHOST_TEXT_CT.into(),
-        )];
-        self.body = rendered.html.into_bytes();
-        self.verdict = Verdict::ContentOk;
-        self.error_hint = None;
-    }
-
-    fn browser_request(&self, url: String, deadline: Instant) -> Result<GhostRequest, String> {
-        Ok(GhostRequest {
-            url,
-            route: self
-                .route
-                .clone()
-                .ok_or("HTTP response has no route for browser handoff")?,
-            deadline,
-        })
-    }
-}
-
-/// Injected ghost escalation hook. Takes a selected request, returns
-/// rendered HTML + cookies on success, Err(reason) on failure
-/// (captcha, timeout, launch error) : the reason flows into the
-/// crawl's skipped[] so the agent sees WHY the browser tier
-/// declined, not just that it did. The orchestrator calls it
-/// when a page is a JS shell (thin extraction) or a bot wall
-/// (Challenge verdict). Capped at 3 per crawl.
-pub type GhostHook =
-    Arc<dyn Fn(GhostRequest) -> BoxFuture<'static, Result<GhostRender, String>> + Send + Sync>;
-
 /// Pluggable fetch: real = DonShadow, tests = in-memory map.
 pub type PageFetcher = Arc<
     dyn Fn(
@@ -805,28 +753,9 @@ fn resume_store_issue(tok: &str, state: &ResumeState) {
     }
 }
 
-/// Tier-2 (real browser) escalations allowed per crawl: each one is
-/// a 20-40s headless-browser cycle, so the cap is the crawl's cost
-/// ceiling, not a tuning knob.
-const GHOST_BUDGET: usize = 3;
-
-/// Claim one ghost escalation from the shared budget. Atomic
-/// check-and-decrement: workers used to `load() > 0` then
-/// `fetch_sub(1)` as two steps, so two workers seeing budget == 1
-/// both passed the check, the second `fetch_sub` wrapped the counter
-/// to `usize::MAX`, and every later check passed for the rest of the
-/// crawl -- the cost cap gone. Only reachable with `concurrency > 1`
-/// (the default is 1), but that is a public `CrawlOptions` field.
-fn claim_ghost_slot(budget: &AtomicUsize) -> bool {
-    budget
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-        .is_ok()
-}
-
 pub struct Crawler {
     fetch: PageFetcher,
     governor: Arc<Governor>,
-    ghost: Option<GhostHook>,
     token_seq: AtomicUsize,
     /// The ruleset the frontier and robots cache enforce; None = the
     /// process ruleset, resolved when a crawl starts.
@@ -838,7 +767,6 @@ impl Crawler {
         Self {
             fetch,
             governor,
-            ghost: None,
             token_seq: AtomicUsize::new(0),
             rules: None,
         }
@@ -850,15 +778,6 @@ impl Crawler {
     #[cfg(test)]
     pub(crate) fn with_rules(mut self, rules: &'static crate::rules::RuleSet) -> Self {
         self.rules = Some(rules);
-        self
-    }
-
-    /// Attach a ghost escalation hook for JS-only pages.
-    /// When a page's extraction is thin (JS shell) or its
-    /// verdict is Challenge (bot wall), the orchestrator calls
-    /// the hook to render the page in a headless browser.
-    pub fn with_ghost(mut self, ghost: GhostHook) -> Self {
-        self.ghost = Some(ghost);
         self
     }
 
@@ -1494,7 +1413,6 @@ impl Crawler {
         ));
 
         let workers = opts.concurrency.max(1);
-        let ghost_budget = Arc::new(AtomicUsize::new(GHOST_BUDGET));
         let mut handles = Vec::new();
         for wid in 0..workers {
             let queue = Arc::clone(&sh_queue);
@@ -1513,8 +1431,6 @@ impl Crawler {
             let fetch = fetch.clone();
             let buffered = buffered.clone();
             let governor = Arc::clone(&self.governor);
-            let ghost_hook = self.ghost.clone();
-            let ghost_budget = Arc::clone(&ghost_budget);
             let opts_worker = opts.clone();
             let seed_host2 = seed_host.clone();
             let seed_norm_w = seed_norm.clone();
@@ -1788,7 +1704,7 @@ impl Crawler {
                         tokio::time::sleep(wait).await;
                     }
 
-                    let mut page = fetch(
+                    let page = fetch(
                         item.url.clone(),
                         lane.id.clone(),
                         item.parent.clone(),
@@ -1917,73 +1833,8 @@ impl Crawler {
                         continue 'work;
                     }
 
-                    // Shared HTTP denial policy: one browser observation for
-                    // eligible documents, including an unbranded plain 403.
-                    let mut ghost_rendered = false;
-                    if crate::detect::walls::browser_recovery(
-                        page.status,
-                        &page.headers,
-                        &page.body,
-                        page.verdict,
-                    ) && let Some(ref ghost_hook) = ghost_hook
-                    {
-                        let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if !remaining.is_zero() && claim_ghost_slot(&ghost_budget) {
-                            let rendered = match page.browser_request(item.url.clone(), deadline_at)
-                            {
-                                Ok(request) => {
-                                    tokio::time::timeout_at(deadline_at.into(), ghost_hook(request))
-                                        .await
-                                        .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
-                                }
-                                Err(error) => Err(error),
-                            };
-                            match rendered {
-                                Ok(gp) => {
-                                    if let Err(refusal) = redirect_target_allowed(
-                                        &fetch,
-                                        &governor,
-                                        &robots_cache,
-                                        &opts_worker,
-                                        &seed_host2,
-                                        &parsed,
-                                        &gp.document.url,
-                                    )
-                                    .await
-                                    {
-                                        let mut failure = SeedFailure::from_page(
-                                            &page,
-                                            Some(refusal.reason.clone()),
-                                        );
-                                        failure.landing = Some(gp.document.url.clone());
-                                        failure.denial = refusal.denial;
-                                        note_seed_failure(failure);
-                                        skipped
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .push((item.url.clone(), refusal.reason));
-                                        continue 'work;
-                                    }
-                                    page.apply_render(gp);
-                                    ghost_rendered = true;
-                                }
-                                Err(why) => {
-                                    skipped
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .push((
-                                            item.url.clone(),
-                                            format!("ghost escalation failed: {why}"),
-                                        ));
-                                }
-                            }
-                        }
-                    }
-
                     // Wall/denylist verdicts → skip honestly.
-                    // (Unless ghost rendered the page : then treat
-                    // as ContentOk and proceed to extraction.)
-                    if !ghost_rendered && !matches!(page.verdict, Verdict::ContentOk) {
+                    if !matches!(page.verdict, Verdict::ContentOk) {
                         let why = if item.retries > 0 {
                             format!(
                                 "{} (failed after {} retries)",
@@ -2019,7 +1870,7 @@ impl Crawler {
                         .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("text/html");
-                    if !ghost_rendered && crate::fetch::guards::is_binary(&page.body, ctype) {
+                    if crate::fetch::guards::is_binary(&page.body, ctype) {
                         let kind = ctype.split(';').next().unwrap_or("unknown").trim();
                         skipped
                             .lock()
@@ -2033,11 +1884,7 @@ impl Crawler {
                     eo.focus = focus.as_ref().clone();
                     eo.max_chars = Some(opts_worker.per_page_max);
                     let body_bytes = page.body.as_slice();
-                    let body_ctype = if ghost_rendered {
-                        crate::extract::charset::GHOST_TEXT_CT
-                    } else {
-                        ctype
-                    };
+                    let body_ctype = ctype;
                     // ── PDFium hang isolation ──
                     // `extract::extract` -> `pdf::parse` -> `engine::load_document`
                     // holds a global `Mutex<PdfiumCore>` and calls blocking
@@ -2066,7 +1913,7 @@ impl Crawler {
                             break 'work;
                         }
                     };
-                    let mut r = match extract_res {
+                    let r = match extract_res {
                         Ok(r) => r,
                         Err(e) => {
                             skipped
@@ -2076,82 +1923,6 @@ impl Crawler {
                             continue 'work;
                         }
                     };
-
-                    // Ghost escalation for JS-only pages: if the
-                    // extraction is thin (JS shell) and the page is
-                    // large enough (> 5KB, not a 404), try rendering
-                    // in the headless browser. Capped at 3 per crawl;
-                    // uses the original remaining deadline. Non-JS
-                    // sites never hit this path.
-                    if r.thin
-                        && !ghost_rendered
-                        && page.body.len() > 5_000
-                        && let Some(ref ghost_hook) = ghost_hook
-                    {
-                        let remaining = deadline_at.saturating_duration_since(Instant::now());
-                        if !remaining.is_zero() && claim_ghost_slot(&ghost_budget) {
-                            let rendered = match page.browser_request(item.url.clone(), deadline_at)
-                            {
-                                Ok(request) => {
-                                    tokio::time::timeout_at(deadline_at.into(), ghost_hook(request))
-                                        .await
-                                        .unwrap_or_else(|_| Err("crawl deadline exceeded".into()))
-                                }
-                                Err(error) => Err(error),
-                            };
-                            match rendered {
-                                Ok(gp) => {
-                                    if let Err(refusal) = redirect_target_allowed(
-                                        &fetch,
-                                        &governor,
-                                        &robots_cache,
-                                        &opts_worker,
-                                        &seed_host2,
-                                        &parsed,
-                                        &gp.document.url,
-                                    )
-                                    .await
-                                    {
-                                        skipped
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                            .push((item.url.clone(), refusal.reason));
-                                        continue 'work;
-                                    }
-                                    match extract::extract(
-                                        gp.html.as_bytes(),
-                                        crate::extract::charset::GHOST_TEXT_CT,
-                                        &gp.document.url,
-                                        &eo,
-                                    ) {
-                                        Ok(rendered) => {
-                                            r = rendered;
-                                            page.apply_render(gp);
-                                        }
-                                        Err(error) => {
-                                            skipped
-                                                .lock()
-                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                                .push((
-                                                    item.url.clone(),
-                                                    format!("browser extract failed: {error}"),
-                                                ));
-                                            continue 'work;
-                                        }
-                                    }
-                                }
-                                Err(why) => {
-                                    skipped
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .push((
-                                            item.url.clone(),
-                                            format!("ghost escalation failed: {why}"),
-                                        ));
-                                }
-                            }
-                        }
-                    }
 
                     if page.url != item.url
                         && let Ok(final_url) = Url::parse(&page.url)
@@ -2824,9 +2595,8 @@ impl Crawler {
 
         // A failed seed is the crawl's failure only when nothing else
         // could have produced a page: judged here, from what the workers
-        // did, because a transient seed is retried and a walled one may
-        // be rescued by the browser. A resumed crawl has no preflight
-        // and no seed row, so the rule does not apply to it.
+        // did, because a transient seed is retried. A resumed crawl has
+        // no preflight and no seed row, so the rule does not apply to it.
         let seed_failure = if resume_token.is_none()
             && final_pages.is_empty()
             && stop == StopReason::FrontierEmpty
@@ -3077,7 +2847,6 @@ fn host_matches(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-/// Recheck a candidate's actual final URL before extraction or browser recovery.
 /// Build the per-request redirect gate for a crawl: consulted for
 /// every redirect hop BEFORE it is dialed. Refuses same-host,
 /// scope and robots violations; the hop's response then returns as
@@ -3130,6 +2899,7 @@ struct RedirectRefusal {
     denial: Option<crate::rules::Denial>,
 }
 
+/// Recheck a candidate's actual final URL before extraction.
 async fn redirect_target_allowed(
     fetch: &PageFetcher,
     governor: &Governor,

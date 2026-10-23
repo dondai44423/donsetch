@@ -34,7 +34,7 @@ use persist::{
     load_quality_disk, save_cache_disk, save_health_disk_if_dirty, save_outcome_disk_if_dirty,
     save_quality_disk_if_dirty,
 };
-use tasks::{EngineResult, TaskFut, engine_task, ghost_engine_task, vertical_task};
+use tasks::{EngineResult, TaskFut, engine_task, vertical_task};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -253,11 +253,6 @@ pub struct Searcher {
     /// subsequent `web_fetch` of a top result (search → fetch
     /// is THE agent pipeline). One-shot, TTL'd, bounded.
     prewarms: std::sync::Arc<std::sync::Mutex<PrewarmCache>>,
-    /// Browser render capability (2026 Google serves a JS
-    /// shell to plain HTTP but renders fine in our own
-    /// headless Chrome: live-proven). Used ONLY by the
-    /// thinness-gated cascade lane; None in test builds.
-    ghost: Option<crate::crawl::GhostHook>,
     /// B3: learned host quality (www-stripped host -> EWMA).
     /// Filled by enrich/prefetch outcomes; nudges ranking
     /// slightly after enough samples. Kill: search.quality_prior.
@@ -370,7 +365,6 @@ impl Searcher {
             inflight: Mutex::new(std::collections::HashSet::new()),
             byok_inflight: Mutex::new(std::collections::HashSet::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
-            ghost: None,
             quality: Mutex::new(load_quality_disk()),
             quality_dirty: std::sync::atomic::AtomicBool::new(false),
             outcome: Mutex::new(load_outcome_disk()),
@@ -381,12 +375,6 @@ impl Searcher {
     /// The shared egress pool (crawl/fetch attach the same Arc).
     pub fn egress_pool(&self) -> &std::sync::Arc<EgressPool> {
         &self.pool
-    }
-
-    /// Attach the browser-render capability (cascade lane).
-    pub fn with_ghost(mut self, ghost: crate::crawl::GhostHook) -> Self {
-        self.ghost = Some(ghost);
-        self
     }
 
     /// v3 F1: warm-handoff store : filled by enrichment, drained
@@ -943,71 +931,25 @@ impl Searcher {
                 previous,
             )));
         }
-        // Start the independent browser index alongside recovery requests.
-        // Waiting for failed HTTP retries first only delays a lane that can
-        // succeed without them. A healthy first merge keeps the cheap path.
-        let force_lane = crate::config::cfg().search.ghost_lane == crate::config::GhostLane::Always;
-        let google_http_ok = outcomes
-            .iter()
-            .any(|(engine, result)| engine_name(engine) == "google" && result.is_ok());
-        let lane_permitted = self.ghost.is_some()
-            && crate::config::cfg().search.ghost_lane != crate::config::GhostLane::Never
-            && !self.quarantined("google_ghost");
-        let browser_recovery = async {
-            if !lane_permitted
-                || !google_ghost_wanted(force_lane, google_http_ok, ok_engines, ok_hits)
-            {
-                return Vec::new();
-            }
-            let hook = self.ghost.as_ref().unwrap().clone();
-            let budget = stage_budget(Duration::from_secs(30), Duration::from_secs(2));
-            if budget.is_zero() {
-                return vec![(
-                    "google_ghost".to_string(),
-                    Err(("budget-skipped".into(), "ghost".into(), true)),
-                )];
-            }
-            vec![
-                ghost_engine_task(
-                    "google_ghost".to_string(),
-                    query.to_string(),
-                    hook,
-                    &self.pool,
-                    budget,
-                )
-                .await,
-            ]
-        };
-        let (retry_outcomes, lane_outcomes) = tokio::join!(
-            futures_util::future::join_all(retry_futures),
-            browser_recovery
-        );
+        let retry_outcomes = futures_util::future::join_all(retry_futures).await;
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
         // C5: best instant answer across lanes (first non-empty wins
         // by engine trust order, which outcomes already respect).
         let mut instant: Option<instant::InstantAnswer> = None;
-        let all: Vec<(String, EngineResult)> = outcomes
-            .into_iter()
-            .chain(retry_outcomes)
-            .chain(lane_outcomes)
-            .collect();
+        let all: Vec<(String, EngineResult)> = outcomes.into_iter().chain(retry_outcomes).collect();
         for (label, outcome) in all {
             let profile = label.split_once('@').map(|(_, p)| p.to_string());
             let engine = engine_name(&label).to_string();
-            let ghost_lane = engine == "google_ghost";
             match outcome {
                 Ok((hits, ms, egress_id, was_engine, lane_instant)) => {
                     let base = engine_health_key(&engine);
                     self.record_outcome(base, true);
-                    if was_engine && !ghost_lane {
-                        // "ghost" is not an egress id: pool
-                        // bookkeeping must not record lanes that
-                        // the pool never assigned.
+                    if was_engine {
                         self.pool.report_ok(&engine, &egress_id);
                     }
-                    if was_engine || ghost_lane {
+                    if was_engine {
                         self.bump_trust(base, intent, true);
                     }
                     if instant.is_none()
@@ -1033,7 +975,7 @@ impl Searcher {
                     if is_engine_fault(&status) {
                         self.record_outcome(base, false);
                     }
-                    if (was_engine || ghost_lane) && !ghost_lane {
+                    if was_engine {
                         if status.starts_with("dead") {
                             self.pool.report_dead(&egress_id);
                         } else if status == "auth-fail" {
@@ -1042,7 +984,7 @@ impl Searcher {
                             self.pool.report_blocked(&engine, &egress_id);
                         }
                     }
-                    if (was_engine || ghost_lane) && is_engine_fault(&status) {
+                    if was_engine && is_engine_fault(&status) {
                         self.bump_trust_status(base, intent, false, &status);
                     }
                     report.push(EngineReport {
@@ -1397,13 +1339,7 @@ fn engine_health_key(engine: &str) -> &str {
     if engine == "google" {
         return "google_http_v1";
     }
-    // Different Google transports can fail independently; only ranking groups
-    // them into one index family. A WML block must not quarantine the browser.
-    if engine == "google_ghost" {
-        engine
-    } else {
-        egress::health_key(engine)
-    }
+    egress::health_key(engine)
 }
 
 fn retry_engine_failure(status: &str) -> bool {
@@ -1423,16 +1359,6 @@ async fn bounded_retry(
     tokio::time::timeout(budget, task)
         .await
         .unwrap_or_else(|_| (engine, Err(("retry-timeout".into(), egress, was_engine))))
-}
-
-fn google_ghost_wanted(force: bool, http_ok: bool, engines_ok: usize, hits_ok: usize) -> bool {
-    force || (!http_ok && ghost_lane_wanted(engines_ok, hits_ok))
-}
-
-/// Thinness gate for the ghost cascade lane. A successful HTTP Google
-/// response already supplies that index; the caller skips the browser then.
-fn ghost_lane_wanted(engines_ok: usize, hits_ok: usize) -> bool {
-    engines_ok < 3 || hits_ok < 15
 }
 
 /// Input hygiene for the search surface. Empty queries waste a
@@ -1968,18 +1894,10 @@ mod tests {
     }
 
     #[test]
-    fn google_transport_health_is_separate_but_index_family_is_shared() {
+    fn google_transport_health_key_is_transport_specific() {
         assert_eq!(engine_health_key("google@6230-05.50"), "google_http_v1");
         assert_ne!(engine_health_key("google"), "google");
-        assert_ne!(
-            engine_health_key("google"),
-            engine_health_key("google_ghost")
-        );
         assert_eq!(engine_health_key("ddg_html"), "ddg");
-        assert_eq!(
-            rank::engine_family("google"),
-            rank::engine_family("google_ghost")
-        );
     }
 
     #[test]
@@ -1993,14 +1911,6 @@ mod tests {
         let reloaded: EngineReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
         assert_eq!(reloaded.profile.as_deref(), Some("6230-04.44"));
-    }
-
-    #[test]
-    fn successful_google_http_skips_browser_unless_explicitly_forced() {
-        assert!(!google_ghost_wanted(false, true, 1, 3));
-        assert!(google_ghost_wanted(false, false, 1, 3));
-        assert!(!google_ghost_wanted(false, false, 4, 20));
-        assert!(google_ghost_wanted(true, true, 4, 20));
     }
 
     #[test]
@@ -2081,7 +1991,6 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(!intent::engines_for(intent).contains(&"google_ghost"));
         }
     }
 
@@ -2100,7 +2009,6 @@ mod tests {
         assert!(is_engine_fault("blocked:403"));
         assert!(is_engine_fault("blocked:captcha"));
         assert!(is_engine_fault("empty-parse"));
-        assert!(is_engine_fault("ghost-timeout"));
         assert!(is_engine_fault("timeout"));
         assert!(is_engine_fault("no-url"));
         assert!(is_engine_fault("net"));
@@ -2162,14 +2070,6 @@ mod tests {
     }
 
     #[test]
-    fn google_ghost_is_its_own_family_for_ranking_math() {
-        assert_eq!(rank::engine_family("google_ghost"), "google");
-        assert_eq!(rank::engine_family("google"), "google");
-        // Not a vertical: full RRF mass, no vertical-only penalty.
-        assert!(!rank::is_vertical("google_ghost"));
-    }
-
-    #[test]
     fn family_count_dedups_shared_indexes() {
         let mut r = Merged {
             title: "t".into(),
@@ -2183,7 +2083,7 @@ mod tests {
             ("bing".into(), 0),
             ("ddg".into(), 3),
             ("yahoo".into(), 5),
-            ("google_ghost".into(), 2),
+            ("google".into(), 2),
             ("brave".into(), 4),
         ];
         // 5 engines, 3 families (bing family dedups to one opinion).
@@ -2339,17 +2239,6 @@ mod tests {
             validate_query("glue").is_none(),
             "punctuation-only-ish query is fine"
         );
-    }
-
-    #[test]
-    fn ghost_lane_gate_needs_real_thinness_or_force() {
-        // A healthy merge never pays a browser render.
-        assert!(!ghost_lane_wanted(5, 40));
-        assert!(!ghost_lane_wanted(3, 16));
-        // Thin merge on either axis fires the lane.
-        assert!(ghost_lane_wanted(2, 40), "few engines ok");
-        assert!(ghost_lane_wanted(4, 12), "thin hits");
-        assert!(ghost_lane_wanted(0, 0));
     }
 
     #[test]

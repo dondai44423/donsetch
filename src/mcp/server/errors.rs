@@ -160,12 +160,6 @@ pub(super) fn search_batch_deadline_error(queries: &[String]) -> Value {
     )
 }
 
-/// Ghost render capability shared by the crawl and the search
-/// SERP cascade lane. `skip_cache_read` = never serve a previous
-/// render from the cache (the search lane uses this: a cached
-/// walled SERP would replay "no results" for the whole TTL).
-/// Writes are always kept: the cache still serves normal fetches
-/// of the same URL.
 pub(super) fn search_error(query: &str, cause: &str, byok_tried: bool, kind: &str) -> Value {
     if kind == "permanent" {
         // validate_query rejected the query before any engine or

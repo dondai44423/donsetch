@@ -2522,41 +2522,6 @@ impl GhostState {
     }
 }
 
-/// Opaque cache partition for a browser route, build and persona wire.
-pub(crate) fn render_context(
-    profile: &crate::profile::BrowserProfile,
-    wire: &crate::ghost::GhostWire,
-    persona: Option<(u32, u64)>,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    for value in [
-        profile.user_agent.clone(),
-        profile.sec_ch_ua.clone(),
-        wire.locale.clone(),
-        wire.tz.clone(),
-        wire.route
-            .as_ref()
-            .map(|route| route.id())
-            .unwrap_or_default(),
-        format!("{:?}", crate::config::cfg().browser.backend),
-    ] {
-        hash.update((value.len() as u64).to_be_bytes());
-        hash.update(value.as_bytes());
-    }
-    hash.update(wire.viewport.0.to_be_bytes());
-    hash.update(wire.viewport.1.to_be_bytes());
-    hash.update([u8::from(persona.is_some())]);
-    if let Some((generation, seed)) = persona {
-        hash.update(generation.to_be_bytes());
-        hash.update(seed.to_be_bytes());
-    }
-    hash.finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 // ────────────────────────── legacy migration ──────────────────────────
 
 #[derive(Deserialize)]
@@ -2578,41 +2543,6 @@ struct LegacySolved {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stealth_v3_render_context_tracks_wire_build_and_persona_changes() {
-        let profile = crate::profile::BrowserProfile::host_default();
-        let wire = crate::ghost::GhostWire {
-            route: Some(crate::egress::request_route::RequestRoute::direct()),
-            ..Default::default()
-        };
-        let context = render_context(&profile, &wire, Some((3, 17)));
-        assert_eq!(context.len(), 64);
-        assert_eq!(context, render_context(&profile, &wire, Some((3, 17))));
-        let mut changed = wire.clone();
-        changed.route = Some(crate::egress::request_route::RequestRoute::pinned(
-            crate::egress::proxy::Proxy::parse("http://owned:secret@127.0.0.1:8080").unwrap(),
-        ));
-        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
-        changed = wire.clone();
-        changed.locale = "fr-FR".into();
-        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
-        changed = wire.clone();
-        changed.viewport.0 += 1;
-        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
-        changed = wire.clone();
-        changed.viewport.1 += 1;
-        assert_ne!(context, render_context(&profile, &changed, Some((3, 17))));
-        let mut changed = profile.clone();
-        changed.user_agent.push_str(" changed");
-        assert_ne!(context, render_context(&changed, &wire, Some((3, 17))));
-        changed = profile.clone();
-        changed.sec_ch_ua.push_str(" changed");
-        assert_ne!(context, render_context(&changed, &wire, Some((3, 17))));
-        for persona in [None, Some((4, 17)), Some((3, 18))] {
-            assert_ne!(context, render_context(&profile, &wire, persona));
-        }
-    }
 
     fn cr(name: &str, value: &str, domain: &str, exp: Option<u64>) -> CookieRecord {
         CookieRecord {

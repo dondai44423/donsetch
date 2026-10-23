@@ -420,8 +420,6 @@ fn merge_inner(
 
 // Index family: engines sharing an index count once for
 // consensus (a Bing hit + DDG hit = one opinion, not two).
-// google_ghost is the browser-render lane running the same
-// Google index as the plain parser would: one family.
 /// Title key for the syndication dedup: lowercase with collapsed
 /// whitespace, PUNCTUATION PRESERVED. The previous key stripped every
 /// non-alphanumeric char, which collapsed genuinely different titles
@@ -445,7 +443,7 @@ pub(crate) fn engine_family(engine: &str) -> &str {
         "bing" | "ddg" | "ddg_lite" | "ddg_html" | "yahoo" => "bing",
         "brave" => "brave",
         "mojeek" => "mojeek",
-        "google" | "google_ghost" => "google",
+        "google" => "google",
         other => other, // verticals are their own family
     }
 }

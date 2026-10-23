@@ -196,8 +196,7 @@ so in a comment. The crawl tests use `Crawler::with_rules` to stay pure.
 ## Known gaps, accepted for v1
 
 - A redirect the browser follows into a denied host is stopped by the CDP
-  guard but surfaces as a browser navigation error, not `policy.denied`; the
-  crawl's browser hook reports it as text (`GhostHook` returns a `String`).
+  guard but surfaces as a browser navigation error, not `policy.denied`.
 - The paid unlocker can return a denied host's page after a redirect on its
   side; the request never leaves from the operator's IP.
 - A rule refusing a phase-1 robots or sitemap fetch is silent: discovery
@@ -237,8 +236,7 @@ Each is additive: no v1 key or output changes meaning when it arrives.
   applying to everything. Revisit if a deny breaks pages nobody named.
 - **Typed browser denials.** Store the `Denied` the CDP guard saw for a
   document request in a per-tab slot that navigation returns, so a
-  browser-followed redirect reports the rule; then type `GhostHook`'s error
-  so the crawl keeps it.
+  browser-followed redirect reports the rule.
 - **A second config file layer** (project-level). The map shape already
   merges per key. Then the duplicate-key error should name each key's layer
   (`Loaded::origin_of_path` exists for it), and `tier = "auto"` becomes the

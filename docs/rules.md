@@ -638,8 +638,8 @@ and origins, like every other knob. The rule table itself is not listed; use
 - **The browser reports some refusals as browser errors.** `policy.denied`
   appears only when the URL the browser was sent to is itself denied, or the
   page lands on a denied URL. A redirect the browser follows into a denied
-  host is blocked, and surfaces as a browser navigation error; in a crawl the
-  skip reason reads `ghost escalation failed: …`. A navigation the page starts
+  host is blocked, and surfaces as a browser navigation error. A navigation
+  the page starts
   on its own after loading (a script or meta refresh) is blocked the same way
   and surfaces as a failed page. A subresource from a denied host (an image, a
   script) is dropped silently from any page the browser renders.
