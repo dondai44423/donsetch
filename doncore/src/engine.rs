@@ -49,12 +49,43 @@ pub struct Outcome {
     pub phases: Vec<(String, u128)>,
     pub errors: Vec<String>,
     pub net_log: Vec<rt::NetRecord>,
-    pub cache: Option<String>,
+    pub cache: Option<CacheOutcome>,
+}
+
+/// How the state plane served this document. Typed: consumers map it;
+/// nobody parses the human note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheState {
+    /// Cache disabled for this engine.
+    Off,
+    /// No usable entry; the wire answer stands as fetched.
+    Miss,
+    /// Served from a provably fresh stored entry — no request made.
+    Fresh,
+    /// A stored entry was revalidated (304) and the stored body merged.
+    Revalidated,
+    /// The wire answer was written to the cache ("stored") or the cache
+    /// declined it ("not cacheable").
+    Stored,
+}
+
+/// The cache's own account of a document fetch: the typed state plus the
+/// human detail the CLI prints.
+#[derive(Clone, Debug)]
+pub struct CacheOutcome {
+    pub state: CacheState,
+    pub detail: String,
+}
+
+impl std::fmt::Display for CacheOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
 }
 
 struct DocFetch {
     resp: WireResp,
-    note: Option<String>,
+    cache: Option<CacheOutcome>,
     phase: String,
 }
 
@@ -92,7 +123,10 @@ impl Engine {
                             ms: 0,
                             ..Default::default()
                         },
-                        note: Some(format!("fresh (age {}s)", hit.age)),
+                        cache: Some(CacheOutcome {
+                            state: CacheState::Fresh,
+                            detail: format!("fresh (age {}s)", hit.age),
+                        }),
                         phase: "cache".into(),
                     });
                 }
@@ -118,7 +152,10 @@ impl Engine {
                                     ms: r.ms,
                                     ..Default::default()
                                 },
-                                note: Some(format!("revalidated (304, {}ms)", r.ms)),
+                                cache: Some(CacheOutcome {
+                                    state: CacheState::Revalidated,
+                                    detail: format!("revalidated (304, {}ms)", r.ms),
+                                }),
                                 phase: "wire".into(),
                             });
                         }
@@ -135,23 +172,32 @@ impl Engine {
                         }
                         return Ok(DocFetch {
                             resp: r2,
-                            note: Some("refetched (validator mismatch)".into()),
+                            cache: Some(CacheOutcome {
+                                state: CacheState::Stored,
+                                detail: "refetched (validator mismatch)".into(),
+                            }),
                             phase: "wire".into(),
                         });
                     }
                     if r.status == 200 {
                         c.store(url, &r);
-                        let note = format!("updated ({}ms)", r.ms);
+                        let detail = format!("updated ({}ms)", r.ms);
                         return Ok(DocFetch {
                             resp: r,
-                            note: Some(note),
+                            cache: Some(CacheOutcome {
+                                state: CacheState::Stored,
+                                detail,
+                            }),
                             phase: "wire".into(),
                         });
                     }
                     c.remove(url);
                     return Ok(DocFetch {
                         resp: r,
-                        note: Some("reval-refused".into()),
+                        cache: Some(CacheOutcome {
+                            state: CacheState::Miss,
+                            detail: "reval-refused".into(),
+                        }),
                         phase: "wire".into(),
                     });
                 }
@@ -169,27 +215,33 @@ impl Engine {
         if let Some(c) = &self.cache {
             if r.status == 200 {
                 let stored = c.store(url, &r);
-                let note = if stored {
-                    format!("stored ({} KB)", r.body.len() / 1024)
+                let (state, detail) = if stored {
+                    (
+                        CacheState::Stored,
+                        format!("stored ({} KB)", r.body.len() / 1024),
+                    )
                 } else {
-                    "miss (not cacheable)".to_string()
+                    (CacheState::Miss, "miss (not cacheable)".to_string())
                 };
                 return Ok(DocFetch {
                     resp: r,
-                    note: Some(note),
+                    cache: Some(CacheOutcome { state, detail }),
                     phase: "wire".into(),
                 });
             }
             c.remove(url);
         }
-        let net_note = if self.cache.is_some() {
-            Some("miss".to_string())
+        let net = if self.cache.is_some() {
+            Some(CacheOutcome {
+                state: CacheState::Miss,
+                detail: "miss".to_string(),
+            })
         } else {
             None
         };
         Ok(DocFetch {
             resp: r,
-            note: net_note,
+            cache: net,
             phase: "wire".into(),
         })
     }
@@ -203,7 +255,7 @@ impl Engine {
         let docf = self
             .fetch_doc(url, Vec::new())
             .map_err(|e| format!("wire: {e}"))?;
-        let mut cache_note: Option<String> = docf.note;
+        let mut cache: Option<CacheOutcome> = docf.cache;
         let doc = docf.resp;
         phases.push((docf.phase, doc.ms));
         let mut status = doc.status;
@@ -411,7 +463,7 @@ impl Engine {
                     phases.push((format!("nav{round}:{kind}"), 0));
                     match self.fetch_doc(nav_url, vec![("referer".into(), page_url.clone())]) {
                         Ok(df) => {
-                            cache_note = df.note.clone();
+                            cache = df.cache.clone();
                             let d = df.resp;
                             if (200..400).contains(&d.status) && !challenge_detected(&d.body) {
                                 current_html = d.body;
@@ -486,7 +538,7 @@ impl Engine {
             if challenge && jar_after != jar_before && !current_html.is_empty() {
                 let t2 = Instant::now();
                 if let Ok(df) = self.fetch_doc(url, Vec::new()) {
-                    cache_note = df.note;
+                    cache = df.cache;
                     let b2 = df.resp;
                     phases.push(("bounce".into(), t2.elapsed().as_millis()));
                     if std::env::var("DONCORE_DEBUG").is_ok() {
@@ -587,7 +639,7 @@ impl Engine {
             phases,
             errors,
             net_log,
-            cache: cache_note,
+            cache,
         })
     }
 }

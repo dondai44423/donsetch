@@ -61,6 +61,81 @@ pub struct WireResp {
     pub truncated: bool,
 }
 
+// ── errors: classified at the source ─────────────────────────────────────
+//
+// A failed request returns one string, and its CLASS is a machine-readable
+// prefix (`dns:`, `dns-timeout:`, `timeout:`, `tls:`, `connect:`, `proxy:`,
+// `body:`, `redirect:`, `request:`, `internal:`) derived from wreq's typed
+// predicates — never by matching message text. The product maps the prefix
+// back to its own taxonomy, so a dead name, a blackhole and a refused port
+// stay three different honest answers (measured 2026-10-23: before this they
+// all read `client error (Connect)`).
+
+/// The class of a failed request, derived from wreq's error kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorClass {
+    Dns,
+    DnsTimeout,
+    Timeout,
+    Tls,
+    Connect,
+    Proxy,
+    Body,
+    Redirect,
+    Request,
+    Internal,
+}
+
+impl ErrorClass {
+    /// The prefix the wire puts in front of the diagnostic text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorClass::Dns => "dns",
+            ErrorClass::DnsTimeout => "dns-timeout",
+            ErrorClass::Timeout => "timeout",
+            ErrorClass::Tls => "tls",
+            ErrorClass::Connect => "connect",
+            ErrorClass::Proxy => "proxy",
+            ErrorClass::Body => "body",
+            ErrorClass::Redirect => "redirect",
+            ErrorClass::Request => "request",
+            ErrorClass::Internal => "internal",
+        }
+    }
+
+    /// Classify a wreq failure. Order matters: the most specific predicate
+    /// wins, so a name that fails inside the connect phase still reads `dns`,
+    /// and a DNS timeout is its own class (the product's DnsTimeout).
+    fn of(e: &wreq::Error) -> Self {
+        if e.is_dns() {
+            if e.is_timeout() {
+                ErrorClass::DnsTimeout
+            } else {
+                ErrorClass::Dns
+            }
+        } else if e.is_proxy_connect() {
+            ErrorClass::Proxy
+        } else if e.is_tls() {
+            ErrorClass::Tls
+        } else if e.is_timeout() {
+            ErrorClass::Timeout
+        } else if e.is_redirect() {
+            ErrorClass::Redirect
+        } else if e.is_body() || e.is_decode() {
+            ErrorClass::Body
+        } else if e.is_connect() {
+            ErrorClass::Connect
+        } else {
+            ErrorClass::Request
+        }
+    }
+}
+
+/// One diagnostic line with its class in front: `<class>: <detail>`.
+pub fn wire_err(class: ErrorClass, detail: impl std::fmt::Display) -> String {
+    format!("{}: {detail}", class.as_str())
+}
+
 struct Job {
     req: WireReq,
     reply: std_mpsc::Sender<Result<WireResp, String>>,
@@ -453,13 +528,13 @@ impl ClientCache {
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(25));
         if let Some(p) = proxy {
-            let proxy = wreq::Proxy::all(p).map_err(|e| format!("proxy: {e}"))?;
+            let proxy = wreq::Proxy::all(p).map_err(|e| wire_err(ErrorClass::Proxy, e))?;
             builder = builder.proxy(proxy);
         }
         for (host, addr) in &self.resolve {
             builder = builder.resolve(host.clone(), *addr);
         }
-        let client = Arc::new(builder.build().map_err(|e| format!("client: {e}"))?);
+        let client = Arc::new(builder.build().map_err(|e| wire_err(ErrorClass::Internal, e))?);
         self.map.insert(key, Arc::clone(&client));
         Ok(client)
     }
@@ -536,7 +611,7 @@ impl Wire {
                 match r {
                     Some(rrx) => rrx
                         .recv()
-                        .map_err(|_| "wire worker dropped the job".to_string())?,
+                        .map_err(|_| wire_err(ErrorClass::Internal, "wire worker dropped the job"))?,
                     None => Err("wire worker gone".to_string()),
                 }
             })
@@ -548,8 +623,8 @@ impl Wire {
         let (rtx, rrx) = std_mpsc::channel();
         self.tx
             .send(Job { req, reply: rtx })
-            .map_err(|_| "wire worker gone".to_string())?;
-        rrx.recv().map_err(|_| "wire worker dropped the job".to_string())?
+            .map_err(|_| wire_err(ErrorClass::Internal, "wire worker gone"))?;
+        rrx.recv().map_err(|_| wire_err(ErrorClass::Internal, "wire worker dropped the job"))?
     }
 }
 
@@ -562,7 +637,7 @@ async fn do_request(
     let mut builder = client.request(
         req.method
             .parse()
-            .map_err(|_| format!("bad method {}", req.method))?,
+            .map_err(|_| wire_err(ErrorClass::Request, format!("bad method {}", req.method)))?,
         &req.url,
     );
     match req.kind {
@@ -611,7 +686,7 @@ async fn do_request(
     if let Some(body) = &req.body {
         builder = builder.body(body.clone());
     }
-    let resp = builder.send().await.map_err(|e| format!("transport: {e}"))?;
+    let resp = builder.send().await.map_err(|e| wire_err(ErrorClass::of(&e), e))?;
     let status = resp.status().as_u16();
     let final_url = resp.uri().to_string();
     if std::env::var("DONCORE_DEBUG").is_ok() {
@@ -649,7 +724,7 @@ async fn do_request(
     let mut truncated = false;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("body read: {e}"))?;
+        let chunk = chunk.map_err(|e| wire_err(ErrorClass::Body, e))?;
         if buf.len() + chunk.len() > cap {
             buf.extend_from_slice(&chunk[..cap.saturating_sub(buf.len())]);
             truncated = true;
@@ -902,5 +977,48 @@ mod tests {
             head.contains("GET http://proxied.invalid/x"),
             "the proxy must get an absolute request target: {head}"
         );
+    }
+
+    #[test]
+    fn a_dead_name_reads_as_dns() {
+        let w = wire();
+        let err = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: "https://no-such-host-abcxyz123.invalid/".into(),
+                kind: ReqKind::Document,
+                ..Default::default()
+            })
+            .expect_err("an unresolvable name must fail");
+        assert!(err.starts_with("dns"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_port_reads_as_connect() {
+        let w = wire();
+        let err = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: "http://127.0.0.1:9/".into(),
+                kind: ReqKind::Document,
+                ..Default::default()
+            })
+            .expect_err("nothing listens on the discard port here");
+        assert!(err.starts_with("connect"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_proxy_reads_as_proxy() {
+        let w = wire();
+        let err = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: "http://target.invalid/".into(),
+                kind: ReqKind::Document,
+                proxy: Some("http://127.0.0.1:9".into()),
+                ..Default::default()
+            })
+            .expect_err("the proxy hop is refused");
+        assert!(err.starts_with("proxy"), "{err}");
     }
 }

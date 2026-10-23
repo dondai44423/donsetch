@@ -187,7 +187,10 @@ fn fetch(args: &[String]) {
             println!("── doncore fetch ─────────────────────────────");
             println!("url:      {} (status {})", o.url, o.status);
             println!("label:    {}", o.label);
-            println!("cache:    {}", o.cache.as_deref().unwrap_or("off"));
+            println!(
+                "cache:    {}",
+                o.cache.as_ref().map(|c| c.detail.as_str()).unwrap_or("off")
+            );
             println!(
                 "phases:   {}",
                 o.phases
