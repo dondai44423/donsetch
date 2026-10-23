@@ -90,6 +90,7 @@ impl Engine {
                             headers: hit.headers,
                             body: hit.body,
                             ms: 0,
+                            ..Default::default()
                         },
                         note: Some(format!("fresh (age {}s)", hit.age)),
                         phase: "cache".into(),
@@ -104,6 +105,7 @@ impl Engine {
                         kind: ReqKind::Document,
                         extra_headers: hdrs,
                         body: None,
+                        ..Default::default()
                     })?;
                     if r.status == 304 {
                         if let Some(body) = c.commit(&snap, &r.headers, r.ms) {
@@ -114,6 +116,7 @@ impl Engine {
                                     headers: snap.headers.clone(),
                                     body,
                                     ms: r.ms,
+                                    ..Default::default()
                                 },
                                 note: Some(format!("revalidated (304, {}ms)", r.ms)),
                                 phase: "wire".into(),
@@ -125,6 +128,7 @@ impl Engine {
                             kind: ReqKind::Document,
                             extra_headers: extra,
                             body: None,
+                            ..Default::default()
                         })?;
                         if r2.status == 200 {
                             c.store(url, &r2);
@@ -160,6 +164,7 @@ impl Engine {
             kind: ReqKind::Document,
             extra_headers: extra,
             body: None,
+            ..Default::default()
         })?;
         if let Some(c) = &self.cache {
             if r.status == 200 {

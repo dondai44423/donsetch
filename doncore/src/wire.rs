@@ -7,33 +7,58 @@ use std::time::Instant;
 
 use tokio::sync::mpsc as tokio_mpsc;
 
+use futures_util::StreamExt;
+
 use crate::engine::floor_char_boundary;
 use crate::state::{now_secs, to_unix};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ReqKind {
+    #[default]
     Document,
     Script,
     Xhr,
     Image,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WireReq {
     pub method: String,
     pub url: String,
     pub kind: ReqKind,
     pub extra_headers: Vec<(String, String)>,
     pub body: Option<String>,
+    // ── per-request knobs; runtime requests take the defaults ──────────────
+    /// Wall bound for this request alone (the client's 25s stays the outer
+    /// cap).
+    pub timeout_ms: Option<u64>,
+    /// Response byte cap; reading stops there and `truncated` says so.
+    pub max_bytes: Option<usize>,
+    /// Also return the raw bytes (`raw`): binary consumers — PDF, images,
+    /// archives. The decoded `body` is filled either way.
+    pub bytes: bool,
+    /// Suppress the jar for this request: send no cookies, store none. API
+    /// calls (search lanes, BYOK, updates) do not want session cookies.
+    pub no_cookies: bool,
+    /// Egress override: an http(s) proxy URL used for this request only.
+    pub proxy: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+/// Default response byte cap. A hostile or careless server must never be able
+/// to hand the engine an unbounded body; overridable per request.
+pub const DEFAULT_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default)]
 pub struct WireResp {
     pub status: u16,
     pub final_url: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
     pub ms: u128,
+    /// Raw bytes when the caller asked for them (`WireReq::bytes`).
+    pub raw: Option<Vec<u8>>,
+    /// The body hit `max_bytes` and was cut there.
+    pub truncated: bool,
 }
 
 struct Job {
@@ -395,6 +420,51 @@ pub fn tune_emulation(mut emu: wreq::Emulation) -> wreq::Emulation {
     emu
 }
 
+/// Lazily built wreq clients — one per egress: the direct client plus one per
+/// proxy URL. A proxied client is never shared with the direct lane, and a
+/// proxy URL the builder rejects fails that request only.
+struct ClientCache {
+    emulation: wreq::Emulation,
+    resolve: Vec<(String, std::net::SocketAddr)>,
+    map: std::collections::HashMap<String, Arc<wreq::Client>>,
+}
+
+impl ClientCache {
+    fn new(emulation: wreq::Emulation, resolve: Vec<(String, std::net::SocketAddr)>) -> Self {
+        Self {
+            emulation,
+            resolve,
+            map: std::collections::HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, proxy: Option<&str>) -> Result<Arc<wreq::Client>, String> {
+        let key = proxy.unwrap_or("").to_string();
+        if let Some(c) = self.map.get(&key) {
+            return Ok(Arc::clone(c));
+        }
+        let mut builder = wreq::Client::builder()
+            .emulation(self.emulation.clone())
+            .redirect(wreq::redirect::Policy::limited(10))
+            // Unreachable/blackholed hosts must fail at the structural pace,
+            // not the OS SYN pace: the 25s total stays the outer bound,
+            // connect (TCP+TLS) gets 3s — draw #2 burned 25s in connect on
+            // xbabe/adups/kompoz2; every observed live wire completed in <1.3s.
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(25));
+        if let Some(p) = proxy {
+            let proxy = wreq::Proxy::all(p).map_err(|e| format!("proxy: {e}"))?;
+            builder = builder.proxy(proxy);
+        }
+        for (host, addr) in &self.resolve {
+            builder = builder.resolve(host.clone(), *addr);
+        }
+        let client = Arc::new(builder.build().map_err(|e| format!("client: {e}"))?);
+        self.map.insert(key, Arc::clone(&client));
+        Ok(client)
+    }
+}
+
 impl Wire {
     /// Spawns the worker thread. `emulation` is the tuned wreq emulation.
     pub fn new(
@@ -409,20 +479,7 @@ impl Wire {
                 .enable_all()
                 .build()
                 .expect("tokio worker runtime");
-            let mut builder = wreq::Client::builder()
-                .emulation(emulation)
-                .redirect(wreq::redirect::Policy::limited(10))
-                // Unreachable/blackholed hosts must fail at the structural
-                // pace, not the OS SYN pace: the 25s total stays the outer
-                // bound, connect (TCP+TLS) gets 3s — draw #2 burned 25s in
-                // connect on xbabe/adups/kompoz2; every observed live wire
-                // completed in <1.3s.
-                .connect_timeout(std::time::Duration::from_secs(3))
-                .timeout(std::time::Duration::from_secs(25));
-            for (host, addr) in resolve {
-                builder = builder.resolve(host, addr);
-            }
-            let client = Arc::new(builder.build().expect("wreq client"));
+            let clients = Arc::new(Mutex::new(ClientCache::new(emulation, resolve)));
             rt.block_on(async move {
                 // Browser-faithful job concurrency: a page's scripts fetch in
                 // parallel (≈6 per host is the browser default); the serial
@@ -432,11 +489,22 @@ impl Wire {
                 // exactly as before.
                 let sem = Arc::new(tokio::sync::Semaphore::new(6));
                 while let Some(job) = rx.recv().await {
-                    let client = Arc::clone(&client);
+                    let clients = Arc::clone(&clients);
                     let jar = Arc::clone(&jar_worker);
                     let sem = Arc::clone(&sem);
                     tokio::spawn(async move {
                         let _permit = sem.acquire_owned().await.ok();
+                        let client = match clients
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(job.req.proxy.as_deref())
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = job.reply.send(Err(e));
+                                return;
+                            }
+                        };
                         let resp = do_request(&client, &jar, &job.req).await;
                         let _ = job.reply.send(resp);
                     });
@@ -516,7 +584,12 @@ async fn do_request(
     for (k, v) in &req.extra_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    let cookie = {
+    if let Some(ms) = req.timeout_ms {
+        builder = builder.timeout(std::time::Duration::from_millis(ms));
+    }
+    let cookie = if req.no_cookies {
+        None
+    } else {
         let jar = jar.lock().unwrap_or_else(|p| p.into_inner());
         jar.header_for(&req.url)
     };
@@ -538,10 +611,7 @@ async fn do_request(
     if let Some(body) = &req.body {
         builder = builder.body(body.clone());
     }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| format!("transport: {e}"))?;
+    let resp = builder.send().await.map_err(|e| format!("transport: {e}"))?;
     let status = resp.status().as_u16();
     let final_url = resp.uri().to_string();
     if std::env::var("DONCORE_DEBUG").is_ok() {
@@ -553,21 +623,46 @@ async fn do_request(
     }
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut set_cookies: Vec<String> = Vec::new();
+    let mut charset: Option<String> = None;
     for (name, value) in resp.headers().iter() {
         let v = value.to_str().unwrap_or("").to_string();
         if name.as_str().eq_ignore_ascii_case("set-cookie") {
             set_cookies.push(v.clone());
         }
+        if name.as_str().eq_ignore_ascii_case("content-type") {
+            charset = v
+                .parse::<mime::Mime>()
+                .ok()
+                .and_then(|m| m.get_param("charset").map(|c| c.as_str().to_string()));
+        }
         headers.push((name.as_str().to_string(), v));
     }
-    {
+    if !req.no_cookies {
         let mut jar = jar.lock().unwrap_or_else(|p| p.into_inner());
         jar.store_response_cookies(&final_url, &set_cookies);
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("body read: {e}"))?;
+    // One body path for text and binary: read capped, then decode. The decode
+    // mirrors `text()` exactly (Content-Type charset, default UTF-8); the cap
+    // is the addition, and `truncated` makes it visible.
+    let cap = req.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("body read: {e}"))?;
+        if buf.len() + chunk.len() > cap {
+            buf.extend_from_slice(&chunk[..cap.saturating_sub(buf.len())]);
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let encoding = charset
+        .as_deref()
+        .and_then(|c| encoding_rs::Encoding::for_label(c.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (text, _, _) = encoding.decode(&buf);
+    let body = text.into_owned();
     if std::env::var("DONCORE_DEBUG").is_ok() {
         // Wire forensics (DEBUG only): request bodies and non-2xx response
         // bodies land in scratch/ — enough to read what a rejected
@@ -592,5 +687,220 @@ async fn do_request(
         headers,
         body,
         ms: t0.elapsed().as_millis(),
+        raw: if req.bytes { Some(buf) } else { None },
+        truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    /// One-shot HTTP server on loopback: answers every request with `body`
+    /// (and `ctype`), recording each request's head so a test can assert on
+    /// what the wire actually sent. Returns the base URL and the request log.
+    fn serve(body: &'static [u8], ctype: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let log = Arc::clone(&log2);
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().expect("clone"));
+                    let mut head = String::new();
+                    let mut len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                        let done = line == "\r\n" || line == "\n";
+                        head.push_str(&line);
+                        if done {
+                            break;
+                        }
+                    }
+                    let mut req_body = vec![0u8; len];
+                    if len > 0 {
+                        let _ = r.read_exact(&mut req_body);
+                    }
+                    head.push_str(&String::from_utf8_lossy(&req_body));
+                    log.lock().unwrap_or_else(|p| p.into_inner()).push(head);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    let _ = s.write_all(body);
+                    let _ = s.flush();
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/"), log)
+    }
+
+    fn wire() -> Wire {
+        use wreq::IntoEmulation;
+        let emu = wreq_util::Emulation::builder()
+            .profile(wreq_util::Profile::Chrome149)
+            .platform(wreq_util::Platform::Linux)
+            .build();
+        Wire::new(emu.into_emulation(), Vec::new())
+    }
+
+    fn get(w: &Wire, url: String, opts: RequestOptsFields) -> WireResp {
+        w.fetch(WireReq {
+            method: "GET".into(),
+            url,
+            kind: ReqKind::Document,
+            extra_headers: Vec::new(),
+            body: None,
+            timeout_ms: opts.timeout_ms,
+            max_bytes: opts.max_bytes,
+            bytes: opts.bytes,
+            no_cookies: opts.no_cookies,
+            proxy: None,
+        })
+        .expect("fetch")
+    }
+
+    /// The knobs a test varies; spelled out so the request literal above stays
+    /// a single place to change.
+    #[derive(Default)]
+    struct RequestOptsFields {
+        timeout_ms: Option<u64>,
+        max_bytes: Option<usize>,
+        bytes: bool,
+        no_cookies: bool,
+    }
+
+    #[test]
+    fn a_binary_body_reads_capped_and_flagged() {
+        static BIG: [u8; 4096] = [b'x'; 4096];
+        let (url, _log) = serve(&BIG, "application/octet-stream");
+        let w = wire();
+        let resp = get(
+            &w,
+            url,
+            RequestOptsFields {
+                max_bytes: Some(1024),
+                bytes: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(resp.status, 200);
+        assert!(resp.truncated, "hitting the cap must be flagged");
+        assert_eq!(resp.raw.as_ref().map(|b| b.len()), Some(1024));
+        assert_eq!(resp.body.len(), 1024);
+    }
+
+    #[test]
+    fn a_body_under_the_cap_is_not_flagged() {
+        let (url, _log) = serve(b"hello", "text/plain");
+        let w = wire();
+        let resp = get(
+            &w,
+            url,
+            RequestOptsFields {
+                max_bytes: Some(1024),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resp.body, "hello");
+        assert!(!resp.truncated);
+        assert!(resp.raw.is_none(), "raw only when asked for");
+    }
+
+    #[test]
+    fn a_post_body_is_sent_verbatim() {
+        let (url, log) = serve(b"ok", "text/plain");
+        let w = wire();
+        let resp = w
+            .fetch(WireReq {
+                method: "POST".into(),
+                url,
+                kind: ReqKind::Xhr,
+                extra_headers: vec![("content-type".into(), "application/json".into())],
+                body: Some("{\"a\":1}".into()),
+                ..Default::default()
+            })
+            .expect("fetch");
+        assert_eq!(resp.status, 200);
+        let head = log.lock().unwrap_or_else(|p| p.into_inner()).join("\n");
+        assert!(head.contains("{\"a\":1}"), "request body missing: {head}");
+    }
+
+    #[test]
+    fn no_cookies_suppresses_the_jar() {
+        let (url, log) = serve(b"ok", "text/plain");
+        let w = wire();
+        {
+            let mut jar = w.jar.lock().unwrap_or_else(|p| p.into_inner());
+            jar.set_js_cookie("sid=1", "127.0.0.1");
+        }
+        get(&w, url.clone(), RequestOptsFields::default());
+        get(
+            &w,
+            url,
+            RequestOptsFields {
+                no_cookies: true,
+                ..Default::default()
+            },
+        );
+        let log = log.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(log.len(), 2, "two requests");
+        assert!(
+            log[0].to_ascii_lowercase().contains("cookie: sid=1"),
+            "the jar cookie must go out by default: {}",
+            log[0]
+        );
+        assert!(
+            !log[1].to_ascii_lowercase().contains("cookie:"),
+            "no_cookies must send none: {}",
+            log[1]
+        );
+    }
+
+    #[test]
+    fn a_charset_body_decodes_with_its_encoding() {
+        // windows-1252 "café": 0xE9 is é there, invalid UTF-8 on purpose.
+        static BODY: [u8; 4] = [b'c', b'a', b'f', 0xE9];
+        let (url, _log) = serve(&BODY, "text/html; charset=windows-1252");
+        let w = wire();
+        let resp = get(&w, url, RequestOptsFields::default());
+        assert_eq!(resp.body, "café");
+    }
+
+    #[test]
+    fn a_proxy_carries_the_request_in_absolute_form() {
+        // The server doubles as a plain-HTTP proxy: it must see the absolute
+        // request target, and the host never resolves here — the proxy is the
+        // only way the request can leave the process at all.
+        let (proxy, log) = serve(b"proxied", "text/plain");
+        let w = wire();
+        let resp = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: "http://proxied.invalid/x".into(),
+                kind: ReqKind::Document,
+                proxy: Some(proxy),
+                ..Default::default()
+            })
+            .expect("fetch through the proxy");
+        assert_eq!(resp.body, "proxied");
+        let head = log.lock().unwrap_or_else(|p| p.into_inner()).join("\n");
+        assert!(
+            head.contains("GET http://proxied.invalid/x"),
+            "the proxy must get an absolute request target: {head}"
+        );
+    }
 }

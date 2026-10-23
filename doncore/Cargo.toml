@@ -12,12 +12,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 httpdate = "1"
 sha2 = "0.11"
-wreq = { version = "6.0.0-rc.31", features = ["gzip", "brotli", "zstd", "deflate", "charset", "cookies"] }
+wreq = { version = "6.0.0-rc.31", features = ["gzip", "brotli", "zstd", "deflate", "charset", "cookies", "stream"] }
 wreq-util = "3.0.0-rc.14"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 scraper = { version = "0.24", features = ["deterministic"] }
 ego-tree = "0.10"
 url = "2"
+# App-facing wire surface: capped streaming reads (futures-util) and the
+# same charset decode `text()` uses (encoding_rs + mime).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+encoding_rs = "0.8"
+mime = "0.3"
 
 # Windows-native host facts (memory: GlobalMemoryStatusEx; battery:
 # GetSystemPowerStatus). Target-gated — never compiled on Linux/macOS; the

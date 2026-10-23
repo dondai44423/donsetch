@@ -488,6 +488,7 @@ fn run_document_inner(
                     kind,
                     extra_headers: extra,
                     body: if body.is_empty() { None } else { Some(body) },
+                    ..Default::default()
                 };
                 match wire1.fetch(req) {
                     Ok(r) => {
@@ -735,6 +736,7 @@ fn run_document_inner(
                     kind: ReqKind::Script,
                     extra_headers: vec![("referer".into(), page_url.to_string())],
                     body: None,
+                    ..Default::default()
                 }),
                 _ => None, // inline + module slots (modules fetch in the deferred pass)
             })
@@ -789,6 +791,7 @@ fn run_document_inner(
                         kind: ReqKind::Script,
                         extra_headers: vec![("referer".into(), page_url.to_string())],
                         body: None,
+                        ..Default::default()
                     });
                     match r {
                         Ok(r) if (200..300).contains(&r.status) => {
@@ -861,6 +864,7 @@ fn run_document_inner(
                         kind: ReqKind::Script,
                         extra_headers: vec![("referer".into(), page_url.to_string())],
                         body: None,
+                        ..Default::default()
                     })
                 } else {
                     ext_results
@@ -1149,6 +1153,7 @@ fn run_document_inner(
                     kind: ReqKind::Script,
                     extra_headers: vec![("referer".into(), page_url.to_string())],
                     body: None,
+                    ..Default::default()
                 }) {
                     Ok(r) if (200..300).contains(&r.status) => {
                         if is_mod {
@@ -1836,6 +1841,7 @@ impl rquickjs::loader::Loader for ModLoader {
             kind: ReqKind::Script,
             extra_headers: vec![("referer".into(), self.page_url.clone())],
             body: None,
+            ..Default::default()
         });
         let body = match r {
             Ok(r) if (200..300).contains(&r.status) => r.body,
