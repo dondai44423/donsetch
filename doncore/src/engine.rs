@@ -192,8 +192,11 @@ impl Engine {
                     // Only a 304 to the entry's own URL can validate it:
                     // one reached through a redirect hop answers for the
                     // hop's target, which has no snapshot here (v4
-                    // semantics: conditionals are first-hop only).
-                    if r.status == 304 && r.final_url == url {
+                    // semantics: conditionals are first-hop only). Compare
+                    // canonicalized: the wire normalizes a bare authority
+                    // (`https://host` -> `https://host/`), so a byte compare
+                    // would reject the entry's own revalidation.
+                    if r.status == 304 && same_url(&r.final_url, url) {
                         if let Some((body, headers)) = c.commit(&snap, &r.headers, r.ms) {
                             return Ok(DocFetch {
                                 resp: WireResp {
@@ -1201,4 +1204,19 @@ pub fn crude_text(html: &str) -> String {
         }
     }
     collapsed.trim().to_string()
+}
+
+/// True when two strings name the same URL once canonicalized. The wire
+/// normalizes a bare authority (`https://host` → `https://host/`, host case,
+/// default ports), so a byte compare would misjudge the entry's own
+/// revalidation as a 304 reached through a redirect hop. A 304 that really
+/// arrived through a hop lands on a different URL and stays rejected.
+fn same_url(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }

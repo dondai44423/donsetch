@@ -1083,3 +1083,54 @@ async fn v471_mismatched_304_refetches_once_without_validators() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn stealth_v3_revalidation_recognizes_its_own_url_after_wire_normalization() {
+    use donsetch::fetch::client::CacheState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    crate::sandbox();
+    unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // A bare authority (no trailing slash): the wire canonicalizes the
+    // request to `/`, so the entry's own 304 must still be recognized as
+    // answering for this URL, not for a redirect hop's target.
+    let url = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        for ordinal in 1..=2 {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 16384);
+                head.push(tcp.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("GET / "), "canonical request line: {head}");
+            let response = if ordinal == 1 {
+                assert!(!head.contains("if-modified-since:"));
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nLast-Modified: Wed, 21 Oct 2026 20:09:25 GMT\r\nContent-Length: 9\r\nConnection: close\r\n\r\nbare body"
+            } else {
+                assert!(
+                    head.to_lowercase().contains("if-modified-since:"),
+                    "revalidation must carry the stored validator: {head}"
+                );
+                assert!(head.contains("21 Oct 2026 20:09:25 GMT"), "{head}");
+                "HTTP/1.1 304 Not Modified\r\nLast-Modified: Wed, 21 Oct 2026 20:09:25 GMT\r\nConnection: close\r\n\r\n"
+            };
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let fetcher = Fetcher::new(BrowserProfile::chrome_150(Platform::Linux)).unwrap();
+    assert_eq!(fetcher.fetch(&url).await.unwrap().body, b"bare body");
+    let out = fetcher
+        .fetch(&url)
+        .await
+        .expect("a 304 on the entry's own URL revalidates, never a protocol failure");
+    assert_eq!(out.cache, CacheState::Revalidated);
+    assert_eq!(out.status, 200);
+    assert_eq!(out.body, b"bare body");
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
