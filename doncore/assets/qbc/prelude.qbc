@@ -1,4 +1,4 @@
-Ò9ÉàÕ/__NATIVES
+(W'Õ/__NATIVES
 __DTF__ETStore__ElemC__NodeC__collectPorts__deepCloneNode__dwActive__dwLast__fireError__lastXFrame__mkRange__mkRectList__secrets__clearSrc__wireCall__nowMs__sha256__sleep__cookieGet__cookieSet__cookieAll
 __log__mkNativeC__dumpFile
 IDENTPAGE_URL__TRACE__native__gGet__gSet
@@ -170,7 +170,7 @@ LinuxplatformonchangeonOk
 onErrNotAllowedError"Permission denied Failed to execute 'getUserMedia' on 'Navigator': 3 arguments required, but only  present.
 audio
 videoÄFailed to execute 'getUserMedia' on 'Navigator': At least one of audio and video must be requested¬Failed to execute 'webkitGetUserMedia' on 'Navigator': 3 arguments required, but only ĞFailed to execute 'webkitGetUserMedia' on 'Navigator': At least one of audio and video must be requested®Failed to execute 'sendBeacon' on 'Navigator': 1 argument required, but only 0 present.POSTxhrContent-Type0text/plain;charset=UTF-8BEACON lvlchgbatteryLevelbatteryChargingcharging
-levelchargingTimeInfinitydischargingTimelatitudelongitudeaccuracycoordschromeMajorNot A(BrandChromiumuauserAgentappVersionNetscapeappNameMozillaappCodeName
+levelchargingTimeInfinitydischargingTimelatitudelongitudeaccuracycoordschromeMajorNot:A-BrandChromiumuauserAgentappVersionNetscapeappNameMozillaappCodeName
 GeckoproductproductSubGoogle Inc.vendorvendorSubLinux x86_64localelanguagelanguages
 cores&hardwareConcurrencymemoryGbdeviceMemorymaxTouchPointsdoNotTrackcookieEnabledonLine pdfViewerEnabledpluginsmimeTypes(getHighEntropyValuesuserAgentData
 querypermissionswriteTextreadTextclipboardjavaEnabledgetUserMedia$webkitGetUserMediasendBeacongetBattery.registerProtocolHandler$getCurrentPositionwatchPositionclearWatchgeolocationnm4
@@ -4250,7 +4250,7 @@ KC   Å LE   KE   ÅLF   KF   $ )Ñk   )0®†,F'4,¡function () {
       return __evRaw(s);
     }C
     !”  ˜   ,^(https?:)\/\/([^\/]+)œ   F      õÿÿÿ 	h t t p    s : / / $   . 0 ÿÿğÿÿÿ ×AD  Ä Ä4$ ÓğË»FF  œË¼Fœ(×(®Û. *P ^function (u) { var m = u.match(/^(https?:)\/\/([^\/]+)/); return m ? m[1] + "//" + m[2] : u; }C
-    Úæ  @ è @ê  – Ü= ÖË ˜ ‚ š  99^Mozilla\/b   )      õÿÿÿ 	M o z i l l a /  20030107C
+    Úæ  @ è @ê  – Ü= ÖË ˜ ‚ š  8^Mozilla\/b   )      õÿÿÿ 	M o z i l l a /  20030107C
       Šì   ¶
   C
        è  ×ºFK:   ×¼FK·  ×»FK¸  ¼K3   (®û<*&* Ufunction (p) { return { name: p[0], description: p[2], filename: p[1], length: 2 }; }C
@@ -4337,10 +4337,10 @@ avÁ*24*$ *äfunction (url, data) {
 K  
 K  
 K  ÅôK  ÅôK  ÌK´  	KÑ  ã@Ó  Ò  ­ğÒ  òã@Ó  KÓ  ÅL  K  ÅLš   Kš   K  ÅL  K  K  Å	L  K  Å
-L  K  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL   K   ÅL!  K!  K"  Õ(®à)¹(<%:9 M::: +  '@ &M( Ê^[ß*function () {
+L  K  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL  K  ÅL   K   ÅL!  K!  K"  Õ(®à)¹(<%:9 M::: +  '@ &M( Ê^[Ş*function () {
   var major = IDENT.chromeMajor;
   var brands = [
-    { brand: "Not A(Brand", version: "99" },
+    { brand: "Not:A-Brand", version: "8" },
     { brand: "Chromium", version: major },
   ];
   var nav = {
@@ -24561,7 +24561,7 @@ DDD 48I @  46,G & 2@1 ( 2'4( †YU S S : !$ =46G  € € 4*!;
   ,   ê        01 .  >.WB>&W64,M> !É ¼       t   ¬   B   ¬   N    À     1$5 1   >:/8IYIX?Y??N  ) J    d    ø    è    º    >    l    2    $    ¤    H  (@£g,p<%8Ÿ0p@%<«4pD%@·2pB%>±6pF%B½FpV%RíDpT%Pç8*<uJ%D8pH%DÃ*p:%6™(p8%4“.p>%:¥:pJ%FÉ2pB%> £ £ £   
 £   À        ¨  "  ¤   š  @   
   
-      Ê    ˜  Ô  ‚    –    Œ    ş    ¾ ’İ2function () {
+      Ê    ˜  Ô  ‚    –    Œ    ş    ¾ ‘İ2function () {
 // which the host-side __mkNativeC wrapper reads; the closure keeps a local
 // alias so internal code is unchanged.
 var __NATIVES = (__DCI.natives = []);
@@ -26697,7 +26697,7 @@ window.onload = null; window.onerror = null; window.onunhandledrejection = null;
 window.navigator = (function () {
   var major = IDENT.chromeMajor;
   var brands = [
-    { brand: "Not A(Brand", version: "99" },
+    { brand: "Not:A-Brand", version: "8" },
     { brand: "Chromium", version: major },
   ];
   var nav = {

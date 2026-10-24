@@ -39,10 +39,11 @@ const MAX_REDIRECTS: u8 = 10;
 /// their own; their callers wrap them in timeouts.
 const DOC_BUDGET_MS: u64 = 25_000;
 
-/// The engine's identity persona. `"154"` is the ClientHello-parity class
-/// measured against the installed Chromium; anything else is the stock
-/// preset. The swap keeps the product on the measured class.
-const ENGINE_PERSONA: &str = "154";
+/// The engine's identity persona. `"156"` is the live ClientHello-parity
+/// class (synced 2026-10-24 to the reference Chromium's wire values; the engine
+/// also accepts the legacy `"154"` tag as the same class). Anything else is
+/// the stock preset.
+const ENGINE_PERSONA: &str = "156";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheState {

@@ -728,20 +728,25 @@ pub struct Wire {
     pub jar: Arc<Mutex<Jar>>,
 }
 
-/// Chrome-matching persona constants (154 = the version installed on this
-/// machine; branded "Chromium" exactly as the local build reports).
-pub const UA_154: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
-pub const SEC_CH_UA_154: &str = "\"Not A(Brand\";v=\"99\", \"Chromium\";v=\"154\"";
+/// Chrome-matching persona constants, synced to the LIVE reference browser on
+/// this machine (Chromium 156). Measured same-hour via tls.peet.ws against the
+/// real browser: JA4 and the Akamai H2 fingerprint already match; these are the
+/// header values that differed (UA build, grease brand format, jxl in accept).
+pub const UA_CHROME: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
+pub const SEC_CH_UA_CHROME: &str = "\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\"";
+pub const ACCEPT_DOC: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
 
-/// Brings a wreq-util emulation up to the Chrome 154 wire reality:
+/// Brings a wreq-util emulation up to the live Chrome wire reality:
 /// exact header values, the missing Chrome headers, and Chrome's output
 /// order. TLS/H2 settings stay from the preset (no newer preset exists).
 pub fn tune_emulation(mut emu: wreq::Emulation) -> wreq::Emulation {
     use wreq::header::{HeaderValue, OrigHeaderMap};
     emu.headers
-        .insert("user-agent", HeaderValue::from_static(UA_154));
+        .insert("user-agent", HeaderValue::from_static(UA_CHROME));
     emu.headers
-        .insert("sec-ch-ua", HeaderValue::from_static(SEC_CH_UA_154));
+        .insert("sec-ch-ua", HeaderValue::from_static(SEC_CH_UA_CHROME));
+    emu.headers
+        .insert("accept", HeaderValue::from_static(ACCEPT_DOC));
     emu.headers
         .insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
     emu.headers

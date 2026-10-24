@@ -69,15 +69,15 @@ pub fn host_platform() -> Platform {
 pub fn default_ua() -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
     }
     #[cfg(target_os = "macos")]
     {
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
     }
     #[cfg(target_os = "windows")]
     {
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
     }
 }
 
@@ -98,15 +98,16 @@ pub fn default_platform_version() -> &'static str {
     }
 }
 
-/// The identity-tuned wire. `persona`: `"154"` for the installed-Chromium
-/// parity class, anything else for the stock preset. `resolve` pins
+/// The identity-tuned wire. `persona`: `"156"` (the live parity class, also
+/// accepted as the legacy tag `"154"`) for the installed-Chromium parity
+/// class, anything else for the stock preset. `resolve` pins
 /// host → address (tests, `--resolve`).
 pub fn chrome(persona: &str, resolve: Vec<(String, SocketAddr)>) -> (Wire, Identity) {
     let util_em = UtilEmulation::builder()
         .profile(Profile::Chrome149)
         .platform(host_platform())
         .build();
-    let full = if persona == "154" {
+    let full = if persona == "156" || persona == "154" {
         tune_emulation(util_em.into_emulation())
     } else {
         util_em.into_emulation()
@@ -160,17 +161,17 @@ mod tests {
 
     #[test]
     fn the_persona_picks_the_identity_class() {
-        let (_, ident_154) = chrome("154", Vec::new());
-        assert!(ident_154.ua.contains("Chrome/154"), "{}", ident_154.ua);
+        let (_, ident_156) = chrome("156", Vec::new());
+        assert!(ident_156.ua.contains("Chrome/156"), "{}", ident_156.ua);
         let (_, ident_149) = chrome("149", Vec::new());
         assert!(ident_149.ua.contains("Chrome/149"), "{}", ident_149.ua);
-        assert_ne!(ident_154.ua, ident_149.ua);
+        assert_ne!(ident_156.ua, ident_149.ua);
     }
 
     #[test]
     fn opening_without_stores_still_builds_the_engine() {
         let engine = open(
-            "154",
+            "156",
             Vec::new(),
             Features {
                 cache: false,
@@ -180,7 +181,7 @@ mod tests {
         );
         assert!(engine.cache.is_none());
         assert!(engine.hosts.is_none());
-        assert!(engine.identity_json.contains("Chrome/154"));
+        assert!(engine.identity_json.contains("Chrome/156"));
     }
 
     /// The swap's one state-location contract: the product's cache dir steers

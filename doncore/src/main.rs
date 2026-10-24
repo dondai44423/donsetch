@@ -33,7 +33,7 @@ fn main() {
         _ => {
             println!("doncore v0.1 — single-engine fetch system (dev CLI)");
             println!("  doncore info");
-            println!("  doncore fetch <url> [--js auto|always|never] [--budget ms] [--dump PATH] [--harvest] [--full] [--persona 149|154] [--no-cache] [--no-jar] [--no-hosts]");
+            println!("  doncore fetch <url> [--js auto|always|never] [--budget ms] [--dump PATH] [--harvest] [--full] [--persona 149|156] [--no-cache] [--no-jar] [--no-hosts]");
             println!("  doncore cache stats|prune|clear");
             println!("  doncore jar stats|clear");
             println!("  doncore hosts stats|clear");
@@ -118,7 +118,7 @@ fn fetch(args: &[String]) {
     let mut dump: Option<String> = None;
     let mut harvest = false;
     let mut full = false;
-    let mut persona = "154".to_string();
+    let mut persona = "156".to_string();
     let mut resolves: Vec<String> = Vec::new();
     let mut no_cache = false;
     let mut no_jar = false;

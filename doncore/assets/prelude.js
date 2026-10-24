@@ -2144,7 +2144,7 @@ window.onload = null; window.onerror = null; window.onunhandledrejection = null;
 window.navigator = (function () {
   var major = IDENT.chromeMajor;
   var brands = [
-    { brand: "Not A(Brand", version: "99" },
+    { brand: "Not:A-Brand", version: "8" },
     { brand: "Chromium", version: major },
   ];
   var nav = {

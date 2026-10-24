@@ -922,6 +922,13 @@ pub fn challenge_detected(html: &str) -> bool {
     WALL.iter().any(|m| l.contains(m))
 }
 
+// W2 NOTE (2026-10-24, moonshot): a `scripts/precursor` marker was tried here
+// and REVERTED — measured same-hour: medium.com still walled with it (the CF
+// precursor stage needs a real flow, not a classification flip), while
+// stackoverflow — a proven-clearable row — degraded from `wire+js+clearance`
+// to `wire+js+challenge-form`. The sweep-#5 lesson stands: loose vendor strings
+// never gate a decision alone. The precursor flow is its own unit.
+
 /// Loose markers: vendor strings that appear site-wide on real pages (CF's
 /// challenge-platform beacon, datadome/turnstile embeds). Diagnostic only
 /// (the `[js]` trace) — measured in sweep #5 wasting multi-second JS runs

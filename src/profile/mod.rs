@@ -192,7 +192,7 @@ impl BrowserProfile {
             ("sec-ch-ua-platform".into(), format!("\"{}\"", self.platform.ch_platform())),
             ("upgrade-insecure-requests".into(), "1".into()),
             ("user-agent".into(), self.user_agent.clone()),
-            ("accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".into()),
+            ("accept".into(), "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".into()),
             ("sec-fetch-site".into(), "none".into()),
             ("sec-fetch-mode".into(), "navigate".into()),
             ("sec-fetch-user".into(), "?1".into()),
@@ -270,7 +270,7 @@ impl RequestClass {
     fn accept_and_dest(self) -> (String, String) {
         match self {
             RequestClass::Navigation => (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
                     .to_string(),
                 "document".to_string(),
             ),
