@@ -1,11 +1,10 @@
 //! Dev/internal commands (`donsetch dev ...`) : extraction
-//! debugging, raw fetch probes, TLS fingerprint checks, ghost
-//! browser operations. Not part of the agent surface.
+//! debugging, raw fetch probes, TLS fingerprint checks. Not
+//! part of the agent surface.
 
 use crate::egress::proxy;
 use crate::extract;
 use crate::fetch::client::Fetcher;
-use crate::ghost;
 use crate::profile::BrowserProfile;
 
 pub async fn dispatch(args: &[String]) {
@@ -15,15 +14,13 @@ pub async fn dispatch(args: &[String]) {
         "probe" => probe_cmd(&args[1..]).await,
         "fingerprint" => fingerprint_cmd(&args[1..]).await,
         "resume-test" => resume_test_cmd(&args[1..]).await,
-        "ghost" => ghost_cmd(&args[1..]).await,
         _ => {
-            crate::diag!("dev subcommands: extract | probe | fingerprint | ghost | resume-test");
+            crate::diag!("dev subcommands: extract | probe | fingerprint | resume-test");
             crate::diag!();
             crate::diag!("  extract --input <file>     Extract from a local HTML/PDF file");
             crate::diag!("  probe <url> [proxy] [dump]  Raw fetch with diagnostics");
             crate::diag!("  fingerprint [url]            TLS/HTTP fingerprint check");
             crate::diag!("  resume-test <url>            3x fetch to test connection reuse");
-            crate::diag!("  ghost <solve|render|shot> <url>  Ghost browser ops");
         }
     }
 }
@@ -167,121 +164,6 @@ async fn resume_test_cmd(args: &[String]) {
                 crate::diag!("fetch{i} error: {e}");
                 std::process::exit(1);
             }
-        }
-    }
-}
-
-async fn ghost_cmd(args: &[String]) {
-    let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
-    let profile = BrowserProfile::host_default();
-    match sub {
-        "solve" => {
-            let url = args.get(1).expect("usage: ghost solve <url>");
-            let t0 = std::time::Instant::now();
-            let mut g = ghost::Ghost::launch(&profile, None).await.expect("launch");
-            crate::diag!("launched in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
-            match ghost::ops::solve(&mut g, url, std::time::Duration::from_secs(30))
-                .await
-                .expect("solve")
-            {
-                ghost::ops::SolveOutcome::Solved(r) => {
-                    println!("SOLVED in {:?}", r.took);
-                    println!("clearance: {}", ghost::ops::has_clearance(&r.cookies));
-                    println!("cookies: {}", r.cookies.len());
-                    for c in &r.cookies {
-                        println!("  {} (domain {})", c.name, c.domain);
-                    }
-                }
-                ghost::ops::SolveOutcome::CaptchaWalled => {
-                    println!("CAPTCHA-WALLED (honest dead end)")
-                }
-                ghost::ops::SolveOutcome::TimedOut => println!("TIMED OUT"),
-            }
-            g.kill().await;
-        }
-        "render" => {
-            let url = args
-                .get(1)
-                .expect("usage: ghost render <url> [htmldump] [mddump]");
-            let mut g = ghost::Ghost::launch(&profile, None).await.expect("launch");
-            let html = ghost::ops::render(&mut g, url, std::time::Duration::from_secs(30))
-                .await
-                .expect("render");
-            println!("rendered {} bytes", html.len());
-            if let Some(p) = args.get(2) {
-                std::fs::write(p, &html).expect("write htmldump");
-                crate::diag!("dom -> {p}");
-            }
-            let ex = extract::extract(
-                html.as_bytes(),
-                extract::charset::GHOST_TEXT_CT,
-                url,
-                &extract::ExtractOptions::default(),
-            )
-            .expect("extract");
-            if let Some(p) = args.get(3) {
-                std::fs::write(p, &ex.markdown).expect("write mddump");
-                crate::diag!("markdown -> {p}");
-            }
-            print!("{}", &ex.markdown[..ex.markdown.len().min(2000)]);
-            crate::diag!(
-                "--- thin={} kind={:?} blocks={}",
-                ex.thin,
-                ex.content_kind,
-                ex.blocks_total
-            );
-            g.kill().await;
-        }
-        "shot" => {
-            let url = args.get(1).expect("usage: ghost shot <url> [path]");
-            let path = args.get(2).cloned().unwrap_or_else(|| {
-                crate::paths::screenshots_dir()
-                    .join("ghost.png")
-                    .to_string_lossy()
-                    .into_owned()
-            });
-            let mut g = ghost::Ghost::launch(&profile, None).await.expect("launch");
-            g.navigate(url).await.expect("nav");
-            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-            g.screenshot(&path).await.expect("shot");
-            println!("shot -> {path}");
-            g.kill().await;
-        }
-        "selftest" => {
-            let mut g = ghost::Ghost::launch(&profile, None).await.expect("launch");
-            match ghost::ops::selftest(&mut g).await {
-                Ok(j) => println!("{j}"),
-                Err(e) => crate::diag!("selftest: {e}"),
-            }
-            g.kill().await;
-        }
-        "freeze-check" => {
-            let mut g = ghost::Ghost::launch(&profile, None).await.expect("launch");
-            let h1 = ghost::ops::render(
-                &mut g,
-                "https://example.com",
-                std::time::Duration::from_secs(15),
-            )
-            .await
-            .expect("render1");
-            println!("render1: {}B", h1.len());
-            g.freeze();
-            println!("frozen");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let alive = g.thaw();
-            println!("thawed alive={alive}");
-            let h2 = ghost::ops::render(
-                &mut g,
-                "https://example.com",
-                std::time::Duration::from_secs(15),
-            )
-            .await
-            .expect("render2");
-            println!("render2 after thaw: {}B", h2.len());
-            g.kill().await;
-        }
-        _ => {
-            crate::diag!("ghost subcommands: solve | render | shot | selftest | freeze-check")
         }
     }
 }

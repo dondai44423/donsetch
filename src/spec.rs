@@ -44,8 +44,6 @@ pub enum ParamKind {
     /// JSON boolean; CLI flag whose presence sets `false`
     /// (negating flags like --any-host for same_host).
     SetFalse,
-    /// Ordered browser action objects; CLI takes one JSON array string.
-    ActionList,
 }
 
 /// How the parameter appears on the CLI.
@@ -269,28 +267,6 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         help: "Include image alt text and sources. Default false.",
         mcp_help: Some(
             "Include image alt text and source URLs. Use image_text instead when words inside an image must be read.",
-        ),
-    },
-    ParamSpec {
-        name: "actions",
-        flag: "actions",
-        kind: ParamKind::ActionList,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Browser steps to run BEFORE extraction : page control inside fetch: [{\"do\":\"click\",\"selector\":\"#load-more\"},{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"query\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]. Steps: wait {ms}, wait_selector {selector,timeout_ms}, wait_text {text,timeout_ms}, click {selector OR text}, hover, type {selector?,text}, press {key: Enter|Tab|Escape|Backspace|ArrowDown|...}, scroll {to: top|bottom|down | px}. Max 16 steps. Actions run in a browser; after them the page is extracted normally : focus/section/toc still apply. First failing step aborts honestly with per-step results in structuredContent.actions; fix that step and re-run.",
-        mcp_help: Some(
-            "Any action routes the fetch through a browser; omit for static reads. Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported.",
-        ),
-    },
-    ParamSpec {
-        name: "shot",
-        flag: "shot",
-        kind: ParamKind::Str,
-        cli: CliKind::Flag,
-        required: false,
-        help: "File path : saves a PNG screenshot when blocked by interactive captcha. Only fires on captcha walls; not a general screenshot tool. Relative names resolve under the cache's screenshots dir (default ~/.cache/donsetch/screenshots); absolute paths must already be below it, and an invalid path is refused before any fetch work.",
-        mcp_help: Some(
-            "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool. Relative names resolve under the screenshots root; absolute paths must already be below it. An invalid path is refused before any fetch work.",
         ),
     },
 ];
@@ -562,7 +538,7 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_fetch",
         cli_cmd: "fetch",
         summary: "Fetch a URL as clean markdown (in-process JS, PDF, honest failures)",
-        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay at the local fetch; bot walls fail honestly and fast (a configured unlocker gets one try); a JS-only page runs its scripts in the in-process engine before it is given up on. Use actions only when page interaction is needed; any action routes the fetch through a browser. Deterministic wait_selector/wait_text beats blind sleeps. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, thin (present only when the read is a suspected shell), and error code/next_action. Fetch mode, timing, quality, adapter and escalation diagnostics live in _meta.",
+        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay at the local fetch; bot walls fail honestly and fast (a configured unlocker gets one try); a JS-only page runs its scripts in the in-process engine before it is given up on. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, thin (present only when the read is a suspected shell), and error code/next_action. Fetch mode, timing, quality, adapter and escalation diagnostics live in _meta.",
         mcp_description: "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints locally; pages run their scripts in-process and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
         params: FETCH_PARAMS,
         examples: &[
@@ -570,7 +546,7 @@ pub static TOOLS: &[ToolSpec] = &[
             "donsetch fetch https://long-docs-page --focus \"error handling\"",
             "donsetch fetch https://long-docs-page --offset 16000",
             "donsetch fetch https://a.com/x https://b.com/y   # bulk fetch",
-            "donsetch fetch https://site.com/search --actions '[{\"do\":\"type\",\"selector\":\"input[q]\",\"text\":\"rust async\"},{\"do\":\"press\",\"key\":\"Enter\"},{\"do\":\"wait_text\",\"text\":\"results\"}]'",
+            "donsetch fetch https://example.com/changelog --must-contain \"breaking\"",
         ],
     },
     ToolSpec {
@@ -643,6 +619,15 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
                         .into(),
                 );
             }
+            if name == "actions" && tool.name == "web_fetch" {
+                return Err(
+                    "actions was removed: every web_fetch runs the local engine, with no browser drive"
+                        .into(),
+                );
+            }
+            if name == "shot" && tool.name == "web_fetch" {
+                return Err("shot was removed: use web_screenshot for captures".into());
+            }
             return Err(format!(
                 "unknown parameter {name:?}; use the current tools/list schema"
             ));
@@ -677,9 +662,6 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
             ParamKind::StrList => strings(usize::MAX),
             ParamKind::StrListMax(max) => strings(max),
             ParamKind::SetTrue | ParamKind::SetFalse => value.is_boolean(),
-            ParamKind::ActionList => value
-                .as_array()
-                .is_some_and(|items| items.iter().all(Value::is_object)),
             ParamKind::Enum(_) => unreachable!("enums checked above"),
         };
         if !valid {
@@ -720,7 +702,7 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
                 continue;
             }
             ParamKind::Usize => "integer",
-            ParamKind::StrList | ParamKind::StrListMax(_) | ParamKind::ActionList => "array",
+            ParamKind::StrList | ParamKind::StrListMax(_) => "array",
             ParamKind::SetTrue | ParamKind::SetFalse => "boolean",
         };
         schema.insert("type".into(), json!(ty));
@@ -732,37 +714,6 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
         }
         if let ParamKind::StrListMax(max) = p.kind {
             schema.insert("maxItems".into(), json!(max));
-        }
-        if p.kind == ParamKind::ActionList {
-            schema.insert(
-                "items".into(),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "do": {
-                            "type": "string",
-                            "enum": [
-                                "wait", "wait_selector", "wait_text", "click", "hover",
-                                "type", "press", "scroll"
-                            ]
-                        },
-                        "selector": { "type": "string" },
-                        "text": { "type": "string" },
-                        "key": { "type": "string" },
-                        "to": {
-                            "type": "string",
-                            "enum": ["top", "bottom", "down", "px"]
-                        },
-                        "px": { "type": "integer" },
-                        "ms": { "type": "integer" },
-                        "timeout_ms": { "type": "integer" }
-                    },
-                    "required": ["do"],
-                    "additionalProperties": false
-                }),
-            );
-            schema.insert("minItems".into(), json!(1));
-            schema.insert("maxItems".into(), json!(16));
         }
         schema.insert("description".into(), json!(p.mcp_help.unwrap_or(p.help)));
         props.insert(p.name.into(), Value::Object(schema));
@@ -806,9 +757,7 @@ the output tells you what happened at every step. \
 Use --focus to narrow the content, --must-contain for a cheap \
 probe, or pass a URL from donsetch search to fetch that result. \
 MCP search handles belong to their server session and cannot be reused \
-in a separate CLI invocation. \
---actions sends clicks/typing to a browser for \
-sites that need interaction."
+in a separate CLI invocation."
         }
         "search" => {
             "Search the web across 10+ keyless engines, merged with \
@@ -895,11 +844,6 @@ fn cli_arg(p: &ParamSpec) -> Arg {
                             variants.iter().copied(),
                         ))
                 }
-                ParamKind::ActionList => arg.value_name("JSON").value_parser(|value: &str| {
-                    serde_json::from_str::<Value>(value)
-                        .map(|_| value.to_owned())
-                        .map_err(|e| format!("invalid actions JSON: {e}"))
-                }),
                 ParamKind::StrList => arg
                     .value_name("GLOB")
                     .action(ArgAction::Append)
@@ -942,13 +886,6 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
                         map.insert(p.name.into(), json!(v));
                     }
                 }
-                ParamKind::ActionList => {
-                    if let Some(v) = m.get_one::<String>(p.name) {
-                        let parsed = serde_json::from_str::<Value>(v)
-                            .expect("action JSON was validated by clap");
-                        map.insert(p.name.into(), parsed);
-                    }
-                }
                 ParamKind::Usize => {
                     if let Some(v) = m.get_one::<usize>(p.name) {
                         map.insert(p.name.into(), json!(v));
@@ -982,22 +919,28 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn v471_cli_rejects_malformed_action_json_before_conversion() {
+    fn removed_fetch_params_get_removal_notes_and_leave_the_cli() {
         let tool = super::by_cli_cmd("fetch").unwrap();
-        for invalid in ["[", "undefined", r#"[{"do":}]"#] {
-            let error = super::cli_command(tool)
-                .try_get_matches_from(["fetch", "https://example.com", "--actions", invalid])
-                .expect_err("malformed actions must fail before a fetch can run");
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        let schema = mcp_schema(tool);
+        let props = &schema["inputSchema"]["properties"];
+        for (name, note) in [
+            ("actions", "actions was removed"),
+            ("shot", "shot was removed"),
+        ] {
+            assert!(props.get(name).is_none(), "{name} must leave the schema");
+            let mut args = serde_json::json!({ "url": "https://example.com" });
+            args[name] = serde_json::json!("x");
+            let err = check_args(tool, &args).expect_err("removed param must be refused");
+            assert!(err.contains(note), "{name}: {err}");
+            let flag = format!("--{name}");
+            let cli = super::cli_command(tool)
+                .try_get_matches_from(["fetch", "https://example.com", flag.as_str(), "x"])
+                .expect_err("removed flag must leave the CLI");
+            assert_eq!(cli.kind(), clap::error::ErrorKind::UnknownArgument);
         }
-        let actions = r##"[{"do":"click","selector":"#more"}]"##;
-        let matches = super::cli_command(tool)
-            .try_get_matches_from(["fetch", "https://example.com", "--actions", actions])
-            .unwrap();
-        assert_eq!(
-            super::matches_to_json(tool, &matches)["actions"],
-            serde_json::from_str::<serde_json::Value>(actions).unwrap()
-        );
+        let err = check_args(tool, &serde_json::json!({ "nope": 1 }))
+            .expect_err("unknown param must be refused");
+        assert!(err.contains("unknown parameter"), "{err}");
     }
 
     #[test]
@@ -1167,43 +1110,6 @@ mod tests {
                 assert_eq!(check_args(tool, &args), Ok(()), "{}.{}", tool.name, p.name);
             }
         }
-    }
-
-    #[test]
-    fn action_field_describes_the_runtime_shape() {
-        let schema = mcp_schema(fetch_tool());
-        let actions = &schema["inputSchema"]["properties"]["actions"];
-        let help = actions["description"].as_str().unwrap();
-        assert!(
-            help.starts_with(
-                "Any action routes the fetch through a browser; omit for static reads."
-            )
-        );
-        assert!(
-            !schema["inputSchema"]["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v == "actions")
-        );
-        assert_eq!(actions["type"], "array");
-        assert_eq!(actions["minItems"], 1);
-        assert_eq!(actions["maxItems"], 16);
-        assert_eq!(actions["items"]["required"], json!(["do"]));
-        assert_eq!(actions["items"]["additionalProperties"], false);
-        assert_eq!(
-            actions["items"]["properties"]["do"]["enum"],
-            json!([
-                "wait",
-                "wait_selector",
-                "wait_text",
-                "click",
-                "hover",
-                "type",
-                "press",
-                "scroll"
-            ])
-        );
     }
 
     #[test]

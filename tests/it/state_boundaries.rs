@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 const HOST: &str = "boundary.example";
-const URL: &str = "https://boundary.example/page";
 
 fn copied_state(seed: &Value) -> (GhostState, PathBuf, Vec<u8>) {
     let root = crate::sandbox();
@@ -48,16 +47,6 @@ fn persisted_observation_counters_saturate_without_losing_the_observation() {
                 "warm_samples",
             ],
         ),
-        (
-            "solved",
-            |s| s.record_solved(HOST, &[], Some("owned"), false),
-            &["solve_count", "ghost_samples"],
-        ),
-        (
-            "wall-failed",
-            |s| s.record_wall_failed(HOST),
-            &["wall_fail_streak", "ghost_samples"],
-        ),
     ];
     let mut failures = Vec::new();
     let mut reached = 0;
@@ -81,8 +70,6 @@ fn persisted_observation_counters_saturate_without_losing_the_observation() {
                     }
                     "warm-ok" => assert!(p["last_refreshed"].as_u64().unwrap() > 0),
                     "warm-stale" => assert!(p["observed_lifetime"].as_u64().unwrap() >= 120),
-                    "solved" => assert_eq!(p["wall_vendor"], "owned"),
-                    "wall-failed" => assert!(p["last_wall_fail"].as_u64().unwrap() > 0),
                     _ => unreachable!(),
                 }
             }));
@@ -93,7 +80,7 @@ fn persisted_observation_counters_saturate_without_losing_the_observation() {
             }
         }
     }
-    assert_eq!(reached, 17);
+    assert_eq!(reached, 13);
     assert!(
         failures.is_empty(),
         "persisted counter failures: {failures:?}"
@@ -123,128 +110,6 @@ fn persisted_future_solve_is_not_fresh_or_warm() {
         ));
         assert_eq!(std::fs::read(original).unwrap(), bytes);
     }
-}
-
-#[test]
-fn persisted_future_render_is_not_served() {
-    for future in [now() + 3600, u64::MAX] {
-        let seed = json!({"version": 3, "renders": {URL: {"html": "owned", "at": future}}});
-        let (mut state, original, bytes) = copied_state(&seed);
-        assert!(state.render_for(URL).is_none());
-        state.record_render(URL, "fresh-owned");
-        assert_eq!(
-            GhostState::load().render_for(URL).unwrap().html,
-            "fresh-owned"
-        );
-        assert_eq!(std::fs::read(original).unwrap(), bytes);
-    }
-}
-
-#[test]
-fn persisted_render_context_rejects_other_routes_and_legacy_entries() {
-    let seed = json!({"version": 3, "renders": {URL: {"html": "legacy", "at": now()}}});
-    let (mut state, original, bytes) = copied_state(&seed);
-    assert!(
-        state.render_for(URL).is_none(),
-        "legacy cached DOM cannot establish which login generation produced it"
-    );
-    assert!(state.render_for_context(URL, "owned-route-a").is_none());
-    state.record_render_context(URL, "scoped-owned", "owned-route-a");
-    let state = GhostState::load();
-    assert_eq!(
-        state.render_for_context(URL, "owned-route-a").unwrap().html,
-        "scoped-owned"
-    );
-    assert!(state.render_for_context(URL, "owned-route-b").is_none());
-    assert!(state.render_for(URL).is_none());
-    assert!(donsetch::state::clear_session_cookies_for(HOST));
-    assert!(
-        GhostState::load()
-            .render_for_context(URL, "owned-route-a")
-            .is_none()
-    );
-    assert_eq!(std::fs::read(original).unwrap(), bytes);
-}
-
-#[test]
-fn persisted_scoped_render_rejects_expired_and_future_timestamps() {
-    for at in [now() - 301, now() + 3600, u64::MAX] {
-        let seed = json!({"version": 3, "renders": {URL: {
-            "html": "stale", "at": at, "context": "owned-route-a"
-        }}});
-        let (mut state, original, bytes) = copied_state(&seed);
-        assert!(state.render_for_context(URL, "owned-route-a").is_none());
-        state.record_render_context(URL, "fresh-owned", "owned-route-a");
-        assert_eq!(
-            GhostState::load()
-                .render_for_context(URL, "owned-route-a")
-                .unwrap()
-                .html,
-            "fresh-owned"
-        );
-        assert_eq!(std::fs::read(original).unwrap(), bytes);
-    }
-}
-
-#[test]
-fn persisted_browser_render_retains_its_own_document_receipt() {
-    let (mut state, original, bytes) = copied_state(&json!({"version":3}));
-    for status in [Some(201), None] {
-        let document = donsetch::ghost::document::Document {
-            generation: 7,
-            frame: "owned-main".into(),
-            loader: "owned-loader".into(),
-            url: URL.into(),
-            status,
-        };
-        state.record_render_document(&document, "owned browser content", "owned-route-a");
-        let saved = GhostState::load();
-        let render = saved.render_for_context(URL, "owned-route-a").unwrap();
-        assert_eq!(render.document.as_ref(), Some(&document));
-        assert_eq!(render.html, "owned browser content");
-        assert!(saved.render_for(URL).is_none());
-    }
-    assert_eq!(std::fs::read(original).unwrap(), bytes);
-}
-
-#[test]
-fn persisted_render_replacement_at_capacity_keeps_other_entries() {
-    let mut seed = json!({"version": 3, "renders": {}});
-    for i in 0..20 {
-        seed["renders"][format!("https://boundary.example/{i}")] =
-            json!({"html": "owned", "at": now() - 30 + i, "context": "owned-route-a"});
-    }
-    let (mut state, original, bytes) = copied_state(&seed);
-    state.record_render_context(
-        "https://boundary.example/19",
-        "replacement",
-        "owned-route-b",
-    );
-    let saved = GhostState::load();
-    assert_eq!(
-        saved.renders.len(),
-        20,
-        "updating an existing key must not evict another page"
-    );
-    assert!(saved.renders.contains_key("https://boundary.example/0"));
-    assert_eq!(
-        saved
-            .render_for_context("https://boundary.example/19", "owned-route-b")
-            .unwrap()
-            .html,
-        "replacement"
-    );
-    state.record_render_context("https://boundary.example/new", "new", "owned-route-b");
-    let saved = GhostState::load();
-    assert_eq!(saved.renders.len(), 20);
-    assert!(!saved.renders.contains_key("https://boundary.example/0"));
-    assert!(saved.renders.contains_key("https://boundary.example/1"));
-    assert!(
-        saved
-            .render_for_context("https://boundary.example/new", "owned-route-b")
-            .is_some()
-    );
-    assert_eq!(std::fs::read(original).unwrap(), bytes);
 }
 
 #[test]
@@ -279,7 +144,7 @@ fn persisted_future_wall_failure_does_not_create_an_immortal_cooldown() {
             RouteDecision::Cold
         ));
         assert_eq!(state.route_stats().3, 0);
-        state.record_wall_failed(HOST);
+        state.record_cold_walled(HOST, Some("owned"));
         assert!(matches!(
             GhostState::load().route_for_class(HOST, "direct"),
             RouteDecision::SolveCooldown(_)
@@ -371,7 +236,7 @@ fn persisted_save_reports_io_failure_and_recovers() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "ghost_state_boundaries::persisted_save_reports_io_failure_and_recovers",
+                "state_boundaries::persisted_save_reports_io_failure_and_recovers",
                 "--nocapture",
             ])
             .env(CHILD, fault)
@@ -400,7 +265,7 @@ fn persisted_save_reports_io_failure_and_recovers() {
         let (_, original, bytes) = copied_state(&seed);
         let stderr = run_child(fault);
         assert!(!stderr.contains("OWNED-SECRET-NEVER-LOG"));
-        if !stderr.contains("[ghost] cookie vault persist failed:") {
+        if !stderr.contains("[state] cookie vault persist failed:") {
             unreported.push(fault);
         }
         match fault {

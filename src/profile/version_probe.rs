@@ -178,7 +178,7 @@ struct ProbeTree {
     #[cfg(unix)]
     pid: Option<u32>,
     #[cfg(windows)]
-    job: crate::ghost::proc::KillOnCloseJob,
+    job: crate::browser::proc::KillOnCloseJob,
 }
 
 impl ProbeTree {
@@ -199,7 +199,7 @@ impl ProbeTree {
             // closes the race in which descendants could escape before the
             // process is assigned to the kill-on-close Job Object.
             cmd.creation_flags(Threading::CREATE_SUSPENDED | Threading::CREATE_NO_WINDOW);
-            crate::ghost::proc::KillOnCloseJob::new().map(|job| Self { job })
+            crate::browser::proc::KillOnCloseJob::new().map(|job| Self { job })
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -223,7 +223,7 @@ impl ProbeTree {
             self.job
                 .assign(child.as_raw_handle())
                 .map_err(|error| format!("assign suspended probe to Job Object: {error}"))?;
-            crate::ghost::proc::resume_process(child.as_raw_handle())
+            crate::browser::proc::resume_process(child.as_raw_handle())
                 .map_err(|status| format!("resume probe process: NTSTATUS {status:#x}"))
         }
 

@@ -62,7 +62,7 @@ pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
             }
         }
         FetchError::ProxyConfig(msg) => format!("proxy configuration error: {msg}"),
-        FetchError::Ghost(msg) => format!("browser automation error: {msg}"),
+        FetchError::Browser(msg) => format!("browser automation error: {msg}"),
         // A name failure is not a policy block: the DNS variants carry
         // the honest message, and the code the agent reads comes from
         // the variant, not from this prose (#248).
@@ -603,7 +603,6 @@ pub(super) fn transport_next_action(e: &FetchError, kind: &str) -> String {
 #[derive(Default)]
 pub(super) struct Trace {
     steps: Vec<Value>,
-    pub(super) browser_document: Option<crate::ghost::document::Document>,
 }
 
 tokio::task_local! {
@@ -614,22 +613,6 @@ tokio::task_local! {
 }
 
 impl Trace {
-    pub(super) fn observe_browser(&mut self, document: &crate::ghost::document::Document) {
-        self.browser_document = Some(document.clone());
-        self.step(
-            "browser",
-            "browser-document",
-            &format!(
-                "generation={} status={}",
-                document.generation,
-                document
-                    .status
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "unavailable".into())
-            ),
-            0,
-        );
-    }
     pub(super) fn step(&mut self, stage: &str, action: &str, outcome: &str, ms: u128) {
         let step = json!({
             "stage": stage,
@@ -746,7 +729,7 @@ pub(super) fn transport_class(e: &FetchError) -> &'static str {
         FetchError::DnsTimeout(_) => "dns_timeout",
         FetchError::Ssrf(_) => "ssrf",
         FetchError::InvalidUrl(_) => "invalid_url",
-        FetchError::Ghost(_) => "ghost",
+        FetchError::Browser(_) => "browser",
         FetchError::Http(_) | FetchError::NonHttpRedirect(_) => "protocol",
         FetchError::ProxyConfig(_) => "configuration",
         // Not a transport class: no transport failed, a local rule
@@ -1650,8 +1633,8 @@ mod transport_class_tests {
             "protocol"
         );
         assert_eq!(
-            transport_class(&FetchError::Ghost("no browser".into())),
-            "ghost"
+            transport_class(&FetchError::Browser("no browser".into())),
+            "browser"
         );
     }
 }

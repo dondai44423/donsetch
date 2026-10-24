@@ -326,7 +326,7 @@ fn parse_cdp_response_matches_chrome_shapes() {
             {"name":"b","value":"vb","domain":"x.test","path":"/","expires":1893456000.0,"size":3,"httpOnly":true,"secure":true,"session":false,"sameParty":false,"sourceScheme":"Secure","sourcePort":443,"sameSite":"Strict"}
         ]
     });
-    let cs = donsetch::ghost::Ghost::parse_cdp_cookies(&res);
+    let cs = donsetch::browser::parse_cdp_cookies(&res);
     assert_eq!(cs.len(), 2);
     assert_eq!(cs[0].expires_at, None);
     assert_eq!(cs[0].same_site, "Lax");
@@ -402,13 +402,9 @@ async fn probe_domain_does_not_panic_inside_a_tokio_runtime() {
 /// Tier-1 jar echo hygiene (v4 phase 1.4, issue #173): the logout
 /// sweep owns every persisted copy. Two cookie records and two
 /// rendered pages, one of each matching the domain, one of each for
-/// another host. The rendered-DOM cache is a fourth copy of the
-/// session's fruit (a page fetched behind the session is stored
-/// whole in `renders`, RENDER_TTL = 5 min, and served by the tier-2
-/// fetch shortcut); a logout that leaves it hands back the logged-in
-/// DOM with no network hop for up to five minutes.
+/// another host.
 ///
-/// One test carries both echoes on purpose: the suite shares one
+/// One test carries the echo on purpose: the suite shares one
 /// on-disk state via the static cache dir, so a second concurrent
 /// writer would race the whole-file save under `cargo test`.
 #[test]
@@ -424,11 +420,6 @@ fn logout_wipes_the_tier1_echo() {
             cookie(".alpha.test", "session_cookie", "a", None),
             cookie("beta.test", "other_cookie", "b", None),
         ]);
-        state.record_render(
-            "https://app.alpha.test/dashboard",
-            "<html><body>logged-in dashboard</body></html>",
-        );
-        state.record_render("https://beta.test/page", "<html>public</html>");
         state.save();
     }
     assert!(clear_session_cookies_for("alpha.test"));
@@ -446,16 +437,6 @@ fn logout_wipes_the_tier1_echo() {
     assert!(
         tiers.iter().any(|d| d.ends_with("beta.test")),
         "background housekeeping must keep unrelated domains"
-    );
-    assert!(
-        state
-            .render_for("https://app.alpha.test/dashboard")
-            .is_none(),
-        "the rendered DOM of a logged-out domain must not survive logout"
-    );
-    assert!(
-        state.render_for("https://beta.test/page").is_some(),
-        "logout must not evict renders of unrelated domains"
     );
 }
 
@@ -690,25 +671,4 @@ fn explicit_relogin_blocks_old_browser_harvest_and_accepts_new_rotation() {
     store_session_cookies(&fresh);
     assert_eq!(load_session_cookies(), vec![replacement]);
     assert_eq!(GhostState::load().auth_revision, second.auth_revision);
-}
-
-#[test]
-fn cached_account_document_cannot_survive_or_resurrect_after_relogin() {
-    isolate_state();
-    use donsetch::state::store_login_cookies;
-    let mut c = cookie(".account.test", "xs", "first", None);
-    store_login_cookies(std::slice::from_ref(&c)).unwrap();
-    let mut old = GhostState::load();
-    let url = "https://account.test/private";
-    old.record_render(url, "<p>FIRST ACCOUNT</p>");
-    let stamp = old.renders[url].session_stamp.clone();
-    assert!(old.render_for(url).is_some());
-    c.value = "second".into();
-    store_login_cookies(&[c]).unwrap();
-    assert!(old.render_for(url).is_none());
-    // An already-running render may finish after the login write. It must
-    // carry its original session identity rather than the latest disk epoch.
-    old.record_render_session(url, "<p>OLD IN-FLIGHT ACCOUNT</p>", &stamp);
-    assert!(old.render_for(url).is_none());
-    assert!(GhostState::load().render_for(url).is_none());
 }

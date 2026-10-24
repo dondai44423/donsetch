@@ -215,11 +215,6 @@ impl Persona {
     pub fn coherent(&self, caps: &PersonaCaps) -> bool {
         self.coherence_errors(caps).is_empty()
     }
-
-    /// Ghost wire identity derived from this persona (v4 E2).
-    pub fn ghost_wire(&self) -> crate::ghost::GhostWire {
-        crate::ghost::GhostWire::from_persona(self)
-    }
 }
 
 fn valid_locale(locale: &str) -> bool {
@@ -380,19 +375,6 @@ mod tests {
         assert!(!valid_locale("e"));
         assert!(!valid_locale("en-U"));
         assert!(!valid_locale("en-US-x"));
-    }
-
-    #[test]
-    fn ghost_wire_follows_persona_viewport_and_locale() {
-        let mut p = Persona::mint("example.com", &caps(), 1, 1_700_000_000);
-        p.viewport = (1366, 768);
-        p.locale = "de-DE".into();
-        let w = p.ghost_wire();
-        assert_eq!(w.viewport, (1366, 768));
-        assert_eq!(w.locale, "de-DE");
-        // Corrupt viewport is clamped, never passed to Chrome.
-        p.viewport = (10, 10);
-        assert_eq!(p.ghost_wire().viewport, (800, 600));
     }
 
     #[test]

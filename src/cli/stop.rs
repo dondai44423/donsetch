@@ -1,23 +1,31 @@
-//! `donsetch stop` : kill orphaned Chrome instances and clean up
-//! stale lock files. Use after a crash or when Chrome processes
-//! from a previous session are still resident.
+//! `donsetch stop` : kill orphaned browser instances and clean up
+//! stale lock files and crash-leftover profiles. Use after a crash or
+//! when browser processes from a previous session are still resident.
 
 pub fn run(args: &[String]) {
     crate::cli::args::Spec::new("stop", "donsetch stop", &[]).reject(&args[2..]);
-    let profile = crate::ghost::profile_dir();
 
     #[cfg(unix)]
     {
         // pkill -f matches a POSIX ERE against the full command line.
-        // The profile path must be escaped: a metacharacter in it (`.`
-        // in `~/.cache`, `+`/`(`/`[` in a user name) silently loosens
+        // The paths must be escaped: a metacharacter in one (`.` in
+        // `~/.cache`, `+`/`(`/`[` in a user name) silently loosens
         // the match -- orphans survive -- or over-matches into other
         // processes' command lines.
-        let pattern = format!(
-            "user-data-dir={}",
-            escape_ere(&profile.display().to_string())
+        let auth = escape_ere(
+            &crate::paths::cache_dir()
+                .join("auth-profile")
+                .display()
+                .to_string(),
         );
-        // Kills every Chrome process using the ghost profile,
+        let browse = escape_ere(
+            &std::env::temp_dir()
+                .join("donsetch-browse-")
+                .display()
+                .to_string(),
+        );
+        let pattern = format!("user-data-dir=({auth}|{browse})");
+        // Kills every browser process bound to those profiles,
         // including renderers and GPU processes that share the
         // --user-data-dir argument.
         let out = std::process::Command::new("pkill")
@@ -25,28 +33,32 @@ pub fn run(args: &[String]) {
             .output();
         match out {
             Ok(o) if o.status.success() => {
-                crate::diag!("[ghost] killed orphaned Chrome instances");
+                crate::diag!("[browse] killed orphaned browser instances");
             }
             Ok(_) => {
                 // pkill exit 1 = no processes matched: not an error.
-                crate::diag!("[ghost] no orphaned Chrome instances found");
+                crate::diag!("[browse] no orphaned browser instances found");
             }
             Err(_) => {
-                crate::diag!("[ghost] pkill not available, checking manually");
+                crate::diag!("[browse] pkill not available, checking manually");
             }
         }
     }
 
     // Clean up stale lock files regardless of platform.
+    let auth_profile = crate::paths::cache_dir().join("auth-profile");
     for f in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-        let _ = std::fs::remove_file(profile.join(f));
+        let _ = std::fs::remove_file(auth_profile.join(f));
     }
+    let _ = std::fs::remove_file(crate::paths::cache_dir().join("auth-profile.lock"));
+    // Legacy leftover from the ghost era: never written now, but a
+    // pre-v5 crash may still have left the lock behind.
     let _ = std::fs::remove_file(crate::paths::cache_dir().join("ghost-profile.lock"));
 
     // Sweep temp profiles left behind by a crash.
     sweep_temp_profiles(&std::env::temp_dir());
 
-    crate::diag!("[ghost] cleaned stale locks and temp profiles");
+    crate::diag!("[browse] cleaned stale locks and temp profiles");
 }
 
 /// Escape POSIX extended-regular-expression metacharacters so a
@@ -66,26 +78,30 @@ fn escape_ere(s: &str) -> String {
     out
 }
 
-/// Remove crash-leftover `donsetch-ghost-<pid>` temp profiles whose
-/// owning process is gone.
+/// Remove crash-leftover `donsetch-browse-<pid>-*` (and legacy
+/// `donsetch-ghost-<pid>`) temp profiles whose owning process is gone.
 ///
-/// The suffix is the owning process's pid (see ghost/mod.rs: a second
-/// session that loses the shared-profile flock runs Chrome against a
-/// throwaway `donsetch-ghost-<pid>` profile). That profile is LIVE for
-/// as long as the process runs: deleting it mid-session rips the
-/// user-data-dir out from under a running Chrome. Only profiles whose
-/// pid is gone are debris.
+/// The suffix starts with the owning process's pid (see
+/// browser/mod.rs: every capture gets a throwaway
+/// `donsetch-browse-<pid>-<nonce>-<seq>` profile). That profile is
+/// LIVE for as long as the process runs: deleting it mid-session
+/// rips the user-data-dir out from under a running browser. Only
+/// profiles whose pid is gone are debris.
 fn sweep_temp_profiles(temp_dir: &std::path::Path) {
-    const TEMP_PREFIX: &str = "donsetch-ghost-";
+    const TEMP_PREFIXES: [&str; 2] = ["donsetch-browse-", "donsetch-ghost-"];
     let Ok(entries) = std::fs::read_dir(temp_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(pid_str) = name.strip_prefix(TEMP_PREFIX) else {
+        let Some(rest) = TEMP_PREFIXES
+            .iter()
+            .find_map(|prefix| name.strip_prefix(prefix))
+        else {
             continue;
         };
+        let pid_str = rest.split('-').next().unwrap_or(rest);
         if let Some(pid) = pid_str.parse::<u32>().ok().filter(|p| *p > 0)
             && process_is_alive(pid)
         {
@@ -140,15 +156,13 @@ mod tests {
         dir
     }
 
-    // A concurrent session's fallback profile is named after its
-    // owner's pid and is LIVE. The old sweep deleted every
-    // `donsetch-ghost-*` dir unconditionally, ripping the
-    // user-data-dir out from under a running Chrome. Red proof: the
-    // old code removes this dir too.
+    // A live session's capture profile is named after its owner's
+    // pid and is LIVE. Deleting it mid-session rips the
+    // user-data-dir out from under a running browser.
     #[test]
     fn sweep_keeps_a_live_sessions_temp_profile() {
         let dir = scratch("live");
-        let live = dir.join(format!("donsetch-ghost-{}", std::process::id()));
+        let live = dir.join(format!("donsetch-browse-{}-0-0", std::process::id()));
         std::fs::create_dir_all(&live).unwrap();
         std::fs::write(live.join("Cookies"), "live").unwrap();
 
@@ -172,7 +186,7 @@ mod tests {
             .expect("spawn");
         let dead_pid = child.id();
         child.wait().expect("wait");
-        let dead = dir.join(format!("donsetch-ghost-{dead_pid}"));
+        let dead = dir.join(format!("donsetch-browse-{dead_pid}-0-0"));
         std::fs::create_dir_all(&dead).unwrap();
 
         sweep_temp_profiles(&dir);
@@ -187,9 +201,9 @@ mod tests {
     // profile path.
     #[test]
     fn pkill_pattern_escapes_regex_metacharacters() {
-        let got = escape_ere("/home/u/.cache/donsetch/ghost-profile");
+        let got = escape_ere("/home/u/.cache/donsetch/auth-profile");
         assert_eq!(
-            got, "/home/u/\\.cache/donsetch/ghost-profile",
+            got, "/home/u/\\.cache/donsetch/auth-profile",
             "dots must be literal"
         );
         let got = escape_ere("a+b(c)[d]{e}|f^g$h*i?j\\k");

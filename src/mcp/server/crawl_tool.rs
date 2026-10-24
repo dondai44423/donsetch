@@ -102,8 +102,8 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         return refusal;
     }
 
-    // Ghost-warm: if this host was tier-2 solved recently, the
-    // clearance cookies ride tier 1 from page one.
+    // Warm vault: if this host carries verified clearance cookies,
+    // they ride from page one.
     if let Some(host) = url::Url::parse(&url)
         .ok()
         .and_then(|u| u.host_str().map(String::from))
@@ -112,17 +112,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         if let RouteDecision::Warm(cookies) = route {
             daemon.fetcher.import_cookies(&cookies).await;
         }
-    }
-
-    // Map mode: thin static inventories get one bounded rendered read
-    // of the seed through the same ghost path fetch/screenshot own;
-    // any failure keeps the static map (the renderer returns None).
-    if opts.mode == CrawlMode::Map {
-        let daemon = Arc::clone(daemon);
-        opts.render_html = Some(std::sync::Arc::new(move |url: String| {
-            let daemon = Arc::clone(&daemon);
-            Box::pin(async move { rendered_seed_html(&daemon, &url).await })
-        }));
     }
 
     let requested_mode = opts.mode;
@@ -190,80 +179,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         rendered["structuredContent"]["resolved_seed"] = json!(result.seed);
     }
     rendered
-}
-
-/// One rendered read of the seed for a thin map inventory. Returns
-/// (rendered HTML, final URL); None on any failure, and for a read that
-/// is not the seed's content (`rendered_seed_usable`) : the map keeps its
-/// static inventory and never dies because the browser cannot start.
-async fn rendered_seed_html(daemon: &Arc<Daemon>, url: &str) -> Option<(String, String)> {
-    let target = crate::fetch::guards::validate_url_basic(url).ok()?;
-    if crate::fetch::guards::ensure_url_safe(target.as_str())
-        .await
-        .is_err()
-    {
-        return None;
-    }
-    let host = target.host_str()?.to_string();
-    let wire = {
-        let mut state = daemon.state.lock().await;
-        let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
-        state.ensure_persona(&host, &caps);
-        state.ensure_persona_egress(&host);
-        let mut wire = state
-            .personas
-            .get(&host)
-            .filter(|p| p.quarantine_reason.is_none())
-            .map(|p| p.ghost_wire())
-            .unwrap_or_default();
-        let route = daemon.fetcher.route_for_fetch(target.as_str());
-        wire.route = Some(route);
-        wire
-    };
-    let ghost = daemon
-        .ghost_mgr
-        .acquire_for_wire(&daemon.profile, Some(&host), wire)
-        .await
-        .ok()?;
-    let read = daemon
-        .ghost_mgr
-        .read_document(
-            ghost,
-            &daemon.profile,
-            target.as_str(),
-            std::time::Duration::from_secs(20),
-        )
-        .await
-        .ok()?;
-    // The static harvest reads the buffered seed only when it is
-    // ContentOk and 2xx; the rendered one takes the same gate, or a
-    // dead seed's 404 page (site header and footer links) would come
-    // back as a complete map.
-    if !rendered_seed_usable(read.page.outcome, read.page.document.status) {
-        return None;
-    }
-    let ghost = read.guard;
-    let html = ghost.outer_html().await.ok()?;
-    let final_url = ghost
-        .current_url()
-        .await
-        .unwrap_or_else(|_| url.to_string());
-    Some((html, final_url))
-}
-
-/// True when a rendered seed read counts as the seed's content for the
-/// map harvest: the browser outcome is `Content` or `Incomplete`, and
-/// the document's HTTP status, when known, is 2xx. A 404, a wall, a
-/// login or a paywall page is never harvested.
-fn rendered_seed_usable(outcome: ops::BrowserOutcome, status: Option<u16>) -> bool {
-    // Incomplete is a page whose content oracle did not settle in time,
-    // not a refusal; today's harvest reads it and keeps doing so. The
-    // status check is needed beside the outcome: a 404 page with a full
-    // site header classifies as Content by its visible text alone.
-    matches!(
-        outcome,
-        ops::BrowserOutcome::Content | ops::BrowserOutcome::Incomplete
-    ) && status.is_none_or(|s| (200..300).contains(&s))
 }
 
 /// The refusal for a seed the guard rejects, or None when it passes.
@@ -434,7 +349,7 @@ fn seed_failure_error(failure: &crate::crawl::SeedFailure, escalation: Option<Va
                     "wall.blocked"
                 })),
             format!("the site walled the seed fetch ({status})"),
-            "fetch the seed URL with web_fetch, which can escalate to a browser, or use another source",
+            "fetch the seed URL with web_fetch, or use another source",
         ),
         None => (
             if (400..500).contains(&status) {
@@ -1628,34 +1543,11 @@ mod crawl_output_contract_tests {
         );
     }
 
-    #[test]
-    fn the_rendered_seed_harvest_needs_a_content_like_read() {
-        use crate::ghost::ops::BrowserOutcome as O;
-        assert!(super::rendered_seed_usable(O::Content, Some(200)));
-        assert!(super::rendered_seed_usable(O::Content, None));
-        assert!(super::rendered_seed_usable(O::Incomplete, Some(200)));
-        for refused in [
-            O::NotFound,
-            O::ManagedChallenge,
-            O::HumanRequired,
-            O::AuthRequired,
-            O::Paywall,
-        ] {
-            assert!(
-                !super::rendered_seed_usable(refused, Some(200)),
-                "{refused:?}"
-            );
-        }
-        // A 404 page with a full site header reads as Content.
-        assert!(!super::rendered_seed_usable(O::Content, Some(404)));
-    }
-
     /// A map crawl of one seed answering `seed_status` with a page full of
-    /// links; every other URL is a 404. The renderer applies the rendered
-    /// harvest's gate to a read with the same status.
+    /// links; every other URL is a 404.
     async fn map_crawl_of_seed(seed_status: u16) -> CrawlResult {
         use crate::crawl::governor::{Governor, Lane, LaneKind};
-        use crate::crawl::{CrawlOptions, Crawler, FetchedPage, PageFetcher, RenderFn};
+        use crate::crawl::{CrawlOptions, Crawler, FetchedPage, PageFetcher};
         use crate::detect::walls::Verdict;
         use futures_util::FutureExt;
         use std::sync::Arc;
@@ -1699,15 +1591,6 @@ mod crawl_output_contract_tests {
                 .boxed()
             },
         );
-        let render: RenderFn = Arc::new(move |url: String| {
-            Box::pin(async move {
-                super::rendered_seed_usable(
-                    crate::ghost::ops::BrowserOutcome::Content,
-                    Some(seed_status),
-                )
-                .then(|| (PAGE.to_string(), url))
-            })
-        });
         let crawler = Crawler::new(
             fetch,
             Arc::new(Governor::new(vec![Lane {
@@ -1722,7 +1605,6 @@ mod crawl_output_contract_tests {
                     mode: CrawlMode::Map,
                     respect_robots: false,
                     deadline: Duration::from_secs(30),
-                    render_html: Some(render),
                     ..Default::default()
                 },
                 None,

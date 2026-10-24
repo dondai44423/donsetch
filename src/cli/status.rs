@@ -147,13 +147,9 @@ pub async fn run(args: &[String]) {
 
     // Resolution may probe a browser; keep that blocking operation off the
     // async executor. Status never triggers a public binary download.
-    let browser = tokio::task::spawn_blocking(crate::ghost::resolve_browser_without_download)
+    let browser = tokio::task::spawn_blocking(crate::browser::resolve_browser_without_download)
         .await
-        .unwrap_or_else(|e| {
-            Err(crate::error::FetchError::ghost(format!(
-                "browser resolution task failed: {e}"
-            )))
-        });
+        .unwrap_or_else(|e| Err(format!("browser resolution task failed: {e}")));
     let browser_human = match &browser {
         Ok(info) => info.describe(),
         Err(error) => format!("unavailable: {error}"),
@@ -161,7 +157,6 @@ pub async fn run(args: &[String]) {
     let browser_json = match &browser {
         Ok(info) => json!({
             "available": true,
-            "backend": info.backend.as_str(),
             "source": info.source,
             "path": info.path.display().to_string(),
             "version": info.version,
@@ -232,9 +227,6 @@ pub async fn run(args: &[String]) {
             if state.prewarmed_served_total > 0 {
                 line.push_str(&format!(" · {} prewarmed", state.prewarmed_served_total));
             }
-            if state.pool_served_total > 0 {
-                line.push_str(&format!(" · {} warm", state.pool_served_total));
-            }
             if cooldowns > 0 {
                 line.push_str(&format!(" · {cooldowns} in cooldown"));
             }
@@ -248,7 +240,7 @@ pub async fn run(args: &[String]) {
 
     // v4 B5 Improve receipts: the self-improvement loop must be
     // observable, never magic. Warm-hit + cooldown + trust health.
-    let warm_hits = state.pool_served_total + state.prewarmed_served_total;
+    let warm_hits = state.prewarmed_served_total;
     let low_trust = {
         // Local search-trust snapshot without spinning a Searcher.
         let (t, ti, f) = crate::search::persist_load_for_status();

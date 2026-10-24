@@ -1,62 +1,17 @@
 //! The fetch tool handler: dispatch, URL/handle resolution,
 //! multi-fetch batching, single fetch + wall handling (the optional
-//! unlocker), actions and OCR, page history + link handles, and the
-//! result envelope assembly.
+//! unlocker), OCR, page history + link handles, and the result
+//! envelope assembly.
 
 use serde_json::{Value, json};
 
 use super::*;
 use crate::egress::request_route::RequestRoute;
 
-/// The caller's whole-call budget, carried into the browser helpers so a
-/// single pass can be sized against what is left of it.
-///
-/// The passes used to be fixed at 20s (25s on the actions path) and ignored
-/// `deadline_ms` entirely, while the deadline wrapped the whole call from
-/// outside. With a short deadline the call was therefore cut off MID-pass:
-/// measured, a 12s deadline against a known interstitial
-/// answered `deadline.hit` with no wall verdict at all, even though the first
-/// pass had already seen the wall, and the browser kept working on a pass
-/// nobody was waiting for. A pass is bounded by the remaining budget now,
-/// without a floor that can exceed the clock; the fixed default stands when
-/// the caller asked for no deadline.
-#[derive(Clone, Copy)]
-pub(super) struct Budget {
-    deadline: Option<std::time::Duration>,
-    start: std::time::Instant,
-}
-
-impl Budget {
-    fn of(args: &Value) -> Self {
-        Self {
-            deadline: args
-                .get("deadline_ms")
-                .and_then(Value::as_u64)
-                .map(|ms| std::time::Duration::from_millis(ms.clamp(1, 600_000))),
-            start: std::time::Instant::now(),
-        }
-    }
-
-    /// How long one browser pass may run.
-    fn pass(self, default_secs: u64) -> std::time::Duration {
-        let default = std::time::Duration::from_secs(default_secs);
-        let Some(d) = self.deadline else {
-            return default;
-        };
-        // Reserve at most a tenth of the remaining time for the envelope.
-        // A fixed two seconds would consume short calls before navigation.
-        let remaining = d.saturating_sub(self.start.elapsed());
-        let reserve = (remaining / 10).min(std::time::Duration::from_secs(2));
-        let usable = remaining.saturating_sub(reserve);
-        usable.min(default)
-    }
-}
-
-/// State selected once before adapter or browser work.
+/// State selected once for the whole call.
 struct FetchCall {
     session_stamp: String,
     route: RequestRoute,
-    budget: Budget,
 }
 
 async fn fetch_with_budget(
@@ -90,23 +45,6 @@ async fn fetch_with_budget(
     let trace = witness
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A deadline or cancellation can interrupt an action before its result
-    // arrives. The side effect may still have happened; never advise replay.
-    if is_failure(&result)
-        && trace
-            .iter()
-            .any(|step| step["action"] == "action-execution" && step["outcome"] == "started")
-    {
-        let action = "inspect the result with a plain fetch without actions; earlier actions may have completed, so do not replay them automatically";
-        result["errorKind"] = json!("permanent");
-        result["structuredContent"]["retry_safe"] = json!(false);
-        result["structuredContent"]["next_action"] = json!(action);
-        if let Some(text) = result["content"][0]["text"].as_str() {
-            let message = text.split("\n\nNext action:").next().unwrap_or(text);
-            result["content"][0]["text"] = json!(format!("{message}\n\nNext action: {action}"));
-        }
-    }
-    add_shot_receipt(args, &mut result, &trace);
     drop(trace);
     if args.get("links").and_then(Value::as_bool) == Some(true)
         || args.get("media").and_then(Value::as_bool) == Some(true)
@@ -118,89 +56,6 @@ async fn fetch_with_budget(
         debug["elapsed_ms"] = json!(started.elapsed().as_millis());
     }
     result
-}
-
-fn add_shot_receipt(args: &Value, result: &mut Value, trace: &[Value]) {
-    let Some(path) = args.get("shot").and_then(Value::as_str) else {
-        return;
-    };
-    let outcome = trace
-        .iter()
-        .rev()
-        .find(|step| step["action"] == "screenshot")
-        .and_then(|step| step["outcome"].as_str());
-    let reason: String = match outcome {
-        Some(o) => o.to_string(),
-        None if !is_failure(&*result) => {
-            "skipped: no interactive captcha capture was needed".to_string()
-        }
-        None if result.pointer("/structuredContent/retry_in_secs").is_some() => {
-            "skipped: host is in a learned solve-cooldown; the fetch was refused before any captcha capture"
-                .to_string()
-        }
-        None => match result
-            .pointer("/structuredContent/code")
-            .and_then(Value::as_str)
-        {
-            Some("deadline.hit") => {
-                "skipped: the fetch hit its deadline before an interactive captcha capture"
-                    .to_string()
-            }
-            Some("browser.transport") | Some("browser.timeout") => {
-                "skipped: the browser pass failed before an interactive captcha capture"
-                    .to_string()
-            }
-            _ => "skipped: fetch failed before an interactive captcha capture".to_string(),
-        },
-    };
-    result["structuredContent"]["shot"] = json!({
-        "requested": path,
-        "saved_to": outcome.and_then(|s| s.strip_prefix("saved: ")),
-        "reason": reason,
-    });
-}
-
-async fn record_shot(ghost: &crate::ghost::Ghost, path: &str, trace: &mut Trace) {
-    let outcome = match ghost.screenshot(path).await {
-        Ok(()) => match crate::paths::resolve_screenshot_path(path) {
-            Ok(dest) => format!("saved: {}", dest.display()),
-            Err(e) => format!("failed: {e}"),
-        },
-        Err(e) => format!("failed: {e}"),
-    };
-    trace.step("browser", "screenshot", &outcome, 0);
-}
-
-/// V11: the shot destination is validated when the call is parsed.
-/// `record_shot` only runs when a capture is attempted, after the
-/// fetch has already spent its work: an outside path used to be
-/// refused only then (the audit's case: after a full Cloudflare
-/// solve pass, 42s of browser work). A bad destination is a bad
-/// argument; refuse it before any network or browser work.
-fn shot_path_error(args: &Value) -> Option<Value> {
-    let shot = args.get("shot").and_then(Value::as_str)?;
-    let reason = match crate::paths::resolve_screenshot_path(shot) {
-        Ok(_) => return None,
-        Err(e) => e,
-    };
-    let root = crate::paths::screenshots_dir();
-    Some(tool_error_structured(
-        format!("fetch: shot path rejected: {reason}"),
-        "permanent",
-        Some(json!({
-            "code": "shot.invalid",
-            "shot": {
-                "requested": shot,
-                "saved_to": null,
-                "reason": format!("rejected: {reason}")
-            },
-            "allowed_root": root.display().to_string(),
-            "next_action": format!(
-                "pass a relative filename (it resolves under {}) or an absolute path already below it; drop `shot` if no capture is wanted",
-                root.display()
-            ),
-        })),
-    ))
 }
 
 pub(super) async fn fetch_tool(
@@ -243,17 +98,10 @@ pub(super) async fn fetch_tool(
         .and_then(Value::as_u64)
         .map(|t| (t as usize).clamp(200, 500_000));
 
-    // V11: a bad shot destination is refused here, before any
-    // network or browser work (see shot_path_error).
-    if let Some(error) = shot_path_error(args) {
-        return error;
-    }
-
     if urls.len() == 1 && budget_tokens.is_none() {
         let url = match resolve_fetch_url(daemon, &urls[0]).await {
             Ok(u) => u,
-            Err(mut e) => {
-                add_shot_receipt(args, &mut e, &[]);
+            Err(e) => {
                 return e;
             }
         };
@@ -264,14 +112,13 @@ pub(super) async fn fetch_tool(
     // always run under the deadline + MCP-cancellation wrapper (#164).
     // Previously this branch (reached whenever budget_tokens was set,
     // since the fast path above demands budget_tokens.is_none())
-    // called fetch_single bare: an uncancellable, deadline-free fetch
-    // on a path that can still spawn a ghost render. budget_tokens
-    // also bounds the page now, exactly like the batch path.
+    // called fetch_single bare: an uncancellable, deadline-free
+    // fetch. budget_tokens also bounds the page now, exactly like
+    // the batch path.
     if urls.len() == 1 {
         let resolved = match resolve_fetch_url(daemon, &urls[0]).await {
             Ok(url) => url,
-            Err(mut error) => {
-                add_shot_receipt(args, &mut error, &[]);
+            Err(error) => {
                 return error;
             }
         };
@@ -290,144 +137,6 @@ pub(super) async fn fetch_tool(
         return result;
     }
     fetch_multi(daemon, args, urls, budget_tokens, deadline, ctx).await
-}
-
-#[cfg(test)]
-mod shot_path_tests {
-    use super::shot_path_error;
-    use serde_json::json;
-
-    // V11: parse-time refusal of invalid `shot` destinations.
-    #[test]
-    fn invalid_shot_paths_are_refused_at_parse() {
-        for (shot, want) in [
-            ("/tmp/v11-outside.png", "outside"),
-            ("../evil.png", "traversal"),
-            ("", "empty"),
-            ("a\0b.png", "NUL"),
-        ] {
-            let error = shot_path_error(&json!({"shot": shot}))
-                .unwrap_or_else(|| panic!("{shot:?} must be refused"));
-            let sc = &error["structuredContent"];
-            assert_eq!(sc["code"], "shot.invalid", "{shot:?}");
-            assert_eq!(sc["ok"], false, "{shot:?}");
-            assert_eq!(error["isError"], false, "{shot:?}");
-            assert!(
-                sc["next_action"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("screenshots"),
-                "{shot:?}"
-            );
-            let text = error["content"][0]["text"].as_str().unwrap_or("");
-            assert!(text.contains(want), "{shot:?}: {text}");
-            let shot_field = &sc["shot"];
-            assert_eq!(shot_field["requested"].as_str(), Some(shot), "{shot:?}");
-            assert!(shot_field["saved_to"].is_null(), "{shot:?}");
-            assert!(
-                shot_field["reason"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("rejected"),
-                "{shot:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn valid_shot_paths_pass_the_parse_gate() {
-        assert!(shot_path_error(&json!({})).is_none());
-        assert!(shot_path_error(&json!({"shot": 5})).is_none());
-        assert!(shot_path_error(&json!({"shot": "v11-out.png"})).is_none());
-        let inside = crate::paths::screenshots_dir().join("sub").join("ok.png");
-        assert!(shot_path_error(&json!({"shot": inside.to_str().unwrap()})).is_none());
-    }
-}
-
-#[cfg(test)]
-mod shot_receipt_tests {
-    use super::add_shot_receipt;
-    use serde_json::json;
-
-    fn reason_of(result: &serde_json::Value) -> String {
-        result["structuredContent"]["shot"]["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    // The 4chan report: a learned solve-cooldown refusal and a real
-    // browser failure shared one ambiguous string. Each cause now
-    // names itself.
-    #[test]
-    fn a_learned_solve_cooldown_names_itself() {
-        let mut result = json!({"structuredContent": {"ok": false, "retry_in_secs": 900}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("solve-cooldown"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_deadline_names_itself() {
-        let mut result = json!({"structuredContent": {"ok": false, "code": "deadline.hit"}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("deadline"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_browser_failure_names_itself() {
-        let mut result = json!({"structuredContent": {"ok": false, "code": "browser.transport"}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("browser pass failed"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_success_without_a_capture_says_no_capture_was_needed() {
-        let mut result = json!({"structuredContent": {"ok": true}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("no interactive captcha"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn an_unclassified_failure_keeps_the_generic_reason() {
-        let mut result = json!({"structuredContent": {"ok": false, "code": "content.notfound"}});
-        add_shot_receipt(&json!({"shot": "/tmp/cap.png"}), &mut result, &[]);
-        assert!(
-            reason_of(&result).contains("fetch failed"),
-            "{}",
-            reason_of(&result)
-        );
-    }
-
-    #[test]
-    fn a_recorded_outcome_beats_the_reason_guessing() {
-        let mut result = json!({"structuredContent": {"ok": false}});
-        add_shot_receipt(
-            &json!({"shot": "/tmp/cap.png"}),
-            &mut result,
-            &[json!({"action": "screenshot", "outcome": "saved: /tmp/cap.png"})],
-        );
-        assert!(
-            reason_of(&result).contains("saved"),
-            "{}",
-            reason_of(&result)
-        );
-    }
 }
 
 #[cfg(test)]
@@ -547,8 +256,7 @@ pub(super) async fn fetch_multi(
             async move {
                 let url = match resolve_fetch_url(&d, &requested).await {
                     Ok(url) => url,
-                    Err(mut error) => {
-                        add_shot_receipt(&a, &mut error, &[]);
+                    Err(error) => {
                         return (requested, error);
                     }
                 };
@@ -659,7 +367,7 @@ pub(super) fn render_fetch_batch(
                 if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
                     o["content_ok"] = json!(false);
                 }
-                for field in ["shot", "budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part"] {
+                for field in ["budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part"] {
                     if let Some(value) = state.get(field)
                         && !value.is_null()
                     {
@@ -687,7 +395,7 @@ pub(super) fn render_fetch_batch(
             if is_err(r) {
                 o["content_ok"] = json!(false);
                 o["content_complete"] = json!(false);
-                for field in ["shot", "read_status", "next_action"] {
+                for field in ["read_status", "next_action"] {
                     if let Some(value) = r["structuredContent"].get(field) {
                         o[field] = value.clone();
                     }
@@ -1005,7 +713,6 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     if let Err(error) = fetch_read_options(args) {
         return error;
     }
-    let budget = Budget::of(args);
     // Preserve persona binding before the pool pick, then freeze that route
     // for the entire call. A related adapter host cannot bind another lane.
     let route = {
@@ -1018,7 +725,6 @@ pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) 
     };
     let call = FetchCall {
         route,
-        budget,
         session_stamp: crate::state::disk_session_stamp().unwrap_or_else(|| "legacy:0".into()),
     };
     Box::pin(fetch_single_inner(daemon, args, url, &call)).await
@@ -1072,10 +778,6 @@ fn fetch_url_rewrite(
 ) -> Option<(String, &'static str)> {
     crate::adapters::rewrite(url).filter(|(_, name)| {
         !no_adapter
-            && args
-                .get("actions")
-                .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty)
             && (args.get("section").and_then(Value::as_str).is_none()
                 || *name == "adapter:stackexchange-api")
             && args.get("selector").and_then(Value::as_str).is_none()
@@ -1338,46 +1040,27 @@ async fn fetch_single_inner(
             );
         }
     }
-    let shot = args.get("shot").and_then(Value::as_str);
 
-    // === v2: fetch-actions : browser control INSIDE fetch ===
-    // A non-empty `actions` array routes the whole call to the
-    // ghost with an action executor: navigate → act → extract.
-    // Parsing/validation happens before any browser time is
-    // spent; a typo in step 5 must not burn a launch on step 1.
-    let actions = match args.get("actions") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(v) => match crate::ghost::actions::parse(v) {
-            Ok(a) => a,
-            Err(e) => return tool_error(format!("fetch: {e}")),
-        },
-    };
-    if !actions.is_empty() {
-        if crate::fetch::guards::is_pdf_url_like(&url) {
-            return tool_error(
-                "fetch: actions cannot run on PDFs : fetch the PDF directly instead",
-            );
-        }
-        return fetch_with_actions(
-            daemon, &url, &url_host, &opts, &actions, shot, image_text, call,
-        )
-        .await;
+    // v5: `actions` was removed with the browser tier. The spec layer
+    // answers it first (like `tier`); this guard is the layer under it.
+    if args.get("actions").is_some_and(|v| !v.is_null()) {
+        return tool_error(
+            "fetch: actions was removed: every web_fetch runs the local engine, with no browser drive",
+        );
     }
 
     let host = url_host;
 
     // === PDF early detection ===
-    // PDFs are never rendered (a browser PDF viewer is a JS shell
-    // with no extractable text). If the URL looks like a PDF, always
-    // fetch raw bytes and route to the DonSheet engine.
-    // Uses the SAME helper as the actions guard : covers both the
-    // `.pdf` suffix and the `/pdf/` path convention (arXiv serves
-    // PDFs at /pdf/1706.03762 with no extension).
+    // If the URL looks like a PDF, always fetch raw bytes and route
+    // to the DonSheet engine. The check covers both the `.pdf`
+    // suffix and the `/pdf/` path convention (arXiv serves PDFs at
+    // /pdf/1706.03762 with no extension).
     let is_pdf_url = crate::fetch::guards::is_pdf_url_like(&url);
     // v4.7 V03: JSON data endpoints (`reddit .json`, API dumps) are
-    // terminal at the local fetch : a rendered document cannot
-    // improve a structured payload. Same class PDFs and adapter
-    // endpoints already follow.
+    // terminal at the local fetch : no further pass can improve a
+    // structured payload. Same class PDFs and adapter endpoints
+    // already follow.
     let is_json_url = is_json_url_like(&url);
 
     // === Decision: how to route this fetch? ===
@@ -1425,25 +1108,23 @@ async fn fetch_single_inner(
             _ => None,
         }
     };
-    if shot.is_none() {
-        let age = daemon
-            .state
-            .lock()
-            .await
-            .human_wall_age(&host, &url, &call.route.id());
-        if let Some(age) = age {
-            let mut trace = Trace::default();
-            trace.step("route", "human-wall-cache", "recent observed refusal", 0);
-            return tool_error_structured(
-                "this exact URL recently required human verification",
-                "walled",
-                Some(
-                    json!({"url":url,"code":"wall.captcha","cached":true,"observed_ago_s":age,
+    let age = daemon
+        .state
+        .lock()
+        .await
+        .human_wall_age(&host, &url, &call.route.id());
+    if let Some(age) = age {
+        let mut trace = Trace::default();
+        trace.step("route", "human-wall-cache", "recent observed refusal", 0);
+        return tool_error_structured(
+            "this exact URL recently required human verification",
+            "walled",
+            Some(
+                json!({"url":url,"code":"wall.captcha","cached":true,"observed_ago_s":age,
                     "next_action":"complete this verification in an interactive browser session; a new login or route invalidates this short-lived refusal",
                     "escalation":trace.value()}),
-                ),
-            );
-        }
+            ),
+        );
     }
     let retry_http =
         no_adapter || args.get("_reddit_session").and_then(Value::as_bool) == Some(true);
@@ -1502,15 +1183,15 @@ async fn fetch_single_inner(
         );
     }
 
-    // === Fetch (tier 1, unless skipped) ===
+    // === The local fetch ===
     let mut out: Option<crate::fetch::client::FetchOutcome> = None;
 
     // === v3 F1: search→fetch warm handoff ===
     // Enrichment already fetched the top search results : if
     // this URL is one of them, serve that body, skip the
     // network. One-shot (a second fetch goes to the wire for
-    // freshness); the rest of the pipeline (extraction,
-    // thin→ghost, history) runs unchanged on the cached body.
+    // freshness); the rest of the pipeline (extraction, history)
+    // runs unchanged on the cached body.
     let mut prewarmed = false;
     // Bind the take() result first: a lock guard in the if-let
     // scrutinee would live across the .await below and make the
@@ -1640,7 +1321,7 @@ async fn fetch_single_inner(
         // paywall, or auth wall is an honest terminal answer from
         // the origin; recording it as "walled" used to poison easy
         // domains into permanent skip-to-solve (every later fetch
-        // burned a 20s ghost launch on a 404).
+        // paid for a doomed wall attempt on a 404).
         let o = out.as_ref().unwrap();
         {
             let mut state = daemon.state.lock().await;
@@ -1654,9 +1335,9 @@ async fn fetch_single_inner(
             match o.verdict {
                 // An adapter endpoint's refusal is not evidence about
                 // the PAGE (reddit's protected `.json` is the known
-                // case, #291): recording it as a domain wall routed
-                // the fallback retry, and every later fetch, around
-                // tier 1 entirely. The fallback below re-probes the
+                // case, #291): recording it as a domain wall
+                // mis-routed the fallback retry and every later fetch.
+                // The fallback below re-probes the
                 // caller's URL itself; its own verdict is what
                 // records a wall. v4.7 V03: the same holds for any
                 // JSON data endpoint : a `.json` challenge says
@@ -1668,7 +1349,7 @@ async fn fetch_single_inner(
                         // Warm cookies went stale : learn the real lifetime.
                         state.record_warm_stale(&host);
                     } else {
-                        // Cold (or recheck) was challenged : domain needs tier 2.
+                        // Cold (or recheck) was challenged : the domain is walled.
                         let vendor = match &o.verdict {
                             Verdict::Challenge(v) => Some(format!("{v:?}").to_lowercase()),
                             _ => None,
@@ -1702,10 +1383,10 @@ async fn fetch_single_inner(
         }
     }
 
-    // v4.7 V03: JSON data endpoints are terminal at the HTTP tier.
+    // v4.7 V03: JSON data endpoints are terminal at the local fetch.
     // The `.json` name or a JSON content type means a structured
-    // payload : a browser pass cannot improve it, it must not gate
-    // the verdict, and it must not trigger a decoy comparison.
+    // payload : nothing downstream can improve it, and it must not
+    // gate the verdict.
     let json_like = is_json_url || out.as_ref().is_some_and(is_json_endpoint);
 
     // === Verdict gate ===
@@ -2563,321 +2244,6 @@ fn ct_is_json(headers: &[(String, String)]) -> bool {
 /// `.json` document or the response itself is JSON.
 fn is_json_endpoint(o: &crate::fetch::client::FetchOutcome) -> bool {
     is_json_url_like(&o.url) || ct_is_json(&o.headers)
-}
-
-/// v2: fetch with an action script : navigate, act (click /
-/// type / press / scroll / wait), then run the NORMAL DonSift
-/// extraction over the final DOM. focus/section/toc all work
-/// on the interacted-with page. One call replaces hound's
-/// navigate→act→act→read round-trips.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_with_actions(
-    daemon: &Arc<Daemon>,
-    url: &str,
-    host: &str,
-    opts: &ExtractOptions,
-    actions: &[crate::ghost::actions::Action],
-    shot: Option<&str>,
-    image_text: bool,
-    call: &FetchCall,
-) -> Value {
-    let budget = call.budget;
-    let mut trace = Trace::default();
-    trace.step("route", "actions", "browser-script", 0);
-
-    let t0 = std::time::Instant::now();
-    let mut wire = {
-        let state = daemon.state.lock().await;
-        state
-            .personas
-            .get(host)
-            .filter(|p| p.quarantine_reason.is_none())
-            .map(|p| p.ghost_wire())
-            .unwrap_or_default()
-    };
-    wire.route = Some(call.route.clone());
-    let g = match daemon
-        .ghost_mgr
-        .acquire_for_wire(&daemon.profile, Some(host), wire)
-        .await
-    {
-        Ok(g) => g,
-        Err(e) => {
-            return tool_error_structured(
-                format!("browser launch failed: {e}"),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "status": 0,
-                    "next_action": "run `donsetch doctor` : the browser path is broken on this machine",
-                    "escalation": trace.value(),
-                })),
-            );
-        }
-    };
-    trace.step("browser", "browser-launch", "ok", t0.elapsed().as_millis());
-
-    // Initial render through the standard ghost oracle: navigate,
-    // settle, challenge handling, content checks.
-    let t1 = std::time::Instant::now();
-    let read = match daemon
-        .ghost_mgr
-        .read_document(g, &daemon.profile, url, budget.pass(25))
-        .await
-    {
-        Ok(read) => read,
-        Err(error @ FetchError::Denied { .. }) => {
-            return policy_error_value(&error, url, Some(trace.value()));
-        }
-        Err(error) => {
-            return tool_error_structured(
-                format!("browser navigation error: {error}"),
-                "transient",
-                Some(json!({ "url": url, "status": null, "escalation": trace.value() })),
-            );
-        }
-    };
-    if let Some(recovery) = read.recovery {
-        trace.step(
-            "browser",
-            "browser-read-retry",
-            recovery.reason,
-            recovery.elapsed.as_millis(),
-        );
-    }
-    let mut g = read.guard;
-    let page = read.page;
-    trace.step(
-        "browser",
-        "ghost-render",
-        &format!(
-            "captcha={} dom={}KB",
-            page.outcome.is_wall(),
-            page.html.len() / 1024
-        ),
-        t1.elapsed().as_millis(),
-    );
-    trace.observe_browser(&page.document);
-    if page.outcome.is_wall() {
-        if let Some(p) = shot {
-            record_shot(&g, p, &mut trace).await;
-        }
-        return tool_error_structured(
-            format!("blocked at {url} : interactive captcha before actions could run"),
-            "walled",
-            Some(json!({
-                "url": url,
-                "status": page.document.status,
-                "verdict": "Challenge",
-                "next_action": next_action_for(Some(Verdict::Challenge(Vendor::Generic)), 200, "walled"),
-                "escalation": trace.value(),
-            })),
-        );
-    }
-
-    let initial_gate = match page.document.status {
-        Some(401) => Some(Verdict::AuthWall),
-        Some(402) => Some(Verdict::Paywall),
-        Some(404 | 410) => Some(Verdict::SoftNotFound),
-        _ => crate::detect::walls::content_gate(page.html.as_bytes()),
-    };
-    if let Some(gate) = initial_gate {
-        return tool_error_structured(
-            verdict_error(gate, page.document.status.unwrap_or(0), &page.document.url),
-            verdict_kind(gate, page.document.status.unwrap_or(0)),
-            Some(
-                json!({"url":page.document.url, "status":page.document.status,
-                "verdict":format!("{gate:?}"), "escalation":trace.value()}),
-            ),
-        );
-    }
-
-    // Run the script.
-    let t2 = std::time::Instant::now();
-    trace.step("browser", "action-execution", "started", 0);
-    let outcomes = match crate::ghost::actions::run(&mut g, actions).await {
-        Ok(o) => {
-            trace.step(
-                "browser",
-                "actions",
-                &format!("{} steps ok", o.len()),
-                t2.elapsed().as_millis(),
-            );
-            o
-        }
-        Err((step, reason, partial)) => {
-            for o in &partial {
-                trace.step("browser", &format!("action[{}]", o.step), &o.outcome, o.ms);
-            }
-            if let Some(p) = shot {
-                record_shot(&g, p, &mut trace).await;
-            }
-            let steps_json: Vec<Value> = partial
-                .iter()
-                .map(|o| json!({"step": o.step, "action": o.action, "outcome": o.outcome, "ms": o.ms}))
-                .collect();
-            return tool_error_structured(
-                format!(
-                    "actions[{step}] failed: {reason} : an action may already have completed (see structuredContent.actions)"
-                ),
-                "permanent",
-                Some(json!({
-                    "url": url,
-                    "status": page.document.status,
-                    "actions": steps_json,
-                    "escalation": trace.value(),
-                    "next_action": "inspect the page with a plain fetch (no actions), correct the failing step's selector/text, re-run",
-                })),
-            );
-        }
-    };
-
-    // Post-action DOM + optional screenshot for visual debugging.
-    let before = g.document();
-    let html = match g.outer_html().await {
-        Ok(h) => h,
-        Err(e) => {
-            return tool_error_structured(
-                format!("post-action DOM read failed: {e}"),
-                "transient",
-                Some(json!({
-                    "url": url,
-                    "status": page.document.status,
-                    "escalation": trace.value(),
-                })),
-            );
-        }
-    };
-    let document = g.document();
-    if before.generation != document.generation {
-        return tool_error_structured(
-            "post-action document changed during extraction; add a wait for the destination",
-            "transient",
-            Some(json!({"url": url, "status": null, "escalation": trace.value()})),
-        );
-    }
-    trace.observe_browser(&document);
-    // Actions can navigate; the final URL is part of the DOM's provenance.
-    if let Err(e) = crate::fetch::guards::ensure_url_safe(&document.url).await {
-        if matches!(e, FetchError::Denied { .. }) {
-            return policy_error_value(&e, &document.url, Some(trace.value()));
-        }
-        return tool_error_structured(
-            format!("post-action navigation failed: {e}"),
-            fetch_error_kind(&e),
-            Some(
-                json!({"url": document.url, "code": fetch_error_code(&e), "escalation": trace.value()}),
-            ),
-        );
-    }
-    let gate = match document.status {
-        Some(401) => Verdict::AuthWall,
-        Some(402) => Verdict::Paywall,
-        Some(404 | 410) => Verdict::SoftNotFound,
-        _ => crate::detect::walls::detect_dom_smart(html.as_bytes()),
-    };
-    if gate != Verdict::ContentOk {
-        return tool_error_structured(
-            verdict_error(gate, document.status.unwrap_or(0), &document.url),
-            verdict_kind(gate, document.status.unwrap_or(0)),
-            Some(
-                json!({"url": document.url, "status": document.status, "escalation": trace.value()}),
-            ),
-        );
-    }
-    if let Some(p) = shot {
-        record_shot(&g, p, &mut trace).await;
-    }
-
-    // Cookie write-back : the browser's clearance cookies flow to
-    // the jar and vault for future plain-HTTP fetches of this
-    // domain. record_solved ONLY when a challenge was actually
-    // cleared (page.vendor set) : marking a never-walled domain as
-    // needing a solve would poison its route to skip-to-solve forever
-    // (the v1.1 reddit-poisoning bug class). Replay is unverified
-    // in the actions flow (no HTTP replay happens) : false until
-    // the fetch path proves it.
-    if let Ok(Ok(cookies)) =
-        tokio::time::timeout(std::time::Duration::from_secs(3), g.cookies()).await
-        && !cookies.is_empty()
-    {
-        // A pooled browser can predate a logout for one of its
-        // domains: a dead session must not ride back into the jar
-        // or the vault.
-        let cookies = crate::state::session_cookies_since(&cookies, g.launched_epoch);
-        daemon.fetcher.import_vault_cookies(&cookies).await;
-        crate::state::store_session_cookies(&cookies);
-        if page.vendor.is_some() {
-            daemon
-                .state
-                .lock()
-                .await
-                .record_solved(host, &cookies, page.vendor.as_deref(), false);
-        }
-    }
-
-    // Standard extraction over the final DOM : prose first, then
-    // links-keeping. A shell after actions is still a shell.
-    let mut best: Option<extract::Extracted> = None;
-    if let Ok(e) = extract::extract(
-        html.as_bytes(),
-        extract::charset::GHOST_TEXT_CT,
-        &document.url,
-        opts,
-    ) && !e.thin
-    {
-        best = Some(e);
-    }
-    if best.is_none() {
-        let mut lopts = opts.clone();
-        lopts.include_links = true;
-        if let Ok(e2) = extract::extract(
-            html.as_bytes(),
-            extract::charset::GHOST_TEXT_CT,
-            &document.url,
-            &lopts,
-        ) && !e2.thin
-        {
-            best = Some(e2);
-        }
-    }
-    let Some(ex) = best else {
-        return tool_error_structured(
-            format!(
-                "actions succeeded but the resulting page yielded no extractable content ({}KB DOM) : inspect the resulting page without repeating actions",
-                html.len() / 1024
-            ),
-            "transient",
-            Some(json!({
-                "url": document.url,
-                "status": document.status,
-                "verdict": "Incomplete",
-                "escalation": trace.value(),
-                "next_action": "add {\"do\":\"wait_text\",\"text\":\"<expected>\"} or {\"do\":\"wait\",\"ms\":2000} before extraction",
-            })),
-        );
-    };
-
-    let steps_json: Vec<Value> = outcomes
-        .iter()
-        .map(|o| json!({"step": o.step, "action": o.action, "outcome": o.outcome, "ms": o.ms}))
-        .collect();
-    let mut res = finish_result(
-        &ex,
-        "actions",
-        document.status.unwrap_or(0),
-        "ContentOk",
-        &document.url,
-        &trace,
-        t0.elapsed().as_millis(),
-    );
-    maybe_record_agent_outcome(daemon, host, opts, &ex, "ContentOk");
-    res["structuredContent"]["actions"] = Value::Array(steps_json);
-    apply_link_handles(daemon, &mut res).await;
-    if image_text {
-        apply_image_ocr(daemon, &mut res, &ex.images).await;
-    }
-    res
 }
 
 /// v3 image OCR: fetch + OCR the page's content images (up to 4,
@@ -3945,73 +3311,6 @@ mod budget_tests {
     }
     use super::*;
 
-    fn args_with(ms: Option<u64>) -> Value {
-        match ms {
-            Some(v) => json!({ "deadline_ms": v }),
-            None => json!({}),
-        }
-    }
-
-    #[test]
-    fn no_deadline_keeps_the_fixed_pass() {
-        let b = Budget::of(&args_with(None));
-        assert_eq!(b.pass(20), std::time::Duration::from_secs(20));
-        assert_eq!(b.pass(25), std::time::Duration::from_secs(25));
-    }
-
-    #[test]
-    fn a_short_deadline_shrinks_the_pass_instead_of_being_cut_off() {
-        // 12s of budget: a 20s pass runs past it, so the caller gets a clock
-        // hit instead of the wall verdict that pass had already seen.
-        let b = Budget::of(&args_with(Some(12_000)));
-        let p = b.pass(20);
-        assert!(
-            p < std::time::Duration::from_secs(12),
-            "the pass must fit the budget, got {p:?}"
-        );
-        assert!(
-            p >= std::time::Duration::from_secs(3),
-            "the floor must keep it usable, got {p:?}"
-        );
-    }
-
-    #[test]
-    fn a_deadline_larger_than_the_default_still_caps_at_the_default() {
-        let b = Budget::of(&args_with(Some(600_000)));
-        assert_eq!(b.pass(20), std::time::Duration::from_secs(20));
-        assert_eq!(b.pass(25), std::time::Duration::from_secs(25));
-    }
-
-    #[test]
-    fn stealth_v3_short_budget_still_allocates_a_browser_pass() {
-        for ms in [500, 1000, 2000] {
-            let b = Budget::of(&args_with(Some(ms)));
-            let pass = b.pass(20);
-            assert!(
-                pass >= std::time::Duration::from_millis(ms / 2),
-                "the envelope reserve cannot consume the whole {ms}ms budget: {pass:?}"
-            );
-            assert!(pass < std::time::Duration::from_millis(ms));
-        }
-        let expired = Budget {
-            deadline: Some(std::time::Duration::from_millis(500)),
-            start: std::time::Instant::now() - std::time::Duration::from_millis(501),
-        };
-        assert_eq!(
-            expired.pass(20),
-            std::time::Duration::ZERO,
-            "expired budget cannot gain time"
-        );
-    }
-
-    #[test]
-    fn a_tiny_deadline_never_allocates_time_beyond_the_call() {
-        let b = Budget::of(&args_with(Some(500)));
-        let pass = b.pass(20);
-        assert!(pass > std::time::Duration::ZERO);
-        assert!(pass < std::time::Duration::from_millis(500));
-    }
-
     #[tokio::test]
     async fn wave450_deadline_retains_observed_escalation() {
         let witness = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -4110,7 +3409,7 @@ mod adapter_hop_tests {
                         }));
                     }
                     let mut daemon = Daemon::new().await.unwrap();
-                    daemon.fetcher = Arc::new(Fetcher::new(daemon.profile.clone()).unwrap().with_egress(Arc::clone(&pool)));
+                    daemon.fetcher = Arc::new(Fetcher::new(daemon.fetcher.profile().clone()).unwrap().with_egress(Arc::clone(&pool)));
                     let daemon = Arc::new(daemon);
                     let result = tokio::time::timeout(std::time::Duration::from_secs(8),
                         fetch_single(&daemon, &json!({}), "http://old.reddit.com/r/owned/")
@@ -4132,23 +3431,18 @@ mod adapter_hop_tests {
     }
 
     #[test]
-    fn browser_controls_keep_the_requested_website_url() {
+    fn section_and_selector_keep_the_requested_website_url() {
         let url = url::Url::parse("https://stackoverflow.com/questions/42917566/example").unwrap();
         assert!(
             fetch_url_rewrite(&url, &json!({}), false).is_some(),
             "a plain fetch rewrites to the adapter endpoint"
         );
-        let cases = [
-            json!({"actions":[{"do":"wait","ms":10}]}),
-            json!({"actions":[]}),
-            json!({"section":"Answer 1"}),
-            json!({"selector":"article"}),
-        ];
+        let cases = [json!({"section":"Answer 1"}), json!({"selector":"article"})];
         let rewrites: Vec<bool> = cases
             .iter()
             .map(|args| fetch_url_rewrite(&url, args, false).is_some())
             .collect();
-        assert_eq!(rewrites, vec![false, true, true, false]);
+        assert_eq!(rewrites, vec![true, false]);
         assert!(fetch_url_rewrite(&url, &json!({}), true).is_none());
     }
 
@@ -4558,7 +3852,7 @@ mod rules_tests {
                     }
                     let mut daemon = Daemon::new().await.unwrap();
                     daemon.fetcher = Arc::new(
-                        Fetcher::new(daemon.profile.clone())
+                        Fetcher::new(daemon.fetcher.profile().clone())
                             .unwrap()
                             .with_egress(Arc::clone(&pool)),
                     );

@@ -1,9 +1,9 @@
 //! `web_screenshot` MCP tool (issue #171).
 //!
-//! A rendered PNG of a page, via DonSeTch's browser. No new trust
-//! surface: the URL passes the same guards, the browser is the
-//! same pool, the bytes stay in this process for the caller's
-//! token budget to decide on.
+//! One rendered PNG of a page, captured through the locally installed
+//! browser in a throwaway headless profile. No new trust surface: the
+//! URL passes the same guards, one launch per call, and the bytes stay
+//! in this process for the caller's token budget to decide on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +53,7 @@ fn deadline_arg(args: &Value) -> Duration {
 }
 
 pub async fn web_screenshot_tool(
-    daemon: &Arc<Daemon>,
+    _daemon: &Arc<Daemon>,
     args: &Value,
     mut ctx: Option<super::ToolCtx>,
 ) -> Value {
@@ -82,75 +82,21 @@ pub async fn web_screenshot_tool(
     if host.is_empty() {
         return tool_error("web_screenshot: the url has no host");
     }
-    // The render path honors cancellation and a hard ceiling: the
-    // pool-slot acquire alone can wait on another call's 20-40s
-    // render, and the tool used to observe neither the deadline nor
-    // notifications/cancelled while it did.
+    // The capture observes the caller's budget end to end: launch,
+    // load and shoot all run under the tool's deadline and
+    // notifications/cancelled (the launch is killed on drop).
     let work = async {
         let inner: Result<serde_json::Value, serde_json::Value> = async {
             let target = ensure_url_safe(target.as_str())
                 .await
                 .map_err(|error| fetch_failure(&error, &url_in, ToString::to_string))?;
-            let (wire, route) = {
-                let mut state = daemon.state.lock().await;
-                let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
-                state.ensure_persona(&host, &caps);
-                state.ensure_persona_egress(&host);
-                let mut wire = state
-                    .personas
-                    .get(&host)
-                    .filter(|p| p.quarantine_reason.is_none())
-                    .map(|p| p.ghost_wire())
-                    .unwrap_or_default();
-                let route = daemon.fetcher.route_for_fetch(target.as_str());
-                wire.route = Some(route.clone());
-                (wire, route)
-            };
-            let ghost = {
-                // v4 E2: screenshot must claim the same persona wire
-                // as tier-1 (viewport + locale), or the capture is a
-                // different identity than the page we just fetched.
-                match daemon
-                    .ghost_mgr
-                    .acquire_for_wire(&daemon.profile, Some(&host), wire)
+            let (png, final_url) =
+                crate::browser::capture_page_png(target.as_str(), full_page, wait_ms)
                     .await
-                {
-                    Ok(g) => g,
-                    Err(e) => {
-                        return Err(tool_error(format!("web_screenshot: no browser: {e}")));
-                    }
-                }
-            };
-
-            let read = daemon
-                .ghost_mgr
-                .read_document(
-                    ghost,
-                    &daemon.profile,
-                    target.as_str(),
-                    budget
-                        .saturating_sub(started.elapsed())
-                        .min(Duration::from_secs(20)),
-                )
-                .await
-                .map_err(|error| {
-                    fetch_failure(&error, &url_in, |e| {
-                        format!("web_screenshot: page failed to render: {e}")
-                    })
-                })?;
-            let ghost = read.guard;
-            if wait_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-            }
-            let (png, document) = match ghost.screenshot_document(full_page).await {
-                Ok(b) => b,
-                Err(e) => return Err(tool_error(format!("web_screenshot: capture failed: {e}"))),
-            };
-            validate_url_basic(&document.url)
-                .map_err(|error| fetch_failure(&error, &document.url, ToString::to_string))?;
+                    .map_err(|e| tool_error(format!("web_screenshot: {e}")))?;
             let filename = format!("capture-{}.png", crate::handles::random_base62(16));
             let path = crate::paths::resolve_screenshot_path(&filename).map_err(tool_error)?;
-            crate::ghost::save_screenshot(&path, &png)
+            crate::browser::save_screenshot(&path, &png)
                 .map_err(|e| tool_error(format!("web_screenshot: saving capture failed: {e}")))?;
             let b64 = BASE64_STANDARD.encode(&png);
             Ok(json!({
@@ -163,8 +109,7 @@ pub async fn web_screenshot_tool(
                     {
                         "type": "text",
                         "text": format!(
-                            "Captured {} ({} view, {} PNG bytes)",
-                            document.url,
+                            "Captured {final_url} ({} view, {} PNG bytes)",
                             if full_page { "full-page" } else { "viewport" },
                             png.len()
                         )
@@ -172,7 +117,7 @@ pub async fn web_screenshot_tool(
                 ],
                 "structuredContent": {
                     "ok": true,
-                    "url": document.url,
+                    "url": final_url,
                     "full_page": full_page,
                     "bytes": png.len(),
                     "path": path
@@ -180,9 +125,7 @@ pub async fn web_screenshot_tool(
                 "isError": false,
                 "_meta": {
                     "com.donsetch/screenshot-debug": {
-                        "requested_url": url_in,
-                        "route": route.id(),
-                        "document": document
+                        "requested_url": url_in
                     }
                 }
             }))

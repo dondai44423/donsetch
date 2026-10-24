@@ -7,7 +7,7 @@
 //! - After Enter: cookies for the target domain (or newly appeared
 //!   cookies, in multi-site mode) are harvested, filtered to
 //!   session-worthy ones, and stored in the existing vault, which
-//!   both tier-1 fetches and tier-2 renders already replay.
+//!   every later fetch replays.
 //! - Cookie values live only in the vault; the registry
 //!   (auth-state.json) is masked metadata.
 
@@ -184,8 +184,8 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
         None => (None, None, None),
     };
 
-    // Browser resolution: stock Chromium, never the stealth backend.
-    let resolved = crate::ghost::resolve_browser_without_download()
+    // Browser resolution: the locally installed Chromium.
+    let resolved = crate::browser::resolve_browser_without_download()
         .map_err(|e| format!("no usable browser: {e} (run `donsetch doctor` for guidance)"))?;
     // A login needs a visible browser. Headless machines use --import.
     if !crate::config::cfg().browser.login_force && !display_available() {
@@ -297,7 +297,7 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
         }
     }
 
-    let cdp = crate::ghost::cdp::Cdp::connect(&ws)
+    let cdp = crate::browser::cdp::Cdp::connect(&ws)
         .await
         .map_err(|e| format!("CDP attach: {e}; nothing stored"))?;
     let response = cdp
@@ -311,7 +311,7 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
     {
         return Err("cookie capture returned no cookie inventory; nothing stored".into());
     }
-    let final_res = crate::ghost::Ghost::parse_cdp_cookies(&response);
+    let final_res = crate::browser::parse_cdp_cookies(&response);
 
     // Close the browser cleanly (goodbye, cookies flushed).
     let _ = cdp.call(None, "Browser.close", serde_json::json!({})).await;

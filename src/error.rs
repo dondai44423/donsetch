@@ -8,7 +8,9 @@ pub enum FetchError {
     Http(String),
     /// Invalid local proxy settings, rather than an origin transport failure.
     ProxyConfig(String),
-    Ghost(String),
+    /// A local-browser failure (launch, CDP link, capture): the
+    /// browser module and its callers produce these.
+    Browser(String),
     Timeout,
     TooManyRedirects,
     /// The host could not be resolved at all: NXDOMAIN, no addresses,
@@ -43,8 +45,8 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    pub fn ghost(msg: impl Into<String>) -> Self {
-        Self::Ghost(msg.into())
+    pub fn browser(msg: impl Into<String>) -> Self {
+        Self::Browser(msg.into())
     }
 }
 
@@ -56,7 +58,7 @@ impl fmt::Display for FetchError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Http(e) => write!(f, "http: {e}"),
             Self::ProxyConfig(e) => write!(f, "proxy configuration: {e}"),
-            Self::Ghost(e) => write!(f, "ghost: {e}"),
+            Self::Browser(e) => write!(f, "browser: {e}"),
             Self::Timeout => write!(f, "timeout"),
             Self::TooManyRedirects => write!(f, "too many redirects"),
             // The DNS prose carries no "SSRF guard" tail: that tail is

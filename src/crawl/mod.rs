@@ -436,18 +436,6 @@ pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>;
 pub type UnchangedFn = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// v3: (url, fingerprint, markdown, title) : the delta-crawl memory feed.
 pub type OnPageFn = std::sync::Arc<dyn Fn(&str, Option<&str>, &str, Option<&str>) + Send + Sync>;
-/// Map mode: one rendered read of the seed for thin static inventories
-/// (JS-built navigation never appears in raw HTML). Returns (rendered
-/// html, final url); None = no rendered html, keep the static map.
-pub type RenderFn = std::sync::Arc<
-    dyn Fn(
-            String,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send>>
-        + Send
-        + Sync,
->;
-
 #[derive(Clone)]
 pub struct CrawlOptions {
     pub focus: Option<String>,
@@ -502,11 +490,6 @@ pub struct CrawlOptions {
     pub shape_seed: Option<u64>,
     /// Map hard cap.
     pub map_cap: usize,
-    /// Map mode: called with the seed URL when the static inventory is
-    /// thin (JS-built navigation never appears in raw HTML). Returns
-    /// (rendered html, final url) or None; failures keep the static
-    /// map. At most one call per map.
-    pub render_html: Option<RenderFn>,
     /// Minimum content quality (0.0-1.0). Pages below this
     /// are skipped (still counted against page budget).
     pub min_quality: f32,
@@ -535,7 +518,6 @@ impl Default for CrawlOptions {
             delta_unchanged: None,
             on_page: None,
             map_cap: 120,
-            render_html: None,
             min_quality: 0.05,
         }
     }
@@ -1141,42 +1123,6 @@ impl Crawler {
                         if let Some(u) = frontier::resolve(&base, &href) {
                             candidates.push(u);
                         }
-                    }
-                }
-            }
-            const MAP_RENDER_FLOOR: usize = 32;
-            // Phase 1 reads robots.txt even with respect_robots off, so
-            // the seed's verdict counts only when robots are respected.
-            let seed_robots_ok = !opts.respect_robots || robots.allows_url(&seed_url);
-            if map.len() + candidates.len() < MAP_RENDER_FLOOR
-                && seed_robots_ok
-                && let Some(render) = opts.render_html.as_ref()
-                && deadline_at.saturating_duration_since(Instant::now()) > Duration::from_secs(15)
-            {
-                match tokio::time::timeout_at(deadline_at.into(), render(seed.clone()))
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    Some((html, final_url)) => {
-                        let parsed = Url::parse(&final_url).unwrap_or_else(|_| seed_url.clone());
-                        let base = extract_base_href(&html)
-                            .and_then(|bh| parsed.join(&bh).ok())
-                            .filter(|b| matches!(b.scheme(), "http" | "https"))
-                            .unwrap_or(parsed);
-                        let before = candidates.len();
-                        for (href, _anchor) in self_harvest_static(&html, &base) {
-                            if let Some(u) = frontier::resolve(&base, &href) {
-                                candidates.push(u);
-                            }
-                        }
-                        crate::diag!(
-                            "[crawl] thin static map; rendered harvest added {} candidate link(s)",
-                            candidates.len() - before
-                        );
-                    }
-                    None => {
-                        crate::diag!("[crawl] thin static map; rendered harvest unavailable");
                     }
                 }
             }

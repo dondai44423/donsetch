@@ -6,8 +6,8 @@
 //! need manual intervention.
 //!
 //! The browser path must be BORING to install (50-case report):
-//! doctor proves Chromium presence, Xvfb, a REAL browser launch
-//! with fingerprint selftest, and model availability. A feature that
+//! doctor proves Chromium presence, a REAL browser launch with a
+//! CDP round-trip, and model availability. A feature that
 //! only works when the user guesses a hidden
 //! prerequisite is not finished, and doctor is where that
 //! prerequisite surfaces.
@@ -57,9 +57,8 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 "Binary integrity",
                 "Installation",
                 "Chrome/Chromium",
-                "Xvfb",
                 "Browser launch",
-                "Ghost profile",
+                "Auth profile",
                 "ONNX Runtime",
                 "PDFium",
                 "OCR models",
@@ -89,7 +88,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 "Cache directory",
                 "Auth sessions",
                 "State permissions",
-                "Ghost state",
+                "State store",
                 "Config posture",
                 "Local rules",
                 "Clearance stores",
@@ -350,11 +349,8 @@ pub async fn run(args: &[String]) {
     // 4. Chrome/Chromium.
     report!("Chrome/Chromium", check_chrome().await);
 
-    // 5. Xvfb (Linux headful stealth prerequisite).
-    report!("Xvfb", check_xvfb());
-
-    // 6. Ghost profile.
-    report!("Ghost profile", check_ghost_profile());
+    // 5. Auth profile.
+    report!("Auth profile", check_auth_profile());
 
     // Browser availability means a real launch and selftest, including in
     // default mode. Deep adds network/provider probes.
@@ -391,7 +387,7 @@ pub async fn run(args: &[String]) {
     report!("ONNX Runtime", check_onnx());
 
     // 14. Ghost state.
-    report!("Ghost state", check_ghost_state());
+    report!("State store", check_state_store());
 
     // 15. Bright Data account keys (SERP + unlocker): the paid
     // layer gets more than a y/n. Default mode validates locally
@@ -747,7 +743,7 @@ fn print_improve_loop() {
     let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
     let (t, ti, f) = crate::search::persist_load_for_status();
     let low = t.values().filter(|&&x| x < 0.5).count() + ti.values().filter(|&&x| x < 0.5).count();
-    let warm_hits = state.pool_served_total + state.prewarmed_served_total;
+    let warm_hits = state.prewarmed_served_total;
     let (q_hosts, q_high, q_low) = crate::search::persist_load_quality_for_status();
     let (o_keys, o_demoted) = crate::search::persist_load_outcome_for_status();
     cli::print_kv("receipts", "");
@@ -929,7 +925,7 @@ async fn check_tls(fetcher: &Fetcher) -> CheckResult {
 }
 
 async fn check_chrome() -> CheckResult {
-    let result = tokio::task::spawn_blocking(crate::ghost::resolve_browser).await;
+    let result = tokio::task::spawn_blocking(crate::browser::resolve_browser).await;
     match result {
         Ok(Ok(browser)) => {
             // Full dotted build, not just the major: probing the
@@ -942,17 +938,15 @@ async fn check_chrome() -> CheckResult {
                     .or_else(|| browser.version.clone())
                     .unwrap_or_else(|| "unknown version".into());
             CheckResult::Pass(format!(
-                "{} at {} ({}; {})",
+                "{} at {} ({})",
                 version,
                 browser.path.display(),
-                browser.backend.as_str(),
                 browser.source
             ))
         }
         Ok(Err(error)) => CheckResult::Fail(
             error.to_string(),
-            "Install Chromium, set DONGHOST_CHROME, or set CLOAKBROWSER_BINARY_PATH. ".to_string()
-                + "Set DONSETCH_CLOAK_AUTO_DOWNLOAD=1 to fetch the signed CloakBrowser binary.",
+            "Install Chromium or set DONGHOST_CHROME.".into(),
         ),
         Err(error) => CheckResult::Fail(
             format!("browser resolution task failed: {error}"),
@@ -961,144 +955,69 @@ async fn check_chrome() -> CheckResult {
     }
 }
 
-/// Xvfb: the Linux headful-stealth prerequisite. Missing Xvfb
-/// does NOT disable the browser : ghost falls back to off-screen
-/// headful on the real display (a window may flash briefly) or
-/// headless on Wayland-only sessions (more detectable). Warn,
-/// not fail : but the user deserves to know.
-fn check_xvfb() -> CheckResult {
-    #[cfg(linux_like)]
-    {
-        // A forced headless backend deliberately does not need Xvfb.
-        if crate::ghost::cloak::headless_mode_requested() {
-            return CheckResult::Pass("not needed (headless backend)".into());
-        }
-        // Termux (Android) has no X11 by default. Xvfb is not
-        // needed : Ghost uses --headless=new mode.
-        if std::env::var_os("PREFIX")
-            .map(|p| p.to_string_lossy().contains("com.termux"))
-            .unwrap_or(false)
-        {
-            return CheckResult::Pass("not needed (Termux : headless mode)".into());
-        }
-        if crate::ghost::xvfb::is_available() {
-            // :99 socket alive = daemon's Xvfb will be reused.
-            let reuse = std::path::Path::new("/tmp/.X11-unix/X99").exists();
-            CheckResult::Pass(if reuse {
-                "available, display :99 alive (reused)".into()
-            } else {
-                "available (starts on demand)".into()
-            })
-        } else {
-            CheckResult::Warn(
-                "not installed : the browser falls back to headless/off-screen (less stealthy)"
-                    .into(),
-            )
-        }
-    }
-    #[cfg(not(linux_like))]
-    {
-        CheckResult::Pass("not needed on this platform".into())
-    }
-}
-/// The REAL browser test: launch Chromium exactly as the ghost
-/// would (same flags, same Xvfb dance), run the fingerprint
-/// selftest page, kill. Bounded to 40s. This is what turns
-/// the 50-case report's "a feature that works only when the
-/// user guesses the hidden prerequisite is not finished".
+/// The REAL browser test: launch the resolved Chromium headless
+/// exactly as login and web_screenshot would, probe it over CDP,
+/// close. Bounded to 40s. This is what turns the 50-case report's
+/// "a feature that works only when the user guesses the hidden
+/// prerequisite is not finished".
 async fn check_browser_launch() -> CheckResult {
-    let manager = crate::ghost::manager::GhostManager::new().await;
+    let resolved = match crate::browser::resolve_browser() {
+        Ok(r) => r,
+        Err(e) => {
+            return CheckResult::Fail(
+                format!("launch failed: {e}"),
+                "Browser-backed features (screenshot, login) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
+            );
+        }
+    };
     let inner = async {
-        let profile = BrowserProfile::host_default();
         let t0 = std::time::Instant::now();
-        let mut ghost = match manager.acquire(&profile).await {
-            Ok(g) => g,
+        let session = match crate::browser::launch_headless(&resolved.path).await {
+            Ok(s) => s,
             Err(e) => {
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
-                    "Browser-backed features (screenshot, actions, login) will not work. Install Chromium/Xvfb, set DONGHOST_CHROME, or configure CloakBrowser with CLOAKBROWSER_BINARY_PATH.".into(),
+                    "Browser-backed features (screenshot, login) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
                 );
             }
         };
         let launch_ms = t0.elapsed().as_millis();
-
-        let fp = crate::ghost::ops::selftest(&mut ghost).await;
-        drop(ghost);
-        match fp {
-            Ok(json_str) => {
-                let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
-                // Real-Chrome parity: webdriver must be false VIA THE
-                // NATIVE ACCESSOR with no own property on the
-                // navigator instance (an injected own property is a
-                // tell). undefined was pre-Chrome-89 behavior.
-                let webdriver = v.get("webdriver").and_then(|w| w.as_bool());
-                let no_own_prop =
-                    v.get("webdriverOwnProp").and_then(|w| w.as_bool()) == Some(false);
-                // WebGL null is a headless-only signature: it fires
-                // when the host cannot provide any GL (common on
-                // GPU-less Linux + a Chromium build without a
-                // working software rasterizer). Windows/macOS and
-                // GPU Linux report a real renderer and clear this.
-                // Warn, do not fail: the browser still works, and
-                // the SwiftShader launch flags enable it whenever
-                // the host can.
-                let gl_ok = v
-                    .get("webglRenderer")
-                    .and_then(|w| w.as_str())
-                    .is_some_and(|r| !r.is_empty() && r != "?" && r != "err" && r != "undefined");
-                let deep_clean = webdriver == Some(false)
-                    && no_own_prop
-                    && v.get("hasChrome").and_then(|x| x.as_bool()) == Some(true)
-                    && v.get("plugins")
-                        .and_then(|x| x.as_u64())
-                        .is_some_and(|n| n > 0)
-                    && v.get("ua")
-                        .and_then(|x| x.as_str())
-                        .is_some_and(|ua| !ua.contains("HeadlessChrome"));
-                let gl_note = if gl_ok {
-                    format!(
-                        "webgl={}",
-                        v.get("webglRenderer")
-                            .and_then(|w| w.as_str())
-                            .unwrap_or("ok")
-                    )
-                } else {
-                    "webgl=null (host provides no GL; software renderer unavailable in this Chromium build)"
-                        .to_string()
-                };
-                if deep_clean && gl_ok {
-                    CheckResult::Pass(format!(
-                        "launched in {launch_ms}ms, deep fingerprint clean (webdriver=false native, no own prop, {gl_note})"
-                    ))
-                } else if deep_clean {
-                    CheckResult::Warn(format!(
-                        "launched in {launch_ms}ms, fingerprint clean EXCEPT {gl_note}"
-                    ))
-                } else {
-                    CheckResult::Warn(format!(
-                        "launched in {launch_ms}ms, deep fingerprint incomplete: webdriver={webdriver:?} ownProp={:?}, gl={:?}, chrome={:?}, plugins={:?}",
-                        v.get("webdriverOwnProp"),
-                        v.get("webglRenderer"),
-                        v.get("hasChrome"),
-                        v.get("plugins")
-                    ))
-                }
+        // One CDP round-trip on the page target: the session must
+        // answer a trivial evaluate.
+        let probe = session
+            .cdp()
+            .call(
+                None,
+                "Runtime.evaluate",
+                serde_json::json!({"expression": "1+1", "returnByValue": true}),
+            )
+            .await;
+        session.close().await;
+        match probe {
+            Ok(v)
+                if v.pointer("/result/value")
+                    .and_then(|v| v.as_f64())
+                    == Some(2.0) =>
+            {
+                CheckResult::Pass(format!("launched in {launch_ms}ms, CDP responded"))
             }
-            Err(e) => CheckResult::Warn(format!(
-                "launched in {launch_ms}ms, deep fingerprint selftest failed: {e}"
+            Ok(_) => CheckResult::Warn(format!(
+                "launched in {launch_ms}ms, CDP evaluate returned an unexpected shape"
             )),
+            Err(e) => CheckResult::Fail(
+                format!("launched in {launch_ms}ms, CDP probe failed: {e}"),
+                "The browser started but its DevTools endpoint did not answer. Check for a conflicting remote-debugging port or a broken browser build.".into(),
+            ),
         }
     };
     // Hard bound: a wedged browser here must not hang doctor.
-    let result = match tokio::time::timeout(std::time::Duration::from_secs(40), inner).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(40), inner).await {
         Ok(r) => r,
         Err(_) => CheckResult::Fail(
             "launch timed out after 40s".into(),
-            "Run doctor --fix and inspect the browser/display checks. Close only a confirmed stale DonGhost process; preserve other browser sessions and live display sockets.".into(),
+            "Run doctor --fix and inspect the browser check. Close only a confirmed stale DonSeTch browser process; preserve other browser sessions and live display sockets.".into(),
         ),
-    };
-    manager.shutdown().await;
-    result
+    }
 }
 
 /// Sets every regular file under `root` that others can read to
@@ -1293,16 +1212,11 @@ fn check_rerank_model() -> CheckResult {
     }
 }
 
-fn check_ghost_profile() -> CheckResult {
-    let dir = crate::ghost::profile_dir();
-
+fn check_auth_profile() -> CheckResult {
+    let dir = crate::paths::cache_dir().join("auth-profile");
     if !dir.exists() {
-        return match std::fs::create_dir_all(&dir) {
-            Ok(()) => CheckResult::Fixed("created profile directory".into()),
-            Err(e) => CheckResult::Fail("not found".into(), format!("Cannot create: {e}")),
-        };
+        return CheckResult::Pass("not created yet (`donsetch login` creates it)".into());
     }
-
     match probe_writable(&dir) {
         Ok(()) => CheckResult::Pass("writable; profile locks preserved".into()),
         Err(e) => CheckResult::Fail("not writable".into(), format!("Check permissions: {e}")),
@@ -1376,10 +1290,10 @@ fn check_cache_dir() -> CheckResult {
             let total = dir_size(&dir);
 
             // Breakdown by component : helps users understand what's
-            // using space. The ghost-profile (Chrome's own cache) is
-            // typically the largest; ghost-state.json (self-improvement)
-            // should be < 1MB after cookie filtering.
-            let ghost_profile = dir.join("ghost-profile");
+            // using space. The auth-profile (Chrome's login cache) can
+            // grow; ghost-state.json (self-improvement) should be
+            // < 1MB after cookie filtering.
+            let auth_profile = dir.join("auth-profile");
             let ghost_state = dir.join("ghost-state.json");
             let ocr = dir.join("ocr");
             let rerank = dir.join("rerank");
@@ -1395,9 +1309,9 @@ fn check_cache_dir() -> CheckResult {
                     },
                 ),
                 (
-                    "ghost-profile",
-                    if ghost_profile.exists() {
-                        dir_size(&ghost_profile)
+                    "auth-profile",
+                    if auth_profile.exists() {
+                        dir_size(&auth_profile)
                     } else {
                         0
                     },
@@ -1563,7 +1477,7 @@ fn check_onnx() -> CheckResult {
     }
 }
 
-fn check_ghost_state() -> CheckResult {
+fn check_state_store() -> CheckResult {
     let path = paths::cache_dir().join("ghost-state.json");
     if path.exists() {
         match std::fs::read(&path) {
@@ -1582,8 +1496,7 @@ fn check_ghost_state() -> CheckResult {
     }
     let state = crate::state::GhostState::load();
     let domains = state.profiles.len();
-    let renders = state.renders.len();
-    CheckResult::Pass(format!("{domains} domains, {renders} renders cached"))
+    CheckResult::Pass(format!("{domains} domains known"))
 }
 
 /// BYOK plugins: registration state only. Never probes the
@@ -2374,7 +2287,7 @@ fn apply_fixes(collected: &mut [(String, String, String, String)]) {
             "Cache directory" => std::fs::create_dir_all(crate::paths::cache_dir())
                 .map(|_| check_cache_dir())
                 .map_err(|e| e.to_string()),
-            "Ghost state" => {
+            "State store" => {
                 let path = crate::paths::cache_dir().join("ghost-state.json");
                 let corrupt = std::fs::read(&path)
                     .map_err(|e| e.to_string())
@@ -2394,7 +2307,7 @@ fn apply_fixes(collected: &mut [(String, String, String, String)]) {
                 ));
                 corrupt
                     .and_then(|_| std::fs::rename(&path, &backup).map_err(|e| e.to_string()))
-                    .map(|_| check_ghost_state())
+                    .map(|_| check_state_store())
             }
             _ => continue,
         };
@@ -2449,10 +2362,9 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
     };
 
     if parity {
-        let mgr = crate::ghost::manager::GhostManager::new().await;
-        return match scorecard::capture_via_ghost(&mgr).await {
-            Ok(ghost) => {
-                let report = scorecard::diff(&ghost, &live);
+        return match scorecard::capture_via_browser().await {
+            Ok(browser) => {
+                let report = scorecard::diff(&browser, &live);
                 let bad = report.iter().filter(|v| !v.same).count();
                 println!("  parity scope: local fetch vs LOCAL BROWSER (fixtureless, evergreen)");
                 println!();
@@ -2474,8 +2386,8 @@ async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {
                 }
             }
             Err(e) => {
-                crate::diag!("  ghost parity unavailable: {e}");
-                crate::diag!("  (need a local Chrome: ghost must render the echo once)");
+                crate::diag!("  browser parity unavailable: {e}");
+                crate::diag!("  (need a local Chrome: the browser must render the echo once)");
                 // Parity is best-effort evergreen, not the fixture gate.
                 1
             }
@@ -2588,9 +2500,9 @@ mod doctor_ultra_tests {
         let corrupt = b"{not json";
         std::fs::write(cache.dir.join("ghost-state.json"), corrupt).unwrap();
         std::fs::write(cache.dir.join("keep-model.bin"), b"valid unrelated model").unwrap();
-        assert!(matches!(check_ghost_state(), CheckResult::Fail(_, _)));
+        assert!(matches!(check_state_store(), CheckResult::Fail(_, _)));
         let mut checks = vec![(
-            "Ghost state".into(),
+            "State store".into(),
             "fail".into(),
             "corrupt".into(),
             "repair".into(),
@@ -2611,7 +2523,7 @@ mod doctor_ultra_tests {
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read(backups[0].path()).unwrap(), corrupt);
         assert!(matches!(
-            check_ghost_state(),
+            check_state_store(),
             CheckResult::Pass(_) | CheckResult::Warn(_)
         ));
         apply_fixes(&mut checks);
@@ -2638,7 +2550,7 @@ mod doctor_ultra_tests {
     #[test]
     fn wave450_doctor_preserves_profile_locks_and_existing_probe_file() {
         let _cache = isolated_cache();
-        let profile = crate::ghost::profile_dir();
+        let profile = crate::paths::cache_dir().join("auth-profile");
         std::fs::create_dir_all(&profile).unwrap();
         for name in [
             "SingletonLock",
@@ -2649,7 +2561,7 @@ mod doctor_ultra_tests {
             std::fs::write(profile.join(name), b"owned by another process").unwrap();
         }
         assert!(matches!(
-            check_ghost_profile(),
+            check_auth_profile(),
             CheckResult::Pass(_) | CheckResult::Warn(_)
         ));
         for name in [

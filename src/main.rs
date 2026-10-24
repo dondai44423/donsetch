@@ -143,7 +143,7 @@ async fn run() {
     //
     // NOT for `mcp`, though : SIG_DFL is process-wide, and in the
     // daemon it turns every EPIPE into an instant kill. That
-    // bypasses stdio.rs's clean broken-transport shutdown (ghost
+    // bypasses stdio.rs's clean broken-transport shutdown (browser-child
     // cleanup included; macOS Chrome has no pdeathsig to fall
     // back on), lets a BYOK plugin that exits without reading its
     // stdin take the whole daemon down through the request write,
@@ -297,7 +297,7 @@ async fn run() {
         // ── Dev/internal (hidden from --help) ──
         "dev" => dev::dispatch(&args[2..]).await,
         // Backward-compat: bare dev commands still work.
-        "probe" | "fingerprint" | "resume-test" | "ghost" | "extract" => {
+        "probe" | "fingerprint" | "resume-test" | "extract" => {
             dev::dispatch(&args[1..]).await;
         }
 
@@ -350,11 +350,11 @@ async fn route_help(cmd: &str) {
         "doctor" => {
             println!("Usage: donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]");
             println!();
-            println!("  Health checks: binary, network, TLS, browser, Xvfb, ghost profile,");
-            println!("  cache, permissions, PDFium, OCR models, rerank model, egress lanes,");
-            println!("  local rules.");
+            println!("  Health checks: binary, network, TLS, browser, browser launch,");
+            println!("  auth profile, cache, permissions, PDFium, OCR models, rerank model,");
+            println!("  egress lanes, local rules.");
             println!("  Auto-fixes what it can. Reports issues with instructions.");
-            println!("  --deep     live browser launch + proxy lane probes");
+            println!("  --deep     live egress-lane and provider probes");
             println!("  --improve  explain the local self-improvement loop + receipts");
             println!("  --fix      apply safe mechanical repairs");
             println!("  --json     structured output for agents/CI");
@@ -419,7 +419,7 @@ async fn route_help(cmd: &str) {
         "stop" => {
             println!("Usage: donsetch stop");
             println!();
-            println!("  Kills orphaned Chrome instances and cleans stale ghost locks and");
+            println!("  Kills orphaned browser instances and cleans stale locks and");
             println!("  temp profiles. Run after a hard interrupt; harmless when there is");
             println!("  nothing to clean.");
         }

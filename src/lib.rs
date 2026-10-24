@@ -5,7 +5,8 @@
 //!
 //! - [`extract`] : DonSift: HTML/PDF bytes → agent-native markdown
 //! - [`fetch`] : the fetch pipeline riding the in-tree engine
-//! - [`ghost`] : the managed browser (screenshot and actions runs)
+//! - [`browser`] : the locally installed browser (login, screenshot, parity)
+//! - [`state`] : the disk-backed fetch state (route memory, session vault)
 //! - [`search`] : DonSeek: keyless multi-engine search
 //! - [`crawl`] : DonTread: sitemap-aware site walking
 //! - [`detect`] : wall/bot detection verdicts
@@ -17,6 +18,7 @@
 
 pub mod adapters;
 pub mod auth;
+pub mod browser;
 pub mod cli;
 pub mod config;
 pub mod cpu;
@@ -31,7 +33,6 @@ pub mod egress;
 pub mod error;
 pub mod extract;
 pub mod fetch;
-pub mod ghost;
 pub mod handles;
 pub mod mcp;
 pub mod onnx;
@@ -44,6 +45,7 @@ pub mod rules;
 pub mod search;
 pub mod spec;
 pub mod state;
+pub mod state_probe;
 
 #[cfg(test)]
 pub(crate) mod test_support;

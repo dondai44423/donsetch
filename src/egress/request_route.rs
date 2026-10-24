@@ -121,32 +121,6 @@ impl RequestRoute {
             }
         }
     }
-
-    /// Native HTTP/HTTPS proxy map plus HTTP's exact host-only bypass policy.
-    pub(crate) fn browser_proxies(
-        &self,
-    ) -> Result<(Option<Proxy>, Option<Proxy>, String), FetchError> {
-        match &self.0 {
-            RoutePolicy::Direct => Ok((None, None, String::new())),
-            RoutePolicy::Pinned(proxy) | RoutePolicy::Pool { proxy, .. } => {
-                Ok((Some(proxy.clone()), Some(proxy.clone()), String::new()))
-            }
-            RoutePolicy::Configured {
-                http,
-                https,
-                bypass,
-            } => {
-                if bypass.split(',').any(|entry| entry.trim() == "*") {
-                    return Ok((None, None, String::new()));
-                }
-                Ok((
-                    parse_selected(http)?,
-                    parse_selected(https)?,
-                    bypass.clone(),
-                ))
-            }
-        }
-    }
 }
 
 /// A selected proxy value parses straight into the typed config error:
@@ -226,10 +200,6 @@ mod tests {
             std::env::set_var("NO_PROXY", "*");
         }
         assert_eq!(route.proxy_for("http://example.org/").unwrap(), before);
-        let (http, https, bypass) = route.browser_proxies().unwrap();
-        assert_eq!(http, before);
-        assert_eq!(https.unwrap().host, "proxy-b");
-        assert!(bypass.contains("owned.example"));
         assert!(!format!("{route:?}").contains("alice") && !route.id().contains("owned-secret"));
         assert_ne!(route.id(), RequestRoute::pinned(before.unwrap()).id());
     }

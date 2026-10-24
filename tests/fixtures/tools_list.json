@@ -84,65 +84,6 @@
           "media": {
             "type": "boolean",
             "description": "Include image alt text and source URLs. Use image_text instead when words inside an image must be read."
-          },
-          "actions": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "do": {
-                  "type": "string",
-                  "enum": [
-                    "wait",
-                    "wait_selector",
-                    "wait_text",
-                    "click",
-                    "hover",
-                    "type",
-                    "press",
-                    "scroll"
-                  ]
-                },
-                "selector": {
-                  "type": "string"
-                },
-                "text": {
-                  "type": "string"
-                },
-                "key": {
-                  "type": "string"
-                },
-                "to": {
-                  "type": "string",
-                  "enum": [
-                    "top",
-                    "bottom",
-                    "down",
-                    "px"
-                  ]
-                },
-                "px": {
-                  "type": "integer"
-                },
-                "ms": {
-                  "type": "integer"
-                },
-                "timeout_ms": {
-                  "type": "integer"
-                }
-              },
-              "required": [
-                "do"
-              ],
-              "additionalProperties": false
-            },
-            "minItems": 1,
-            "maxItems": 16,
-            "description": "Any action routes the fetch through a browser; omit for static reads. Ordered page interactions before reading (1-16 objects). Each object requires do. Required fields: wait uses ms; wait_selector uses selector; wait_text uses text; click/hover uses selector or text; type uses text and optional selector; press uses key; scroll uses to or px. The first failed step stops and is reported."
-          },
-          "shot": {
-            "type": "string",
-            "description": "File path: save a PNG screenshot when blocked by an interactive captcha. Fires on captcha walls only, not a general screenshot tool. Relative names resolve under the screenshots root; absolute paths must already be below it. An invalid path is refused before any fetch work."
           }
         },
         "required": [

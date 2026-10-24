@@ -262,7 +262,7 @@ fn the_sponsor_line_is_labelled_human_only_and_switchable() {
     std::fs::write(
         sb.root.join("donsetch.toml"),
         format!(
-            "[browser]\nbackend = \"chromium\"\nchromium_path = {:?}\n[proxy]\nfrom_environment = false\nhttps = \"http://127.0.0.1:0\"\nhttp = \"http://127.0.0.1:0\"\n",
+            "[browser]\nchromium_path = {:?}\n[proxy]\nfrom_environment = false\nhttps = \"http://127.0.0.1:0\"\nhttp = \"http://127.0.0.1:0\"\n",
             sb.root.join("missing-browser").to_string_lossy()
         ),
     )

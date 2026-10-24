@@ -1,12 +1,12 @@
 //! Background probe-down recovery (v4 phase 0.2).
 //!
-//! Route memory learns "this host needs tier 2" from challenge
+//! Wall memory learns "this host is defended" from challenge
 //! verdicts. Without a healer, that decision is one-way: a site
-//! that relaxes its wall would keep paying the slow tier forever
+//! that relaxes its wall would keep failing fast forever
 //! (the RecheckCold path heals, but lazily, at the cost of one
 //! user-visible fetch). The prober closes the loop: on a budget,
 //! in the background, it re-probes stale walled hosts with a
-//! cold tier-1 request and lets the wall DOWNGRADE when the
+//! cold, cookie-free request and lets the wall DOWNGRADE when the
 //! evidence says so. Probes never touch the shared cookie jar
 //! (a probe answers "does a COLD client still get walled?") and
 //! never read or write the revalidation cache (a cached page is

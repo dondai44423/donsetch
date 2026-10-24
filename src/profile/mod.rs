@@ -367,7 +367,7 @@ pub(crate) fn probe_installed() -> Option<(u32, bool)> {
             return Some((major, branded));
         }
         // Fallback: ask the binary, but never let it hang or orphan.
-        let browser = crate::ghost::resolve_browser_without_download().ok()?;
+        let browser = crate::browser::resolve_browser_without_download().ok()?;
         let path = browser.path.to_string_lossy().to_string();
         let banner = probe_version_string_at_path(&path)?;
         let branded = banner.contains("Google Chrome") || banner.contains("Google Chrome Canary");

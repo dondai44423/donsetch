@@ -2,17 +2,15 @@
 //!
 //! Every fetch is both an action AND an observation. This store
 //! learns from each outcome and routes the next fetch more
-//! efficiently. The more you use DonSeTch, the less it escalates
-//! to tier 2 : domains it has already solved get warm tier-1
-//! with their clearance cookies injected, and cookies are kept
-//! alive by write-back from successful warm fetches.
+//! efficiently: domains known to be walled fail fast, warm
+//! clearance cookies ride when they can be trusted, and they are
+//! kept alive by write-back from successful warm fetches.
 //!
-//! Two persistent stores:
+//! One persistent store:
 //!
 //! - **Domain profiles**: per-host routing intelligence + cookie
-//!   vault. `route_for(host)` decides cold / warm / skip-to-solve
-//!   / recheck-cold. `record_*` methods observe outcomes.
-//! - **Rendered pages**: SPA renders cached with a TTL.
+//!   vault. `route_for(host)` decides the route; `record_*`
+//!   methods observe outcomes.
 //!
 //! File: ~/.cache/donsetch/ghost-state.json (atomic writes).
 
@@ -102,16 +100,14 @@ pub struct DomainProfile {
     pub warm_ok_count: u32,
     #[serde(default)]
     pub warm_fail_count: u32,
-    #[serde(default)]
-    pub solve_count: u32,
 
     // === Wall signature ===
     #[serde(default)]
     pub wall_vendor: Option<String>,
-    /// Known to need tier 2 (seen a challenge here).
+    /// Known to be walled (a challenge was seen here).
     #[serde(default)]
     pub needs_tier2: bool,
-    /// Last time we tried tier 1 cold here (for wall-removal recheck).
+    /// Last time the host was tried cold (for wall-removal recheck).
     #[serde(default)]
     pub last_cold_check: u64,
 
@@ -164,11 +160,6 @@ pub struct DomainProfile {
     pub warm_ewma: f32,
     #[serde(default)]
     pub warm_samples: u32,
-    /// EWMA of ghost (tier-2/solve) success.
-    #[serde(default = "default_ewma")]
-    pub ghost_ewma: f32,
-    #[serde(default)]
-    pub ghost_samples: u32,
     /// Recent classified failures (newest last, cap
     /// FAILURES_PER_HOST). Failure-class discipline: transport errors
     /// and auth/ratelimit land HERE, never in the wall flags, so a
@@ -304,13 +295,6 @@ pub struct GhostState {
     /// network fetch.
     #[serde(default)]
     pub prewarmed_served_total: u64,
-    /// v4 phase 3 ghost pool visibility: how many ghost acquires were
-    /// served by an already-live pooled browser (thaw-and-go), as
-    /// opposed to paying a browser launch. Sums across the daemon's
-    /// lifetime; zero cold-starts are not counted. Surfaced in
-    /// donsetch status as the pool's warm-reuse receipt.
-    #[serde(default)]
-    pub pool_served_total: u64,
     /// Tier-1 whole-jar persistence (v4 phase 1.4): the browser
     /// cookie-store view, so a returning agent replays device /
     /// analytics / cf_bm cookies like a returning browser instead
@@ -326,8 +310,6 @@ pub struct GhostState {
     pub personas: HashMap<String, crate::persona::Persona>,
     #[serde(default)]
     pub profiles: HashMap<String, DomainProfile>,
-    #[serde(default)]
-    pub renders: HashMap<String, RenderCache>,
     /// Tier-1 echo stashed by sync_tier1_cookies for the save that
     /// follows to re-apply after disk reconciliation: (stamp of the
     /// snapshot, rows). Process-local; never serialized.
@@ -376,7 +358,7 @@ pub(crate) fn ensure_session_identity() {
         change_session_revision(&mut state, false);
         bump_vault_epoch(&mut state);
         if let Err(error) = state.persist() {
-            crate::diag!("[ghost] session identity persist failed: {error}");
+            crate::diag!("[state] session identity persist failed: {error}");
         }
     }
 }
@@ -430,53 +412,6 @@ fn bump_vault_epoch(state: &mut GhostState) {
     state.vault_epoch = state.vault_epoch.saturating_add(1);
 }
 
-/// The vault epoch currently on disk, for stamping captures against
-/// the disk write order. Only the field is deserialized.
-pub(crate) fn disk_epoch_now() -> u64 {
-    #[derive(serde::Deserialize)]
-    struct EpochOnly {
-        #[serde(default)]
-        vault_epoch: u64,
-    }
-    std::fs::read(path())
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<EpochOnly>(&bytes).ok())
-        .map(|e| e.vault_epoch)
-        .unwrap_or(0)
-}
-
-/// The subset of `cookies` a browser launched at epoch `since` may
-/// still claim: a domain session-cleared at or after `since` is a
-/// dead session to that browser, and re-importing or re-vaulting it
-/// would undo the logout. Loads the state once. A launch epoch of 0
-/// (the browser started before any vault write) predates every
-/// clear, so ever-cleared domains filter out; the `> 0` guard is
-/// what keeps never-cleared domains (cleared_epoch 0) for every
-/// launch vintage.
-pub(crate) fn session_cookies_since(cookies: &[CookieRecord], since: u64) -> Vec<CookieRecord> {
-    let state = GhostState::load();
-    cookies
-        .iter()
-        .filter(|c| {
-            let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
-            let mut domain = host.as_str();
-            loop {
-                if state.profiles.get(domain).is_some_and(|p| {
-                    p.session_cleared_epoch > 0 && p.session_cleared_epoch >= since
-                }) {
-                    return false;
-                }
-                let Some((_, parent)) = domain.split_once('.') else {
-                    break;
-                };
-                domain = parent;
-            }
-            true
-        })
-        .cloned()
-        .collect()
-}
-
 /// Cross-process serialization for every ghost-state.json writer:
 /// the cookie helpers, snapshot saves and any other donsetch process
 /// sharing the cache dir. Unix takes a blocking flock, which the
@@ -522,7 +457,7 @@ impl StateWriteLock {
                     // the process down here: locking is best effort
                     // (like the flock failure below), and the save
                     // reports its own persist error.
-                    crate::diag!("[ghost] cookie vault lock failed: {error}");
+                    crate::diag!("[state] cookie vault lock failed: {error}");
                     return Self {
                         file: None,
                         locked: false,
@@ -542,7 +477,7 @@ impl StateWriteLock {
                 if error.kind() != std::io::ErrorKind::Interrupted {
                     // Best effort, like every other state write:
                     // report and proceed rather than wedge the caller.
-                    crate::diag!("[ghost] cookie vault lock failed: {error}");
+                    crate::diag!("[state] cookie vault lock failed: {error}");
                     STATE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
                     return Self {
                         file: Some(file),
@@ -580,7 +515,7 @@ impl StateWriteLock {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                     Err(error) => {
-                        crate::diag!("[ghost] cookie vault lock failed: {error}");
+                        crate::diag!("[state] cookie vault lock failed: {error}");
                         return Self {
                             file: None,
                             locked: false,
@@ -650,23 +585,6 @@ fn stamp_session_cleared(state: &mut GhostState, key: &str, extra_hosts: &[Strin
         .session_cleared_epoch = stamp;
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct RenderCache {
-    #[serde(default)]
-    pub session_stamp: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub document: Option<crate::ghost::document::Document>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
-    pub html: String,
-    pub at: u64,
-    /// Vault ordering stamp taken at capture: a merge drops this
-    /// render when its host's session_cleared_epoch is at or after
-    /// this value (the capture predates the recorded deletion).
-    #[serde(default)]
-    pub capture_epoch: u64,
-}
-
 // ────────────────────────── route memory (v4 phase 0) ──────────────────────────
 
 /// Max remembered domains: LRU-evict the coldest beyond this
@@ -727,12 +645,9 @@ pub fn current_egress_class(host: &str) -> &'static str {
 /// invalidation (IP change, session revoke).
 const TTL_CAP: u64 = 2 * 60 * 60; // 2 hours
 
-/// If a domain is known to need tier 2, periodically try tier 1
-/// cold anyway : the wall may have been removed.
+/// If a domain is known to be walled, periodically try it cold
+/// anyway : the wall may have been removed.
 const RECHECK_INTERVAL: u64 = 24 * 60 * 60; // 24 hours
-
-/// SPA renders stale after 5 min.
-const RENDER_TTL: u64 = 5 * 60;
 
 /// Solve-cooldown backoff: 15 min base, doubling per consecutive
 /// wall-persisted failure, hard-capped at 2 hours. A permanently
@@ -743,15 +658,6 @@ fn solve_cooldown_secs(streak: u32) -> u64 {
     let shifts = streak.saturating_sub(2).min(3);
     base << shifts
 }
-
-/// Max render cache entries. Each stores full HTML : cap to
-/// prevent unbounded growth. LRU eviction when full.
-/// 20 entries × ~200KB avg = ~4MB max contribution to state file.
-const RENDER_MAX: usize = 20;
-
-/// Max HTML size to cache per render (200KB). Larger pages are
-/// rendered but not persisted : they'd bloat the state file.
-const RENDER_MAX_HTML: usize = 200_000;
 
 // ────────────────────────── cookie filtering ──────────────────────────
 
@@ -1036,23 +942,6 @@ pub fn store_login_cookies(cookies: &[CookieRecord]) -> Result<(), String> {
             p.human_wall = None;
         }
     }
-    let mut extra = Vec::new();
-    state.renders.retain(|url, _| {
-        let host = crate::search::rank::host_of(url);
-        if affected(&host) {
-            extra.push(host);
-            false
-        } else {
-            true
-        }
-    });
-    for host in extra {
-        state
-            .profiles
-            .entry(host)
-            .or_default()
-            .session_cleared_epoch = barrier;
-    }
     change_session_revision(&mut state, true);
     bump_vault_epoch(&mut state);
     state
@@ -1160,7 +1049,7 @@ pub fn store_session_cookies(cookies: &[CookieRecord]) {
     }
     bump_vault_epoch(&mut state);
     if let Err(error) = state.persist() {
-        crate::diag!("[ghost] cookie vault persist failed: {error}");
+        crate::diag!("[state] cookie vault persist failed: {error}");
     }
 }
 
@@ -1256,38 +1145,14 @@ pub fn clear_session_cookies_for_checked(domain: &str) -> Result<bool, String> {
         });
         removed |= p.session_cookies.len() != before;
     }
-    // Issue #173 (deeper pass): the rendered-DOM cache is a fourth copy
-    // of the session's fruit. A page fetched behind the session is
-    // stored whole in `renders` (RENDER_TTL = 5 min) and served by the
-    // tier-2 fetch shortcut, so a logged-out domain's dashboard would
-    // still hand back its authenticated DOM for up to five minutes.
-    // Drop every render whose host belongs to the logged-out domain.
-    // The affected hosts also carry the deletion stamp below, so a
-    // live snapshot cannot resurrect one of these documents.
-    let before_r = state.renders.len();
-    let mut cleared_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
-    state.renders.retain(|url, _| {
-        let host = crate::search::rank::host_of(url);
-        if crate::auth::cookie_belongs_to(&key, &host) {
-            cleared_hosts.insert(host);
-            false
-        } else {
-            true
-        }
-    });
-    removed |= state.renders.len() != before_r;
     if removed {
         // Stamp the deletion so a live daemon snapshot (whose
-        // tier1_cookies / renders predate this logout) adopts the
-        // disk side on its next save instead of resurrecting them,
-        // and so a capture ordered at or before the stamp can never
-        // survive a merge (the render keep-rule in
-        // merge_vault_from_disk).
+        // tier1_cookies predate this logout) adopts the disk side
+        // on its next save instead of resurrecting them.
         change_session_revision(&mut state, true);
         bump_vault_epoch(&mut state);
         let stamp = state.vault_epoch;
-        let extras: Vec<String> = cleared_hosts.into_iter().collect();
-        stamp_session_cleared(&mut state, &key, &extras, stamp);
+        stamp_session_cleared(&mut state, &key, &[], stamp);
         state
             .persist()
             .map_err(|e| format!("logout vault was not saved: {e}"))?;
@@ -1353,31 +1218,6 @@ impl GhostState {
             .unwrap_or_else(|| format!("legacy:{}", self.vault_epoch))
     }
 
-    /// Per-host login generation, including ancestor logout/relogin barriers.
-    pub(crate) fn render_stamp(&self, url: &str) -> String {
-        let host = crate::search::rank::host_of(url);
-        let mut domain = host.as_str();
-        let mut generation = 0;
-        loop {
-            if let Some(p) = self.profiles.get(domain) {
-                generation = generation.max(p.session_cleared_epoch);
-            }
-            let Some((_, parent)) = domain.split_once('.') else {
-                break;
-            };
-            domain = parent;
-        }
-        format!("host:{generation}")
-    }
-
-    fn current_render_stamp(&self, url: &str) -> String {
-        if disk_session_stamp().is_none_or(|stamp| stamp == self.session_stamp()) {
-            self.render_stamp(url)
-        } else {
-            Self::load().render_stamp(url)
-        }
-    }
-
     pub fn load() -> Self {
         let p = path();
         if let Ok(s) = std::fs::read_to_string(&p) {
@@ -1397,11 +1237,7 @@ impl GhostState {
                     }
                     // Corrupt or legacy floats must not steer routing:
                     // a NaN / out-of-range EWMA is not evidence.
-                    for ewma in [
-                        &mut profile.t1_ewma,
-                        &mut profile.ghost_ewma,
-                        &mut profile.warm_ewma,
-                    ] {
+                    for ewma in [&mut profile.t1_ewma, &mut profile.warm_ewma] {
                         let value = *ewma;
                         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                             *ewma = default_ewma();
@@ -1420,23 +1256,20 @@ impl GhostState {
                     }
                 }
                 // One-time un-poisoning (v2.2): pre-v2.2 code marked
-                // domains needs_tier2 on ANY non-content verdict :
-                // a single 404 or rate-limit forced ghost on every
-                // later fetch. Profiles that never recorded an
-                // actual solve carry no wall knowledge: reset them
-                // so they get a fresh cold tier-1 chance.
+                // domains walled on ANY non-content verdict :
+                // a single 404 or rate-limit forced a walled route on
+                // every later fetch. Profiles that carry no wall
+                // knowledge (no cookies) are reset so they get a
+                // fresh cold chance.
                 // Gated on the state version (v4 phase 0): ungated,
                 // this migration ran on EVERY load and wiped the
-                // memory of legitimately-walled-but-never-solved
-                // hosts between CLI invocations and daemon restarts
-                // (live-caught on the wall rig: needs_tier2 vanished
-                // between two CLI runs). Route amnesia, now ended.
+                // memory of legitimately-walled hosts between CLI
+                // invocations and daemon restarts (live-caught on
+                // the wall rig: needs_tier2 vanished between two CLI
+                // runs). Route amnesia, now ended.
                 if state.version < 2 {
                     for profile in state.profiles.values_mut() {
-                        if profile.needs_tier2
-                            && profile.solve_count == 0
-                            && profile.cookies.is_empty()
-                        {
+                        if profile.needs_tier2 && profile.cookies.is_empty() {
                             profile.needs_tier2 = false;
                             profile.wall_vendor = None;
                             changed = true;
@@ -1454,26 +1287,6 @@ impl GhostState {
                 // they never fire again for this file.
                 state.version = STATE_VERSION;
 
-                // Cap renders to RENDER_MAX (old state files may
-                // have hundreds of cached renders).
-                while state.renders.len() > RENDER_MAX {
-                    if let Some(oldest_key) = state
-                        .renders
-                        .iter()
-                        .min_by_key(|(_, r)| r.at)
-                        .map(|(k, _)| k.clone())
-                    {
-                        state.renders.remove(&oldest_key);
-                    }
-                    changed = true;
-                }
-                // Prune oversized renders (old files may have
-                // cached >200KB pages).
-                let before_renders = state.renders.len();
-                state.renders.retain(|_, r| r.html.len() <= RENDER_MAX_HTML);
-                if state.renders.len() != before_renders {
-                    changed = true;
-                }
                 if changed {
                     state.save();
                 }
@@ -1508,7 +1321,6 @@ impl GhostState {
                         },
                     );
                 }
-                state.renders = old.renders;
                 state.save();
                 return state;
             }
@@ -1623,16 +1435,6 @@ impl GhostState {
     /// prewarm is on; no extra gate here.
     pub fn note_prewarm_served(&mut self) {
         self.prewarmed_served_total = self.prewarmed_served_total.saturating_add(1);
-        self.save();
-    }
-
-    /// v4 phase 3 visibility: count a fetch served from an
-    /// already-warm pool browser (no launch, no thaw failure). With
-    /// DONSETCH_NO_GHOST_POOL set, the pool is one slot but warm
-    /// reuse inside that slot still counts: the receipt lives with
-    /// the behavior.
-    pub fn note_pool_served(&mut self) {
-        self.pool_served_total = self.pool_served_total.saturating_add(1);
         self.save();
     }
 
@@ -1861,7 +1663,7 @@ impl GhostState {
         // write landed first.
         let _lock = StateWriteLock::acquire();
         if let Err(error) = self.persist() {
-            crate::diag!("[ghost] cookie vault persist failed: {error}");
+            crate::diag!("[state] cookie vault persist failed: {error}");
         }
     }
 
@@ -1906,7 +1708,7 @@ impl GhostState {
                 // exists RIGHT NOW: independent load() snapshots race
                 // (a stale in-memory copy saving later would otherwise
                 // rewind lifetimes). Max-merge is correct for counters:
-                // they only grow. Real case: the pool-warm receipt.
+                // they only grow. Real case: the prewarm receipt.
                 let disk = std::fs::read(&p)
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<GhostState>(&bytes).ok());
@@ -1916,7 +1718,6 @@ impl GhostState {
                         self.shadowed_assets_total.max(disk.shadowed_assets_total);
                     self.prewarmed_served_total =
                         self.prewarmed_served_total.max(disk.prewarmed_served_total);
-                    self.pool_served_total = self.pool_served_total.max(disk.pool_served_total);
                     self.merge_vault_from_disk(disk);
                 }
                 // A stashed tier-1 echo re-applies AFTER the merge:
@@ -1976,8 +1777,8 @@ impl GhostState {
     /// Pure reconciliation over one loaded disk copy; called from
     /// save() with the file as it exists RIGHT NOW.
     ///
-    /// The vault (profiles[].session_cookies, tier1_cookies,
-    /// renders) has TWO writer classes: the load-modify-save
+    /// The vault (profiles[].session_cookies, tier1_cookies) has
+    /// TWO writer classes: the load-modify-save
     /// helpers (store_session_cookies / clear_session_cookies_for),
     /// which never touch a live daemon snapshot, and the snapshot
     /// itself (sync_tier1_cookies). Both stamp a strictly larger
@@ -1988,9 +1789,6 @@ impl GhostState {
     /// a daemon save rewrote the file from its boot-era snapshot:
     /// every harvest since was erased, and every logout deletion
     /// came back (dead sessions replayed on the next launch).
-    /// Renders reconcile per key: a live capture is not erased by an
-    /// unrelated newer disk epoch, and a capture stamped at or before
-    /// a host's session clear is dropped, never resurrected.
     pub fn merge_vault_from_disk(&mut self, disk: &GhostState) {
         if disk.vault_epoch <= self.vault_epoch {
             return;
@@ -2017,47 +1815,13 @@ impl GhostState {
         self.tier1_cookies = disk.tier1_cookies.clone();
         self.auth_revision = disk.auth_revision.clone();
         self.session_revision = disk.session_revision.clone();
-        // Renders merge per key: adopting the disk map wholesale
-        // dropped every render the live snapshot captured after the
-        // disk write that created the newer epoch, and keeping the
-        // snapshot's map wholesale would resurrect a logged-out DOM.
-        // A self-only render survives exactly when no session clear
-        // for its host is stamped at or after its capture.
-        self.renders.retain(|url, r| {
-            if disk.renders.contains_key(url) {
-                return true; // superseded below when disk's is newer
-            }
-            let host = crate::search::rank::host_of(url);
-            let cleared = disk
-                .profiles
-                .get(&host)
-                .map(|p| p.session_cleared_epoch)
-                .unwrap_or(0);
-            cleared < r.capture_epoch
-        });
-        for (url, dr) in disk.renders.iter() {
-            match self.renders.get_mut(url) {
-                // Both captured it: the newer capture wins; an equal
-                // second keeps the live snapshot's copy.
-                Some(sr) => {
-                    if dr.at > sr.at {
-                        *sr = dr.clone();
-                    }
-                }
-                None => {
-                    self.renders.insert(url.clone(), dr.clone());
-                }
-            }
-        }
         self.vault_epoch = disk.vault_epoch;
     }
 
     // ── Decision ──
 
     /// Route decision for the next fetch to this host.
-    /// Is this host known to need tier 2 (seen a challenge)?
-    /// Powers the v3 anti-cloak trigger: a walled domain that
-    /// suddenly passes tier-1 cold is suspicious.
+    /// Is this host known to be walled (a challenge was seen here)?
     pub fn is_known_walled(&self, host: &str) -> bool {
         self.profiles.get(host).is_some_and(|p| p.needs_tier2)
     }
@@ -2119,12 +1883,11 @@ impl GhostState {
             return RouteDecision::Cold;
         };
         let n = now();
-        // Solve-cooldown comes FIRST: a domain whose wall survived
-        // real-browser passes recently fails fast until the cooldown
-        // lapses. Exponential backoff per failure streak, capped at
-        // 2 hours, so a permanently-walled domain costs an honest
-        // sub-second error instead of a 20-40s browser cycle per
-        // fetch.
+        // Solve-cooldown comes FIRST: a domain that kept walling
+        // cold recently fails fast until the cooldown lapses.
+        // Exponential backoff per failure streak, capped at 2 hours,
+        // so a permanently-walled domain costs an honest sub-second
+        // error instead of another doomed attempt per fetch.
         let wall_class = profile
             .wall_egress_class
             .as_ref()
@@ -2144,10 +1907,10 @@ impl GhostState {
             Some(c) => c == class,
         };
         if profile.needs_tier2 {
-            // Warm only when cookies are fresh AND tier-1 replay has
+            // Warm only when cookies are fresh AND cookie replay has
             // actually been verified to work for this domain. Vendors
             // that bind clearance to the browser fingerprint reject
-            // tier-1 replay forever : serving Warm there just burns a
+            // cookie replay forever : serving Warm there just burns a
             // doomed roundtrip before every solve.
             if class_ok && cookies_fresh_at(profile, n) && profile.replay_ok {
                 return RouteDecision::Warm(profile.cookies.clone());
@@ -2230,8 +1993,8 @@ impl GhostState {
         })
     }
 
-    /// Tier 1 cold succeeded. If the domain was previously known
-    /// to need tier 2, the wall is gone : clear the flag.
+    /// A cold fetch succeeded. If the domain was previously known
+    /// to be walled, the wall is gone : clear the flag.
     pub fn record_cold_ok(&mut self, host: &str) {
         if !route_memory_enabled() || route_memory_readonly() {
             return;
@@ -2243,14 +2006,14 @@ impl GhostState {
         p.fetch_count = p.fetch_count.saturating_add(1);
         p.last_cold_check = n;
         p.warm_fail_streak = 0;
-        // Tier 1 got real content : whatever wall state existed
-        // is irrelevant now. Clear the wall + cooldown memory.
+        // The cold fetch got real content : whatever wall state
+        // existed is irrelevant now. Clear the wall + cooldown memory.
         p.wall_fail_streak = 0;
         p.last_wall_fail = 0;
         if p.needs_tier2 {
             p.needs_tier2 = false;
             p.wall_vendor = None;
-            // Cookies from a previous solve are stale context : clear.
+            // Stale clearance cookies : clear them.
             p.cookies.clear();
             p.observed_lifetime = None;
             p.replay_ok = false;
@@ -2259,9 +2022,9 @@ impl GhostState {
         self.save();
     }
 
-    /// Tier 1 cold was walled : domain needs tier 2.
+    /// A cold fetch was walled : the domain is defended.
     /// (Callers: ONLY on an actual Challenge verdict. A 404 or a
-    /// rate-limit is not a wall : it must not force ghost mode.)
+    /// rate-limit is not a wall : it must not burn route memory.)
     pub fn record_cold_walled(&mut self, host: &str, vendor: Option<&str>) {
         if !route_memory_enabled() || route_memory_readonly() {
             return;
@@ -2277,6 +2040,16 @@ impl GhostState {
         if let Some(v) = vendor {
             p.wall_vendor = Some(v.to_string());
         }
+        // Consecutive cold walls arm the cooldown: the wall
+        // persisted across attempts, so later fetches fail fast
+        // until it is due for another honest try.
+        let class = current_egress_class(host).to_string();
+        if p.wall_egress_class.as_ref().is_some_and(|c| c != &class) {
+            p.wall_fail_streak = 0;
+        }
+        p.wall_egress_class = Some(class);
+        p.wall_fail_streak = p.wall_fail_streak.saturating_add(1);
+        p.last_wall_fail = n;
         self.save();
     }
 
@@ -2296,6 +2069,10 @@ impl GhostState {
         p.fetch_count = p.fetch_count.saturating_add(1);
         p.warm_ok_count = p.warm_ok_count.saturating_add(1);
         p.warm_fail_streak = 0;
+        // A verified warm replay proves the wall is passable:
+        // clear the cooldown memory.
+        p.wall_fail_streak = 0;
+        p.last_wall_fail = 0;
         p.last_refreshed = n;
         // Merge: replace by (name, domain), add new ones : but only
         // clearance cookies.
@@ -2314,18 +2091,18 @@ impl GhostState {
         self.save();
     }
 
-    /// Tier 1 warm was walled : cookies went stale. Learn the
+    /// A warm fetch was walled : cookies went stale. Learn the
     /// real lifetime: it's at most `now - last_solved`. Next
     /// time, trust the observation over the server's claim and
-    /// re-solve before the cookies expire.
+    /// stop serving the dead cookies.
     ///
     /// Dampened: the FIRST warm failure keeps the cookies (vendor
     /// challenges rotate; one wall is often transient : the next
     /// warm fetch gets to prove the cookies still live). Only a
     /// SECOND consecutive failure clears the vault and learns the
     /// lifetime. The learned lifetime is floored at 120s: a fluke
-    /// wall one second after a solve must never clamp the domain
-    /// to permanent skip-to-solve (the stackoverflow bug).
+    /// wall one second after a fresh clearance must never clamp the
+    /// domain to a permanent skip (the stackoverflow bug).
     pub fn record_warm_stale(&mut self, host: &str) {
         if !route_memory_enabled() || route_memory_readonly() {
             return;
@@ -2350,176 +2127,6 @@ impl GhostState {
         }
         self.save();
     }
-
-    /// Tier 2 solved the wall : store fresh cookies with real
-    /// expiry captured from CDP. Only clearance cookies are kept :
-    /// tracking cookies bloat the state file with no benefit.
-    ///
-    /// `replay_ok` records whether tier-1 replay of these cookies
-    /// was VERIFIED (post-solve tier-1 fetch came back with real
-    /// content). Warm routing is gated on it : see route_for.
-    pub fn record_solved(
-        &mut self,
-        host: &str,
-        cookies: &[CookieRecord],
-        vendor: Option<&str>,
-        replay_ok: bool,
-    ) {
-        if !route_memory_enabled() || route_memory_readonly() {
-            return;
-        }
-        let n = now();
-        let p = self.profiles.entry(host.to_string()).or_default();
-        p.ghost_ewma = ewma_update(p.ghost_ewma, p.ghost_samples, true);
-        p.ghost_samples = p.ghost_samples.saturating_add(1);
-        p.cookies = filter_clearance(cookies);
-        p.last_solved = n;
-        p.last_refreshed = n;
-        p.solve_count = p.solve_count.saturating_add(1);
-        p.needs_tier2 = true;
-        p.warm_fail_streak = 0;
-        p.replay_ok = replay_ok;
-        // A SOLVED wall clears the failure memory: the browser got
-        // through, so the environment can solve this domain today.
-        p.wall_fail_streak = 0;
-        p.last_wall_fail = 0;
-        // A fresh solve restarts the lifetime observation window :
-        // stale pre-fix lifetimes (the 1-second clamp bug) must
-        // not outlive the solve that invalidated them.
-        if p.observed_lifetime.is_some_and(|o| o < 120) {
-            p.observed_lifetime = None;
-        }
-        if let Some(v) = vendor {
-            p.wall_vendor = Some(v.to_string());
-        }
-        self.save();
-    }
-
-    /// Ghost pass ended walled: the challenge persisted even in a
-    /// REAL browser. Consecutive failures drive the solve-cooldown.
-    pub fn record_wall_failed(&mut self, host: &str) {
-        if !route_memory_enabled() || route_memory_readonly() {
-            return;
-        }
-        let n = now();
-        let class = current_egress_class(host).to_string();
-        let p = self.profiles.entry(host.to_string()).or_default();
-        if p.wall_egress_class.as_ref().is_some_and(|c| c != &class) {
-            p.wall_fail_streak = 0;
-        }
-        p.wall_egress_class = Some(class);
-        p.ghost_ewma = ewma_update(p.ghost_ewma, p.ghost_samples, false);
-        p.ghost_samples = p.ghost_samples.saturating_add(1);
-        p.wall_fail_streak = p.wall_fail_streak.saturating_add(1);
-        p.last_wall_fail = n;
-        // A wall that survives a real browser tells nothing about
-        // cookies: keep whatever solve state existed. Only the
-        // cooldown memory updates.
-        self.save();
-    }
-
-    pub fn record_render(&mut self, url: &str, html: &str) {
-        self.record_render_entry(url, html, None, None, None);
-    }
-
-    pub fn record_render_context(&mut self, url: &str, html: &str, context: &str) {
-        self.record_render_entry(url, html, Some(context.to_string()), None, None);
-    }
-
-    pub fn record_render_document(
-        &mut self,
-        document: &crate::ghost::document::Document,
-        html: &str,
-        context: &str,
-    ) {
-        let stamp = self.render_stamp(&document.url);
-        self.record_render_document_session(document, html, context, &stamp);
-    }
-
-    pub fn record_render_document_session(
-        &mut self,
-        document: &crate::ghost::document::Document,
-        html: &str,
-        context: &str,
-        session_stamp: &str,
-    ) {
-        self.record_render_entry(
-            &document.url,
-            html,
-            Some(context.to_string()),
-            Some(document.clone()),
-            Some(session_stamp),
-        );
-    }
-
-    pub fn record_render_session(&mut self, url: &str, html: &str, session_stamp: &str) {
-        self.record_render_entry(url, html, None, None, Some(session_stamp));
-    }
-
-    fn record_render_entry(
-        &mut self,
-        url: &str,
-        html: &str,
-        context: Option<String>,
-        document: Option<crate::ghost::document::Document>,
-        session_stamp: Option<&str>,
-    ) {
-        // Skip oversized pages : caching 1MB+ HTML bloats the state
-        // file with no benefit (large pages are usually not SPAs
-        // that need render caching).
-        if html.len() > RENDER_MAX_HTML {
-            return;
-        }
-        // LRU cap: evict oldest renders when at capacity. Future
-        // stamps (clock skew) clamp to now so they cannot pin the
-        // eviction forever.
-        if !self.renders.contains_key(url)
-            && self.renders.len() >= RENDER_MAX
-            && let Some(oldest_key) = self
-                .renders
-                .iter()
-                .min_by_key(|(_, r)| r.at.min(now()))
-                .map(|(k, _)| k.clone())
-        {
-            self.renders.remove(&oldest_key);
-        }
-        let session_stamp = session_stamp
-            .map(str::to_owned)
-            .unwrap_or_else(|| self.render_stamp(url));
-        self.renders.insert(
-            url.to_string(),
-            RenderCache {
-                session_stamp,
-                document,
-                context,
-                html: html.to_string(),
-                at: now(),
-                // Anchor to the disk write order (sibling processes
-                // share no counter): one past the freshest epoch this
-                // state knows.
-                capture_epoch: disk_epoch_now().max(self.vault_epoch).saturating_add(1),
-            },
-        );
-        self.save();
-    }
-
-    pub fn render_for(&self, url: &str) -> Option<&RenderCache> {
-        let n = now();
-        self.renders.get(url).filter(|r| {
-            r.context.is_none()
-                && r.session_stamp == self.current_render_stamp(url)
-                && n.checked_sub(r.at).is_some_and(|age| age < RENDER_TTL)
-        })
-    }
-
-    pub fn render_for_context(&self, url: &str, context: &str) -> Option<&RenderCache> {
-        let n = now();
-        self.renders.get(url).filter(|r| {
-            r.context.as_deref() == Some(context)
-                && r.session_stamp == self.current_render_stamp(url)
-                && n.checked_sub(r.at).is_some_and(|age| age < RENDER_TTL)
-        })
-    }
 }
 
 // ────────────────────────── legacy migration ──────────────────────────
@@ -2528,8 +2135,6 @@ impl GhostState {
 struct LegacyState {
     #[serde(default)]
     solved: HashMap<String, LegacySolved>,
-    #[serde(default)]
-    renders: HashMap<String, RenderCache>,
 }
 
 #[derive(Deserialize)]
@@ -2698,153 +2303,10 @@ mod tests {
         assert_eq!(mine.tier1_cookies.len(), 1, "tie = snapshot stands");
     }
 
-    // == v4.6 vault ordering: captures vs deletions ==
-
-    #[test]
-    fn relogin_barrier_blocks_old_child_captures_but_accepts_new_actor() {
-        let mut state = GhostState {
-            vault_epoch: 12,
-            ..Default::default()
-        };
-        state
-            .profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cleared_epoch = 11;
-        std::fs::create_dir_all(path().parent().unwrap()).unwrap();
-        std::fs::write(path(), serde_json::to_vec(&state).unwrap()).unwrap();
-        let c = cr("xs", "opaque", "new.child.ex.com", None);
-        assert!(session_cookies_since(std::slice::from_ref(&c), 10).is_empty());
-        assert!(session_cookies_since(std::slice::from_ref(&c), 11).is_empty());
-        assert_eq!(session_cookies_since(std::slice::from_ref(&c), 12), vec![c]);
-        let unrelated = cr("xs", "opaque", "other.com", None);
-        assert_eq!(
-            session_cookies_since(std::slice::from_ref(&unrelated), 10),
-            vec![unrelated]
-        );
-    }
-
-    fn render(html: &str, at: u64, capture_epoch: u64) -> RenderCache {
-        RenderCache {
-            session_stamp: String::new(),
-            document: None,
-            context: Some("ctx".into()),
-            html: html.into(),
-            at,
-            capture_epoch,
-        }
-    }
-
-    // The vault RED, at merge level: a helper harvest (newer disk
-    // epoch, no clear for the host) must not discard a live capture
-    // recorded after the harvest; the capture stamp outranks it.
-    #[test]
-    fn live_capture_after_helper_harvest_survives_the_snapshot_merge() {
-        let mut mine = GhostState {
-            vault_epoch: 5,
-            ..Default::default()
-        };
-        mine.renders
-            .insert("http://ex.com/owned".into(), render("live", 100, 7));
-        let mut disk = GhostState {
-            vault_epoch: 6,
-            ..Default::default()
-        };
-        disk.profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cookies = vec![cr("sid", "harvested", ".ex.com", None)];
-        mine.merge_vault_from_disk(&disk);
-        assert!(
-            mine.renders.contains_key("http://ex.com/owned"),
-            "the live capture must survive the harvest's newer epoch"
-        );
-        assert_eq!(
-            mine.profiles["ex.com"].session_cookies[0].value, "harvested",
-            "the harvest must still be adopted"
-        );
-        assert_eq!(mine.vault_epoch, 6);
-    }
-
-    // A logout stamped AFTER the capture must delete the unsaved
-    // capture too: no authenticated DOM resurrection.
-    #[test]
-    fn logout_after_capture_drops_the_unsaved_render() {
-        let mut mine = GhostState {
-            vault_epoch: 5,
-            ..Default::default()
-        };
-        mine.renders
-            .insert("http://ex.com/secret".into(), render("auth", 100, 7));
-        let mut disk = GhostState {
-            vault_epoch: 8,
-            ..Default::default()
-        };
-        disk.profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cleared_epoch = 8;
-        mine.merge_vault_from_disk(&disk);
-        assert!(
-            !mine.renders.contains_key("http://ex.com/secret"),
-            "a pre-logout capture must not survive its deletion"
-        );
-    }
-
-    // The reverse order is legitimate: a capture stamped after the
-    // clear (anonymous fetch or re-login) survives later merges.
-    #[test]
-    fn capture_after_logout_survives_the_next_merge() {
-        let mut mine = GhostState {
-            vault_epoch: 8,
-            ..Default::default()
-        };
-        mine.renders
-            .insert("http://ex.com/anon".into(), render("post", 200, 9));
-        let mut disk = GhostState {
-            vault_epoch: 9,
-            ..Default::default()
-        };
-        disk.profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cleared_epoch = 8;
-        mine.merge_vault_from_disk(&disk);
-        assert!(mine.renders.contains_key("http://ex.com/anon"));
-    }
-
-    // Same key both sides: the newer capture wins; an equal second
-    // keeps the live snapshot's copy; disk-only keys are adopted.
-    #[test]
-    fn render_merge_prefers_the_newer_capture_and_keeps_ties() {
-        let mut mine = GhostState {
-            vault_epoch: 5,
-            ..Default::default()
-        };
-        mine.renders
-            .insert("http://ex.com/a".into(), render("old", 100, 6));
-        mine.renders
-            .insert("http://ex.com/b".into(), render("tie-mine", 150, 6));
-        let mut disk = GhostState {
-            vault_epoch: 6,
-            ..Default::default()
-        };
-        disk.renders
-            .insert("http://ex.com/a".into(), render("new", 120, 5));
-        disk.renders
-            .insert("http://ex.com/b".into(), render("tie-disk", 150, 5));
-        disk.renders
-            .insert("http://ex.com/c".into(), render("adopted", 140, 5));
-        mine.merge_vault_from_disk(&disk);
-        assert_eq!(mine.renders["http://ex.com/a"].html, "new");
-        assert_eq!(mine.renders["http://ex.com/b"].html, "tie-mine");
-        assert_eq!(mine.renders["http://ex.com/c"].html, "adopted");
-    }
-
     // Deletion stamps ride onto every profile the logout touches,
-    // including hosts that only ever appeared as render URLs.
+    // including hosts listed as extras by the caller.
     #[test]
-    fn session_clear_stamp_reaches_subdomains_and_render_hosts() {
+    fn session_clear_stamp_reaches_subdomains_and_listed_extras() {
         let mut state = GhostState::default();
         state.profiles.entry("ex.com".into()).or_default();
         state.profiles.entry("app.ex.com".into()).or_default();
@@ -2873,26 +2335,6 @@ mod tests {
         };
         bump_vault_epoch(&mut top);
         assert_eq!(top.vault_epoch, u64::MAX);
-    }
-
-    // The capture stamp is taken at record time and must not raise
-    // the snapshot's own epoch (that would skip adopting the
-    // harvest's disk state at the save that follows).
-    #[test]
-    fn record_render_stamps_the_capture_without_raising_the_vault() {
-        let mut state = GhostState {
-            vault_epoch: 5,
-            ..Default::default()
-        };
-        state.record_render_context("http://ex.com/p", "<p>x</p>", "ctx");
-        let r = &state.renders["http://ex.com/p"];
-        assert!(
-            r.capture_epoch > state.vault_epoch,
-            "capture {} must outrank the vault epoch {}",
-            r.capture_epoch,
-            state.vault_epoch
-        );
-        assert_eq!(state.vault_epoch, 5, "the snapshot's epoch must not move");
     }
 
     // == v4 phase 0: route memory ==
@@ -2937,11 +2379,14 @@ mod tests {
         for _ in 0..3 {
             state.record_cold_walled(host, Some("cloudflare"));
         }
-        let p = state.profiles.get(host).unwrap();
+        let p = state.profiles.get_mut(host).unwrap();
         assert!(p.t1_ewma < EWMA_BLOCK_THRESHOLD, "ewma {}", p.t1_ewma);
-        // Clear the boolean flag to prove the EWMA consult, not the
-        // flag, drives the decision.
-        state.profiles.get_mut(host).unwrap().needs_tier2 = false;
+        // The three straight walls also armed the cooldown, which
+        // sits above this consult. Clear it and the boolean flag so
+        // only the EWMA consult can drive the decision under test.
+        p.wall_fail_streak = 0;
+        p.last_wall_fail = 0;
+        p.needs_tier2 = false;
         assert!(matches!(state.route_for(host), RouteDecision::SkipToSolve));
     }
 
@@ -3051,14 +2496,13 @@ mod tests {
         };
         let walled = DomainProfile {
             needs_tier2: true,
-            solve_count: 0,
             ..Default::default()
         };
         state.profiles.insert("walled.example".into(), walled);
         // Simulate the v1 migration pass (the gated block in load):
         if state.version < 2 {
             for profile in state.profiles.values_mut() {
-                if profile.needs_tier2 && profile.solve_count == 0 && profile.cookies.is_empty() {
+                if profile.needs_tier2 && profile.cookies.is_empty() {
                     profile.needs_tier2 = false;
                     profile.wall_vendor = None;
                 }
@@ -3097,7 +2541,6 @@ mod tests {
             DomainProfile {
                 needs_tier2: true,
                 replay_ok: true,
-                solve_count: 3,
                 wall_vendor: Some("cloudflare".into()),
                 last_solved: now(),
                 ..Default::default()
@@ -3394,7 +2837,6 @@ mod tests {
         let p: DomainProfile = serde_json::from_str(old).unwrap();
         assert_eq!(p.t1_ewma, 1.0);
         assert_eq!(p.warm_ewma, 1.0);
-        assert_eq!(p.ghost_ewma, 1.0);
         assert_eq!(p.t1_samples, 0);
         assert!(p.failures.is_empty());
         assert!(p.needs_tier2);
@@ -3697,17 +3139,15 @@ mod tests {
     }
 
     #[test]
-    fn solved_stores_cookies_and_vendor() {
+    fn cold_walled_marks_the_wall_and_stores_the_vendor() {
         let mut s = GhostState::default();
-        let cookies = vec![cr("cf_clearance", "tok", ".hard.com", Some(now() + 3600))];
-        s.record_solved("hard.com", &cookies, Some("cloudflare"), true);
+        s.record_cold_walled("hard.com", Some("cloudflare"));
         let p = &s.profiles["hard.com"];
         assert!(p.needs_tier2);
-        assert_eq!(p.solve_count, 1);
+        assert_eq!(p.walled_count, 1);
         assert_eq!(p.wall_vendor.as_deref(), Some("cloudflare"));
-        assert_eq!(p.cookies.len(), 1);
-        assert!(!p.cookies.is_empty());
-        assert!(p.replay_ok);
+        assert_eq!(p.wall_fail_streak, 1);
+        assert!(p.cookies.is_empty());
     }
 
     // ── replay gating + warm-stale dampening (v2.2) ──
@@ -3733,8 +3173,7 @@ mod tests {
             RouteDecision::SkipToSolve
         ));
         // Verified replay flips it to Warm.
-        let cookies = vec![cr("cf_clearance", "x", ".strict.com", Some(now() + 3600))];
-        s.record_solved("strict.com", &cookies, Some("cloudflare"), true);
+        s.profiles.get_mut("strict.com").unwrap().replay_ok = true;
         assert!(matches!(s.route_for("strict.com"), RouteDecision::Warm(_)));
     }
 
@@ -3777,30 +3216,36 @@ mod tests {
     #[test]
     fn solve_cooldown_routes_fast_fail_then_heals() {
         let mut s = GhostState::default();
-        s.record_wall_failed("poison.com");
-        s.record_wall_failed("poison.com");
-        // Inside the cooldown: fail fast, no browser cycle.
+        s.record_cold_walled("poison.com", Some("cf"));
+        s.record_cold_walled("poison.com", Some("cf"));
+        // Inside the cooldown: fail fast, no wasted attempt.
         assert!(matches!(
             s.route_for("poison.com"),
             RouteDecision::SolveCooldown(_)
         ));
-        // Cooldown lapsed: falls back to normal routing (cold here:
-        // no other memory on this fresh profile).
+        // Cooldown lapsed: routable again (an honest attempt; the
+        // wall memory stays).
         let p = s.profiles.get_mut("poison.com").unwrap();
         p.last_wall_fail = now() - 16 * 60;
-        assert!(matches!(s.route_for("poison.com"), RouteDecision::Cold));
+        assert!(matches!(
+            s.route_for("poison.com"),
+            RouteDecision::SkipToSolve
+        ));
     }
 
     #[test]
-    fn solved_wall_clears_cooldown_memory() {
+    fn warm_ok_clears_cooldown_memory() {
         let mut s = GhostState::default();
-        s.record_wall_failed("heals.com");
-        s.record_wall_failed("heals.com");
-        s.record_solved(
+        s.record_cold_walled("heals.com", Some("Cloudflare"));
+        s.record_cold_walled("heals.com", Some("Cloudflare"));
+        let p = s.profiles.get_mut("heals.com").unwrap();
+        p.replay_ok = true;
+        // Fresh solve evidence: cookies_fresh_at needs last_solved
+        // inside its cap (the field rides legacy state otherwise).
+        p.last_solved = now();
+        s.record_warm_ok(
             "heals.com",
             &[cr("cf_clearance", "x", ".heals.com", Some(9_999_999_999))],
-            Some("Cloudflare"),
-            true,
         );
         let p = &s.profiles["heals.com"];
         assert_eq!(p.wall_fail_streak, 0);
@@ -3811,8 +3256,8 @@ mod tests {
     #[test]
     fn cold_ok_clears_cooldown_memory() {
         let mut s = GhostState::default();
-        s.record_wall_failed("eases.com");
-        s.record_wall_failed("eases.com");
+        s.record_cold_walled("eases.com", Some("cf"));
+        s.record_cold_walled("eases.com", Some("cf"));
         s.record_cold_ok("eases.com");
         let p = &s.profiles["eases.com"];
         assert_eq!(p.wall_fail_streak, 0);
@@ -3822,7 +3267,7 @@ mod tests {
     #[test]
     fn one_wall_fail_is_not_a_cooldown() {
         let mut s = GhostState::default();
-        s.record_wall_failed("once.com");
+        s.record_cold_walled("once.com", Some("cf"));
         assert!(
             !matches!(s.route_for("once.com"), RouteDecision::SolveCooldown(_)),
             "a single failure must not gate the domain"
@@ -3872,12 +3317,6 @@ mod tests {
         assert!(learned >= 120, "lifetime floored at 120s, got {learned}");
         assert!(!p.replay_ok);
         // Warm success resets the streak.
-        s.record_solved(
-            "hard.com",
-            &[cr("cf_clearance", "y", ".hard.com", Some(9999))],
-            None,
-            true,
-        );
         s.record_warm_ok("hard.com", &[]);
         assert_eq!(s.profiles["hard.com"].warm_fail_streak, 0);
     }
@@ -3927,16 +3366,21 @@ mod tests {
         let host = "cf-protected.com";
         let now = now();
 
-        // Visit 1: unknown → cold → walled → solve (replay verified)
+        // Visit 1: unknown → cold → walled; the vault carries
+        // verified clearance (a login session or legacy state).
         assert!(matches!(s.route_for(host), RouteDecision::Cold));
         s.record_cold_walled(host, Some("cloudflare"));
-        let cookies = vec![cr(
-            "cf_clearance",
-            "tok1",
-            ".cf-protected.com",
-            Some(now + 3600),
-        )];
-        s.record_solved(host, &cookies, Some("cloudflare"), true);
+        {
+            let p = s.profiles.get_mut(host).unwrap();
+            p.cookies = vec![cr(
+                "cf_clearance",
+                "tok1",
+                ".cf-protected.com",
+                Some(now + 3600),
+            )];
+            p.replay_ok = true;
+            p.last_solved = now;
+        }
 
         // Visit 2: hard + fresh + replay-verified → warm
         match s.route_for(host) {
@@ -3964,7 +3408,6 @@ mod tests {
         // Verify the domain profile converged
         let p = &s.profiles[host];
         assert_eq!(p.warm_ok_count, 1);
-        assert_eq!(p.solve_count, 1);
         assert_eq!(p.walled_count, 1);
         assert!(p.needs_tier2);
     }
@@ -4050,14 +3493,14 @@ mod tests {
     }
 
     #[test]
-    fn solved_stores_only_clearance() {
+    fn warm_ok_stores_only_clearance() {
         let mut s = GhostState::default();
         let cookies = vec![
             cr("cf_clearance", "tok", ".a.com", Some(now() + 3600)),
             cr("_ga", "tracking", ".a.com", None),
             cr("datadome", "val", ".a.com", Some(now() + 3600)),
         ];
-        s.record_solved("a.com", &cookies, Some("cloudflare"), true);
+        s.record_warm_ok("a.com", &cookies);
         let p = &s.profiles["a.com"];
         assert_eq!(p.cookies.len(), 2); // cf_clearance + datadome only
     }
