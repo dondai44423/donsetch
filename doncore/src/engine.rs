@@ -53,6 +53,20 @@ pub struct Outcome {
     pub errors: Vec<String>,
     pub net_log: Vec<rt::NetRecord>,
     pub cache: Option<CacheOutcome>,
+    /// Wave W / D5 (2026-10-24): the largest inline JSON state object the
+    /// document carried (`ytInitialData`, `__NEXT_DATA__`, Nuxt, IG's
+    /// `_sharedData` — the class is "big JSON literal assigned to a global"),
+    /// surfaced when the final content stayed thin. The content a
+    /// JS-dependent page ships in its own HTML is content; the extractor
+    /// walks it instead of failing "did not hydrate".
+    pub state: Option<StateJson>,
+}
+
+/// A harvested inline state object: its global name and the JSON text.
+#[derive(Clone, Debug)]
+pub struct StateJson {
+    pub name: String,
+    pub json: String,
 }
 
 /// How the state plane served this document. Typed: consumers map it;
@@ -355,6 +369,9 @@ impl Engine {
         // the typing block below the challenge cycle needs the budget verdict at
         // the same scope level as the label (mirrors round_stalled/stalled_ms)
         let mut budget_cut = false;
+        // Wave W: a runtime round cut by budget or stall produced UNKNOWN
+        // evidence, never no-gain evidence (see note_runtime).
+        let mut runtime_cut = false;
 
         let challenge = challenge_detected(&current_html);
         let html_like = looks_html(&current_html);
@@ -373,6 +390,9 @@ impl Engine {
         let mut errors: Vec<String> = Vec::new();
         let mut net_log: Vec<rt::NetRecord> = Vec::new();
 
+        // Loose vendor markers, computed once at function scope (the run
+        // gate reads them inside Auto; the typing block reads them after).
+        let hint = js_challenge_hint(&current_html);
         let run_js = match js {
             JsMode::Never => false,
             JsMode::Always => html_like,
@@ -385,13 +405,18 @@ impl Engine {
                 // ticketmaster's own content, site-wide `px-captcha`) forced
                 // 4-12s JS runs on pages that had already delivered — the
                 // gate stops that class cold (nike was the same law, part 15).
-                let hint = js_challenge_hint(&current_html);
                 let mut run = html_like && crude_len < 600 && (challenge || !scripts.is_empty());
                 // phase 3 (PER-HOST LEARNING): the measured skip — a page
                 // shape whose runtime runs never gained content stays off
                 // the runtime while the evidence is fresh. Challenges are
                 // never skipped, and `--js always` bypasses this entirely.
-                if run && !challenge && (200..400).contains(&status) {
+                // Wave W / D3: a loose challenge hint (challenge-platform,
+                // cf-chl, turnstile, datadome…) on a THIN page means the page
+                // may be an unsolved challenge — the sweep-#5 law only bars
+                // loose strings from forcing RUNS on content pages; here they
+                // bar the LEARNED SKIP, or failed solves become permanent
+                // thin serves (quora's live 200-variant).
+                if run && !challenge && !hint && (200..400).contains(&status) {
                     if let (Some(h), Some(hk)) = (&self.hosts, &host_key) {
                         let key = shape_key(crude_len, scripts.len());
                         if let Some(runs) = h.skip_ok(hk, &key, budget_ms) {
@@ -418,6 +443,7 @@ impl Engine {
         // clearance-TTL observation.
         let thin_ctx = if run_js
             && !challenge
+            && !hint
             && (200..400).contains(&status)
             && html_like
             && crude_len < 600
@@ -516,6 +542,9 @@ impl Engine {
                 round_stalled = report.stalled;
                 stalled_ms = report.stalled_ms;
                 budget_cut = report.timed_out;
+                if report.timed_out || report.stalled {
+                    runtime_cut = true;
+                }
                 if report.idle_ms > 0 && !challenge {
                     errors.push(format!(
                         "stopped: page idle — no content/net/cookie change for {}ms (typed no-progress stop)",
@@ -679,7 +708,18 @@ impl Engine {
         // must never surface as ordinary content, and a challenge the budget cut
         // must not read as success. The worst fetch outcome in this project is a
         // success-looking page that is actually the challenge.
+        // Wave W / D3 (2026-10-24): the wall_evidence scan runs on the FINAL
+        // html — but a challenge widget RE-RENDERS the DOM, and the re-rendered
+        // shell can lose every textual marker ("Just a moment…" lived in the
+        // wire document, not the widget's DOM). The engine KNOWS whether it ran
+        // a challenge and whether that challenge cleared: challenge && thin
+        // output && no clearance label IS a wall, markers or no markers. The
+        // pre-JS wire document is what gets served then — it is the honest
+        // wall evidence, and the product's detector reads its real markers.
+        let mut wire_html = doc.body.clone();
         if label != "wire+js+clearance" && label != "wire+js+nav" {
+            let challenge_uncleared =
+                challenge && label.starts_with("wire+js") && crude_text(&current_html).len() < 600;
             if let Some(kind) = wall_evidence(&current_html) {
                 if label != "walled" {
                     let prev = label.clone();
@@ -694,6 +734,36 @@ impl Engine {
                     "walled: challenge still in progress when the runtime budget ran out — no clearance"
                         .into(),
                 );
+            } else if challenge_uncleared && label != "walled" {
+                let prev = label.clone();
+                label = "walled".into();
+                errors.push(format!(
+                    "walled: challenge ran ({prev}) but never cleared — no clearance cookie, no navigation, no content"
+                ));
+            } else if !challenge
+                && hint
+                && label.starts_with("wire+js")
+                && crude_text(&current_html).len() < 600
+                && label != "walled"
+            {
+                // Wave W / D3: the loose-marker challenge shell — the runtime
+                // ran, nothing hydrated, and the thin body carries vendor
+                // challenge markers (challenge-platform / cf-chl / turnstile /
+                // datadome). An unsolved wall, typed honestly.
+                label = "walled".into();
+                errors.push(
+                    "walled: vendor challenge shell never produced content (challenge markers present, no clearance)".into(),
+                );
+            }
+            if label == "walled"
+                && (challenge || hint)
+                && crude_text(&current_html).len() < 600
+                && (challenge_detected(&wire_html) || wall_evidence(&wire_html).is_some())
+            {
+                // Serve the wall the WIRE fetched, not the widget's re-render:
+                // the original document carries the vendor markers the
+                // product's detector (and the agent) need to see.
+                std::mem::swap(&mut current_html, &mut wire_html);
             }
         }
 
@@ -702,7 +772,7 @@ impl Engine {
         if let (Some(h), Some(hk)) = (&self.hosts, &host_key) {
             if let Some((key, before)) = &thin_ctx {
                 let gain = crude_text(&current_html).len().saturating_sub(*before) as u64;
-                h.note_runtime(hk, key, gain, budget_ms);
+                h.note_runtime(hk, key, gain, budget_ms, !runtime_cut);
             }
             if challenge {
                 h.note_challenge(hk);
@@ -732,8 +802,17 @@ impl Engine {
         }
 
         let text = crude_text(&current_html);
+        // Wave W / D5: thin output + a big inline state object in the WIRE
+        // document = the content shipped with the page. Harvest it (never
+        // for a wall outcome — a challenge shell's state is not content).
+        let state = if text.len() < 600 && label != "walled" {
+            harvest_state_json(&doc.body)
+        } else {
+            None
+        };
         let jar_len = self.wire.jar.lock().unwrap().len();
         Ok(Outcome {
+            state,
             status,
             headers: final_headers,
             url: final_url,
@@ -1206,6 +1285,141 @@ pub fn crude_text(html: &str) -> String {
     collapsed.trim().to_string()
 }
 
+/// Wave W / D5: find the largest inline JSON state object in a document.
+/// The class: an inline `<script>` assigning a big JSON literal to a global
+/// (`ytInitialData = {...}`, `window._sharedData = {...}`,
+/// `var __NEXT_DATA__ = {...}`). Measured: youtube.com ships its whole
+/// homepage this way (962KB document, 163 visible DOM chars) and fails
+/// "did not hydrate" with the content in hand. A whole-script JSON body
+/// (type="application/json" style) is harvested too.
+const STATE_MIN: usize = 8 * 1024;
+const STATE_MAX: usize = 2 * 1024 * 1024;
+
+pub fn harvest_state_json(html: &str) -> Option<StateJson> {
+    let mut best: Option<StateJson> = None;
+    let mut pos = 0usize;
+    let lower = html.to_ascii_lowercase();
+    while let Some(off) = lower[pos..].find("<script") {
+        let start = pos + off;
+        let Some(gt_off) = lower[start..].find('>') else {
+            break;
+        };
+        let gt = start + gt_off;
+        let Some(close_off) = lower[gt..].find("</script") else {
+            break;
+        };
+        let close = gt + close_off;
+        let body = &html[gt + 1..close];
+        pos = close + 9;
+        if body.len() < STATE_MIN {
+            continue;
+        }
+        let trimmed = body.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if let Some(st) = take_json(trimmed, STATE_MAX) {
+                if st.len() >= STATE_MIN {
+                    best = max_state(
+                        best,
+                        StateJson {
+                            name: "inline".into(),
+                            json: st,
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+        let mut search = 0usize;
+        while let Some(eq_off) = body[search..].find('=') {
+            let eq = search + eq_off;
+            let before = body[..eq].trim_end();
+            let lhs_start = before
+                .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let lhs = &before[lhs_start..];
+            let name = lhs.rsplit('.').next().unwrap_or("");
+            let after = body[eq + 1..].trim_start();
+            let valid_name = name.len() >= 3
+                && name.len() <= 48
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$');
+            if valid_name && (after.starts_with('{') || after.starts_with('[')) {
+                if let Some(st) = take_json(after, STATE_MAX) {
+                    if st.len() >= STATE_MIN {
+                        best = max_state(
+                            best,
+                            StateJson {
+                                name: name.to_string(),
+                                json: st,
+                            },
+                        );
+                    }
+                }
+            }
+            search = eq + 1;
+            if search >= body.len() {
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn max_state(cur: Option<StateJson>, cand: StateJson) -> Option<StateJson> {
+    match cur {
+        Some(c) if c.json.len() >= cand.json.len() => Some(c),
+        _ => Some(cand),
+    }
+}
+
+/// Extract one JSON value from the start of `s` (object or array), honoring
+/// string escapes so braces inside strings cannot end it early. None when no
+/// value starts here or it exceeds `cap`.
+fn take_json(s: &str, cap: usize) -> Option<String> {
+    let b = s.as_bytes();
+    if b.is_empty() || (b[0] != b'{' && b[0] != b'[') {
+        return None;
+    }
+    let open = b[0];
+    let close = if open == b'{' { b'}' } else { b']' };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &c) in b.iter().enumerate() {
+        if i > cap {
+            return None;
+        }
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            _ if c == open => depth += 1,
+            _ if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    let slice = &s[..=i];
+                    return serde_json::from_str::<serde_json::Value>(slice)
+                        .ok()
+                        .map(|_| slice.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// True when two strings name the same URL once canonicalized. The wire
 /// normalizes a bare authority (`https://host` → `https://host/`, host case,
 /// default ports), so a byte compare would misjudge the entry's own
@@ -1218,5 +1432,23 @@ fn same_url(a: &str, b: &str) -> bool {
     match (url::Url::parse(a), url::Url::parse(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod wave_w_state_tests {
+    use super::*;
+
+    #[test]
+    fn wave_w_harvests_the_global_assignment_class() {
+        let big = format!("{{\"videos\": [\"{}\"]}}", "title ".repeat(3000));
+        let html = format!(
+            "<html><head><script>var config = 1;</script><script>window.ytInitialData = {big};</script></head><body><div id=root></div></body></html>"
+        );
+        let st = harvest_state_json(&html).expect("state must harvest");
+        assert_eq!(st.name, "ytInitialData");
+        assert!(st.json.len() > 8000);
+        let html2 = "<html><body><script>window.__INIT = {\"a\": 1};</script></body></html>";
+        assert!(harvest_state_json(html2).is_none());
     }
 }

@@ -207,6 +207,13 @@ fn fetch(args: &[String]) {
                 o.net_calls,
                 o.jar_len
             );
+            if let Some(st) = &o.state {
+                println!(
+                    "state:    {} ({} KB harvested from inline JSON)",
+                    st.name,
+                    st.json.len() / 1024
+                );
+            }
             let ctype = o
                 .headers
                 .iter()

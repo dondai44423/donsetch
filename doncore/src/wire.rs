@@ -822,6 +822,32 @@ impl IdentityStrip {
     }
 }
 
+/// Wave W / D2 (2026-10-24): the body law. A total wall clock around the
+/// whole response is WRONG for this wire (v4.7.3 measured it; the v5 wire
+/// regressed it and arXiv's throttled PDF died at 25.8s with bytes flowing).
+/// Phase bounds instead: headers wait at most this long; a body may take as
+/// long as it keeps making progress (bytes at least this often); the
+/// structural total above is only the never-hang guarantee. The env
+/// overrides exist for the fixtures (a live 30s stall is not a test).
+fn env_bound_ms(name: &str, default: std::time::Duration) -> std::time::Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
+}
+
+fn headers_bound() -> std::time::Duration {
+    env_bound_ms("DONCORE_HEADERS_BOUND_MS", HEADERS_BOUND)
+}
+
+fn body_stall() -> std::time::Duration {
+    env_bound_ms("DONCORE_BODY_STALL_MS", BODY_STALL)
+}
+
+const HEADERS_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+const BODY_STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Lazily built wreq clients — one per egress: the direct client plus one per
 /// proxy URL. A proxied client is never shared with the direct lane, and a
 /// proxy URL the builder rejects fails that request only.
@@ -870,7 +896,16 @@ impl ClientCache {
             // connect (TCP+TLS) gets 3s — draw #2 burned 25s in connect on
             // xbabe/adups/kompoz2; every observed live wire completed in <1.3s.
             .connect_timeout(std::time::Duration::from_secs(3))
-            .timeout(std::time::Duration::from_secs(25));
+            // NO client-level total (Wave W / D2, 2026-10-24): wreq's
+            // `.timeout()` wraps the BODY stream too — a 25s wall killed
+            // every transfer that legitimately needs longer with bytes
+            // flowing (arXiv PDF: throttled origin, 25.8s), and 60s only
+            // moved the cliff. The v4.7.3 law is restored exactly: the
+            // headers phase is bounded (10s, `do_request`), the body by
+            // PROGRESS (30s no-byte stall), writes+connect by connect
+            // timeout + the headers bound. A caller's own `timeout_ms`
+            // still applies a per-request total when it sets one.
+            ;
         if let Some(p) = proxy {
             let proxy = wreq::Proxy::all(p).map_err(|e| wire_err(ErrorClass::Proxy, e))?;
             builder = builder.proxy(proxy);
@@ -1090,13 +1125,25 @@ async fn do_request(
         builder = builder.body(body.clone());
     }
     let send = builder.send();
+    // Headers phase bound: the connect timeout covers TCP+TLS, but a server
+    // that accepts and then never answers would sit inside the structural
+    // total. Ten seconds with no response head is a typed timeout.
+    let mut send = std::pin::pin!(send);
     let resp = match req.cancel.clone() {
         Some(mut rx) => {
             if *rx.borrow() {
                 return Err(wire_err(ErrorClass::Request, "cancelled: caller went away"));
             }
             tokio::select! {
-                r = send => r,
+                r = tokio::time::timeout(headers_bound(), send.as_mut()) => match r {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Err(wire_err(
+                            ErrorClass::Timeout,
+                            format!("headers: no response within {}s", HEADERS_BOUND.as_secs()),
+                        ))
+                    }
+                },
                 _ = rx.changed() => {
                     return Err(wire_err(
                         ErrorClass::Request,
@@ -1105,7 +1152,15 @@ async fn do_request(
                 }
             }
         }
-        None => send.await,
+        None => match tokio::time::timeout(headers_bound(), send).await {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(wire_err(
+                    ErrorClass::Timeout,
+                    format!("headers: no response within {}s", HEADERS_BOUND.as_secs()),
+                ))
+            }
+        },
     }
     .map_err(|e| {
         if let Some(url) = chain_denied_hop(&e) {
@@ -1152,11 +1207,29 @@ async fn do_request(
     // One body path for text and binary: read capped, then decode. The decode
     // mirrors `text()` exactly (Content-Type charset, default UTF-8); the cap
     // is the addition, and `truncated` makes it visible.
+    // Wave W / D2: the body is bounded by PROGRESS, not a wall clock — each
+    // chunk must arrive within BODY_STALL of the last one. A throttled origin
+    // that keeps sending (arXiv PDFs) completes; a stalled one times out with
+    // the honest `timeout: body: stalled` class. The caller's own
+    // `timeout_ms` (set per request) still wins as a total when present.
     let cap = req.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     let mut buf: Vec<u8> = Vec::new();
     let mut truncated = false;
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = match tokio::time::timeout(body_stall(), stream.next()).await {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(wire_err(
+                    ErrorClass::Timeout,
+                    format!(
+                        "body: stalled — no bytes for {}ms (progress-bounded; the server stopped sending)",
+                        body_stall().as_millis()
+                    ),
+                ))
+            }
+        };
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| wire_err(ErrorClass::Body, e))?;
         if buf.len() + chunk.len() > cap {
             buf.extend_from_slice(&chunk[..cap.saturating_sub(buf.len())]);
@@ -1887,5 +1960,119 @@ mod tests {
             .expect_err("a 407 CONNECT must fail");
         assert!(err.starts_with("proxy:"), "{err}");
         assert!(err.contains("407"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod wave_w_body_law_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+
+    /// A server that answers headers immediately, then drips the body one
+    /// byte at a time with pauses longer than a browser would tolerate but
+    /// shorter than the stall bound: a throttled origin that KEEPS SENDING.
+    /// Wave W / D2: the v5 wire's whole-request wall clock killed exactly
+    /// this transfer (arXiv PDF, 25.8s); the progress law must complete it.
+    #[test]
+    fn slow_drip_body_completes_under_the_progress_law() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut r = std::io::BufReader::new(s.try_clone().expect("clone"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let body: Vec<u8> = (0..64u8).collect();
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nConnection: close\r\n\r\n",
+            );
+            for b in body {
+                let _ = s.write_all(&[b]);
+                let _ = s.flush();
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            // total transfer ~1.9s with bytes every 30ms: progress throughout
+        });
+        let w = wire();
+        let resp = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: format!("http://127.0.0.1:{port}/x.pdf"),
+                kind: ReqKind::Document,
+                bytes: true,
+                ..Default::default()
+            })
+            .expect("a dripping body completes");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.raw.as_deref(),
+            Some(&(0..64u8).collect::<Vec<u8>>()[..])
+        );
+    }
+
+    /// A server that answers headers and then goes SILENT mid-body: the
+    /// stall bound cuts it with the honest `timeout: body: stalled` class,
+    /// at the (fixture-tuned) stall bound — not at a 25s wall.
+    #[test]
+    fn stalled_body_times_out_typed_at_the_stall_bound() {
+        std::env::set_var("DONCORE_BODY_STALL_MS", "600");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut r = std::io::BufReader::new(s.try_clone().expect("clone"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            // headers promise 1024 bytes, then send 16 and go dark
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n",
+            );
+            let _ = s.write_all(&[b'a'; 16]);
+            let _ = s.flush();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let w = wire();
+        let t0 = Instant::now();
+        let err = w
+            .fetch(WireReq {
+                method: "GET".into(),
+                url: format!("http://127.0.0.1:{port}/stall"),
+                kind: ReqKind::Document,
+                ..Default::default()
+            })
+            .expect_err("a silent server must time out");
+        let ms = t0.elapsed().as_millis();
+        assert!(
+            err.starts_with("timeout:") && err.contains("body: stalled"),
+            "{err}"
+        );
+        // the stall bound (600ms fixture) cuts it, not any wall clock
+        assert!(ms < 3000, "cut at {ms}ms — the stall bound did not own it");
+        std::env::remove_var("DONCORE_BODY_STALL_MS");
+    }
+
+    fn wire() -> Wire {
+        use wreq::IntoEmulation;
+        let emu = wreq_util::Emulation::builder()
+            .profile(wreq_util::Profile::Chrome149)
+            .platform(wreq_util::Platform::Linux)
+            .build();
+        Wire::new(emu.into_emulation(), Vec::new())
     }
 }

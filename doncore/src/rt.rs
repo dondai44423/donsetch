@@ -144,13 +144,23 @@ fn content_settled(
     // 602 chars flat from 1.2s) wait out six seconds for nothing — stability
     // IS the proof it will not grow; elapsed time was not.
     let threshold: i64 = 600;
-    if len >= threshold && *prev_len >= 0 && (len - *prev_len).abs() <= 32 {
+    // Wave W: a shorter REAL page (x.com's hydrated logged-out shell, 413
+    // chars) is content too — it settles on a longer stability proof instead
+    // of burning the budget under an analytics timer churn.
+    let short_threshold: i64 = 250;
+    let short_need: u32 = 5;
+    if (len >= threshold && *prev_len >= 0 && (len - *prev_len).abs() <= 32 && *stable + 1 >= 2)
+        || (len >= short_threshold
+            && *prev_len >= 0
+            && (len - *prev_len).abs() <= 32
+            && *stable + 1 >= short_need)
+    {
         *stable += 1;
     } else {
         *stable = 0;
     }
     *prev_len = len;
-    let settled = *stable >= 2;
+    let settled = *stable >= 2 || (len >= short_threshold && *stable >= short_need);
     if std::env::var("DONCORE_TRACE").is_ok() {
         eprintln!(
             "[settle] {tag} loop={loop_elapsed_ms}ms len={len} th={threshold} stable={} settled={settled}",
@@ -168,6 +178,9 @@ fn content_settled(
 /// meow/food (and fail/overrunBegin) posts are liveness — never progress.
 /// Never applies to non-challenge pages (content_settled owns those).
 const CHALLENGE_STALL_MS: u128 = 1500;
+/// Wave W / D1: the interrupt bound for ONE synchronous eval inside a
+/// challenge round (re-armed per stage advance). See `bump`.
+const CHALLENGE_SYNC_BOUND_MS: u128 = 2500;
 const CHALLENGE_STALL_SAMPLE_MS: u128 = 100;
 const CHALLENGE_JS_BUSY_MS: u128 = 120;
 /// Runtime override for the stall/busy bounds (experiments): parse `name`
@@ -179,11 +192,23 @@ fn env_ms(name: &str, default: u128) -> u128 {
         .unwrap_or(default)
 }
 
+/// Wave W / D1 (2026-10-24): advance QUALITY. The live audit measured CF
+/// widget challenges burning the caller's whole budget (4chan 25.3s, medium
+/// 16.1s, quora 15.0s) because JS-busy (≥120ms in one sample) and repeated
+/// heartbeat POSTs refreshed the watchdog forever. A STAGE advance is: a
+/// postMessage stage move, a cookie change, a pending/new dynamic script, or
+/// a wire call to an endpoint SHAPE never seen this round. LIVENESS
+/// (busy JS, a repeated endpoint) counts only inside the boot window —
+/// after that it is the meow/food law applied to the whole watchdog: a
+/// challenge that keeps repeating itself is stalled, and the honest answer
+/// is a fast typed wall, not a budget burn.
+const CHALLENGE_BOOT_WINDOW_MS: u128 = 2500;
+
 struct StallWatch {
     last_progress: Instant,
     last_adv: i64,
-    last_net: usize,
     last_jar: usize,
+    net_shapes: std::collections::HashSet<(String, String)>,
     sampled_at: Instant,
     busy_ms: u128,
     trace: bool,
@@ -195,8 +220,8 @@ impl StallWatch {
         Self {
             last_progress: now,
             last_adv: -1,
-            last_net: 0,
             last_jar: 0,
+            net_shapes: std::collections::HashSet::new(),
             sampled_at: now,
             busy_ms: 0,
             trace: std::env::var("DONCORE_TRACE").is_ok(),
@@ -216,8 +241,22 @@ impl StallWatch {
         }
     }
 
-    /// Sample ~every 100ms. Some(silence_ms) once nothing has advanced for
-    /// CHALLENGE_STALL_MS — the caller stops the round.
+    /// The endpoint shape of a net record: method + path (query stripped) —
+    /// heartbeats re-POST the same path with fresh tokens; a NEW stage calls
+    /// a NEW path.
+    fn net_shape(rec: &NetRecord) -> (String, String) {
+        let path = rec
+            .url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .map(|(_, p)| p.split(['?', '#']).next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        (rec.method.clone(), path)
+    }
+
+    /// Sample ~every 100ms. Some(silence_ms) once no STAGE advance has
+    /// happened for CHALLENGE_STALL_MS (outside the boot window) — the
+    /// caller stops the round.
     fn sample(
         &mut self,
         ctx: &rquickjs::Context,
@@ -234,30 +273,46 @@ impl StallWatch {
                 ctx.eval::<i64, _>("(typeof __DCI.pmAdv === \"function\") ? __DCI.pmAdv() : -1")
             })
             .unwrap_or(-1);
-        let net = harvest.borrow().len();
         let jlen = jar.lock().unwrap_or_else(|p| p.into_inner()).len();
         let pend: i32 = ctx
             .with(|ctx| ctx.eval::<i32, _>(PENDING_SCRIPTS_EXPR).unwrap_or(0))
             .max(0);
         let busy = self.busy_ms >= env_ms("DONCORE_JSBUSY_MS", CHALLENGE_JS_BUSY_MS);
         self.busy_ms = 0;
+        let boot =
+            t0.elapsed().as_millis() <= env_ms("DONCORE_BOOT_WINDOW_MS", CHALLENGE_BOOT_WINDOW_MS);
+        // stage advances
+        let pm_adv = adv >= 0 && adv != self.last_adv;
+        let new_shape = {
+            let h = harvest.borrow();
+            let mut fresh = false;
+            for rec in h.iter() {
+                if self.net_shapes.insert(Self::net_shape(rec)) {
+                    fresh = true;
+                }
+            }
+            fresh
+        };
         let mut why = "";
-        if adv >= 0 && adv != self.last_adv {
+        if pm_adv {
             why = "pm";
-        } else if net != self.last_net {
-            why = "net";
+        } else if new_shape {
+            why = "net+";
         } else if jlen != self.last_jar {
             why = "jar";
         } else if pend > 0 {
             why = "pend";
-        } else if busy {
-            why = "busy";
+        } else if boot && busy {
+            why = "busy(boot)";
+        } else if boot && harvest.borrow().len() != self.net_shapes.len() {
+            // boot window: even a repeat POST is movement while the widget
+            // is still coming up (early rounds re-POST with fresh rays)
+            why = "net(boot)";
         }
         if !why.is_empty() {
             if adv >= 0 {
                 self.last_adv = adv;
             }
-            self.last_net = net;
             self.last_jar = jlen;
             self.last_progress = Instant::now();
             if self.trace {
@@ -268,7 +323,7 @@ impl StallWatch {
         let silence = self.last_progress.elapsed().as_millis();
         if silence >= env_ms("DONCORE_STALL_MS", CHALLENGE_STALL_MS) {
             if self.trace {
-                eprintln!("[stall] no advance for {silence}ms — stopping challenge round");
+                eprintln!("[stall] no stage advance for {silence}ms — stopping challenge round");
             }
             return Some(silence);
         }
@@ -355,6 +410,76 @@ impl IdleWatch {
 // but never answered).
 const API_PROBE_SNIPPET: &str = r#";(function(){try{var __ae=window.addEventListener;window.addEventListener=function(t,f,o){if(t==='message'&&typeof f==='function'){var w=function(ev){try{var d=(ev&&ev.data)||{};__DCI.log('API-RECV ev='+String(d.event)+' @'+Date.now())}catch(eR1){}try{return f.apply(this,arguments)}catch(e){__DCI.log('API-THREW '+String(e&&e.message).slice(0,170)+' @@ '+String(e&&e.stack).split(String.fromCharCode(10)).slice(0,5).join(' | ').slice(0,360));throw e}};var __rr=__ae.call(this,t,w,o);try{__DCI.log('API-REG @'+Date.now())}catch(eR2){}return __rr}return __ae.apply(this,arguments)}}catch(e){}})();"#;
 
+/// Wave W (2026-10-24): stylesheet loads. Chrome fetches every
+/// `<link rel=stylesheet>` and fires `load`/`error` on the element when the
+/// fetch settles; CSS-gated boot patterns (x.com's entry loader) hang
+/// forever without the event. Drives the prelude's takeStyles/styleDone.
+fn drain_styles(ctx: &rquickjs::Context, wire: &Wire, page_url: &str, deadline: Instant) {
+    let batch: String = ctx
+        .with(|ctx| ctx.eval::<String, _>("__DCI.takeStyles()"))
+        .unwrap_or_else(|_| "[]".to_string());
+    let items: Vec<serde_json::Value> = serde_json::from_str(&batch).unwrap_or_default();
+    if std::env::var("DONCORE_TRACE").is_ok() {
+        eprintln!("[styles] takeStyles -> {batch}");
+    }
+    if items.is_empty() {
+        return;
+    }
+    let reqs: Vec<WireReq> = items
+        .iter()
+        .filter_map(|it| {
+            let href = it.get("href")?.as_str()?.to_string();
+            let resolved = url::Url::parse(page_url)
+                .ok()
+                .and_then(|b| b.join(&href).ok())
+                .map(|u| u.to_string())
+                .unwrap_or(href);
+            Some(WireReq {
+                method: "GET".into(),
+                url: resolved,
+                kind: ReqKind::Style,
+                extra_headers: vec![("referer".into(), page_url.to_string())],
+                body: None,
+                timeout_ms: Some(remaining_ms(deadline)),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let results = wire.fetch_many(reqs);
+    for (it, r) in items.iter().zip(results) {
+        let ok = matches!(&r, Ok(resp) if (200..300).contains(&resp.status));
+        let i = it.get("i").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if i >= 0 {
+            let src = format!("__DCI.styleDone({i}, {ok})");
+            let _ = ctx.with(|ctx| ctx.eval::<(), _>(src));
+        }
+    }
+}
+
+/// Wave W: module evals carry a WIDER sync window than classic scripts —
+/// SPA entry bundles legitimately compute for seconds (pinterest's hydration
+/// module ~2.5s measured; the classic 2s bound cut it mid-render and turned a
+/// serving page into a shell). Six seconds still kills the pathological class
+/// (x.com's 14s single-module burn) without starving real hydration.
+fn bump_module(stop: &std::cell::Cell<Instant>, hard: Instant) {
+    let window = env_ms("DONCORE_MODULE_SYNC_MS", 6000);
+    let n = Instant::now() + Duration::from_millis(window as u64);
+    stop.set(if n < hard { n } else { hard });
+}
+
+/// Wave W: the per-call timeout a JS-phase wire fetch carries — the fetch's
+/// remaining structural budget, so a hung subresource surfaces as a typed
+/// page-visible failure instead of blocking the JS thread to the structural
+/// backstop. Past-deadline calls get the floor (1ms): the interrupt handler
+/// owns that regime; the wire just refuses to be the thing that outlives it.
+fn remaining_ms(deadline: Instant) -> u64 {
+    deadline
+        .checked_duration_since(Instant::now())
+        .map(|d| (d.as_millis() as u64).min(60_000))
+        .filter(|ms| *ms > 0)
+        .unwrap_or(1)
+}
+
 pub fn run_document(
     identity_json: &str,
     page_url: &str,
@@ -415,12 +540,17 @@ fn run_document_inner(
     // `error` only when some fetch failed, `load` for parse/throw/resolution
     // failures (dyn-sl2..sl6).
     let mod_netfail = Rc::new(Cell::new(false));
+    // The fetch's structural deadline — defined before every consumer below
+    // (the module loader, the net bridge, the script drains) so each wire
+    // call can carry the remaining budget as its own timeout.
+    let hard_deadline = Instant::now() + Duration::from_millis(budget_ms);
     rt.set_loader(
         ModResolver,
         ModLoader {
             wire: wire.clone(),
             page_url: page_url.to_string(),
             netfail: Rc::clone(&mod_netfail),
+            deadline: hard_deadline,
         },
     );
     // The ACTIVE stop time: starts at the hard structural deadline (the call
@@ -432,16 +562,22 @@ fn run_document_inner(
     // while real work that keeps producing events (stockx's 22-chunk init,
     // ~4s in QuickJS) is exempt — cutting mid-eval lost 12k chars. The
     // IdleWatch covers the between-iterations case with a typed note.
-    let hard_deadline = Instant::now() + Duration::from_millis(budget_ms);
     let stop_at = Rc::new(Cell::new(hard_deadline));
     fn bump(stop: &std::cell::Cell<Instant>, hard: Instant, challenge: bool) {
-        if challenge {
-            // Challenge rounds keep the full budget — the stall watchdog
-            // owns their no-advance case, and their compute stretches must
-            // not be interrupted by this bound.
-            return;
-        }
-        let n = Instant::now() + Duration::from_millis(2000);
+        // Wave W / D1: challenge rounds keep the FULL budget for their waits
+        // and round cadence, but a single SYNCHRONOUS eval is bounded by the
+        // interrupt at CHALLENGE_SYNC_BOUND_MS — re-armed by every stage
+        // advance between evals. Measured: 4chan's widget burned 20s inside
+        // ONE eval (the proof-of-work loop; QuickJS is 10-50x off V8 on hash
+        // iteration), where no watchdog can run. The bound turns that burn
+        // into an interrupted eval and an honest fast wall. SO-class solves
+        // measured 2.48-2.7s with many SMALL evals — unaffected.
+        let window = if challenge {
+            env_ms("DONCORE_CHALLENGE_SYNC_MS", CHALLENGE_SYNC_BOUND_MS)
+        } else {
+            2000
+        };
+        let n = Instant::now() + Duration::from_millis(window as u64);
         stop.set(if n < hard { n } else { hard });
     }
     let timed_out = Rc::new(Cell::new(false));
@@ -471,6 +607,7 @@ fn run_document_inner(
     // ── host functions + bootstrap + prelude + tree load ─────────────
     ctx.with(|ctx| -> Result<(), String> {
         let wire1 = wire.clone();
+        let bridge_deadline = hard_deadline;
         let h1 = Rc::clone(&harvest);
         let call = Function::new(
             ctx.clone(),
@@ -494,6 +631,7 @@ fn run_document_inner(
                     kind,
                     extra_headers: extra,
                     body: if body.is_empty() { None } else { Some(body) },
+                    timeout_ms: Some(remaining_ms(bridge_deadline)),
                     ..Default::default()
                 };
                 match wire1.fetch(req) {
@@ -742,6 +880,7 @@ fn run_document_inner(
                     kind: ReqKind::Script,
                     extra_headers: vec![("referer".into(), page_url.to_string())],
                     body: None,
+                    timeout_ms: Some(remaining_ms(hard_deadline)),
                     ..Default::default()
                 }),
                 _ => None, // inline + module slots (modules fetch in the deferred pass)
@@ -806,6 +945,7 @@ fn run_document_inner(
                         kind: ReqKind::Script,
                         extra_headers: vec![("referer".into(), page_url.to_string())],
                         body: None,
+                        timeout_ms: Some(remaining_ms(hard_deadline)),
                         ..Default::default()
                     });
                     match r {
@@ -844,6 +984,10 @@ fn run_document_inner(
                 continue;
             }
             mod_netfail.set(false);
+            // W2: a module eval is a synchronous-stretch risk with legitimate
+            // multi-second bodies — the WIDER module window applies (see
+            // bump_module).
+            bump_module(&stop_at, hard_deadline);
             let err: String = ctx.with(|ctx| eval_module_catch(&ctx, &name, &src));
             if !err.is_empty() {
                 report.scripts_failed += 1;
@@ -879,6 +1023,7 @@ fn run_document_inner(
                         kind: ReqKind::Script,
                         extra_headers: vec![("referer".into(), page_url.to_string())],
                         body: None,
+                        timeout_ms: Some(remaining_ms(hard_deadline)),
                         ..Default::default()
                     })
                 } else {
@@ -948,6 +1093,10 @@ fn run_document_inner(
                 let _ = ctx.eval::<(), _>("__DCI.curBeginKey(__DCI.CUR_KEY, __DCI.CUR_MODE)");
             });
         }
+        // W2: every synchronous eval carries the active bound (challenge:
+        // the sync window; a PoW loop inside a STATIC script burns the same
+        // 20s a dyn one does).
+        bump(&stop_at, hard_deadline, challenge);
         let err: String = ctx.with(|ctx| eval_catch(&ctx, &src));
         if !err.is_empty() {
             report.scripts_failed += 1;
@@ -978,6 +1127,12 @@ fn run_document_inner(
         }
     }
 
+    // Wave W: stylesheet loads — fetched and their load/error events fired
+    // AFTER the static script pass (a browser's CSS arrives while scripts
+    // run; the gating listeners are registered by those scripts — firing
+    // earlier would race them dead).
+    drain_styles(&ctx, wire, page_url, hard_deadline);
+
     // ── settle: microtasks + timers + lifecycle events ───────────────
     // __settle returns: >0 fired, 0 nothing left, -(wait_ms) earliest pending timer.
     // Timers are honored up to a horizon (a browser never exits with a due timer);
@@ -1007,7 +1162,15 @@ fn run_document_inner(
     let _ = ctx.with(|ctx| ctx.eval::<(), _>("__DCI.t.parseHeld = false;"));
     bump(&stop_at, hard_deadline, challenge);
     loop {
-        if timed_out.get() || Instant::now() >= stop_at.get() || settle_iters > 5000 {
+        // Challenge rounds wait to the HARD deadline (their retry timers can
+        // sit past the active sync bound); non-challenge rounds use the
+        // active no-progress stop as before.
+        let loop_stop = if challenge {
+            hard_deadline
+        } else {
+            stop_at.get()
+        };
+        if timed_out.get() || Instant::now() >= loop_stop || settle_iters > 5000 {
             if !timed_out.get() && !challenge && Instant::now() >= stop_at.get() {
                 bound_stop = true;
             }
@@ -1193,6 +1356,7 @@ fn run_document_inner(
                     kind: ReqKind::Script,
                     extra_headers: vec![("referer".into(), page_url.to_string())],
                     body: None,
+                    timeout_ms: Some(remaining_ms(hard_deadline)),
                     ..Default::default()
                 }) {
                     Ok(r) if (200..300).contains(&r.status) => {
@@ -1322,6 +1486,9 @@ fn run_document_inner(
             if is_mod {
                 mod_netfail.set(false);
             }
+            if is_mod {
+                bump_module(&stop_at, hard_deadline);
+            }
             let err: String = if is_mod {
                 // ST-8 unit 7: a dynamic module goes through real ESM (same as
                 // the static deferred pass), named by its resolved URL; an
@@ -1442,13 +1609,20 @@ fn run_document_inner(
             });
             pump_jobs(&rt, 4000, &job_errors);
         }
+        // dynamic <link rel=stylesheet> insertions ride the same drain
+        drain_styles(&ctx, wire, page_url, hard_deadline);
         let mut dyn_settle_iters = 0;
         let dyn_settle_t0 = Instant::now();
         let mut early2_prev_len: i64 = -1;
         let mut early2_stable: u32 = 0;
         let mut early2_sampled_at = Instant::now();
         loop {
-            if timed_out.get() || Instant::now() >= stop_at.get() || dyn_settle_iters > 5000 {
+            let loop_stop = if challenge {
+                hard_deadline
+            } else {
+                stop_at.get()
+            };
+            if timed_out.get() || Instant::now() >= loop_stop || dyn_settle_iters > 5000 {
                 if !timed_out.get() && !challenge && Instant::now() >= stop_at.get() {
                     bound_stop = true;
                 }
@@ -1885,6 +2059,9 @@ struct ModLoader {
     wire: Wire,
     page_url: String,
     netfail: Rc<Cell<bool>>,
+    /// Wave W: every module fetch is bounded by the fetch's own deadline —
+    /// a hung subresource must never block the JS thread past the budget.
+    deadline: Instant,
 }
 
 impl rquickjs::loader::Loader for ModLoader {
@@ -1900,6 +2077,7 @@ impl rquickjs::loader::Loader for ModLoader {
             kind: ReqKind::Script,
             extra_headers: vec![("referer".into(), self.page_url.clone())],
             body: None,
+            timeout_ms: Some(remaining_ms(self.deadline)),
             ..Default::default()
         });
         let body = match r {

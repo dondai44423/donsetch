@@ -230,6 +230,38 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
             walk(&value, "", &mut items, &mut order, 0);
         }
     }
+    finish(items, html, None, url, opts)
+}
+
+/// Wave W / D5 (2026-10-24): the engine harvested the page's largest inline
+/// state object straight from the WIRE document (the post-JS DOM serialize
+/// can lose script bodies — YouTube's ytInitialData lived in a script the
+/// serialize dropped, and the blob miner below saw an empty shell). Same
+/// walk, same scoring, same rendering as the html path.
+pub fn extract_state(
+    name: &str,
+    json: &str,
+    url: &str,
+    opts: &ExtractOptions,
+) -> Option<Extracted> {
+    let _ = name;
+    if opts.selector.is_some() || opts.toc {
+        return None;
+    }
+    let value: Value = serde_json::from_str(json).ok()?;
+    let mut items: Vec<Item> = Vec::new();
+    let mut order: usize = 0;
+    walk(&value, "", &mut items, &mut order, 0);
+    finish(items, "", None, url, opts)
+}
+
+fn finish(
+    items: Vec<Item>,
+    html: &str,
+    _direct: Option<&()>,
+    url: &str,
+    opts: &ExtractOptions,
+) -> Option<Extracted> {
     if items.is_empty() {
         return None;
     }
@@ -255,8 +287,13 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         return None;
     }
 
-    // Render markdown.
-    let preferred_title = super::metadata::metadata(&Html::parse_document(html)).title;
+    // Render markdown. (Empty html = the direct state path: no document
+    // to mine a title from.)
+    let preferred_title = if html.is_empty() {
+        None
+    } else {
+        super::metadata::metadata(&Html::parse_document(html)).title
+    };
     let (md, title) = render(&kept, url, preferred_title);
 
     if opts.focus.is_some() || opts.section.is_some() || opts.must_contain.is_some() {
@@ -809,6 +846,20 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     // reject unless the path is a real content key AND it reads
     // as prose (has spaces).
     if !t.contains(' ') && len >= 40 {
+        return (0.0, false);
+    }
+    // Wave W: route/manifest fragments (SPA state ships route tables:
+    // "/webcast/wallet_api/withdraw/v2") — space-free multi-segment paths
+    // are navigation data, never content.
+    if !t.contains(' ') && t.matches('/').count() >= 2 {
+        return (0.0, false);
+    }
+    // Wave W: config/identifier junk — snake_case machine tokens
+    // ("row_video_only_v86_predict500_copp_full") and embedded UA strings.
+    if !t.contains(' ') && (t.matches('_').count() >= 3 || t.matches('.').count() >= 3) {
+        return (0.0, false);
+    }
+    if t.starts_with("Mozilla/") {
         return (0.0, false);
     }
     let letters: usize = t.chars().filter(|c| c.is_ascii_alphabetic()).count();
@@ -1403,5 +1454,46 @@ mod strip_html_guard_tests {
         assert!(!out.contains("leak"), "{out}");
         assert!(out.contains("Hello"), "{out}");
         assert!(out.contains("world"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod wave_w_state_walk {
+    use super::*;
+
+    #[test]
+    fn wave_walks_a_content_bearing_state() {
+        let json = format!(
+            "{{\"videos\":[{}]}}",
+            (0..12)
+                .map(|i| {
+                    format!(
+                        "{{\"title\":\"Episode {} — building fast fetch tiers\",\"description\":\"{}\"}}",
+                        i,
+                        format!("Episode {} notes: {}", i, "A deep dive into transport design, stealth and honesty signals. ".repeat(3))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let opts = ExtractOptions::default();
+        let ex = extract_state("feed", &json, "https://example.tv/", &opts)
+            .expect("a content-bearing state must extract");
+        assert!(ex.total_chars > 400, "total_chars={}", ex.total_chars);
+        assert!(!ex.thin, "state content is not thin");
+        assert!(ex.markdown.contains("Episode 0"), "titles must survive");
+    }
+
+    #[test]
+    fn wave_a_content_free_state_is_honestly_rejected() {
+        // The logged-out youtube.com variant ships a ytInitialData with UI
+        // chrome only (no consent cookies -> no feed): the walker must NOT
+        // dress it up as content.
+        let Ok(json) = std::fs::read_to_string("/var/tmp/v5wave/ytstate.json") else {
+            eprintln!("fixture absent, skipping");
+            return;
+        };
+        let opts = ExtractOptions::default();
+        assert!(extract_state("ytInitialData", &json, "https://www.youtube.com/", &opts).is_none());
     }
 }

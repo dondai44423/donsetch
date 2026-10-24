@@ -305,16 +305,33 @@ function __elStore(o) {
   return L;
 }
 function addEventTarget(obj) {
-  obj.addEventListener = function (t, f) {
+  obj.addEventListener = function (t, f, cap) {
     if (__TRACE) { try { (globalThis.__aelLog = globalThis.__aelLog || []).push(String(t) + "|" + String(new Error().stack).split("\n")[1]); if (globalThis.__aelLog.length > 400) globalThis.__aelLog.shift(); } catch (e) {} }
     var L = __elStore(this);
     (L[t] = L[t] || []).push(f);
+    // Wave W (2026-10-24): capture registration. Resource events (load /
+    // error on link/img/script) do not bubble, but Chrome runs CAPTURE
+    // listeners on window/document/ancestors during the descent — the
+    // CSS-gated-boot pattern (x.com: document.addEventListener('load',
+    // startEntry, true) arms the app entry on the stylesheet's load) is
+    // dead without it. Stored beside the normal list (target-level
+    // dispatch keeps working); __fireResource walks this store.
+    if (cap === true) {
+      var C = __g(this, "__LC");
+      if (C === undefined) { C = {}; __hide(this, "__LC", C); }
+      (C[t] = C[t] || []).push(f);
+    }
   };
   obj.removeEventListener = function (t, f) {
     var L = __elStore(this);
     var a = L[t] || [];
     var i = a.indexOf(f);
     if (i >= 0) a.splice(i, 1);
+    var C = __g(this, "__LC");
+    if (C && C[t]) {
+      var j = C[t].indexOf(f);
+      if (j >= 0) C[t].splice(j, 1);
+    }
   };
   obj.dispatchEvent = function (e) {
     if (!e || !e.type) return true;
@@ -1104,10 +1121,7 @@ function __imgLoad(el) {
       var ok = ds.indexOf(",") > 0;
       try { __ns(el, "__complete", true); try { el.complete = true; } catch (e) {} } catch (e) {}
       try { __ns(el, "__imgFailed", !ok); } catch (e) {}
-      var ev = { type: ok ? "load" : "error", target: el, currentTarget: el, bubbles: false, cancelable: false };
-      try { if (ok && typeof el.onload === "function") el.onload(ev); } catch (e) { try { if (typeof __fireError === "function") __fireError(e); } catch (_fe) {} }
-      try { if (!ok && typeof el.onerror === "function") el.onerror(ev); } catch (e) { try { if (typeof __fireError === "function") __fireError(e); } catch (_fe) {} }
-      try { el.dispatchEvent(ev); } catch (e) {}
+      try { __fireResource(el, ok ? "load" : "error"); } catch (e) {}
     }, 0);
     return;
   }
@@ -1124,10 +1138,7 @@ function __imgLoad(el) {
     try { __ns(el, "__complete", true); try { el.complete = true; } catch (e) {} } catch (e) {}
     var ok = st >= 200 && st < 400;
     try { __ns(el, "__imgFailed", !ok); } catch (e) {}
-    var ev = { type: ok ? "load" : "error", target: el, currentTarget: el, bubbles: false, cancelable: false };
-    try { if (ok && typeof el.onload === "function") el.onload(ev); } catch (e) { try { if (typeof __fireError === "function") __fireError(e); } catch (_fe) {} }
-    try { if (!ok && typeof el.onerror === "function") el.onerror(ev); } catch (e) { try { if (typeof __fireError === "function") __fireError(e); } catch (_fe) {} }
-    try { el.dispatchEvent(ev); } catch (e) {}
+    try { __fireResource(el, ok ? "load" : "error"); } catch (e) {}
   }, 0);
 }
 (function () {
@@ -3713,6 +3724,78 @@ __DCI.takeScripts = function () {
   // drop every item after the first; splice keeps the rest queued.
   var out = __DCI.pendingScripts.splice(0, 1);
   return JSON.stringify(out);
+};
+
+// ───────────────────── Wave W: stylesheet loads + resource events ─────
+// Chrome fetches <link rel=stylesheet> and fires `load`/`error` on the
+// element when the fetch settles (capture-phase listeners on window and
+// document see them; they never bubble). Sites gate app boot on this
+// (x.com's loader inserts its entry module from a capture-phase load
+// listener); before this, stylesheets were never fetched and the events
+// never fired — the whole CSS-gated hydration class died as "did not
+// hydrate" with zero net calls.
+function __capFire(o, t, ev) {
+  try {
+    var C = __g(o, "__LC");
+    if (!C || !C[t]) return;
+    var a = C[t].slice();
+    for (var i = 0; i < a.length; i++) {
+      try { ev.currentTarget = o; a[i].call(o, ev); } catch (err) {
+        __log("capture " + t + ": " + err);
+        try { if (typeof __fireError === "function") __fireError(err, o); } catch (_fe) {}
+      }
+    }
+  } catch (e0) {}
+}
+function __fireResource(el, type) {
+  var ev = { type: type, target: el, currentTarget: el, bubbles: false, cancelable: false };
+  // capture descent: window -> document -> element ancestors -> element
+  __capFire(window, type, ev);
+  __capFire(document, type, ev);
+  try {
+    var p = el, i = 0;
+    var chain = [];
+    while (p && i < 100) { chain.push(p); if (p.nodeType === 9) break; p = p.parentNode || __mr(p, "__parent"); i++; }
+    for (var j = chain.length - 1; j >= 0; j--) {
+      if (chain[j] === el) continue;
+      // window/document were fired explicitly above — the DOM chain stops at
+      // document (nodeType 9); firing it twice double-delivers the event.
+      if (chain[j] === document) continue;
+      __capFire(chain[j], type, ev);
+    }
+  } catch (e1) {}
+  // target level: on<type> attribute handler + own listeners
+  try {
+    var h = el["on" + type];
+    if (typeof h === "function") { ev.currentTarget = el; h.call(el, ev); }
+  } catch (e2) { try { if (typeof __fireError === "function") __fireError(e2, el); } catch (_fe2) {} }
+  try { el.dispatchEvent(ev); } catch (e3) {}
+}
+__DCI.styleEls = [];
+__DCI.takeStyles = function () {
+  if (__DCI.t.navReq || __DCI.t.navHtml) return "[]";
+  var out = [];
+  try {
+    var links = document.getElementsByTagName("link");
+    for (var i = 0; i < links.length; i++) {
+      var el = links[i];
+      if (__g(el, "_stTook") === true) continue;
+      var rel = String(((__mr(el, "attrs") && __mr(el, "attrs").rel) || el.rel) || "").toLowerCase();
+      if (rel.indexOf("stylesheet") < 0) continue;
+      var href = String(((__mr(el, "attrs") && __mr(el, "attrs").href) || el.href) || "");
+      if (!href) continue;
+      __hide(el, "_stTook", true);
+      var idx = __DCI.styleEls.length;
+      __DCI.styleEls.push(el);
+      out.push({ href: href, i: idx });
+    }
+  } catch (e) {}
+  return JSON.stringify(out);
+};
+__DCI.styleDone = function (i, ok) {
+  var el = __DCI.styleEls[i];
+  if (!el) return;
+  __fireResource(el, ok ? "load" : "error");
 };
 // ST-8 unit 7 (measured vs Chromium 154 same-hour, dynsrc2/dynsrc3): a
 // dynamically inserted external script fires `load` on its element once it

@@ -73,6 +73,9 @@ pub struct FetchOutcome {
     pub used_pool: bool,
     pub verdict: Verdict,
     pub elapsed: Duration,
+    /// Wave W / D5: the engine's harvested inline JSON state (present only
+    /// on the document path, only when the final content stayed thin).
+    pub state: Option<doncore::engine::StateJson>,
 }
 
 /// Pre-navigation redirect policy (v4.6): consulted for every
@@ -390,6 +393,7 @@ impl Fetcher {
             used_pool: false,
             verdict,
             elapsed: Duration::ZERO,
+            state: None,
         }
     }
 
@@ -463,7 +467,15 @@ impl Fetcher {
         } else {
             out.text.into_bytes()
         };
-        let verdict = walls::detect(out.status, &out.headers, &body);
+        let mut verdict = walls::detect(out.status, &out.headers, &body);
+        // Wave W / D3: the engine's own wall typing is evidence the body
+        // cannot always carry — a challenge widget re-renders the DOM and can
+        // strip every vendor marker from it. When the engine says `walled`
+        // (it ran the challenge cycle and knows it never cleared), a
+        // body-only ContentOk is overridden: the request was not served.
+        if out.label == "walled" && verdict == Verdict::ContentOk {
+            verdict = Verdict::Challenge(crate::detect::walls::Vendor::Generic);
+        }
         Ok(FetchOutcome {
             route,
             url: out.url,
@@ -476,6 +488,7 @@ impl Fetcher {
             used_pool: false,
             verdict,
             elapsed: started.elapsed(),
+            state: out.state.clone(),
         })
     }
 

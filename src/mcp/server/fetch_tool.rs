@@ -1644,6 +1644,34 @@ async fn fetch_single_inner(
     // apps, SPAs). A 2KB page with no content is a 404, never a
     // shell class.
     let still_thin = final_ex.as_ref().map(|e| e.thin).unwrap_or(false);
+    // Wave W: a state-rescued extraction is content — the shell/wall
+    // decisions below must not fire on it.
+    // === Wave W / D5: the inline-state rescue ===
+    // The page shipped its content as a big inline JSON global and the DOM
+    // never hydrated (or hydrated around it): the engine harvested the
+    // object from the WIRE document; DonSift's state walker turns it into
+    // content. Runs BEFORE the walled/shell decisions so a state-bearing
+    // page is SERVED, never failed as "did not hydrate" (measured:
+    // youtube.com, 163 visible DOM chars, the whole homepage in
+    // ytInitialData).
+    let mut state_rescued = false;
+    // (shell_text/chrome_text are defined below; the engine only harvests
+    // state when the DOM stayed thin, so still_thin is the faithful trigger)
+    if still_thin
+        && let Some(o) = out.as_ref()
+        && let Some(st) = o.state.as_ref()
+        && let Some(mut js) =
+            crate::extract::jsdata::extract_state(&st.name, &st.json, &o.url, &opts)
+        && js.total_chars > final_ex.as_ref().map(|e| e.total_chars).unwrap_or(0)
+    {
+        js.images = final_ex
+            .as_ref()
+            .map(|e| e.images.clone())
+            .unwrap_or_default();
+        final_ex = Some(js);
+        state_rescued = true;
+        trace.step("local", "state-extract", "ok", 0);
+    }
     let page_size = out.as_ref().map(|o| o.body.len()).unwrap_or(0);
     // PDF detection: if the response is a PDF (content-type or magic
     // bytes), never render it : a browser PDF viewer is a JS shell
@@ -1711,10 +1739,24 @@ async fn fetch_single_inner(
     // interstitial behind a 2xx. Shell-class: a client-rendered page
     // that never hydrated locally. Adapters, JSON payloads and PDFs
     // are excluded (they are terminal at the local fetch already).
-    let sink_eligible = !is_pdf_content && !adapter_host && !json_like;
+    let sink_eligible = !is_pdf_content && !adapter_host && !json_like && !state_rescued;
+    // Wave W / D5: a scripted micro-document with near-empty extraction is a
+    // throttle/block shell (bloomberg's 502-byte ok:true body), never ok.
+    let micro_shell = sink_eligible
+        && status_2xx
+        && out
+            .as_ref()
+            .map(|o| {
+                crate::detect::walls::js_micro_shell(
+                    &o.body,
+                    final_ex.as_ref().map(|e| e.markdown.len()).unwrap_or(0),
+                )
+            })
+            .unwrap_or(false);
     let wall_like = sink_eligible && (challenge || challenge_text);
-    let shell_like =
-        sink_eligible && !wall_like && (shell_text || chrome_text || (still_thin && !is_small_404));
+    let shell_like = sink_eligible
+        && !wall_like
+        && (shell_text || chrome_text || micro_shell || (still_thin && !is_small_404));
     if wall_like {
         let v = extraction_wall.unwrap_or(Verdict::Challenge(Vendor::Generic));
         // The optional unlocker: a paid opt-in reached after a local
@@ -1744,6 +1786,28 @@ async fn fetch_single_inner(
         );
     }
     if shell_like {
+        // Wave W / D4: a thin shell whose visible content is auth CTAs is an
+        // authentication gate, not a hydration failure — the honest answer a
+        // browser would give (measured: x.com's logged-out shell).
+        if out
+            .as_ref()
+            .map(|o| crate::detect::walls::auth_shell(&o.body))
+            .unwrap_or(false)
+        {
+            return tool_error_structured(
+                format!(
+                    "login required at {url} : the page is an authentication gate and served no public content"
+                ),
+                "permanent",
+                Some(json!({
+                    "url": url,
+                    "status": final_status,
+                    "verdict": "AuthWall",
+                    "next_action": "authenticate (donsetch login), or choose a public source for this content",
+                    "escalation": trace.value(),
+                })),
+            );
+        }
         return tool_error_structured(
             format!(
                 "no readable content at {url} : the page renders client-side and did not hydrate"

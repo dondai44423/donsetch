@@ -1433,16 +1433,24 @@ impl HostStore {
     /// a futile one — the flowing samples the skip later stands on. Budget-
     /// cut runs are samples too: the gain is the measure, and the largest
     /// futile budget seen is what the skip must respect.
-    pub fn note_runtime(&self, host: &str, key: &str, gain: u64, budget_ms: u64) {
+    /// `clean` = the runtime ran to its own finish (not cut by the budget,
+    /// not a stall). Wave W / D1-D3 (2026-10-24): a run that gained nothing
+    /// because the BUDGET killed it is "unknown", not "futile" — the live
+    /// audit caught the learner converting failed challenge solves into
+    /// permanent skips (quora's CF variant, x.com's entry-shell), which then
+    /// served thin bodies without ever attempting the runtime again. Only a
+    /// clean no-gain finish is skip evidence; a gain always counts.
+    pub fn note_runtime(&self, host: &str, key: &str, gain: u64, budget_ms: u64, clean: bool) {
         self.update(host, |r, now| {
             let k = r.keys.entry(key.to_string()).or_default();
             if gain >= RUNTIME_GAIN_MIN {
                 k.gains += 1;
-            } else {
+                k.last = now;
+            } else if clean {
                 k.runs += 1;
                 k.budget = k.budget.max(budget_ms);
+                k.last = now;
             }
-            k.last = now;
             r.updated = now;
             while r.keys.len() > HOSTS_KEYS_CAP {
                 let victim = r
@@ -1516,7 +1524,7 @@ impl HostStore {
             out.retain(|_, r| now.saturating_sub(r.updated) <= self.ttl_secs);
         }
         let out = cap_hosts(out);
-        let j = DiskHosts { v: 1, hosts: out };
+        let j = DiskHosts { v: 2, hosts: out };
         let written = serde_json::to_vec(&j)
             .map_err(std::io::Error::other)
             .and_then(|js| write_atomic(&self.path, &js))
@@ -1593,7 +1601,20 @@ fn read_raw_hosts(path: &Path) -> BTreeMap<String, HostRec> {
         return BTreeMap::new();
     };
     match serde_json::from_str::<DiskHosts>(&s) {
-        Ok(j) if j.v == 1 => j.hosts,
+        Ok(mut j) if j.v == 1 => {
+            // Wave W migration (2026-10-24): v1 runtime evidence counted
+            // budget-burned challenge attempts as "no gain" (the live audit
+            // caught x.com/quora permanently skipped by their own failed
+            // solves). The v2 evidence rule only accepts clean finishes, so
+            // every v1 no-gain row is invalid — dropped once, here. Walls,
+            // challenges and clearance observations (different semantics)
+            // survive.
+            for r in j.hosts.values_mut() {
+                r.keys.clear();
+            }
+            j.hosts
+        }
+        Ok(j) if j.v == 2 => j.hosts,
         Ok(_) => BTreeMap::new(),
         Err(_) => {
             dbg_h("hosts: unreadable, starting empty");

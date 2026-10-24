@@ -627,6 +627,119 @@ pub fn human_captcha(body: &[u8]) -> bool {
 /// B). Detection here is marker + size: an interstitial's own words
 /// are a handful of lines, so a long article that merely mentions a
 /// challenge phrase stays content.
+/// Wave W / D4 (2026-10-24): the login-CTA shell. A thin 2xx SSR page whose
+/// visible content is dominated by auth calls-to-action is an authentication
+/// gate, not a hydration failure — a real browser shows exactly this page to
+/// a logged-out visitor (measured: x.com's shell, 436 visible chars, one
+/// nonce'd script, "Continue with phone / Google / Apple … Sign in"). The
+/// honest typing is wall.auth, never "did not hydrate".
+///
+/// Class rule, no per-site anything: the page must be visually thin (< 1200
+/// visible chars — a real article is orders bigger), carry ≥ 2 DISTINCT
+/// auth-CTA markers, and have no passwordless prose substance (no 6+-word
+/// sentence outside the CTA/legal boilerplate). Articles ABOUT login pages
+/// carry one marker and real prose; they never fire.
+pub fn auth_shell(body: &[u8]) -> bool {
+    let visible = visible_text_count(body);
+    if visible == 0 || visible > 1200 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&body[..body.len().min(256 * 1024)]).to_ascii_lowercase();
+    // strip script/style blocks: markers there are code, not CTA
+    let mut clean = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(pos) = rest.find("<script").or_else(|| rest.find("<style")) {
+        clean.push_str(&rest[..pos]);
+        let close = if rest[pos..].starts_with("<script") {
+            "</script"
+        } else {
+            "</style"
+        };
+        match rest[pos..].find(close) {
+            Some(e) => rest = &rest[pos + e + close.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    clean.push_str(rest);
+    // strip remaining tags: they are not word separators, and a title
+    // gluing onto body text through a tag defeats the sentence split
+    // (measured: the login-tutorial fixture read as one giant sentence).
+    let mut tagless = String::with_capacity(clean.len());
+    let mut rest = clean.as_str();
+    while let Some(lt) = rest.find('<') {
+        tagless.push_str(&rest[..lt]);
+        match rest[lt..].find('>') {
+            Some(gt) => {
+                // a tag is a phrase boundary: split on it (the sentence
+                // split below reads newline as a separator)
+                tagless.push('\n');
+                rest = &rest[lt + gt + 1..];
+            }
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    tagless.push_str(rest);
+    let clean = tagless;
+    const MARKERS: [&str; 14] = [
+        "log in",
+        "sign in",
+        "sign up",
+        "create account",
+        "continue with google",
+        "continue with apple",
+        "continue with phone",
+        "email or username",
+        "username or email",
+        "forgot password",
+        "already have an account",
+        "don't have an account",
+        "register now",
+        "join now",
+    ];
+    let distinct = MARKERS.iter().filter(|m| clean.contains(**m)).count();
+    if distinct < 2 {
+        return false;
+    }
+    // No real prose outside CTAs: a sentence carrying ≥6 words longer than
+    // 3 chars (the shell-text prose bar) that contains no marker and no
+    // legal boilerplate means an article-class page. Brand taglines ("It's
+    // what's happening / X") never reach the bar.
+    let lowered = clean.to_ascii_lowercase();
+    for sentence in lowered.split(['.', '!', '?', '\n', '\u{00b7}']) {
+        let substantial = sentence
+            .split_whitespace()
+            .filter(|w| w.chars().count() > 3)
+            .count();
+        if substantial >= 6 && !MARKERS.iter().any(|m| sentence.contains(m)) {
+            let joined = sentence.trim();
+            let boilerplate = ["terms of service", "privacy policy", "cookie"]
+                .iter()
+                .any(|b| joined.contains(b));
+            if !boilerplate {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Wave W / D5: the micro shell. A 2xx HTML document under 2KB that carries a
+/// script tag can never be real content (the smallest honest pages —
+/// example.com — have no scripts); when its extraction is near-empty it is a
+/// throttle/block shell (measured: bloomberg's 502-byte ok:true body), and it
+/// must surface as an honest thin-shell transient, never as ok content.
+pub fn js_micro_shell(body: &[u8], markdown_len: usize) -> bool {
+    // markdown floor 150: spinner/block-shell level. example.com carries a
+    // script and ~195 chars of REAL prose — a real micro page, never a shell.
+    body.len() < 2048 && markdown_len < 150 && body.windows(7).any(|w| w == b"<script")
+}
+
 pub fn challenge_text(text: &str) -> bool {
     if text.chars().count() > 1200 {
         return false;
@@ -1630,6 +1743,53 @@ mod reliability_tests {
         assert!(!human_verification_wall(
             article.as_bytes(),
             detect(200, &[], article.as_bytes())
+        ));
+    }
+}
+
+#[cfg(test)]
+mod wave_w_honesty_tests {
+    use super::*;
+
+    #[test]
+    fn wave_w_x_com_login_shell_is_an_auth_gate() {
+        let shell = "<html><head><meta property=\"og:title\" content=\"X. It&#x27;s what&#x27;s happening / X\"/><script nonce=\"a\">window.__INITIAL_STATE__={}</script></head><body><h1>X. It&#x27;s what&#x27;s happening / X</h1><main><h2>Happening now</h2><button>Continue with phone</button><button>Continue with Google</button><button>Continue with Apple</button><span>or</span><form><input placeholder=\"Email or username\"/></form><button>Continue</button><p>By continuing, you agree to our Terms of Service , Privacy Policy and Cookie Use.</p><span>Already have an account? <a>Sign in</a></span></main></body></html>";
+        assert!(
+            auth_shell(shell.as_bytes()),
+            "the x.com shell must type auth"
+        );
+    }
+
+    #[test]
+    fn wave_w_login_tutorial_article_is_not_an_auth_gate() {
+        let article = "<html><body><article><h1>Log in to Vercel with CI</h1><p>A practical authentication tutorial with working code and deployment instructions for continuous integration.</p><p>This guide explains how to sign in safely using environment secrets and scoped tokens.</p></article></body></html>";
+        assert!(!auth_shell(article.as_bytes()));
+        assert!(!auth_shell(
+            b"<h1>Log in to Vercel</h1><form><input type='password'></form>"
+        ));
+    }
+
+    #[test]
+    fn wave_w_micro_shell_needs_a_script_and_near_empty_extraction() {
+        assert!(js_micro_shell(
+            b"<html><body><script>window.x=1</script><p>ok</p></body></html>",
+            16
+        ));
+        // example.com (2026-10 content): tiny page WITH a script and real
+        // prose — a real micro page, never a shell
+        assert!(!js_micro_shell(
+            b"<html><head><title>Example Domain</title></head><body><script src=\"/s.js\"></script><h1>Example Domain</h1><p>This domain is for use in illustrative examples in documents. You may use this domain in literature without prior coordination.</p></body></html>",
+            195
+        ));
+        // a block shell: script + a spinner sentence only
+        assert!(js_micro_shell(
+            b"<html><body><script src=\"/x.js\"></script><p>Please wait.</p></body></html>",
+            30
+        ));
+        // scripted but with real extracted prose
+        assert!(!js_micro_shell(
+            b"<html><body><script>x</script><p>word word word word word word word word word word word word</p></body></html>",
+            420
         ));
     }
 }
