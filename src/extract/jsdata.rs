@@ -1467,10 +1467,14 @@ mod wave_w_state_walk {
             "{{\"videos\":[{}]}}",
             (0..12)
                 .map(|i| {
+                    let notes = format!(
+                        "Episode {} notes: {}",
+                        i,
+                        "A deep dive into transport design, stealth and honesty signals. ".repeat(3)
+                    );
                     format!(
                         "{{\"title\":\"Episode {} — building fast fetch tiers\",\"description\":\"{}\"}}",
-                        i,
-                        format!("Episode {} notes: {}", i, "A deep dive into transport design, stealth and honesty signals. ".repeat(3))
+                        i, notes
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1490,7 +1494,19 @@ mod wave_w_state_walk {
         // chrome only (no consent cookies -> no feed): the walker must NOT
         // dress it up as content.
         let Ok(json) = std::fs::read_to_string("/var/tmp/v5wave/ytstate.json") else {
-            eprintln!("fixture absent, skipping");
+            // The captured blob is ephemeral; the same property is pinned
+            // synthetically so the assertion never silently disappears:
+            // UI-chrome-only state must be rejected, not dressed as content.
+            let chrome_only = "{\"header\":{\"title\":\"YouTube\",\"menu\":[{\"label\":\"About\"},{\"label\":\"Press\"},{\"label\":\"Copyright\"},{\"label\":\"Contact us\"},{\"label\":\"Creators\"},{\"label\":\"Advertise\"},{\"label\":\"Developers\"}]}}";
+            assert!(
+                extract_state(
+                    "ytInitialData",
+                    chrome_only,
+                    "https://www.youtube.com/",
+                    &ExtractOptions::default()
+                )
+                .is_none()
+            );
             return;
         };
         let opts = ExtractOptions::default();

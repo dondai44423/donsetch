@@ -92,6 +92,79 @@ const QBC_PRELUDE: &[u8] = include_bytes!("../assets/qbc/prelude.qbc");
 /// on drop; a Ctx stored in heap-closure state keeps its context alive past
 /// JS_FreeRuntime and trips the gc_obj_list assertion) and never a JS value.
 /// The context is taken at call time off the function object itself.
+/// Error text for a failed script: 160 chars by default (bounded output),
+/// the whole stack under DONCORE_TRACE (a diagnosis needs the whole chain).
+fn err_cut(err: &str) -> String {
+    let cap = if std::env::var("DONCORE_TRACE").is_ok() {
+        4000
+    } else {
+        160
+    };
+    err.chars().take(cap).collect()
+}
+
+/// A `data:` URL is SOURCE, not a location: Chrome decodes it locally and
+/// never dials it. The wire's builder rejects the scheme, which is exactly
+/// how facebook's ServerJS payload chain died (47/47 scripts failed with
+/// "builder error: invalid format"). Returns the decoded body, or None when
+/// the URL is not data: (the caller then rides the wire as usual).
+fn data_url_body(u: &str) -> Option<Vec<u8>> {
+    let rest = u.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if meta.to_ascii_lowercase().ends_with(";base64") {
+        Some(b64_decode(data.trim())?)
+    } else {
+        let mut out = Vec::with_capacity(data.len());
+        let b = data.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                let hx = |c: u8| -> Option<u8> {
+                    match c {
+                        b'0'..=b'9' => Some(c - b'0'),
+                        b'a'..=b'f' => Some(c - b'a' + 10),
+                        b'A'..=b'F' => Some(c - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                if let (Some(h), Some(l)) = (hx(b[i + 1]), hx(b[i + 2])) {
+                    out.push(h * 16 + l);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        Some(out)
+    }
+}
+
+/// Minimal std-only base64 (RFC 4648, padding optional) for data: URLs.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut n = 0u32;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((acc >> n) as u8);
+        }
+    }
+    Some(out)
+}
+
 fn native_wrap<'js>(ctx: rquickjs::Ctx<'js>, id: usize) -> rquickjs::Result<Function<'js>> {
     Function::new(
         ctx,
@@ -456,14 +529,32 @@ fn drain_styles(ctx: &rquickjs::Context, wire: &Wire, page_url: &str, deadline: 
     }
 }
 
-/// Wave W: module evals carry a WIDER sync window than classic scripts —
+/// The sync-stretch window for ONE non-challenge eval: the 2s base plus real
+/// work allowance for big bundles. A multi-MB SPA bundle is normal (YouTube
+/// serves 10.8MB of kevlar; the flat 2s window cut its boot mid-run every
+/// time — measured: no bump_module ever fired, the module ran as a classic
+/// with a 2s stop) and a bundle's boot is not a burrow: it is the page doing
+/// the work a browser also spends seconds on. ~1.2s per MB, capped at 15s and
+/// always by the hard deadline. Challenge rounds keep their own bound.
+fn window_ms(challenge: bool, bytes: usize) -> u128 {
+    if challenge {
+        env_ms("DONCORE_CHALLENGE_SYNC_MS", CHALLENGE_SYNC_BOUND_MS)
+    } else {
+        (2000u64 + (bytes as u64 / 1_000_000) * 1200).min(15_000) as u128
+    }
+}
+
+/// Wave X: module evals carry a WIDER sync window than classic scripts —
 /// SPA entry bundles legitimately compute for seconds (pinterest's hydration
 /// module ~2.5s measured; the classic 2s bound cut it mid-render and turned a
-/// serving page into a shell). Six seconds still kills the pathological class
-/// (x.com's 14s single-module burn) without starving real hydration.
-fn bump_module(stop: &std::cell::Cell<Instant>, hard: Instant) {
-    let window = env_ms("DONCORE_MODULE_SYNC_MS", 6000);
+/// serving page into a shell). The size term applies on top so a 10MB bundle
+/// is never cut by the small-bundle default.
+fn bump_module(stop: &std::cell::Cell<Instant>, hard: Instant, bytes: usize) {
+    let window = env_ms("DONCORE_MODULE_SYNC_MS", 6000).max(window_ms(false, bytes));
     let n = Instant::now() + Duration::from_millis(window as u64);
+    if std::env::var("DONCORE_TRACE").is_ok() {
+        eprintln!("[bound] module window={window}ms bytes={bytes}");
+    }
     stop.set(if n < hard { n } else { hard });
 }
 
@@ -563,7 +654,7 @@ fn run_document_inner(
     // ~4s in QuickJS) is exempt — cutting mid-eval lost 12k chars. The
     // IdleWatch covers the between-iterations case with a typed note.
     let stop_at = Rc::new(Cell::new(hard_deadline));
-    fn bump(stop: &std::cell::Cell<Instant>, hard: Instant, challenge: bool) {
+    fn bump_bytes(stop: &std::cell::Cell<Instant>, hard: Instant, challenge: bool, bytes: usize) {
         // Wave W / D1: challenge rounds keep the FULL budget for their waits
         // and round cadence, but a single SYNCHRONOUS eval is bounded by the
         // interrupt at CHALLENGE_SYNC_BOUND_MS — re-armed by every stage
@@ -572,11 +663,10 @@ fn run_document_inner(
         // iteration), where no watchdog can run. The bound turns that burn
         // into an interrupted eval and an honest fast wall. SO-class solves
         // measured 2.48-2.7s with many SMALL evals — unaffected.
-        let window = if challenge {
-            env_ms("DONCORE_CHALLENGE_SYNC_MS", CHALLENGE_SYNC_BOUND_MS)
-        } else {
-            2000
-        };
+        let window = window_ms(challenge, bytes);
+        if std::env::var("DONCORE_TRACE").is_ok() {
+            eprintln!("[bound] eval window={window}ms challenge={challenge} bytes={bytes}");
+        }
         let n = Instant::now() + Duration::from_millis(window as u64);
         stop.set(if n < hard { n } else { hard });
     }
@@ -586,6 +676,9 @@ fn run_document_inner(
         let s = Rc::clone(&stop_at);
         rt.set_interrupt_handler(Some(Box::new(move || {
             if Instant::now() >= s.get() {
+                if std::env::var("DONCORE_TRACE").is_ok() {
+                    eprintln!("[bound] interrupt FIRED (stop_at was in the past)");
+                }
                 t.set(true);
                 true
             } else {
@@ -784,6 +877,12 @@ fn run_document_inner(
         if std::env::var("DONCORE_TRACE").is_ok() {
             let _ = ctx.eval::<(), _>("__DCI.TRACE_ON=true;");
         }
+        // The instrument sweep (GOPD/HAS/logging wrappers) is slow enough to
+        // change what it measures — it takes its own switch so verbose ERROR
+        // output (TRACE_ON) can be read without instrumenting the run.
+        if std::env::var("DONCORE_TRACE_SWEEP").is_ok() {
+            let _ = ctx.eval::<(), _>("__DCI.TRACE_SWEEP=true;");
+        }
         if std::env::var("DONCORE_FAST_TICKS").is_ok() {
             // tick-chain compression: challenge state machines re-arm the same
             // callback on a ~550ms timeout dozens of times; the cadence is
@@ -910,6 +1009,10 @@ fn run_document_inner(
         }
     }
     let mut mod_seq = 0usize;
+    // Total bytes of page scripts evaluated so far: the settle drains re-arm
+    // with the same size-aware window the boot itself gets, so a heavy SPA's
+    // callback work is not cut by the small-page 2s bound.
+    let mut boot_bytes: usize = 0;
     // ST-8 unit 7 (dyn3): the document module map — a same-URL module script
     // is fetched+declared ONCE per run across the static and dynamic passes
     // (measured vs Chromium 154: stat+stat mc=1, stat+dyn mc=1, dyn+dyn mc=1).
@@ -984,15 +1087,15 @@ fn run_document_inner(
                 continue;
             }
             mod_netfail.set(false);
-            // W2: a module eval is a synchronous-stretch risk with legitimate
-            // multi-second bodies — the WIDER module window applies (see
-            // bump_module).
-            bump_module(&stop_at, hard_deadline);
+            // W2/X: a module eval is a synchronous-stretch risk with legitimate
+            // multi-second bodies — the size-aware module window applies.
+            boot_bytes += src.len();
+            bump_module(&stop_at, hard_deadline, src.len());
             let err: String = ctx.with(|ctx| eval_module_catch(&ctx, &name, &src));
             if !err.is_empty() {
                 report.scripts_failed += 1;
                 if report.errors.len() < 40 {
-                    let cut: String = err.chars().take(160).collect();
+                    let cut: String = err_cut(&err);
                     report.errors.push(format!("{name}: {cut}"));
                 }
             }
@@ -1015,6 +1118,13 @@ fn run_document_inner(
         };
         let (src, origin) = match slot {
             ScriptSlot::Inline(s) => (s.clone(), "inline".to_string()),
+            ScriptSlot::External(u) if u.starts_with("data:") => {
+                // data: URLs carry their own source — decoded locally, never dialed.
+                (
+                    String::from_utf8_lossy(&data_url_body(u).unwrap_or_default()).into_owned(),
+                    u.clone(),
+                )
+            }
             ScriptSlot::External(u) => {
                 let r = if challenge {
                     wire.fetch(WireReq {
@@ -1093,15 +1203,15 @@ fn run_document_inner(
                 let _ = ctx.eval::<(), _>("__DCI.curBeginKey(__DCI.CUR_KEY, __DCI.CUR_MODE)");
             });
         }
-        // W2: every synchronous eval carries the active bound (challenge:
-        // the sync window; a PoW loop inside a STATIC script burns the same
-        // 20s a dyn one does).
-        bump(&stop_at, hard_deadline, challenge);
+        // a static eval carries the active bound, sized by the body: a 10MB
+        // bundle gets the size-scaled window (window_ms), tiny scripts the 2s base.
+        boot_bytes += src.len();
+        bump_bytes(&stop_at, hard_deadline, challenge, src.len());
         let err: String = ctx.with(|ctx| eval_catch(&ctx, &src));
         if !err.is_empty() {
             report.scripts_failed += 1;
             if report.errors.len() < 40 {
-                let cut: String = err.chars().take(160).collect();
+                let cut: String = err_cut(&err);
                 if origin == "inline" {
                     let head: String = src.trim_start().chars().take(52).collect();
                     let head = head.replace('\n', " ");
@@ -1160,7 +1270,7 @@ fn run_document_inner(
     // ST-7 WH (h): the parse is over — release the lifecycle hold so the
     // first settle fires DOMContentLoaded/load ahead of the page timers.
     let _ = ctx.with(|ctx| ctx.eval::<(), _>("__DCI.t.parseHeld = false;"));
-    bump(&stop_at, hard_deadline, challenge);
+    bump_bytes(&stop_at, hard_deadline, challenge, boot_bytes);
     loop {
         // Challenge rounds wait to the HARD deadline (their retry timers can
         // sit past the active sync bound); non-challenge rounds use the
@@ -1227,7 +1337,7 @@ fn run_document_inner(
             }
         }
         if fired > 0 {
-            bump(&stop_at, hard_deadline, challenge);
+            bump_bytes(&stop_at, hard_deadline, challenge, boot_bytes);
             continue;
         }
         if fired == 0 {
@@ -1316,7 +1426,7 @@ fn run_document_inner(
             // skips and fetch failures included. A run of dup rounds used to
             // skip the pre-eval bump below and the ACTIVE stop time expired
             // mid-drain (sl5: cut at 2.1s, last script never fired).
-            bump(&stop_at, hard_deadline, challenge);
+            bump_bytes(&stop_at, hard_deadline, challenge, boot_bytes);
             let mut resolved_url: String = String::new();
             let mut body = if !src.is_empty() {
                 report.scripts_total += 1;
@@ -1486,8 +1596,13 @@ fn run_document_inner(
             if is_mod {
                 mod_netfail.set(false);
             }
+            boot_bytes += body.len();
             if is_mod {
-                bump_module(&stop_at, hard_deadline);
+                bump_module(&stop_at, hard_deadline, body.len());
+            } else {
+                // a classic dynamic script is a real work unit too: the
+                // size-scaled window, not the loop's generic re-arm.
+                bump_bytes(&stop_at, hard_deadline, challenge, body.len());
             }
             let err: String = if is_mod {
                 // ST-8 unit 7: a dynamic module goes through real ESM (same as
@@ -1568,7 +1683,7 @@ fn run_document_inner(
                     report.errors.push(format!("dumped {p}"));
                 }
                 if report.errors.len() < 40 {
-                    let cut: String = err.chars().take(160).collect();
+                    let cut: String = err_cut(&err);
                     let snip = err_snippet(&err, &body);
                     let last: String = ctx.with(|ctx| {
                         ctx.eval::<String, _>(
@@ -1680,7 +1795,7 @@ fn run_document_inner(
                 }
             }
             if fired > 0 {
-                bump(&stop_at, hard_deadline, challenge);
+                bump_bytes(&stop_at, hard_deadline, challenge, boot_bytes);
                 continue;
             }
             if fired == 0 {
@@ -2256,4 +2371,112 @@ pub fn js_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod wave_x_tests {
+    use super::*;
+    use crate::client::chrome;
+    use crate::engine::{collect_scripts, html_to_tree_json};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// One-shot loopback server: every request gets `body` as text/html.
+    fn serve(body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf); // request head; body not needed
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    let _ = s.flush();
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    /// The sync-stretch window must scale with the unit of work: a 10MB SPA
+    /// bundle is not a 2s burrow (measured: YouTube's 10.8MB kevlar bundle
+    /// was cut at the flat 2s bound every run — no bump_module ever fired).
+    #[test]
+    fn the_sync_window_scales_with_the_bundle() {
+        assert_eq!(window_ms(false, 0), 2000);
+        assert_eq!(window_ms(false, 10_800_000), 14_000);
+        assert_eq!(window_ms(false, 20_000_000), 15_000);
+        assert_eq!(window_ms(false, 1_000_000), 3200);
+        // challenge rounds keep their own bound regardless of size
+        assert!(window_ms(true, 10_800_000) <= 4000);
+    }
+
+    /// A data: URL is source, not a location (facebook's ServerJS chain died
+    /// 47/47 with `builder error: invalid format` when these rode the wire).
+    #[test]
+    fn a_data_url_script_is_source_not_a_location() {
+        let b64 = data_url_body("data:text/javascript;base64,ZXZhbCgxKQ==").expect("b64");
+        assert_eq!(String::from_utf8(b64).unwrap(), "eval(1)");
+        let plain = data_url_body("data:text/javascript,var%20a%3D1%3B").expect("plain");
+        assert_eq!(String::from_utf8(plain).unwrap(), "var a=1;");
+        assert!(data_url_body("https://example.com/x.js").is_none());
+        assert!(data_url_body("data:text/javascript;base64,!!!").is_none());
+    }
+
+    /// The end-to-end pin for the two SPA-starvation fixes: a page defines a
+    /// custom element (the registry must be the branded one — the stub threw
+    /// Illegal invocation), reads computed styles (root 16px, a 2em element
+    /// resolving through the <style> cascade to 32px), and injects a data:
+    /// script that must run locally.
+    #[test]
+    fn a_page_defines_custom_elements_and_reads_computed_style() {
+        let html = r#"<!doctype html><html><head><style>#b { font-size: 2em; }</style></head>
+<body><div id="a"></div><div id="b"></div>
+<script>
+var out = [];
+try { customElements.define('x-probe', function () {}); out.push('define-ok'); }
+catch (e) { out.push('define-threw:' + e.message); }
+out.push('root=' + getComputedStyle(document.documentElement).fontSize);
+out.push('b=' + getComputedStyle(document.getElementById('b')).fontSize);
+out.push('pv=' + getComputedStyle(document.getElementById('b')).getPropertyValue('font-size'));
+var s = document.createElement('script');
+s.src = 'data:text/javascript;base64,' + btoa('document.getElementById("a").textContent += "|data-ok";');
+document.body.appendChild(s);
+document.getElementById('a').textContent = out.join('|');
+</script></body></html>"#;
+        let url = serve(html.to_string());
+        let (wire, ident) = chrome("154", Vec::new());
+        let tree = html_to_tree_json(html);
+        let scripts = collect_scripts(html, &url);
+        let (dom, report, _net) =
+            run_document(&ident.json(), &url, &tree, &scripts, &wire, 20_000, false)
+                .expect("run_document");
+        assert!(
+            dom.contains("define-ok"),
+            "customElements.define must be callable on the window registry (report: {:?}, dom: {})",
+            report.errors,
+            &dom[..dom.len().min(600)]
+        );
+        assert!(
+            dom.contains("root=16px"),
+            "root font-size must be the 16px initial: {}",
+            &dom[..dom.len().min(600)]
+        );
+        assert!(
+            dom.contains("b=32px"),
+            "2em must resolve through the sheet cascade: {}",
+            &dom[..dom.len().min(600)]
+        );
+        assert!(
+            dom.contains("data-ok"),
+            "a data: script must decode and run locally: {}",
+            &dom[..dom.len().min(600)]
+        );
+    }
 }

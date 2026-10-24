@@ -889,9 +889,9 @@ function makeElement(tag, attrs, ns) {
 function makeStyle() {
   var props = {};
   var s = {
-    setProperty: function (k, v) { props[String(k)] = String(v); },
+    setProperty: function (k, v) { props[String(k)] = String(v); __hide(s, "_sf_" + String(k).replace(/-([a-z])/g, function (m, c) { return c.toUpperCase(); }), String(v)); },
     getPropertyValue: function (k) { return props[String(k)] || ""; },
-    removeProperty: function (k) { var p = props[String(k)]; delete props[String(k)]; return p || ""; },
+    removeProperty: function (k) { var p = props[String(k)]; delete props[String(k)]; __hide(s, "_sf_" + String(k).replace(/-([a-z])/g, function (m, c) { return c.toUpperCase(); }), undefined); return p || ""; },
     get cssText() {
       var out = "";
       Object.keys(props).forEach(function (k) { out += k + ": " + props[k] + "; "; });
@@ -902,6 +902,7 @@ function makeStyle() {
       String(v).split(";").forEach(function (part) {
         var i = part.indexOf(":");
         if (i > 0) props[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+        if (i > 0) __hide(s, "_sf_" + part.slice(0, i).trim().replace(/-([a-z])/g, function (m, c) { return c.toUpperCase(); }), part.slice(i + 1).trim());
       });
     },
   };
@@ -2573,26 +2574,299 @@ window.matchMedia = function (q) {
   return res;
 };
 
-window.getComputedStyle = function (el) {
-  var tag = el && __mr(el, "tag") ? String(__mr(el, "tag")) : "";
-  var inline = /^(span|a|abbr|b|i|em|strong|small|code|label|select|textarea|br|img|input|button|output|slot|time|u|s|q|cite|mark|sub|sup)$/.test(tag);
-  var st = {
-    // the live CF api.js reads the transform/position/display matrix off this
-    // object while assembling extraParams; a missing field used to kill its
-    // requestExtraParams reply (reading .length of undefined).
-    getPropertyValue: function (p) {
-      var k = String(p == null ? "" : p);
-      var v = st[k] !== undefined ? st[k] : st[k.replace(/-([a-z])/g, function (m, c) { return c.toUpperCase(); })];
-      return v === undefined ? "" : String(v);
-    },
-    backgroundColor: "rgba(0, 0, 0, 0)",
-    cssFloat: "none", display: inline ? "inline" : "block", visibility: "visible", opacity: "1",
-    position: "static", transform: "none", contentVisibility: "visible",
-    width: "auto", height: "auto", overflow: "visible", zIndex: "auto",
+// ── computed style: the CSSOM VALUE MODEL ────────────────────────────────
+// There is no layout engine, but computed values are not layout: they are
+// the cascade of spec initial values + UA defaults + author styles +
+// inheritance, and every one of those is knowable here. Sites read them as
+// ARITHMETIC (measured: YouTube computed
+// getComputedStyle(documentElement).fontSize.replace("px","") — the old
+// stub returned undefined and the .replace killed the whole kevlar module,
+// 0 net calls, no hydration). So the engine answers with the value a
+// browser would give for everything it can know, and the spec initial
+// otherwise. Deliberately bounded: simple selectors (no combinators), a
+// small but honest UA table, inheritance for the inherited set.
+(function () {
+  // CSS initial values (the strings Chrome reports for a defaulted element).
+  var INIT = {
+    "font-size": "16px", "font-family": "Times New Roman", "font-weight": "400",
+    "font-style": "normal", "font-variant": "normal", "font-stretch": "100%",
+    "line-height": "normal", "color": "rgb(0, 0, 0)", "text-align": "start",
+    "text-indent": "0px", "text-transform": "none", "text-decoration": "none",
+    "letter-spacing": "normal", "word-spacing": "0px", "white-space": "normal",
+    "direction": "ltr", "unicode-bidi": "normal", "visibility": "visible",
+    "display": "block", "position": "static", "float": "none", "clear": "none",
+    "opacity": "1", "z-index": "auto", "transform": "none",
+    "transform-origin": "50% 50%", "transition": "all 0s ease 0s",
+    "animation": "none 0s ease 0s 1 normal none running", "cursor": "auto",
+    "overflow": "visible", "overflow-x": "visible", "overflow-y": "visible",
+    "width": "auto", "height": "auto", "min-width": "auto", "min-height": "auto",
+    "max-width": "none", "max-height": "none",
+    "margin": "0px", "margin-top": "0px", "margin-right": "0px",
+    "margin-bottom": "0px", "margin-left": "0px",
+    "padding": "0px", "padding-top": "0px", "padding-right": "0px",
+    "padding-bottom": "0px", "padding-left": "0px",
+    "border": "0px none rgb(0, 0, 0)", "border-top-width": "0px",
+    "border-right-width": "0px", "border-bottom-width": "0px",
+    "border-left-width": "0px", "border-style": "none", "border-color": "rgb(0, 0, 0)",
+    "background-color": "rgba(0, 0, 0, 0)", "background-image": "none",
+    "background-position": "0% 0%", "background-repeat": "repeat", "background-size": "auto",
+    "top": "auto", "right": "auto", "bottom": "auto", "left": "auto",
+    "box-sizing": "content-box", "vertical-align": "baseline", "content": "normal",
+    "list-style-type": "disc", "list-style-position": "outside",
+    "border-collapse": "separate", "table-layout": "auto", "caption-side": "top",
+    "flex-direction": "row", "flex-wrap": "nowrap", "justify-content": "normal",
+    "align-items": "normal", "align-self": "auto", "flex-grow": "0", "flex-shrink": "1",
+    "flex-basis": "auto", "order": "0", "gap": "normal", "row-gap": "normal",
+    "column-gap": "normal", "grid-auto-flow": "row", "grid-template-columns": "none",
+    "grid-template-rows": "none", "object-fit": "fill", "pointer-events": "auto",
+    "user-select": "auto", "outline": "rgb(0, 0, 0) none 0px", "resize": "none",
+    "clip": "auto", "filter": "none", "mix-blend-mode": "normal", "isolation": "auto",
+    "aspect-ratio": "auto", "inset": "auto", "text-overflow": "clip",
+    "word-break": "normal", "overflow-wrap": "normal", "tab-size": "8",
+    "border-radius": "0px", "box-shadow": "none", "columns": "auto",
   };
-  st.propertyValue = st.getPropertyValue;
-  return st;
-};
+  var INH = { "font-size": 1, "font-family": 1, "font-weight": 1, "font-style": 1,
+    "font-variant": 1, "font-stretch": 1, "line-height": 1, "color": 1,
+    "text-align": 1, "text-indent": 1, "text-transform": 1, "letter-spacing": 1,
+    "word-spacing": 1, "white-space": 1, "direction": 1, "unicode-bidi": 1,
+    "visibility": 1, "cursor": 1, "list-style-type": 1, "list-style-position": 1,
+    "caption-side": 1, "pointer-events": 1, "user-select": 1, tabSize: 0 };
+  // UA defaults that are commonly READ (Chrome 154 values, same-hour oracle).
+  var UA = {
+    "html": { display: "block" }, "body": { display: "block", margin: "8px" },
+    "head": { display: "none" }, "script": { display: "none" }, "style": { display: "none" },
+    "link": { display: "none" }, "meta": { display: "none" }, "title": { display: "none" },
+    "base": { display: "none" }, "template": { display: "none" }, "noscript": { display: "none" },
+    "p": { display: "block", margin: "16px 0px" }, "div": { display: "block" },
+    "h1": { display: "block", "font-size": "2em", "font-weight": "700", margin: "21.44px 0px" },
+    "h2": { display: "block", "font-size": "1.5em", "font-weight": "700", margin: "19.92px 0px" },
+    "h3": { display: "block", "font-size": "1.17em", "font-weight": "700", margin: "18.72px 0px" },
+    "h4": { display: "block", "font-weight": "700", margin: "21.28px 0px" },
+    "h5": { display: "block", "font-size": "0.83em", "font-weight": "700", margin: "22.08px 0px" },
+    "h6": { display: "block", "font-size": "0.67em", "font-weight": "700", margin: "24.96px 0px" },
+    "ul": { display: "block", margin: "16px 0px", "padding-left": "40px" },
+    "ol": { display: "block", margin: "16px 0px", "padding-left": "40px" },
+    "li": { display: "list-item" }, "table": { display: "table" },
+    "thead": { display: "table-header-group" }, "tbody": { display: "table-row-group" },
+    "tr": { display: "table-row" }, "td": { display: "table-cell", padding: "1px" },
+    "th": { display: "table-cell", padding: "1px", "font-weight": "700", "text-align": "center" },
+    "a": { display: "inline", color: "rgb(0, 0, 238)", "text-decoration": "underline", cursor: "pointer" },
+    "img": { display: "inline" }, "input": { display: "inline-block" },
+    "button": { display: "inline-block" }, "select": { display: "inline-block" },
+    "textarea": { display: "inline-block" }, "iframe": { display: "block" },
+    "video": { display: "inline" }, "canvas": { display: "inline" },
+    "span": { display: "inline" }, "strong": { display: "inline", "font-weight": "700" },
+    "b": { display: "inline", "font-weight": "700" }, "em": { display: "inline", "font-style": "italic" },
+    "i": { display: "inline", "font-style": "italic" }, "br": { display: "inline" },
+    "hr": { display: "block", margin: "8px auto" }, "pre": { display: "block", "font-family": "monospace", "white-space": "pre" },
+    "code": { display: "inline", "font-family": "monospace" },
+    "label": { display: "inline", cursor: "default" }, "form": { display: "block" },
+    "nav": { display: "block" }, "main": { display: "block" }, "section": { display: "block" },
+    "header": { display: "block" }, "footer": { display: "block" }, "article": { display: "block" },
+    "aside": { display: "block" }, "figure": { display: "block", margin: "16px 0px" },
+    "svg": { display: "inline" }, "path": { display: "inline" },
+  };
+  var CAMEL = {}, DASH = {};
+  for (var pk in INIT) {
+    var cp = pk.replace(/-([a-z])/g, function (m, c) { return c.toUpperCase(); });
+    if (pk === "float") cp = "cssFloat";
+    CAMEL[pk] = cp; DASH[cp] = pk;
+  }
+  function parseDecls(text, out) {
+    if (!text) return out;
+    var parts = String(text).split(";");
+    for (var i = 0; i < parts.length; i++) {
+      var d = parts[i], c = d.indexOf(":");
+      if (c < 0) continue;
+      var k = d.slice(0, c).trim().toLowerCase(), v = d.slice(c + 1).trim();
+      if (!k || !v) continue;
+      if (k.indexOf("--") === 0) continue;
+      out[k] = v.replace(/\s*!important\s*$/i, "");
+    }
+    return out;
+  }
+  // Simple-selector matcher: tag, #id, .class, [attr], * — combinators and
+  // pseudo-classes are skipped (a value we cannot honestly place is not
+  // invented). The universal `:root` and `html` are honored.
+  function selMatches(sel, el) {
+    sel = sel.trim();
+    if (!sel) return -1;
+    if (sel === ":root") sel = "html";
+    else if (sel.indexOf(":") >= 0 && sel.replace(/:root|::?[a-z-]+(\([^)]*\))?/g, "").trim() !== sel.replace(/:root/g, "html").trim() && /[:>+~,\s]/.test(sel)) return -1;
+    var m = /^([a-zA-Z][\w-]*)?((?:[.#\[][^.#\[]*\]*|\.-?[\w-]+|#[\w-]+)*)$/.exec(sel);
+    if (!m || sel.indexOf(" ") >= 0 || /[>+~]/.test(sel)) return -1;
+    var spec = 0;
+    var tag = m[1];
+    if (!tag && !m[2]) return -1;
+    if (tag) {
+      var et = String((__mr(el, "attrs") && __mr(el, "tag")) || __mr(el, "tag") || "").toLowerCase();
+      if (et !== tag.toLowerCase()) return -1;
+      spec += 1;
+    }
+    var rest = m[2] || "", cls = rest.match(/\.-?[\w-]+/g) || [], ids = rest.match(/#[\w-]+/g) || [], ats = rest.match(/\[[^\]]*\]/g) || [];
+    var attrs = __mr(el, "attrs") || {};
+    for (var i = 0; i < ids.length; i++) {
+      if (String(attrs.id || "") !== ids[i].slice(1)) return -1;
+      spec += 100;
+    }
+    var cl = String(attrs.class || "").split(/\s+/);
+    for (var j = 0; j < cls.length; j++) {
+      var want = cls[j].slice(1);
+      if (cl.indexOf(want) < 0) return -1;
+      spec += 10;
+    }
+    for (var a = 0; a < ats.length; a++) {
+      var mm = /^\[\s*([\w-]+)(?:\s*([~|^$*]?=)\s*"?([^"\]]*)"?)?\s*\]$/.exec(ats[a]);
+      if (!mm) return -1;
+      var av = attrs[mm[1]];
+      if (av === undefined) return -1;
+      if (mm[2]) {
+        av = String(av);
+        if (mm[2] === "=" && av !== mm[3]) return -1;
+        if (mm[2] === "^=" && av.indexOf(mm[3]) !== 0) return -1;
+        if (mm[2] === "$=" && av.slice(-mm[3].length) !== mm[3]) return -1;
+        if (mm[2] === "*=" && av.indexOf(mm[3]) < 0) return -1;
+      }
+      spec += 10;
+    }
+    return spec;
+  }
+  var __sheetCache = { at: 0, rules: null };
+  function sheetRules() {
+    var now = Date.now();
+    if (__sheetCache.rules && now - __sheetCache.at < 250) return __sheetCache.rules;
+    var rules = [];
+    try {
+      var stys = document.getElementsByTagName("style");
+      for (var i = 0; i < stys.length; i++) {
+        var txt = "";
+        try { txt = stys[i].textContent || ""; } catch (e) { txt = ""; }
+        txt = String(txt).replace(/\/\*[\s\S]*?\*\//g, "");
+        var re = /([^{}]+)\{([^{}]*)\}/g, mm;
+        while ((mm = re.exec(txt))) {
+          var sels = mm[1].split(",");
+          var decls = parseDecls(mm[2], {});
+          for (var s = 0; s < sels.length; s++) rules.push({ sel: sels[s], decls: decls });
+        }
+      }
+    } catch (e) {}
+    __sheetCache.at = now; __sheetCache.rules = rules;
+    return rules;
+  }
+  function ownDecls(el) {
+    var out = {};
+    try {
+      var st = __mr(el, "__style");
+      if (st) {
+        if (st.__props) parseDecls(st.__props, out);
+        for (var k in st) if (INIT[k] !== undefined || DASH[k] !== undefined) out[DASH[k] || k] = String(st[k]);
+        for (var pk2 in INIT) {
+          var cv = __g(st, "_sf_" + CAMEL[pk2]);
+          if (cv !== undefined) out[pk2] = String(cv);
+        }
+      }
+    } catch (e) {}
+    try { parseDecls((__mr(el, "attrs") || {}).style, out); } catch (e) {}
+    return out;
+  }
+  function emPx(v, base) {
+    var s = String(v);
+    if (/^-?[\d.]+px$/.test(s)) return s;
+    if (/^-?[\d.]+(\.[\d]+)?em$/.test(s)) return (parseFloat(s) * base) + "px";
+    if (/^-?[\d.]+%$/.test(s)) return (parseFloat(s) / 100 * base) + "px";
+    if (/^-?[\d.]+pt$/.test(s)) return (parseFloat(s) * 4 / 3) + "px";
+    if (/^-?[\d.]+rem$/.test(s)) return (parseFloat(s) * 16) + "px";
+    return s;
+  }
+  function resolved(el, prop) {
+    // cascade winner: UA (score 0) < author rules (specificity + order) < inline
+    var best, bestScore = -1;
+    try {
+      var at = __mr(el, "attrs") || {};
+      var tag = String(at.tag || "").toLowerCase();
+      var ua = UA[tag];
+      if (ua && ua[prop] !== undefined) { best = ua[prop]; bestScore = 0; }
+      var rules = sheetRules();
+      for (var i = 0; i < rules.length; i++) {
+        if (!(prop in rules[i].decls)) continue;
+        var sp = selMatches(rules[i].sel, el);
+        if (sp < 0) continue;
+        var score = sp * 100000 + i;
+        if (score >= bestScore) { best = rules[i].decls[prop]; bestScore = score + 1; }
+      }
+      var own = ownDecls(el);
+      if (prop in own) best = own[prop];
+    } catch (e) {}
+    return best;
+  }
+  function fontPx(el, depth) {
+    if (!el || depth > 30) return 16;
+    var v = resolved(el, "font-size");
+    if (v === undefined) return fontPx(parentOf(el), depth + 1);
+    var s = String(v);
+    if (/^-?[\d.]+px$/.test(s)) return parseFloat(s) || 16;
+    if (/^-?[\d.]+rem$/.test(s)) return parseFloat(s) * 16;
+    if (/^-?[\d.]+em$/.test(s)) return fontPx(parentOf(el), depth + 1) * parseFloat(s);
+    if (/^-?[\d.]+%$/.test(s)) return fontPx(parentOf(el), depth + 1) * parseFloat(s) / 100;
+    if (/^-?[\d.]+pt$/.test(s)) return parseFloat(s) * 4 / 3;
+    return parseFloat(s) || 16;
+  }
+  function parentOf(el) {
+    try { return __mr(el, "__parent") || null; } catch (e) { return null; }
+  }
+  function inherited(el, prop, depth) {
+    if (!el || depth > 40) return INIT[prop];
+    var v = resolved(el, prop);
+    if (v !== undefined) return v;
+    return inherited(parentOf(el), prop, depth + 1);
+  }
+  var __gcsCache = (typeof WeakMap === "function") ? new WeakMap() : null;
+  function cacheFor(el) {
+    if (!__gcsCache || !el || typeof el !== "object") return null;
+    var now = Date.now(), c = __gcsCache.get(el);
+    if (c && now - c.t < 200) return c;
+    c = { t: now, v: {} };
+    try { __gcsCache.set(el, c); } catch (e) { return null; }
+    return c;
+  }
+  function computedValue(el, prop) {
+    var c = cacheFor(el);
+    if (c && c.v[prop] !== undefined) return c.v[prop];
+    var v;
+    if (INH[prop] !== undefined) v = inherited(el, prop, 0);
+    else v = resolved(el, prop);
+    if (v === undefined) v = INIT[prop];
+    if (v === undefined) return "";
+    if (prop === "font-size") v = emPx(v, fontPx(parentOf(el), 0));
+    else if (/(width|height|margin|padding|top|right|bottom|left|gap|spacing|indent)/.test(prop)) v = emPx(v, fontPx(el, 0));
+    var out = String(v);
+    if (c) c.v[prop] = out;
+    return out;
+  }
+  window.getComputedStyle = function (el) {
+    var st = {
+      // the live CF api.js reads the transform/position/display matrix off
+      // this object while assembling extraParams; a missing field used to
+      // kill its requestExtraParams reply (reading .length of undefined).
+      getPropertyValue: function (p) {
+        var k = String(p == null ? "" : p);
+        if (st[k] !== undefined) return String(st[k]);
+        return "";
+      },
+    };
+    st.propertyValue = st.getPropertyValue;
+    for (var pk in INIT) {
+      var cp = CAMEL[pk];
+      var val = computedValue(el, pk);
+      try {
+        Object.defineProperty(st, cp, { get: __native("get " + cp, 0, (function (P) { return function () { return computedValue(el, P); }; })(pk)), enumerable: true, configurable: true });
+        if (cp !== pk) Object.defineProperty(st, pk, { get: __native("get " + pk, 0, (function (P) { return function () { return computedValue(el, P); }; })(pk)), enumerable: false, configurable: true });
+      } catch (e) { if (val !== undefined) st[cp] = val; }
+    }
+    try { Object.defineProperty(st, "_s7b", { value: "CSSStyleDeclaration", configurable: true }); } catch (e) {}
+    return st;
+  };
+})();
 window.scrollTo = function () {}; window.scrollBy = function () {};
 window.alert = function () {}; window.confirm = function () { return true; }; window.prompt = function () { return null; };
 window.open = function () { return null; }; window.close = function () {}; window.focus = function () {}; window.blur = function () {};
@@ -3700,7 +3974,17 @@ function __prepScript(n) {
   if (ty && ty !== "module" && !/javascript|ecmascript/i.test(ty)) return;   // non-JS types never execute
   var src = String((__mr(n, "attrs") && __mr(n, "attrs").src) || n.src || "");
   var code = "";
-  if (!src) { try { code = String(n.textContent || __mr(n, "text") || ""); } catch (e2) { code = ""; } }
+  // a data: script is SOURCE, not a location — Chrome decodes it locally and
+  // never dials it; the wire rejects the scheme (facebook's ServerJS chain
+  // died 47/47 on exactly that). Decoded into code; src="" makes it inline.
+  if (src.indexOf("data:") === 0) {
+    try {
+      var __dm = /^data:[^,]*?(;base64)?,([\s\S]*)$/.exec(src);
+      if (__dm) code = __dm[1] ? atob(__dm[2]) : decodeURIComponent(__dm[2]);
+    } catch (eData) { code = ""; }
+    src = "";
+  }
+  if (!src && !code) { try { code = String(n.textContent || __mr(n, "text") || ""); } catch (e2) { code = ""; } }
   if (!src && !code) return;
   var conn = false;
   try { conn = !!__isConnected(n); } catch (e3) { conn = false; }
@@ -4144,7 +4428,9 @@ if (typeof globalThis.reportError === "undefined") {
 }
 
 // ── tracer sweep: attach miss-logging under the main namespaces ─────
-if (__TRACE) {
+// (DONCORE_TRACE_SWEEP — its own switch: the wrappers are slow enough to
+// skew timing, so plain DONCORE_TRACE stays pass-through log verbosity.)
+if (__TRACE && __DCI.TRACE_SWEEP) {
   var __rgopd = Reflect.getOwnPropertyDescriptor;
   // SAFE subject label: never INVOKE getters. Reading o.nodeName on the
   // document ran through a guarded accessor -> ownNT() -> GOPD(document,
@@ -8432,7 +8718,7 @@ try { delete globalThis.SharedArrayBuffer; } catch (e) {}
   }
   var CER = g.CustomElementRegistry;
   if (CER && CER.prototype) {
-    function regGuard(t) { if (__g(t, "_s7b") !== "CustomElementRegistry") throw inv(); }
+    function regGuard(t) { if (__g(t, "_s7b") !== "CustomElementRegistry") { if (__DCI.TRACE_ON) { var __d; try { __d = Object.prototype.toString.call(t) + " ctor=" + (t && t.constructor && t.constructor.name) + " s7b=" + String(__g(t, "_s7b")) + " o7b=" + (t && typeof t === "object" ? String(Object.getOwnPropertyNames(t).slice(0, 6)) : typeof t) + " isW=" + (typeof window !== "undefined" && window.customElements === t); } catch (eD) { __d = "unreadable"; } throw new TypeError("Illegal invocation [regGuard this=" + __d + "]"); } throw inv(); } }
     mfn(CER, "define", 3, function (name, ctor, opts) {
       regGuard(this); if (arguments.length < 2) arity("CustomElementRegistry", "define", 2, arguments.length);
       var map = __g(this, "_ceMap"), names = __g(this, "_ceNames"), n = String(name);
@@ -8457,6 +8743,22 @@ try { delete globalThis.SharedArrayBuffer; } catch (e) {}
     mfn(CER, "upgrade", 1, function (node) { regGuard(this); });
     mfn(CER, "initialize", 1, function (node) { regGuard(this); return node; });
   }
+  // The window-level `customElements` binding was the table-layer stub (defAG,
+  // ~7576): a plain object with a noop define. The U2b-6 materializer then
+  // chained that stub onto the REBUILT CustomElementRegistry.prototype, whose
+  // define/get are brand-guarded — so a page calling
+  // window.customElements.define(...) threw Illegal invocation and its module
+  // bootstrap died (measured: YouTube's kevlar_base_module — the whole SPA
+  // starved: 40/40 scripts ok, net calls 0). The window binding must be the
+  // ONE registry, the same branded instance document.customElementRegistry
+  // returns. (Class rule: where a real factory exists, it owns the global; the
+  // boot fallback stays only as the pre-CER placeholder.)
+  try {
+    Object.defineProperty(g, "customElements", {
+      get: __native("get customElements", 0, function () { return ncRegistry(); }),
+      enumerable: true, configurable: true,
+    });
+  } catch (e) {}
   try {
     var ELP = g.Element && g.Element.prototype;
     if (ELP) {
