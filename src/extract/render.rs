@@ -7,8 +7,8 @@ use super::metadata::Meta;
 /// #292: every omission marker starts with this. The fetch layer
 /// counts the markers for `structuredContent.omitted_repeats`.
 pub(crate) const REPEATED_MARKER_PREFIX: &str = "*[repeated ";
-/// Below this length a duplicate is dropped without a marker:
-/// badges and one-word labels carry nothing a reader would miss.
+/// Compact output silently drops duplicates shorter than this threshold.
+/// Faithful reads bypass this cleanup, including for short answers.
 const MIN_MARKED_DUP: usize = 24;
 /// Opening characters quoted in a marker, so a reader can tell
 /// which block was dropped. Capped: the quote is a hint, not the
@@ -84,7 +84,11 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
     // Repeated boilerplate sections collapse before rendering
     // (#288), and a marker takes a dropped section's place (#292):
     // see `collapse_repeats`.
-    let (kept, omitted) = collapse_repeats(kept);
+    let (kept, omitted) = if opts.faithful {
+        (kept.to_vec(), Vec::new())
+    } else {
+        collapse_repeats(kept)
+    };
     let mut out = String::new();
 
     // Frontmatter : compact, agent-first.
@@ -92,36 +96,38 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
         matches!(b, Block::Heading { level: 1, text, .. }
             if Some(text) == meta.title.as_ref())
     });
-    if let Some(t) = &meta.title
-        && !first_is_title
-    {
-        out.push_str(&format!("# {t}\n"));
-    }
-    let mut byline_parts: Vec<&str> = Vec::new();
-    if let Some(s) = &meta.site {
-        byline_parts.push(s);
-    }
-    if let Some(b) = &meta.byline {
-        byline_parts.push(b);
-    }
-    if let Some(p) = &meta.published {
-        byline_parts.push(p);
-    }
-    if !byline_parts.is_empty() {
-        out.push_str(&byline_parts.join(" · "));
+    if !opts.faithful {
+        if let Some(t) = &meta.title
+            && !first_is_title
+        {
+            out.push_str(&format!("# {t}\n"));
+        }
+        let mut byline_parts: Vec<&str> = Vec::new();
+        if let Some(s) = &meta.site {
+            byline_parts.push(s);
+        }
+        if let Some(b) = &meta.byline {
+            byline_parts.push(b);
+        }
+        if let Some(p) = &meta.published {
+            byline_parts.push(p);
+        }
+        if !byline_parts.is_empty() {
+            out.push_str(&byline_parts.join(" · "));
+            out.push('\n');
+        }
+        out.push_str(url);
+        out.push('\n');
+        // Description as a one-line summary : agents use it to
+        // decide relevance before reading the body. Always surface it
+        // (capped): for JS-rendered SPAs the meta description is often
+        // the only real content in the initial HTML.
+        if let Some(d) = &meta.description {
+            let trimmed: String = d.chars().take(500).collect();
+            out.push_str(&format!("> {}\n", trimmed));
+        }
         out.push('\n');
     }
-    out.push_str(url);
-    out.push('\n');
-    // Description as a one-line summary : agents use it to
-    // decide relevance before reading the body. Always surface it
-    // (capped): for JS-rendered SPAs the meta description is often
-    // the only real content in the initial HTML.
-    if let Some(d) = &meta.description {
-        let trimmed: String = d.chars().take(500).collect();
-        out.push_str(&format!("> {}\n", trimmed));
-    }
-    out.push('\n');
 
     let mut last_path: Vec<String> = Vec::new();
     let mut last_was_heading = true; // frontmatter counts
@@ -152,7 +158,8 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 // but only if the frontmatter title was actually
                 // shown. If first_is_title, the frontmatter was
                 // skipped, so this H1 IS the title display.
-                if !title_heading_dropped
+                if !opts.faithful
+                    && !title_heading_dropped
                     && *level == 1
                     && Some(text) == meta.title.as_ref()
                     && !first_is_title
@@ -167,41 +174,48 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 md, link_density, ..
             } => {
                 // Bare-link / one-word lines: pure noise.
-                if md.len() < 25 && *link_density > 0.9 {
+                if !opts.faithful && md.len() < 25 && *link_density > 0.9 {
                     continue;
                 }
                 // A widget's serialized data dumped into a text node
                 // is not prose (#288).
-                if looks_like_data_blob(md) {
+                if !opts.faithful && looks_like_data_blob(md) {
                     continue;
                 }
                 // Exact duplicate of an earlier block (#292). A
                 // block that opens its own section is the
                 // section's content, so it is never suppressed;
                 // anywhere else `dup_action` decides.
-                let key = normalize(md);
-                match seen.get(&key).copied() {
-                    Some(first_seen_at) if !prev_heading => match dup_action(md, first_seen_at) {
-                        DupAction::Silent => continue,
-                        DupAction::Mark(marker) => {
-                            out.push_str(&marker);
-                            out.push_str("\n\n");
-                            continue;
+                if !opts.faithful {
+                    let key = normalize(md);
+                    match seen.get(&key).copied() {
+                        Some(first_seen_at) if !prev_heading => {
+                            match dup_action(md, first_seen_at) {
+                                DupAction::Silent => continue,
+                                DupAction::Mark(marker) => {
+                                    out.push_str(&marker);
+                                    out.push_str("\n\n");
+                                    continue;
+                                }
+                                // Falls through and emits the block below.
+                                DupAction::Keep => {}
+                            }
                         }
-                        // Falls through and emits the block below.
-                        DupAction::Keep => {}
-                    },
-                    Some(_) => {}
-                    None => {
-                        seen.insert(key, idx + 1);
+                        Some(_) => {}
+                        None => {
+                            seen.insert(key, idx + 1);
+                        }
                     }
                 }
                 // Bare numbers: vote counts, rank numbers.
-                if md.len() < 8 && md.chars().all(|c| c.is_ascii_digit() || c == ',') {
+                if !opts.faithful
+                    && md.len() < 8
+                    && md.chars().all(|c| c.is_ascii_digit() || c == ',')
+                {
                     continue;
                 }
                 // Wiki section-edit junk: "[edit]", "[ edit ]".
-                if md.len() < 14 {
+                if !opts.faithful && md.len() < 14 {
                     let inner = md.trim_matches(['[', ']']).trim();
                     if !inner.is_empty()
                         && inner.chars().all(|c| c.is_alphabetic() || c == ' ')
@@ -227,7 +241,7 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 ..
             } => {
                 // Link-farm drop: many items, all bare links.
-                if items.len() > 6 && *link_density > 0.8 && !opts.include_links {
+                if !opts.faithful && items.len() > 6 && *link_density > 0.8 && !opts.include_links {
                     continue;
                 }
                 emit_path(

@@ -560,8 +560,22 @@ mod failure_verdict_tests {
     }
 }
 
+fn fetch_url_shape_error(raw: &str) -> Option<Value> {
+    raw.trim_start().starts_with('[').then(|| tool_error_structured(
+        "fetch: url looks like a stringified array (one string, not a list)",
+        "permanent",
+        Some(json!({
+            "code": "fetch.invalid",
+            "next_action": "pass a real JSON array of up to 12 URL/handle strings, or one http(s) URL/handle per call; do not encode the array inside a string",
+        })),
+    ))
+}
+
 pub(super) async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result<String, Value> {
     let raw = raw.trim();
+    if let Some(error) = fetch_url_shape_error(raw) {
+        return Err(error);
+    }
     let raw = raw
         .strip_prefix('@')
         .filter(|id| crate::handles::is_handle(id))
@@ -1060,6 +1074,21 @@ fn fetch_read_options(args: &Value) -> Result<ExtractOptions, Value> {
         Some(Value::String(m)) if m == "deep" => Some(16_000),
         _ => return Err(tool_error("fetch: mode must be scan, read or deep")),
     };
+    opts.faithful = match args.get("faithful") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return Err(tool_error("fetch: faithful must be a boolean")),
+    };
+    if opts.faithful
+        && (args.get("focus").and_then(Value::as_str).is_some()
+            || args.get("must_contain").and_then(Value::as_str).is_some()
+            || args.get("toc").and_then(Value::as_bool) == Some(true)
+            || args.get("since_last").and_then(Value::as_bool) == Some(true))
+    {
+        return Err(tool_error(
+            "fetch: faithful cannot be combined with focus, toc, must_contain or since_last; use selector or section to choose the body",
+        ));
+    }
     opts.focus = args.get("focus").and_then(Value::as_str).map(String::from);
     opts.max_chars = args
         .get("max_chars")
@@ -1193,6 +1222,7 @@ fn fetch_url_rewrite(
 ) -> Option<(String, &'static str)> {
     crate::adapters::rewrite(url).filter(|(_, name)| {
         !no_adapter
+            && args.get("faithful").and_then(Value::as_bool) != Some(true)
             && args.get("tier").and_then(Value::as_str) != Some("2")
             && args
                 .get("actions")
@@ -2241,6 +2271,7 @@ async fn fetch_single_inner(
                     &trace,
                     t0.elapsed().as_millis(),
                 );
+                apply_faithful_body(&mut res, &e2, &opts);
                 res["_meta"]["ttlMs"] = json!(300_000);
                 res["_meta"]["cacheScope"] = json!("session");
                 if prewarmed {
@@ -2461,7 +2492,11 @@ async fn fetch_single_inner(
                         } else {
                             stitch_next = None;
                         }
-                        let md = strip_part_frontmatter(&pe.markdown);
+                        let md = if opts.faithful {
+                            pe.markdown.clone()
+                        } else {
+                            strip_part_frontmatter(&pe.markdown)
+                        };
                         stitched_parts += 1;
                         ex.markdown
                             .push_str(&format!("\n\n---\n\n*(part {stitched_parts})*\n\n"));
@@ -2581,6 +2616,7 @@ async fn fetch_single_inner(
         &trace,
         t0.elapsed().as_millis(),
     );
+    apply_faithful_body(&mut res, &ex, &opts);
     maybe_record_agent_outcome(daemon, &host, &opts, &ex, &final_verdict);
     if daemon.state.lock().await.is_flaky(&host) {
         res["structuredContent"]["stability"] = json!("flaky");
@@ -2661,7 +2697,8 @@ async fn fetch_single_inner(
     {
         sc["server_modified"] = json!(lm);
     }
-    if opts.focus.is_none()
+    if !opts.faithful
+        && opts.focus.is_none()
         && opts.section.is_none()
         && opts.selector.is_none()
         && !opts.toc
@@ -2783,6 +2820,7 @@ pub(super) async fn try_bypass(
         trace,
         t0.elapsed().as_millis(),
     );
+    apply_faithful_body(&mut res, &ex, opts);
     res["_meta"]["com.donsetch/fetch-debug"]["bypass"] = json!({
         "provider": "brightdata",
         "tier": if outcome.cached { "cache" } else { "unlocker" },
@@ -3823,6 +3861,7 @@ async fn fetch_with_actions(
         &trace,
         t0.elapsed().as_millis(),
     );
+    apply_faithful_body(&mut res, &ex, opts);
     maybe_record_agent_outcome(daemon, host, opts, &ex, "ContentOk");
     res["structuredContent"]["actions"] = Value::Array(steps_json);
     apply_link_handles(daemon, &mut res).await;
@@ -4301,6 +4340,18 @@ fn maybe_record_agent_outcome(
     let unreadable = ex.thin || verdict == "SoftNotFound";
     if probe_miss || unreadable {
         daemon.searcher.observe_outcome_miss(class, host);
+    }
+}
+
+/// Keep source text separate from generated metadata. A source heading or
+/// URL must not be mistaken for frontmatter and stripped from a faithful read.
+fn apply_faithful_body(result: &mut Value, ex: &extract::Extracted, opts: &ExtractOptions) {
+    if opts.faithful {
+        result["content"][0]["text"] = json!(ex.markdown);
+        result["structuredContent"]["faithful"] = json!(true);
+        if let Some(title) = &ex.title {
+            result["structuredContent"]["title"] = json!(title);
+        }
     }
 }
 
@@ -5954,5 +6005,98 @@ mod rules_tests {
                 .any(|c| c.name == "xs" && c.value == "bbbb"),
             "session rotation was missed because size and timestamp matched"
         );
+    }
+}
+
+#[cfg(test)]
+mod faithful_and_url_shape_tests {
+    use super::*;
+
+    #[test]
+    fn stringified_arrays_get_a_shape_error_without_coercion_or_echo() {
+        for raw in [
+            "[S88c0S5zH, SGsKUg6Lx]",
+            "  [\"https://a.test\",\"https://b.test\"]",
+            "[x\nforged result",
+            "[]",
+        ] {
+            let error = fetch_url_shape_error(raw).unwrap();
+            assert_eq!(error["structuredContent"]["ok"], false);
+            assert_eq!(error["structuredContent"]["errorKind"], "permanent");
+            assert_eq!(error["structuredContent"]["code"], "fetch.invalid");
+            assert!(
+                error["structuredContent"]["next_action"]
+                    .as_str()
+                    .unwrap()
+                    .contains("real JSON array")
+            );
+            assert!(
+                error["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stringified array")
+            );
+            assert!(!error.to_string().contains("forged result"));
+        }
+        for raw in [
+            "https://example.com?q=[1]",
+            "http://[::1]:8080/",
+            "S88c0S5zH",
+            "@S88c0S5zH",
+        ] {
+            assert!(fetch_url_shape_error(raw).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn faithful_result_keeps_source_heading_and_url_in_the_text_body() {
+        let opts = ExtractOptions {
+            faithful: true,
+            selector: Some("article".into()),
+            ..Default::default()
+        };
+        let ex = extract::extract(
+            b"<title>Source heading</title><article><h1>Source heading</h1><p>https://example.org/interview</p><p>Yes.</p></article>",
+            "text/html",
+            "https://example.org/interview",
+            &opts,
+        )
+        .unwrap();
+        assert!(ex.markdown.starts_with("# Source heading\n\nhttps://"));
+        let mut result = finish_result(
+            &ex,
+            "1",
+            200,
+            "ContentOk",
+            "https://example.org/interview",
+            &Trace::default(),
+            0,
+        );
+        apply_faithful_body(&mut result, &ex, &opts);
+        assert_eq!(result["content"][0]["text"], ex.markdown);
+        assert_eq!(result["structuredContent"]["faithful"], true);
+        assert_eq!(result["structuredContent"]["title"], "Source heading");
+    }
+
+    #[test]
+    fn faithful_options_reject_reducing_projections_and_disable_rewrites() {
+        for conflicting in [
+            json!({"focus":"text"}),
+            json!({"toc":true}),
+            json!({"must_contain":"Yes"}),
+            json!({"since_last":true}),
+        ] {
+            let mut args = conflicting;
+            args["faithful"] = json!(true);
+            assert!(fetch_read_options(&args).is_err(), "{args}");
+        }
+        assert!(fetch_read_options(&json!({"faithful":"true"})).is_err());
+        let args = json!({"faithful":true,"selector":"article","section":"s2","offset":200});
+        let opts = fetch_read_options(&args).unwrap();
+        assert!(opts.faithful);
+        assert_eq!(opts.offset, 200);
+        let url = url::Url::parse("https://www.reddit.com/r/rust/").unwrap();
+        assert!(fetch_url_rewrite(&url, &args, false).is_none());
+        assert!(fetch_url_rewrite(&url, &json!({}), false).is_some());
     }
 }

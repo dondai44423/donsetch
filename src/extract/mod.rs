@@ -33,6 +33,8 @@ use scraper::Html;
 
 #[derive(Default, Clone)]
 pub struct ExtractOptions {
+    /// Preserve selected HTML body text, order and repetitions without token-saving cleanup.
+    pub faithful: bool,
     /// BM25 relevance query: keep only blocks matching, with context.
     pub focus: Option<String>,
     /// CSS selector: extract only from matching subtrees.
@@ -576,20 +578,26 @@ pub fn extract(
     // Reddit dedicated extractor: bypasses DonSift for
     // old.reddit.com, produces compact structured output.
     // Returns None for non-reddit or unrecognized pages.
-    if let Some(extracted) = reddit::extract(&html_text, url, opts) {
+    if !opts.faithful
+        && let Some(extracted) = reddit::extract(&html_text, url, opts)
+    {
         return Ok(extracted);
     }
 
     // Hacker News dedicated extractor: the comment tree is a
     // table layout the generic pipeline mangles. Full comment
     // text with authors and reply depth.
-    if let Some(extracted) = hn::extract(&html_text, url, opts) {
+    if !opts.faithful
+        && let Some(extracted) = hn::extract(&html_text, url, opts)
+    {
         return Ok(extracted);
     }
 
     // Domain-intelligence adapters (v3): GitHub / Stack Exchange /
     // Wikipedia infobox / docs-framework pages restructured.
-    if let Some(extracted) = crate::adapters::extract_html(&html_text, url, opts) {
+    if !opts.faithful
+        && let Some(extracted) = crate::adapters::extract_html(&html_text, url, opts)
+    {
         return Ok(extracted);
     }
 
@@ -635,6 +643,13 @@ pub fn extract(
                         .filter_map(scraper::ElementRef::wrap)
                         .count(),
                 });
+            } else if opts.faithful {
+                let ids: std::collections::HashSet<_> = matched.iter().map(|el| el.id()).collect();
+                matched
+                    .iter()
+                    .copied()
+                    .filter(|el| !el.ancestors().any(|ancestor| ids.contains(&ancestor.id())))
+                    .collect()
             } else {
                 matched
             }
@@ -685,7 +700,7 @@ pub fn extract(
     // A TOC is a complete projection, not a failed short extraction. Once
     // downstream has built the outline, content-oriented rescue paths must
     // not replace it with the page body.
-    if opts.toc || opts.selector.is_some() {
+    if opts.faithful || opts.toc || opts.selector.is_some() {
         return Ok(extracted);
     }
 

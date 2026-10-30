@@ -3,7 +3,7 @@
 # DonSeTch
 
 **The web, for AI agents.**
-**V5 on works (Update stalled for 3-5 days): major change incoming**
+**V5 is being redesigned privately and will take longer. V4 updates will continue in the meantime; the features below describe the released product.**
 <div align="center">
 <a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="dondai44423%2Fdonsetch | Trendshift" width="250" height="55"/></a>
 </div>
@@ -304,6 +304,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 **DonSift extraction**: HTML bytes in, agent-native markdown out. Typed blocks (heading, paragraph, list, table, code, quote, media) with heading breadcrumbs.
 
 - **`focus`**: BM25-relevant passages with heading context. Scores use each passage's own text; a repeated page title or common subject cannot make every paragraph relevant. Tables keep selected rows with their headers and complete cells; unordered lists keep selected items with their nested conditions. Omitted blocks, rows and items are counted. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
+- **`faithful=true`** (CLI `--faithful`): read the selected HTML body in source order, keeping intentional repetitions, short answers, numbers and separators. No paragraph deduplication, repeated-section collapse, generated summary or domain adapter. Use `selector="article"` to choose the body, or `section` to choose a heading section. Hidden elements, scripts and navigation remain excluded; this is body text, not raw HTML. Pagination and `next_offset` still apply; repeat `faithful` and the same scope when continuing. Do not combine it with `focus`, `toc`, `must_contain` or `since_last`.
 - **`selector`**: extract only matching HTML subtrees. A miss returns `selector.nomatch` with the inspected element count; invalid syntax returns `selector.invalid`. Non-HTML responses cannot satisfy a CSS scope.
 - **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
 - **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
@@ -812,7 +813,6 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | It cannot | Why |
 |---|---|
 | Solve interactive captchas locally | hCaptcha, reCAPTCHA, Turnstile: an honest dead end, no solving service by design. |
-| Send ML-DSA post-quantum signatures | BoringSSL 5.1 lacks them. Lands when BoringSSL has it. |
 | Search with every engine down | An error with per-engine status. Honest, never fake. |
 | Replace a human working a defended site | See "Pick the right tool" above. |
 

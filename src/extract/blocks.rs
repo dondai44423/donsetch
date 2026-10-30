@@ -211,7 +211,13 @@ fn walk<'a>(
                     }
                     walk(child_el, base, opts, headings, out, depth + 1);
                 }
-            } else if let Some(t) = table_block(el, headings, opts.selector.is_some(), base, opts) {
+            } else if let Some(t) = table_block(
+                el,
+                headings,
+                opts.selector.is_some() || opts.faithful,
+                base,
+                opts,
+            ) {
                 push_block(t, out);
             }
         }
@@ -308,10 +314,51 @@ fn walk<'a>(
         // layer drops them unless include_media. On-demand image
         // OCR (v3) needs the image list even when media lines are
         // not part of the output.
-        "figure" | "img" => {
+        "img" => {
             media_block(el, base, headings, out);
         }
+        "figure" if !opts.faithful => {
+            media_block(el, base, headings, out);
+        }
+        "hr" if opts.faithful => push_block(
+            Block::Para {
+                md: "---".into(),
+                link_density: 0.0,
+                path: current_path(headings),
+            },
+            out,
+        ),
         "hr" => {}
+        _ if opts.faithful => {
+            let mut run = String::new();
+            for child in el.children() {
+                match child.value() {
+                    Node::Text(t) => run.push_str(t.text.as_ref()),
+                    Node::Element(_) => {
+                        let Some(c) = ElementRef::wrap(child) else {
+                            continue;
+                        };
+                        if super::junk::skip(c) {
+                            continue;
+                        }
+                        if c.value().name() == "br" {
+                            run.push('\0');
+                        } else if INLINE_TAGS.contains(&c.value().name()) && !contains_block(c) {
+                            run.push_str(
+                                &inline::element_markdown(c, base, opts)
+                                    .0
+                                    .replace('\n', "\0"),
+                            );
+                        } else {
+                            flush_run(&mut run, headings, out);
+                            walk(c, base, opts, headings, out, depth + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            flush_run(&mut run, headings, out);
+        }
         _ => {
             // Container or unknown: emit direct loose text as a
             // paragraph (div-soup), then recurse into children.
@@ -347,6 +394,21 @@ fn walk<'a>(
                 walk(child_el, base, opts, headings, out, depth + 1);
             }
         }
+    }
+}
+
+fn flush_run(run: &mut String, headings: &[(u8, String)], out: &mut Vec<Block>) {
+    let md = inline::collapse_to_markdown(run);
+    run.clear();
+    if !md.trim().is_empty() {
+        push_block(
+            Block::Para {
+                md,
+                link_density: 0.0,
+                path: current_path(headings),
+            },
+            out,
+        );
     }
 }
 

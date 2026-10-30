@@ -5,6 +5,34 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.10.3] - 2026-10-30
+
+### Added
+
+- `web_fetch` accepts `faithful: true` (CLI `--faithful`) for reading an HTML
+  article without dropping repeated paragraphs or short answers. It preserves
+  selected body text in source order, skips adapter rewrites and generated
+  summaries, and retains the existing pagination contract. `selector` and
+  `section` can narrow the body; reducing projections are rejected (#389).
+
+### Fixed
+
+- Xvfb stderr is drained throughout its lifetime into a bounded diagnostic
+  tail, so repeated xkbcomp warnings cannot fill its pipe and wedge the
+  browser tier. Startup probes the X11 protocol without needing `xdpyinfo`.
+  Stale recovery targets only the exact, same-user Xvfb display, escalates
+  from TERM to KILL, and refuses to rebind while either socket is occupied.
+  Wrapper scripts and neighboring display numbers are not matched (#391).
+- A fetch URL that looks like an array encoded inside one string gets an
+  actionable error: pass a real JSON array or one URL/handle. It is not
+  silently coerced, including when the string contains valid JSON (#390).
+
+### Changed
+
+- Update boring/boring-sys to 5.3.0, libc to 0.2.191, tokio to 1.53.3, psl
+  to 2.1.243 and rustls-native-certs to 0.8.5 (#384–388).
+- V5 remains in private redesign; v4 maintenance continues while it develops.
+
 ## [4.10.2] - 2026-10-22
 
 ### Added

@@ -100,6 +100,17 @@ pub struct ToolSpec {
 
 const FETCH_PARAMS: &[ParamSpec] = &[
     ParamSpec {
+        name: "faithful",
+        flag: "faithful",
+        kind: ParamKind::SetTrue,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Preserve selected HTML body text in source order, including short text and repetitions. Skips deduplication, summaries and domain adapters; selector can choose the body. Pagination still applies. Not combined with focus, toc, must_contain or since_last.",
+        mcp_help: Some(
+            "Preserve HTML body text and repetitions in source order, without cleanup or adapters. Use selector to choose a body; pagination still applies. Not with focus, toc, must_contain or since_last.",
+        ),
+    },
+    ParamSpec {
         name: "url",
         flag: "",
         kind: ParamKind::StrOrList,

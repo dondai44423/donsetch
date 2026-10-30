@@ -2929,3 +2929,126 @@ fn reliability_short_article_focus_preserves_specific_evidence() {
     assert!(!focused.markdown.contains("showing full content"));
     assert!(focused.markdown.len() * 2 < full.markdown.len());
 }
+
+#[test]
+fn faithful_preserves_the_reported_interview_and_short_text_in_order() {
+    let html = r#"<!doctype html><html><head>
+    <title>Interview article extraction example</title>
+    <meta name="description" content="Metadata is not the article body.">
+    </head><body><article>
+    <h1>Interview article extraction example</h1>
+    <p>The interviewer asks whether the first proposal should proceed after the team reviews its practical effects.</p>
+    <p>Yes.</p>
+    <p>The interviewer then asks whether the separate second proposal should proceed after a further round of review.</p>
+    <p>Yes.</p>
+    <p>The interview concludes by explaining that each answer responds to a different question and belongs in the transcript.</p>
+    <p>7</p><hr><p>[pause]</p><p><a href="/answer">No.</a></p>
+    </article></body></html>"#;
+    let opts = ExtractOptions {
+        faithful: true,
+        selector: Some("article".into()),
+        ..Default::default()
+    };
+    let ex = extract_html_opts(html, &opts);
+    assert_eq!(ex.markdown.matches("Yes.").count(), 2, "{}", ex.markdown);
+    let first = ex.markdown.find("Yes.").unwrap();
+    let second_question = ex.markdown.find("The interviewer then").unwrap();
+    let second = ex.markdown.rfind("Yes.").unwrap();
+    assert!(first < second_question && second_question < second);
+    for text in ["\n7\n", "\n---\n", "[pause]", "No."] {
+        assert!(
+            ex.markdown.contains(text),
+            "missing {text}: {}",
+            ex.markdown
+        );
+    }
+    assert!(!ex.markdown.contains("Metadata is not"));
+    assert_eq!(
+        ex.title.as_deref(),
+        Some("Interview article extraction example")
+    );
+    assert!(ex.next_offset.is_none());
+    assert!(!ex.markdown.contains("*[repeated"));
+    let default = extract_html_opts(
+        html,
+        &ExtractOptions {
+            selector: opts.selector,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        default.markdown.matches("Yes.").count(),
+        1,
+        "default cleanup stays unchanged"
+    );
+}
+
+#[test]
+fn faithful_keeps_repeated_sections_loose_text_and_captions() {
+    let para = "The same full paragraph belongs at both positions in this transcript. ".repeat(8);
+    let html = format!(
+        "<article>Before<p>Middle</p>After <em>emphasis</em><h2>Repeat</h2><p>{para}</p><h2>Repeat</h2><p>{para}</p><figure><img src='/image.png'><figcaption>Caption text</figcaption></figure><p>End<sup>1</sup></p></article>"
+    );
+    let ex = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            faithful: true,
+            selector: Some("article, article p".into()),
+            ..Default::default()
+        },
+    );
+    assert!(ex.markdown.find("Before").unwrap() < ex.markdown.find("Middle").unwrap());
+    assert!(ex.markdown.find("Middle").unwrap() < ex.markdown.find("After").unwrap());
+    assert_eq!(
+        ex.markdown.matches(para.trim()).count(),
+        2,
+        "{}",
+        ex.markdown
+    );
+    assert_eq!(ex.markdown.matches("## Repeat").count(), 2);
+    assert!(ex.markdown.contains("Caption text"));
+    assert!(ex.markdown.contains("End^{1}"));
+    assert!(!ex.markdown.contains("*[repeated"));
+}
+
+#[test]
+fn faithful_pagination_reassembles_every_occurrence_without_rescue() {
+    let html = format!(
+        "<article><h1>Transcript</h1>{}</article><script type='application/ld+json'>{{\"articleBody\":\"Not the selected article\"}}</script>",
+        "<p>Yes. 終 Another answer in the transcript.</p>".repeat(40)
+    );
+    let mut opts = ExtractOptions {
+        faithful: true,
+        selector: Some("article".into()),
+        max_chars: Some(200),
+        ..Default::default()
+    };
+    let full = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            max_chars: Some(20_000),
+            ..opts.clone()
+        },
+    );
+    let mut collected = String::new();
+    loop {
+        let ex = extract_html_opts(&html, &opts);
+        assert!(ex.markdown.len() <= 200);
+        collected.push_str(
+            ex.markdown
+                .split("\n\n*[truncated : continue with offset=")
+                .next()
+                .unwrap(),
+        );
+        match ex.next_offset {
+            Some(next) => {
+                assert!(next > opts.offset);
+                opts.offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(collected, full.markdown);
+    assert_eq!(collected.matches("Yes.").count(), 40);
+    assert!(!collected.contains("Not the selected"));
+}

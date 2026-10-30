@@ -233,7 +233,7 @@ fn render(
                     // bare digits) : those are pure token waste.
                     "sup" => {
                         let t = plain(c);
-                        if !t.is_empty() && !is_citation_marker(&t) {
+                        if !t.is_empty() && (opts.faithful || !is_citation_marker(&t)) {
                             buf.push_str(&format!("^{{{t}}}"));
                             *total += t.len();
                         }
@@ -258,10 +258,15 @@ fn render(
                     // (multi-paragraph comments, list items): at
                     // least a space : the words must never fuse.
                     "p" | "li" | "div" | "blockquote" => {
-                        if !buf.is_empty() && !buf.ends_with(' ') {
+                        if opts.faithful {
+                            buf.push_str("\0\0");
+                        } else if !buf.is_empty() && !buf.ends_with(' ') {
                             buf.push(' ');
                         }
                         render(c, base, opts, buf, total, link, depth + 1, false);
+                        if opts.faithful {
+                            buf.push_str("\0\0");
+                        }
                     }
                     _ => {
                         if crate::extract::junk::skip(c) {
@@ -525,6 +530,7 @@ mod tests {
         let document = Html::parse_fragment(html);
         let root = document.root_element();
         let opts = super::super::ExtractOptions {
+            faithful: false,
             focus: None,
             selector: None,
             max_chars: None,
@@ -564,6 +570,7 @@ mod tests {
         let document = Html::parse_fragment(html);
         let root = document.root_element();
         let opts = super::super::ExtractOptions {
+            faithful: false,
             focus: None,
             selector: None,
             max_chars: None,

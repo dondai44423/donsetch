@@ -131,13 +131,12 @@ mod linux {
                 });
             }
 
-            // Kill stale Xvfb on this display (crash recovery). Safe:
-            // we are the only starter allowed past the gate.
-            let _ = tokio::process::Command::new("pkill")
-                .args(["-f", &format!("Xvfb {display}")])
-                .output()
-                .await;
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // Only retire an unresponsive Xvfb owned by this user on this
+            // exact display. Never pattern-kill wrappers or another display.
+            if let Err(error) = retire_stale_display().await {
+                let _ = std::fs::remove_file(lock_path());
+                return Err(error);
+            }
 
             // Remove stale socket + lock files. A dead Xvfb leaves
             // these behind : a new Xvfb can't bind to a stale socket,
@@ -176,7 +175,7 @@ mod linux {
                 "tcp",
             ]);
             cmd.stdout(Stdio::null())
-                .stderr(Stdio::piped()) // kept for the failure diagnostic
+                .stderr(Stdio::piped()) // continuously drained, with a bounded diagnostic tail
                 .stdin(Stdio::null());
 
             // Die with the parent: the kernel kills this display when
@@ -198,36 +197,37 @@ mod linux {
                 ))
             })?;
 
-            // Wait for the display to be ready by connecting to the
-            // X11 socket Xvfb binds once it accepts clients. Both
-            // namespaces count (see x_socket_alive): on WSLg the
-            // filesystem socket can never appear, and insisting on
-            // it there cost 10s and the headful mode entirely.
+            let stderr = child.stderr.take().map(StderrDrain::spawn);
+
+            // Wait for a real X11 setup reply in either namespace. A
+            // listening socket alone cannot establish readiness.
             // 10s timeout: WSL and some containers are slower to start.
             let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
-                    if x_socket_alive() {
-                        return;
+                    if display_alive().await {
+                        return true;
                     }
                     // Check if Xvfb died early.
                     if child.try_wait().ok().flatten().is_some() {
-                        return; // process exited : will fail below
+                        return false; // process exited : will fail below
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             })
             .await;
 
-            if ready.is_err() || !x_socket_alive() {
+            if !matches!(ready, Ok(true)) {
                 // Gather the real reason: Xvfb's own final words beat
                 // any generic guess (bad driver, missing xkb dir,
                 // permission problem : none of which are fixed by
                 // "install Xvfb").
-                let tail = read_stderr_tail(&mut child).await.unwrap_or_default();
-                // A display that never came up is not this process's
-                // to leave running: no reaper owns the child yet, and
-                // tokio's Child does not kill on drop.
+                // Kill first so stderr can reach EOF. Inherited descriptors
+                // in grandchildren must not hold the failure path indefinitely.
                 let _ = child.kill().await;
+                let tail = match stderr {
+                    Some(drain) => drain.finish().await,
+                    None => String::new(),
+                };
                 let _ = std::fs::remove_file(lock_path());
                 return Err(FetchError::ghost(format!(
                     "Xvfb failed to start on {display}{}{}",
@@ -240,7 +240,7 @@ mod linux {
                 crate::diag!("[ghost] Xvfb started on {display}");
             }
             Ok(Self {
-                reaper: Some(spawn_reaper(child)),
+                reaper: Some(spawn_reaper(child, stderr)),
                 lock_path: Some(lock_path()),
             })
         }
@@ -320,9 +320,10 @@ mod linux {
     /// Spawn the task that owns an Xvfb for its whole life: it
     /// wait()s the child out (no zombie can outlive it by more than
     /// one tick) and kills it on request.
-    pub(crate) fn spawn_reaper(mut child: Child) -> Reaper {
+    pub(super) fn spawn_reaper(mut child: Child, stderr: Option<StderrDrain>) -> Reaper {
         let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
+            let _stderr = stderr;
             loop {
                 match kill_rx.try_recv() {
                     // A request, or a dropped sender (the handle is
@@ -376,34 +377,132 @@ mod linux {
             .unwrap_or(std::time::Duration::from_secs(3600))
     }
 
-    /// Drain the remaining stderr of a failed Xvfb child into a
-    /// single bounded line: the process's own final words, the only
-    /// honest failure diagnostic. The child is already dead, so the
-    /// read ends at EOF; the timeout only guards a weird hang.
-    async fn read_stderr_tail(child: &mut Child) -> Option<String> {
-        use tokio::io::AsyncReadExt;
-        let mut stderr = child.stderr.take()?;
-        let mut total = Vec::with_capacity(4096);
-        let read = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let mut buf = [0u8; 4096];
-            loop {
-                match stderr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        total.extend_from_slice(&buf[..n]);
-                        if total.len() > 8192 {
+    /// Continuously drains the pipe for the child's whole lifetime. Retains
+    /// only the last 8 KiB, even if Xvfb or xkbcomp never stops writing.
+    pub(super) struct StderrDrain {
+        tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl StderrDrain {
+        pub(super) fn spawn(mut stderr: tokio::process::ChildStderr) -> Self {
+            use tokio::io::AsyncReadExt;
+            let tail =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let captured = tail.clone();
+            let task = tokio::spawn(async move {
+                let mut buf = [0; 4096];
+                loop {
+                    let n = match stderr.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(error) => {
+                            let mut tail = captured
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            tail.extend(format!("\nXvfb stderr read failed: {error}").bytes());
+                            while tail.len() > 8192 {
+                                tail.pop_front();
+                            }
                             break;
                         }
+                    };
+                    let mut tail = captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    tail.extend(&buf[..n]);
+                    while tail.len() > 8192 {
+                        tail.pop_front();
+                    }
+                }
+            });
+            Self { tail, task }
+        }
+
+        #[cfg(test)]
+        pub(super) fn retained_bytes(&self) -> usize {
+            self.tail.lock().unwrap().len()
+        }
+
+        pub(super) async fn finish(mut self) -> String {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(500), &mut self.task).await;
+            let tail = self
+                .tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bytes: Vec<u8> = tail.iter().copied().collect();
+            tail_line(&String::from_utf8_lossy(&bytes)).unwrap_or_default()
+        }
+    }
+
+    impl Drop for StderrDrain {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// The executable and display must both match exactly. A wrapper whose
+    /// arguments mention Xvfb, or :990 when retiring :99, is not an owner.
+    pub(super) fn xvfb_argv_matches(exe: &std::path::Path, argv: &[u8], display: &str) -> bool {
+        exe.file_name().is_some_and(|name| name == "Xvfb")
+            && argv.split(|b| *b == 0).nth(1) == Some(display.as_bytes())
+    }
+
+    fn xvfb_on_display(pid: libc::pid_t, display: &str) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let base = std::path::PathBuf::from(format!("/proc/{pid}"));
+        if !std::fs::metadata(&base).is_ok_and(|m| m.uid() == unsafe { libc::geteuid() }) {
+            return false;
+        }
+        let (Ok(exe), Ok(argv)) = (
+            std::fs::read_link(base.join("exe")),
+            std::fs::read(base.join("cmdline")),
+        ) else {
+            return false;
+        };
+        xvfb_argv_matches(&exe, &argv, display)
+    }
+
+    async fn retire_stale_display() -> Result<(), FetchError> {
+        let display = format!(":{}", display_num());
+        let entries = std::fs::read_dir("/proc").map_err(|e| {
+            FetchError::ghost(format!("cannot identify stale Xvfb on {display}: {e}"))
+        })?;
+        let pids: Vec<libc::pid_t> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
+            .filter(|pid| xvfb_on_display(*pid, &display))
+            .collect();
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            for &pid in &pids {
+                // Recheck identity before every signal; a retired PID may
+                // have been recycled while waiting for graceful shutdown.
+                if xvfb_on_display(pid, &display) && unsafe { libc::kill(pid, signal) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(FetchError::ghost(format!(
+                            "cannot retire Xvfb {pid} on {display}: {error}"
+                        )));
                     }
                 }
             }
-            total.len()
-        })
-        .await;
-        if read.is_err() && total.is_empty() {
-            return None;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            while pids.iter().any(|pid| xvfb_on_display(*pid, &display))
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
         }
-        tail_line(&String::from_utf8_lossy(&total))
+        // Never unlink a live server's pathname and then start a second
+        // server behind its abstract socket. Unknown owners are not ours
+        // to kill; report the conflict instead.
+        if pids.iter().any(|pid| xvfb_on_display(*pid, &display)) || socket_occupied().await {
+            return Err(FetchError::ghost(format!(
+                "unresponsive display {display} is still occupied (including its abstract X11 socket); refusing to start a second Xvfb"
+            )));
+        }
+        Ok(())
     }
 
     /// Last non-blank line of `text`, trimmed, cut to ~300 bytes.
@@ -430,31 +529,10 @@ mod linux {
         format!("/tmp/.X11-unix/X{}", display_num())
     }
 
-    /// Is anyone serving this display? Xvfb binds the socket name
-    /// twice: once under /tmp/.X11-unix, once in the Linux abstract
-    /// namespace (the `@`-prefixed entry in `ss -x`). WSLg mounts
-    /// /tmp/.X11-unix read-only, so there Xvfb can only ever bind
-    /// the abstract one : probing the file alone reports a perfectly
-    /// healthy display as dead, the 10s readiness budget is burned
-    /// on a path that can never appear, and the whole pool silently
-    /// degrades to --headless=new.
-    ///
-    /// The file is tried first: it is the common case, it is what a
-    /// stale-socket check needs (a tombstone file refuses connect),
-    /// and it keeps the fast path one syscall deep.
-    pub(super) fn x_socket_alive() -> bool {
-        let sock = x_socket_path();
-        if std::fs::exists(&sock).unwrap_or(false)
-            && std::os::unix::net::UnixStream::connect(&sock).is_ok()
-        {
-            return true;
-        }
-        abstract_socket_alive(&sock)
-    }
-
     /// Connect to the abstract-namespace twin of `name`. The API is
     /// Linux/Android-only, which is exactly the platform set this
     /// module compiles on (`linux_like`).
+    #[cfg(test)]
     pub(super) fn abstract_socket_alive(name: &str) -> bool {
         #[cfg(target_os = "android")]
         use std::os::android::net::SocketAddrExt;
@@ -478,74 +556,59 @@ mod linux {
             .unwrap_or(false)
     }
 
-    /// Check if an X display is alive by verifying someone is
-    /// listening on its X11 socket, in either namespace. A stale
-    /// socket (from a killed Xvfb process) will still have the
-    /// file but no server: connecting fails with ECONNREFUSED.
-    /// Used by GhostManager to revalidate a cached display before
-    /// every launch (a dead display must be replaced, not replayed).
+    /// Probe the X11 setup protocol, abstract socket first like libxcb.
+    /// A connect alone cannot distinguish a wedged server from a usable one.
+    /// The full operation is bounded even when the socket backlog is full.
     pub async fn display_alive() -> bool {
-        if !x_socket_alive() {
-            return false;
-        }
-        // A tombstone socket left behind by a zombie'd Xvfb (kill
-        // -9 mid-session) can still answer a bare connect, and a
-        // Chromium client handed that socket will never open CDP
-        // (devtools ws timeout on every tier-2 escalation). A
-        // bounded real-protocol probe settles it: only a server
-        // that answers xdpyinfo within 2 seconds is healthy.
-        if !xdpyinfo_probe().await {
-            return false;
-        }
-        true
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let path = x_socket_path();
+            let mut socket = match tokio::net::UnixStream::connect(format!("\0{path}")).await {
+                Ok(socket) => socket,
+                Err(_) => match tokio::net::UnixStream::connect(&path).await {
+                    Ok(socket) => socket,
+                    Err(_) => return false,
+                },
+            };
+            // Little-endian X11 v11 setup, no authorization (-ac server).
+            // An authorization refusal is still a responsive X server: do
+            // not retire somebody's healthy authenticated display.
+            if socket
+                .write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            let mut reply = [0; 8];
+            socket.read_exact(&mut reply).await.is_ok()
+                && reply[0] <= 2
+                && u16::from_le_bytes([reply[2], reply[3]]) == 11
+        })
+        .await
+        .unwrap_or(false)
     }
 
-    /// Real X-protocol probe. False when xdpyinfo is missing (the
-    /// cheaper connect-only semantics still apply) or the display
-    /// does not answer within the budget.
-    async fn xdpyinfo_probe() -> bool {
-        static PROBE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-        const PRESENT: u8 = 1;
-        const MISSING: u8 = 2;
-        let state = PROBE_STATE.load(std::sync::atomic::Ordering::Relaxed);
-        let present = if state == PRESENT {
-            true
-        } else if state == MISSING {
-            false
-        } else {
-            let ok = tokio::process::Command::new("which")
-                .arg("xdpyinfo")
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            PROBE_STATE.store(
-                if ok { PRESENT } else { MISSING },
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            ok
-        };
-        if !present {
-            return true; // xdpyinfo absent: trust the connect check
-        }
-        let display = format!(":{}", display_num());
-        let child = tokio::process::Command::new("xdpyinfo")
-            .arg("-display")
-            .arg(&display)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
-            Err(_) => return true, // spawn failed: do not veto on tooling
-        };
-        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
-            Ok(Ok(status)) => status.success(),
-            _ => {
-                let _ = child.kill().await;
-                false
+    /// A non-responsive listener still owns its name. A full backlog is
+    /// occupied too; never unlink or start another server over it.
+    async fn socket_occupied() -> bool {
+        let path = x_socket_path();
+        for name in [format!("\0{path}"), path] {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                tokio::net::UnixStream::connect(name),
+            )
+            .await
+            {
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) => {}
+                _ => return true,
             }
         }
+        false
     }
 }
 
@@ -663,6 +726,10 @@ mod tests {
 
     #[test]
     fn gate_conflicts_and_recovers() {
+        // Nextest isolates config/env; never remove the live daemon's :99 gate.
+        unsafe {
+            std::env::set_var("DONSETCH_XVFB_DISPLAY", "116");
+        }
         let _lock = SYNC_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -674,6 +741,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(x::create_gate().is_ok());
         let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("DONSETCH_XVFB_DISPLAY");
+        }
     }
 
     #[tokio::test]
@@ -793,7 +863,7 @@ mod tests {
             .spawn()
             .expect("spawn");
         let pid = child.id().expect("pid");
-        let _reaper = x::spawn_reaper(child);
+        let _reaper = x::spawn_reaper(child, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::path::Path::new(&format!("/proc/{pid}")).exists() {
             assert!(
@@ -915,11 +985,129 @@ mod tests {
             .spawn()
             .expect("spawn");
         let pid = child.id().expect("pid");
-        let reaper = x::spawn_reaper(child);
+        let reaper = x::spawn_reaper(child, None);
         reaper.shutdown().await;
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "kill + reap must leave nothing behind"
         );
+    }
+    #[tokio::test]
+    async fn stderr_drain_handles_more_than_a_pipe_and_retains_a_bounded_tail() {
+        let mut child = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                "head -c 524288 /dev/zero >&2; printf '\nlast diagnostic\n' >&2",
+            ])
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let drain = x::StderrDrain::spawn(child.stderr.take().unwrap());
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .expect("an undrained pipe blocks the writer")
+            .unwrap();
+        assert!(status.success());
+        assert!(drain.retained_bytes() <= 8192);
+        assert_eq!(drain.finish().await, "last diagnostic");
+    }
+
+    #[test]
+    fn stale_identity_matches_only_the_exact_xvfb_executable_and_display() {
+        let exe = std::path::Path::new("/usr/bin/Xvfb");
+        assert!(x::xvfb_argv_matches(exe, b"Xvfb\0:99\0-ac\0", ":99"));
+        assert!(!x::xvfb_argv_matches(exe, b"Xvfb\0:990\0", ":99"));
+        assert!(!x::xvfb_argv_matches(
+            std::path::Path::new("/bin/sh"),
+            b"sh\0-c\0Xvfb :99\0",
+            ":99"
+        ));
+        assert!(!x::xvfb_argv_matches(
+            std::path::Path::new("/bin/notXvfb"),
+            b"Xvfb\0:99\0",
+            ":99"
+        ));
+    }
+
+    // Nextest isolates the display env/config. Only this test's owned
+    // server is stopped; the desktop and any daemon display are untouched.
+    #[tokio::test]
+    async fn stale_recovery_kills_a_term_immune_server_before_rebinding() {
+        unsafe {
+            std::env::set_var("DONSETCH_XVFB_DISPLAY", "114");
+        }
+        let mut stale = tokio::process::Command::new("Xvfb")
+            .args([
+                ":114",
+                "-screen",
+                "0",
+                "1280x720x24",
+                "-ac",
+                "-nolisten",
+                "tcp",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !x::display_alive().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owned fixture did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        unsafe {
+            assert_eq!(libc::kill(stale.id().unwrap() as i32, libc::SIGSTOP), 0);
+        }
+        assert!(
+            !x::display_alive().await,
+            "a listener alone is not a usable display"
+        );
+        let replacement = x::Xvfb::start()
+            .await
+            .expect("retire and replace the stopped Xvfb");
+        assert!(!replacement.is_borrowed());
+        assert!(x::display_alive().await);
+        assert!(!stale.wait().await.unwrap().success());
+        replacement.kill().await;
+        assert!(!x::display_alive().await);
+        unsafe {
+            std::env::remove_var("DONSETCH_XVFB_DISPLAY");
+        }
+    }
+    #[tokio::test]
+    async fn stale_recovery_refuses_an_unknown_abstract_socket_owner() {
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
+        #[cfg(target_os = "linux")]
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        unsafe {
+            std::env::set_var("DONSETCH_XVFB_DISPLAY", "115");
+        }
+        let name = "/tmp/.X11-unix/X115";
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        let error = x::Xvfb::start()
+            .await
+            .err()
+            .expect("unknown owner must not be replaced");
+        assert!(error.to_string().contains("still occupied"), "{error}");
+        assert!(
+            x::abstract_socket_alive(name),
+            "the foreign socket is untouched"
+        );
+        assert!(
+            !std::path::Path::new(&x::lock_path()).exists(),
+            "failed coordinator releases its gate"
+        );
+        drop(listener);
+        unsafe {
+            std::env::remove_var("DONSETCH_XVFB_DISPLAY");
+        }
     }
 }
