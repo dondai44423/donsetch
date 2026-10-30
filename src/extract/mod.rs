@@ -494,11 +494,20 @@ pub fn extract(
             });
         }
         let (slice, next) = paginate(&text, opts.offset, max_chars);
+        // The notice sits outside the max_chars budget, like the source
+        // header, so max_chars >= the size it names returns the whole
+        // body; next_offset stays an offset into the source text.
+        let notice = skipped_filters_notice(opts, text.len());
+        let total_chars = text.len() + notice.as_ref().map_or(0, String::len);
+        let markdown = match notice {
+            Some(notice) => format!("{notice}{slice}"),
+            None => slice,
+        };
 
         return Ok(Extracted {
-            tokens_est: slice.len() / 4,
-            total_chars: text.len(),
-            markdown: slice,
+            tokens_est: markdown.len() / 4,
+            total_chars,
+            markdown,
             title: None,
             byline: None,
             published: None,
@@ -1223,6 +1232,56 @@ pub fn probe_render(text: &str, pattern: &str, is_regex: bool) -> String {
         // hit on a char boundary.
         Err(_) if !is_regex => report(Some(literal_hits(text, pattern))),
         Err(_) => report(None),
+    }
+}
+
+/// Separates the filter names from the explanation in the notice a
+/// plain-text read leads with when it could not apply them.
+const FILTERS_SKIPPED_MARK: &str = " not applied: ";
+
+/// Leading notice for a plain-text read that was asked for focus,
+/// section or toc, which need HTML or PDF structure. `None` when none
+/// of them was set. `size` is the body length in bytes.
+fn skipped_filters_notice(opts: &ExtractOptions, size: usize) -> Option<String> {
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let mut names = Vec::new();
+    if set(&opts.focus) {
+        names.push("focus");
+    }
+    if set(&opts.section) {
+        names.push("section");
+    }
+    if opts.toc {
+        names.push("toc");
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "*[{}{FILTERS_SKIPPED_MARK}plain-text response, no HTML or PDF structure : showing raw text ({size} bytes). \
+         To read it whole, prefer curl or wget saving to a file if your environment allows it, \
+         otherwise set max_chars to at least {size}. To find a passage, use must_contain, then offset]*\n\n",
+        names.join(", ")
+    ))
+}
+
+/// Read filters that a plain-text read could not apply, as named by
+/// the notice it leads with. Empty for every other result.
+pub fn skipped_filters(markdown: &str) -> Vec<&str> {
+    let names = markdown
+        .strip_prefix("*[")
+        .and_then(|rest| rest.split_once(FILTERS_SKIPPED_MARK))
+        .map(|(names, _)| names.split(", ").collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Raw text can itself start with "*[", so accept only the names
+    // the notice can carry.
+    if names
+        .iter()
+        .all(|n| matches!(*n, "focus" | "section" | "toc"))
+    {
+        names
+    } else {
+        Vec::new()
     }
 }
 

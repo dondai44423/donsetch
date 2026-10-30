@@ -811,6 +811,30 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | Solve interactive captchas locally | hCaptcha, reCAPTCHA, Turnstile: an honest dead end, no solving service by design. |
 | Search with every engine down | An error with per-engine status. Honest, never fake. |
 | Replace a human working a defended site | See "Pick the right tool" above. |
+| Filter plain text or markdown | `focus`, `section` and `toc` need HTML or PDF structure. A `.txt` or `.md` response comes back as raw text with a notice giving its size, and `filters_skipped` in the result state. Prefer curl or wget for such files, or use `must_contain`, then `offset`. |
+
+### Big reads and your agent's context
+
+DonSeTch returns as much as `max_chars` asks for. What happens to a large result is up to your MCP client, not DonSeTch or the protocol, and two sizes decide what it costs your agent's context:
+
+- **The switch point.** Below it, the whole result goes into the model's context. Above it, the client saves the result to a file.
+- **The preview.** After the switch, some clients keep only a short preview in context, others still put tens of kilobytes of the result there on every call.
+
+Both differ per client. Measure yours once: fetch a long document (a `.txt` RFC works) with increasing `max_chars`, and note the largest result that still arrives whole and how much of it reaches the model after the switch. Then tell your agent in its rules file (`CLAUDE.md`, `AGENTS.md`, …), for example:
+
+> donsetch `web_fetch` results up to ~N KB arrive whole in context; larger ones are saved to a file and leave a K KB preview in context. To read a whole document, use a `max_chars` above its size only when K KB of context per call is acceptable; otherwise use `must_contain` and `offset`.
+
+<details>
+  <summary>Measured on two clients (2026-10-30)</summary>
+
+Text-only `web_fetch` of a 231 KiB `.txt` (draft-ietf-oauth-v2-1-16) with DonSeTch 4.10.2, varying only `max_chars`. Sizes are result bytes, ±1 KB. Client policies change between releases: re-measure after upgrading.
+
+| Client | Arrives whole | Above that |
+|---|---|---|
+| Claude Code 2.1.309 (Claude Desktop 4.4212) | up to ~49 KB | ~50-74 KB: saved to a file, 2 KB preview in context. From ~75 KB: saved to a file, only the path and an error notice in context. |
+| OpenCode 1.19.1 | up to ~51 KB | Saved to a file; the first ~51 KB still goes into context on every call. |
+
+</details>
 
 ## 🆚 How it compares
 

@@ -73,7 +73,7 @@
             "type": "boolean"
           },
           "focus": {
-            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section.",
+            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section. HTML and PDF only: a plain-text or markdown response (typical for .txt and .md URLs) comes back raw with a notice giving its size. For such files prefer curl or wget saving to a file if your environment allows it; otherwise use must_contain, then offset, or a max_chars of at least that size.",
             "type": "string"
           },
           "image_text": {
@@ -110,7 +110,7 @@
             "type": "integer"
           },
           "section": {
-            "description": "Heading name (substring, case-insensitive) or an sN id from a toc outline: return only that section. Use after toc.",
+            "description": "Heading name (substring, case-insensitive) or an sN id from a toc outline: return only that section. Use after toc. HTML and PDF only, like focus.",
             "type": "string"
           },
           "selector": {
@@ -139,7 +139,7 @@
             "type": "string"
           },
           "toc": {
-            "description": "Return only the heading outline. Use as a standalone first read, then make a new fetch with section or focus.",
+            "description": "Return only the heading outline. Use as a standalone first read, then make a new fetch with section or focus. HTML and PDF only, like focus.",
             "type": "boolean"
           },
           "url": {

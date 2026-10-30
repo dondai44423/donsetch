@@ -5,6 +5,17 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `web_fetch` no longer drops `focus`, `section` or `toc` silently on a
+  plain-text or markdown response, which has no structure for them to act on.
+  The body now leads with a notice naming the skipped filters and the body
+  size, pointing at curl/wget, `must_contain` and `max_chars`, and the result
+  state carries `filters_skipped`. The tool descriptions and README say these
+  filters apply to HTML and PDF only.
+
 ## [4.10.3] - 2026-10-30
 
 ### Added
