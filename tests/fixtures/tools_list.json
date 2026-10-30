@@ -68,6 +68,10 @@
             "description": "Hard time budget in ms (500-600000). On expiry: honest error with next_action, never a silent hang. Batch mode: per-URL budget.",
             "type": "integer"
           },
+          "faithful": {
+            "description": "Preserve HTML body text and repetitions in source order, without cleanup or adapters. Use selector to choose a body; pagination still applies. Not with focus, toc, must_contain or since_last.",
+            "type": "boolean"
+          },
           "focus": {
             "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section.",
             "type": "string"
