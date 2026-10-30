@@ -766,7 +766,7 @@ pub(super) fn render_fetch_batch(
                 if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
                     o["content_ok"] = json!(false);
                 }
-                for field in ["shot", "budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part"] {
+                for field in ["shot", "budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part", "filters_skipped"] {
                     if let Some(value) = state.get(field)
                         && !value.is_null()
                     {
@@ -4416,6 +4416,10 @@ pub(super) fn finish_result(
     if ex.thin {
         structured["thin"] = json!(true);
     }
+    let skipped = extract::skipped_filters(&ex.markdown);
+    if !skipped.is_empty() {
+        structured["filters_skipped"] = json!(skipped);
+    }
     // #292: repeated blocks/sections were omitted and marked in
     // place; the count makes the omission auditable without reading
     // the whole page.
@@ -4735,7 +4739,8 @@ mod batch_budget_tests {
 #[cfg(test)]
 mod fetch_output_contract_tests {
     use super::{Trace, finish_result, format_fetch_markdown};
-    use crate::extract::{ContentKind, Extracted};
+    use crate::extract::{self, ContentKind, ExtractOptions, Extracted};
+    use serde_json::json;
 
     #[test]
     fn stealth_v3_unavailable_browser_status_is_null_not_success_200() {
@@ -4797,6 +4802,47 @@ mod fetch_output_contract_tests {
             0,
         );
         assert_eq!(output["structuredContent"]["content_complete"], true);
+    }
+
+    #[test]
+    fn skipped_read_filters_reach_model_state() {
+        let opts = ExtractOptions {
+            focus: Some("lifetime".into()),
+            toc: true,
+            ..Default::default()
+        };
+        let skipped = extract::extract(
+            b"A maximum authorization code lifetime of 10 minutes.\n",
+            "text/plain",
+            "https://owned.test/draft.txt",
+            &opts,
+        )
+        .unwrap();
+        let output = finish_result(
+            &skipped,
+            "1",
+            200,
+            "ContentOk",
+            "https://owned.test/draft.txt",
+            &Trace::default(),
+            0,
+        );
+        assert_eq!(
+            output["structuredContent"]["filters_skipped"],
+            json!(["focus", "toc"])
+        );
+        assert_eq!(output["structuredContent"]["content_complete"], true);
+
+        let output = finish_result(
+            &extracted("# Owned document\n\nActual evidence."),
+            "1",
+            200,
+            "ContentOk",
+            "https://owned.test/page",
+            &Trace::default(),
+            0,
+        );
+        assert!(output["structuredContent"].get("filters_skipped").is_none());
     }
 
     pub(super) fn extracted(markdown: &str) -> Extracted {
@@ -4967,7 +5013,8 @@ mod batch_output_contract_tests {
                 "thin": true,
                 "changed": "major",
                 "next_offset": 16000,
-                "cloak_suspected": true
+                "cloak_suspected": true,
+                "filters_skipped": ["focus"]
             }
         });
         let flagged_output = render_fetch_batch(
@@ -4984,6 +5031,8 @@ mod batch_output_contract_tests {
         assert_eq!(flagged_state["changed"], "major");
         assert_eq!(flagged_state["next_offset"], 16000);
         assert_eq!(flagged_state["cloak_suspected"], true);
+        assert_eq!(flagged_state["filters_skipped"], json!(["focus"]));
+        assert!(first.get("filters_skipped").is_none());
     }
 }
 
@@ -5005,6 +5054,22 @@ mod budget_tests {
         assert_eq!(ex.via, Some("adapter:pypi-json"));
         assert!(ex.markdown.contains("requests 2.34.2"));
         assert!(!is_framework_shell(&ex), "{}", ex.markdown);
+        assert!(extract::skipped_filters(&ex.markdown).is_empty());
+
+        // The package card reads no filter, so a focus is reported.
+        let focused = extract::extract(
+            payload.to_string().as_bytes(),
+            "application/json",
+            "https://pypi.org/pypi/requests/json",
+            &ExtractOptions {
+                focus: Some("license".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(focused.via, Some("adapter:pypi-json"));
+        assert_eq!(extract::skipped_filters(&focused.markdown), ["focus"]);
+        assert!(focused.markdown.contains("requests 2.34.2"));
     }
 
     #[test]

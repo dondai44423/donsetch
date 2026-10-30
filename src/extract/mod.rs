@@ -423,9 +423,19 @@ pub fn extract(
                 .iter()
                 .map(|e| format!("- {}\n", e.loc))
                 .collect::<String>();
-            let mut ex = extract(inventory.as_bytes(), "text/plain; charset=utf-8", url, opts)?;
+            // The inventory is generated text, so the plain-text notice
+            // (its size, curl advice) would describe the wrong bytes.
+            let mut ex = extract(
+                inventory.as_bytes(),
+                "text/plain; charset=utf-8",
+                url,
+                &without_read_filters(opts),
+            )?;
             ex.via = Some("format:sitemap");
             ex.content_kind = ContentKind::Listing;
+            note_skipped_filters(&mut ex, opts, || {
+                "sitemap, shown as its URL list : filtering it is not supported".to_string()
+            });
             return Ok(ex);
         }
     }
@@ -495,7 +505,7 @@ pub fn extract(
         }
         let (slice, next) = paginate(&text, opts.offset, max_chars);
 
-        return Ok(Extracted {
+        let mut ex = Extracted {
             tokens_est: slice.len() / 4,
             total_chars: text.len(),
             markdown: slice,
@@ -516,7 +526,26 @@ pub fn extract(
             fingerprint: None,
             via: Some("format:text"),
             partial: None,
+        };
+        // focus, section and toc work on the block model, and this
+        // branch builds none: the whole body is one slice. They could
+        // work on markdown, whose headings and paragraphs map onto
+        // Heading and Para blocks, but that needs a markdown parser
+        // (none is a dependency today) feeding the text through
+        // downstream(). Splitting on blank lines, as
+        // focus::expand_code_blocks does for large code blocks, would
+        // serve focus on any text but not toc or section. Until then,
+        // say the filters were skipped instead of dropping them.
+        let media = notice_media_type(&ct);
+        let size = text.len();
+        note_skipped_filters(&mut ex, opts, || {
+            format!(
+                "{media} response, no HTML or PDF structure : showing raw text ({size} bytes). \
+                 To read it whole, prefer curl or wget saving to a file if your environment allows it, \
+                 otherwise set max_chars to at least {size}. To find a passage, use must_contain, then offset"
+            )
         });
+        return Ok(ex);
     }
 
     // --- PDF: DonSheet parses bytes into the same block model. ---
@@ -1223,6 +1252,100 @@ pub fn probe_render(text: &str, pattern: &str, is_regex: bool) -> String {
         // hit on a char boundary.
         Err(_) if !is_regex => report(Some(literal_hits(text, pattern))),
         Err(_) => report(None),
+    }
+}
+
+/// Separates the filter names from the explanation in the notice a
+/// result leads with when it could not apply them.
+const FILTERS_SKIPPED_MARK: &str = " not applied: ";
+
+/// The read filters among focus, section and toc that `opts` asks for.
+fn requested_filters(opts: &ExtractOptions) -> Vec<&'static str> {
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let mut names = Vec::new();
+    if set(&opts.focus) {
+        names.push("focus");
+    }
+    if set(&opts.section) {
+        names.push("section");
+    }
+    if opts.toc {
+        names.push("toc");
+    }
+    names
+}
+
+/// The media type of `content_type` for a notice: parameters dropped,
+/// only media-type characters kept, at most 64 bytes, and "non-HTML"
+/// when nothing is left. The header comes from the server, so it must
+/// not be able to write arbitrary text into the notice.
+fn notice_media_type(content_type: &str) -> &str {
+    let media = content_type.split(';').next().unwrap_or_default().trim();
+    let valid = !media.is_empty()
+        && media.len() <= 64
+        && media
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/!#$&^_.+-".contains(&b));
+    if valid { media } else { "non-HTML" }
+}
+
+/// `opts` without focus, section and toc.
+fn without_read_filters(opts: &ExtractOptions) -> ExtractOptions {
+    ExtractOptions {
+        focus: None,
+        section: None,
+        toc: false,
+        ..opts.clone()
+    }
+}
+
+/// Leads `ex` with a notice naming the read filters `opts` asks for and
+/// `why` they were not applied; leaves `ex` alone when `opts` asks for
+/// none, or runs a `must_contain` probe. The notice sits outside the
+/// max_chars budget and leaves `next_offset` an offset into the source.
+pub(crate) fn note_skipped_filters(
+    ex: &mut Extracted,
+    opts: &ExtractOptions,
+    why: impl FnOnce() -> String,
+) {
+    // A probe replaces the body, and the result state recognizes it
+    // by its leading "probe: ", which a notice in front would hide.
+    let probe = opts
+        .must_contain
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    let names = requested_filters(opts);
+    if probe || names.is_empty() {
+        return;
+    }
+    let notice = format!(
+        "*[{}{FILTERS_SKIPPED_MARK}{}]*\n\n",
+        names.join(", "),
+        why()
+    );
+    ex.total_chars += notice.len();
+    ex.markdown.insert_str(0, &notice);
+    ex.tokens_est = ex.markdown.len() / 4;
+}
+
+/// Read filters named by a leading skipped-filters notice. Parses the
+/// text only, so a source that itself starts with such a notice for
+/// known filter names is reported the same way.
+pub fn skipped_filters(markdown: &str) -> Vec<&str> {
+    let names = markdown
+        .strip_prefix("*[")
+        .and_then(|rest| rest.split_once(FILTERS_SKIPPED_MARK))
+        .map(|(names, _)| names.split(", ").collect::<Vec<_>>())
+        .unwrap_or_default();
+    // Raw text can itself start with "*[", so accept only the names
+    // the notice can carry.
+    if names
+        .iter()
+        .all(|n| matches!(*n, "focus" | "section" | "toc"))
+    {
+        names
+    } else {
+        Vec::new()
     }
 }
 

@@ -421,6 +421,13 @@ mod tests {
         .unwrap();
         assert!(selected.markdown.contains("returns early"));
         assert!(!selected.markdown.contains("option?"));
+        // This card runs the HTML pipeline, so section applied: no
+        // skipped-filters notice.
+        assert!(
+            !selected.markdown.contains(" not applied: "),
+            "{}",
+            selected.markdown
+        );
         let capped = extract_api(
             &bytes,
             &endpoint,

@@ -438,7 +438,15 @@ pub fn extract_json(
     if let Ok(s) = std::str::from_utf8(body) {
         debug_dump(s, url);
     }
-    reddit_json::extract(body, url, opts).or_else(|| packages::extract(body, url, opts))
+    let mut ex =
+        reddit_json::extract(body, url, opts).or_else(|| packages::extract(body, url, opts))?;
+    // These cards render their whole payload; unlike the
+    // StackExchange one above, which runs the HTML pipeline, they
+    // apply no read filter.
+    crate::extract::note_skipped_filters(&mut ex, opts, || {
+        "site API card, no HTML or PDF structure : showing the card unfiltered".to_string()
+    });
+    Some(ex)
 }
 
 /// Extract-level dispatch for HTML bodies. Returns `None` →
@@ -688,7 +696,22 @@ mod tests {
         ] {
             let ex = extract_json(body, "application/json", url, &cut).expect("card");
             assert!(ex.markdown.contains("**Post**"), "{}", ex.markdown);
+            // The card is served unfiltered, and says so.
+            assert!(
+                ex.markdown.starts_with("*[")
+                    && ex.markdown.contains(" not applied: site API card"),
+                "{}",
+                ex.markdown
+            );
+            assert_eq!(crate::extract::skipped_filters(&ex.markdown).len(), 1);
         }
+        let plain = extract_json(body, "application/json", url, &Default::default()).expect("card");
+        assert!(crate::extract::skipped_filters(&plain.markdown).is_empty());
+        assert!(
+            !plain.markdown.contains(" not applied: "),
+            "{}",
+            plain.markdown
+        );
         let probe = crate::extract::ExtractOptions {
             must_contain: Some("Post".into()),
             ..Default::default()
