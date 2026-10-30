@@ -527,6 +527,15 @@ pub fn extract(
             via: Some("format:text"),
             partial: None,
         };
+        // focus, section and toc work on the block model, and this
+        // branch builds none: the whole body is one slice. They could
+        // work on markdown, whose headings and paragraphs map onto
+        // Heading and Para blocks, but that needs a markdown parser
+        // (none is a dependency today) feeding the text through
+        // downstream(). Splitting on blank lines, as
+        // focus::expand_code_blocks does for large code blocks, would
+        // serve focus on any text but not toc or section. Until then,
+        // say the filters were skipped instead of dropping them.
         let media = notice_media_type(&ct);
         let size = text.len();
         note_skipped_filters(&mut ex, opts, || {
