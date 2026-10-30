@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Update boring/boring-sys to 5.3.0, libc to 0.2.191, tokio to 1.53.3, psl
   to 2.1.243 and rustls-native-certs to 0.8.5 (#384–388).
+- Upgrade zstd to 0.14.3, zstd-safe to 8.2.0 and zstd-sys to 2.1.2, resolving
+  RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403 and RUSTSEC-2026-0410.
 - V5 remains in private redesign; v4 maintenance continues while it develops.
 
 ## [4.10.2] - 2026-10-22
