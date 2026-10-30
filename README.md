@@ -76,10 +76,6 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 
 <div align="center">
 
-<a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH"><img src="assets/sponsors/sidrune-ai-partner-banner.png" alt="Sidrune AI: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through the DonSeTch partner link." width="100%"></a>
-
-**Sidrune AI**: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through [this link](https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH).
-
 <a href="https://proxy-seller.com/"><img src="assets/sponsors/proxy-seller-banner.png" alt="Proxy-Seller: private residential, mobile, ISP and datacenter proxies with HTTP(S) and SOCKS5 support. Promo code DON15 for 15% off." width="100%"></a>
 
 **[Proxy-Seller](https://proxy-seller.com/)**: private residential, mobile (4G/5G/LTE), ISP, and datacenter IPv4/IPv6 proxies with HTTP(S) and SOCKS5 support, 47M+ residential IPs in 220+ locations, precise country/city/ISP targeting, 99.7% uptime, and 24/7 support. Promo code **DON15** takes 15% off.
