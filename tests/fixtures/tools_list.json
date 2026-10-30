@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints at every tier; HTML may escalate to a browser and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
+      "description": "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints at every tier; HTML may escalate to a browser and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. filters_skipped lists read filters the response type could not apply. Cite the returned URL.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -73,7 +73,7 @@
             "type": "boolean"
           },
           "focus": {
-            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section. HTML and PDF only: a plain-text or markdown response (typical for .txt and .md URLs) comes back raw with a notice giving its size. For such files prefer curl or wget saving to a file if your environment allows it; otherwise use must_contain, then offset, or a max_chars of at least that size.",
+            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section. HTML and PDF only: a plain-text, markdown or JSON response (decided by Content-Type; typical for .txt and .md URLs) comes back unfiltered with a notice, which gives the size of raw text. For such files prefer curl or wget saving to a file if your environment allows it; otherwise use must_contain, then offset, or a max_chars of at least that size.",
             "type": "string"
           },
           "image_text": {

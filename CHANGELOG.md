@@ -7,14 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A README section on how MCP clients handle large results: where a client
+  stops returning a result inline and how much of it still reaches the model
+  after that, how to measure both for your client, a sample rule for the
+  agent's rules file, and thresholds measured on Claude Code 2.1.309 and
+  OpenCode 1.19.1.
+
 ### Fixed
 
-- `web_fetch` no longer drops `focus`, `section` or `toc` silently on a
-  plain-text or markdown response, which has no structure for them to act on.
-  The body now leads with a notice naming the skipped filters and the body
-  size, pointing at curl/wget, `must_contain` and `max_chars`, and the result
-  state carries `filters_skipped`. The tool descriptions and README say these
-  filters apply to HTML and PDF only.
+- `web_fetch` no longer drops `focus`, `section` or `toc` silently when the
+  response has no structure for them to act on: a plain-text, markdown or JSON
+  response, a sitemap, or a reddit or package API card. The body now leads
+  with a notice naming the skipped filters; for raw text it also gives the
+  Content-Type and the body size and points at curl/wget, `must_contain` and
+  `max_chars`. The result state carries `filters_skipped`, in batch results
+  too. The tool descriptions and README say these filters apply to HTML and
+  PDF only.
 
 ## [4.10.3] - 2026-10-30
 

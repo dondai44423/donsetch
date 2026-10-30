@@ -766,7 +766,7 @@ pub(super) fn render_fetch_batch(
                 if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
                     o["content_ok"] = json!(false);
                 }
-                for field in ["shot", "budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part"] {
+                for field in ["shot", "budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part", "filters_skipped"] {
                     if let Some(value) = state.get(field)
                         && !value.is_null()
                     {
@@ -5013,7 +5013,8 @@ mod batch_output_contract_tests {
                 "thin": true,
                 "changed": "major",
                 "next_offset": 16000,
-                "cloak_suspected": true
+                "cloak_suspected": true,
+                "filters_skipped": ["focus"]
             }
         });
         let flagged_output = render_fetch_batch(
@@ -5030,6 +5031,8 @@ mod batch_output_contract_tests {
         assert_eq!(flagged_state["changed"], "major");
         assert_eq!(flagged_state["next_offset"], 16000);
         assert_eq!(flagged_state["cloak_suspected"], true);
+        assert_eq!(flagged_state["filters_skipped"], json!(["focus"]));
+        assert!(first.get("filters_skipped").is_none());
     }
 }
 
@@ -5051,6 +5054,22 @@ mod budget_tests {
         assert_eq!(ex.via, Some("adapter:pypi-json"));
         assert!(ex.markdown.contains("requests 2.34.2"));
         assert!(!is_framework_shell(&ex), "{}", ex.markdown);
+        assert!(extract::skipped_filters(&ex.markdown).is_empty());
+
+        // The package card reads no filter, so a focus is reported.
+        let focused = extract::extract(
+            payload.to_string().as_bytes(),
+            "application/json",
+            "https://pypi.org/pypi/requests/json",
+            &ExtractOptions {
+                focus: Some("license".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(focused.via, Some("adapter:pypi-json"));
+        assert_eq!(extract::skipped_filters(&focused.markdown), ["focus"]);
+        assert!(focused.markdown.contains("requests 2.34.2"));
     }
 
     #[test]

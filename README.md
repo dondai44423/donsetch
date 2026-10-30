@@ -811,11 +811,11 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | Solve interactive captchas locally | hCaptcha, reCAPTCHA, Turnstile: an honest dead end, no solving service by design. |
 | Search with every engine down | An error with per-engine status. Honest, never fake. |
 | Replace a human working a defended site | See "Pick the right tool" above. |
-| Filter plain text or markdown | `focus`, `section` and `toc` need HTML or PDF structure. A `.txt` or `.md` response comes back as raw text with a notice giving its size, and `filters_skipped` in the result state. Prefer curl or wget for such files, or use `must_contain`, then `offset`. |
+| Filter plain text, markdown or JSON | `focus`, `section` and `toc` need HTML or PDF structure. The response's Content-Type decides, not the URL: a plain-text, markdown or JSON response (typical for `.txt` and `.md` URLs) comes back unfiltered with a notice giving its size, and `filters_skipped` in the result state. Sitemaps and site API cards get a shorter notice, without the size or the curl advice. Prefer curl or wget for such files, or use `must_contain`, then `offset`. |
 
 ### Big reads and your agent's context
 
-DonSeTch returns as much as `max_chars` asks for. What happens to a large result is up to your MCP client, not DonSeTch or the protocol, and two sizes decide what it costs your agent's context:
+DonSeTch returns up to `max_chars` bytes of the document, plus a short header. What happens to a large result is up to your MCP client, not DonSeTch or the protocol, and two sizes decide what it costs your agent's context:
 
 - **The switch point.** Below it, the whole result goes into the model's context. Above it, the client saves the result to a file.
 - **The preview.** After the switch, some clients keep only a short preview in context, others still put tens of kilobytes of the result there on every call.

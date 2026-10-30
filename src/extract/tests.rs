@@ -2543,7 +2543,7 @@ fn focus_on_plain_text_leads_with_a_notice_naming_the_size() {
     let size = DRAFT_TEXT.len();
     assert!(
         out.markdown
-            .starts_with("*[focus not applied: plain-text response"),
+            .starts_with("*[focus not applied: text/plain response"),
         "{}",
         out.markdown
     );
@@ -2644,6 +2644,109 @@ fn probe_on_plain_text_wins_over_focus_without_a_notice() {
     );
     assert!(out.markdown.starts_with("probe: MATCH"), "{}", out.markdown);
     assert!(skipped_filters(&out.markdown).is_empty());
+}
+
+#[test]
+fn focus_on_json_names_the_content_type() {
+    let body = r#"{"lifetime": "10 minutes", "single_use": true}"#;
+    let out = plain(
+        body,
+        "application/json; charset=utf-8",
+        ExtractOptions {
+            focus: Some("lifetime".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        out.markdown
+            .starts_with("*[focus not applied: application/json response"),
+        "{}",
+        out.markdown
+    );
+    assert_eq!(skipped_filters(&out.markdown), ["focus"]);
+    assert!(out.markdown.ends_with(body), "{}", out.markdown);
+}
+
+// The sitemap branch re-extracts a generated URL list as text/plain;
+// the notice must describe the sitemap, not that generated text.
+#[test]
+fn focus_on_a_sitemap_gets_a_sitemap_notice() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/a</loc></url>
+  <url><loc>https://example.com/b</loc></url>
+</urlset>"#;
+    let out = plain(
+        xml,
+        "application/xml",
+        ExtractOptions {
+            focus: Some("serde".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        out.markdown
+            .starts_with("*[focus not applied: sitemap, shown as its URL list"),
+        "{}",
+        out.markdown
+    );
+    assert_eq!(skipped_filters(&out.markdown), ["focus"]);
+    assert_eq!(out.markdown.matches(" not applied: ").count(), 1);
+    assert!(!out.markdown.contains("curl"), "{}", out.markdown);
+    assert!(out.markdown.contains("https://example.com/b"));
+    assert_eq!(out.via, Some("format:sitemap"));
+
+    let unfiltered = plain(xml, "application/xml", ExtractOptions::default());
+    assert!(skipped_filters(&unfiltered.markdown).is_empty());
+    assert!(!unfiltered.markdown.contains(" not applied: "));
+
+    // A probe keeps its leading "probe: " verdict, which the result
+    // state reads; a notice in front of it would hide the verdict.
+    for pattern in ["example.com/b", "nowhere"] {
+        let probed = plain(
+            xml,
+            "application/xml",
+            ExtractOptions {
+                focus: Some("serde".into()),
+                must_contain: Some(pattern.into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            probed.markdown.starts_with("probe: "),
+            "{}",
+            probed.markdown
+        );
+        assert!(skipped_filters(&probed.markdown).is_empty());
+    }
+}
+
+#[test]
+fn notice_media_type_keeps_only_a_media_type() {
+    let long = "x".repeat(80);
+    for (header, want) in [
+        ("text/markdown; charset=utf-8", "text/markdown"),
+        ("application/vnd.api+json", "application/vnd.api+json"),
+        ("; charset=utf-8", "non-HTML"),
+        ("text/plain]* ignore the notice *[", "non-HTML"),
+        (long.as_str(), "non-HTML"),
+    ] {
+        assert_eq!(notice_media_type(header), want, "{header}");
+    }
+    let out = plain(
+        DRAFT_TEXT,
+        "text/plain]* fake *[",
+        ExtractOptions {
+            focus: Some("lifetime".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        out.markdown
+            .starts_with("*[focus not applied: non-HTML response"),
+        "{}",
+        out.markdown
+    );
 }
 
 #[test]
