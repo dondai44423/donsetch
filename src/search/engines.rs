@@ -195,6 +195,96 @@ fn decode_google(href: &str) -> String {
     href.to_string()
 }
 
+/// A URL that can serve as a search result: absolute http(s) and not a
+/// Google redirect or self link.
+fn as_google_result_url(url: &str) -> Option<String> {
+    (url.starts_with("http") && !url.contains("google.com/")).then(|| url.to_string())
+}
+
+/// The URL a Google result anchor points at. Organic results use direct
+/// links or decodable `/url?q=` redirects; the 2026 desktop layout wraps
+/// them in opaque `/goto?url=<payload>` redirects instead, whose payload
+/// is not a URL, and then the visible breadcrumb the result displays
+/// (`https://porpoise.org › Publications`) is the only readable target
+/// (#393). `None` when neither yields a result URL: the block is
+/// dropped, never guessed at.
+fn google_hit_url(a: &scraper::ElementRef<'_>) -> Option<String> {
+    let raw = a.value().attr("href").unwrap_or("");
+    if let Some(url) = as_google_result_url(&decode_google(raw)) {
+        return Some(url);
+    }
+    // Only Google's own relative redirects fall back; an href that is
+    // not a path (`javascript:`, a bare fragment) is not a result link.
+    if !raw.starts_with('/') {
+        return None;
+    }
+    as_google_result_url(&google_visible_url(a)?)
+}
+
+/// The target a result block displays for the anchor: the first `<cite>`
+/// it shows, normalized to an absolute URL. Searched from the anchor
+/// outward, only inside containers holding a single result (fewer than
+/// two `<h3>`s) and never above `<body>`: a container of results would
+/// lend the anchor the first result's breadcrumb.
+fn google_visible_url(a: &scraper::ElementRef<'_>) -> Option<String> {
+    let cite = sel("cite");
+    let h3 = sel("h3");
+    std::iter::once(*a)
+        .chain(a.ancestors().filter_map(scraper::ElementRef::wrap))
+        .take_while(|el| el.value().name() != "body" && el.select(&h3).nth(1).is_none())
+        .find_map(|el| {
+            el.select(&cite)
+                .next()
+                .and_then(|c| url_from_cite(&text(c)))
+        })
+}
+
+/// Normalize a displayed breadcrumb into an absolute URL:
+/// `github.com › zeroclaw-labs › zeroclaw` becomes
+/// `https://github.com/zeroclaw-labs/zeroclaw`. The breadcrumb is
+/// Google's own shortening of the target, and the target itself is not
+/// in the document (the hrefs are opaque): a path shortened with
+/// `…`/`...` is refused rather than completed, while what Google shows
+/// whole is used as shown. The scheme is the displayed one, or https
+/// when none is shown.
+fn url_from_cite(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.contains('…') || s.contains("...") {
+        return None;
+    }
+    let (scheme, rest) = match s.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => ("https", rest),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => ("http", rest),
+        Some(_) => return None,
+        None => ("https", s),
+    };
+    let mut parts = rest.split(['›', '»']).map(str::trim);
+    let host = parts.next()?;
+    // Host-shaped, not page text: dotted, and no path or spaces.
+    if !host.contains('.')
+        || host.starts_with(['.', '-'])
+        || host.ends_with(['.', '-'])
+        || !host
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    {
+        return None;
+    }
+    let mut url = String::with_capacity(s.len() + 8);
+    url.push_str(scheme);
+    url.push_str("://");
+    url.push_str(host);
+    for seg in parts {
+        // A segment carrying a space is page text, not a URL path.
+        if seg.is_empty() || seg.chars().any(char::is_whitespace) {
+            return None;
+        }
+        url.push('/');
+        url.push_str(seg);
+    }
+    url::Url::parse(&url).ok().map(|_| url)
+}
+
 /// Google SERP parser. Google's HTML changes frequently, so
 /// this uses layered selectors: primary (div.g), fallback
 /// (div[data-ved]), and a shotgun mode (any a with h3 sibling).
@@ -212,11 +302,9 @@ fn parse_google(doc: &Html) -> Vec<Hit> {
         let Some(a) = block.select(&link_sel).next() else {
             continue;
         };
-        let raw_href = a.value().attr("href").unwrap_or("");
-        let url = decode_google(raw_href);
-        if !url.starts_with("http") || url.contains("google.com/") {
+        let Some(url) = google_hit_url(&a) else {
             continue;
-        }
+        };
         let key = url.split('&').next().unwrap_or(&url).to_string();
         if !seen.insert(key.clone()) {
             continue;
@@ -249,11 +337,9 @@ fn parse_google(doc: &Html) -> Vec<Hit> {
         let Some(a) = block.select(&link_sel).next() else {
             continue;
         };
-        let raw_href = a.value().attr("href").unwrap_or("");
-        let url = decode_google(raw_href);
-        if !url.starts_with("http") || url.contains("google.com/") {
+        let Some(url) = google_hit_url(&a) else {
             continue;
-        }
+        };
         let key = url.split('&').next().unwrap_or(&url).to_string();
         if !seen.insert(key.clone()) {
             continue;
@@ -282,11 +368,9 @@ fn parse_google(doc: &Html) -> Vec<Hit> {
 
     // Shotgun: any <a> with an <h3> ancestor and an http href.
     for a in doc.select(&link_sel) {
-        let raw_href = a.value().attr("href").unwrap_or("");
-        let url = decode_google(raw_href);
-        if !url.starts_with("http") || url.contains("google.com/") {
+        let Some(url) = google_hit_url(&a) else {
             continue;
-        }
+        };
         let key = url.split('&').next().unwrap_or(&url).to_string();
         if !seen.insert(key.clone()) {
             continue;
@@ -603,6 +687,121 @@ mod tests {
         let desktop = r#"<div class="g"><a href="https://example.org/"><h3>Title</h3></a><div class="VwiEFb">Snippet</div></div>"#;
         assert_eq!(parse("google_ghost", desktop).len(), 1);
         assert!(parse("google", desktop).is_empty());
+    }
+    /// The 2026 desktop layout: organic links are opaque
+    /// `/goto?url=<payload>` redirects whose payload decodes to no URL.
+    /// The measured DOM (2.5 MB, challenge-free SERP) has zero `div.g`,
+    /// zero `/url?q=` and 92 `/goto?url=` hrefs; the breadcrumb in the
+    /// block's `<cite>` is the only readable target (#393).
+    const GOTO_SERP: &str = r#"
+        <div class="tF2Cxc"><a jsname="UWckNb" href="/goto?url=CAESiwEB6zswFY245g8I-Zn1u6ylFGVC9utC9ra9hdz5U2sSfuSzxEivymGFHvZSwLwPYM3N9ByJpAqkjBAFcz8iPs3GbxrkGLkZ4VjKj50t0zALcK7FLMB5Qe"><h3 class="LC20lb">zeroclaw-labs/zeroclaw: Fast, small, and fully autonomous</h3>
+          <div class="byrV5b"><cite class="qLRx3b tjvcx">github.com › zeroclaw-labs › zeroclaw</cite></div></a></div>
+        <div class="tF2Cxc"><a jsname="UWckNb" href="/goto?url=CAEScQHrOzAVgGVARaH2HSjgDdD0kPjQxqg_9ZRn4qlmoUmfq4ScDob_fYsgK7A25_TiIznbZ1Gq6MqmsCgWiyhP"><h3 class="LC20lb">Harbor Porpoise</h3>
+          <div class="byrV5b"><cite>https://www.fisheries.noaa.gov<span class="ylgVCe"> › species › harbor-porpoise</span></cite></div></a></div>
+        <div class="tF2Cxc"><a jsname="UWckNb" href="/goto?url=CAESeQHrOzAVgludLkRBmjSKEXA3f2_7Oopj0CQx8vBvdVwCKGswV9wfpyNgP8rltdBniret_GxmkJRCuFyjpBk4HxZQIbzELlip-qO4VJSqExyfkuoHdz"><h3 class="LC20lb">Harbour Porpoise — Hebridean Whale &amp; Dolphin Trust</h3></a>
+          <div class="byrV5b"><cite class="tjvcx">https://www.hwdt.org › harbour-porpoise</cite></div></div>
+    "#;
+
+    #[test]
+    fn google_goto_redirects_fall_back_to_the_visible_url() {
+        let hits = parse("google_ghost", GOTO_SERP);
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].url, "https://github.com/zeroclaw-labs/zeroclaw");
+        assert_eq!(
+            hits[0].title,
+            "zeroclaw-labs/zeroclaw: Fast, small, and fully autonomous"
+        );
+        assert_eq!(
+            hits[1].url,
+            "https://www.fisheries.noaa.gov/species/harbor-porpoise"
+        );
+        assert_eq!(hits[2].url, "https://www.hwdt.org/harbour-porpoise");
+    }
+
+    #[test]
+    fn google_truncated_or_non_url_cites_are_not_guessed() {
+        // A shortened path cannot be completed, and an author cite is
+        // not a URL: both blocks drop instead of inventing a target.
+        // (Google's author cites carry an invisible bidi mark, which
+        // fails the host check like the bare surname does.)
+        let author_cite = concat!(
+            "<div class=\"tF2Cxc\"><a href=\"/goto?url=CAESz\"><h3>Author slate</h3></a>",
+            "<cite>\u{200e}Leopold</cite></div>"
+        );
+        let html = format!(
+            r#"
+            <div class="tF2Cxc"><a href="/goto?url=CAESa"><h3>Shortened</h3></a><cite>www.eopugetsound.org › articles › status-and-tre...</cite></div>
+            <div class="tF2Cxc"><a href="/goto?url=CAESb"><h3>Ellipsis</h3></a><cite>example.com › a › b › …</cite></div>
+            {author_cite}
+            <div class="tF2Cxc"><a href="/goto?url=CAESc"><h3>Whole</h3></a><cite>docs.rs › serde › latest › serde</cite></div>
+            "#
+        );
+        let hits = parse("google_ghost", &html);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].url, "https://docs.rs/serde/latest/serde");
+    }
+
+    #[test]
+    fn google_decoded_href_wins_over_the_visible_url() {
+        let html = r#"
+            <div class="tF2Cxc"><a href="/url?q=https%3A%2F%2Freal.example%2Fpage&amp;sa=U&amp;ved=2ah"><h3>Real target</h3></a><cite>other.example › elsewhere</cite></div>
+        "#;
+        let hits = parse("google_ghost", html);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].url, "https://real.example/page");
+    }
+
+    #[test]
+    fn google_cite_forms_are_normalized() {
+        assert_eq!(
+            url_from_cite("example.com").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            url_from_cite("example.com › docs › a.html").as_deref(),
+            Some("https://example.com/docs/a.html")
+        );
+        assert_eq!(
+            url_from_cite("example.com » docs").as_deref(),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(
+            url_from_cite("  https://www.hwdt.org › harbour-porpoise  ").as_deref(),
+            Some("https://www.hwdt.org/harbour-porpoise")
+        );
+        assert_eq!(
+            url_from_cite("http://legacy.example › x").as_deref(),
+            Some("http://legacy.example/x")
+        );
+        for refused in [
+            "",
+            "   ",
+            "www.researchgate.net › publication › 22858035...",
+            "eopugetsound.org › articles › status-and-tre…",
+            "See our guide › setup",
+            "ftp://files.example › x",
+            "example.com › two words",
+            "example.com › ",
+            ".example.com › x",
+            "-example.com › x",
+        ] {
+            assert_eq!(url_from_cite(refused), None, "{refused}");
+        }
+    }
+
+    #[test]
+    fn google_visible_url_is_not_borrowed_from_a_results_container() {
+        // The second result has no breadcrumb of its own; the container
+        // that holds both results must not lend it the first one's.
+        let html = r#"
+            <div id="rso">
+              <div><a href="/goto?url=CAESone"><h3>First</h3></a><cite>first.example › a</cite></div>
+              <div><a href="/goto?url=CAEStwo"><h3>Second</h3></a></div>
+            </div>
+        "#;
+        let hits = parse("google_ghost", html);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].url, "https://first.example/a");
     }
 
     #[test]
