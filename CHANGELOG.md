@@ -5,7 +5,7 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.10.4] - 2026-10-31
 
 ### Added
 
@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[Title](…) next`, not `[ Title ](…)next`), faithful reads keep the
   space at an inline element's edge, and no stray space is left on either
   side of a `<br>` (`a\nb`, not `a \n b`).
+- `web_search`'s Google ghost lane works again on Google's 2026 desktop
+  SERP: organic results are now wrapped in opaque `/goto?url=` redirects
+  whose payload is not a URL, so every result was dropped and a
+  challenge-free page came back as `blocked:captcha` with 0 hits. The lane
+  reads the breadcrumb each result displays instead, refuses a breadcrumb
+  Google shortened (`…`, `...`), and reports the hits (#393).
 
 ## [4.10.3] - 2026-10-30
 
