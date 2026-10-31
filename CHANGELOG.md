@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after that, how to measure both for your client, a sample rule for the
   agent's rules file, and thresholds measured on Claude Code 2.1.309 and
   OpenCode 1.19.1.
+- Inline `style` attributes set bold and italic in fetched HTML:
+  `font-weight` of `bold`, `bolder` or 600 and up, and `font-style` of
+  `italic` or `oblique`, on inline elements such as `span`. An element's
+  own style overrides its tag, so the `<b style="font-weight: normal">`
+  wrapper around text pasted from Google Docs no longer makes the whole
+  paste bold. Stylesheets, classes and styles on block elements are not
+  read; `!important` follows CSS.
 
 ### Fixed
 
@@ -25,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_chars`. The result state carries `filters_skipped`, in batch results
   too. The tool descriptions and README say these filters apply to HTML and
   PDF only.
+- Nested bold and italic render as valid markdown: `<em><strong>x</strong></em>`
+  is `***x***` again, where a backslash on the bold marker left the text
+  italic between literal asterisks. A tag nested in its own kind
+  (`<em><em>`, `<strong><b>`) adds no second marker, which had turned
+  italic into bold. Adjacent runs of one kind merge, so `<b>foo</b><b>bar</b>`
+  is `**foobar**`, not four literal asterisks in a bold run. Whitespace at a
+  tag's edge moves outside the markers, so `<strong>Note: </strong>text` is
+  `**Note:** text`, not literal asterisks.
+- A space between two inline elements is kept: `<strong>foo</strong>
+  <em>bar</em>` and two links separated by a space no longer run their
+  words together. Whitespace at a link's edge moves outside its brackets
+  (`[Title](…) next`, not `[ Title ](…)next`), faithful reads keep the
+  space at an inline element's edge, and no stray space is left on either
+  side of a `<br>` (`a\nb`, not `a \n b`).
 
 ## [4.10.3] - 2026-10-30
 

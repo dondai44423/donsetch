@@ -3311,3 +3311,24 @@ fn faithful_pagination_reassembles_every_occurrence_without_rescue() {
     assert_eq!(collected.matches("Yes.").count(), 40);
     assert!(!collected.contains("Not the selected"));
 }
+
+// A faithful run joins inline elements to raw text: the space at an
+// element's edge must survive outside its markers, and none may be
+// left around a <br>.
+#[test]
+fn faithful_run_keeps_edge_spaces_and_drops_them_around_a_break() {
+    let html = r#"<!doctype html><html><body><article>
+    <div>word<em> italic</em> word, a <br> b</div>
+    </article></body></html>"#;
+    let opts = ExtractOptions {
+        faithful: true,
+        selector: Some("article".into()),
+        ..Default::default()
+    };
+    let ex = extract_html_opts(html, &opts);
+    assert!(
+        ex.markdown.contains("word *italic* word, a\nb"),
+        "{}",
+        ex.markdown
+    );
+}
