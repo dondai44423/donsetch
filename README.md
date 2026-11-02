@@ -452,6 +452,7 @@ donsetch keys add serpbase sb-...       # SerpBase Google SERP (100 free searche
 donsetch keys add bravesearch ...       # Brave Search API
 donsetch keys add tinyfish sk-...       # TinyFish (free tier)
 donsetch keys add parallel nKil3...     # Parallel AI (fast mode)
+donsetch keys add outcrawl ...          # Outcrawl (free tier of 1,000 credits a month)
 donsetch keys add bd "<token>::<SERP zone>"           # Bright Data SERP
 donsetch keys add unlocker "<token>::<Unlocker zone>" # Bright Data Web Unlocker
 donsetch keys default local             # dispatch order: keyless first

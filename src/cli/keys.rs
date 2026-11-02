@@ -9,7 +9,7 @@
 //!   donsetch keys import <path>            Import keys from a file
 //!   donsetch keys clear                     Remove all keys
 //!
-//! Providers: tavily, exa, serper, serpapi, serpbase, bravesearch, tinyfish, parallel, brightdata, unlocker
+//! Providers: tavily, exa, serper, serpapi, serpbase, bravesearch, tinyfish, parallel, brightdata, outcrawl, unlocker
 
 use super::{bold, dim, green, red, yellow};
 
@@ -893,6 +893,7 @@ pub fn help() {
     println!("    tinyfish   TinyFish Search (api.search.tinyfish.ai)");
     println!("    parallel   Parallel AI Search (api.parallel.ai) : fast mode");
     println!("    brightdata Bright Data SERP API (api.brightdata.com)");
+    println!("    outcrawl   Outcrawl Search (api.outcrawl.ai)");
     println!(
         "    unlocker   Bright Data Web Unlocker (paid solver for walled sites; key:: zone, fetch-side)"
     );

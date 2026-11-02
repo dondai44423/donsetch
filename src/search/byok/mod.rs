@@ -2,7 +2,7 @@
 //!
 //! When the user configures API keys for external search providers
 //! (Tavily, Exa, Serper.dev, SerpApi, Brave Search API, TinyFish,
-//! Parallel AI, Bright Data), the entire local 5-engine
+//! Parallel AI, Bright Data, Outcrawl), the entire local 5-engine
 //! search system is bypassed. The provider handles everything:
 //! search, IP, rate limiting. DonSeTch just sends the query and
 //! normalizes the results.
@@ -17,6 +17,7 @@
 mod bravesearch;
 mod brightdata;
 mod exa;
+mod outcrawl;
 mod parallel;
 pub mod plugin;
 mod serpapi;
@@ -550,6 +551,7 @@ async fn dispatch(
         "tinyfish" => tinyfish::search(client, key, query, max, intent).await,
         "parallel" => parallel::search(client, key, query, max, intent).await,
         "brightdata" => brightdata::search(client, key, query, max, intent).await,
+        "outcrawl" => outcrawl::search(client, key, query, max, intent).await,
         _ => Err(KeyError::UnknownError(format!(
             "unknown provider: {provider}"
         ))),
