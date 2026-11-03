@@ -66,15 +66,10 @@ fn escape_ere(s: &str) -> String {
     out
 }
 
-/// Remove crash-leftover `donsetch-ghost-<pid>` temp profiles whose
-/// owning process is gone.
-///
-/// The suffix is the owning process's pid (see ghost/mod.rs: a second
-/// session that loses the shared-profile flock runs Chrome against a
-/// throwaway `donsetch-ghost-<pid>` profile). That profile is LIVE for
-/// as long as the process runs: deleting it mid-session rips the
-/// user-data-dir out from under a running Chrome. Only profiles whose
-/// pid is gone are debris.
+/// Remove crash-leftover temporary profiles whose owning process is gone.
+/// Current names are `donsetch-ghost-<pid>-<nonce>-<sequence>`; legacy
+/// PID-only names are also recognized. A live PID conservatively retains
+/// the profile, including when a PID has been reused.
 fn sweep_temp_profiles(temp_dir: &std::path::Path) {
     const TEMP_PREFIX: &str = "donsetch-ghost-";
     let Ok(entries) = std::fs::read_dir(temp_dir) else {
@@ -86,7 +81,11 @@ fn sweep_temp_profiles(temp_dir: &std::path::Path) {
         let Some(pid_str) = name.strip_prefix(TEMP_PREFIX) else {
             continue;
         };
-        if let Some(pid) = pid_str.parse::<u32>().ok().filter(|p| *p > 0)
+        if let Some(pid) = pid_str
+            .split('-')
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .filter(|p| *p > 0)
             && process_is_alive(pid)
         {
             continue;
@@ -148,16 +147,21 @@ mod tests {
     #[test]
     fn sweep_keeps_a_live_sessions_temp_profile() {
         let dir = scratch("live");
-        let live = dir.join(format!("donsetch-ghost-{}", std::process::id()));
-        std::fs::create_dir_all(&live).unwrap();
-        std::fs::write(live.join("Cookies"), "live").unwrap();
-
-        sweep_temp_profiles(&dir);
-
-        assert!(
-            live.join("Cookies").exists(),
-            "a live session's temp profile was deleted"
-        );
+        // Current names carry a nonce and sequence; older releases used
+        // only the PID. Both belong to the live process.
+        for suffix in [
+            std::process::id().to_string(),
+            format!("{}-1793520000000000000-0", std::process::id()),
+        ] {
+            let live = dir.join(format!("donsetch-ghost-{suffix}"));
+            std::fs::create_dir_all(&live).unwrap();
+            std::fs::write(live.join("Cookies"), "live").unwrap();
+            sweep_temp_profiles(&dir);
+            assert!(
+                live.join("Cookies").exists(),
+                "live profile deleted: {suffix}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -172,12 +176,15 @@ mod tests {
             .expect("spawn");
         let dead_pid = child.id();
         child.wait().expect("wait");
-        let dead = dir.join(format!("donsetch-ghost-{dead_pid}"));
-        std::fs::create_dir_all(&dead).unwrap();
-
-        sweep_temp_profiles(&dir);
-
-        assert!(!dead.exists(), "crash leftover was kept");
+        for suffix in [
+            dead_pid.to_string(),
+            format!("{dead_pid}-1793520000000000000-0"),
+        ] {
+            let dead = dir.join(format!("donsetch-ghost-{suffix}"));
+            std::fs::create_dir_all(&dead).unwrap();
+            sweep_temp_profiles(&dir);
+            assert!(!dead.exists(), "crash leftover was kept: {suffix}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
