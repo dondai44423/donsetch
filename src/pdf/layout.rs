@@ -275,13 +275,14 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
     //    (word boundary : Korean, Devanagari, CJK↔Latin junctions)
     //  - decorations: near-zero-width run markers, invisible.
     // Distinguisher is measured WIDTH, not presence.
-    let space_width_real = |c: &&PdfChar| (c.x1 - c.x0) > 0.18 * c.size.max(2.0);
+    let space_width_real =
+        |c: &&PdfChar| (c.spacing_x().1 - c.spacing_x().0) > 0.18 * c.size.max(2.0);
     let reals: Vec<&&PdfChar> = cluster
         .iter()
         .filter(|c| c.cp != ' ' || space_width_real(c))
         .collect();
     for w in reals.windows(2) {
-        g.push(w[1].x0 - w[0].x1);
+        g.push(w[1].spacing_x().0 - w[0].spacing_x().1);
     }
     g.retain(|x| *x > 0.01);
     g.sort_by(|a, b| a.total_cmp(b));
@@ -305,6 +306,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
 
     let mut word_x0 = f32::NAN;
     let mut prev_x1 = 0f32;
+    let mut prev_spacing_x1 = 0f32;
     let mut prev_size = 10f32;
     let mut prev_cp = '\0';
     let mut glyph_count = 0usize;
@@ -318,7 +320,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
         // Space insertion: script-aware + statistics-aware (real glyph
         // gaps only : decorations are out of `reals`).
         if i > 0 {
-            let gap = c.x0 - prev_x1;
+            let gap = c.spacing_x().0 - prev_spacing_x1;
             let widen = 0.16 * prev_size;
             let adaptive = (1.4 * med_gap).max(widen);
             // Script-aware pairing. "Spaceless pairs" never break inside a
@@ -331,17 +333,21 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
             let mix_cjk = is_han_kana(prev_cp) || is_han_kana(c.cp);
             let decor = decor_spaces
                 .iter()
-                .any(|&sx| sx > prev_x1 - 0.5 && sx < c.x0 + 0.5);
+                .any(|&sx| sx > prev_spacing_x1 - 0.5 && sx < c.spacing_x().0 + 0.5);
             // A real space glyph reaching this position is a hard break.
             let real_space = prev_cp == ' ' && space_width_real(reals[i - 1]);
-            let break_here = if pair_cjk {
-                real_space
+            let break_here = if real_space {
+                // Loose bounds can touch after an actual space. Its
+                // advance still separates words and their table geometry.
+                true
+            } else if pair_cjk {
+                false
             } else if pair_deva {
                 gap > (2.0 * med_gap).max(0.06 * prev_size)
             } else if mix_cjk {
                 gap > 0.55 * prev_size || (decor && gap > 0.10 * prev_size)
             } else {
-                gap > adaptive || (decor && gap > 0.10 * prev_size) || (real_space && gap > 0.02)
+                gap > adaptive || (decor && gap > 0.10 * prev_size)
             };
             if break_here {
                 // Close the current word.
@@ -385,6 +391,11 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
             word_x0 = c.x0;
         }
         prev_x1 = c.x1.max(prev_x1);
+        prev_spacing_x1 = if i == 0 {
+            c.spacing_x().1
+        } else {
+            c.spacing_x().1.max(prev_spacing_x1)
+        };
         prev_size = c.size;
         prev_cp = c.cp;
     }

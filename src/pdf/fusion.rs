@@ -404,6 +404,7 @@ mod tests {
                 dingbat: false,
                 rt: false,
                 ocr: false,
+                spacing_box: None,
             });
         }
         let trust = glyph_trust(&chars);

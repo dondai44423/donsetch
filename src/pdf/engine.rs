@@ -27,6 +27,9 @@ pub struct PdfChar {
     pub y0: f32,
     pub x1: f32,
     pub y1: f32,
+    /// Glyph bounds including side bearings, in the same normalized frame.
+    /// Used only for spacing; ink boxes retain layout/table geometry.
+    pub spacing_box: Option<[f32; 4]>,
     /// Font size in points.
     pub size: f32,
     /// Font weight 100..900 (-1 when unknown).
@@ -45,6 +48,14 @@ pub struct PdfChar {
     pub rt: bool,
     /// Text came from the OCR tier, not the glyph stream.
     pub ocr: bool,
+}
+
+impl PdfChar {
+    pub fn spacing_x(&self) -> (f32, f32) {
+        self.spacing_box
+            .map(|b| (b[0], b[2]))
+            .unwrap_or((self.x0, self.x1))
+    }
 }
 
 pub struct PageChars {
@@ -553,7 +564,7 @@ fn walk_outlines(doc: FpdfDocument) -> Vec<OutlineItem> {
 }
 
 /// What beyond raw chars a load should gather per page.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct LoadOpts {
     /// Rasterize each page (96dpi + annotation layer) for the pixel
     /// engine. Lazy callers (raw dumps) keep this off.
@@ -564,6 +575,17 @@ pub struct LoadOpts {
     pub dpi: f32,
     /// Pages read per document; `MAX_PAGES` unless a test says less.
     pub max_pages: usize,
+}
+
+impl Default for LoadOpts {
+    fn default() -> Self {
+        Self {
+            want_pixels: false,
+            want_forms: false,
+            dpi: 0.0,
+            max_pages: MAX_PAGES,
+        }
+    }
 }
 
 /// The per-page bundle the sink receives. Pixel/form extras empty unless
@@ -823,6 +845,23 @@ where
                     // for unmapped glyphs.
                     let (mut x0, mut x1, mut y_b, mut y_t) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
                     FPDFText_GetCharBox(tp, i32_i, &mut x0, &mut x1, &mut y_b, &mut y_t);
+                    let mut loose = FsRect::default();
+                    let spacing_box = if FPDFText_GetLooseCharBox(tp, i32_i, &mut loose) != 0
+                        && [loose.left, loose.right, loose.bottom, loose.top]
+                            .iter()
+                            .all(|v| v.is_finite())
+                        && loose.right > loose.left
+                        && loose.top >= loose.bottom
+                    {
+                        Some([
+                            loose.left,
+                            height - loose.top,
+                            loose.right,
+                            height - loose.bottom,
+                        ])
+                    } else {
+                        None
+                    };
                     let size = FPDFText_GetFontSize(tp, i32_i);
                     let weight = FPDFText_GetFontWeight(tp, i32_i);
 
@@ -901,6 +940,7 @@ where
                         y0: height - y_t.max(y_b) as f32,
                         x1: x1 as f32,
                         y1: height - y_t.min(y_b) as f32,
+                        spacing_box,
                         size,
                         weight,
                         flags: flags as u32
