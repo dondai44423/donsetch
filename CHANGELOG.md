@@ -5,6 +5,34 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `donsetch stop` keeps live temporary browser profiles whose names include
+  a nonce and sequence, as well as the older PID-only names. Cleanup had
+  mistaken every current-format profile for a crash leftover (#397).
+- PDF word spacing uses glyph bounds including side bearings rather than
+  ink gaps, preserving numbers such as `15 %` and exact `must_contain`
+  matches. Ink bounds still drive layout and table geometry. Rotated PDF
+  text also keeps its reading direction through frame canonicalization (#399).
+- Fetch language metadata no longer identifies Latin text as English,
+  Cyrillic text as Russian, or Devanagari text as Hindi. `lang` is present
+  only for supported HTML declarations, with `lang_source`; observed writing
+  scripts use a separate `script` field. PDFs and API cards no longer claim
+  an unestablished language. Undeclared text retains script-aware tokenization
+  and accent folding without language-specific stemming (#398).
+- Google's browser search lane keeps one or two usable results instead of
+  discarding them as a captcha. Zero parsed results report `empty-parse`;
+  confirmed captcha failures retain `blocked:captcha`. The existing breadcrumb
+  URL limitations are documented and retained in v4 (#396).
+
+### Changed
+
+- Additions to the native featured BYOK search-provider list are paused.
+  Existing providers remain supported; new integrations can use the existing
+  search plugin interface.
+
 ## [4.10.4] - 2026-10-31
 
 ### Added

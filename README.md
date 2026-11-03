@@ -305,6 +305,7 @@ Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the gh
 - **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
 - **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
 - **Classification**: `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page`, a 0-1 quality score, and inline trust signals (focus-miss, JS-shell warning, empty content).
+- **Language metadata**: `lang` is included only for a supported HTML declaration, with `lang_source` (`html_lang` or `meta`). It records the declaration, which can be wrong. An observed `script` such as `latin` or `devanagari` is separate and does not identify a language. PDFs and undeclared pages no longer guess English or another language from their script. Without a declaration, focus keeps script-aware tokenization and accent folding but does not apply language-specific stemming.
 - **Page memory**: every fetch is fingerprinted, so a re-fetch reports `changed` with section-level diffs, and `since_last=true` collapses a re-check to one line (~30 tokens).
 - **`must_contain`**: verifies a claim against the full page but returns MATCH/NO-MATCH plus up to 3 excerpts (~60 tokens instead of 4k).
 - **`stitch=true`**: collects up to six same-host parts within 1 MiB. Output obeys `max_chars`; `next_offset` resumes collected text and `next_part` identifies an unfinished part.
@@ -429,6 +430,7 @@ No API key, no account. Six keyless engines across four independent index famili
 - **Backends**: Bing family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek, Google, plus keyless verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv, StackExchange, MDN, Google News).
 - **Native Google, browser-free**: HTTP through the legacy mobile endpoint on the existing Rust transport, with seven experimentally verified Nokia profiles (`6230-03.15` by default). A profile that succeeds stays preferred per egress, CAPTCHA advances the cursor circularly, rate limits do not. Retry, pacing and quarantine use the same policy as every other engine. Availability depends on Google and your network; see [configuration and limits](docs/google-wml.md).
 - **Ghost SERP cascade**: if the fan-out and its retry wave leave the merge thin (under 3 lanes or under 15 hits) and native Google failed, one headless render can recover Google's desktop SERP. It costs nothing when healthy, only fires under underdelivery, and reports itself honestly as `google_ghost`.
+- **Desktop Google URL limit**: opaque `/goto?url=` links use the visible breadcrumb when it is complete. Shortened breadcrumbs are omitted; a complete breadcrumb can still name a parent section instead of the exact page. We retain this limit in v4 rather than resolving redirects for every result. One or two usable hits are retained; zero parsed hits report `empty-parse`, while confirmed captchas remain `blocked:captcha`.
 - **Semantic reranking**: a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, 23MB) reads query + title + snippet through full attention, blended 60/40 with RRF + BM25 + consensus. A post-enrichment top-up re-scores close calls using the destination page's real title and description instead of SERP fragments.
 - **Consensus**: a URL several independent indexes return gets a boost. Every result carries `score`, `consensus` (independent index families) and `engines`, and the compact surface shows `· N sources`.
 - **Learned engine health**: per-engine trust EWMAs and chronic-failure quarantine survive restarts, so dead engines get benched instead of burning fan-out slots on every query.
@@ -459,7 +461,7 @@ donsetch keys default local             # dispatch order: keyless first
 
 - Stack keys per provider: two Exa keys are one 3,000-credit pool. `donsetch keys export/import` moves the store.
 - Automatic fallback to keyless when a provider errors or runs dry, per-key rate-limit cooldown and depletion tracking.
-- The native adapter list is deliberately short, only the biggest services get one. Everything else belongs in the plugin system below, wired by you, running in the same chain.
+- Additions to the native featured search-provider list are paused. Existing providers remain supported; additional services can use the plugin system below, running in the same chain.
 - Bright Data SERP, Web Unlocker and the proxy/data products are available at [get.brightdata.com](https://get.brightdata.com/ivqwoicrrlbr) (affiliate link).
 
 <div align="center">

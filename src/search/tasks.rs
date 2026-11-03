@@ -260,10 +260,11 @@ pub(super) async fn ghost_engine_task(
     };
     let (hits, instant) = engines::parse_with_instant("google_ghost", &rendered);
     let ms = started.elapsed().as_millis() as u64;
-    if hits.len() < 3 {
-        // 200-but-no-results 2026 Google = bot wall or an AI-mode
-        // shell: either way the lane produced nothing usable.
-        return (engine, Err(("blocked:captcha".into(), egress, true)));
+    if hits.is_empty() {
+        // A parser miss does not establish a challenge. Confirmed access
+        // gates are returned by the browser hook above; sparse usable
+        // results still belong in the merge.
+        return (engine, Err(("empty-parse".into(), egress, true)));
     }
     (engine, Ok((hits, ms, egress, true, instant)))
 }
@@ -466,6 +467,54 @@ mod tests {
             0,
             "no browser, no render cache"
         );
+    }
+
+    #[tokio::test]
+    async fn google_browser_sparse_results_are_not_captchas() {
+        use futures_util::FutureExt;
+        use std::sync::Arc;
+        for count in [0, 1, 2, 3] {
+            let html = (0..count).map(|i| format!(
+                "<div class=\"tF2Cxc\"><a href=\"/goto?url=opaque{i}\"><h3>Result {i}</h3></a><cite>example.com › page{i}</cite></div>"
+            )).collect::<String>();
+            let hook: crate::crawl::GhostHook = Arc::new(move |_| {
+                let html = html.clone();
+                async move {
+                    Ok(crate::crawl::GhostRender {
+                        html,
+                        document: Default::default(),
+                    })
+                }
+                .boxed()
+            });
+            let (_, result) = ghost_engine_task(
+                "google_ghost".into(),
+                "owned query".into(),
+                hook,
+                &EgressPool::new(Vec::new()),
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            if count == 0 {
+                assert_eq!(result.err().unwrap().0, "empty-parse");
+            } else {
+                assert_eq!(
+                    result.expect("usable sparse hits must survive").0.len(),
+                    count
+                );
+            }
+        }
+        let hook: crate::crawl::GhostHook =
+            Arc::new(|_| async { Err("rendered access gate: captcha".into()) }.boxed());
+        let (_, result) = ghost_engine_task(
+            "google_ghost".into(),
+            "owned query".into(),
+            hook,
+            &EgressPool::new(Vec::new()),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, "blocked:captcha");
     }
 
     #[tokio::test]
