@@ -220,10 +220,13 @@ fn attention_output_has_no_furniture_loop() {
     };
     let parsed = crate::pdf::parse(&bytes).expect("parse");
     let text = all_block_text(&parsed.blocks);
-    // The running footer must be suppressed (recurs on all 15 pages).
+    // This proceedings note appears once, on page 1 of the current arXiv
+    // PDF; it is not a repeating footer. Preserve unique source text while
+    // preventing a furniture loop. Synthetic reading tests cover recurring
+    // headers, footers and page numbers independently.
     assert!(
-        !text.contains("31st Conference on Neural Information"),
-        "furniture not suppressed"
+        count_occurrences(&text, "31st Conference on Neural Information") <= 1,
+        "proceedings note repeated"
     );
 }
 
@@ -514,4 +517,102 @@ fn pdf_date_non_ascii_does_not_panic() {
         crate::pdf::pdf_date(&Some("D:20260525080808+00'00'".to_string())),
         Some("2026-05-25".to_string())
     );
+}
+
+// The reported French amendment (#399) sets "15 %" in Times at 12pt.
+// Its narrow digit ink boxes must not create a word boundary. Use a
+// self-contained PDF with standard text plus a Type3 narrow-digit font,
+// so the side-bearing regression is independent of host font substitution.
+fn spacing_pdf(matrix: &str) -> Vec<u8> {
+    let stream = format!(
+        "BT /F1 12 Tf {matrix} Tm (At most 15 % of revenue, or 2 % of total revenue.) Tj 0 -24 Td [(15) -500 (16)] TJ 0 -24 Td (1 5 %) Tj 0 -24 Td /F2 12 Tf (555515555 15 1 5) Tj ET\n"
+    );
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 6 0 R >> >> /Contents 5 0 R >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len()),
+        "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /one 7 0 R /five 8 0 R /space 9 0 R >> /Encoding << /Type /Encoding /Differences [32 /space 49 /one 53 /five] >> /FirstChar 32 /LastChar 53 /Widths [250 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500] /Resources << >> >>".to_string(),
+        {
+            let glyph = "500 0 0 0 240 700 d1 0 0 240 700 re f\n";
+            format!("<< /Length {} >>\nstream\n{glyph}endstream", glyph.len())
+        },
+        {
+            let glyph = "500 0 10 0 490 700 d1 10 0 480 700 re f\n";
+            format!("<< /Length {} >>\nstream\n{glyph}endstream", glyph.len())
+        },
+        {
+            let glyph = "250 0 d0\n";
+            format!("<< /Length {} >>\nstream\n{glyph}endstream", glyph.len())
+        },
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0];
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn spacing_preserves_digits_and_real_word_gaps() {
+    for matrix in [
+        "1 0 0 1 72 720",
+        "0 1 -1 0 300 72",
+        "-1 0 0 -1 500 72",
+        "0 -1 1 0 72 650",
+    ] {
+        let bytes = spacing_pdf(matrix);
+        let (_, pages) = crate::pdf::engine::load_document(
+            &bytes,
+            &Default::default(),
+            |mut input: crate::pdf::engine::PageInput| {
+                crate::pdf::rotate::canonicalize(&mut input.chars);
+                crate::pdf::layout::assemble(input.chars)
+            },
+        )
+        .expect("load spacing PDF");
+        let lines: Vec<_> = pages[0]
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert!(
+            lines.contains(&"At most 15 % of revenue, or 2 % of total revenue."),
+            "matrix {matrix}: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"555515555 15 1 5"),
+            "side bearings became spaces: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"15 16"),
+            "positioned word gap lost: {lines:?}"
+        );
+        assert!(lines.contains(&"1 5 %"), "explicit space lost: {lines:?}");
+        for line in &pages[0].lines {
+            let words: Vec<_> = line.words.iter().map(|word| word.text.as_str()).collect();
+            let expected: Vec<_> = line.text.split_whitespace().collect();
+            assert_eq!(
+                words, expected,
+                "word geometry lost boundaries: {}",
+                line.text
+            );
+            assert!(line.words.iter().all(|word| word.x1 > word.x0));
+        }
+    }
 }

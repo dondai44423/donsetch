@@ -82,7 +82,9 @@ pub fn canonicalize(pc: &mut PageChars) -> Option<f32> {
     // Rotate the frame so the dominant run becomes upright.
     // Glyph quarter-turn winner is counter-clockwise; to canonicalize we
     // rotate CLOCKWISE by winner*90°.
-    let ccw = winner as f32;
+    // PDF matrices use y-up coordinates; glyph boxes use y-down. A
+    // positive PDF text angle therefore needs the inverse screen turn.
+    let ccw = ((4 - winner) % 4) as f32;
     rotate_frame(pc, ccw);
     Some(ccw * 90.0)
 }
@@ -107,6 +109,14 @@ fn rotate_frame(pc: &mut PageChars, quarters: f32) {
             3 => (h - c.y1, c.x0, h - c.y0, c.x1),
             _ => (c.x0, c.y0, c.x1, c.y1),
         };
+        if let Some([x0, y0, x1, y1]) = c.spacing_box {
+            c.spacing_box = Some(match q {
+                1 => [y0, w - x1, y1, w - x0],
+                2 => [w - x1, h - y1, w - x0, h - y0],
+                3 => [h - y1, x0, h - y0, x1],
+                _ => [x0, y0, x1, y1],
+            });
+        }
         c.x0 = nx0;
         c.x1 = nx1;
         c.y0 = ny0;
@@ -234,6 +244,7 @@ mod tests {
             dingbat: false,
             rt: false,
             ocr: false,
+            spacing_box: None,
         }
     }
 
@@ -250,18 +261,18 @@ mod tests {
     #[test]
     fn vertical_page_canonicalizes_to_horizontal() {
         // A vertical-rl CJK page: all glyphs angled at 90°, column running
-        // downward (y increases per glyph) at x~150 on a 200x400 page.
+        // upward (PDF +90 degrees, screen y decreases) at x~150 on a 200x400 page.
         let mut pc = page(vec![
-            ch('日', 150.0, 50.0, 162.0, 62.0, 90.0, 12.0),
+            ch('日', 150.0, 82.0, 162.0, 94.0, 90.0, 12.0),
             ch('本', 150.0, 66.0, 162.0, 78.0, 90.0, 12.0),
-            ch('語', 150.0, 82.0, 162.0, 94.0, 90.0, 12.0),
+            ch('語', 150.0, 50.0, 162.0, 62.0, 90.0, 12.0),
         ]);
         let rotated = canonicalize(&mut pc);
-        assert_eq!(rotated, Some(90.0));
-        // The column (running down) must now run left-to-right.
-        assert_eq!(pc.chars[0].x0, 50.0);
-        assert_eq!(pc.chars[1].x0, 66.0);
-        assert_eq!(pc.chars[2].x0, 82.0);
+        assert_eq!(rotated, Some(270.0));
+        // The column must now run left-to-right.
+        assert_eq!(pc.chars[0].x0, 306.0);
+        assert_eq!(pc.chars[1].x0, 322.0);
+        assert_eq!(pc.chars[2].x0, 338.0);
         // Same row: y extents equal.
         assert_eq!(pc.chars[0].y0, pc.chars[1].y0);
         // Page dims must swap (200x400 -> 400x200 for a quarter turn).

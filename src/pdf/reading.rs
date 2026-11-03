@@ -295,3 +295,62 @@ fn split_recurse(
     cut(a, depth + 1, acc, body);
     cut(b, depth + 1, acc, body);
 }
+
+#[cfg(test)]
+mod furniture_tests {
+    use super::*;
+
+    fn line(text: &str, y: f32, page: usize) -> Line {
+        Line {
+            text: text.into(),
+            words: vec![],
+            x0: 50.0,
+            y0: y,
+            x1: 400.0,
+            y1: y + 10.0,
+            size: 10.0,
+            weight: 400,
+            italic: false,
+            mono: false,
+            font: 0,
+            glyphs: text.len(),
+            order: 0,
+            page,
+        }
+    }
+
+    #[test]
+    fn repeated_furniture_is_removed_and_unique_source_notes_survive() {
+        let mut pages: Vec<_> = (0..4)
+            .map(|index| PageLines {
+                index,
+                width: 612.0,
+                height: 792.0,
+                images: 0,
+                fusion: None,
+                lines: vec![
+                    line("Running document header", 20.0, index),
+                    line("Body evidence", 300.0, index),
+                    line("Recurring publisher footer", 750.0, index),
+                    line(&(index + 1).to_string(), 770.0, index),
+                ],
+            })
+            .collect();
+        pages[0]
+            .lines
+            .push(line("Unique proceedings note", 730.0, 0));
+        suppress_furniture(&mut pages);
+        for page in &pages {
+            assert!(page.lines.iter().any(|l| l.text == "Body evidence"));
+            assert!(!page.lines.iter().any(|l| l.text.contains("Running")
+                || l.text.contains("Recurring")
+                || l.text == (page.index + 1).to_string()));
+        }
+        assert!(
+            pages[0]
+                .lines
+                .iter()
+                .any(|l| l.text == "Unique proceedings note")
+        );
+    }
+}

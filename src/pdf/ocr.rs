@@ -388,6 +388,7 @@ pub fn lines_to_chars(
                 dingbat: false,
                 rt: false,
                 ocr: true,
+                spacing_box: None,
             });
             order += 1;
         }
