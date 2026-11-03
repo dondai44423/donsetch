@@ -123,9 +123,12 @@ pub struct Extracted {
     /// Best-guess content kind from block composition.
     /// Conservative: only non-Page when confident.
     pub content_kind: ContentKind,
-    /// Detected language (BCP-47 code: "en", "zh", "ja", etc.).
+    /// Declared primary language subtag, or "unknown" without a declaration.
     #[allow(dead_code)]
     pub lang: String,
+    pub lang_source: Option<&'static str>,
+    /// Observed dominant writing script, independent of language.
+    pub script: Option<language::Script>,
     /// Quality score 0.0..1.0 : content density, metadata
     /// completeness, structure diversity. Helps agents
     /// decide if content is trustworthy.
@@ -495,6 +498,8 @@ pub fn extract(
                 blocks_shown: 1,
                 focus_omitted: false,
                 lang: "unknown".to_string(),
+                lang_source: None,
+                script: None,
                 quality: 1.0,
                 pdf_pages: None,
                 images: vec![],
@@ -520,6 +525,8 @@ pub fn extract(
             thin: false,
             content_kind: ContentKind::Page,
             lang: "unknown".to_string(),
+            lang_source: None,
+            script: None,
             quality: 0.0,
             pdf_pages: None,
             images: Vec::new(),
@@ -810,6 +817,8 @@ fn empty_pdf(url: &str, reason: &str) -> Extracted {
         thin: false,
         content_kind: ContentKind::Page,
         lang: "unknown".to_string(),
+        lang_source: None,
+        script: None,
         quality: 0.0,
         pdf_pages: None,
         images: Vec::new(),
@@ -896,6 +905,8 @@ fn downstream(
             thin: false,
             content_kind: ContentKind::Page,
             lang: lang_info.code.clone(),
+            lang_source: lang_info.source,
+            script: Some(lang_info.script),
             quality: 0.0,
             pdf_pages: None,
             images: Vec::new(),
@@ -1155,6 +1166,8 @@ fn downstream(
             blocks_shown,
             focus_omitted,
             lang: lang_info.code.clone(),
+            lang_source: lang_info.source,
+            script: Some(lang_info.script),
             quality,
             pdf_pages,
             images,
@@ -1179,6 +1192,8 @@ fn downstream(
         thin,
         content_kind,
         lang: lang_info.code.clone(),
+        lang_source: lang_info.source,
+        script: Some(lang_info.script),
         quality,
         pdf_pages,
         images,

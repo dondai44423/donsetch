@@ -95,6 +95,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let total = full.len();
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&full, opts.offset, max);
+    let lang_info = crate::extract::language::detect(&doc);
     Some(Extracted {
         tokens_est: slice.len() / 4,
         markdown: slice,
@@ -112,7 +113,9 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Article,
-        lang: "en".to_string(),
+        lang: lang_info.code.clone(),
+        lang_source: lang_info.source,
+        script: Some(lang_info.script),
         quality: 0.9,
         pdf_pages: None,
         images: Vec::new(),
