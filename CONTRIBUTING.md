@@ -132,14 +132,15 @@ Scope optional: `feat(search): add scholar vertical`.
 
 - **Bug fixes** with a test that would have caught the bug.
 - **New search engines** that are keyless and don't require API keys.
-- **BYOK providers** for search: additional cloud/API providers (Tavily, Exa, Serper, TinyFish, etc.) wired through `donsetch keys`. These are opt-in, behind a user-supplied API key, and never required for the core toolset to work. PRs for new providers or requests for specific ones are both welcome.
+- **Fixes to existing BYOK search providers.** These remain optional and must never weaken the keyless experience.
 - **Anti-bot improvements**: new wall vendors, better detection heuristics.
 - **PDF extraction** edge cases: corrupt files, weird encodings, exotic tables.
 - **Performance**: measured improvements, not micro-optimizations.
 
 ## What we're not looking for
 
-- **Core features that hard-require API keys.** The default toolset must work with zero keys, zero accounts. BYOK providers are fine because they're optional: the user opts in by providing their own key. If a feature genuinely needs a key and provides massive value (e.g., a specialized data source), it can be accepted as an optional provider behind BYOK, clearly marked as opt-in. It must never degrade the keyless experience.
+- **New native BYOK search providers are paused.** We are keeping the current featured provider list for now; please do not open PRs adding providers to it. Additional services can use the existing [search plugin interface](README.md#search-plugins-any-provider-no-release-needed), without a DonSeTch release.
+- **Core features that hard-require API keys.** The default toolset must work with zero keys, zero accounts. Existing BYOK integrations remain optional: the user opts in by providing their own key. They must never degrade the keyless experience.
 - Adding Python or Node.js dependencies. DonSeTch is Rust, built from scratch. That's the point.
 - Solving interactive captchas (hCaptcha, reCAPTCHA). That's a hard line, not a TODO.
 - Mass-scraping features. DonSeTch is for agentic research, not bulk extraction.
