@@ -159,6 +159,7 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
 
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
+    let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
         tokens_est: slice.len() / 4,
         markdown: slice,
@@ -173,7 +174,9 @@ fn extract_listing(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extra
         focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Listing,
-        lang: "en".to_string(),
+        lang: lang_info.code.clone(),
+        lang_source: lang_info.source,
+        script: Some(lang_info.script),
         quality: 0.9,
         pdf_pages: None,
         images: Vec::new(),
@@ -249,6 +252,7 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
     let _ = comment_sel; // suppress unused warning
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
+    let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
         tokens_est: slice.len() / 4,
         markdown: slice,
@@ -263,7 +267,9 @@ fn extract_thread(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Extrac
         focus_omitted: false,
         thin: false,
         content_kind: ContentKind::Forum,
-        lang: "en".to_string(),
+        lang: lang_info.code.clone(),
+        lang_source: lang_info.source,
+        script: Some(lang_info.script),
         quality: 0.95,
         pdf_pages: None,
         images: Vec::new(),

@@ -4430,8 +4430,16 @@ pub(super) fn finish_result(
     if omitted > 0 {
         structured["omitted_repeats"] = json!(omitted);
     }
-    if !ex.markdown.starts_with("probe: ") && !matches!(ex.lang.as_str(), "" | "und" | "unknown") {
-        structured["lang"] = json!(ex.lang);
+    if !ex.markdown.starts_with("probe: ") {
+        if let Some(source) = ex.lang_source
+            && !matches!(ex.lang.as_str(), "" | "und" | "unknown")
+        {
+            structured["lang"] = json!(ex.lang);
+            structured["lang_source"] = json!(source);
+        }
+        if let Some(script) = ex.script.filter(|s| *s != extract::language::Script::Other) {
+            structured["script"] = json!(script.as_str());
+        }
     }
     if let Some(next_offset) = ex.next_offset {
         structured["next_offset"] = json!(next_offset);
@@ -4861,12 +4869,49 @@ mod fetch_output_contract_tests {
             thin: false,
             content_kind: ContentKind::Article,
             lang: "en".into(),
+            lang_source: None,
+            script: None,
             quality: 0.91,
             pdf_pages: None,
             images: Vec::new(),
             fingerprint: Some("opaque".into()),
             via: None,
             partial: None,
+        }
+    }
+
+    #[test]
+    fn language_metadata_distinguishes_declarations_from_scripts() {
+        for (declaration, expected_lang, expected_source) in [
+            ("", None, None),
+            (" lang=\"fr\"", Some("fr"), Some("html_lang")),
+        ] {
+            let html = format!(
+                "<html{declaration}><body><article><h1>Financement public</h1><p>Le parlement examine les propositions de financement et les dépenses publiques pour les collectivités et les services publics.</p></article></body></html>"
+            );
+            let ex = extract::extract(
+                html.as_bytes(),
+                "text/html",
+                "https://example.com/fr",
+                &ExtractOptions::default(),
+            )
+            .unwrap();
+            let result = finish_result(
+                &ex,
+                "1",
+                200,
+                "ContentOk",
+                "https://example.com/fr",
+                &Trace::default(),
+                1,
+            );
+            let state = &result["structuredContent"];
+            assert_eq!(state.get("lang").and_then(|v| v.as_str()), expected_lang);
+            assert_eq!(
+                state.get("lang_source").and_then(|v| v.as_str()),
+                expected_source
+            );
+            assert_eq!(state["script"], "latin");
         }
     }
 

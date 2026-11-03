@@ -1,10 +1,6 @@
-//! Language + script detection. Drives tokenization strategy
-//! (CJK bigrams vs word-split), stopword filtering, and
-//! stemming. No external model : pure Unicode-range analysis
-//! + HTML hints. Good enough to route tokenization correctly;
-//!
-//! The focus filter degrades gracefully on wrong calls.
-//!
+//! Declared language and observed writing scripts. Unicode ranges choose
+//! tokenization; they do not identify a language. Language-specific stemming
+//! uses a document declaration when available, without an external model.
 
 use scraper::Html;
 
@@ -23,13 +19,31 @@ pub enum Script {
     Other,
 }
 
+impl Script {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Latin => "latin",
+            Self::Cyrillic => "cyrillic",
+            Self::Greek => "greek",
+            Self::Arabic => "arabic",
+            Self::Hebrew => "hebrew",
+            Self::Devanagari => "devanagari",
+            Self::Thai => "thai",
+            Self::Hangul => "hangul",
+            Self::Han => "han",
+            Self::Kana => "kana",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguageInfo {
-    /// BCP-47 tag from <html lang="..."> or meta, or best
-    /// guess from script analysis. "en", "zh", "ja", "ko",
-    /// "ar", "hi", "ne", "th", "ru", "de", "fr", "es", "pt",
-    /// "unknown".
+    /// Normalized primary language subtag from an HTML declaration, or
+    /// "unknown" when no supported declaration is available.
     pub code: String,
+    /// Where the language was declared; declarations are not verified.
+    pub source: Option<&'static str>,
     /// Dominant script (drives tokenization).
     pub script: Script,
     /// All scripts present in the text (for mixed content).
@@ -144,18 +158,12 @@ pub fn detect_from_text(text: &str) -> LanguageInfo {
             .copied()
             .unwrap_or(0)
             .cmp(&counts.get(a).copied().unwrap_or(0))
+            .then_with(|| a.as_str().cmp(b.as_str()))
     });
-    if scripts.is_empty() {
-        return LanguageInfo {
-            code: "en".to_string(),
-            script: Script::Latin,
-            scripts: vec![Script::Latin],
-        };
-    }
-    let dominant = *scripts.first().unwrap();
-    let code = script_to_lang(dominant, &scripts);
+    let dominant = scripts.first().copied().unwrap_or(Script::Other);
     LanguageInfo {
-        code,
+        code: "unknown".to_string(),
+        source: None,
         script: dominant,
         scripts,
     }
@@ -165,26 +173,15 @@ pub fn detect_from_text(text: &str) -> LanguageInfo {
 /// `<html lang>`, `<meta http-equiv=content-language>`,
 /// then falls back to script analysis of text content.
 pub fn detect(doc: &Html) -> LanguageInfo {
-    // 1. HTML lang attribute : most reliable.
+    let mut info = script_analysis(doc);
     if let Some(lang) = html_lang(doc) {
-        let script = lang_to_script(&lang);
-        return LanguageInfo {
-            code: lang,
-            script,
-            scripts: vec![script],
-        };
+        info.code = lang;
+        info.source = Some("html_lang");
+    } else if let Some(lang) = meta_content_language(doc) {
+        info.code = lang;
+        info.source = Some("meta");
     }
-    // 2. Meta content-language.
-    if let Some(lang) = meta_content_language(doc) {
-        let script = lang_to_script(&lang);
-        return LanguageInfo {
-            code: lang,
-            script,
-            scripts: vec![script],
-        };
-    }
-    // 3. Script analysis of text content.
-    script_analysis(doc)
+    info
 }
 
 fn html_lang(doc: &Html) -> Option<String> {
@@ -230,57 +227,32 @@ fn script_analysis(doc: &Html) -> LanguageInfo {
             .unwrap()
     };
 
-    // Sample body text, then classify with the same census the
-    // text path uses.
+    // Walk once and skip non-content subtrees. Checking every text node's
+    // ancestors would make deeply wrapped documents quadratic.
     let mut sampled = String::new();
-    for t in root.text() {
-        sampled.push_str(t);
-        if sampled.len() > 20_000 {
-            break;
+    let mut sampled_chars = 0;
+    let mut pending = vec![*root];
+    while let Some(node) = pending.pop() {
+        if let Some(el) = node.value().as_element()
+            && (matches!(el.name(), "script" | "style" | "template" | "noscript")
+                || el.attr("hidden").is_some()
+                || el.attr("aria-hidden") == Some("true"))
+        {
+            continue;
+        }
+        if let Some(text) = node.value().as_text() {
+            for ch in text.chars().take(5000 - sampled_chars) {
+                sampled.push(ch);
+                sampled_chars += 1;
+            }
+            if sampled_chars == 5000 {
+                break;
+            }
+        } else {
+            pending.extend(node.children().rev());
         }
     }
     detect_from_text(&sampled)
-}
-
-/// Map a BCP-47 tag to its dominant script.
-fn lang_to_script(lang: &str) -> Script {
-    let primary = lang.split(['-', '_']).next().unwrap_or("").to_lowercase();
-    match primary.as_str() {
-        "zh" | "zh-cn" | "zh-tw" | "zh-hk" | "zh-sg" | "zh-mo" => Script::Han,
-        "ja" => Script::Han, // Japanese mixes Han + Kana; Han is dominant usually
-        "ko" => Script::Hangul,
-        "th" => Script::Thai,
-        "ar" => Script::Arabic,
-        "he" | "iw" => Script::Hebrew,
-        "hi" | "ne" | "sa" | "mr" | "bn" | "gu" | "ta" | "te" | "pa" => Script::Devanagari,
-        "ru" | "uk" | "be" | "bg" | "sr" | "mk" | "kk" | "ky" | "mn" => Script::Cyrillic,
-        "el" => Script::Greek,
-        _ => Script::Latin,
-    }
-}
-
-/// Map a dominant script to a best-guess language code.
-/// When Han + Kana co-occur → Japanese. Han alone → Chinese.
-fn script_to_lang(dominant: Script, all: &[Script]) -> String {
-    match dominant {
-        Script::Han => {
-            if all.contains(&Script::Kana) {
-                "ja".to_string()
-            } else {
-                "zh".to_string()
-            }
-        }
-        Script::Kana => "ja".to_string(),
-        Script::Hangul => "ko".to_string(),
-        Script::Thai => "th".to_string(),
-        Script::Arabic => "ar".to_string(),
-        Script::Hebrew => "he".to_string(),
-        Script::Devanagari => "hi".to_string(), // could be ne, but hi is more common
-        Script::Cyrillic => "ru".to_string(),
-        Script::Greek => "el".to_string(),
-        Script::Latin => "en".to_string(), // default Latin = English
-        Script::Other => "unknown".to_string(),
-    }
 }
 
 /// Normalize a raw lang attribute to a short BCP-47 code.
@@ -320,11 +292,50 @@ mod tests {
     }
 
     #[test]
+    fn script_census_does_not_claim_a_language() {
+        for (text, script) in [
+            (
+                "Le parlement examine les propositions de financement.",
+                Script::Latin,
+            ),
+            (
+                "Українські документи містять важливі відомості",
+                Script::Cyrillic,
+            ),
+            ("नेपालको संविधान र सार्वजनिक जानकारी", Script::Devanagari),
+        ] {
+            let info = detect_from_text(text);
+            assert_eq!(info.code, "unknown", "{text}");
+            assert_eq!(info.script, script);
+        }
+        for text in ["", "12345 %", "---"] {
+            let info = detect_from_text(text);
+            assert_eq!(info.code, "unknown", "{text}");
+            assert_eq!(info.script, Script::Other);
+        }
+    }
+
+    #[test]
+    fn observed_script_ignores_script_sources_and_hidden_text() {
+        let html = format!(
+            "<html lang='fr'><body><script>{}</script><div hidden>{}</div><p>これは日本語の文章です。機械学習について説明します。</p></body></html>",
+            "latin source ".repeat(500),
+            "latin hidden ".repeat(500)
+        );
+        let info = detect(&parse(&html));
+        assert_eq!(info.code, "fr");
+        assert_eq!(info.source, Some("html_lang"));
+        assert!(info.scripts.contains(&Script::Kana));
+        assert!(!info.scripts.contains(&Script::Latin));
+    }
+
+    #[test]
     fn html_lang_attr() {
         let doc = parse(r#"<html lang="ja"><body>こんにちは</body></html>"#);
         let info = detect(&doc);
         assert_eq!(info.code, "ja");
-        assert_eq!(info.script, Script::Han);
+        assert_eq!(info.script, Script::Kana);
+        assert_eq!(info.source, Some("html_lang"));
     }
 
     #[test]
@@ -341,6 +352,7 @@ mod tests {
         );
         let info = detect(&doc);
         assert_eq!(info.code, "de");
+        assert_eq!(info.source, Some("meta"));
     }
 
     #[test]
@@ -348,14 +360,14 @@ mod tests {
         let doc = parse("<html><body>机器学习是人工智能的一个分支</body></html>");
         let info = detect(&doc);
         assert_eq!(info.script, Script::Han);
-        assert_eq!(info.code, "zh");
+        assert_eq!(info.code, "unknown");
     }
 
     #[test]
     fn script_analysis_japanese() {
         let doc = parse("<html><body>これは日本語のテキストです。機械学習の分野</body></html>");
         let info = detect(&doc);
-        assert_eq!(info.code, "ja");
+        assert_eq!(info.code, "unknown");
         // Should detect both Han and Kana.
         assert!(info.scripts.contains(&Script::Kana));
     }
@@ -364,7 +376,7 @@ mod tests {
     fn script_analysis_korean() {
         let doc = parse("<html><body>안녕하세요. 이것은 한국어 텍스트입니다.</body></html>");
         let info = detect(&doc);
-        assert_eq!(info.code, "ko");
+        assert_eq!(info.code, "unknown");
         assert_eq!(info.script, Script::Hangul);
     }
 
@@ -372,7 +384,7 @@ mod tests {
     fn script_analysis_arabic() {
         let doc = parse("<html><body>هذا نص باللغة العربية</body></html>");
         let info = detect(&doc);
-        assert_eq!(info.code, "ar");
+        assert_eq!(info.code, "unknown");
         assert_eq!(info.script, Script::Arabic);
     }
 
@@ -395,14 +407,14 @@ mod tests {
         let doc = parse("<html><body>Это текст на русском языке</body></html>");
         let info = detect(&doc);
         assert_eq!(info.script, Script::Cyrillic);
-        assert_eq!(info.code, "ru");
+        assert_eq!(info.code, "unknown");
     }
 
     #[test]
-    fn default_latin_is_english() {
+    fn undeclared_latin_has_no_language() {
         let doc = parse("<html><body>This is English text content.</body></html>");
         let info = detect(&doc);
-        assert_eq!(info.code, "en");
+        assert_eq!(info.code, "unknown");
         assert_eq!(info.script, Script::Latin);
     }
 
@@ -410,8 +422,8 @@ mod tests {
     fn empty_page() {
         let doc = parse("<html><body></body></html>");
         let info = detect(&doc);
-        // No lang attr, no text → defaults to English.
-        assert_eq!(info.code, "en");
+        // No declaration and no letters establish neither language nor script.
+        assert_eq!(info.code, "unknown");
     }
 
     #[test]

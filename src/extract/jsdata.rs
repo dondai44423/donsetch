@@ -256,8 +256,13 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     }
 
     // Render markdown.
-    let preferred_title = super::metadata::metadata(&Html::parse_document(html)).title;
+    let doc = Html::parse_document(html);
+    let preferred_title = super::metadata::metadata(&doc).title;
+    let mut lang_info = super::language::detect(&doc);
     let (md, title) = render(&kept, url, preferred_title);
+    let observed = super::language::detect_from_text(&md);
+    lang_info.script = observed.script;
+    lang_info.scripts = observed.scripts;
 
     if opts.focus.is_some() || opts.section.is_some() || opts.must_contain.is_some() {
         // Rescued data earns the same read controls as ordinary DOM content.
@@ -296,7 +301,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
             false,
             false,
             Vec::new(),
-            super::language::detect_from_text(&md),
+            lang_info,
             None,
             url,
             opts,
@@ -321,7 +326,9 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         focus_omitted: false,
         thin: total < 800,
         content_kind: ContentKind::Page,
-        lang: guess_lang(&md),
+        lang: lang_info.code.clone(),
+        lang_source: lang_info.source,
+        script: Some(lang_info.script),
         quality: 0.7,
         pdf_pages: None,
         images: Vec::new(),
@@ -1025,19 +1032,6 @@ fn extract_site(url: &str) -> Option<String> {
     url::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
-}
-
-fn guess_lang(md: &str) -> String {
-    // Light heuristic: if it contains CJK, say so; else "en".
-    if md.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
-        "zh".into()
-    } else if md.chars().any(|c| ('\u{ac00}'..='\u{d7af}').contains(&c)) {
-        "ko".into()
-    } else if md.chars().any(|c| ('\u{3040}'..='\u{30ff}').contains(&c)) {
-        "ja".into()
-    } else {
-        "en".into()
-    }
 }
 
 /// Apply caller's max_chars/offset (shared shape with DonSift).
