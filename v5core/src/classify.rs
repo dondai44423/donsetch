@@ -105,6 +105,10 @@ const SIGNATURES: &[Signature] = &[
         markers: &["kpsdk", "x-kpsdk-ct", "ips.js"],
     },
     Signature {
+        vendor: "reddit",
+        markers: &["jsc_token"],
+    },
+    Signature {
         vendor: "ebay-block",
         markers: &["pardon our interruption"],
     },
@@ -156,6 +160,16 @@ fn asks(vendor: &str, lower: &str) -> (&'static str, Class) {
         // compute; that is a contract, not a human step.
         "akamai" => ("sensor payload", Class::WallContract),
         "kasada" => ("sdk payload", Class::WallContract),
+        // Reddit's own gate ships a form whose one field its inline program
+        // computes and submits: the page's own program, so the engine runs it.
+        // A page of the same origin with no form names no program.
+        "reddit" => {
+            if lower.contains("js_challenge") {
+                ("js challenge form", Class::WallProgram)
+            } else {
+                ("block page", Class::WallIdentity)
+            }
+        }
         "imperva" => ("incident page", Class::WallIdentity),
         _ => ("block page", Class::WallIdentity),
     }
@@ -448,6 +462,34 @@ mod tests {
             headers: &[],
         })
         .class
+    }
+
+    #[test]
+    fn reddits_gate_is_the_pages_own_program() {
+        let gate = "<html><head><title>Reddit</title></head><body><form hidden method=\"GET\" \
+                    action=\"/r/rust/\"><input type=\"hidden\" name=\"solution\" />\
+                    <input type=\"hidden\" name=\"js_challenge\" value=\"1\"/>\
+                    <input type=\"hidden\" name=\"jsc_token\" value=\"ab12\"/></form></body></html>";
+        let verdict = classify(Evidence {
+            status: 200,
+            body: gate,
+            content_ok: false,
+            headers: &[],
+        });
+        assert_eq!(verdict.class, Class::WallProgram);
+        assert_eq!(
+            verdict.wall.as_ref().map(|wall| wall.vendor.as_str()),
+            Some("reddit")
+        );
+        // The same origin's block page names no program: it stays a refusal.
+        let blocked = "<html><body>You've been blocked by network security.</body></html>";
+        let verdict = classify(Evidence {
+            status: 403,
+            body: blocked,
+            content_ok: false,
+            headers: &[],
+        });
+        assert_eq!(verdict.class, Class::WallIdentity);
     }
 
     #[test]

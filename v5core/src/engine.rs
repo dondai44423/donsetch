@@ -737,6 +737,14 @@ pub fn is_cloudflare_page(html: &str) -> bool {
     html.contains("cf_chl_opt") || html.contains("/cdn-cgi/challenge-platform/")
 }
 
+/// Reddit's own gate: a form whose one field its inline program computes and
+/// submits (`jsc_token` names the token, `js_challenge=1` the form). The page
+/// carries the program, so the engine runs it and the form navigation is what
+/// the fetcher spends.
+pub fn is_reddit_page(html: &str) -> bool {
+    html.contains("jsc_token")
+}
+
 #[cfg(test)]
 mod host_source_tests {
     /// V8 extension source must be 7-bit ASCII: deno_core asserts it in debug

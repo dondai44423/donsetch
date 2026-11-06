@@ -610,4 +610,77 @@ fn the_engine_page_check_follows_the_vendor() {
     let aws_waf = "<html><script>window.gokuProps={};</script></html>";
     assert!(is_program_page("aws-waf", aws_waf));
     assert!(!is_program_page("cloudflare", aws_waf));
+
+    // Reddit's gate: a form whose field its own inline program computes.
+    let reddit = "<html><form method=\"GET\" action=\"/r/rust/\">\
+        <input type=\"hidden\" name=\"jsc_token\" value=\"ab\"/></form></html>";
+    assert!(is_program_page("reddit", reddit));
+    assert!(!is_program_page("aws-waf", reddit));
+}
+
+/// Reddit's gate end to end: the origin serves its challenge page to a client
+/// with no answer, and content to the request the page's own program builds --
+/// the seed it wrote, doubled, with the token the form declared.
+struct Gate {
+    server: Server,
+    answered: Arc<AtomicU32>,
+}
+
+const GATE_SEED: &str = "979da15b3033efb7";
+
+impl Gate {
+    fn start() -> Self {
+        let answered = Arc::new(AtomicU32::new(0));
+        let server = {
+            let answered = Arc::clone(&answered);
+            Server::start(move |request| {
+                let path = request.path.as_str();
+                if path.contains(&format!("solution={GATE_SEED}{GATE_SEED}"))
+                    && path.contains("js_challenge=1")
+                    && path.contains("jsc_token=tok-gate")
+                {
+                    answered.fetch_add(1, Ordering::SeqCst);
+                    return Reply::ok(content_page());
+                }
+                Reply::ok(gate_page())
+            })
+        };
+        Self { server, answered }
+    }
+
+    fn answered(&self) -> u32 {
+        self.answered.load(Ordering::SeqCst)
+    }
+}
+
+/// The page Reddit serves a client it means to gate, with this test's own seed.
+fn gate_page() -> String {
+    format!(
+        "<!DOCTYPE html><html><head><title>Reddit</title>\
+         <script>document.addEventListener(\"DOMContentLoaded\",async function(){{\
+         var e=document.forms[0],n=(e.onsubmit=function(t){{return new URLSearchParams(document.location.search)\
+         .forEach((e,n)=>t.target.appendChild(Object.assign(document.createElement(\"input\"),\
+         {{name:e,type:\"hidden\",value:n}}))),!0}},await(async e=>e+e)(\"{GATE_SEED}\"));\
+         e.elements.namedItem(\"solution\").value=n,e.requestSubmit()}},{{once:!0}});</script>\
+         </head><body><form hidden method=\"GET\" action=\"/\">\
+         <input type=\"hidden\" name=\"solution\" />\
+         <input type=\"hidden\" name=\"js_challenge\" value=\"1\"/>\
+         <input type=\"hidden\" name=\"jsc_token\" value=\"tok-gate\"/>\
+         <input type=\"hidden\" name=\"jsc_orig_r\" value=\"\"/>\
+         </form></body></html>"
+    )
+}
+
+#[test]
+fn a_gated_document_is_content_once_its_own_program_has_run() {
+    let origin = Gate::start();
+    let mut session = Worker::new(false);
+    let outcome = session.fetch(&origin.server.url("/"), &options());
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
+    assert_eq!(
+        origin.answered(),
+        1,
+        "one solved request, and it is the content request"
+    );
+    assert!(engine_notes(&outcome) >= 1, "{:?}", outcome.attempts);
 }

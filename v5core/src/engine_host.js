@@ -1222,6 +1222,82 @@
       document.scripts = scriptEls;
     }
 
+    // A form's controls, read live: namedItem must see a field the page appends
+    // while onsubmit runs, which is how these gates fold the query string in.
+    function formControls(form) {
+      const controls = () => form.childNodes.filter((child) => child && child.name);
+      return {
+        get length() { return controls().length; },
+        item(index) { return controls()[index] || null; },
+        namedItem(name) { return controls().find((control) => control.name === String(name)) || null; },
+      };
+    }
+
+    // The navigation a browser makes on submit: a GET form replaces the action's
+    // query with its controls, encoded as a browser encodes them. A method this
+    // host does not run says so instead of sending a request the page did not
+    // ask for.
+    function submitForm(form) {
+      const event = { type: "submit", target: form, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+      if (typeof form.onsubmit === "function") {
+        let allowed;
+        try { allowed = form.onsubmit.call(form, event); }
+        catch (e) { note("log", "onsubmit: " + (e && e.message)); return; }
+        if (allowed === false || event.defaultPrevented) return;
+      }
+      if (form.method !== "get") { note("log", "form submit: method " + form.method + " is not run"); return; }
+      const pairs = [];
+      for (const control of form.childNodes) {
+        if (!control || !control.name) continue;
+        if (["submit", "button", "image", "reset", "file"].includes(String(control.type))) continue;
+        if (control.disabled) continue;
+        pairs.push(formEncode(control.name) + "=" + formEncode(String(control.value)));
+      }
+      let target;
+      try { target = new URL(form.action || M.page.url, M.page.url); }
+      catch (e) { note("log", "form action: " + (e && e.message)); return; }
+      if (pairs.length) target.search = pairs.join("&");
+      else { target.search = ""; }
+      M.redirect = target.href;
+      note("surface", "form submit");
+      note("log", "form submit " + M.redirect.slice(0, 140));
+    }
+
+    // The page's own <form> elements, with the fields the HTML declares. A JS
+    // challenge may compute one field's value and submit the form as its last
+    // step (Reddit's gate does exactly that): the host builds the navigation a
+    // browser would make and the fetcher performs it. Only fields the page
+    // ships or appends are sent, in document order; nothing is invented.
+    const formEls = [];
+    {
+      const formRe = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+      let formMatch;
+      while ((formMatch = formRe.exec(page.html))) {
+        const attrs = formMatch[1] || "";
+        const form = new El("form");
+        form.method = ((/method\s*=\s*["']?([a-zA-Z]+)/i.exec(attrs) || [])[1] || "get").toLowerCase();
+        form.action = (/action\s*=\s*["']([^"']*)["']/i.exec(attrs) || [])[1] || "";
+        form.onsubmit = null;
+        const fieldRe = /<input\b([^>]*)>/gi;
+        let fieldMatch;
+        while ((fieldMatch = fieldRe.exec(formMatch[2] || ""))) {
+          const fieldAttrs = fieldMatch[1] || "";
+          const name = (/name\s*=\s*["']([^"']*)["']/i.exec(fieldAttrs) || [])[1];
+          if (!name) continue;
+          const field = new El("input");
+          field.name = name;
+          field.value = (/value\s*=\s*["']([^"']*)["']/i.exec(fieldAttrs) || [])[1] || "";
+          field.type = ((/type\s*=\s*["']([^"']*)["']/i.exec(fieldAttrs) || [])[1] || "text").toLowerCase();
+          form.appendChild(field);
+        }
+        form.elements = formControls(form);
+        form.submit = () => submitForm(form);
+        form.requestSubmit = () => submitForm(form);
+        formEls.push(form);
+      }
+      document.forms = formEls;
+    }
+
     const navigator = {
       userAgent: ident.userAgent, appVersion: ident.appVersion, appName: "Netscape",
       appCodeName: "Mozilla", platform: ident.platform, vendor: ident.vendor, vendorSub: "",

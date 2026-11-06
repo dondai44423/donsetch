@@ -93,6 +93,44 @@ fn a_benign_challenge_mints_inside_the_envelope() {
     assert!(mint.ms < 3_000.0);
 }
 
+/// Reddit's gate as the origin serves it: a form whose one field the page's own
+/// inline program computes (the seed doubled) and submits. `SEED` stands in for
+/// the per-request value the server writes into the script.
+const REDDIT_GATE: &str = r#"<!DOCTYPE html><html><head><title>Reddit</title>
+<script nonce="n1">
+document.addEventListener("DOMContentLoaded",async function(){var e=document.forms[0],n=(e.onsubmit=function(t){return new URLSearchParams(document.location.search).forEach((e,n)=>t.target.appendChild(Object.assign(document.createElement("input"),{name:e,type:"hidden",value:n}))),!0},await(async e=>e+e)("SEED"));e.elements.namedItem("solution").value=n,e.requestSubmit()},{once:!0});
+</script></head><body><main><div class="logo">Reddit</div></main>
+<form hidden method="GET" action="/r/rust/">
+<input type="hidden" name="solution" />
+<input type="hidden" name="js_challenge" value="1"/>
+<input type="hidden" name="jsc_token" value="tok-abc123"/>
+<input type="hidden" name="jsc_orig_r" value=""/>
+</form></body></html>"#;
+
+#[test]
+fn a_form_challenge_navigates_where_its_own_program_says() {
+    let _turn = serial();
+    let html = REDDIT_GATE.replace("SEED", "979da15b3033efb7");
+    let mint = mint_within(
+        &limits(),
+        "https://www.reddit.com/r/rust/",
+        &html,
+        chrome(),
+        None,
+    )
+    .expect("the gate mints");
+    assert_eq!(
+        mint.redirect.as_deref(),
+        Some("https://www.reddit.com/r/rust/?solution=979da15b3033efb7979da15b3033efb7&js_challenge=1&jsc_token=tok-abc123&jsc_orig_r="),
+        "the form's own fields in document order, with the value its program set"
+    );
+    assert!(
+        mint.surfaces.iter().any(|surface| surface == "form submit"),
+        "the host names the surface it needed: {:?}",
+        mint.surfaces
+    );
+}
+
 #[test]
 fn the_page_cannot_see_the_engines_ops() {
     let server = quiet();

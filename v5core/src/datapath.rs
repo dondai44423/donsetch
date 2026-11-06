@@ -150,7 +150,13 @@ pub fn plan(url: &str) -> Option<(&'static DataPath, Request)> {
 fn resolve_reddit(url: &Url) -> Option<Request> {
     // Ask for the feed of the page that was requested, not of a different one.
     let path = url.path().trim_end_matches('/').to_string();
-    // A thread URL keeps its slug: /r/x/comments/id/title -> .../.rss
+    // A thread is not a listing. Its feed carries the comments alone, without the
+    // post the reader asked for, so it is not equivalent to the page: a thread is
+    // answered by its own document (and the engine behind its gate). The feed
+    // answers the listings it mirrors item for item.
+    if path.contains("/comments/") {
+        return None;
+    }
     let target = format!("https://www.reddit.com{path}/.rss");
     Some(Request {
         method: "GET",
@@ -625,11 +631,14 @@ mod tests {
     }
 
     #[test]
-    fn reddit_resolves_a_listing_and_a_thread_to_the_feed() {
+    fn reddit_resolves_a_listing_to_its_feed_and_leaves_a_thread_to_its_page() {
         let (_, request) = plan("https://www.reddit.com/").unwrap();
         assert_eq!(request.url, "https://www.reddit.com/.rss");
-        let (_, request) = plan("https://www.reddit.com/r/rust/comments/abc/title/").unwrap();
-        assert!(request.url.ends_with("/r/rust/comments/abc/title/.rss"));
+        let (_, request) = plan("https://www.reddit.com/r/rust/").unwrap();
+        assert_eq!(request.url, "https://www.reddit.com/r/rust/.rss");
+        // A thread's feed is its comments alone, without the post the reader
+        // asked for: the document answers a thread, not the interface.
+        assert!(plan("https://www.reddit.com/r/rust/comments/abc/title/").is_none());
     }
 
     #[test]

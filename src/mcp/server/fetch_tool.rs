@@ -798,80 +798,6 @@ fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) ->
     adapter_host && !no_adapter && !matches!(verdict, Verdict::ContentOk)
 }
 
-/// One legacy-host navigation to seed the reddit session (#291
-/// follow-through): any old.reddit.com response runs its login
-/// flow and seeds the cookies `www.reddit.com` needs before it
-/// serves the real SSR page instead of the humanity interstitial
-/// or the JS shell. The body is discarded; the side effect is the
-/// cookie jar. Returns whether a navigation actually ran.
-async fn reddit_session_hop(
-    daemon: &Arc<Daemon>,
-    u: &url::Url,
-    trace: &mut Trace,
-    route: &RequestRoute,
-) -> bool {
-    let Some(oldu) = crate::adapters::reddit_session_url(u) else {
-        return false;
-    };
-    let t0 = std::time::Instant::now();
-    let hop = daemon
-        .fetcher
-        .fetch_persona_on_route(&oldu, Some(route))
-        .await;
-    trace.step(
-        "local",
-        "reddit-session",
-        &format!("status={}", hop.as_ref().map_or(0, |o| o.status)),
-        t0.elapsed().as_millis(),
-    );
-    true
-}
-
-/// Reddit's anonymous identity cookie, `loid`, is the gate for the
-/// direct `.json` endpoint (verified live: loid alone serves the
-/// listing, absent it is refused). When the jar already carries it
-/// the pre-emptive legacy-host hop is a redundant request; without
-/// it the hop is what seeds a session. A refusal on a direct
-/// attempt still runs the one-shot session fallback, so a stale
-/// loid self-heals.
-fn reddit_session_live(cookie_names: &[String]) -> bool {
-    cookie_names.iter().any(|name| name == "loid")
-}
-
-async fn reddit_session_fallback(
-    daemon: &Arc<Daemon>,
-    args: &Value,
-    url: &str,
-    trace: &mut Trace,
-    call: &FetchCall,
-) -> Value {
-    let hop_done = match url::Url::parse(url) {
-        Ok(pu) => reddit_session_hop(daemon, &pu, trace, &call.route).await,
-        Err(_) => false,
-    };
-    let prior = trace.value().as_array().cloned().unwrap_or_default();
-    let mut args2 = args.clone();
-    args2["_reddit_session"] = json!(true);
-    let mut res = Box::pin(fetch_single_inner(daemon, &args2, url, call)).await;
-    if let Some(sc) = res.pointer_mut("/structuredContent") {
-        sc["reddit_session"] = json!(hop_done);
-    }
-    fold_trace_into_result(&mut res, prior);
-    res
-}
-
-/// A reddit page refusal locally that one session-init retry can
-/// fix (the content host serves the humanity page or the JS shell
-/// to a sessionless client). Never twice (`_reddit_session`
-/// guard), never off the content host.
-fn reddit_session_retry_eligible(verdict: &Verdict, host: &str, args: &Value) -> bool {
-    matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked)
-        && matches!(host, "www.reddit.com" | "reddit.com")
-        && !args
-            .get("_reddit_session")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-}
 
 /// Retry the caller's URL without the adapter rewrite, and fold the
 /// adapter hop's trail in front of the retry's so the trail reads
@@ -886,15 +812,11 @@ async fn adapter_fallback(
     trace: &mut Trace,
     action: &str,
     why: &str,
-    session_seeded: bool,
     call: &FetchCall,
 ) -> Value {
     trace.step("adapter", action, why, 0);
-    // Try the public page before spending a session-init request. A blocked
-    // or thin Reddit page still gets the existing one-hop session recovery.
-    // Legacy-host caller URLs retry on the content host: `old.`/
-    // `np.` serve a login wall to anonymous clients, so the retry
-    // there could never succeed.
+    // Legacy-host caller URLs retry on the content host: `old.`/`np.` serve a
+    // login wall to anonymous clients, so the retry there could never succeed.
     let retry_url = url::Url::parse(orig_url)
         .ok()
         .and_then(|u| crate::adapters::reddit_content_url(&u))
@@ -905,7 +827,6 @@ async fn adapter_fallback(
     };
     let mut args2 = args.clone();
     args2["_no_adapter"] = json!(true);
-    args2["_reddit_session"] = json!(session_seeded);
     let mut res = Box::pin(fetch_single_inner(daemon, &args2, &retry_url, call)).await;
     if let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["adapter_fallback"] = json!(true);
@@ -1109,39 +1030,12 @@ async fn fetch_single_inner(
         out = Some(entry.outcome);
     }
 
-    let mut adapter_session_seeded = false;
     if !prewarmed {
         let t0 = std::time::Instant::now();
-        let response = {
-            let request = daemon
-                .fetcher
-                .fetch_persona_on_route(&url, Some(&call.route));
-            let needs_seed = adapter_used == Some("adapter:reddit-json")
-                && !reddit_session_live(&daemon.fetcher.cookie_names(&host));
-            if needs_seed {
-                // The structured endpoint and session initialization do not
-                // depend on each other's response. Overlap their network waits.
-                // A usable JSON reply wins immediately; failures still wait
-                // for the session before reading the public SSR page. A jar
-                // that already holds the session skips the hop entirely.
-                let seed = reddit_session_hop(daemon, &parsed_url, &mut trace, &call.route);
-                tokio::pin!(request, seed);
-                tokio::select! {
-                    reply = &mut request => {
-                        if !matches!(&reply, Ok(out) if out.verdict == Verdict::ContentOk) {
-                            adapter_session_seeded = seed.await;
-                        }
-                        reply
-                    },
-                    seeded = &mut seed => {
-                        adapter_session_seeded = seeded;
-                        request.await
-                    },
-                }
-            } else {
-                request.await
-            }
-        };
+        let response = daemon
+            .fetcher
+            .fetch_persona_on_route(&url, Some(&call.route))
+            .await;
         let fetched = match response {
             Ok(o) => o,
             Err(e) => {
@@ -1161,7 +1055,6 @@ async fn fetch_single_inner(
                         &mut trace,
                         "fallback",
                         "transport error : retrying original URL",
-                        adapter_session_seeded,
                         call,
                     )
                     .await;
@@ -1279,19 +1172,9 @@ async fn fetch_single_inner(
                     &mut trace,
                     "fallback",
                     &why,
-                    adapter_session_seeded,
                     call,
                 )
                 .await;
-            }
-            // A reddit page (thread, listing, about, wiki) refused
-            // without a session: the humanity page or the
-            // shell. One legacy-host navigation seeds the session,
-            // the retry gets the real SSR page, and the SSR adapter
-            // turns that into the card. Cheap enough to try before
-            // any wall handling.
-            _ if reddit_session_retry_eligible(&o.verdict, &host, args) => {
-                return reddit_session_fallback(daemon, args, &url, &mut trace, call).await;
             }
             v => {
                 let kind = verdict_kind(v, o.status);
@@ -1361,7 +1244,6 @@ async fn fetch_single_inner(
             &mut trace,
             "shape-mismatch",
             "structured payload unavailable : retrying original URL",
-            adapter_session_seeded,
             call,
         )
         .await;
@@ -1528,14 +1410,6 @@ async fn fetch_single_inner(
             .as_ref()
             .map(|e| crate::extract::quality::chrome_only(&e.markdown))
             .unwrap_or(false);
-    // Reddit can answer 200 with a logged-out JS shell. The same cheap
-    // session initialization used for explicit walls belongs before render.
-    if status_2xx
-        && (still_thin || shell_text || challenge_text || chrome_text)
-        && reddit_session_retry_eligible(&Verdict::Blocked, &host, args)
-    {
-        return reddit_session_fallback(daemon, args, &url, &mut trace, call).await;
-    }
     // Wall-class: a challenge body, an extraction wall, or an
     // interstitial behind a 2xx. Shell-class: a client-rendered page
     // that never hydrated locally. Adapters, JSON payloads and PDFs
@@ -3125,87 +2999,6 @@ mod adapter_hop_tests {
     use super::*;
     use crate::detect::walls::Vendor;
 
-    // Nextest owns config/state; match the production runtime's 8 MiB stack.
-    #[test]
-    fn stealth_v3_adapter_fallback_keeps_the_callers_selected_lane() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all().build().unwrap();
-                runtime.block_on(async {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    unsafe {
-                        std::env::set_var("DONSETCH_FETCH_ROTATE", "1");
-                        std::env::remove_var("DONSETCH_NO_FETCH_ROTATE");
-                        std::env::set_var("DONSETCH_NO_ENV_PROXY", "1");
-                        std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1");
-                        std::env::set_var("DONSETCH_NO_ROUTE_PROBES", "1");
-                    }
-                    let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let proxies = [&a, &b].map(|listener| {
-                        crate::egress::proxy::Proxy::parse(&format!(
-                            "http://{}", listener.local_addr().unwrap()
-                        )).unwrap()
-                    });
-                    let pool = Arc::new(crate::search::egress::EgressPool::new(proxies.to_vec()));
-                    crate::search::egress::install_global(Arc::clone(&pool));
-                    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-                    let (stop, stopped) = tokio::sync::watch::channel(false);
-                    let mut servers = Vec::new();
-                    for (lane, listener) in [("A", a), ("B", b)] {
-                        let events = Arc::clone(&events);
-                        let mut stopped = stopped.clone();
-                        servers.push(tokio::spawn(async move {
-                            loop {
-                                let mut socket = tokio::select! {
-                                    _ = stopped.changed() => break,
-                                    accepted = listener.accept() => accepted.unwrap().0,
-                                };
-                                let mut head = Vec::new();
-                                while !head.ends_with(b"\r\n\r\n") {
-                                    assert!(head.len() < 16384);
-                                    head.push(socket.read_u8().await.unwrap());
-                                }
-                                let request = String::from_utf8(head).unwrap();
-                                let target = request.split_whitespace().nth(1).unwrap().to_owned();
-                                events.lock().unwrap().push((lane, target.clone()));
-                                let (status, body) = if target.contains(".json") {
-                                    (429, "<html><body>Too many requests</body></html>".to_string())
-                                } else {
-                                    (200, format!("<article><h1>Owned fallback lane {lane}</h1><p>{}</p></article>",
-                                        "This complete research document must retain the proxy selected for the original call. ".repeat(40)))
-                                };
-                                socket.write_all(format!("HTTP/1.1 {status} Owned\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-                            }
-                        }));
-                    }
-                    let mut daemon = Daemon::new().await.unwrap();
-                    daemon.fetcher = Arc::new(Fetcher::new(daemon.fetcher.profile().clone()).unwrap().with_egress(Arc::clone(&pool)));
-                    let daemon = Arc::new(daemon);
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(8),
-                        fetch_single(&daemon, &json!({}), "http://old.reddit.com/r/owned/")
-                    ).await.unwrap();
-                    stop.send(true).unwrap();
-                    for server in servers { tokio::time::timeout(std::time::Duration::from_secs(2), server).await.unwrap().unwrap(); }
-                    assert_eq!(result["structuredContent"]["ok"], true, "{result}");
-                    let events = events.lock().unwrap();
-                    // The adapter read is one encounter (v5 may ask it as more
-                    // than one identity); the fallback is one read after it.
-                    assert!(events[0].1.contains(".json"), "{events:?}");
-                    let last = events.last().unwrap();
-                    assert!(last.1.ends_with("/r/owned/"), "{events:?}");
-                    assert_eq!(events.iter().filter(|(_, target)| target.ends_with("/r/owned/")).count(), 1,
-                        "one fallback read: {events:?}");
-                    assert!(events.iter().all(|(lane, _)| *lane == "A"),
-                        "a related fallback must not repick after the adapter burns its lane: {events:?}");
-                    assert!(result["content"][0]["text"].as_str().unwrap().contains("Owned fallback lane A"), "{result}");
-                    assert!(!pool.is_dead(&proxies[0].id()),
-                        "an origin 429 must not globally bench a reachable proxy");
-                });
-            }).unwrap().join().unwrap();
-    }
 
     #[test]
     fn the_adapter_rewrite_runs_unless_the_read_is_its_own_fallback() {
@@ -3263,57 +3056,6 @@ mod adapter_hop_tests {
         ));
         // The retry itself must not bounce (`_no_adapter`).
         assert!(!adapter_hop_failed(Verdict::Blocked, true, true));
-    }
-
-    // V02: `loid` is the gateway cookie for the direct `.json`
-    // endpoint. When the jar holds it, the pre-emptive hop is
-    // skipped; the refusal ladder still covers a revoked session.
-    #[test]
-    fn a_live_loid_gates_the_preemptive_reddit_hop() {
-        let cookie = |name: &str| name.to_string();
-        assert!(reddit_session_live(&[cookie("loid")]));
-        assert!(reddit_session_live(&[
-            cookie("session_tracker"),
-            cookie("loid")
-        ]));
-        assert!(!reddit_session_live(&[cookie("session_tracker")]));
-        assert!(!reddit_session_live(&[]));
-    }
-
-    // The session retry: reddit page refusals get one session-init
-    // attempt; never twice, never off the content host.
-    #[test]
-    fn reddit_session_retry_eligibility() {
-        let args = serde_json::json!({});
-        assert!(reddit_session_retry_eligible(
-            &Verdict::Challenge(Vendor::Generic),
-            "www.reddit.com",
-            &args
-        ));
-        assert!(reddit_session_retry_eligible(
-            &Verdict::Blocked,
-            "reddit.com",
-            &args
-        ));
-        // Other hosts keep their own rules.
-        assert!(!reddit_session_retry_eligible(
-            &Verdict::Blocked,
-            "registry.npmjs.org",
-            &args
-        ));
-        // Served content is content.
-        assert!(!reddit_session_retry_eligible(
-            &Verdict::ContentOk,
-            "www.reddit.com",
-            &args
-        ));
-        // The retry is one-shot.
-        let done = serde_json::json!({"_reddit_session": true});
-        assert!(!reddit_session_retry_eligible(
-            &Verdict::Blocked,
-            "www.reddit.com",
-            &done
-        ));
     }
 
     // The adapter hop's steps fold in FRONT of the retry's own trail
@@ -3627,11 +3369,10 @@ mod rules_tests {
         let (results, targets) = fetch_through_owned_lanes(
             section(&[("www.reddit.com", deny(None))]),
             vec![
-                // The adapter rewrites old. onto www. for its JSON read, and
-                // its fallback retries on www. as well.
+                // The adapter sends a legacy-host URL to the content host. That
+                // host is denied, and the rewrite's target is judged before
+                // anything leaves: the caller's host is never even dialled.
                 (json!({}), "http://old.reddit.com/r/owned/"),
-                // A wiki page has no JSON shape: it stays on the allowed host.
-                (json!({}), "http://old.reddit.com/r/owned/wiki/books"),
             ],
         );
         let denied = &results[0]["structuredContent"];
@@ -3642,18 +3383,9 @@ mod rules_tests {
         );
         assert_eq!(denied["rule"], "www.reddit.com");
         assert_eq!(denied["next_action"], MESSAGE);
-        assert_eq!(
-            results[1]["structuredContent"]["ok"], true,
-            "{}",
-            results[1]
-        );
         assert!(
             targets.iter().all(|t| !t.contains("www.reddit.com")),
             "nothing reaches the denied host: {targets:?}"
-        );
-        assert!(
-            targets.iter().any(|t| t.contains("old.reddit.com")),
-            "{targets:?}"
         );
     }
 }

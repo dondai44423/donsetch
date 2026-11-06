@@ -1446,7 +1446,10 @@ impl Worker {
 
             // The document is walled, a shell, or incomplete. The site's own data
             // interface usually answers the same question openly, and a request to
-            // it is exactly what the app itself sends.
+            // it is exactly what the app itself sends. An interface that is only
+            // asking for time (paced, cooling down) has not answered: fall through
+            // to the site's own program rather than re-asking the document, which
+            // is how a rate window used to hide a page the engine could clear.
             if !data_tried && datapath::plan(url).is_some() {
                 data_tried = true;
                 match self.ask_interface(
@@ -1459,7 +1462,7 @@ impl Worker {
                     &mut attempts,
                 ) {
                     Interface::Answered(outcome) => return *outcome,
-                    Interface::Wait => continue,
+                    Interface::Wait => {}
                     Interface::Unanswered => {}
                 }
             }
@@ -1498,6 +1501,16 @@ impl Worker {
                     // only on a page that holds the program, and only on the last
                     // attempt the encounter allows — identity first, always.
                     Some("cloudflare")
+                } else if crate::engine::is_reddit_page(&response.body) && response.status != 429 {
+                    // Reddit's gate is served to every class that is not a
+                    // desktop browser (those get the interactive captcha), and
+                    // what it carries is the page's own program: a form whose
+                    // field that program computes. Run it as the client that
+                    // received it, on this first wall -- unlike AWS WAF, the
+                    // answer does not depend on being re-asked as Chrome.
+                    // A 429 is the origin asking for time, not a program: it is
+                    // paced, never minted on.
+                    Some("reddit")
                 } else {
                     None
                 };
@@ -1771,6 +1784,18 @@ impl Worker {
                                             true,
                                             now,
                                         );
+                                        // The answer to a spent challenge is
+                                        // itself state: the session it opens
+                                        // (cookies on the retry) is carried, so
+                                        // the next read of this origin is one
+                                        // request.
+                                        let spent: Vec<StoredCookie> =
+                                            retry.cookies.iter().map(stored).collect();
+                                        self.state.store_cookies(
+                                            &host,
+                                            engine_identity.name,
+                                            spent,
+                                        );
                                         if self.persist {
                                             self.state.record(
                                                 &host,
@@ -1787,7 +1812,12 @@ impl Worker {
                                             url: url.to_string(),
                                             cache: None,
                                             host,
-                                            final_url: retry.url.clone(),
+                                            // The document the caller asked for. A
+                                            // challenge hand-off is a handshake, not
+                                            // a redirect: its solved URL carries a
+                                            // single-use token and is not the page's
+                                            // identity.
+                                            final_url: url.to_string(),
                                             class: Class::Content,
                                             identity: Some(engine_identity.name.to_string()),
                                             status: retry.status,
@@ -1986,6 +2016,7 @@ impl Worker {
 fn is_program_page(vendor: &str, body: &str) -> bool {
     match vendor {
         "cloudflare" => crate::engine::is_cloudflare_page(body),
+        "reddit" => crate::engine::is_reddit_page(body),
         _ => crate::engine::is_aws_waf_page(body),
     }
 }

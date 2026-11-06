@@ -67,6 +67,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `state.no_disk_state` (`DONSEEK_NO_DISK_STATE`) now also keeps the fetch
   engine's learned state and page cache in memory.
+- **Reddit.** Its JS gate — a form whose one field the page's own inline
+  program computes and submits — now runs in the in-process engine and is
+  spent as the same client: a page, a subreddit listing and a thread all come
+  back as content, and the anonymous session the solve opens makes every later
+  read one request. The `old.reddit.com` session hop and the `.json` rewrite
+  that went with it are gone; both were what put the fetcher behind Reddit's
+  interactive humanity check. A listing is answered by its own document once the
+  session is open; a gated or paced listing falls back to Reddit's own Atom feed,
+  which carries the 25 items the server-rendered page leaves to JavaScript, and a
+  thread is answered by its own document because a thread's feed carries the
+  comments alone.
 
 ### Security
 
