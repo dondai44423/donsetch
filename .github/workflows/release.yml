@@ -52,15 +52,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             features: --features ocr,rerank,http
             rustflags: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
-          - name: linux-arm64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            # PDF (core) is in; OCR/rerank off: the official ONNX
-            # aarch64 prebuilt deadlocks at dlopen on native arm64.
-            features: ''
-            # bfd 2.38 on 22.04 cannot parse .crel relocations from
-            # rustc 1.98 for aarch64 (issue #93): force lld.
-            rustflags: -C link-arg=-fuse-ld=lld
+          # linux-arm64 is deliberately absent from this matrix. The v5
+          # core's binary does not start on aarch64-linux: v5core's own
+          # suite passes there (164/164), the product binary that links it
+          # segfaults before main in every profile and with either linker,
+          # so the fault is in how the product links the core on this
+          # target. Shipping a binary that cannot start is not an option,
+          # and v4.10.5 remains installable for arm64 users meanwhile.
+          # Evidence and next step: status.md, "the aarch64 product binary".
           - name: darwin-arm64
             os: macos-latest
             target: aarch64-apple-darwin

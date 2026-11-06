@@ -48,7 +48,7 @@ Downloads the prebuilt binary for your platform from [GitHub Releases](https://g
 | Platform | Asset | OCR + rerank |
 |---|---|---|
 | Linux x86_64 (glibc >= 2.35) | `donsetch-linux-x64.tar.gz` | yes |
-| Linux ARM64 | `donsetch-linux-arm64.tar.gz` | no, and PDF is fragile (ONNX has no working aarch64 prebuilt) |
+| Linux ARM64 | no asset in the 5.0 beta: the v5 core's binary does not start on aarch64 yet, so nothing broken ships | — |
 | macOS Apple Silicon (>= 13.4) | `donsetch-darwin-arm64.tar.gz` | yes |
 | macOS Intel (>= 13.4) | `donsetch-darwin-x64.tar.gz` | yes |
 | Windows x86_64 | `donsetch-win32-x64.tar.gz` | yes |

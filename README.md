@@ -191,7 +191,7 @@ RUSTFLAGS="-C link-arg=-fuse-ld=lld" cargo build --release
 
 The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built on Ubuntu 22.04 and runs there directly.
 
-**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64, macOS-x64 and Windows-x64; linux-arm64 is core-only, because the aarch64 ONNX runtime deadlocks in its loader. On macOS, OCR and rerank need macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary). Linux ARM64 carries one more honest limit: fragile PDF (a loader hang in some paths, tracked in CI).
+**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. On macOS, OCR and rerank need macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary). **Linux ARM64 is not in the 5.0 beta:** the v5 core's binary does not start on aarch64 yet (the core's own suite passes there; the product's link does not), so the beta ships no arm64 asset — 4.10.5 remains the installable release on that target.
 
 </details>
 
