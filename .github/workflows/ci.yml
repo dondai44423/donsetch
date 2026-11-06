@@ -295,21 +295,24 @@ jobs:
       # rust-cache, per-branch keys), so the timeout has to clear the
       # slowest cold build; a hung TEST is caught by nextest's own
       # per-test slow-timeout, not by this number.
+      # A test list is not proof the binary runs: a fault that only shows at
+      # exec (the aarch64 lane hit exactly that) surfaced as nextest's
+      # "creating test list failed" instead of the crash itself. This starts
+      # the product binary the release will actually ship, on the host it
+      # will run on.
+      - name: The shipped binary starts
+        if: matrix.tests == 'full'
+        run: |
+          uname -a; getconf PAGESIZE; ldd --version | head -1
+          cargo build --profile ci ${{ matrix.features }} --target ${{ matrix.target }} --bin donsetch
+          echo '--- running --version'
+          ./target/${{ matrix.target }}/ci/donsetch --version
+        timeout-minutes: 20
+
       - name: Test (nextest, full)
         if: matrix.tests == 'full'
         run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }}
         timeout-minutes: 60
-
-      # A test list is not proof the binary runs: link a fault that only
-      # shows at exec (the aarch64 lane hit exactly that) and nextest
-      # reports "creating test list failed" instead of naming it. This
-      # starts the product binary the release will actually ship.
-      - name: The shipped binary starts
-        if: matrix.tests == 'full'
-        run: |
-          cargo build --profile ci ${{ matrix.features }} --target ${{ matrix.target }} --bin donsetch
-          ./target/${{ matrix.target }}/ci/donsetch --version
-        timeout-minutes: 20
 
       # Everywhere else the risk is platform COMPILATION (cfg paths,
       # linkage, process semantics), and the expensive part of a test run
