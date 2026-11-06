@@ -69,6 +69,7 @@ mod bypass_live;
 mod cli_surface;
 mod crawl_fresh_fetch;
 mod daemon_boot_stays_alive;
+mod disk_state;
 mod egress_proxy;
 mod fetch_views;
 mod focus_regressions;

@@ -1,7 +1,6 @@
 //! The search tool handler: dispatch, query parsing (incl. the
 //! 2-variant batch), single + batch search flows, handle/URL
-//! binding, model/debug meta surfaces, the ghost pre-solve hook,
-//! and the search error contract.
+//! binding, model/debug meta surfaces and the search error contract.
 
 use serde_json::{Value, json};
 

@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (use `web_screenshot`), each refused with a note; the browser stays only
   for `donsetch login` and `web_screenshot`.
 
+### Fixed
+
+- `state.no_disk_state` (`DONSEEK_NO_DISK_STATE`) now also keeps the fetch
+  engine's learned state and page cache in memory.
+
 ### Security
 
 - Lockfile: tokio 1.54.1 and zstd-sys 2.1.2 for RUSTSEC-2026-0386, -0391,

@@ -74,7 +74,9 @@ impl Fetcher {
     pub fn new(profile: BrowserProfile) -> Result<Self, FetchError> {
         Ok(Self {
             profile,
-            v5: crate::fetch::v5::V5Fetcher::new(true),
+            // `state.no_disk_state` keeps v5's learned state and page cache in
+            // memory, like every other store.
+            v5: crate::fetch::v5::V5Fetcher::new(!crate::config::cfg().state.no_disk_state),
             egress: None,
         })
     }
