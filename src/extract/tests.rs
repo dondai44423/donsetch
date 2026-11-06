@@ -1870,6 +1870,51 @@ fn code_lang_detection_patterns() {
     assert!(extract_html(html3).markdown.contains("```javascript"));
 }
 
+// MDN puts the language on the <pre> (SyntaxHighlighter's `brush:`) and
+// repeats it as a visible header label. The fence must carry it, and the
+// label must not survive as a stray one-word paragraph (it did: a bare "js"
+// line above every example).
+#[test]
+fn a_code_label_on_the_pre_element_reaches_the_fence() {
+    let html = r#"<html><body><article><h2>Example</h2>
+<div class="code-example">
+<p class="example-header"><span class="language-name">js</span></p>
+<pre class="brush: js notranslate"><code>const r = await fetch(u);</code></pre>
+</div>
+</article></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(md.contains("```js\n"), "fence lost its language:\n{md}");
+    assert!(
+        !md.lines().any(|l| l.trim() == "js"),
+        "the label survived as a paragraph:\n{md}"
+    );
+}
+
+#[test]
+fn a_lone_language_word_above_a_fence_becomes_its_info_string() {
+    let html = r#"<html><body><article><h2>Install</h2>
+<p>Run this:</p>
+<p>Bash</p>
+<pre><code>cargo install donsetch</code></pre>
+</article></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(md.contains("```bash\n"), "label not folded:\n{md}");
+    assert_eq!(md.matches("Bash").count(), 0, "label printed:\n{md}");
+}
+
+#[test]
+fn a_code_block_that_already_has_a_language_keeps_its_paragraph() {
+    // A one-word paragraph before an already-tagged fence is prose, not a
+    // label: nothing may be dropped.
+    let html = r#"<html><body><article><h2>Notes</h2>
+<p><strong>Rust</strong> is the language used below.</p>
+<pre><code class="language-rust">fn main() {}</code></pre>
+</article></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(md.contains("is the language used below"), "{md}");
+    assert!(md.contains("```rust"));
+}
+
 // ════════════════════════════════════════════════════════════
 // 29. PAGINATE START : RESUMES AT BLOCK BOUNDARY
 // ════════════════════════════════════════════════════════════
@@ -2422,5 +2467,82 @@ fn media_is_recorded_for_ocr_but_never_rendered() {
         r.images.iter().any(|(_, src)| src.ends_with("diagram.png")),
         "{:?}",
         r.images
+    );
+}
+
+// ── Markdown structure survives hostile metadata and cell text ──
+
+#[test]
+fn a_multiline_meta_description_stays_one_quoted_line() {
+    // A content attribute carries newlines happily; emitted raw, the
+    // summary breaks out of its blockquote and the rest reads as the
+    // page's own prose.
+    let html = "<html><head><title>Release notes</title>\
+        <meta name=\"description\" content=\"First line of the summary.\nSecond line, which used to escape the quote.\n\">\
+        </head><body><article><h1>Release notes</h1>\
+        <p>The release adds a retry policy, a bounded queue and a per-host budget, all documented below.</p>\
+        </article></body></html>";
+    let md = extract_html(html).markdown;
+    assert!(
+        md.contains("> First line of the summary. Second line, which used to escape the quote."),
+        "summary not folded onto one quoted line:\n{md}"
+    );
+    assert!(
+        !md.lines()
+            .any(|l| l.trim() == "Second line, which used to escape the quote."),
+        "summary escaped its blockquote:\n{md}"
+    );
+}
+
+#[test]
+fn a_table_cell_pipe_cannot_shift_columns() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Flag</th><th>Meaning</th></tr>
+<tr><td>a|b</td><td>either, as written</td></tr>
+<tr><td>--x</td><td>exclusive</td></tr>
+</table>
+</article></body></html>"#;
+    let md = extract_html(html).markdown;
+    let row = md
+        .lines()
+        .find(|l| l.starts_with("| a"))
+        .unwrap_or_else(|| panic!("row missing:\n{md}"));
+    let delimiters = row.matches('|').count() - row.matches("\\|").count();
+    assert_eq!(delimiters, 3, "column count shifted: {row}");
+    assert!(row.contains("a\\|b"), "pipe not escaped: {row}");
+}
+
+#[test]
+fn a_table_cell_with_a_newline_is_one_cell() {
+    let html = r#"<html><body><article>
+<table>
+<tr><th>Flag</th><th>Meaning</th></tr>
+<tr><td>--verbose</td><td>print every
+hop of the request</td></tr>
+<tr><td>--quiet</td><td>say nothing</td></tr>
+</table>
+</article></body></html>"#;
+    let md = extract_html(html).markdown;
+    let rows: Vec<&str> = md.lines().filter(|l| l.starts_with("|")).collect();
+    assert_eq!(rows.len(), 4, "a cell newline split the row:\n{md}");
+    assert!(
+        rows[2].contains("print every hop of the request"),
+        "{}",
+        rows[2]
+    );
+}
+
+#[test]
+fn a_highlighter_wrapper_class_names_the_fence() {
+    // GitHub marks the language on the div that wraps the <pre>.
+    let html = r#"<html><body><article><h2>Example</h2>
+<div class="highlight highlight-source-rust notranslate"><pre>fn main() { println!("hi"); }</pre></div>
+</article></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(md.contains("```rust\n"), "wrapper language lost:\n{md}");
+    assert!(
+        !md.contains("```source-rust") && !md.contains("```highlight"),
+        "prefix stripped wrong:\n{md}"
     );
 }

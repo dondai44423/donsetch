@@ -113,6 +113,141 @@ pub fn segment(
 ) {
     let mut headings: Vec<(u8, String)> = Vec::new();
     walk(root, base, opts, &mut headings, out, 0);
+    fold_code_labels(out);
+}
+
+/// A code block's language often arrives as its own element: MDN renders
+/// `<span class="language-name">js</span>` in the example header, docs
+/// themes put a lone "Bash" line above the fence. As a paragraph that is a
+/// stray word costing a line, and the fence is left bare; fold the word into
+/// the fence's info string instead.
+fn fold_code_labels(blocks: &mut Vec<Block>) {
+    let mut i = 1;
+    while i < blocks.len() {
+        // Some(new_lang) => the paragraph is a code language label; a
+        // `Some(Some(..))` also fills a fence that had none, `Some(None)`
+        // only drops a header label that repeats the fence's language.
+        let label = match (&blocks[i - 1], &blocks[i]) {
+            (Block::Para { md, .. }, Block::Code { lang, .. }) => {
+                let tok = md.trim();
+                let usable = !tok.is_empty()
+                    && !tok.chars().any(char::is_whitespace)
+                    && tok.chars().count() <= 16
+                    && foldable_lang(tok);
+                if !usable {
+                    None
+                } else {
+                    match lang {
+                        None => Some(Some(tok.to_lowercase())),
+                        Some(l) if l.eq_ignore_ascii_case(tok) => Some(None),
+                        _ => None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        match label {
+            Some(new_lang) => {
+                if let Some(lang) = new_lang
+                    && let Block::Code { lang: l, .. } = &mut blocks[i]
+                {
+                    *l = Some(lang);
+                }
+                blocks.remove(i - 1);
+                // The code block is now at the same index.
+            }
+            None => i += 1,
+        }
+    }
+}
+
+/// Language names a code label may carry. Used both to read a `class`
+/// attribute and to recognise a label that rendered as its own block, so it
+/// has to stay conservative: a stray paragraph is only folded into a fence
+/// when the whole paragraph is one of these words.
+const KNOWN_LANGS: &[&str] = &[
+    "python",
+    "py",
+    "rust",
+    "javascript",
+    "js",
+    "typescript",
+    "ts",
+    "java",
+    "go",
+    "golang",
+    "c",
+    "cpp",
+    "c++",
+    "csharp",
+    "cs",
+    "ruby",
+    "php",
+    "swift",
+    "kotlin",
+    "scala",
+    "sql",
+    "bash",
+    "shell",
+    "sh",
+    "zsh",
+    "console",
+    "terminal",
+    "html",
+    "css",
+    "scss",
+    "sass",
+    "json",
+    "jsonc",
+    "yaml",
+    "yml",
+    "xml",
+    "toml",
+    "ini",
+    "markdown",
+    "md",
+    "dockerfile",
+    "makefile",
+    "lua",
+    "perl",
+    "r",
+    "diff",
+    "patch",
+    "text",
+    "txt",
+    "plaintext",
+    "http",
+    "graphql",
+    "protobuf",
+    "proto",
+    "nginx",
+    "powershell",
+    "ps1",
+    "vim",
+    "asm",
+    "elixir",
+    "erlang",
+    "haskell",
+    "clojure",
+    "dart",
+    "julia",
+    "matlab",
+    "objectivec",
+    "zig",
+    "nim",
+];
+
+fn is_known_lang(token: &str) -> bool {
+    let t = token.trim().to_lowercase();
+    KNOWN_LANGS.contains(&t.as_str())
+}
+
+/// A label may be folded into a fence only when a stray paragraph with that
+/// exact text is implausible: "c" and "r" are real language names AND
+/// ordinary one-word paragraphs, so they stay a class-attribute signal.
+fn foldable_lang(token: &str) -> bool {
+    let t = token.trim().to_lowercase();
+    is_known_lang(&t) && !matches!(t.as_str(), "c" | "r")
 }
 
 fn current_path(headings: &[(u8, String)]) -> Vec<String> {
@@ -779,72 +914,71 @@ fn collapse_blank_lines(code: &str) -> String {
     out.trim_matches('\n').to_string()
 }
 
-/// Detect code block language from <pre><code> class attributes.
-/// Checks common patterns: language-*, highlight-*, lang-*,
-/// brush:*, and bare language names.
+/// Detect code block language from class attributes on the `<pre>` and on
+/// its `<code>` child: `language-*`, `highlight-*`, `lang-*`, `brush:*`
+/// (SyntaxHighlighter, which MDN uses on the `<pre>` itself), and a bare
+/// known language name.
 fn detect_code_lang(el: ElementRef<'_>) -> Option<String> {
-    let code_el = el
-        .select(&scraper::Selector::parse("code").unwrap())
-        .next()?;
-    let class = code_el.value().attr("class")?;
-    for token in class.split_whitespace() {
-        // language-python, language-rust (highlight.js, Prism)
-        if let Some(lang) = token.strip_prefix("language-") {
-            return Some(lang.to_string());
+    // The <pre> carries the language on some themes (MDN: brush: js); a
+    // syntax-highlighter wrapper carries it on the parent (GitHub:
+    // <div class="highlight highlight-source-rust"><pre>…).
+    let mut classes: Vec<String> = Vec::new();
+    if let Some(c) = el.value().attr("class") {
+        classes.push(c.to_string());
+    }
+    if let Some(code_el) = el.select(&scraper::Selector::parse("code").unwrap()).next()
+        && let Some(c) = code_el.value().attr("class")
+    {
+        classes.push(c.to_string());
+    }
+    let mut node = *el;
+    for _ in 0..2 {
+        let Some(parent) = node.parent() else { break };
+        let Some(parent_el) = ElementRef::wrap(parent) else {
+            node = parent;
+            continue;
+        };
+        if let Some(c) = parent_el.value().attr("class") {
+            classes.push(c.to_string());
         }
-        // highlight-python (some highlighters)
-        if let Some(lang) = token.strip_prefix("highlight-") {
-            return Some(lang.to_string());
-        }
-        // lang-python (GitHub-style)
-        if let Some(lang) = token.strip_prefix("lang-") {
-            return Some(lang.to_string());
-        }
-        // brush: python (SyntaxHighlighter)
-        if let Some(lang) = token.strip_prefix("brush:") {
-            return Some(lang.trim().to_string());
+        node = parent;
+    }
+    for class in &classes {
+        let tokens: Vec<&str> = class.split_whitespace().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            // language-python, language-rust (highlight.js, Prism)
+            for prefix in ["language-", "highlight-source-", "highlight-", "lang-"] {
+                if let Some(lang) = token.strip_prefix(prefix) {
+                    let lang = lang.trim();
+                    if !lang.is_empty() {
+                        return Some(lang.to_string());
+                    }
+                }
+            }
+            // brush: python (SyntaxHighlighter; the value is its own token,
+            // so "brush:" alone takes the next word, and "brush:python"
+            // carries it inline).
+            if *token == "brush:" {
+                if let Some(next) = tokens.get(i + 1) {
+                    return Some(next.trim().to_string());
+                }
+                continue;
+            }
+            if let Some(lang) = token.strip_prefix("brush:") {
+                let lang = lang.trim();
+                if !lang.is_empty() {
+                    return Some(lang.to_string());
+                }
+            }
         }
     }
-    // Bare language name as class: <code class="python">
-    // Only accept well-known language names to avoid false positives.
-    let known = [
-        "python",
-        "rust",
-        "javascript",
-        "js",
-        "typescript",
-        "ts",
-        "java",
-        "go",
-        "c",
-        "cpp",
-        "csharp",
-        "ruby",
-        "php",
-        "swift",
-        "kotlin",
-        "scala",
-        "sql",
-        "bash",
-        "shell",
-        "sh",
-        "html",
-        "css",
-        "json",
-        "yaml",
-        "xml",
-        "toml",
-        "markdown",
-        "md",
-        "dockerfile",
-        "makefile",
-        "lua",
-        "perl",
-        "r",
-    ];
-    for token in class.split_whitespace() {
-        if known.contains(&token.to_lowercase().as_str()) {
-            return Some(token.to_lowercase());
+    // Bare language name as a class: <code class="python">. Only a known
+    // name counts, so a layout class never becomes an info string.
+    for class in &classes {
+        for token in class.split_whitespace() {
+            if is_known_lang(token) {
+                return Some(token.to_lowercase());
+            }
         }
     }
     None

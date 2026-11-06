@@ -92,20 +92,28 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
         matches!(b, Block::Heading { level: 1, text, .. }
             if Some(text) == meta.title.as_ref())
     });
-    if let Some(t) = &meta.title
+    if let Some(t) = meta
+        .title
+        .as_deref()
+        .map(one_line)
+        .filter(|t| !t.is_empty())
         && !first_is_title
     {
         out.push_str(&format!("# {t}\n"));
     }
-    let mut byline_parts: Vec<&str> = Vec::new();
-    if let Some(s) = &meta.site {
-        byline_parts.push(s);
-    }
-    if let Some(b) = &meta.byline {
-        byline_parts.push(b);
-    }
-    if let Some(p) = &meta.published {
-        byline_parts.push(p);
+    let mut byline_parts: Vec<String> = Vec::new();
+    for part in [
+        meta.site.as_deref(),
+        meta.byline.as_deref(),
+        meta.published.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(one_line)
+    {
+        if !part.is_empty() {
+            byline_parts.push(part);
+        }
     }
     if !byline_parts.is_empty() {
         out.push_str(&byline_parts.join(" · "));
@@ -117,9 +125,14 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
     // decide relevance before reading the body. Always surface it
     // (capped): for JS-rendered SPAs the meta description is often
     // the only real content in the initial HTML.
-    if let Some(d) = &meta.description {
+    if let Some(d) = meta
+        .description
+        .as_deref()
+        .map(one_line)
+        .filter(|d| !d.is_empty())
+    {
         let trimmed: String = d.chars().take(500).collect();
-        out.push_str(&format!("> {}\n", trimmed));
+        out.push_str(&format!("> {trimmed}\n"));
     }
     out.push('\n');
 
@@ -258,11 +271,13 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 }
                 let mut h = headers.clone();
                 h.resize(cols, String::new());
+                let h: Vec<String> = h.iter().map(|c| table_cell(c)).collect();
                 out.push_str(&format!("| {} |\n", h.join(" | ")));
                 out.push_str(&format!("|{}\n", " --- |".repeat(cols)));
                 for row in rows {
                     let mut r = row.clone();
                     r.resize(cols, String::new());
+                    let r: Vec<String> = r.iter().map(|c| table_cell(c)).collect();
                     out.push_str(&format!("| {} |\n", r.join(" | ")));
                 }
                 if *truncated {
@@ -501,11 +516,42 @@ fn looks_like_data_blob(md: &str) -> bool {
     t.matches("\":").count() >= 4
 }
 
+/// One table cell as markdown: a literal `|` ends the column and a newline
+/// ends the row, either of which silently shifts every later cell. Pipes
+/// already escaped by a producer are left alone, so the escape cannot
+/// double.
+fn table_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev = '\0';
+    for c in s.chars() {
+        match c {
+            '|' if prev != '\\' => {
+                out.push('\\');
+                out.push('|');
+            }
+            '\n' | '\r' | '\t' => out.push(' '),
+            _ => out.push(c),
+        }
+        prev = c;
+    }
+    out.trim().to_string()
+}
+
 fn normalize(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// One line of plain text, whitespace collapsed.
+///
+/// A `content="…"` attribute, a `<title>` or a byline may carry newlines
+/// and tabs; emitted raw they break the heading, the byline or the `>`
+/// summary they land in — and a summary that breaks out of its quote is
+/// prose the reader cannot tell from the page's own.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Emit the heading breadcrumb when the path changes mid-focus
