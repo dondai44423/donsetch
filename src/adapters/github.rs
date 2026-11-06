@@ -17,9 +17,6 @@ const MAX_COMMENTS: usize = 60;
 
 /// Entry point.
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() {
-        return None; // explicit selector = caller knows better
-    }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
     if host != "github.com" && host != "www.github.com" {

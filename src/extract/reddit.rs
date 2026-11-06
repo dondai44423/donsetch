@@ -21,13 +21,8 @@ use super::{ContentKind, ExtractOptions, Extracted, inline};
 const MAX_DEPTH: usize = 100;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    // Respect explicit selectors and TOC : let DonSift handle.
-    if opts.selector.is_some()
-        || opts.toc
-        || opts.focus.is_some()
-        || opts.section.is_some()
-        || opts.must_contain.is_some()
-    {
+    // Crawl's block focus belongs to the generic pipeline.
+    if opts.focus.is_some() {
         return None;
     }
 

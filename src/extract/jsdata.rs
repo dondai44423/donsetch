@@ -213,10 +213,6 @@ struct Blob {
 /// Entry point. Returns `Some` only when meaningful content was
 /// recovered from embedded JSON.
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() || opts.toc {
-        return None;
-    }
-
     let blobs = find_blobs(html);
     if blobs.is_empty() {
         return None;
@@ -243,9 +239,6 @@ pub fn extract_state(
     opts: &ExtractOptions,
 ) -> Option<Extracted> {
     let _ = name;
-    if opts.selector.is_some() || opts.toc {
-        return None;
-    }
     let value: Value = serde_json::from_str(json).ok()?;
     let mut items: Vec<Item> = Vec::new();
     let mut order: usize = 0;
@@ -294,7 +287,7 @@ fn finish(
     };
     let (md, title) = render(&kept, url, preferred_title);
 
-    if opts.focus.is_some() || opts.section.is_some() || opts.must_contain.is_some() {
+    if opts.focus.is_some() {
         // Rescued data earns the same read controls as ordinary DOM content.
         let mut blocks = Vec::new();
         for item in &kept {
@@ -1021,6 +1014,12 @@ fn render(items: &[Item], url: &str, preferred_title: Option<String>) -> (String
         }
         let clean = strip_html(&it.text);
         let clean = clean.trim();
+        // A short title-like item heads what follows: as a markdown
+        // heading, fetch's outline, section and focus can address it.
+        if it.title_like && !clean.is_empty() && clean.chars().count() <= 200 {
+            md.push_str(&format!("## {clean}\n\n"));
+            continue;
+        }
         if clean.chars().count() < 25 {
             continue;
         }
@@ -1129,24 +1128,44 @@ mod tests {
         let html = format!(
             "<title>Company information</title><script type='application/json'>{payload}</script>"
         );
-        let options = crate::extract::ExtractOptions {
-            section: Some("Funding history".into()),
-            ..Default::default()
-        };
-        let selected = super::extract(&html, "https://example.com/company", &options).unwrap();
-        assert!(selected.markdown.contains("a billion dollars"));
-        assert!(!selected.markdown.contains("assembly equipment"));
-        let probed = super::extract(
-            &html,
-            "https://example.com/company",
-            &crate::extract::ExtractOptions {
-                must_contain: Some("a billion dollars".into()),
-                ..Default::default()
+        // fetch's views reach the rescued evidence through its headings.
+        use crate::extract::view::{self, Term, View};
+        let whole =
+            super::extract(&html, "https://example.com/company", &Default::default()).unwrap();
+        let selected = view::render(
+            &whole.markdown,
+            &View {
+                section: Some("Funding history".into()),
+                max_chars: 100_000,
+                ..View::default()
             },
-        )
-        .unwrap();
-        assert!(probed.markdown.contains("MATCH"));
-        assert!(probed.markdown.len() < 1000);
+            None,
+        );
+        assert!(
+            selected.text.contains("a billion dollars"),
+            "{}",
+            selected.text
+        );
+        assert!(
+            !selected.text.contains("assembly equipment"),
+            "{}",
+            selected.text
+        );
+        let probed = view::render(
+            &whole.markdown,
+            &View {
+                must_contain: vec![Term::parse("a billion dollars").unwrap()],
+                ..View::default()
+            },
+            None,
+        );
+        assert_eq!(
+            probed.verdict,
+            Some(view::Verdict::Match),
+            "{}",
+            probed.text
+        );
+        assert!(probed.text.len() < 1000);
         let focused = super::extract(
             &html,
             "https://example.com/company",
@@ -1270,17 +1289,7 @@ mod tests {
     use crate::extract::ExtractOptions;
 
     fn opts() -> ExtractOptions {
-        ExtractOptions {
-            selector: None,
-            toc: false,
-            max_chars: None,
-            offset: 0,
-            focus: None,
-            include_links: false,
-            include_media: false,
-            section: None,
-            ..Default::default()
-        }
+        ExtractOptions::default()
     }
 
     #[test]

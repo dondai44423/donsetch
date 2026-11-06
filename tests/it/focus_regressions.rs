@@ -207,17 +207,19 @@ fn full_table_paginates_without_destroying_late_rows_or_long_cells() {
     assert!(ex.markdown.contains(&long_cell));
     assert!(ex.markdown.contains("| Rule | Details |"));
     assert_eq!(ex.fingerprint, full.fingerprint);
-    let probe = extract::extract(
-        html.as_bytes(),
-        "text/html",
-        "https://fixture.invalid/guide",
-        &ExtractOptions {
-            must_contain: Some("legally binding".into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(probe.markdown.contains("MATCH"));
+    // must_contain reads the whole document, however small the window.
+    let view = extract::view::View {
+        must_contain: vec![extract::view::Term::parse("legally binding").unwrap()],
+        max_chars: 2000,
+        ..Default::default()
+    };
+    let probe = extract::view::render(&full.markdown, &view, None);
+    assert_eq!(
+        probe.verdict,
+        Some(extract::view::Verdict::Match),
+        "{}",
+        probe.text
+    );
 }
 
 #[test]

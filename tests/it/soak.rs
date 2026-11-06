@@ -28,25 +28,13 @@ fn soak_rss_stays_bounded() {
     .expect("corpus fixture");
     let baseline = rss_kb();
 
-    // 200 extraction cycles (full pipeline + focus + toc + probe).
+    // 200 extraction cycles: the full pipeline, then a fetch view over it
+    // (focus, outline, must_contain, the page window in turn).
+    use donsetch::extract::view::{self, Term, View};
     for i in 0..200 {
         let opts = donsetch::extract::ExtractOptions {
-            max_chars: Some(20_000),
-            ..match i % 4 {
-                1 => donsetch::extract::ExtractOptions {
-                    focus: Some("ownership borrow checker".into()),
-                    ..Default::default()
-                },
-                2 => donsetch::extract::ExtractOptions {
-                    toc: true,
-                    ..Default::default()
-                },
-                3 => donsetch::extract::ExtractOptions {
-                    must_contain: Some("borrow".into()),
-                    ..Default::default()
-                },
-                _ => Default::default(),
-            }
+            max_chars: Some(8 * 1_048_576),
+            ..Default::default()
         };
         let ex = donsetch::extract::extract(
             &corpus,
@@ -55,7 +43,26 @@ fn soak_rss_stays_bounded() {
             &opts,
         )
         .unwrap();
-        assert!(!ex.markdown.is_empty());
+        let window = View {
+            max_chars: 20_000,
+            ..Default::default()
+        };
+        let chosen = match i % 4 {
+            1 => View {
+                focus: Some("ownership borrow checker".into()),
+                ..window
+            },
+            2 => View {
+                toc: true,
+                ..window
+            },
+            3 => View {
+                must_contain: vec![Term::parse("borrow").unwrap()],
+                ..window
+            },
+            _ => window,
+        };
+        assert!(!view::render(&ex.markdown, &chosen, None).text.is_empty());
     }
 
     // Handle table churn: 10k links through the 2048-slot LRU.

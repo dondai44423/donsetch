@@ -526,14 +526,9 @@ mod tests {
         let root = document.root_element();
         let opts = super::super::ExtractOptions {
             focus: None,
-            selector: None,
             max_chars: None,
             offset: 0,
             include_links: false,
-            include_media: false,
-            toc: false,
-            section: None,
-            must_contain: None,
             verified: false,
         };
         markdown(root, "https://example.com/", &opts).0
@@ -566,14 +561,9 @@ mod tests {
         let root = document.root_element();
         let opts = super::super::ExtractOptions {
             focus: None,
-            selector: None,
             max_chars: None,
             offset: 0,
             include_links: links,
-            include_media: false,
-            toc: false,
-            section: None,
-            must_contain: None,
             verified: false,
         };
         markdown(root, "https://example.com/", &opts).0

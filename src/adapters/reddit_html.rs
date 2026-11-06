@@ -22,9 +22,6 @@ use crate::extract::{ContentKind, ExtractOptions, Extracted, PartialContent, inl
 const MAX_ITEMS: usize = 40;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() {
-        return None;
-    }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
     if !crate::adapters::is_reddit_host(host) {

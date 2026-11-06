@@ -9,9 +9,6 @@ use scraper::{ElementRef, Html, Selector};
 use crate::extract::{ContentKind, ExtractOptions, Extracted, inline};
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() {
-        return None;
-    }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
     // *.wikipedia.org only : the REST/mobile mirrors differ.

@@ -19,9 +19,6 @@ enum Framework {
 }
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() {
-        return None;
-    }
     let doc = Html::parse_document(html);
     let fw = detect(&doc)?;
 

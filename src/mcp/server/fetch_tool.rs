@@ -46,11 +46,9 @@ async fn fetch_with_budget(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     drop(trace);
-    if args.get("links").and_then(Value::as_bool) == Some(true)
-        || args.get("media").and_then(Value::as_bool) == Some(true)
-    {
+    if args.get("links").and_then(Value::as_bool) == Some(true) {
         result["structuredContent"]["budget_scope"] =
-            json!("rendered markdown, including link and media markup");
+            json!("rendered markdown, including link markup");
     }
     if let Some(debug) = result.pointer_mut("/_meta/com.donsetch~1fetch-debug") {
         debug["elapsed_ms"] = json!(started.elapsed().as_millis());
@@ -67,9 +65,8 @@ pub(super) async fn fetch_tool(
         .get("deadline_ms")
         .and_then(Value::as_u64)
         .map(|ms| std::time::Duration::from_millis(ms.clamp(1, 600_000)));
-    // v3: url accepts one URL/handle OR an array of them : batch
-    // fetch in a single call, optionally under a shared token
-    // budget (budget_tokens) allocated across results.
+    // url is one URL/handle or an array of up to 12: one parallel batch
+    // whose max_chars is the total across its pages.
     let urls: Vec<String> = match args.get("url") {
         Some(Value::String(s)) => vec![s.to_string()],
         Some(Value::Array(a)) => {
@@ -92,51 +89,37 @@ pub(super) async fn fetch_tool(
         }
         _ => return tool_error("fetch: url must be http(s)"),
     };
-    let budget_tokens = args
-        .get("budget_tokens")
-        .and_then(Value::as_u64)
-        .map(|t| (t as usize).clamp(200, 500_000));
-
-    if urls.len() == 1 && budget_tokens.is_none() {
+    // Argument mistakes answer before any URL is resolved or fetched.
+    if let Err(error) = fetch_view(args) {
+        return error;
+    }
+    if urls.len() == 1 {
         let url = match resolve_fetch_url(daemon, &urls[0]).await {
             Ok(u) => u,
             Err(e) => {
                 return e;
             }
         };
-        let result = fetch_with_budget(daemon, args, &url, deadline, ctx.as_mut()).await;
-        return result;
+        return fetch_with_budget(daemon, args, &url, deadline, ctx.as_mut()).await;
     }
-    // Single resolved URL: keep the single-page response shape, but
-    // always run under the deadline + MCP-cancellation wrapper (#164).
-    // Previously this branch (reached whenever budget_tokens was set,
-    // since the fast path above demands budget_tokens.is_none())
-    // called fetch_single bare: an uncancellable, deadline-free
-    // fetch. budget_tokens also bounds the page now, exactly like
-    // the batch path.
-    if urls.len() == 1 {
-        let resolved = match resolve_fetch_url(daemon, &urls[0]).await {
-            Ok(url) => url,
-            Err(error) => {
-                return error;
-            }
-        };
-        let owned_args;
-        let effective_args = if let Some(b) = budget_tokens {
-            let budget_chars = b.saturating_mul(4).max(800);
-            let mut a = args.clone();
-            a["max_chars"] = json!(budget_chars);
-            owned_args = a;
-            &owned_args
-        } else {
-            args
-        };
-        let result =
-            fetch_with_budget(daemon, effective_args, &resolved, deadline, ctx.as_mut()).await;
-        return result;
-    }
-    fetch_multi(daemon, args, urls, budget_tokens, deadline, ctx).await
+    let budget = args
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .map_or(BATCH_MAX_CHARS_DEFAULT, |n| {
+            (n as usize).clamp(MAX_CHARS_MIN, MAX_CHARS_MAX)
+        });
+    fetch_multi(daemon, args, urls, budget, deadline, ctx).await
 }
+
+/// `max_chars` when the caller sets none: one page.
+pub(super) const MAX_CHARS_DEFAULT: usize = 16_000;
+/// `max_chars` when the caller sets none: the total of a URL batch.
+pub(super) const BATCH_MAX_CHARS_DEFAULT: usize = 48_000;
+const MAX_CHARS_MIN: usize = 200;
+const MAX_CHARS_MAX: usize = 1_048_576;
+/// The most document one read extracts before any view applies. A larger
+/// document is cut here, and its views say part of it was not read.
+const DOCUMENT_MAX_CHARS: usize = 8 * 1_048_576;
 
 #[cfg(test)]
 mod fetch_batch_tests {
@@ -215,25 +198,21 @@ pub(super) async fn resolve_fetch_url(daemon: &Arc<Daemon>, raw: &str) -> Result
     ))
 }
 
-/// Batch fetch (v3): parallel single-fetches composed into one
-/// result under an optional shared token budget. Small pages stay
-/// whole; the budget slices proportional to size, never below a
-/// floor. All-failed = honest error; partial = composed result
-/// with per-URL status.
+/// Batch fetch: parallel single fetches composed into one result under
+/// the shared `budget` of characters. Small pages stay whole; the budget
+/// slices proportional to size, never below a floor. All-failed = honest
+/// error; partial = composed result with per-URL status.
 pub(super) async fn fetch_multi(
     daemon: &Arc<Daemon>,
     args: &Value,
     urls: Vec<String>,
-    budget_tokens: Option<usize>,
+    budget: usize,
     deadline: Option<std::time::Duration>,
     ctx: Option<ToolCtx>,
 ) -> Value {
-    // Under a budget, let each fetch run up to the whole budget
-    // (slicing happens in composition); without one, defaults rule.
+    // Each fetch may use the whole budget; composition slices.
     let mut call_args = args.clone();
-    if let Some(b) = budget_tokens {
-        call_args["max_chars"] = json!(b * 4);
-    }
+    call_args["max_chars"] = json!(budget);
     let progress_parts = ctx.as_ref().map(|c| c.progress_parts());
     // Cancellation must reach every sub-fetch: the batch used to
     // drop the ctx entirely, so a cancelled 12-URL batch kept
@@ -297,17 +276,9 @@ pub(super) async fn fetch_multi(
         .map(|r| if is_err(r) { None } else { Some(md_of(r)) })
         .collect();
     let mut sliced_flags = vec![false; results.len()];
-    if let Some(budget_tok) = budget_tokens {
-        slice_batch_markdowns(
-            &urls,
-            &results,
-            &mut markdowns,
-            budget_tok,
-            &mut sliced_flags,
-        );
-    }
+    slice_batch_markdowns(&urls, &results, &mut markdowns, budget, &mut sliced_flags);
 
-    render_fetch_batch(&urls, &results, &markdowns, budget_tokens, &sliced_flags)
+    render_fetch_batch(&urls, &results, &markdowns, budget, &sliced_flags)
 }
 
 /// Compose a batch without repeating page evidence or transport telemetry on
@@ -317,7 +288,7 @@ pub(super) fn render_fetch_batch(
     urls: &[String],
     results: &[Value],
     markdowns: &[Option<String>],
-    budget_tokens: Option<usize>,
+    budget: usize,
     sliced_flags: &[bool],
 ) -> Value {
     debug_assert_eq!(urls.len(), results.len());
@@ -366,7 +337,7 @@ pub(super) fn render_fetch_batch(
                 if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
                     o["content_ok"] = json!(false);
                 }
-                for field in ["budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "matched", "stitch_complete", "next_part"] {
+                for field in ["budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "must_contain", "focus", "section", "next_page"] {
                     if let Some(value) = state.get(field)
                         && !value.is_null()
                     {
@@ -447,7 +418,7 @@ pub(super) fn render_fetch_batch(
         .collect::<Vec<_>>();
     let debug = json!({
         "count": results.len(),
-        "budget_tokens": budget_tokens,
+        "max_chars": budget,
         "results": debug_results,
     });
 
@@ -540,10 +511,9 @@ pub(super) fn slice_batch_markdowns(
     urls: &[String],
     results: &[Value],
     markdowns: &mut [Option<String>],
-    budget_tokens: usize,
+    budget_chars: usize,
     sliced_flags: &mut [bool],
 ) {
-    let budget_chars = budget_tokens.saturating_mul(4);
     let lens: Vec<usize> = markdowns
         .iter()
         .map(|m| m.as_ref().map(|s| s.len()).unwrap_or(0))
@@ -626,7 +596,7 @@ pub(super) fn slice_batch_markdowns(
     }
 }
 
-fn fetch_input(args: &Value, url: &str) -> Result<url::Url, Value> {
+fn fetch_input(url: &str) -> Result<url::Url, Value> {
     // Full parse up front: an unparseable URL would otherwise flow
     // through the whole pipeline with host="" : poisoning domain
     // profiles and producing confusing late errors.
@@ -651,67 +621,128 @@ fn fetch_input(args: &Value, url: &str) -> Result<url::Url, Value> {
             })),
         ));
     }
-    if let Some(selector) = args.get("selector").and_then(Value::as_str)
-        && scraper::Selector::parse(selector).is_err()
-    {
-        return Err(tool_error_structured(
-            format!("invalid CSS selector: {selector}"),
-            "permanent",
-            Some(json!({
-                "url": url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax",
-            })),
-        ));
-    }
     Ok(parsed_url)
 }
 
-fn fetch_read_options(args: &Value) -> Result<ExtractOptions, Value> {
-    let mut opts = ExtractOptions::default();
-    let preset = match args.get("mode") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(m)) if m == "scan" => Some(800),
-        Some(Value::String(m)) if m == "read" => Some(4_000),
-        Some(Value::String(m)) if m == "deep" => Some(16_000),
-        _ => return Err(tool_error("fetch: mode must be scan, read or deep")),
+/// An argument mistake: permanent, named, before anything is fetched.
+fn args_error(message: impl Into<String>, next_action: &str) -> Value {
+    tool_error_structured(
+        message.into(),
+        "permanent",
+        Some(json!({"code": "fetch.args", "next_action": next_action})),
+    )
+}
+
+/// The extraction options and the agent's view, from the call's arguments.
+/// Extraction always reads the whole document; the view projects it.
+pub(super) fn fetch_view(args: &Value) -> Result<(ExtractOptions, extract::view::View), Value> {
+    use extract::view::{MUST_CONTAIN_MAX_TERMS, Term, View};
+    let opts = ExtractOptions {
+        include_links: args.get("links").and_then(Value::as_bool).unwrap_or(false),
+        max_chars: Some(DOCUMENT_MAX_CHARS),
+        ..ExtractOptions::default()
     };
-    opts.focus = args.get("focus").and_then(Value::as_str).map(String::from);
-    opts.max_chars = args
-        .get("max_chars")
-        .and_then(Value::as_u64)
-        .map(|n| (n as usize).clamp(200, 1_048_576))
-        .or(preset);
-    opts.offset = args
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(1_000_000_000) as usize;
-    opts.section = args
-        .get("section")
-        .and_then(Value::as_str)
-        .map(String::from);
-    opts.selector = args
-        .get("selector")
-        .and_then(Value::as_str)
-        .map(String::from);
-    opts.toc = args.get("toc").and_then(Value::as_bool).unwrap_or(false);
-    opts.include_links = args.get("links").and_then(Value::as_bool).unwrap_or(false);
-    opts.include_media = args.get("media").and_then(Value::as_bool).unwrap_or(false);
-    opts.must_contain = args
-        .get("must_contain")
-        .and_then(Value::as_str)
-        .map(String::from);
-    Ok(opts)
+    let text = |name: &str| {
+        args.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+    let raw_terms: Vec<String> = match args.get("must_contain") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(one)) => vec![one.clone()],
+        Some(Value::Array(many)) => many
+            .iter()
+            .map(|v| v.as_str().map(String::from))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                args_error(
+                    "must_contain: every term must be a string",
+                    "pass a string or an array of strings",
+                )
+            })?,
+        Some(_) => {
+            return Err(args_error(
+                "must_contain must be a string or an array of strings",
+                "pass a string or an array of strings",
+            ));
+        }
+    };
+    if raw_terms.len() > MUST_CONTAIN_MAX_TERMS {
+        return Err(args_error(
+            format!("must_contain takes at most {MUST_CONTAIN_MAX_TERMS} terms"),
+            "split the terms over several calls",
+        ));
+    }
+    let must_contain = raw_terms
+        .iter()
+        .map(|t| Term::parse(t))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| args_error(e, "fix the term: a phrase, or a /regex/ with valid syntax"))?;
+    let view = View {
+        focus: text("focus"),
+        section: text("section"),
+        toc: flag("toc"),
+        must_contain,
+        offset: args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(1_000_000_000) as usize,
+        max_chars: args
+            .get("max_chars")
+            .and_then(Value::as_u64)
+            .map_or(MAX_CHARS_DEFAULT, |n| {
+                (n as usize).clamp(MAX_CHARS_MIN, MAX_CHARS_MAX)
+            }),
+    };
+    // Each view answers one question; a combination that would silently
+    // drop one of them is refused instead.
+    let probe = !view.must_contain.is_empty();
+    let conflict = |a: &str, b: &str| {
+        args_error(
+            format!("{a} and {b} cannot be combined"),
+            &format!("drop {b}, or make a second call for it"),
+        )
+    };
+    if probe {
+        for (set, name) in [
+            (view.focus.is_some(), "focus"),
+            (view.toc, "toc"),
+            (view.offset > 0, "offset"),
+            (flag("since_last"), "since_last"),
+        ] {
+            if set {
+                return Err(conflict("must_contain", name));
+            }
+        }
+    }
+    if view.toc && view.focus.is_some() {
+        return Err(conflict("toc", "focus"));
+    }
+    if flag("since_last") {
+        for (set, name) in [
+            (view.focus.is_some(), "focus"),
+            (view.section.is_some(), "section"),
+            (view.toc, "toc"),
+            (view.offset > 0, "offset"),
+        ] {
+            if set {
+                return Err(conflict("since_last", name));
+            }
+        }
+    }
+    Ok((opts, view))
 }
 
 /// Fetch one live URL on a route selected once for the whole call.
 pub(super) async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
-    let parsed_url = match fetch_input(args, url) {
+    let parsed_url = match fetch_input(url) {
         Ok(parsed) => parsed,
         Err(error) => return error,
     };
-    if let Err(error) = fetch_read_options(args) {
-        return error;
-    }
     // Preserve persona binding before the pool pick, then freeze that route
     // for the entire call. A related adapter host cannot bind another lane.
     let route = {
@@ -752,35 +783,8 @@ pub(super) fn find_rel_next(html: &str, base: &str) -> Option<String> {
     None
 }
 
-/// Strip a part's frontmatter (title line, URL line, description
-/// line) : stitched parts share the article's chrome, and the
-/// `*(part N)*` marker already carries the context.
-pub(super) fn strip_part_frontmatter(md: &str) -> String {
-    let lines: Vec<&str> = md.lines().collect();
-    let mut start = 0;
-    if lines.first().is_some_and(|l| l.starts_with("# ")) {
-        start = 1;
-    }
-    if lines.get(start).is_some_and(|l| l.starts_with("http")) {
-        start += 1;
-    }
-    if lines.get(start).is_some_and(|l| l.starts_with("> ")) {
-        start += 1;
-    }
-    lines[start..].join("\n").trim().to_string()
-}
-
-fn fetch_url_rewrite(
-    url: &url::Url,
-    args: &Value,
-    no_adapter: bool,
-) -> Option<(String, &'static str)> {
-    crate::adapters::rewrite(url).filter(|(_, name)| {
-        !no_adapter
-            && (args.get("section").and_then(Value::as_str).is_none()
-                || *name == "adapter:stackexchange-api")
-            && args.get("selector").and_then(Value::as_str).is_none()
-    })
+fn fetch_url_rewrite(url: &url::Url, no_adapter: bool) -> Option<(String, &'static str)> {
+    crate::adapters::rewrite(url).filter(|_| !no_adapter)
 }
 
 /// Whether a failed verdict means the ADAPTER rewrite bought
@@ -944,7 +948,7 @@ async fn fetch_single_inner(
     call: &FetchCall,
 ) -> Value {
     let t0 = std::time::Instant::now();
-    let parsed_url = match fetch_input(args, url) {
+    let parsed_url = match fetch_input(url) {
         Ok(parsed) => parsed,
         Err(error) => return error,
     };
@@ -961,7 +965,7 @@ async fn fetch_single_inner(
         .unwrap_or(false);
     let orig_url = url.to_string();
     let adapter_used: Option<&'static str>;
-    let url = match fetch_url_rewrite(&parsed_url, args, no_adapter) {
+    let url = match fetch_url_rewrite(&parsed_url, no_adapter) {
         Some((new_url, name)) => {
             adapter_used = Some(name);
             new_url
@@ -992,8 +996,8 @@ async fn fetch_single_inner(
             })),
         );
     }
-    let mut opts = match fetch_read_options(args) {
-        Ok(opts) => opts,
+    let (opts, view) = match fetch_view(args) {
+        Ok(parsed) => parsed,
         Err(error) => return error,
     };
     let image_text = args
@@ -1004,17 +1008,6 @@ async fn fetch_single_inner(
         .get("since_last")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let stitch = args.get("stitch").and_then(Value::as_bool).unwrap_or(false);
-    let output_opts = opts.clone();
-    if stitch && opts.must_contain.is_none() && !opts.toc {
-        opts.max_chars = Some(1_048_576);
-        opts.offset = 0;
-        if output_opts.offset >= 1_048_576 {
-            return tool_error(
-                "fetch: stitched offset exceeds the 1 MiB article collection limit; use the returned next_part URL and offset",
-            );
-        }
-    }
 
     // v5: `actions` was removed with the browser tier. The spec layer
     // answers it first (like `tier`); this guard is the layer under it.
@@ -1423,35 +1416,13 @@ async fn fetch_single_inner(
                 extraction_wall = Some(v);
                 final_verdict = format!("{v:?}");
             }
-            Err(extract::ExtractError::SelectorNoMatch {
-                selector,
-                inspected,
-            }) => {
-                return tool_error_structured(
-                    format!("CSS selector {selector:?} matched no elements"),
-                    "permanent",
-                    Some(
-                        json!({"url": orig_url, "code": "selector.nomatch", "elements_inspected": inspected,
-                        "next_action": "correct the selector, or omit it to read the page"}),
-                    ),
-                );
-            }
-            Err(extract::ExtractError::BadSelector(selector)) => {
-                return tool_error_structured(
-                    format!("invalid CSS selector: {selector}"),
-                    "permanent",
-                    Some(
-                        json!({"url": orig_url, "code": "selector.invalid", "next_action": "correct the CSS selector syntax"}),
-                    ),
-                );
-            }
             Err(e) => {
                 return tool_error_structured(
                     format!("content extraction failed: {e}"),
                     "transient",
                     Some(json!({
                         "url": url,
-                        "next_action": "retry with a narrow selector= or focus=; if the page is JS-heavy, choose another source or retry later",
+                        "next_action": "retry once; if it fails again, the page is too large or malformed to extract: choose another source",
                     })),
                 );
             }
@@ -1659,144 +1630,6 @@ async fn fetch_single_inner(
         );
     }
 
-    // === v3 F3: article pagination stitching ===
-    // rel=next chains walked to a bounded budget: one call returns
-    // the whole article with part markers instead of eight calls.
-    let mut stitched_parts: usize = 1;
-    let mut stitch_next = None;
-    if stitch && output_opts.must_contain.is_none() && !output_opts.toc {
-        const STITCH_MAX_PARTS: usize = 6;
-        const STITCH_BUDGET: usize = 1_048_576;
-        let base = out
-            .as_ref()
-            .filter(|o| o.verdict == Verdict::ContentOk && o.url == final_url)
-            .map(|o| {
-                let ct = o
-                    .headers
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-                (crate::extract::charset::decode(&o.body, &ct), o.url.clone())
-            });
-        if let Some((html, base_url)) = base
-            && let Some(ex) = final_ex.as_mut()
-        {
-            let base_host = url::Url::parse(&base_url)
-                .ok()
-                .and_then(|u| u.host_str().map(String::from));
-            let mut visited = std::collections::HashSet::from([base_url.clone()]);
-            let mut next = find_rel_next(&html, &base_url);
-            if let Some(offset) = ex.next_offset.take() {
-                if let Some(marker) = ex.markdown.rfind("\n\n*[truncated : continue") {
-                    ex.markdown.truncate(marker);
-                }
-                stitch_next = Some(
-                    json!({"url": base_url, "offset": offset, "reason": "article collection limit"}),
-                );
-                next = None;
-            }
-            while let Some(next_url) = next.take() {
-                stitch_next = Some(
-                    json!({"url": next_url, "offset": 0, "reason": "part limit or unavailable part"}),
-                );
-                if stitched_parts >= STITCH_MAX_PARTS || ex.markdown.len() + 200 >= STITCH_BUDGET {
-                    break;
-                }
-                if !visited.insert(next_url.clone()) {
-                    stitch_next = Some(json!({"url": next_url, "reason": "pagination cycle"}));
-                    break;
-                }
-                // Hijack guard: never follow rel=next off-host.
-                let Ok(nu) = url::Url::parse(&next_url) else {
-                    break;
-                };
-                if nu.host_str().map(String::from) != base_host {
-                    break;
-                }
-                let fetched = match daemon.fetcher.fetch(&next_url).await {
-                    Ok(o2)
-                        if matches!(o2.verdict, Verdict::ContentOk)
-                            && url::Url::parse(&o2.url)
-                                .ok()
-                                .and_then(|u| u.host_str().map(String::from))
-                                == base_host =>
-                    {
-                        o2
-                    }
-                    _ => break,
-                };
-                if fetched.url != next_url && !visited.insert(fetched.url.clone()) {
-                    stitch_next =
-                        Some(json!({"url": fetched.url, "reason": "redirected pagination cycle"}));
-                    break;
-                }
-                trace.step(
-                    "stitch",
-                    "fetch-part",
-                    &next_url,
-                    fetched.elapsed.as_millis(),
-                );
-                let ct2 = fetched
-                    .headers
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default();
-                let html2 = crate::extract::charset::decode(&fetched.body, &ct2);
-                let mut popts = opts.clone();
-                popts.max_chars = Some(
-                    STITCH_BUDGET
-                        .saturating_sub(ex.markdown.len() + 40)
-                        .max(200),
-                );
-                match extract::extract_off_worker(&fetched.body, &ct2, &fetched.url, &popts).await {
-                    Ok(mut pe) => {
-                        if pe.thin {
-                            break;
-                        }
-                        if let Some(offset) = pe.next_offset {
-                            if let Some(marker) = pe.markdown.rfind("\n\n*[truncated : continue") {
-                                pe.markdown.truncate(marker);
-                            }
-                            stitch_next = Some(
-                                json!({"url": fetched.url, "offset": offset, "reason": "article collection limit"}),
-                            );
-                        } else {
-                            stitch_next = None;
-                        }
-                        let md = strip_part_frontmatter(&pe.markdown);
-                        stitched_parts += 1;
-                        ex.markdown
-                            .push_str(&format!("\n\n---\n\n*(part {stitched_parts})*\n\n"));
-                        ex.markdown.push_str(&md);
-                        ex.total_chars = ex.markdown.len();
-                        if pe.next_offset.is_some() {
-                            break;
-                        }
-                        next = find_rel_next(&html2, &fetched.url);
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-
-    if stitch
-        && output_opts.must_contain.is_none()
-        && !output_opts.toc
-        && let Some(ex) = final_ex.as_mut()
-    {
-        let (slice, next) = extract::paginate_public(
-            &ex.markdown,
-            output_opts.offset,
-            output_opts.max_chars.unwrap_or(16_000),
-        );
-        ex.markdown = slice;
-        ex.next_offset = next;
-        ex.tokens_est = ex.markdown.len() / 4;
-    }
-
     let Some(ex) = final_ex else {
         return tool_error_structured(
             "fetch produced no usable response",
@@ -1875,6 +1708,34 @@ async fn fetch_single_inner(
     } else {
         final_url.clone()
     };
+    // The document is whole here; the view projects it. OCR text joins the
+    // document first, so every view (a probe, focus) searches it too.
+    let mut ex = ex;
+    let document = ex.markdown.clone();
+    let ocr_state = if image_text {
+        let (section, state) = image_ocr(daemon, &ex.images).await;
+        ex.markdown.push_str(&section);
+        Some(state)
+    } else {
+        None
+    };
+    let incomplete = ex
+        .partial
+        .as_ref()
+        .map(|p| match p.items_total {
+            Some(total) => format!("{}: {} of {total} items loaded", p.reason, p.items_found),
+            None => format!("{}: {} items loaded", p.reason, p.items_found),
+        })
+        .or_else(|| {
+            ex.next_offset.map(|_| {
+                format!("the document is longer than the {DOCUMENT_MAX_CHARS}-char read limit")
+            })
+        });
+    let rendered = extract::view::render(&ex.markdown, &view, incomplete.as_deref());
+    ex.markdown = rendered.text;
+    ex.next_offset = rendered.next_offset;
+    ex.tokens_est = ex.markdown.len() / 4;
+
     let mut res = finish_result(
         &ex,
         final_fetch,
@@ -1884,25 +1745,41 @@ async fn fetch_single_inner(
         &trace,
         t0.elapsed().as_millis(),
     );
-    maybe_record_agent_outcome(daemon, &host, &opts, &ex, &final_verdict);
+    if let Some(sc) = res.pointer_mut("/structuredContent") {
+        if !ex.thin {
+            sc["read_status"] = json!(match (rendered.status, ex.partial.is_some()) {
+                ("content", true) => "partial",
+                (status, _) => status,
+            });
+            sc["content_complete"] = json!(rendered.complete && ex.partial.is_none());
+        }
+        if let Some(state) = rendered.state.as_object() {
+            for (key, value) in state {
+                sc[key] = value.clone();
+            }
+        }
+        if rendered.verdict.is_some()
+            && let Some(object) = sc.as_object_mut()
+        {
+            object.remove("content_kind");
+        }
+        if let Some(state) = ocr_state {
+            sc["image_text"] = state;
+        }
+        if let Some(next) = out
+            .as_ref()
+            .filter(|o| o.verdict == Verdict::ContentOk && adapter_used.is_none())
+            .and_then(|o| next_page(&o.body, &o.url))
+        {
+            sc["next_page"] = json!(next);
+        }
+    }
+    maybe_record_agent_outcome(daemon, &host, &view, &ex, &final_verdict, rendered.verdict);
     if daemon.state.lock().await.is_flaky(&host) {
         res["structuredContent"]["stability"] = json!("flaky");
     }
     if prewarmed {
         res["_meta"]["com.donsetch/fetch-debug"]["prewarmed_by_search"] = json!(true);
-    }
-    if stitch
-        && output_opts.must_contain.is_none()
-        && !output_opts.toc
-        && let Some(sc) = res.pointer_mut("/structuredContent")
-    {
-        sc["stitched"] = json!(stitched_parts);
-        sc["stitch_complete"] = json!(stitch_next.is_none());
-        if let Some(next_part) = stitch_next {
-            sc["content_complete"] = json!(false);
-            sc["read_status"] = json!("partial");
-            sc["next_part"] = next_part;
-        }
     }
     apply_link_handles(daemon, &mut res).await;
 
@@ -1919,33 +1796,41 @@ async fn fetch_single_inner(
     {
         sc["server_modified"] = json!(lm);
     }
-    if opts.focus.is_none()
-        && opts.section.is_none()
-        && opts.selector.is_none()
-        && !opts.toc
-        && opts.must_contain.is_none()
-        && !stitch
-    {
-        apply_page_history(
-            daemon,
-            &mut res,
-            &display_url,
-            PageFacts {
-                fingerprint: ex.fingerprint.as_deref(),
-                markdown: &ex.markdown,
-                title: ex.title.as_deref(),
-                complete: opts.offset == 0
-                    && ex.next_offset.is_none()
-                    && !ex.thin
-                    && ex.partial.is_none(),
-            },
-            since_last,
-        );
-    }
-    if image_text {
-        apply_image_ocr(daemon, &mut res, &ex.images).await;
-    }
+    // Every read records the page for since_last; only a since_last call
+    // replaces its output with the change report.
+    apply_page_history(
+        daemon,
+        &mut res,
+        &display_url,
+        PageFacts {
+            fingerprint: ex.fingerprint.as_deref(),
+            markdown: &document,
+            title: ex.title.as_deref(),
+            complete: incomplete.is_none() && !ex.thin,
+        },
+        since_last,
+    );
     res
+}
+
+/// The same-host page an HTML document names as its next one
+/// (`rel="next"`), for reading a paginated article part by part.
+fn next_page(body: &[u8], base: &str) -> Option<String> {
+    static REL_NEXT: std::sync::LazyLock<regex::bytes::Regex> = std::sync::LazyLock::new(|| {
+        regex::bytes::Regex::new(r#"(?i)<(?:link|a)\b[^>]*\brel\s*=\s*["']?[^"'>]*\bnext\b"#)
+            .expect("static regex")
+    });
+    if !REL_NEXT.is_match(body) {
+        return None;
+    }
+    let html = String::from_utf8_lossy(body);
+    let next = find_rel_next(&html, base)?;
+    let host = |u: &str| {
+        url::Url::parse(u)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+    };
+    (next != base && host(&next).is_some() && host(&next) == host(base)).then_some(next)
 }
 
 /// The optional unlocker (Bright Data Web Unlocker): when a local
@@ -2150,28 +2035,27 @@ fn is_json_endpoint(o: &crate::fetch::client::FetchOutcome) -> bool {
     is_json_url_like(&o.url) || ct_is_json(&o.headers)
 }
 
-/// v3 image OCR: fetch + OCR the page's content images (up to 4,
-/// 5MB each, SSRF-guarded) and append an `## image text` section
-/// to the result. On-demand only : OCR models are heavy and most
-/// pages never need it.
-pub(super) async fn apply_image_ocr(
+/// OCR the page's first content images (up to 4, 5 MB each,
+/// SSRF-guarded): the `image text` section to append to the document,
+/// and the state for the structured result. Runs only when asked.
+pub(super) async fn image_ocr(
     daemon: &Arc<Daemon>,
-    res: &mut Value,
     images: &[(String, String)],
-) {
+) -> (String, Value) {
     #[cfg(not(feature = "ocr"))]
     {
         let _ = (daemon, images);
-        if let Some(sc) = res.pointer_mut("/structuredContent") {
-            sc["image_text"] = json!("unavailable : this build lacks the ocr feature");
-        }
+        (
+            String::new(),
+            json!("unavailable : this build lacks the ocr feature"),
+        )
     }
     #[cfg(feature = "ocr")]
     {
         const MAX_IMAGES: usize = 4;
         const MAX_BYTES: usize = 5 * 1024 * 1024;
         if images.is_empty() {
-            return;
+            return (String::new(), json!({"images": 0, "ocred": 0}));
         }
         let mut section = String::from("\n## image text (OCR)\n");
         let mut ocred = 0usize;
@@ -2268,14 +2152,10 @@ pub(super) async fn apply_image_ocr(
                 Err(error) => section.push_str(&format!("- {src}: [OCR task failed: {error}]\n")),
             }
         }
-        if let Some(cell) = res.pointer_mut("/content/0/text")
-            && let Some(md) = cell.as_str().map(String::from)
-        {
-            *cell = json!(md + &section);
-        }
-        if let Some(sc) = res.pointer_mut("/structuredContent") {
-            sc["image_text"] = json!({ "images": images.len().min(MAX_IMAGES), "ocred": ocred });
-        }
+        (
+            section,
+            json!({ "images": images.len().min(MAX_IMAGES), "ocred": ocred }),
+        )
     }
 }
 
@@ -2513,9 +2393,10 @@ pub(super) fn format_fetch_markdown(
 fn maybe_record_agent_outcome(
     daemon: &Daemon,
     host: &str,
-    opts: &ExtractOptions,
+    view: &extract::view::View,
     ex: &extract::Extracted,
     verdict: &str,
+    probe: Option<extract::view::Verdict>,
 ) {
     if !crate::config::cfg().search.outcome_feedback {
         return;
@@ -2526,10 +2407,10 @@ fn maybe_record_agent_outcome(
         return;
     }
     let class = crate::search::outcome_class(
-        opts.must_contain.is_some(),
-        opts.focus.is_some() || opts.toc || opts.section.is_some(),
+        !view.must_contain.is_empty(),
+        view.focus.is_some() || view.toc || view.section.is_some(),
     );
-    let probe_miss = opts.must_contain.is_some() && ex.markdown.starts_with("probe: NO MATCH");
+    let probe_miss = probe == Some(extract::view::Verdict::NoMatch);
     let unreadable = ex.thin || verdict == "SoftNotFound";
     if probe_miss || unreadable {
         daemon.searcher.observe_outcome_miss(class, host);
@@ -2586,14 +2467,6 @@ pub(super) fn finish_result(
             structured["items_total"] = json!(total);
         }
     }
-    if ex.markdown.starts_with("probe: ") {
-        structured["read_status"] = json!("probe");
-        structured["content_complete"] = json!(false);
-        structured.as_object_mut().unwrap().remove("content_kind");
-        if ex.markdown.starts_with("probe: MATCH") || ex.markdown.starts_with("probe: NO MATCH") {
-            structured["matched"] = json!(ex.markdown.starts_with("probe: MATCH"));
-        }
-    }
     if ex.thin {
         structured["thin"] = json!(true);
     }
@@ -2607,7 +2480,7 @@ pub(super) fn finish_result(
     if omitted > 0 {
         structured["omitted_repeats"] = json!(omitted);
     }
-    if !ex.markdown.starts_with("probe: ") && !matches!(ex.lang.as_str(), "" | "und" | "unknown") {
+    if !matches!(ex.lang.as_str(), "" | "und" | "unknown") {
         structured["lang"] = json!(ex.lang);
     }
     if let Some(next_offset) = ex.next_offset {
@@ -2849,7 +2722,7 @@ mod batch_budget_tests {
     // old accounting left member headers and the slicing marker
     // uncounted (measured ~9% over on a real batch).
     #[test]
-    fn a_batch_stays_within_its_token_budget() {
+    fn a_batch_stays_within_its_max_chars() {
         let urls: Vec<String> = (0..6).map(|i| format!("https://ex.test/{i}")).collect();
         let big = "x".repeat(9_000);
         let results: Vec<Value> = urls
@@ -2865,18 +2738,17 @@ mod batch_budget_tests {
         let mut markdowns: Vec<Option<String>> =
             results.iter().map(|_| Some(big.clone())).collect();
         let mut flags = vec![false; urls.len()];
-        slice_batch_markdowns(&urls, &results, &mut markdowns, 2_000, &mut flags);
+        slice_batch_markdowns(&urls, &results, &mut markdowns, 8_000, &mut flags);
         assert!(
             flags.iter().all(|f| *f),
             "every over-share member gets sliced"
         );
-        let out = render_fetch_batch(&urls, &results, &markdowns, Some(2_000), &flags);
+        let out = render_fetch_batch(&urls, &results, &markdowns, 8_000, &flags);
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.len() <= 2_000 * 4,
-            "batch output {} bytes exceeds its {} byte budget",
-            text.len(),
-            2_000 * 4
+            text.len() <= 8_000,
+            "batch output {} bytes exceeds its 8000-char budget",
+            text.len()
         );
     }
 }
@@ -3090,7 +2962,7 @@ mod batch_output_contract_tests {
             ),
             None,
         ];
-        let output = render_fetch_batch(&urls, &results, &markdowns, Some(2_000), &[false, false]);
+        let output = render_fetch_batch(&urls, &results, &markdowns, 8_000, &[false, false]);
         assert_eq!(output["content"].as_array().unwrap().len(), 1);
         let text = output["content"][0]["text"].as_str().unwrap();
         assert!(text.find("Alpha.").unwrap() < text.find("request timed out").unwrap());
@@ -3126,7 +2998,7 @@ mod batch_output_contract_tests {
             &urls[..1],
             &[flagged],
             &[Some("# Thin\nhttps://example.com/a".into())],
-            None,
+            48_000,
             &[false],
         );
         let flagged_state = &flagged_output["structuredContent"]["results"][0];
@@ -3163,13 +3035,7 @@ mod budget_tests {
     fn wave450_batch_preserves_partial_state_and_never_skips_sliced_content() {
         let url = "https://example.org/".to_string();
         let result = json!({"content":[{"type":"text","text":"evidence"}], "structuredContent":{"content_ok":true,"partial":true,"content_complete":false,"read_status":"partial","items_found":3,"next_offset":16000}});
-        let batch = render_fetch_batch(
-            &[url],
-            &[result],
-            &[Some("evidence".into())],
-            Some(200),
-            &[true],
-        );
+        let batch = render_fetch_batch(&[url], &[result], &[Some("evidence".into())], 800, &[true]);
         let sc = &batch["structuredContent"]["results"][0];
         assert_eq!(sc["partial"], true);
         assert_eq!(sc["items_found"], 3);
@@ -3339,19 +3205,12 @@ mod adapter_hop_tests {
     }
 
     #[test]
-    fn section_and_selector_keep_the_requested_website_url() {
+    fn the_adapter_rewrite_runs_unless_the_read_is_its_own_fallback() {
+        // Views apply to the adapter's markdown like any other, so no view
+        // argument turns the rewrite off; only the adapter fallback does.
         let url = url::Url::parse("https://stackoverflow.com/questions/42917566/example").unwrap();
-        assert!(
-            fetch_url_rewrite(&url, &json!({}), false).is_some(),
-            "a plain fetch rewrites to the adapter endpoint"
-        );
-        let cases = [json!({"section":"Answer 1"}), json!({"selector":"article"})];
-        let rewrites: Vec<bool> = cases
-            .iter()
-            .map(|args| fetch_url_rewrite(&url, args, false).is_some())
-            .collect();
-        assert_eq!(rewrites, vec![true, false]);
-        assert!(fetch_url_rewrite(&url, &json!({}), true).is_none());
+        assert!(fetch_url_rewrite(&url, false).is_some());
+        assert!(fetch_url_rewrite(&url, true).is_none());
     }
 
     #[test]
@@ -3541,7 +3400,7 @@ mod rules_tests {
             None,
             None,
         ];
-        let out = render_fetch_batch(&urls, &results, &markdowns, None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &results, &markdowns, 48_000, &[false; 3]);
         let rows = &out["structuredContent"]["results"];
         assert_eq!(rows[1]["code"], "policy.denied.ip_ban");
         assert_eq!(rows[1]["errorKind"], "permanent");
@@ -3563,7 +3422,7 @@ mod rules_tests {
             .iter()
             .map(|u| policy_error_value(&denial("walled"), u, None))
             .collect();
-        let out = render_fetch_batch(&urls, &denied, &[None, None, None], None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &denied, &[None, None, None], 48_000, &[false; 3]);
         assert_eq!(out["structuredContent"]["ok"], false);
         assert_eq!(out["structuredContent"]["code"], "policy.denied.ip_ban");
         assert_eq!(out["errorKind"], "walled");
@@ -3579,7 +3438,7 @@ mod rules_tests {
                 )
             })
             .collect();
-        let out = render_fetch_batch(&urls, &walled, &[None, None, None], None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &walled, &[None, None, None], 48_000, &[false; 3]);
         assert_eq!(out["structuredContent"]["code"], "wall.blocked");
         assert_eq!(out["errorKind"], "walled");
 
@@ -3593,7 +3452,7 @@ mod rules_tests {
             ),
             walled[2].clone(),
         ];
-        let out = render_fetch_batch(&urls, &mixed, &[None, None, None], None, &[false; 3]);
+        let out = render_fetch_batch(&urls, &mixed, &[None, None, None], 48_000, &[false; 3]);
         assert_ne!(out["structuredContent"]["code"], "policy.denied.ip_ban");
         assert_eq!(out["errorKind"], "transient");
         let rows = &out["structuredContent"]["results"];

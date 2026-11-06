@@ -10,63 +10,6 @@ use super::*;
 use scraper::Html;
 
 #[test]
-fn wave450_wall_cannot_be_laundered_by_reading_modes() {
-    let html = "<html><head><title>Blocked</title></head><body><main><h1>You've been blocked by network security.</h1><p>To continue, log in to your Reddit account or use your developer token.</p></main></body></html>";
-    for opts in [
-        ExtractOptions::default(),
-        ExtractOptions {
-            must_contain: Some("pts".into()),
-            ..Default::default()
-        },
-        ExtractOptions {
-            toc: true,
-            ..Default::default()
-        },
-        ExtractOptions {
-            max_chars: Some(200),
-            offset: 150,
-            ..Default::default()
-        },
-    ] {
-        assert!(
-            extract(
-                html.as_bytes(),
-                "text/html",
-                "https://old.reddit.com/r/rust/",
-                &opts
-            )
-            .is_err(),
-            "a wall must fail before probe, outline or pagination"
-        );
-    }
-    let article = format!("<article><h1>Network security guide</h1>{}<p>The phrase You've been blocked by network security appears on Reddit's block screen.</p></article>", "<p>This guide explains secure connections, authentication and debugging with real application examples.</p>".repeat(25));
-    assert!(
-        extract(
-            article.as_bytes(),
-            "text/html",
-            "https://example.com",
-            &ExtractOptions::default()
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn wave450_section_does_not_change_page_identity() {
-    let html = "<article><h1>Guide</h1><h2>Alpha</h2><p>Alpha is the first topic and has detailed instructions.</p><h2>Beta</h2><p>Beta is another topic with completely different instructions.</p></article>";
-    let full = extract_html(html);
-    let section = extract_html_opts(
-        html,
-        &ExtractOptions {
-            section: Some("Beta".into()),
-            ..Default::default()
-        },
-    );
-    assert_eq!(full.fingerprint, section.fingerprint);
-    assert!(!section.markdown.contains("Alpha is"));
-}
-
-#[test]
 fn wave450_sitemap_is_an_inventory_not_an_app_shell() {
     let xml = b"<?xml version='1.0'?><urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'><url><loc>https://example.com/a?q=1&amp;p=2</loc></url><url><loc>https://example.com/b</loc></url></urlset>";
     let ex = extract(
@@ -814,27 +757,6 @@ fn block_table_pipe_escaped() {
 }
 
 #[test]
-fn block_media_opt_in() {
-    let html = r#"<html><body><article>
-<figure>
-<img src="/diagram.png" alt="Architecture diagram">
-<figcaption>System architecture overview</figcaption>
-</figure>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            include_media: true,
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("Architecture diagram"));
-    // Default (no media): should not include.
-    let r2 = extract_html(html);
-    assert!(!r2.markdown.contains("diagram.png"));
-}
-
-#[test]
 fn block_links_stripped_by_default() {
     let html = r#"<html><body><article>
 <p>Read the <a href="https://rust-lang.org/docs">documentation</a> for more info.</p>
@@ -1096,135 +1018,9 @@ fn pagination_offset_past_end() {
 // 8. TOC MODE
 // ════════════════════════════════════════════════════════════
 
-#[test]
-fn toc_mode_heading_tree() {
-    let html = r#"<html><body><article>
-<h1>Main Title</h1>
-<p>Intro paragraph.</p>
-<h2>Section A</h2>
-<p>Section A content.</p>
-<h3>Subsection A1</h3>
-<p>Subsection content.</p>
-<h2>Section B</h2>
-<p>Section B content.</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            toc: true,
-            ..Default::default()
-        },
-    );
-    // v3: toc lines carry stable section IDs + size labels.
-    assert!(r.markdown.contains("- [s1] Main Title ·"));
-    assert!(r.markdown.contains("  - [s2] Section A ·"));
-    assert!(r.markdown.contains("    - [s3] Subsection A1 ·"));
-    assert!(r.markdown.contains("  - [s4] Section B ·"));
-    assert!(r.markdown.contains("section=\"sN\""));
-    // Should NOT contain body text.
-    assert!(!r.markdown.contains("Intro paragraph"));
-    assert!(!r.markdown.contains("Section A content"));
-}
-
-#[test]
-fn toc_mode_flat_page() {
-    let html = r#"<html><body><article>
-<p>No headings here, just paragraphs.</p>
-<p>Another paragraph.</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            toc: true,
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("no headings"));
-}
-
-#[test]
-fn toc_mode_is_not_replaced_by_raw_text_fallback() {
-    let body = "This paragraph belongs to the page body, not to its requested outline. ".repeat(20);
-    let html = format!(
-        r#"<html><head><title>Small guide</title></head><body><article>
-<h1>Small guide</h1><p>{body}</p>
-</article></body></html>"#
-    );
-    let r = extract_html_opts(
-        &html,
-        &ExtractOptions {
-            toc: true,
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("[s1] Small guide"), "{}", r.markdown);
-    assert!(!r.markdown.contains("This paragraph belongs"));
-}
-
 // ════════════════════════════════════════════════════════════
 // 9. SECTION MODE
 // ════════════════════════════════════════════════════════════
-
-#[test]
-fn section_mode_exact_match() {
-    let html = r#"<html><body><article>
-<h1>Document</h1>
-<p>Intro.</p>
-<h2>History</h2>
-<p>The history of the subject is long and complex.</p>
-<h3>Early Period</h3>
-<p>Early details about the subject.</p>
-<h2>Modern Era</h2>
-<p>Modern developments in the field.</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            section: Some("History".to_string()),
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("history of the subject"));
-    assert!(r.markdown.contains("Early details"));
-    // Should NOT include content from "Modern Era" section.
-    assert!(!r.markdown.contains("Modern developments"));
-}
-
-#[test]
-fn section_mode_case_insensitive() {
-    let html = r#"<html><body><article>
-<h2>Installation</h2>
-<p>To install, run the command.</p>
-<h2>Usage</h2>
-<p>How to use the tool.</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            section: Some("INSTALLATION".to_string()),
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("install, run"));
-    assert!(!r.markdown.contains("How to use"));
-}
-
-#[test]
-fn section_mode_miss_returns_full() {
-    let html = r#"<html><body><article>
-<h2>Real Section</h2>
-<p>Real content.</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            section: Some("Nonexistent".to_string()),
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("*[section"));
-    assert!(r.markdown.contains("Real content"));
-}
 
 // ════════════════════════════════════════════════════════════
 // 10. CONTENT CLASSIFICATION
@@ -1539,22 +1335,6 @@ fn signal_focus_miss() {
 }
 
 #[test]
-fn signal_section_miss() {
-    let html = r#"<html><body><article>
-<h2>Real Section</h2>
-<p>Real content here.</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            section: Some("Nonexistent Section".to_string()),
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("*[section"));
-}
-
-#[test]
 fn signal_thin_js_shell() {
     // Large page with almost no extractable content → thin.
     let html = format!(
@@ -1659,98 +1439,6 @@ fn charset_meta_charset_tag() {
 // ════════════════════════════════════════════════════════════
 // 16. CSS SELECTOR
 // ════════════════════════════════════════════════════════════
-
-#[test]
-fn css_selector_scopes_extraction() {
-    let html = r#"<html><body>
-<div class="sidebar"><p>Sidebar junk.</p></div>
-<div class="main-content">
-<p>This is the content we want to extract from the main div.</p>
-</div>
-</body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            selector: Some(".main-content".to_string()),
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("content we want"));
-    assert!(!r.markdown.contains("Sidebar junk"));
-}
-
-#[test]
-fn css_selector_bad_returns_error() {
-    let r = extract(
-        "<html></html>".as_bytes(),
-        "text/html",
-        "https://example.com",
-        &ExtractOptions {
-            selector: Some("invalid_selector[[[".to_string()),
-            ..Default::default()
-        },
-    );
-    assert!(r.is_err());
-}
-
-#[test]
-fn report_audit_selector_never_widens_short_or_missing_scope() {
-    let html = format!(
-        "<html><body><article><p>{}</p><table class='infobox'><tr><th>Founded</th><td>2021</td></tr></table></article></body></html>",
-        "Outside scope. ".repeat(300)
-    );
-    let opts = ExtractOptions {
-        selector: Some("table.infobox".into()),
-        ..Default::default()
-    };
-    let scoped = extract(
-        html.as_bytes(),
-        "text/html",
-        "https://en.wikipedia.org/wiki/Anthropic",
-        &opts,
-    )
-    .unwrap();
-    assert!(
-        scoped.markdown.contains("Founded"),
-        "selected table must survive"
-    );
-    assert!(
-        !scoped.markdown.contains("Outside scope"),
-        "short selector must never activate a whole-page rescue"
-    );
-    assert!(!scoped.thin, "intentional small scope is not an SPA");
-    let missing = ExtractOptions {
-        selector: Some("#absent".into()),
-        ..Default::default()
-    };
-    assert!(
-        extract(
-            html.as_bytes(),
-            "text/html",
-            "https://example.com/",
-            &missing
-        )
-        .is_err(),
-        "missing selector must fail instead of widening scope"
-    );
-}
-
-#[test]
-fn css_selector_matching_nothing_returns_an_error() {
-    let html = "<html><body><article><p>Real evidence.</p></article></body></html>";
-    let result = extract(
-        html.as_bytes(),
-        "text/html",
-        "https://example.com/",
-        &ExtractOptions {
-            selector: Some("#absent".into()),
-            ..Default::default()
-        },
-    );
-    assert!(
-        matches!(result, Err(ExtractError::SelectorNoMatch { inspected, .. }) if inspected > 0)
-    );
-}
 
 // ════════════════════════════════════════════════════════════
 // 17. MIXED LANGUAGE PAGES
@@ -2362,212 +2050,7 @@ fn v3_dropped_manifest_absent_without_focus() {
 
 // ── v3: toc section IDs + sizes, section by ID ───────────────
 
-#[test]
-fn v3_section_by_id_targets_nth_heading() {
-    let html = r#"<html><body><article>
-<h1>Main</h1><p>intro</p>
-<h2>Alpha</h2><p>alpha content</p>
-<h2>Beta</h2><p>beta content marker_zq1</p>
-</article></body></html>"#;
-    // s3 = "Beta" (1-based across ALL headings in order)
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            section: Some("s3".into()),
-            ..Default::default()
-        },
-    );
-    assert!(
-        r.markdown.contains("beta content marker_zq1"),
-        "section-by-id missed: {}",
-        r.markdown
-    );
-    assert!(!r.markdown.contains("alpha content"));
-}
-
-#[test]
-fn v3_section_by_name_still_works() {
-    let html = r#"<html><body><article>
-<h1>Main</h1><p>intro</p>
-<h2>Alpha</h2><p>alpha content</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            section: Some("alpha".into()),
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("alpha content"));
-}
-
 // ── v3: probe mode ───────────────────────────────────────────
-
-#[test]
-fn v3_probe_substring_match_and_miss() {
-    let html = r#"<html><body><article>
-<h1>Advisory</h1>
-<p>The CVE-2026-1234 vulnerability was patched in version 2.3.1.</p>
-<p>Unrelated paragraph about weather and sunshine.</p>
-</article></body></html>"#;
-    let base = ExtractOptions {
-        must_contain: Some("cve-2026-1234".into()),
-        ..Default::default()
-    };
-    let r = extract_html_opts(html, &base);
-    assert!(r.markdown.starts_with("probe: MATCH"), "{}", r.markdown);
-    assert!(r.markdown.contains("[1]"), "{}", r.markdown);
-    assert!(
-        r.markdown.len() < 400,
-        "probe output too big: {}",
-        r.markdown.len()
-    );
-    // No-hit case
-    let miss = extract_html_opts(
-        html,
-        &ExtractOptions {
-            must_contain: Some("definitely-not-there".into()),
-            ..Default::default()
-        },
-    );
-    assert!(
-        miss.markdown.starts_with("probe: NO MATCH"),
-        "{}",
-        miss.markdown
-    );
-}
-
-#[test]
-fn v3_probe_regex_mode() {
-    let html = r#"<html><body><article>
-<p>Fixed CVE-2026-1111 and CVE-2026-9999 in this release.</p>
-</article></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            must_contain: Some("/CVE-2026-\\d{4}/".into()),
-            ..Default::default()
-        },
-    );
-    assert!(
-        r.markdown.starts_with("probe: MATCH : 2 hits"),
-        "{}",
-        r.markdown
-    );
-}
-
-#[test]
-fn v3_probe_invalid_regex_is_honest_not_panic() {
-    let html = r#"<html><body><p>text</p></body></html>"#;
-    let r = extract_html_opts(
-        html,
-        &ExtractOptions {
-            must_contain: Some("/([unclosed/".into()),
-            ..Default::default()
-        },
-    );
-    assert!(r.markdown.contains("invalid regex"), "{}", r.markdown);
-}
-#[test]
-fn must_contain_regex_with_trailing_flags_is_still_regex() {
-    // A trailing flag like /i must not downgrade the probe to a
-    // literal search.
-    let hit = extract_html_opts(
-        "cve-2026-1234 hatchling",
-        &ExtractOptions {
-            must_contain: Some("/CVE-2026-\\d{4}/i".into()),
-            ..Default::default()
-        },
-    );
-    assert!(hit.markdown.contains("probe: MATCH"), "{}", hit.markdown);
-    let miss = extract_html_opts(
-        "nothing here",
-        &ExtractOptions {
-            must_contain: Some("/CVE-2026-\\d{4}/i".into()),
-            ..Default::default()
-        },
-    );
-    assert!(
-        miss.markdown.contains("probe: NO MATCH"),
-        "{}",
-        miss.markdown
-    );
-}
-
-#[test]
-fn must_contain_probe_applies_to_plain_text_passthrough() {
-    let body = b"HTTP/1.1 Semantics and Content\r\nFielding, Ed.\r\n";
-    let out = extract(
-        body,
-        "text/plain",
-        "https://example.com/rfc",
-        &ExtractOptions {
-            must_contain: Some("Fielding".into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(out.markdown.contains("probe: MATCH"), "{}", out.markdown);
-    // The probe must replace the body, not dump it: a probe block is
-    // a handful of lines, the raw passthrough would carry the full
-    // document text.
-    assert!(out.markdown.len() < 400, "len {}", out.markdown.len());
-}
-
-// Hits were BYTE offsets (regex m.start(), or offsets into a
-// separately lowercased haystack), but context_around treated them
-// as CHAR indices. On any page with non-ASCII text before the match
-// the excerpt window landed after the real hit -- "MATCH: 1 hit"
-// followed by an excerpt that doesn't contain the pattern.
-fn probe_excerpt(text: &str, pattern: &str) -> String {
-    let opts = ExtractOptions {
-        must_contain: Some(pattern.into()),
-        ..Default::default()
-    };
-    let out = probe_render(text, opts.probe_pattern(), opts.probe_is_regex());
-    assert!(out.starts_with("probe: MATCH"), "{out}");
-    out.lines()
-        .find(|l| l.starts_with("[1]"))
-        .unwrap_or_else(|| panic!("no excerpt line:\n{out}"))
-        .to_string()
-}
-
-#[test]
-fn probe_excerpt_points_at_the_hit_on_non_ascii_pages() {
-    let prefix = "Асинхронная среда выполнения для языка Rust. ".repeat(6);
-    let text = format!("{prefix}The tokio runtime schedules tasks. {prefix}");
-    let sub = probe_excerpt(&text, "tokio runtime");
-    assert!(sub.contains("tokio runtime"), "substring excerpt: {sub}");
-    let re = probe_excerpt(&text, "/tokio\\s+runtime/");
-    assert!(re.contains("tokio runtime"), "regex excerpt: {re}");
-}
-
-#[test]
-fn probe_excerpt_survives_case_folding_that_changes_byte_length() {
-    // 'İ' (2 bytes) lowercases to "i̇" (3 bytes): the old lowercased
-    // haystack drifted further from the real text with every one.
-    let prefix = "İSTANBUL İZMİR İÇEL ".repeat(40);
-    let text = format!("{prefix}Needle here. {prefix}");
-    let sub = probe_excerpt(&text, "needle");
-    assert!(sub.contains("Needle"), "excerpt: {sub}");
-}
-
-// A multi-KB substring pattern expands past the regex size limit
-// under (?i); it must still be searched as a literal, not reported
-// as an "invalid regex".
-#[test]
-fn probe_substring_longer_than_the_regex_size_limit_still_matches() {
-    let needle = "проверка ".repeat(800); // ~14 KB, Cyrillic
-    let text = format!("intro {needle} outro");
-    let out = probe_render(&text, needle.trim_end(), false);
-    assert!(
-        out.starts_with("probe: MATCH : 1 hit"),
-        "{}",
-        &out[..out.len().min(120)]
-    );
-    let miss = probe_render("nothing here", needle.trim_end(), false);
-    assert!(miss.starts_with("probe: NO MATCH"), "{miss}");
-}
 
 /// Issue #49: links and formatting nested inside em/strong were
 /// flattened away by `plain()`. Nested inline markup must survive:
@@ -2725,28 +2208,6 @@ async fn extract_off_worker_parses_pdf_off_the_runtime_and_html_inline() {
 }
 
 #[test]
-fn wave450_outline_respects_the_output_budget() {
-    let headings = (0..100)
-        .map(|n| {
-            format!("<h2>Section number {n}</h2><p>Some actual section content for readers.</p>")
-        })
-        .collect::<String>();
-    let html = format!("<html><title>Outline test</title><main>{headings}</main></html>");
-    let opts = ExtractOptions {
-        toc: true,
-        max_chars: Some(300),
-        ..Default::default()
-    };
-    let ex = super::extract(html.as_bytes(), "text/html", "https://example.org/", &opts).unwrap();
-    assert!(
-        ex.markdown.len() < 450,
-        "outline leaked {} chars",
-        ex.markdown.len()
-    );
-    assert!(ex.next_offset.is_some());
-}
-
-#[test]
 fn wave450_adapter_token_estimate_measures_the_returned_slice() {
     let body = "real post body with details. ".repeat(100);
     let html = format!(
@@ -2852,26 +2313,6 @@ fn report_audit_focus_fallback_retains_lead_table_and_source_order() {
 }
 
 #[test]
-fn report_audit_selector_cannot_be_ignored_by_json_or_pdf() {
-    for (body, ct) in [
-        (
-            b"{\"text\":\"real content\"}".as_slice(),
-            "application/json",
-        ),
-        (b"%PDF-1.7".as_slice(), "application/pdf"),
-    ] {
-        let opts = ExtractOptions {
-            selector: Some("article".into()),
-            ..Default::default()
-        };
-        assert!(matches!(
-            extract(body, ct, "https://example.com/document", &opts),
-            Err(ExtractError::SelectorNoMatch { inspected: 0, .. })
-        ));
-    }
-}
-
-#[test]
 fn reliability_links_survive_loose_content_headings_and_table_cells() {
     let html = r#"<html><body><main><h1>Evidence</h1>
     <div>Research cites <a href="https://loose.example/report">the original report</a> for verification and factual context.</div>
@@ -2928,4 +2369,58 @@ fn reliability_short_article_focus_preserves_specific_evidence() {
     assert!(focused.markdown.contains("Retry-After"));
     assert!(!focused.markdown.contains("showing full content"));
     assert!(focused.markdown.len() * 2 < full.markdown.len());
+}
+
+#[test]
+fn a_wall_fails_extraction_whatever_the_window() {
+    // fetch's views run on a successful extraction only, so the wall
+    // verdict comes first for any view; a tiny window cannot hide it.
+    let html = "<html><head><title>Blocked</title></head><body><main><h1>You've been blocked by network security.</h1><p>To continue, log in to your Reddit account or use your developer token.</p></main></body></html>";
+    for opts in [
+        ExtractOptions::default(),
+        ExtractOptions {
+            max_chars: Some(200),
+            offset: 150,
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            extract(
+                html.as_bytes(),
+                "text/html",
+                "https://old.reddit.com/r/rust/",
+                &opts
+            )
+            .is_err(),
+            "a wall must fail before pagination"
+        );
+    }
+    let article = format!("<article><h1>Network security guide</h1>{}<p>The phrase You've been blocked by network security appears on Reddit's block screen.</p></article>", "<p>This guide explains secure connections, authentication and debugging with real application examples.</p>".repeat(25));
+    assert!(
+        extract(
+            article.as_bytes(),
+            "text/html",
+            "https://example.com",
+            &ExtractOptions::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn media_is_recorded_for_ocr_but_never_rendered() {
+    let html = r#"<html><body><article>
+<p>The system has three services that talk over a queue, described below in full detail for operators.</p>
+<figure>
+<img src="https://example.com/diagram.png" alt="Architecture diagram">
+<figcaption>System architecture overview</figcaption>
+</figure>
+</article></body></html>"#;
+    let r = extract_html(html);
+    assert!(!r.markdown.contains("diagram.png"), "{}", r.markdown);
+    assert!(
+        r.images.iter().any(|(_, src)| src.ends_with("diagram.png")),
+        "{:?}",
+        r.images
+    );
 }

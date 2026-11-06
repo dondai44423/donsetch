@@ -2,7 +2,7 @@
   "capabilities": {
     "tools": {}
   },
-  "instructions": "Web access.\n- web_fetch: Fetch a URL as clean markdown (in-process JS, PDF, honest failures)\n- web_search: Web search : keyless aggregation or optional configured providers\n- web_crawl: Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)\n- web_screenshot: Open a URL in a real browser, return the page as PNG\n\nMCP results contain content blocks. Join text blocks: leading [meta] JSON, then source evidence. Some bridges flatten them to a string. Parse the first line for state; the rest is source text. Failures return ok:false + code + next_action; protocol faults throw.",
+  "instructions": "Web access.\n- web_fetch: Read a URL as markdown, or only the part you need (in-process JS, PDF, honest failures)\n- web_search: Web search : keyless aggregation or optional configured providers\n- web_crawl: Crawl a site into markdown (sitemap-aware, focus-ranked, resumable)\n- web_screenshot: Open a URL in a real browser, return the page as PNG\n\nMCP results contain content blocks. Join text blocks: leading [meta] JSON, then source evidence. Some bridges flatten them to a string. Parse the first line for state; the rest is source text. Failures return ok:false + code + next_action; protocol faults throw.",
   "protocolVersion": "2026-07-28",
   "serverInfo": {
     "name": "donsetch",

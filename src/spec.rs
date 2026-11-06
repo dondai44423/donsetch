@@ -1,5 +1,5 @@
-//! Tool spec table : the single source of truth for the three
-//! agent tools (fetch, search, crawl).
+//! Tool spec table : the single source of truth for the four
+//! agent tools (fetch, search, crawl, screenshot).
 //!
 //! Both frontends are GENERATED from this table:
 //!
@@ -17,6 +17,7 @@
 //! absent from the generated JSON, so the core's own defaults
 //! remain the single default source.
 
+use crate::extract::view;
 use clap::{Arg, ArgAction};
 use serde_json::{Value, json};
 
@@ -30,9 +31,9 @@ pub enum ParamKind {
     Str,
     /// JSON integer; CLI `--flag <N>` (usize-parsed).
     Usize,
-    /// JSON string OR array of strings; CLI `--flag <value>` /
-    /// positional bulk. Schema type: ["string", "array"].
-    StrOrList,
+    /// JSON string OR array of at most N strings; CLI repeatable
+    /// `--flag <value>` (one value sends a string) or positional bulk.
+    StrOrListMax(usize),
     /// JSON string from a fixed set; CLI validated choices.
     Enum(&'static [&'static str]),
     /// JSON array of strings; CLI repeatable + comma-splittable.
@@ -95,28 +96,33 @@ pub struct ToolSpec {
 }
 
 // ── web_fetch ────────────────────────────────────────────────
+//
+// Designed from the agent's seat: each option answers one question at the
+// fewest tokens. must_contain (is it there?), focus (where is it?), toc and
+// section (what is here, then one part), the page window (offset,
+// max_chars), links, since_last, image_text and deadline_ms.
 
 const FETCH_PARAMS: &[ParamSpec] = &[
     ParamSpec {
         name: "url",
         flag: "",
-        kind: ParamKind::StrOrList,
+        kind: ParamKind::StrOrListMax(12),
         cli: CliKind::PositionalBulk,
         required: true,
-        help: "URL to fetch: http(s) URL, a handle (L/S from earlier results), or an array of up to 12 for one parallel batch call.",
+        help: "The page to read: an http(s) URL, or a handle from earlier output (S-handles from search, L-handles from links). Several URLs read in parallel as one batch (up to 12); each page gets the same view, and max_chars is the batch total.",
         mcp_help: Some(
-            "One http(s) URL, an S/L handle returned earlier, or an array of up to 12 URLs or handles for one batch read.",
+            "http(s) URL or an S/L handle from earlier output; an array of up to 12 reads them in parallel, each with the same view, max_chars shared across them.",
         ),
     },
     ParamSpec {
-        name: "budget_tokens",
-        flag: "budget-tokens",
-        kind: ParamKind::Usize,
+        name: "must_contain",
+        flag: "must-contain",
+        kind: ParamKind::StrOrListMax(view::MUST_CONTAIN_MAX_TERMS),
         cli: CliKind::Flag,
         required: false,
-        help: "Batch mode (array url): total output token budget shared across all results (200-500k). DonSeTch allocates it across pages by size : small pages stay whole, big ones get sliced with a resume note. Without it each page uses max_chars independently.",
+        help: "Check that the page says something, without reading it. A phrase matches case-insensitively, whatever the spacing, line breaks, quote style, dash style or markdown emphasis; /regex/ (flags imsx) matches a pattern. Repeat the flag for up to 8 terms. The answer is one line per term: found, how often, in which sections (sN, as toc numbers them) with short excerpts; or not found, with a hint when the phrase's words are on the page apart. The verdict is MATCH, PARTIAL, NO MATCH, or UNVERIFIED when part of the page could not be read (a missing term may be there). Searches the whole page, or only --section. Not with --focus, --toc, --offset or --since-last.",
         mcp_help: Some(
-            "Shared output-token limit for a URL batch (200-500000). Omit for one URL. Truncated members return continuation information.",
+            "Presence check instead of reading: a phrase (case, spacing, quote/dash style and markdown emphasis ignored), a /regex/ (flags imsx), or a list of up to 8. Returns per term: found ×count, sections (sN) and excerpts; or not found, with a near-miss hint. Verdict match|partial|no_match|unverified (part of the page unread: absence proves nothing). Searches the whole page, or only section. Not with focus, toc, offset or since_last.",
         ),
     },
     ParamSpec {
@@ -125,49 +131,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Relevance query : selects matching passages, table rows and unordered list items with section context using BM25. A cached cross-encoder may rescue a lexical miss on pages of at most 8 blocks; fetch never downloads a model. No match or less than 20% saving returns full content with a notice; toc + section narrows deterministically when focus falls back.",
+        help: "Return only the passages that answer a question or match keywords, best first, grouped under their section path (§sN · Heading › Sub). Paragraphs, list items, table rows (with the table header) and code are ranked separately; a section whose heading names the topic ranks all its passages. The header line counts the passages kept and names query words the page does not contain. No match returns the outline instead of the page. With --section, ranks inside that part.",
         mcp_help: Some(
-            "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section.",
-        ),
-    },
-    ParamSpec {
-        name: "mode",
-        flag: "mode",
-        kind: ParamKind::Enum(&["scan", "read", "deep"]),
-        cli: CliKind::Flag,
-        required: false,
-        help: "Byte budget for the extracted source markdown (~4 bytes per token): scan=800, read=4000, deep=16000. Explicit max_chars wins; omission keeps the 16000 default. All presets return next_offset when truncated; budget_tokens is the token-denominated budget.",
-        mcp_help: None,
-    },
-    ParamSpec {
-        name: "max_chars",
-        flag: "max-chars",
-        kind: ParamKind::Usize,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Max extracted-markdown bytes to return (default 16000; ~4 bytes per token). Truncated pages include next_offset for resumption.",
-        mcp_help: None,
-    },
-    ParamSpec {
-        name: "offset",
-        flag: "offset",
-        kind: ParamKind::Usize,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Resume from a previous response's next_offset to continue a truncated page. It is a source-document offset, not the returned text's length : pass it back verbatim.",
-        mcp_help: Some(
-            "Continue from a previous next_offset. Reuse the same URL and any focus, section, selector or rendering fields from that fetch.",
-        ),
-    },
-    ParamSpec {
-        name: "section",
-        flag: "section",
-        kind: ParamKind::Str,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Heading name (substring, case-insensitive) or an sN id from a toc outline : return only that section. Use after toc to target a specific part.",
-        mcp_help: Some(
-            "Heading name (substring, case-insensitive) or an sN id from a toc outline: return only that section. Use after toc.",
+            "Question or keywords: returns only matching passages, best first, under their §sN section path, and names query words absent from the page. A miss returns the outline, never the whole page. With section, ranks inside that part.",
         ),
     },
     ParamSpec {
@@ -176,75 +142,42 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "true = heading outline only, no body text. Read structure first, then target with section or focus.",
+        help: "Return the heading outline instead of the text: each heading with its id ([s3]) and size, nested by level. Read it first on a long page, then fetch one part with --section s3. With --section, the outline of that part only.",
         mcp_help: Some(
-            "Return only the heading outline. Use as a standalone first read, then make a new fetch with section or focus.",
+            "Return the heading outline: [sN] ids with sizes, no body. With section, that part's outline only.",
         ),
     },
     ParamSpec {
-        name: "deadline_ms",
-        flag: "deadline-ms",
+        name: "section",
+        flag: "section",
+        kind: ParamKind::Str,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Read one part of the page: an id from --toc (s3), or heading text (an exact heading first, else the first heading containing it; other matches are named). The part runs to the next heading of the same or a higher level, subsections included. A name that matches no heading returns the outline.",
+        mcp_help: Some(
+            "One part: an sN id from toc, or heading text (exact first, else first containing it). Includes subsections; no match returns the outline.",
+        ),
+    },
+    ParamSpec {
+        name: "offset",
+        flag: "offset",
         kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Hard time budget for this call in ms (500-600000). On expiry: honest deadline error + next_action : never a silent hang. Batch mode: per-URL budget.",
+        help: "Continue a response that was cut at max_chars: pass the next_offset it returned, with the same URL and the same view options.",
         mcp_help: Some(
-            "Hard time budget in ms (500-600000). On expiry: honest error with next_action, never a silent hang. Batch mode: per-URL budget.",
+            "Continue a cut-off response: its next_offset, with the same url and view arguments.",
         ),
     },
     ParamSpec {
-        name: "since_last",
-        flag: "since-last",
-        kind: ParamKind::SetTrue,
+        name: "max_chars",
+        flag: "max-chars",
+        kind: ParamKind::Usize,
         cli: CliKind::Flag,
         required: false,
-        help: "Change check instead of full read: if the page is unchanged since your last fetch, output collapses to a one-line verdict; if changed, you get the section-level delta (added/removed/changed). Refetch without it for full content. Monitoring/re-verification at ~zero tokens. Tracked per URL; a URL with no prior baseline is labeled in the output.",
+        help: "Most characters to return (200-1048576; default 16000, about 4000 tokens). A longer result ends with next_offset. For several URLs it is the total for the batch (default 48000): small pages stay whole and large ones are cut, each with its own resume note.",
         mcp_help: Some(
-            "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page; a URL with no prior baseline says so (changed:\"no_baseline\" when the read has no change tracking, else a no-prior-snapshot notice). History is tracked per URL (crawl's since_last is per site). Do not combine with reading filters or rendering fields.",
-        ),
-    },
-    ParamSpec {
-        name: "stitch",
-        flag: "stitch",
-        kind: ParamKind::SetTrue,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Multi-page articles: follow rel=next pagination and collect up to 6 same-host parts within 1 MiB; output obeys max_chars and offset, with next_offset or next_part for unfinished content with *(part N)* markers, instead of re-fetching page by page. Same-host only.",
-        mcp_help: Some(
-            "Read up to 6 parts of a paginated article. Output obeys max_chars; next_offset resumes collected text and next_part identifies uncollected content. Enable only when the requested source spans article pages.",
-        ),
-    },
-    ParamSpec {
-        name: "image_text",
-        flag: "image-text",
-        kind: ParamKind::SetTrue,
-        cli: CliKind::Flag,
-        required: false,
-        help: "OCR the page's content images (up to 4) and append an 'image text' section. For infographics/comics/screenshots whose meaning IS the image. Costs extra fetch+compute : only when image content matters.",
-        mcp_help: Some(
-            "Extract words from up to 4 content images. Enable only when requested evidence is inside an infographic, screenshot, comic or other image.",
-        ),
-    },
-    ParamSpec {
-        name: "must_contain",
-        flag: "must-contain",
-        kind: ParamKind::Str,
-        cli: CliKind::Flag,
-        required: false,
-        help: "Probe mode: verify the page mentions a string/pattern WITHOUT loading it into context. Output = MATCH/NO-MATCH verdict + up to 3 short context excerpts. Case-insensitive substring, or /regex/ (e.g. \"/CVE-2026-\\d+/\"). Full fetch still happens (walls, PDFs) : only the output collapses. For verification questions, not reading.",
-        mcp_help: Some(
-            "Case-insensitive string or /regex/ presence check. Returns MATCH/NO-MATCH and up to 3 excerpts instead of the full page; use for verification, not general reading.",
-        ),
-    },
-    ParamSpec {
-        name: "selector",
-        flag: "selector",
-        kind: ParamKind::Str,
-        cli: CliKind::Flag,
-        required: false,
-        help: "CSS selector : extract only from matching elements. Narrows scope precisely.",
-        mcp_help: Some(
-            "CSS selector for extracting only matching elements. Set only when the selector is known; focus may filter passages inside that region.",
+            "Most characters returned (default 16000, ~4 per token); longer results end with next_offset. For a url array it is the batch total (default 48000).",
         ),
     },
     ParamSpec {
@@ -253,22 +186,82 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "Include [text](url) link URLs. Default false : saves ~30% tokens. Enable only when you need the URLs.",
+        help: "Keep the page's links as [text](handle): a short L-handle that fetch accepts as its url, to follow a link without copying it. Off by default: link text only, which saves about a third of the tokens.",
         mcp_help: Some(
-            "Include destination URLs found inside page content. The fetched page's own citation URL is always returned separately; enable only when outbound targets are requested evidence.",
+            "Keep links as [text](L-handle); pass a handle as url to follow it. Off: link text only (~30% fewer tokens).",
         ),
     },
     ParamSpec {
-        name: "media",
-        flag: "media",
+        name: "since_last",
+        flag: "since-last",
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "Include image alt text and sources. Default false.",
+        help: "Check a page you read before for changes: one line when it is unchanged, else only the sections that changed. Every read records the page, so any earlier fetch of the URL is the baseline. On its own: not with a view option.",
         mcp_help: Some(
-            "Include image alt text and source URLs. Use image_text instead when words inside an image must be read.",
+            "Change check against your previous read of this url: an unchanged line, or only the changed sections. Not with view arguments.",
         ),
     },
+    ParamSpec {
+        name: "image_text",
+        flag: "image-text",
+        kind: ParamKind::SetTrue,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Read the words in the page's first 4 content images (OCR) into an 'image text' section, which every view searches: charts, screenshots, scanned notices, comics. Slower; for pages whose evidence is an image.",
+        mcp_help: Some(
+            "OCR the first 4 content images into an 'image text' section that every view searches. Slower; only when the evidence is in an image.",
+        ),
+    },
+    ParamSpec {
+        name: "deadline_ms",
+        flag: "deadline-ms",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Hard time limit for the call in milliseconds (500-600000). On expiry the answer is a deadline error naming what was tried, never a hang. For several URLs, the limit applies to each.",
+        mcp_help: Some(
+            "Hard time limit in ms (500-600000): a deadline error on expiry, never a hang. Per URL in a batch.",
+        ),
+    },
+];
+
+/// Arguments `web_fetch` no longer takes, with what replaces each. An agent
+/// that learned one from an older schema is told, not just refused.
+const REMOVED_FETCH_PARAMS: &[(&str, &str)] = &[
+    (
+        "archive",
+        "archive was removed: web_fetch returns live page content only",
+    ),
+    (
+        "tier",
+        "tier was removed: every web_fetch runs the local engine, with no browser tier",
+    ),
+    (
+        "actions",
+        "actions was removed: every web_fetch runs the local engine, with no browser drive",
+    ),
+    ("shot", "shot was removed: use web_screenshot for captures"),
+    (
+        "budget_tokens",
+        "budget_tokens was removed: max_chars is the total for a url array",
+    ),
+    (
+        "mode",
+        "mode was removed: set max_chars (about 4 characters per token)",
+    ),
+    (
+        "stitch",
+        "stitch was removed: fetch the next part named by next_page in [meta]",
+    ),
+    (
+        "selector",
+        "selector was removed: use section (a heading or an sN id from toc) or focus",
+    ),
+    (
+        "media",
+        "media was removed: image_text reads the words in images",
+    ),
 ];
 
 // ── web_search ───────────────────────────────────────────────
@@ -537,16 +530,17 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "web_fetch",
         cli_cmd: "fetch",
-        summary: "Fetch a URL as clean markdown (in-process JS, PDF, honest failures)",
-        description: "Fetch one URL (or a batch) as clean markdown : use when you have a specific URL to read. To find URLs use web_search; for whole sites use web_crawl.\n\nURL forms: a URL · an L-handle from earlier fetch output ([text](LxK7mP2q) → fetch LxK7mP2q) · an S-handle from search (fetch the S-handle shown next to a result) · an array of up to 12 for ONE parallel batch call (share a budget with budget_tokens).\n\nPick the CHEAPEST reading mode for the job:\n- Verification question (\"does it mention X?\") → must_contain=\"X\" (or /regex/) : returns MATCH/NO-MATCH + ≤3 excerpts, ~60 tokens.\n- Don't know where it is in a long page → toc=true (outline with section ids+sizes) → section=\"s3\" or section=\"heading text\" for just that part.\n- Know the topic → focus=\"query\" : relevant passages; low savings or no matches return full content with a notice.\n- Just reading → default full page.\n\nRe-checking a page you fetched before: since_last=true → one-line unchanged verdict, or the section-level diff if it changed (~30 tokens). The leading [meta] JSON carries the changed verdict on every fetch.\n\nMulti-page articles (rel=next chains): stitch=true collects up to 6 same-host parts with *(part N)* markers. max_chars still caps output; next_offset resumes collected text, next_part identifies an unfinished part.\n\nReliability: PDFs (even scanned, ≤100MB) auto-parsed; JSON endpoints (`.json` URLs or JSON responses) stay at the local fetch; bot walls fail honestly and fast (a configured unlocker gets one try); a JS-only page runs its scripts in the in-process engine before it is given up on. image_text=true OCRs content images (infographics/comics).\n\nTime control: deadline_ms caps any fetch (honest deadline error, never a hang). Send _meta.progressToken for per-URL progress on batches. Long output: [meta].next_offset → call again with offset.\n\nDomain intelligence: reddit threads/listings, npm/PyPI/crates.io/Go/RubyGems pages, GitHub issues/releases/commits, Stack Overflow, Wikipedia infoboxes and docs sites are auto-restructured from each site's best source : no special params, it just returns clean structure. Operators can add more sites with local JSON adapters (`donsetch adapters`).\n\nResponse: by default content contains a leading [meta] JSON line followed by the source document. State includes url, ok, content_ok, content_kind, read_status, content_complete, partial/item counts when known, changed, next_offset, PDF summary, stitch count, thin (present only when the read is a suspected shell), and error code/next_action. Fetch mode, timing, quality, adapter and escalation diagnostics live in _meta.",
-        mcp_description: "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints locally; pages run their scripts in-process and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
+        summary: "Read a URL as markdown, or only the part you need (in-process JS, PDF, honest failures)",
+        description: "Read one URL, or up to 12 in parallel, as clean markdown: a web page (its scripts run in-process when it needs them), a PDF (scanned pages OCRed), a feed, or a JSON endpoint. Sites with a structured source (GitHub, Reddit, Stack Overflow, Wikipedia, npm/PyPI/crates.io and other registries, docs sites) come back from that source. Use web_search to find URLs and web_crawl for many pages of one site.\n\nViews, cheapest first. Every view reads the whole document and projects it, the same way for every kind of source:\n- must_contain: is it there? A phrase or /regex/, or up to 8 of them. Per term: found ×count, the sections it is in and excerpts; or not found, with a hint when a phrase's words are on the page apart. Verdict match, partial, no_match, or unverified when part of the page could not be read (a listing that loaded only some items, a document past the read limit), because then absence proves nothing. About 60 tokens instead of the page.\n- focus: where is it? Only the passages that answer the question, best first, grouped under their section path, each table row with its header. The header line names query words the page lacks. A miss returns the outline, never the page.\n- toc, then section: what is here, then one part. The outline numbers headings s1, s2, ... with sizes; section takes an id or heading text, subsections included; a miss returns the outline.\n- No view: the page.\nmax_chars caps the response (default 16000 characters); a cut-off response ends with next_offset, and the same call with offset continues it. For a url array max_chars is the batch total (default 48000). A paginated article names its next part in next_page.\n\nlinks keeps link targets as handles fetch accepts. since_last compares with your previous read of the URL and returns only what changed. image_text OCRs the first 4 content images into the document, so every view searches them. deadline_ms bounds the call.\n\nResponse: a leading [meta] JSON line, then the evidence. [meta] holds url (cite it), ok, content_ok, read_status (content, partial, thin, probe, focus, section, outline), content_complete, next_offset, next_page, the view's state (must_contain verdict and counts, focus passages kept of total, section id or not_found), changed, and on failure code, errorKind and next_action. Login walls, paywalls, bot walls and missing pages fail fast and name what stopped them. Transport and timing diagnostics live in _meta.",
+        mcp_description: "Read a page, PDF or feed as markdown, or only the part that answers the question. Text starts with [meta] JSON, then evidence; cite [meta].url. ok:false, content_ok:false or thin:true is unresolved: follow next_action.\nCheapest view first:\n1. Is X there? must_contain: per-term found ×count with sections and excerpts, or not found. unverified = part of the page was unread, so absence proves nothing.\n2. Where is X? focus: matching passages only, best first, under their section path; a miss returns the outline.\n3. Long page: toc (sN ids, sizes), then section=\"sN\".\n4. No view: the page. A cut-off response has next_offset: repeat the call with offset. next_page names a paginated article's next part.\nWalls (login, paywall, bot) fail fast and say which. Sites with a structured source (GitHub, Reddit, Stack Overflow, Wikipedia, registries) come back from it.",
         params: FETCH_PARAMS,
         examples: &[
             "donsetch fetch https://example.com/article",
-            "donsetch fetch https://long-docs-page --focus \"error handling\"",
-            "donsetch fetch https://long-docs-page --offset 16000",
-            "donsetch fetch https://a.com/x https://b.com/y   # bulk fetch",
-            "donsetch fetch https://example.com/changelog --must-contain \"breaking\"",
+            "donsetch fetch https://example.com/changelog --must-contain \"breaking change\" --must-contain \"/CVE-\\d{4}-\\d+/\"",
+            "donsetch fetch https://docs.example.com/guide --focus \"retry backoff limits\"",
+            "donsetch fetch https://docs.example.com/guide --toc",
+            "donsetch fetch https://docs.example.com/guide --section s4",
+            "donsetch fetch https://a.example/x https://b.example/y --max-chars 20000",
         ],
     },
     ToolSpec {
@@ -610,23 +604,10 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
             // A removed surface gets a removal note, not a bare unknown:
             // an agent that learned `archive` from an older schema must
             // learn it is gone (live web only), not keep retrying it.
-            if name == "archive" && tool.name == "web_fetch" {
-                return Err("archive was removed: web_fetch returns live page content only".into());
-            }
-            if name == "tier" && tool.name == "web_fetch" {
-                return Err(
-                    "tier was removed: every web_fetch runs the local engine, with no browser tier"
-                        .into(),
-                );
-            }
-            if name == "actions" && tool.name == "web_fetch" {
-                return Err(
-                    "actions was removed: every web_fetch runs the local engine, with no browser drive"
-                        .into(),
-                );
-            }
-            if name == "shot" && tool.name == "web_fetch" {
-                return Err("shot was removed: use web_screenshot for captures".into());
+            if tool.name == "web_fetch"
+                && let Some((_, note)) = REMOVED_FETCH_PARAMS.iter().find(|(n, _)| n == name)
+            {
+                return Err((*note).into());
             }
             return Err(format!(
                 "unknown parameter {name:?}; use the current tools/list schema"
@@ -658,7 +639,7 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
         let valid = match p.kind {
             ParamKind::Str => value.is_string(),
             ParamKind::Usize => value.as_u64().is_some_and(|n| usize::try_from(n).is_ok()),
-            ParamKind::StrOrList => value.is_string() || strings(12),
+            ParamKind::StrOrListMax(max) => value.is_string() || strings(max),
             ParamKind::StrList => strings(usize::MAX),
             ParamKind::StrListMax(max) => strings(max),
             ParamKind::SetTrue | ParamKind::SetFalse => value.is_boolean(),
@@ -686,12 +667,12 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
         let mut schema = serde_json::Map::new();
         let ty = match p.kind {
             ParamKind::Str | ParamKind::Enum(_) => "string",
-            ParamKind::StrOrList => {
+            ParamKind::StrOrListMax(max) => {
                 schema.insert(
                     "anyOf".into(),
                     json!([
                         { "type": "string" },
-                        { "type": "array", "items": { "type": "string" } }
+                        { "type": "array", "items": { "type": "string" }, "maxItems": max }
                     ]),
                 );
                 schema.insert("description".into(), json!(p.mcp_help.unwrap_or(p.help)));
@@ -751,11 +732,11 @@ pub fn cli_command(tool: &ToolSpec) -> clap::Command {
     // different voice.
     let cli_long = match tool.cli_cmd {
         "fetch" => {
-            "Fetch one URL (or several) as clean markdown. \
-Redirects, bot walls and JS-shells are handled in one local engine; \
-the output tells you what happened at every step. \
-Use --focus to narrow the content, --must-contain for a cheap \
-probe, or pass a URL from donsetch search to fetch that result. \
+            "Read a URL (or several) as clean markdown, or only the part you need. \
+--must-contain checks that the page says something without printing it; \
+--focus prints only the passages that answer a question; \
+--toc prints the outline and --section one part of it. \
+Pass a URL from donsetch search to read that result. \
 MCP search handles belong to their server session and cannot be reused \
 in a separate CLI invocation."
         }
@@ -836,7 +817,8 @@ fn cli_arg(p: &ParamSpec) -> Arg {
         CliKind::Flag => {
             let arg = arg.long(p.flag);
             match p.kind {
-                ParamKind::Str | ParamKind::StrOrList => arg.value_name("VALUE"),
+                ParamKind::Str => arg.value_name("VALUE"),
+                ParamKind::StrOrListMax(_) => arg.value_name("VALUE").action(ArgAction::Append),
                 ParamKind::Usize => arg.value_name("N").value_parser(clap::value_parser!(usize)),
                 ParamKind::Enum(variants) => {
                     arg.value_name("VALUE")
@@ -881,9 +863,24 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
                 }
             }
             CliKind::Flag => match p.kind {
-                ParamKind::Str | ParamKind::StrOrList | ParamKind::Enum(_) => {
+                ParamKind::Str | ParamKind::Enum(_) => {
                     if let Some(v) = m.get_one::<String>(p.name) {
                         map.insert(p.name.into(), json!(v));
+                    }
+                }
+                ParamKind::StrOrListMax(_) => {
+                    let items: Vec<&str> = m
+                        .get_many::<String>(p.name)
+                        .map(|v| v.map(String::as_str).collect())
+                        .unwrap_or_default();
+                    match items.as_slice() {
+                        [] => {}
+                        [one] => {
+                            map.insert(p.name.into(), json!(one));
+                        }
+                        many => {
+                            map.insert(p.name.into(), json!(many));
+                        }
                     }
                 }
                 ParamKind::Usize => {
@@ -923,16 +920,25 @@ mod tests {
         let tool = super::by_cli_cmd("fetch").unwrap();
         let schema = mcp_schema(tool);
         let props = &schema["inputSchema"]["properties"];
-        for (name, note) in [
-            ("actions", "actions was removed"),
-            ("shot", "shot was removed"),
+        for (name, replacement) in [
+            ("actions", "local engine"),
+            ("shot", "web_screenshot"),
+            ("budget_tokens", "max_chars"),
+            ("mode", "max_chars"),
+            ("stitch", "next_page"),
+            ("selector", "section"),
+            ("media", "image_text"),
         ] {
             assert!(props.get(name).is_none(), "{name} must leave the schema");
             let mut args = serde_json::json!({ "url": "https://example.com" });
             args[name] = serde_json::json!("x");
             let err = check_args(tool, &args).expect_err("removed param must be refused");
-            assert!(err.contains(note), "{name}: {err}");
-            let flag = format!("--{name}");
+            assert!(
+                err.starts_with(&format!("{name} was removed")),
+                "{name}: {err}"
+            );
+            assert!(err.contains(replacement), "{name}: {err}");
+            let flag = format!("--{}", name.replace('_', "-"));
             let cli = super::cli_command(tool)
                 .try_get_matches_from(["fetch", "https://example.com", flag.as_str(), "x"])
                 .expect_err("removed flag must leave the CLI");
@@ -941,6 +947,113 @@ mod tests {
         let err = check_args(tool, &serde_json::json!({ "nope": 1 }))
             .expect_err("unknown param must be refused");
         assert!(err.contains("unknown parameter"), "{err}");
+    }
+
+    #[test]
+    fn web_fetch_offers_exactly_its_option_set() {
+        let schema = mcp_schema(fetch_tool());
+        let mut names: Vec<&str> = schema["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "deadline_ms",
+                "focus",
+                "image_text",
+                "links",
+                "max_chars",
+                "must_contain",
+                "offset",
+                "section",
+                "since_last",
+                "toc",
+                "url",
+            ]
+        );
+        assert_eq!(schema["inputSchema"]["required"], json!(["url"]));
+        assert_eq!(schema["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn the_fetch_contract_names_every_option_and_stays_compact() {
+        let tool = fetch_tool();
+        for p in tool.params {
+            assert!(
+                tool.description.contains(p.name),
+                "the full description must explain {}",
+                p.name
+            );
+            assert!(p.mcp_help.is_some(), "{} needs a model-facing line", p.name);
+        }
+        // Every connected client pays for the schema on every turn.
+        let bytes = mcp_schema(tool).to_string().len();
+        assert!(bytes < 3_600, "web_fetch schema grew to {bytes} bytes");
+    }
+
+    #[test]
+    fn must_contain_takes_one_term_or_a_bounded_list_of_strings() {
+        let tool = fetch_tool();
+        let prop = &mcp_schema(tool)["inputSchema"]["properties"]["must_contain"];
+        assert_eq!(prop["anyOf"][0]["type"], "string");
+        assert_eq!(prop["anyOf"][1]["maxItems"], 8);
+        let url = |extra: Value| {
+            let mut args = json!({ "url": "https://example.com" });
+            args["must_contain"] = extra;
+            check_args(tool, &args)
+        };
+        assert_eq!(url(json!("rate limit")), Ok(()));
+        assert_eq!(url(json!(["a", "b", "/c+/"])), Ok(()));
+        let eight: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+        assert_eq!(url(json!(eight)), Ok(()));
+        let nine: Vec<String> = (0..9).map(|i| format!("t{i}")).collect();
+        assert!(url(json!(nine)).is_err());
+        assert!(url(json!(["a", 1])).is_err());
+        assert!(url(json!(true)).is_err());
+        // A url batch keeps its own bound.
+        let thirteen: Vec<String> = (0..13).map(|i| format!("https://e.test/{i}")).collect();
+        assert!(check_args(tool, &json!({ "url": thirteen })).is_err());
+    }
+
+    #[test]
+    fn the_cli_sends_one_term_as_a_string_and_repeats_as_a_list() {
+        let tool = fetch_tool();
+        let parse = |argv: &[&str]| {
+            matches_to_json(tool, &cli_command(tool).try_get_matches_from(argv).unwrap())
+        };
+        let one = parse(&["fetch", "https://e.test/", "--must-contain", "rate limit"]);
+        assert_eq!(one["must_contain"], "rate limit");
+        let two = parse(&[
+            "fetch",
+            "https://e.test/",
+            "--must-contain",
+            "a",
+            "--must-contain",
+            "/b+/",
+        ]);
+        assert_eq!(two["must_contain"], json!(["a", "/b+/"]));
+        let viewed = parse(&[
+            "fetch",
+            "https://e.test/",
+            "--toc",
+            "--section",
+            "s2",
+            "--max-chars",
+            "900",
+        ]);
+        assert_eq!(
+            viewed,
+            json!({"url": "https://e.test/", "toc": true, "section": "s2", "max_chars": 900})
+        );
+        assert!(
+            parse(&["fetch", "https://e.test/"])
+                .get("must_contain")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1031,7 +1144,9 @@ mod tests {
         // must stay discoverable (the main knobs named) without
         // borrowing the agent-facing contract text.
         let long_help = cli_command(fetch_tool()).render_long_help().to_string();
-        assert!(long_help.contains("--focus"), "{long_help}");
+        for flag in ["--focus", "--must-contain", "--toc", "--section"] {
+            assert!(long_help.contains(flag), "{flag}: {long_help}");
+        }
         assert!(long_help.contains("handle"), "{long_help}");
         let long_search = cli_command(search_tool()).render_long_help().to_string();
         assert!(long_search.contains("--intent"), "{long_search}");

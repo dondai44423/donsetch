@@ -295,20 +295,9 @@ pub fn render(meta: &Meta, url: &str, kept: &[&Block], opts: &super::ExtractOpti
                 }
                 out.push('\n');
             }
-            Block::Media { alt, src, .. } => {
-                // Token war: media lines are opt-in. (Segmentation
-                // still records them for on-demand OCR.)
-                if !opts.include_media {
-                    continue;
-                }
-                emit_path(
-                    &mut out,
-                    block.path(),
-                    &mut last_path,
-                    &mut last_was_heading,
-                );
-                out.push_str(&format!("![{alt}]({src})\n\n"));
-            }
+            // Media is never rendered: segmentation records it for
+            // image_text OCR, which reads the words instead.
+            Block::Media { .. } => continue,
         }
         last_was_heading = false;
         prev_heading = matches!(block, Block::Heading { .. });

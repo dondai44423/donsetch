@@ -3,6 +3,7 @@
 //! pipeline : the same claims bench/tokens.py makes live, asserted
 //! deterministically on every build.
 
+use donsetch::extract::view::{self, Term, View};
 use donsetch::extract::{self, ExtractOptions};
 
 fn corpus(name: &str) -> Vec<u8> {
@@ -49,65 +50,99 @@ fn focus_cuts_at_least_40_percent_on_a_long_page() {
     );
 }
 
+/// The whole document of the long corpus page, as fetch extracts it.
+fn wiki_document() -> String {
+    extract::extract(
+        &corpus("wiki-rust.html"),
+        "text/html",
+        "https://fixture.invalid/wiki/Rust_(programming_language)",
+        &opts_with(|o| o.max_chars = Some(8 * 1_048_576)),
+    )
+    .unwrap()
+    .markdown
+}
+
+fn unbounded() -> View {
+    View {
+        max_chars: usize::MAX / 2,
+        ..View::default()
+    }
+}
+
 #[test]
 fn toc_costs_under_5_percent_of_the_full_page() {
     crate::sandbox();
-    let body = corpus("wiki-rust.html");
-    let full = extract::extract(
-        &body,
-        "text/html",
-        "https://fixture.invalid/wiki/Rust_(programming_language)",
-        &opts_with(|o| o.max_chars = Some(200_000)),
-    )
-    .unwrap();
-    let toc = extract::extract(
-        &body,
-        "text/html",
-        "https://fixture.invalid/wiki/Rust_(programming_language)",
-        &opts_with(|o| {
-            o.max_chars = Some(200_000);
-            o.toc = true;
-            o.section = Some("TOC".into());
-        }),
-    )
-    .unwrap();
-    // The toc-only view (section=TOC) must be a small fraction.
+    let doc = wiki_document();
+    let toc = view::render(
+        &doc,
+        &View {
+            toc: true,
+            ..unbounded()
+        },
+        None,
+    );
+    assert!(toc.text.contains("[s1]"), "{}", toc.text);
     assert!(
-        toc.markdown.len() as f64 / full.markdown.len() as f64 <= 0.05,
+        toc.text.len() as f64 / doc.len() as f64 <= 0.05,
         "toc output {} chars vs full {} : >5%",
-        toc.markdown.len(),
-        full.markdown.len()
+        toc.text.len(),
+        doc.len()
+    );
+}
+
+#[test]
+fn focus_view_cuts_at_least_80_percent_on_a_long_page() {
+    crate::sandbox();
+    let doc = wiki_document();
+    let focused = view::render(
+        &doc,
+        &View {
+            focus: Some("ownership borrow checker lifetime".into()),
+            ..unbounded()
+        },
+        None,
+    );
+    assert!(focused.text.contains("borrow"), "{}", focused.text);
+    let saving = 1.0 - focused.text.len() as f64 / doc.len() as f64;
+    assert!(
+        saving >= 0.80,
+        "focus view saving {:.0}% < 80% ({} of {} chars)",
+        saving * 100.0,
+        focused.text.len(),
+        doc.len()
     );
 }
 
 #[test]
 fn probe_output_stays_tiny() {
     crate::sandbox();
-    let body = corpus("wiki-rust.html");
-    let probe = extract::extract(
-        &body,
-        "text/html",
-        "https://fixture.invalid/wiki/Rust_(programming_language)",
-        &opts_with(|o| o.must_contain = Some("borrow checker".into())),
-    )
-    .unwrap();
-    // Verdict + up to 3 context excerpts (±90 chars each): the
-    // invariant is "tiny vs the page", not an arbitrary constant.
+    let doc = wiki_document();
+    let probe = view::render(
+        &doc,
+        &View {
+            must_contain: vec![
+                Term::parse("borrow checker").unwrap(),
+                Term::parse("/Graydon\\s+Hoare/").unwrap(),
+                Term::parse("garbage collector").unwrap(),
+            ],
+            ..unbounded()
+        },
+        None,
+    );
+    // A verdict line plus one short excerpt per term: tiny against the page.
     assert!(
-        probe.markdown.len() <= 800,
-        "probe output {} chars > 800",
-        probe.markdown.len()
+        probe.text.len() <= 900,
+        "probe output {} chars > 900\n{}",
+        probe.text.len(),
+        probe.text
     );
     assert!(
-        (probe.markdown.len() as f64 / probe.total_chars as f64) <= 0.02,
+        (probe.text.len() as f64 / doc.len() as f64) <= 0.02,
         "probe output {} is >2% of the {}-char page",
-        probe.markdown.len(),
-        probe.total_chars
+        probe.text.len(),
+        doc.len()
     );
-    assert!(
-        probe.markdown.to_lowercase().contains("match"),
-        "probe must carry the verdict"
-    );
+    assert!(probe.text.starts_with("must_contain: "), "{}", probe.text);
 }
 
 #[test]

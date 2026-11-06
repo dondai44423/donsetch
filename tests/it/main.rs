@@ -70,6 +70,7 @@ mod cli_surface;
 mod crawl_fresh_fetch;
 mod daemon_boot_stays_alive;
 mod egress_proxy;
+mod fetch_views;
 mod focus_regressions;
 mod mcp_tool_call_does_not_abort;
 mod request_class;

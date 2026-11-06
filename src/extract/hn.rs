@@ -18,10 +18,6 @@ use super::{ContentKind, ExtractOptions, Extracted, inline};
 const MAX_COMMENTS: usize = 150;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() || opts.toc || opts.section.is_some() || opts.must_contain.is_some()
-    {
-        return None;
-    }
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     if host != "news.ycombinator.com" {

@@ -984,14 +984,6 @@ mod stitch_tests {
     pub(super) fn no_next_is_none() {
         assert!(find_rel_next("<html></html>", "https://example.com/").is_none());
     }
-
-    #[test]
-    pub(super) fn part_frontmatter_stripped() {
-        let part =
-            "# My Story\nhttps://example.com/p2\n> Same description\n\nPart two content here.";
-        assert_eq!(strip_part_frontmatter(part), "Part two content here.");
-        assert_eq!(strip_part_frontmatter("Just content"), "Just content");
-    }
 }
 #[cfg(test)]
 mod error_code_tests {

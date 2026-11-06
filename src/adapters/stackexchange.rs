@@ -30,9 +30,6 @@ fn is_se_host(host: &str) -> bool {
 const MAX_ANSWERS: usize = 10;
 
 pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    if opts.selector.is_some() {
-        return None;
-    }
     let u = url::Url::parse(url).ok()?;
     let host = u.host_str()?;
     if !is_se_host(host) {
@@ -410,17 +407,23 @@ mod tests {
             );
         }
         assert!(ex.partial.is_none());
-        let selected = extract_api(
-            &bytes,
-            &endpoint,
-            &ExtractOptions {
+        // fetch's views apply to the adapter's markdown: its answers are
+        // sections, so section and must_contain reach them.
+        use crate::extract::view::{self, Term, View};
+        let window = View {
+            max_chars: 100_000,
+            ..View::default()
+        };
+        let selected = view::render(
+            &ex.markdown,
+            &View {
                 section: Some("Answer 1".into()),
-                ..Default::default()
+                ..window.clone()
             },
-        )
-        .unwrap();
-        assert!(selected.markdown.contains("returns early"));
-        assert!(!selected.markdown.contains("option?"));
+            None,
+        );
+        assert!(selected.text.contains("returns early"), "{}", selected.text);
+        assert!(!selected.text.contains("option?"), "{}", selected.text);
         let capped = extract_api(
             &bytes,
             &endpoint,
@@ -431,16 +434,16 @@ mod tests {
         )
         .unwrap();
         assert!(capped.markdown.len() <= 200 && capped.next_offset.is_some());
-        let probe = extract_api(
-            &bytes,
-            &endpoint,
-            &ExtractOptions {
-                must_contain: Some("returns early".into()),
-                ..Default::default()
+        let probe = view::render(
+            &ex.markdown,
+            &View {
+                must_contain: vec![Term::parse("returns early").unwrap()],
+                ..window
             },
-        )
-        .unwrap();
-        assert!(probe.markdown.contains("MATCH") && probe.markdown.len() < ex.markdown.len());
+            None,
+        );
+        assert_eq!(probe.verdict, Some(view::Verdict::Match), "{}", probe.text);
+        assert!(probe.text.contains("§s"), "{}", probe.text);
         let mut subset = payload.clone();
         subset["items"][0]["answer_count"] = serde_json::json!(5);
         let partial = extract_api(

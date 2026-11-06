@@ -211,7 +211,7 @@ fn walk<'a>(
                     }
                     walk(child_el, base, opts, headings, out, depth + 1);
                 }
-            } else if let Some(t) = table_block(el, headings, opts.selector.is_some(), base, opts) {
+            } else if let Some(t) = table_block(el, headings, base, opts) {
                 push_block(t, out);
             }
         }
@@ -640,7 +640,6 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
 fn table_block(
     el: ElementRef<'_>,
     headings: &[(u8, String)],
-    explicit_scope: bool,
     base: &str,
     opts: &super::ExtractOptions,
 ) -> Option<Block> {
@@ -688,7 +687,7 @@ fn table_block(
     let total_text: usize = headers.iter().map(|h| h.len()).sum::<usize>()
         + rows.iter().flatten().map(|c| c.len()).sum::<usize>();
     let cells = headers.len() + rows.iter().map(|r| r.len()).sum::<usize>();
-    if !explicit_scope && cells <= 3 && total_text < 60 {
+    if cells <= 3 && total_text < 60 {
         return None;
     }
     Some(Block::Table {

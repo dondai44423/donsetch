@@ -5,6 +5,57 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **v5core is the only fetch engine.** Every document and one-shot read goes
+  through its session. The doncore crate, the browser fetch lane, the
+  cookie-vault replay into fetch and the per-domain route and warm state they
+  fed are removed. Bot walls are v5core's call: a page it verified as content
+  is never relabelled a challenge by passive vendor markers. A cached read
+  inside a declared lifetime is served only after one checked read found the
+  page unchanged. Responses that vary on Referer, Sec-Fetch-Site or Origin
+  are cached per navigation. A fetch the caller stops waiting for is
+  cancelled, and a proxy that refuses credentials reports its 407.
+- **Breaking:** `web_fetch` no longer sends sessions stored by
+  `donsetch login`. A page behind a login is a declared auth wall; session
+  support for fetch is a future feature. The `DONSETCH_V5` switch is gone.
+- **Breaking: `web_fetch` options are rebuilt around views of the whole
+  page.** Every view works on every source (HTML, PDF, site adapters, feeds,
+  text), reads the full document (up to 8 MiB) and returns only the view:
+  - `must_contain` takes one term or up to 8. Each term is a phrase
+    (case-insensitive, tolerant of markdown markup, quote and dash variants)
+    or a `/regex/`. Each term gets a count, the sections (`sN`) it occurs in
+    and excerpts; a phrase whose words all occur but not together says
+    where. The verdict is match, partial, no_match, or unverified when part
+    of the page was not read. With `section`, the probe stays inside it.
+  - `focus` returns the passages that answer the query, best first, under
+    their section paths, and names query words absent from the page. A miss
+    returns the outline, never the full page.
+  - `toc` lists sections with `sN` ids and sizes; `section` takes an id or a
+    heading. A missing section returns the outline.
+  - `max_chars` is the total for a URL array (default 48,000; 16,000 for one
+    URL). Results name the next part of a paginated page as `next_page`.
+  - Conflicting options (`must_contain` with `focus`, `toc` or `offset`;
+    `toc` with `focus`; `since_last` with another view) are refused before
+    anything is fetched.
+
+### Removed
+
+- `web_fetch` options, each refused with a note naming the replacement:
+  `budget_tokens` (use `max_chars`, the batch total), `mode` (set
+  `max_chars`), `stitch` (fetch the URL in `next_page`), `selector` (use
+  `section` or `focus`), `media` (use `image_text`).
+- The browser fetch tier. `web_fetch` loses `tier`, `actions` and `shot`
+  (use `web_screenshot`), each refused with a note; the browser stays only
+  for `donsetch login` and `web_screenshot`.
+
+### Security
+
+- Lockfile: tokio 1.54.1 and zstd-sys 2.1.2 for RUSTSEC-2026-0386, -0391,
+  -0398, -0403 and -0410.
+
 ## [4.10.2] - 2026-10-22
 
 ### Added

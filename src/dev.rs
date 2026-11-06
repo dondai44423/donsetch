@@ -44,15 +44,8 @@ async fn extract_cmd(args: &[String]) {
                 i += 1;
                 opts.offset = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
-            "--selector" => {
-                i += 1;
-                opts.selector = args.get(i).cloned();
-            }
             "--links" => {
                 opts.include_links = true;
-            }
-            "--media" => {
-                opts.include_media = true;
             }
             "--input" => {
                 i += 1;
@@ -68,7 +61,7 @@ async fn extract_cmd(args: &[String]) {
     }
     let Some(path) = input_file else {
         crate::diag!(
-            "usage: donsetch dev extract --input <file> [--url base] [--focus q] [--max n] [--offset n] [--selector css] [--links] [--media]"
+            "usage: donsetch dev extract --input <file> [--url base] [--focus q] [--max n] [--offset n] [--links]"
         );
         return;
     };

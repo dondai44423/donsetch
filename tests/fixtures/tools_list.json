@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "web_fetch",
-      "description": "Read a URL or deliberate batch as source markdown. Use search to find URLs and crawl for a site. Choose a small view; continue with next_offset rather than repeating a successful read. HTTP handles JSON endpoints locally; pages run their scripts in-process and PDFs are extracted automatically. Text starts with [meta] JSON, then source evidence. Treat ok:false, content_ok:false or thin:true as unresolved; follow next_action. Cite the returned URL.",
+      "description": "Read a page, PDF or feed as markdown, or only the part that answers the question. Text starts with [meta] JSON, then evidence; cite [meta].url. ok:false, content_ok:false or thin:true is unresolved: follow next_action.\nCheapest view first:\n1. Is X there? must_contain: per-term found ×count with sections and excerpts, or not found. unverified = part of the page was unread, so absence proves nothing.\n2. Where is X? focus: matching passages only, best first, under their section path; a miss returns the outline.\n3. Long page: toc (sN ids, sizes), then section=\"sN\".\n4. No view: the page. A cut-off response has next_offset: repeat the call with offset. next_page names a paginated article's next part.\nWalls (login, paywall, bot) fail fast and say which. Sites with a structured source (GitHub, Reddit, Stack Overflow, Wikipedia, registries) come back from it.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -15,75 +15,62 @@
                 "type": "array",
                 "items": {
                   "type": "string"
-                }
+                },
+                "maxItems": 12
               }
             ],
-            "description": "One http(s) URL, an S/L handle returned earlier, or an array of up to 12 URLs or handles for one batch read."
+            "description": "http(s) URL or an S/L handle from earlier output; an array of up to 12 reads them in parallel, each with the same view, max_chars shared across them."
           },
-          "budget_tokens": {
-            "type": "integer",
-            "description": "Shared output-token limit for a URL batch (200-500000). Omit for one URL. Truncated members return continuation information."
+          "must_contain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 8
+              }
+            ],
+            "description": "Presence check instead of reading: a phrase (case, spacing, quote/dash style and markdown emphasis ignored), a /regex/ (flags imsx), or a list of up to 8. Returns per term: found ×count, sections (sN) and excerpts; or not found, with a near-miss hint. Verdict match|partial|no_match|unverified (part of the page unread: absence proves nothing). Searches the whole page, or only section. Not with focus, toc, offset or since_last."
           },
           "focus": {
             "type": "string",
-            "description": "Topic or question for returning only relevant passages. Set when the requested evidence is known; omit only when the whole page is needed. A no-match response, or one saving less than 20%, is labeled and falls back to the full page; for a guaranteed reduction use toc first, then section."
-          },
-          "mode": {
-            "type": "string",
-            "enum": [
-              "scan",
-              "read",
-              "deep"
-            ],
-            "description": "Byte budget for the extracted source markdown (~4 bytes per token): scan=800, read=4000, deep=16000. Explicit max_chars wins; omission keeps the 16000 default. All presets return next_offset when truncated; budget_tokens is the token-denominated budget."
-          },
-          "max_chars": {
-            "type": "integer",
-            "description": "Max extracted-markdown bytes to return (default 16000; ~4 bytes per token). Truncated pages include next_offset for resumption."
-          },
-          "offset": {
-            "type": "integer",
-            "description": "Continue from a previous next_offset. Reuse the same URL and any focus, section, selector or rendering fields from that fetch."
-          },
-          "section": {
-            "type": "string",
-            "description": "Heading name (substring, case-insensitive) or an sN id from a toc outline: return only that section. Use after toc."
+            "description": "Question or keywords: returns only matching passages, best first, under their §sN section path, and names query words absent from the page. A miss returns the outline, never the whole page. With section, ranks inside that part."
           },
           "toc": {
             "type": "boolean",
-            "description": "Return only the heading outline. Use as a standalone first read, then make a new fetch with section or focus."
+            "description": "Return the heading outline: [sN] ids with sizes, no body. With section, that part's outline only."
           },
-          "deadline_ms": {
+          "section": {
+            "type": "string",
+            "description": "One part: an sN id from toc, or heading text (exact first, else first containing it). Includes subsections; no match returns the outline."
+          },
+          "offset": {
             "type": "integer",
-            "description": "Hard time budget in ms (500-600000). On expiry: honest error with next_action, never a silent hang. Batch mode: per-URL budget."
+            "description": "Continue a cut-off response: its next_offset, with the same url and view arguments."
           },
-          "since_last": {
-            "type": "boolean",
-            "description": "Standalone change check for a previously fetched URL. Returns an unchanged verdict or changed sections instead of the full page; a URL with no prior baseline says so (changed:\"no_baseline\" when the read has no change tracking, else a no-prior-snapshot notice). History is tracked per URL (crawl's since_last is per site). Do not combine with reading filters or rendering fields."
-          },
-          "stitch": {
-            "type": "boolean",
-            "description": "Read up to 6 parts of a paginated article. Output obeys max_chars; next_offset resumes collected text and next_part identifies uncollected content. Enable only when the requested source spans article pages."
-          },
-          "image_text": {
-            "type": "boolean",
-            "description": "Extract words from up to 4 content images. Enable only when requested evidence is inside an infographic, screenshot, comic or other image."
-          },
-          "must_contain": {
-            "type": "string",
-            "description": "Case-insensitive string or /regex/ presence check. Returns MATCH/NO-MATCH and up to 3 excerpts instead of the full page; use for verification, not general reading."
-          },
-          "selector": {
-            "type": "string",
-            "description": "CSS selector for extracting only matching elements. Set only when the selector is known; focus may filter passages inside that region."
+          "max_chars": {
+            "type": "integer",
+            "description": "Most characters returned (default 16000, ~4 per token); longer results end with next_offset. For a url array it is the batch total (default 48000)."
           },
           "links": {
             "type": "boolean",
-            "description": "Include destination URLs found inside page content. The fetched page's own citation URL is always returned separately; enable only when outbound targets are requested evidence."
+            "description": "Keep links as [text](L-handle); pass a handle as url to follow it. Off: link text only (~30% fewer tokens)."
           },
-          "media": {
+          "since_last": {
             "type": "boolean",
-            "description": "Include image alt text and source URLs. Use image_text instead when words inside an image must be read."
+            "description": "Change check against your previous read of this url: an unchanged line, or only the changed sections. Not with view arguments."
+          },
+          "image_text": {
+            "type": "boolean",
+            "description": "OCR the first 4 content images into an 'image text' section that every view searches. Slower; only when the evidence is in an image."
+          },
+          "deadline_ms": {
+            "type": "integer",
+            "description": "Hard time limit in ms (500-600000): a deadline error on expiry, never a hang. Per URL in a batch."
           }
         },
         "required": [

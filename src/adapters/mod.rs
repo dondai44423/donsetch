@@ -425,12 +425,7 @@ pub fn extract_json(
     // runs on HTML blocks, a JSON payload has none, and bailing
     // fell through to the raw-JSON passthrough, which silently
     // dropped the cut and dumped the whole payload. The card IS
-    // the compact truth of this endpoint: serve it. (The HTML
-    // extract adapters keep their guards: there the generic path
-    // applies the cuts on the real DOM.)
-    if opts.must_contain.is_some() {
-        return None;
-    }
+    // the compact truth of this endpoint: serve it.
     let looks_json = ct.contains("json") || matches!(body.first(), Some(b'{') | Some(b'['));
     if !looks_json {
         return None;
@@ -448,13 +443,10 @@ pub fn extract_html(
     url: &str,
     opts: &crate::extract::ExtractOptions,
 ) -> Option<crate::extract::Extracted> {
-    if opts.selector.is_some() || !enabled() {
-        return None;
-    }
-    // Focus/toc/section/probe are pipeline features the adapters don't
-    // reproduce: when the agent asks for a specific cut, the generic
-    // path (which implements them) wins.
-    if opts.focus.is_some() || opts.toc || opts.must_contain.is_some() || opts.section.is_some() {
+    // Crawl's block focus is a pipeline feature the adapters don't
+    // reproduce: the generic path (which implements it) wins. Fetch views
+    // apply to adapter markdown afterwards, like to any other.
+    if !enabled() || opts.focus.is_some() {
         return None;
     }
     debug_dump(html, url);
@@ -662,12 +654,11 @@ mod tests {
         assert!(!is_reddit_host("reddit.com.evil.io"));
     }
 
-    // focus / toc / section cannot be applied to a JSON payload: the
-    // extractors used to bail and the raw JSON got dumped, silently
-    // dropping the cut. The card is the answer now. must_contain
-    // still bails (the non-HTML probe serves it).
+    // Crawl's block focus cannot apply to a JSON payload: the extractors
+    // used to bail and the raw JSON got dumped, silently dropping the cut.
+    // The card is the answer, with or without focus.
     #[test]
-    fn json_cards_survive_cut_params() {
+    fn json_cards_survive_focus() {
         let body = br#"{"kind":"Listing","data":{"children":[{"kind":"t3","data":{
           "title":"Post","subreddit":"rust","author":"a","score":1,
           "created_utc":1755800000.0,"num_comments":0,"selftext":"","over_18":false}}]}}"#;
@@ -677,22 +668,10 @@ mod tests {
                 focus: Some("post".into()),
                 ..Default::default()
             },
-            crate::extract::ExtractOptions {
-                toc: true,
-                ..Default::default()
-            },
-            crate::extract::ExtractOptions {
-                section: Some("x".into()),
-                ..Default::default()
-            },
+            crate::extract::ExtractOptions::default(),
         ] {
             let ex = extract_json(body, "application/json", url, &cut).expect("card");
             assert!(ex.markdown.contains("**Post**"), "{}", ex.markdown);
         }
-        let probe = crate::extract::ExtractOptions {
-            must_contain: Some("Post".into()),
-            ..Default::default()
-        };
-        assert!(extract_json(body, "application/json", url, &probe).is_none());
     }
 }
