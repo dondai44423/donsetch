@@ -11,8 +11,6 @@
 use windows_sys::Win32::Foundation as fnd;
 #[cfg(windows)]
 use windows_sys::Win32::System::JobObjects as job;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading as thr;
 
 // ntdll process suspend/resume : always loaded, linked directly.
 #[cfg(windows)]
