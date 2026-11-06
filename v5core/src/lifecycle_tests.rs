@@ -274,7 +274,13 @@ fn a_learned_lifetime_renews_before_the_refusal() {
     let learned = session.state.mints[host()]
         .refused_age
         .expect("a lifetime was learned");
-    assert_eq!(learned, 350);
+    // Whole seconds, and the clock still runs while the test does: a second
+    // boundary may fall inside the elapse. The invariant is the refusal's
+    // own age, not a stopwatch reading.
+    assert!(
+        matches!(learned, 349..=351),
+        "the refusal must teach the age it happened at (~350 s): {learned}"
+    );
 
     // The new credential reaches 0.9 x the learned age while the origin would
     // still accept it (300 s): the fetcher renews instead of being refused.
