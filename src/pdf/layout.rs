@@ -188,11 +188,17 @@ pub fn assemble(page: PageChars) -> PageLines {
         // with overlapping x-ranges (print overlays/shadow layers) zip
         // when x-sorted. Split bi-modal-size clusters into sub-lines.
         let subclusters = split_duplicate_layers(cluster);
-        for mut cluster in subclusters {
-            cluster.sort_by(|a, b| a.x0.total_cmp(&b.x0).then(a.order.cmp(&b.order)));
-            let line = build_line(&cluster, page.index);
-            if !line.text.trim().is_empty() {
-                out.lines.push(line);
+        for cluster in subclusters {
+            // Layers drawn on top of each other at one baseline (a figure
+            // label over its caption, fake bold) are separated before the
+            // x-sort: sorting merges them into one interleaved line.
+            let layers = dedupe_exact_layers(split_overlaid_layers(cluster));
+            for mut layer in layers {
+                layer.sort_by(|a, b| a.x0.total_cmp(&b.x0).then(a.order.cmp(&b.order)));
+                let line = build_line(&layer, page.index);
+                if !line.text.trim().is_empty() {
+                    out.lines.push(line);
+                }
             }
         }
     }
@@ -286,6 +292,25 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
     g.retain(|x| *x > 0.01);
     g.sort_by(|a, b| a.total_cmp(b));
     let med_gap = g.get(g.len() / 2).copied().unwrap_or(0.0);
+    // The gap a word space makes on THIS line (see `word_space_threshold`):
+    // a font-size fraction alone splits numbers and citations apart
+    // ("[1 8]", "41 .8") in LaTeX-set PDFs, where a kern gap inside a
+    // token is wider than 0.16 em.
+    let dominant_size = {
+        let mut votes: Vec<(u32, f32, usize)> = Vec::new();
+        for c in &reals {
+            let q = (c.size * 4.0).round() as u32;
+            match votes.iter_mut().find(|(v, _, _)| *v == q) {
+                Some(e) => e.2 += 1,
+                None => votes.push((q, c.size, 1)),
+            }
+        }
+        votes
+            .into_iter()
+            .max_by_key(|(_, _, n)| *n)
+            .map(|(_, s, _)| s)
+    };
+    let space_gap = dominant_size.map(|s| word_space_threshold(&g, s));
 
     // Decoration-space x-positions within this line (Chromium prints
     // these at font-run boundaries; used as break evidence for small
@@ -321,6 +346,18 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
             let gap = c.x0 - prev_x1;
             let widen = 0.16 * prev_size;
             let adaptive = (1.4 * med_gap).max(widen);
+            // The line's own word-space width, when it is measurable.
+            let spaced = space_gap.unwrap_or(adaptive).max(adaptive);
+            // A narrow glyph (full stop, comma, bracket) carries most of its
+            // advance as side bearing, so the ink gap beside it is wider than
+            // the geometry means. Discount the bearing before comparing, or
+            // "google.com" reads as "google . com" and "41.8" as "41 .8".
+            let bearing = if small_ink(prev_cp) || small_ink(c.cp) {
+                0.08 * prev_size.max(c.size)
+            } else {
+                0.0
+            };
+            let ink = gap - bearing;
             // Script-aware pairing. "Spaceless pairs" never break inside a
             // run: Han/Kana (and Yi) have no word spaces at all;
             // Devanagari words are conjunct clusters where font-run
@@ -341,7 +378,7 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
             } else if mix_cjk {
                 gap > 0.55 * prev_size || (decor && gap > 0.10 * prev_size)
             } else {
-                gap > adaptive || (decor && gap > 0.10 * prev_size) || (real_space && gap > 0.02)
+                ink > spaced || (decor && ink > 0.10 * prev_size) || (real_space && gap > 0.02)
             };
             if break_here {
                 // Close the current word.
@@ -399,6 +436,29 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
 
     // Collapse runs of spaces and trim.
     let text = collapse_spaces(&text);
+    if std::env::var("DS_PROBE_SPLIT").is_ok() && (text.contains("google") || text.contains("41 ."))
+    {
+        crate::diag!(
+            "[probe] TEXT {:?} space_gap={:?} med={med_gap:.3}",
+            text,
+            space_gap
+        );
+        for w in reals.windows(2) {
+            let gap = w[1].x0 - w[0].x1;
+            let decor = decor_spaces
+                .iter()
+                .any(|&sx| sx > w[0].x1 - 0.5 && sx < w[1].x0 + 0.5);
+            if gap > 0.8 {
+                crate::diag!(
+                    "[probe]   {:?}->{:?} gap={gap:.3} prevsize={:.2} decor={decor} prev_is_space={}",
+                    w[0].cp,
+                    w[1].cp,
+                    w[0].size,
+                    w[0].cp == ' '
+                );
+            }
+        }
+    }
     if crate::config::cfg().debug.pdf_words {
         crate::diag!(
             "[words] {:?} -> {:?}",
@@ -437,6 +497,175 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
         x1: lx1,
         y1: ly1,
     }
+}
+
+/// Split a baseline cluster into the separate text layers drawn on top of
+/// one another: a figure label over its caption, a shadowed headline, fake
+/// bold (the same string inked several times a hair apart).
+///
+/// The stream is the evidence. A line of text advances to the right as the
+/// stream emits it; the same baseline starting again well to the LEFT of the
+/// last glyph means a second run was drawn over the first, and sorting the
+/// whole cluster by x zips the two into one interleaved line
+/// ("AInttpenutito-nI nVipsuuatli…"). Parts whose spans do not overlap are
+/// not layers (a kern-back inside one run): they are rejoined.
+fn split_overlaid_layers(cluster: Vec<&PdfChar>) -> Vec<Vec<&PdfChar>> {
+    if cluster.len() < 4 {
+        return vec![cluster];
+    }
+    let mut by_order = cluster;
+    by_order.sort_by_key(|c| c.order);
+    let mut parts: Vec<Vec<&PdfChar>> = Vec::new();
+    let mut cur: Vec<&PdfChar> = Vec::new();
+    for c in by_order {
+        if let Some(prev) = cur.last() {
+            let size = prev.size.max(c.size).max(2.0);
+            if c.x0 < prev.x0 - 1.5 * size {
+                parts.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    if parts.len() < 2 {
+        return parts;
+    }
+    let span = |p: &[&PdfChar]| {
+        p.iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), c| (a.min(c.x0), b.max(c.x1)))
+    };
+    let (x0, x1) = span(&parts[0]);
+    let overlapping = parts
+        .iter()
+        .filter(|p| {
+            let (a, b) = span(p);
+            a < x1 && b > x0 && p.len() >= 2
+        })
+        .count();
+    if overlapping < 2 {
+        // Not layers: hand the cluster back whole, in stream order.
+        return vec![parts.into_iter().flatten().collect()];
+    }
+    parts
+}
+
+/// Fake bold inks the same string several times a fraction of a hair apart;
+/// only one copy is text. Exact repeats of a layer are dropped, keeping the
+/// widest copy.
+fn dedupe_exact_layers(parts: Vec<Vec<&PdfChar>>) -> Vec<Vec<&PdfChar>> {
+    let text = |p: &[&PdfChar]| -> String {
+        p.iter()
+            .map(|c| c.cp)
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    };
+    let mut out: Vec<Vec<&PdfChar>> = Vec::new();
+    for part in parts {
+        let t = text(&part);
+        if !t.is_empty()
+            && out.iter().any(|kept| {
+                let k = text(kept);
+                k == t && kept.len() >= part.len()
+            })
+        {
+            continue;
+        }
+        out.push(part);
+    }
+    out
+}
+
+/// The gap (in points) above which a gap separates two words on this line.
+///
+/// A fixed fraction of the font size cannot tell a kern gap from a word
+/// space: LaTeX sets "41.8" and "[18]" with gaps of 0.15–0.16 em, while its
+/// word spaces measure 0.25–0.60 em — and a letterspaced heading inverts
+/// that. The line's own gaps are a two-class sample, so split them with a
+/// one-dimensional k-means seeded at the 10th and 90th percentiles, and take
+/// the class boundary only when the two classes are clearly distinct (the
+/// upper class at least twice the lower, and at least a real space wide).
+/// A line with no word spaces does not qualify, and falls back to the
+/// typographic norm: a word space is about a fifth of the em.
+fn word_space_threshold(sorted_gaps: &[f32], size: f32) -> f32 {
+    let floor = 0.14 * size;
+    let ceil = 0.55 * size;
+    let fallback = (0.20 * size).clamp(floor, ceil);
+    if sorted_gaps.len() < 12 {
+        return fallback;
+    }
+    let (mut lo, mut hi) = (
+        sorted_gaps[sorted_gaps.len() / 10],
+        sorted_gaps[sorted_gaps.len() * 9 / 10],
+    );
+    if hi <= lo {
+        return fallback;
+    }
+    let mut nh = 0usize;
+    for _ in 0..10 {
+        let (mut sl, mut sh, mut nl) = (0f32, 0f32, 0usize);
+        nh = 0;
+        for &g in sorted_gaps {
+            if (g - lo).abs() <= (g - hi).abs() {
+                sl += g;
+                nl += 1;
+            } else {
+                sh += g;
+                nh += 1;
+            }
+        }
+        if nl == 0 || nh == 0 {
+            return fallback;
+        }
+        lo = sl / nl as f32;
+        hi = sh / nh as f32;
+    }
+    // A handful of wide gaps is not a word-space class: `nh >= 3` keeps a
+    // table row's column gaps (which are not spaces) out of the estimate.
+    if nh >= 3 && hi >= 2.0 * lo && hi >= floor {
+        // Anchor on the space class rather than the midpoint: a kern gap can
+        // come within a hair of a squeezed word space (LaTeX's "41.8" kerns
+        // at 0.16 em, its spaces at 0.25), so the boundary has to sit below
+        // the smallest real space, not halfway to the kern mean.
+        let mut upper: Vec<f32> = sorted_gaps
+            .iter()
+            .copied()
+            .filter(|g| *g >= (lo + hi) / 2.0)
+            .collect();
+        upper.sort_by(|a, b| a.total_cmp(b));
+        let space = upper.get(upper.len() / 2).copied().unwrap_or(hi);
+        let t = lo + 0.85 * (space - lo);
+        if t > floor && t < ceil {
+            return t;
+        }
+    }
+    fallback
+}
+
+/// Glyphs whose ink is a small mark inside a wide advance: the space
+/// around them is mostly side bearing, not word spacing.
+fn small_ink(cp: char) -> bool {
+    matches!(
+        cp,
+        '.' | ','
+            | ':'
+            | ';'
+            | '!'
+            | '?'
+            | '\''
+            | '"'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '\u{2026}'
+            | '\u{2019}'
+            | '\u{201C}'
+            | '\u{201D}'
+    )
 }
 
 /// Han + Kana + fullwidth CJK forms (no word spaces in these scripts).

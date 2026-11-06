@@ -214,17 +214,80 @@ fn attention_structure() {
 }
 
 #[test]
-fn attention_output_has_no_furniture_loop() {
+fn attention_conference_note_is_not_repeated_per_page() {
     let Some(bytes) = read("attention.pdf") else {
         return;
     };
     let parsed = crate::pdf::parse(&bytes).expect("parse");
     let text = all_block_text(&parsed.blocks);
-    // The running footer must be suppressed (recurs on all 15 pages).
-    assert!(
-        !text.contains("31st Conference on Neural Information"),
-        "furniture not suppressed"
-    );
+    // The NIPS line is a first-page note in this printing, not a running
+    // footer, so it survives once. What must never happen is the loop this
+    // test was written for: the band repeated on every page.
+    let n = text
+        .matches("Conference on Neural Information Processing Systems")
+        .count();
+    assert!(n <= 1, "conference footer repeated {n} times");
+}
+
+/// A page whose footer band holds a page-varying running line and a page
+/// number, plus one body line.
+fn furniture_page(index: usize) -> crate::pdf::layout::PageLines {
+    let page = |text: &str, y0: f32, order: u32| crate::pdf::layout::Line {
+        text: text.to_string(),
+        words: Vec::new(),
+        x0: 40.0,
+        y0,
+        x1: 400.0,
+        y1: y0 + 10.0,
+        size: 9.0,
+        weight: 400,
+        italic: false,
+        mono: false,
+        font: 0,
+        glyphs: text.chars().count(),
+        order,
+        page: index,
+    };
+    crate::pdf::layout::PageLines {
+        index,
+        width: 500.0,
+        height: 800.0,
+        lines: vec![
+            page("Body text unique to this page", 300.0, 0),
+            // Bottom band (y0 >= 0.92 * height), digits vary per page.
+            page(&format!("Annual Report 2026 · page {index}"), 760.0, 1),
+            page(&format!("{}", index + 1), 780.0, 2),
+        ],
+        images: 0,
+        fusion: None,
+    }
+}
+
+#[test]
+fn recurring_footers_and_page_numbers_are_suppressed() {
+    let mut pages: Vec<_> = (0..8).map(furniture_page).collect();
+    crate::pdf::reading::suppress_furniture(&mut pages);
+    for p in &pages {
+        let texts: Vec<&str> = p.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["Body text unique to this page"],
+            "page {} kept furniture: {:?}",
+            p.index,
+            texts
+        );
+    }
+}
+
+#[test]
+fn a_short_document_keeps_its_first_page_footer() {
+    // Under four pages nothing can be called recurring: dropping the only
+    // footer would delete content.
+    let mut pages: Vec<_> = (0..3).map(furniture_page).collect();
+    crate::pdf::reading::suppress_furniture(&mut pages);
+    for p in &pages {
+        assert_eq!(p.lines.len(), 3, "page {} lost lines", p.index);
+    }
 }
 
 // ---------- form (w9.pdf) ----------
