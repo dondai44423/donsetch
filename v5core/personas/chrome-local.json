@@ -1,0 +1,79 @@
+{
+ "navigator": {
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+  "hardwareConcurrency": 16,
+  "userAgentData": {
+   "brands": [
+    {
+     "brand": "Not:A-Brand",
+     "version": "8"
+    },
+    {
+     "brand": "Chromium",
+     "version": "156"
+    }
+   ],
+   "platform": "Linux",
+   "mobile": false
+  }
+ },
+ "requestHeaders": {
+  "accept-language": "en-US,en;q=0.9",
+  "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+ },
+ "webgl": {
+  "vendor": "WebKit",
+  "renderer": "WebKit WebGL",
+  "version": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+  "shadingLanguageVersion": "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)",
+  "maxTextureSize": 16384,
+  "unmaskedVendor": "Google Inc. (Intel)",
+  "unmaskedRenderer": "ANGLE (Intel, Mesa Intel(R) Graphics (ADL GT2), OpenGL ES 3.2)",
+  "extensions": [
+   "EXT_clip_control",
+   "EXT_color_buffer_float",
+   "EXT_color_buffer_half_float",
+   "EXT_conservative_depth",
+   "EXT_depth_clamp",
+   "EXT_disjoint_timer_query_webgl2",
+   "EXT_float_blend",
+   "EXT_polygon_offset_clamp",
+   "EXT_render_snorm",
+   "EXT_texture_compression_bptc",
+   "EXT_texture_compression_rgtc",
+   "EXT_texture_filter_anisotropic",
+   "EXT_texture_mirror_clamp_to_edge",
+   "EXT_texture_norm16",
+   "KHR_parallel_shader_compile",
+   "NV_shader_noperspective_interpolation",
+   "OES_draw_buffers_indexed",
+   "OES_sample_variables",
+   "OES_shader_multisample_interpolation",
+   "OES_texture_float_linear",
+   "WEBGL_blend_func_extended",
+   "WEBGL_clip_cull_distance",
+   "WEBGL_compressed_texture_astc",
+   "WEBGL_compressed_texture_etc",
+   "WEBGL_compressed_texture_etc1",
+   "WEBGL_compressed_texture_s3tc",
+   "WEBGL_compressed_texture_s3tc_srgb",
+   "WEBGL_debug_renderer_info",
+   "WEBGL_debug_shaders",
+   "WEBGL_lose_context",
+   "WEBGL_multi_draw",
+   "WEBGL_stencil_texturing"
+  ],
+  "contextType": "webgl2"
+ },
+ "screen": {
+  "width": 1920,
+  "height": 1080,
+  "availWidth": 1920,
+  "availHeight": 1080,
+  "colorDepth": 24,
+  "pixelDepth": 24,
+  "availLeft": 0,
+  "availTop": 0,
+  "isExtended": false
+ }
+}

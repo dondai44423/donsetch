@@ -46,6 +46,3 @@ pub mod search;
 pub mod spec;
 pub mod state;
 pub mod state_probe;
-
-#[cfg(test)]
-pub(crate) mod test_support;

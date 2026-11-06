@@ -1,0 +1,46 @@
+[package]
+name = "v5core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "v5 fetch core: carried identity and state, an in-process V8 challenge engine, no browser"
+license = "AGPL-3.0-only"
+
+[dependencies]
+# Coherent client profiles (TLS/H2/headers come from one profile, never patched).
+wreq = { version = "=6.0.0-rc.31", default-features = false, features = [
+    "tokio-rt", "gzip", "brotli", "deflate", "zstd", "cookies", "stream", "socks",
+] }
+wreq-util = "=3.0.0-rc.14"
+tokio = { version = "1", features = ["rt", "time", "net", "sync", "macros"] }
+# Already in the tree through wreq: reads the engine's response bodies in chunks.
+futures-util = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# The challenge engine: V8 in-process, so the site's own program runs here and
+# never in a browser.
+deno_core = "0.413"
+# WebCrypto for the engine: the BoringSSL bindings the TLS stack already links.
+btls = "=0.5.6"
+getrandom = "0.2"
+# Trust: the bundled Mozilla roots plus the OS's own store, as Chrome trusts it:
+# Windows' ROOT store, the macOS keychain, the Linux bundle, SSL_CERT_FILE /
+# SSL_CERT_DIR. Set on every client (`http::trust_roots`), not through wreq's
+# `webpki-roots` feature: that feature unifies into the product's own wreq and
+# would replace its system trust with the bundled set.
+webpki-root-certs = "1"
+rustls-native-certs = "0.8"
+url = "2"
+# HTML parsing only: contracts are verified against the served document.
+# This is a parser, not a browser: no scripts, no layout, no rendering.
+scraper = "0.27"
+
+[patch.crates-io]
+wreq = { path = "vendor/wreq" }
+btls-sys = { path = "vendor/btls-sys" }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -418,6 +418,37 @@ jobs:
       - name: Check advisories + licenses + bans + sources
         run: cargo deny --all-features check --hide-inclusion-graph
 
+  # ── v5core, the fetch engine, is its own crate with its own lockfile:
+  # the product suite only reaches it through the product's API, so its
+  # own offline suite (loopback servers, no network) runs here. The
+  # network tests are #[ignore]d and stay a local, egress-gated run.
+  v5core:
+    name: v5core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: clippy
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '>=1.22.0'
+      - name: Install NASM
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
+      - name: Cache ~/.cargo and v5core/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: v5core
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Test
+        working-directory: v5core
+        run: cargo test --release --locked
+      - name: Clippy
+        working-directory: v5core
+        run: cargo clippy --release --all-targets --locked -- -Dwarnings
+
   # ── The npm wrapper's installer logic: resolution order, unwritable
   # installs (#361), atomic landing, wrapper passthrough. npm is the
   # primary install path, so any push touching the package keeps these

@@ -534,6 +534,7 @@ mod tests {
             toc: false,
             section: None,
             must_contain: None,
+            verified: false,
         };
         markdown(root, "https://example.com/", &opts).0
     }
@@ -573,6 +574,7 @@ mod tests {
             toc: false,
             section: None,
             must_contain: None,
+            verified: false,
         };
         markdown(root, "https://example.com/", &opts).0
     }

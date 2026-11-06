@@ -3,11 +3,12 @@ name = "donsetch"
 version = "4.10.2"
 edition = "2024"
 license = "AGPL-3.0-only"
-description = "Web fetch, search and crawl for AI agents. Custom stealthy fetch tier: the in-tree doncore engine."
+description = "Web fetch, search and crawl for AI agents. Custom stealthy fetch tier: the in-tree v5 core."
 
 [dependencies]
-# The fetching engine (one wire: identity, TLS, cache, JS) — in-tree.
-doncore = { path = "doncore" }
+# The fetch core, in-tree: carried identity and learned state per origin,
+# the page cache, data paths and the in-process V8 challenge engine.
+v5core = { path = "v5core" }
 tokio = { version = "1", features = ["full"] }
 url = "2"
 brotli = "9"
@@ -134,6 +135,16 @@ winresource = { version = "0.1", default-features = false }
 [lints.clippy]
 print_stderr = "deny"
 
+# The default profile, reached only by a bare `cargo build` / `cargo test` —
+# not this repo's loop (CONTRIBUTING.md: use the `just` recipes; the fast
+# profile above is the loop). Left at its default it is the one shape that
+# writes full DWARF for this crate and all 512 deps: touching it by hand
+# minted 2.2G of target/debug by 2026-10-30. line-tables-only keeps the
+# file:line in a panic backtrace and drops the rest of it. Nothing here
+# reaches `fast`, `ci` or the shipped `release` profile.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
@@ -182,15 +193,10 @@ codegen-units = 256
 [profile.ci.package."*"]
 opt-level = 1
 
-# The in-tree engine's vendored forks: patches apply from the workspace
-# ROOT, so they live here now that doncore is linked into the app graph
-# (doncore keeps its own copy for standalone builds: engine tests, the
-# harness under v5/doncore/tools/).
+# The fetch core's vendored forks: patches apply from the workspace ROOT
+# (v5core keeps the same table for its standalone builds).
 #  wreq/btls-sys: Chrome ClientHello parity (trust_anchors extension +
 #  signature-algorithm list) that the published presets cannot express.
-#  rquickjs-sys: native Function.prototype.toString in V8's single-line
-#  shape.
 [patch.crates-io]
-wreq = { path = "doncore/vendor/wreq" }
-btls-sys = { path = "doncore/vendor/btls-sys" }
-rquickjs-sys = { path = "doncore/vendor/rquickjs-sys" }
+wreq = { path = "v5core/vendor/wreq" }
+btls-sys = { path = "v5core/vendor/btls-sys" }

@@ -57,6 +57,10 @@ pub struct ExtractOptions {
     /// enters the agent's context wholesale. Case-insensitive
     /// substring; `/re/` syntax = regex.
     pub must_contain: Option<String>,
+    /// The fetch layer verified this body as content: bot-wall markers in it
+    /// (an interstitial's words, a vendor script) are not a wall. Login walls
+    /// and paywalls are still reported.
+    pub verified: bool,
 }
 
 impl ExtractOptions {
@@ -404,6 +408,7 @@ pub fn extract(
     }
 
     if !is_pdf
+        && !opts.verified
         && body_starts_with_html(body)
         && let Some(vendor) = crate::detect::walls::detect_interstitial(body)
     {
@@ -461,7 +466,9 @@ pub fn extract(
         // text/plain or json/xml response returns MATCH/NO-MATCH plus
         // excerpts like the HTML path, never the full document.
         let text = String::from_utf8_lossy(body);
-        if let Some(v) = crate::detect::walls::text_wall(&text) {
+        if let Some(v) = crate::detect::walls::text_wall(&text)
+            && !(opts.verified && bot_wall(v))
+        {
             return Err(ExtractError::Wall(v));
         }
         if let Some(pattern) = &opts.must_contain
@@ -775,6 +782,11 @@ fn empty_pdf(url: &str, reason: &str) -> Extracted {
     }
 }
 
+fn bot_wall(verdict: crate::detect::walls::Verdict) -> bool {
+    use crate::detect::walls::Verdict;
+    matches!(verdict, Verdict::Challenge(_) | Verdict::Blocked)
+}
+
 /// Shared downstream: TOC → section scope → focus BM25 → render →
 /// trust signals → pagination → quality. Identical for HTML and PDF;
 /// PDF upstream produces blocks + meta + notes + language and hands
@@ -804,6 +816,7 @@ fn downstream(
     });
     if pdf_pages.is_none()
         && let Some(v) = crate::detect::walls::text_wall(&identity)
+        && !(opts.verified && bot_wall(v))
     {
         return Err(ExtractError::Wall(v));
     }

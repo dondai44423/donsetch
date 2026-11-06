@@ -133,7 +133,7 @@ pub fn help() {
     println!("Usage:");
     println!("  donsetch login [domain]          Interactive: open a browser, you sign in,");
     println!("                                   press Enter here when done. The session is");
-    println!("                                   stored and replayed by every later fetch.");
+    println!("                                   stored in the private vault.");
     println!("  donsetch login                   Multi-site mode: log into whatever you want,");
     println!("                                   press Enter, all new sessions are stored.");
     println!("  donsetch login --list            Show stored sessions (masked, never values).");
@@ -149,8 +149,9 @@ pub fn help() {
     println!();
     println!("Credentials are typed into the browser only. donsetch never sees");
     println!("your password: no keystroke capture, no screenshots, no CDP before");
-    println!("you press Enter. Stored cookie values live in the same 0600 vault");
-    println!("the fetch engine already uses; the registry holds metadata only.");
+    println!("you press Enter. Stored cookie values live in a 0600 vault; the");
+    println!("registry holds metadata only. Fetch does not send stored sessions:");
+    println!("a login wall is reported as an auth wall, not signed into.");
 }
 
 // ── interactive flow ─────────────────────────────────────────
@@ -385,7 +386,7 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
     if probes.is_empty() && probe {
         println!("    (no probes: nothing stored)");
     }
-    println!("\nLater fetches of these domains replay the session automatically.");
+    println!("\nFetch does not send stored sessions; a login wall stays a declared auth wall.");
     println!("`donsetch login --list` shows stored sessions; `--logout` forgets them.");
     let _ = std::io::stdout().flush();
     Ok(())
@@ -578,7 +579,7 @@ fn import(file: &str, domain: Option<&str>, probe: bool) -> Result<(), String> {
     for (d, _, note) in &probes {
         println!("    probe {d} (unverified): {note}");
     }
-    println!("Later fetches of these domains replay the stored cookies automatically.");
+    println!("Fetch does not send stored sessions; a login wall stays a declared auth wall.");
     Ok(())
 }
 

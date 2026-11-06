@@ -267,7 +267,7 @@ pub enum RequestClass {
 impl RequestClass {
     /// The per-class Accept value and sec-fetch-dest, matching what
     /// Chrome sends for the same subresource type.
-    fn accept_and_dest(self) -> (String, String) {
+    pub(crate) fn accept_and_dest(self) -> (String, String) {
         match self {
             RequestClass::Navigation => (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"

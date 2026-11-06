@@ -463,11 +463,10 @@ mod tests {
                 .any(|w| w == b"hop-ok")
         );
         // The shared jar now holds the device cookie.
-        let jar = searcher.fetcher.jar_snapshot("127.0.0.1");
+        let jar = searcher.fetcher.cookie_names("127.0.0.1");
         assert!(
-            jar.iter().any(|c| c.name == "uid" && c.value == "fleet9"),
-            "the enrich fetch must ride the shared jar: {:?}",
-            jar
+            jar.iter().any(|name| name == "uid"),
+            "the enrich fetch must ride the shared jar: {jar:?}"
         );
         // Second leg: a NEW listener on an ephemeral port; the cookie
         // keys on the host (127.0.0.1), not the port: it must ride.

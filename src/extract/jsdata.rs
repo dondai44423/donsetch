@@ -233,11 +233,9 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     finish(items, html, None, url, opts)
 }
 
-/// Wave W / D5 (2026-10-24): the engine harvested the page's largest inline
-/// state object straight from the WIRE document (the post-JS DOM serialize
-/// can lose script bodies — YouTube's ytInitialData lived in a script the
-/// serialize dropped, and the blob miner below saw an empty shell). Same
-/// walk, same scoring, same rendering as the html path.
+/// One inline state object (a page's JSON global, `name` for diagnostics)
+/// read as content: the same walk, scoring and rendering as the HTML path.
+/// `None` when it carries no content (UI chrome only).
 pub fn extract_state(
     name: &str,
     json: &str,

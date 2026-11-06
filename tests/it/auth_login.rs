@@ -78,49 +78,6 @@ fn spawn_gate_server() -> u16 {
     port
 }
 
-fn new_fetcher() -> donsetch::fetch::client::Fetcher {
-    use donsetch::profile::{BrowserProfile, Platform};
-    let profile = BrowserProfile::chrome_150(Platform::Linux);
-    donsetch::fetch::client::Fetcher::new(profile).expect("fetcher")
-}
-
-// ── pillar 1: login → vault → tier-1 replay, then logout kills it ──
-
-#[test]
-fn login_replays_then_logout_stops_tier1() {
-    isolate_state();
-    let port = spawn_gate_server();
-    let key = "127.0.0.1";
-    let gated = format!("http://127.0.0.1:{port}/gate");
-
-    let rt = tokio::runtime::Runtime::new().expect("rt");
-
-    // Login: the vault gains the session cookie (what the CLI
-    // stores after the human signs in).
-    store_session_cookies(&[cookie(key, "AUTH", "letmein", None)]);
-    rt.block_on(async {
-        let fetcher = new_fetcher();
-        // Exactly what the daemon does on the next tool call.
-        fetcher.reset_to(&load_session_cookies()).await;
-        let outcome = fetcher.fetch(&gated).await.expect("fetch");
-        let body = String::from_utf8_lossy(&outcome.body);
-        assert!(body.contains("WELCOME-INSIDE"), "gated page: {body}");
-    });
-
-    // Logout: vault cleared, a fresh daemon resync denies again.
-    assert!(clear_session_cookies_for(key));
-    rt.block_on(async {
-        let fetcher2 = new_fetcher();
-        fetcher2.reset_to(&load_session_cookies()).await;
-        let outcome2 = fetcher2.fetch(&gated).await.expect("fetch");
-        let body2 = String::from_utf8_lossy(&outcome2.body);
-        assert!(
-            !body2.contains("WELCOME-INSIDE"),
-            "should be gated: {body2}"
-        );
-    });
-}
-
 // ── pillar 2: worthiness + registry masking + isolation ──
 
 #[test]
@@ -578,57 +535,6 @@ fn failed_cli_import_is_nonzero_and_never_reports_saved() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not saved"), "{stderr}");
     assert!(!stderr.contains("secret"));
-}
-
-#[test]
-fn explicit_import_replays_opaque_cookies_to_cookie_gated_http() {
-    isolate_state();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let file = donsetch::paths::cache_dir().join("opaque.txt");
-    std::fs::write(&file, "127.0.0.1\tFALSE\t/\tFALSE\t1999999999\tc_user\tdummyuser\n127.0.0.1\tFALSE\t/\tFALSE\t1999999999\txs\tdummysession\n").unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_donsetch"))
-        .args([
-            "login",
-            "--import",
-            file.to_str().unwrap(),
-            "127.0.0.1",
-            "--no-probe",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("c_user, xs"));
-    let server = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().unwrap();
-        s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        let mut buf = [0; 8192];
-        let n = s.read(&mut buf).unwrap();
-        let request = String::from_utf8_lossy(&buf[..n]);
-        assert!(
-            request.contains("c_user=dummyuser") && request.contains("xs=dummysession"),
-            "{request}"
-        );
-        s.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nOPAQUE-SUCCESS",
-        )
-        .unwrap();
-    });
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let f = new_fetcher();
-        f.reset_to(&load_session_cookies()).await;
-        let r = f
-            .fetch(&format!("http://127.0.0.1:{port}/private"))
-            .await
-            .unwrap();
-        assert_eq!(r.body, b"OPAQUE-SUCCESS");
-    });
-    server.join().unwrap();
 }
 
 #[test]

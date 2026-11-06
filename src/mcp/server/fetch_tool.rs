@@ -63,7 +63,6 @@ pub(super) async fn fetch_tool(
     args: &Value,
     mut ctx: Option<ToolCtx>,
 ) -> Value {
-    daemon.refresh_vault().await;
     let deadline = args
         .get("deadline_ms")
         .and_then(Value::as_u64)
@@ -795,30 +794,6 @@ fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) ->
     adapter_host && !no_adapter && !matches!(verdict, Verdict::ContentOk)
 }
 
-// Reddit adapter/session recovery earns an HTTP recheck after initialization.
-// Its saved wall memory must not skip that recovery. Other hosts retain their
-// learned cooldown.
-// v4.7 V03: JSON data endpoints (reddit `.json`, API dumps) are always Cold:
-// like PDFs, rendering cannot improve a raw payload.
-fn fetch_route(
-    state: &crate::state::GhostState,
-    host: &str,
-    is_pdf_url: bool,
-    is_json_url: bool,
-    adapter_host: bool,
-    retry_http: bool,
-) -> RouteDecision {
-    if is_pdf_url
-        || is_json_url
-        || adapter_host
-        || (retry_http && matches!(host, "www.reddit.com" | "reddit.com"))
-    {
-        RouteDecision::Cold
-    } else {
-        state.route_for(host)
-    }
-}
-
 /// One legacy-host navigation to seed the reddit session (#291
 /// follow-through): any old.reddit.com response runs its login
 /// flow and seeds the cookies `www.reddit.com` needs before it
@@ -837,7 +812,7 @@ async fn reddit_session_hop(
     let t0 = std::time::Instant::now();
     let hop = daemon
         .fetcher
-        .fetch_persona_on_route(&oldu, None, Some(route))
+        .fetch_persona_on_route(&oldu, Some(route))
         .await;
     trace.step(
         "local",
@@ -855,8 +830,8 @@ async fn reddit_session_hop(
 /// it the hop is what seeds a session. A refusal on a direct
 /// attempt still runs the one-shot session fallback, so a stale
 /// loid self-heals.
-fn reddit_session_live(cookies: &[CookieRecord]) -> bool {
-    cookies.iter().any(|c| c.name == "loid")
+fn reddit_session_live(cookie_names: &[String]) -> bool {
+    cookie_names.iter().any(|name| name == "loid")
 }
 
 async fn reddit_session_fallback(
@@ -1089,25 +1064,6 @@ async fn fetch_single_inner(
         let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());
         state.ensure_persona(&host, &caps);
     }
-    // v4 E2: persona locale drives Accept-Language so every fetch
-    // claims one coherent language identity. Viewport/locale for a
-    // browser run are looked up again at acquire time.
-    let persona_al = {
-        let state = daemon.state.lock().await;
-        match state.personas.get(&host) {
-            Some(p) if p.quarantine_reason.is_none() => {
-                Some(crate::profile::accept_language_with_persona(
-                    &host,
-                    url::Url::parse(&url)
-                        .map(|u| u.path().to_string())
-                        .unwrap_or_else(|_| "/".into())
-                        .as_str(),
-                    &p.locale,
-                ))
-            }
-            _ => None,
-        }
-    };
     let age = daemon
         .state
         .lock()
@@ -1126,62 +1082,7 @@ async fn fetch_single_inner(
             ),
         );
     }
-    let retry_http =
-        no_adapter || args.get("_reddit_session").and_then(Value::as_bool) == Some(true);
-    let (route, known_walled) = {
-        let state = daemon.state.lock().await;
-        (
-            fetch_route(
-                &state,
-                &host,
-                is_pdf_url,
-                is_json_url,
-                adapter_host,
-                retry_http,
-            ),
-            state.is_known_walled(&host),
-        )
-    };
-
-    let warm_cookies: Vec<CookieRecord> = match &route {
-        RouteDecision::Warm(c) => c.clone(),
-        _ => Vec::new(),
-    };
-    let is_warm = !warm_cookies.is_empty();
-    if is_warm {
-        daemon.fetcher.import_cookies(&warm_cookies).await;
-    }
-
     let mut trace = Trace::default();
-    let route_name = match &route {
-        RouteDecision::Cold => "cold",
-        RouteDecision::Warm(_) => "warm",
-        RouteDecision::SkipToSolve => "skip-to-solve",
-        RouteDecision::RecheckCold => "recheck-cold",
-        RouteDecision::SolveCooldown(_) => "solve-cooldown",
-    };
-    trace.step("route", "domain-profile", route_name, 0);
-
-    // Fail-fast memory: the wall survived recent attempts.
-    // Honest error, no wasted fetch. The cooldown lapses on
-    // its own; success memories from other layers
-    // (record_cold_ok) clear it on their own cadence.
-    if let RouteDecision::SolveCooldown(retry_in) = route {
-        return tool_error_structured(
-            format!(
-                "known wall at {host} : recent attempts did not clear it on this host; retrying before {retry_in}s from now is unlikely to succeed"
-            ),
-            "walled",
-            Some(json!({
-                "url": url,
-                "status": 0,
-                "code": "wall.blocked",
-                "retry_in_secs": retry_in,
-                "next_action": "wait for the cooldown, or browse the site in your own browser session (a human session clears walls this host cannot)",
-                "escalation": trace.value(),
-            })),
-        );
-    }
 
     // === The local fetch ===
     let mut out: Option<crate::fetch::client::FetchOutcome> = None;
@@ -1219,13 +1120,11 @@ async fn fetch_single_inner(
     if !prewarmed {
         let t0 = std::time::Instant::now();
         let response = {
-            let request = daemon.fetcher.fetch_persona_on_route(
-                &url,
-                persona_al.as_deref(),
-                Some(&call.route),
-            );
+            let request = daemon
+                .fetcher
+                .fetch_persona_on_route(&url, Some(&call.route));
             let needs_seed = adapter_used == Some("adapter:reddit-json")
-                && !reddit_session_live(&daemon.fetcher.jar_snapshot(&host));
+                && !reddit_session_live(&daemon.fetcher.cookie_names(&host));
             if needs_seed {
                 // The structured endpoint and session initialization do not
                 // depend on each other's response. Overlap their network waits.
@@ -1316,22 +1215,13 @@ async fn fetch_single_inner(
         out = Some(fetched);
 
         // === Observe the outcome ===
-        // Every fetch teaches the domain profile something : but
-        // only CHALLENGES say anything about walls. A 404, 429,
-        // paywall, or auth wall is an honest terminal answer from
-        // the origin; recording it as "walled" used to poison easy
-        // domains into permanent skip-to-solve (every later fetch
-        // paid for a doomed wall attempt on a 404).
+        // Counters for `donsetch status`: only CHALLENGES say anything
+        // about walls. A 404, 429, paywall or auth wall is an honest
+        // terminal answer from the origin. The fetch layer keeps its own
+        // per-origin memory; these never route a fetch.
         let o = out.as_ref().unwrap();
         {
             let mut state = daemon.state.lock().await;
-            // Tier-1 jar flush (v4 phase 1.4): persist the whole
-            // cookie store on every completed navigation, inside
-            // the same record_* save (one state write per fetch,
-            // today's cost class). Browser-true: cookies survive
-            // process restarts, so remote sessions see a RETURNING
-            // visitor, not a fresh jar every run.
-            state.sync_tier1_cookies(&daemon.fetcher.jar_all_snapshot().await);
             match o.verdict {
                 // An adapter endpoint's refusal is not evidence about
                 // the PAGE (reddit's protected `.json` is the known
@@ -1343,19 +1233,10 @@ async fn fetch_single_inner(
                 // JSON data endpoint : a `.json` challenge says
                 // nothing about the human-facing pages.
                 Verdict::Challenge(_) if adapter_host || is_json_url || is_json_endpoint(o) => {}
-                Verdict::Challenge(_) => {
+                Verdict::Challenge(vendor) => {
                     state.record_failure(&host, crate::state::FailClass::Block);
-                    if is_warm {
-                        // Warm cookies went stale : learn the real lifetime.
-                        state.record_warm_stale(&host);
-                    } else {
-                        // Cold (or recheck) was challenged : the domain is walled.
-                        let vendor = match &o.verdict {
-                            Verdict::Challenge(v) => Some(format!("{v:?}").to_lowercase()),
-                            _ => None,
-                        };
-                        state.record_cold_walled(&host, vendor.as_deref());
-                    }
+                    let vendor = format!("{vendor:?}").to_lowercase();
+                    state.record_cold_walled(&host, Some(&vendor));
                 }
                 // API access does not prove the original website wall
                 // cleared (v4.7 V03: nor does a JSON endpoint's success :
@@ -1363,19 +1244,7 @@ async fn fetch_single_inner(
                 Verdict::ContentOk if adapter_host || is_json_url || is_json_endpoint(o) => {
                     state.record_fetch(&host)
                 }
-                Verdict::ContentOk => {
-                    if is_warm {
-                        // Warm succeeded : refresh the cookie vault (write-back).
-                        let snap = daemon.fetcher.jar_snapshot(&host);
-                        state.record_warm_ok(&host, &snap);
-                    } else if known_walled {
-                        // A previously walled site may serve bait to HTTP. Keep
-                        // its wall memory until a browser comparison is equivalent.
-                        state.record_fetch(&host);
-                    } else {
-                        state.record_cold_ok(&host);
-                    }
-                }
+                Verdict::ContentOk => state.record_cold_ok(&host),
                 // Everything else (404, rate-limit, paywall, auth,
                 // hard block): counters only, no wall inference.
                 _ => state.record_fetch(&host),
@@ -1541,7 +1410,11 @@ async fn fetch_single_inner(
                 })),
             );
         }
-        match extract::extract_off_worker(&o.body, &ct, &o.url, &opts).await {
+        let read_opts = extract::ExtractOptions {
+            verified: o.verified,
+            ..opts.clone()
+        };
+        match extract::extract_off_worker(&o.body, &ct, &o.url, &read_opts).await {
             Ok(e) => {
                 final_url = o.url.clone();
                 final_ex = Some(e);
@@ -1585,28 +1458,11 @@ async fn fetch_single_inner(
         }
     }
 
-    let ex_thin = final_ex.as_ref().map(|e| e.thin).unwrap_or(false);
     let challenge = out
         .as_ref()
         .map(|o| crate::detect::walls::browser_recovery(o.status, &o.headers, &o.body, o.verdict))
         .unwrap_or(false)
         || extraction_wall.is_some();
-
-    // Warm cookies that only buy a SHELL are stale cookies : but
-    // the evidence must be a shell, not an extraction gap. A warm
-    // ContentOk whose body is big yet nearly invisible-text-free
-    // (JS shell) means the clearance bought nothing. A body with
-    // rich visible text that extracts thin is a DonSift gap :
-    // killing valid cookies for it is the gallery-page bug.
-    let shell_warm = is_warm && ex_thin && {
-        let o = out.as_ref().unwrap();
-        o.body.len() > 20_000
-            && (crate::detect::walls::visible_text_count(&o.body) as f64 / o.body.len() as f64)
-                < 0.02
-    };
-    if shell_warm {
-        daemon.state.lock().await.record_warm_stale(&host);
-    }
 
     // Links fallback: listing/feed pages (Hacker News, indexes)
     // die in the prose pipeline simply for being link-dense. Try
@@ -1644,34 +1500,6 @@ async fn fetch_single_inner(
     // apps, SPAs). A 2KB page with no content is a 404, never a
     // shell class.
     let still_thin = final_ex.as_ref().map(|e| e.thin).unwrap_or(false);
-    // Wave W: a state-rescued extraction is content — the shell/wall
-    // decisions below must not fire on it.
-    // === Wave W / D5: the inline-state rescue ===
-    // The page shipped its content as a big inline JSON global and the DOM
-    // never hydrated (or hydrated around it): the engine harvested the
-    // object from the WIRE document; DonSift's state walker turns it into
-    // content. Runs BEFORE the walled/shell decisions so a state-bearing
-    // page is SERVED, never failed as "did not hydrate" (measured:
-    // youtube.com, 163 visible DOM chars, the whole homepage in
-    // ytInitialData).
-    let mut state_rescued = false;
-    // (shell_text/chrome_text are defined below; the engine only harvests
-    // state when the DOM stayed thin, so still_thin is the faithful trigger)
-    if still_thin
-        && let Some(o) = out.as_ref()
-        && let Some(st) = o.state.as_ref()
-        && let Some(mut js) =
-            crate::extract::jsdata::extract_state(&st.name, &st.json, &o.url, &opts)
-        && js.total_chars > final_ex.as_ref().map(|e| e.total_chars).unwrap_or(0)
-    {
-        js.images = final_ex
-            .as_ref()
-            .map(|e| e.images.clone())
-            .unwrap_or_default();
-        final_ex = Some(js);
-        state_rescued = true;
-        trace.step("local", "state-extract", "ok", 0);
-    }
     let page_size = out.as_ref().map(|o| o.body.len()).unwrap_or(0);
     // PDF detection: if the response is a PDF (content-type or magic
     // bytes), never render it : a browser PDF viewer is a JS shell
@@ -1716,7 +1544,9 @@ async fn fetch_single_inner(
     // #282: "the extraction is non-empty" is not a success test. A
     // challenge interstitial or a chrome-only shell must fail
     // honestly, not serve.
+    let verified = out.as_ref().is_some_and(|o| o.verified);
     let challenge_text = status_2xx
+        && !verified
         && final_ex
             .as_ref()
             .map(|e| crate::detect::walls::challenge_text(&e.markdown))
@@ -1739,7 +1569,7 @@ async fn fetch_single_inner(
     // interstitial behind a 2xx. Shell-class: a client-rendered page
     // that never hydrated locally. Adapters, JSON payloads and PDFs
     // are excluded (they are terminal at the local fetch already).
-    let sink_eligible = !is_pdf_content && !adapter_host && !json_like && !state_rescued;
+    let sink_eligible = !is_pdf_content && !adapter_host && !json_like;
     // Wave W / D5: a scripted micro-document with near-empty extraction is a
     // throttle/block shell (bloomberg's 502-byte ok:true body), never ok.
     let micro_shell = sink_eligible
@@ -1754,8 +1584,14 @@ async fn fetch_single_inner(
             })
             .unwrap_or(false);
     let wall_like = sink_eligible && (challenge || challenge_text);
+    // A body the fetch layer verified as content is served as extracted, short
+    // or not: its own contract already ruled out a shell.
     let shell_like = sink_eligible
         && !wall_like
+        && !(verified
+            && final_ex
+                .as_ref()
+                .is_some_and(|e| !e.markdown.trim().is_empty()))
         && (shell_text || chrome_text || micro_shell || (still_thin && !is_small_404));
     if wall_like {
         let v = extraction_wall.unwrap_or(Verdict::Challenge(Vendor::Generic));
@@ -1803,7 +1639,7 @@ async fn fetch_single_inner(
                     "url": url,
                     "status": final_status,
                     "verdict": "AuthWall",
-                    "next_action": "authenticate (donsetch login), or choose a public source for this content",
+                    "next_action": "the page needs a signed-in session, which fetch does not carry; choose a public source for this content",
                     "escalation": trace.value(),
                 })),
             );
@@ -1978,7 +1814,7 @@ async fn fetch_single_inner(
     // content, whatever produced it. The failure is "walled" so the
     // optional unlocker can engage instead of the agent trusting
     // navigation boilerplate.
-    if let Some((msg, kind, action)) = content_fail(&ex.markdown, &url, final_status) {
+    if let Some((msg, kind, action)) = content_fail(&ex.markdown, &url, final_status, verified) {
         return tool_error_structured(
             msg,
             kind,
@@ -2167,7 +2003,7 @@ pub(super) async fn try_bypass(
     let failure = if ex.blocks_total == 0 || ex.markdown.trim().is_empty() {
         Some("unlocker returned no extracted content".to_string())
     } else {
-        content_fail(&ex.markdown, url, outcome.status).map(|(msg, _, _)| msg)
+        content_fail(&ex.markdown, url, outcome.status, false).map(|(msg, _, _)| msg)
     };
     if let Some(msg) = failure {
         crate::fetch::bypass::invalidate_cached(&cache_dir, url, cfg.render);
@@ -2253,18 +2089,22 @@ fn looks_like_shell_text(markdown: &str) -> bool {
 /// Positive content tests (#282): a challenge interstitial or a
 /// chrome-only shell that made it through as "some text" is not
 /// content. Returns the honest failure for the extracted shape, or
-/// None when the text is real content.
+/// None when the text is real content. A `verified` body (the fetch layer's
+/// contract found content) is not failed on bot-wall words alone.
 fn content_fail(
     markdown: &str,
     url: &str,
     status: u16,
+    verified: bool,
 ) -> Option<(String, &'static str, &'static str)> {
-    if let Some(wall) = crate::detect::walls::text_wall(markdown) {
+    if let Some(wall) = crate::detect::walls::text_wall(markdown)
+        && !(verified && matches!(wall, Verdict::Challenge(_) | Verdict::Blocked))
+    {
         if wall == Verdict::AuthWall {
             return Some((
                 format!("login required at {url}"),
                 "walled",
-                "authenticate with donsetch login <domain>, or use an accessible source",
+                "the page needs a signed-in session, which fetch does not carry; use an accessible source",
             ));
         }
         return Some((
@@ -3482,9 +3322,13 @@ mod adapter_hop_tests {
                     for server in servers { tokio::time::timeout(std::time::Duration::from_secs(2), server).await.unwrap().unwrap(); }
                     assert_eq!(result["structuredContent"]["ok"], true, "{result}");
                     let events = events.lock().unwrap();
-                    assert_eq!(events.len(), 2, "one adapter read and one fallback: {events:?}");
+                    // The adapter read is one encounter (v5 may ask it as more
+                    // than one identity); the fallback is one read after it.
                     assert!(events[0].1.contains(".json"), "{events:?}");
-                    assert!(!events[1].1.contains(".json"), "{events:?}");
+                    let last = events.last().unwrap();
+                    assert!(last.1.ends_with("/r/owned/"), "{events:?}");
+                    assert_eq!(events.iter().filter(|(_, target)| target.ends_with("/r/owned/")).count(), 1,
+                        "one fallback read: {events:?}");
                     assert!(events.iter().all(|(lane, _)| *lane == "A"),
                         "a related fallback must not repick after the adapter burns its lane: {events:?}");
                     assert!(result["content"][0]["text"].as_str().unwrap().contains("Owned fallback lane A"), "{result}");
@@ -3508,75 +3352,6 @@ mod adapter_hop_tests {
             .collect();
         assert_eq!(rewrites, vec![true, false]);
         assert!(fetch_url_rewrite(&url, &json!({}), true).is_none());
-    }
-
-    #[test]
-    fn recovery_retries_recheck_http_despite_saved_wall_routes() {
-        use crate::state::{DomainProfile, GhostState};
-        let host = "www.reddit.com";
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut state = GhostState::default();
-        state.profiles.insert(
-            host.into(),
-            DomainProfile {
-                needs_tier2: true,
-                last_cold_check: now,
-                ..Default::default()
-            },
-        );
-        assert!(matches!(
-            fetch_route(&state, host, false, false, false, false),
-            RouteDecision::SkipToSolve
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, false, false, false, true),
-            RouteDecision::Cold
-        ));
-        let profile = state.profiles.get_mut(host).unwrap();
-        profile.wall_fail_streak = 2;
-        profile.last_wall_fail = now;
-        assert!(matches!(
-            fetch_route(&state, host, false, false, false, false),
-            RouteDecision::SolveCooldown(_)
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, false, false, false, true),
-            RouteDecision::Cold
-        ));
-        state
-            .profiles
-            .insert("stackoverflow.com".into(), state.profiles[host].clone());
-        assert!(matches!(
-            fetch_route(&state, "stackoverflow.com", false, false, false, true),
-            RouteDecision::SolveCooldown(_)
-        ));
-        // Other remembered walls: the cold routes win : the reddit
-        // recheck, PDFs, JSON data endpoints, adapter hosts.
-        assert!(matches!(
-            fetch_route(&state, host, false, false, false, true),
-            RouteDecision::Cold
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, true, false, false, false),
-            RouteDecision::Cold
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, false, false, true, false),
-            RouteDecision::Cold
-        ));
-        // v4.7 V03: JSON data endpoints are terminal at the local fetch :
-        // a learned wall never routes them.
-        assert!(matches!(
-            fetch_route(&state, host, false, true, false, false),
-            RouteDecision::Cold
-        ));
-        assert!(matches!(
-            fetch_route(&state, host, false, true, false, true),
-            RouteDecision::Cold
-        ));
     }
 
     #[test]
@@ -3633,16 +3408,7 @@ mod adapter_hop_tests {
     // skipped; the refusal ladder still covers a revoked session.
     #[test]
     fn a_live_loid_gates_the_preemptive_reddit_hop() {
-        let cookie = |name: &str| CookieRecord {
-            name: name.into(),
-            value: "v".into(),
-            domain: ".reddit.com".into(),
-            path: "/".into(),
-            expires_at: None,
-            secure: true,
-            http_only: true,
-            same_site: "Lax".into(),
-        };
+        let cookie = |name: &str| name.to_string();
         assert!(reddit_session_live(&[cookie("loid")]));
         assert!(reddit_session_live(&[
             cookie("session_tracker"),
@@ -4026,59 +3792,6 @@ mod rules_tests {
         assert!(
             targets.iter().any(|t| t.contains("old.reddit.com")),
             "{targets:?}"
-        );
-    }
-
-    // Installs config and rewrites the owned cache; nextest's process isolation is required.
-    #[tokio::test]
-    async fn reliability_running_daemon_reloads_same_size_same_timestamp_login() {
-        let mut config = crate::config::DonsetchConfig::default();
-        config.proxy.from_environment = false;
-        crate::config::install(config).unwrap();
-        let path = crate::paths::cache_dir().join("ghost-state.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let state = |value: &str, revision: &str, epoch: u64| {
-            json!({
-                "version": 3, "vault_epoch": epoch,
-                "session_revision": revision,
-                "profiles": {"example.test": {"session_cookies":[{
-                    "domain":"example.test","name":"xs","path":"/","value":value,
-                    "expires_at":2000000000u64,"http_only":true,"secure":true,"same_site":"Lax"
-                }]}}
-            })
-            .to_string()
-        };
-        let first = state("aaaa", "11111111111111111111111111111111", 10);
-        let second = state("bbbb", "22222222222222222222222222222222", 11);
-        assert_eq!(first.len(), second.len());
-        std::fs::write(&path, first).unwrap();
-        let daemon = Arc::new(super::Daemon::new().await.unwrap());
-        daemon.refresh_vault().await;
-        assert!(
-            daemon
-                .fetcher
-                .jar_all_snapshot()
-                .await
-                .iter()
-                .any(|c| c.name == "xs" && c.value == "aaaa")
-        );
-        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::fs::write(&path, second).unwrap();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
-            .unwrap();
-        daemon.refresh_vault().await;
-        assert!(
-            daemon
-                .fetcher
-                .jar_all_snapshot()
-                .await
-                .iter()
-                .any(|c| c.name == "xs" && c.value == "bbbb"),
-            "session rotation was missed because size and timestamp matched"
         );
     }
 }

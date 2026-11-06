@@ -1,0 +1,2100 @@
+//! The encounter: one URL, a portfolio, and a budget.
+//!
+//! Order matters and is cheap to keep: the stored winner first, then proven
+//! identities by score, the vendor's known passers, untried identities, and
+//! identities that only failed here last. Each attempt is one request. A wall
+//! that names its vendor moves that vendor's passers forward. The loop stops as
+//! soon as content verifies, and early when the class cannot be fixed by being
+//! someone else (a 404, a shell, a human check no identity is known to pass).
+//!
+//! Around the encounter: the page cache (`cache.rs`) answers or revalidates
+//! first, a remembered route (`OriginState::route`) asks the site's interface
+//! before its document, and what was learned is written once per fetch.
+
+use crate::cache::{self, PageCache, Plan};
+use crate::challenge::akamai_bm_verify;
+use crate::classify::{classify, Class, Evidence, Verdict, Wall};
+use crate::contract::{verify, verify_response, Content, Contract};
+use crate::datapath;
+use crate::http::Wire;
+use crate::identity::{self, Identity};
+use crate::state::{State, StoredCookie};
+use serde::{Deserialize, Serialize};
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Keep the response body on the outcome (inspection runs only).
+    pub capture_body: bool,
+    /// Arrive like a returning visitor: a first-contact warm-up of the origin,
+    /// then the page request with a referer and same-origin fetch metadata.
+    pub arrival: bool,
+    pub max_tries: usize,
+    pub deadline: Duration,
+    pub contract: Option<Contract>,
+    /// Persist scores and cookies between processes.
+    pub persist: bool,
+    /// Force one identity and skip selection (diagnostics and contracts).
+    pub identity: Option<String>,
+    /// Minimum spacing between two requests to the same origin, in ms.
+    pub pace_ms: i64,
+    /// The envelope the challenge engine runs inside.
+    pub engine: crate::envelope::Limits,
+    /// Egress proxy URL for every request of the encounter, the engine's included.
+    pub proxy: Option<String>,
+    /// Read and keep pages in the page cache (`cache.rs`). Only a persisting
+    /// worker caches: a cold probe neither reads nor writes it.
+    pub cache: bool,
+    /// Never serve a cached page without asking the server, even a fresh one.
+    pub revalidate: bool,
+    /// Redirects (followed or not, each hop asked of the caller's guard) and the
+    /// headers a navigation carries besides the identity's own.
+    pub policy: crate::http::Policy,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            capture_body: false,
+            // Measured neutral on this corpus: no class changed, one extra
+            // request paid. Off unless asked for.
+            arrival: false,
+            // Discovery is amortised across encounters and ordered by what this
+            // origin's vendor has accepted before. Walls score per client class:
+            // measured, okhttp beat Cloudflare where Chrome was refused, so the
+            // search has to reach the whole portfolio, not its first three.
+            max_tries: 6,
+            deadline: Duration::from_millis(3000),
+            contract: None,
+            persist: true,
+            identity: None,
+            pace_ms: 900,
+            engine: crate::envelope::Limits::from_env(),
+            proxy: None,
+            cache: true,
+            revalidate: false,
+            policy: crate::http::Policy::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Attempt {
+    pub identity: String,
+    pub transport: String,
+    pub class: Class,
+    pub status: u16,
+    pub ms: f64,
+    pub bytes: usize,
+    pub version: String,
+    pub title: String,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Outcome {
+    pub url: String,
+    pub host: String,
+    pub final_url: String,
+    pub class: Class,
+    pub identity: Option<String>,
+    pub status: u16,
+    pub ms_total: f64,
+    pub ms_first: f64,
+    pub attempts: Vec<Attempt>,
+    pub title: String,
+    pub text_chars: usize,
+    pub wall: Option<Wall>,
+    pub evidence: Vec<String>,
+    pub failures: Vec<String>,
+    pub spent_state: bool,
+    /// How the content was obtained: a page (`document`) or the site's own
+    /// interface (`data`). Nothing else exists, and the difference is reported.
+    pub transport: String,
+    /// `fresh`: served from the page cache without a request; `revalidated`: the
+    /// server confirmed the cached page is current (304); `changed`: a cached copy
+    /// existed and the page fetched whole now reads differently. Absent: fetched
+    /// whole with no copy to compare, or the same text again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<String>,
+    pub items: usize,
+    /// First few item titles, so a caller can check the answer against the page.
+    pub sample: Vec<String>,
+    /// Their URLs: items carry ids the rendered page also links to.
+    pub sample_urls: Vec<String>,
+    /// The data path's answer as clean text (empty for document transports).
+    pub body_text: String,
+    /// The response body, only when the caller asked for it (inspection runs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// The final response's headers, only when the caller asked for the body.
+    #[serde(skip)]
+    pub headers: Vec<(String, String)>,
+    /// The body's bytes as served, only when the caller asked for the body and
+    /// they are not UTF-8 text (otherwise `body` is exact).
+    #[serde(skip)]
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// A fresh page from the cache as an outcome: no request was made.
+#[allow(clippy::too_many_arguments)]
+fn served(
+    url: &str,
+    host: String,
+    entry: cache::Entry,
+    body: String,
+    raw: Option<Vec<u8>>,
+    content: Content,
+    options: &Options,
+    started: Instant,
+) -> Outcome {
+    Outcome {
+        url: url.to_string(),
+        cache: Some("fresh".into()),
+        host,
+        final_url: entry.final_url.clone(),
+        class: Class::Content,
+        identity: Some(entry.identity.clone()),
+        status: entry.status,
+        ms_total: started.elapsed().as_secs_f64() * 1000.0,
+        ms_first: 0.0,
+        attempts: Vec::new(),
+        title: content.title,
+        text_chars: content.text_chars,
+        wall: None,
+        evidence: Vec::new(),
+        failures: Vec::new(),
+        spent_state: false,
+        transport: "document".to_string(),
+        items: 0,
+        sample: Vec::new(),
+        sample_urls: Vec::new(),
+        body_text: String::new(),
+        body: options.capture_body.then_some(body),
+        headers: if options.capture_body {
+            entry.headers.clone()
+        } else {
+            Vec::new()
+        },
+        bytes: if options.capture_body { raw } else { None },
+    }
+}
+
+/// What asking a data path came to.
+enum Interface {
+    Answered(Box<Outcome>),
+    Wait,
+    Unanswered,
+}
+
+/// One fetching context: its own clients (one per identity and egress) and the
+/// state it learns into. Single-threaded; `v5core::Session` pools these.
+pub struct Worker {
+    state: State,
+    wires: HashMap<(&'static str, Option<String>), Wire>,
+    /// The egress of the fetch in progress.
+    proxy: Option<String>,
+    /// The redirect and header rules of the fetch in progress.
+    policy: crate::http::Policy,
+    /// Learn from encounters: scores, cookies, credentials.
+    persist: bool,
+    /// Write what was learned to the state file. Off when an owner of several
+    /// workers persists their merged state itself (`v5core::Session`).
+    saves: bool,
+    /// The state file as this worker last read or wrote it: what a save merges from.
+    base: State,
+    /// Something was learned since the last save.
+    dirty: Cell<bool>,
+    cache: Arc<PageCache>,
+    /// The cached page this fetch may revalidate or compare against.
+    pending: Option<Pending>,
+    /// The document a fetch ended on, for the cache.
+    captured: Option<Captured>,
+}
+
+struct Pending {
+    entry: cache::Entry,
+    /// Send its validators (a revalidation); otherwise it is only compared (an audit).
+    conditional: bool,
+}
+
+struct Captured {
+    identity: &'static str,
+    final_url: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+    bytes: Vec<u8>,
+    cookie: Option<String>,
+    /// The cached entry a 304 confirmed.
+    revalidated: Option<cache::Entry>,
+}
+
+impl Worker {
+    /// A worker that learns, saves its state and caches pages on disk when
+    /// `persist`, and does none of that otherwise.
+    pub fn new(persist: bool) -> Self {
+        let state = if persist {
+            State::load()
+        } else {
+            State::default()
+        };
+        let cache = if persist {
+            PageCache::for_state()
+        } else {
+            PageCache::in_memory()
+        };
+        Self::build(state, persist, persist, Arc::new(cache))
+    }
+
+    /// A worker that learns into `state` and caches into `cache`, and never
+    /// writes the state to disk (its owner does).
+    pub fn learning(state: State, cache: Arc<PageCache>) -> Self {
+        Self::build(state, true, false, cache)
+    }
+
+    fn build(state: State, persist: bool, saves: bool, cache: Arc<PageCache>) -> Self {
+        Self {
+            base: state.clone(),
+            state,
+            wires: HashMap::new(),
+            proxy: None,
+            policy: crate::http::Policy::default(),
+            persist,
+            saves,
+            dirty: Cell::new(false),
+            cache,
+            pending: None,
+            captured: None,
+        }
+    }
+
+    /// The learned state, swapped for `next`.
+    pub fn swap_state(&mut self, next: State) -> State {
+        std::mem::replace(&mut self.state, next)
+    }
+
+    /// Mark the state changed; the fetch writes it once, when it ends.
+    fn save_state(&self) {
+        self.dirty.set(true);
+    }
+
+    /// Ask the origin's own interface (a data path), as `identity`. `Wait` means
+    /// the interface asked for time (a cooldown or its published interval) and the
+    /// attempt is spent.
+    #[allow(clippy::too_many_arguments)]
+    fn ask_interface(
+        &mut self,
+        url: &str,
+        host: &str,
+        identity: &'static Identity,
+        options: &Options,
+        started: Instant,
+        first_ms: f64,
+        attempts: &mut Vec<Attempt>,
+    ) -> Interface {
+        let Some((path, request)) = datapath::plan(url) else {
+            return Interface::Unanswered;
+        };
+        let host = host.to_string();
+        let remaining = options.deadline.saturating_sub(started.elapsed());
+        if remaining.as_millis() >= 700 {
+            let data_host = url::Url::parse(&request.url)
+                .ok()
+                .and_then(|parsed| parsed.host_str().map(str::to_string))
+                .unwrap_or_else(|| host.clone());
+            // The interface publishes its own limits; obeying them is
+            // cheaper than being blocked by them.
+            if let Some(wait) = self.state.cooling(&data_host) {
+                attempts.push(Attempt {
+                    identity: identity.name.to_string(),
+                    transport: "data".to_string(),
+                    class: Class::WallContract,
+                    status: 429,
+                    ms: 0.0,
+                    bytes: 0,
+                    version: String::new(),
+                    title: String::new(),
+                    note: Some(format!("{}: cooling down {wait} ms", path.id)),
+                });
+                return Interface::Wait;
+            }
+            // Never sleep through an interface's interval: a fetch that
+            // waits eleven seconds is worse than one that says "paced".
+            let debt = self.state.pace_debt(&data_host, path.min_interval_ms);
+            if debt > 0 {
+                attempts.push(Attempt {
+                    identity: identity.name.to_string(),
+                    transport: "data".to_string(),
+                    class: Class::WallContract,
+                    status: 0,
+                    ms: 0.0,
+                    bytes: 0,
+                    version: String::new(),
+                    title: String::new(),
+                    note: Some(format!("{}: paced, {debt} ms owed", path.id)),
+                });
+                return Interface::Wait;
+            }
+            if options.pace_ms > 0 {
+                self.state.pace(&data_host, options.pace_ms.min(200));
+            }
+            self.state.mark_call(&data_host);
+            let cookie = self.state.cookie_header_for(&request.url, identity.name);
+            let response = {
+                let wire = self.wire(identity).ok();
+                match wire {
+                    // The app's own call, not a page load: fetch
+                    // metadata from the path, no navigation-only header.
+                    Some(wire) => Some(wire.subresource(
+                        identity,
+                        crate::http::Call {
+                            method: request.method,
+                            url: &request.url,
+                            cookie: cookie.as_deref(),
+                            timeout: remaining,
+                            extra: &request.headers,
+                            body: request.body.as_deref().map(str::as_bytes),
+                            cap: None,
+                            kind: crate::http::Kind::Subresource,
+                        },
+                    )),
+                    None => None,
+                }
+            };
+            let (status, body, elapsed, version, size, cooldown) = match response {
+                Some(Ok(response)) => {
+                    let size = response.body.len();
+                    let cooldown = retry_hint(&response.headers);
+                    (
+                        response.status,
+                        response.body,
+                        response.elapsed_ms,
+                        response.version,
+                        size,
+                        cooldown,
+                    )
+                }
+                Some(Err(error)) => (0, error, 0.0, String::new(), 0, None),
+                None => (0, String::new(), 0.0, String::new(), 0, None),
+            };
+            let (status, body, elapsed, version, size, cooldown) =
+                (status, body, elapsed, version, size, cooldown);
+            if status == 429 {
+                // Whatever the interface says it needs, give it that.
+                self.state
+                    .set_cooldown(&data_host, cooldown.unwrap_or(60_000));
+            }
+            let items = if status == 200 {
+                (path.parse)(&body, &request.url)
+            } else {
+                Vec::new()
+            };
+            attempts.push(Attempt {
+                identity: identity.name.to_string(),
+                transport: "data".to_string(),
+                class: if items.len() >= path.min_items {
+                    Class::Content
+                } else {
+                    Class::Incomplete
+                },
+                status,
+                ms: elapsed,
+                bytes: size,
+                version,
+                title: items
+                    .first()
+                    .map(|item| item.title.clone())
+                    .unwrap_or_default(),
+                note: Some(format!(
+                    "{}: {} items (min {})",
+                    path.id,
+                    items.len(),
+                    path.min_items
+                )),
+            });
+            if items.len() >= path.min_items {
+                if self.persist {
+                    self.state
+                        .record(&host, identity.name, "content", true, elapsed);
+                    self.state.record_vendor_success(&host, identity.name);
+                    // The interface answered: next time it is asked first.
+                    self.state.origins.entry(host.clone()).or_default().route = Some("data".into());
+                    self.save_state();
+                }
+                return Interface::Answered(Box::new(Outcome {
+                    url: url.to_string(),
+                    cache: None,
+                    host,
+                    final_url: request.url.clone(),
+                    class: Class::Content,
+                    identity: Some(identity.name.to_string()),
+                    status,
+                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                    ms_first: first_ms,
+                    attempts: std::mem::take(attempts),
+                    title: path.id.to_string(),
+                    text_chars: items.iter().map(|item| item.title.len()).sum(),
+                    wall: None,
+                    evidence: vec![format!("{}:{}", path.id, items.len())],
+                    failures: Vec::new(),
+                    spent_state: cookie.is_some(),
+                    transport: "data".to_string(),
+                    items: items.len(),
+                    sample: items
+                        .iter()
+                        .take(5)
+                        .map(|item| item.title.clone())
+                        .collect(),
+                    sample_urls: items
+                        .iter()
+                        .filter_map(|item| item.url.clone())
+                        .take(5)
+                        .collect(),
+                    body_text: datapath::render(path, &items),
+                    body: None,
+                    headers: Vec::new(),
+                    bytes: None,
+                }));
+            }
+        }
+        Interface::Unanswered
+    }
+
+    /// One request as one named identity, no selection and no state: the probe
+    /// used to build the identity matrix.
+    pub fn probe_one(
+        &mut self,
+        identity_name: &str,
+        url: &str,
+        contract: &Contract,
+        timeout: Duration,
+    ) -> Attempt {
+        let Some(identity) = identity::lookup(identity_name) else {
+            return Attempt {
+                identity: identity_name.to_string(),
+                transport: "document".to_string(),
+                class: Class::Network,
+                status: 0,
+                ms: 0.0,
+                bytes: 0,
+                version: String::new(),
+                title: String::new(),
+                note: Some("unknown identity".into()),
+            };
+        };
+        let response = {
+            let wire = match self.wire(identity) {
+                Ok(wire) => wire,
+                Err(error) => {
+                    return Attempt {
+                        identity: identity.name.to_string(),
+                        transport: "document".to_string(),
+                        class: Class::Network,
+                        status: 0,
+                        ms: 0.0,
+                        bytes: 0,
+                        version: String::new(),
+                        title: String::new(),
+                        note: Some(error),
+                    };
+                }
+            };
+            wire.get(url, None, identity, timeout)
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                return Attempt {
+                    identity: identity.name.to_string(),
+                    transport: "document".to_string(),
+                    class: Class::Network,
+                    status: 0,
+                    ms: 0.0,
+                    bytes: 0,
+                    version: String::new(),
+                    title: String::new(),
+                    note: Some(error),
+                };
+            }
+        };
+        let content = if (200..400).contains(&response.status) {
+            verify(&response.body, &response.url, contract)
+        } else {
+            Content {
+                title: String::new(),
+                text_chars: 0,
+                passed: false,
+                failures: vec![format!("status {}", response.status)],
+            }
+        };
+        let verdict = classify(Evidence {
+            status: response.status,
+            body: &response.body,
+            content_ok: content.passed,
+            headers: &response.headers,
+        });
+        let note = if content.passed {
+            None
+        } else if let Some(wall) = &verdict.wall {
+            Some(format!("{}:{}", wall.vendor, wall.marker))
+        } else {
+            Some(content.failures.join("; "))
+        };
+        Attempt {
+            identity: identity.name.to_string(),
+            transport: "document".to_string(),
+            class: verdict.class,
+            status: response.status,
+            ms: response.elapsed_ms,
+            bytes: response.body.len(),
+            version: response.version.clone(),
+            title: content.title,
+            note,
+        }
+    }
+
+    fn wire(&mut self, identity: &'static Identity) -> Result<&Wire, String> {
+        let key = (identity.name, self.proxy.clone());
+        if !self.wires.contains_key(&key) {
+            let wire = Wire::via(identity, self.proxy.as_deref())?;
+            self.wires.insert(key.clone(), wire);
+        }
+        let wire = self.wires.get(&key).expect("wire just inserted");
+        wire.set_policy(self.policy.clone());
+        Ok(wire)
+    }
+
+    /// The fetch is over: its policy goes, and when its caller stopped waiting,
+    /// every connection it may have left mid-request goes with the wires (a
+    /// wire's runtime runs its connections only while a request is in flight).
+    fn release(&mut self) {
+        let policy = std::mem::take(&mut self.policy);
+        if policy
+            .cancel
+            .as_ref()
+            .is_some_and(crate::Cancel::is_cancelled)
+        {
+            self.wires.clear();
+        }
+    }
+
+    /// One request as `once` describes it ([`crate::Once`]).
+    pub fn once(&mut self, once: &crate::Once) -> Result<crate::Reply, String> {
+        let name = once.identity.as_deref().unwrap_or("chrome-local");
+        let identity =
+            identity::lookup(name).ok_or_else(|| format!("identity: unknown {name:?}"))?;
+        let host = url::Url::parse(&once.url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+            .ok_or_else(|| format!("request: not a URL: {}", once.url))?;
+        self.proxy = once.proxy.clone();
+        self.policy = once.policy.clone();
+        let cookie = if once.cookies {
+            self.state.cookie_header_for(&once.url, identity.name)
+        } else {
+            None
+        };
+        let headers: Vec<(&str, &str)> = once
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let result = self.wire(identity).and_then(|wire| {
+            wire.call(
+                identity,
+                crate::http::Call {
+                    method: "GET",
+                    url: &once.url,
+                    cookie: cookie.as_deref(),
+                    timeout: once.timeout,
+                    extra: &headers,
+                    body: None,
+                    cap: once.cap,
+                    kind: once.kind,
+                },
+            )
+        });
+        self.release();
+        let response = result?;
+        if once.cookies {
+            let cookies = response.cookies.iter().map(stored).collect();
+            self.state.store_cookies(&host, identity.name, cookies);
+        }
+        Ok(crate::Reply {
+            status: response.status,
+            url: response.url,
+            headers: response.headers,
+            bytes: response.raw.unwrap_or_else(|| response.body.into_bytes()),
+            identity: identity.name,
+            version: response.version,
+            elapsed_ms: response.elapsed_ms,
+        })
+    }
+
+    /// Fetch one URL under the policy in `options`: the page cache first, then
+    /// the encounter; what was learned is written once, at the end.
+    pub fn fetch(&mut self, url: &str, options: &Options) -> Outcome {
+        self.policy = options.policy.clone();
+        let outcome = self.through_cache(url, options);
+        self.release();
+        self.pending = None;
+        self.captured = None;
+        if self.dirty.replace(false) && self.saves {
+            self.base = self.state.save_merged(&self.base);
+            self.state = self.base.clone();
+        }
+        outcome
+    }
+
+    fn through_cache(&mut self, url: &str, options: &Options) -> Outcome {
+        // A cold probe neither reads nor writes the cache: no state in, none out.
+        if !(self.persist && options.persist && options.cache) {
+            return self.encounter(url, options);
+        }
+        let Some(host) = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
+        else {
+            return self.encounter(url, options);
+        };
+        let started = Instant::now();
+        let now = crate::state::now_unix();
+        // The page is looked up as the client the encounter will send first.
+        let first = match &options.identity {
+            Some(forced) => forced.clone(),
+            None => self
+                .state
+                .order(&host, &identity::names())
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+        };
+        let key = cache::key(&first, options.proxy.as_deref(), url);
+        let cookie = self.state.cookie_header_for(url, &first);
+        let trust = match self.state.origins.get(&host) {
+            Some(origin) if origin.distrust_until_unix > now => cache::Trust::Distrusted,
+            Some(origin) if origin.validators_proven => cache::Trust::Proven,
+            _ => cache::Trust::Unproven,
+        };
+        // A declared lifetime is a promise a site may not keep: news fronts change
+        // inside the minute they declare. A read inside one is served without
+        // asking only when the last such read was checked and found unchanged;
+        // a site seen changing inside its lifetime always asks.
+        let origin = self.state.origins.get(&host);
+        let fresh_earned = origin
+            .is_some_and(|origin| origin.fresh_earned && origin.fresh_broken_until_unix <= now);
+        let mut checking_promise = false;
+        // A copy that varies on the caller's referer answers only that referer.
+        let navigation = cache::hash(format!("{:?}", options.policy.navigation).as_bytes());
+        let stored = self.cache.get(&key).filter(|entry| {
+            entry
+                .vary_navigation
+                .is_none_or(|context| context == navigation)
+        });
+        match cache::plan(stored, now, cookie.as_deref(), trust, options.revalidate) {
+            Plan::Fresh(entry) if fresh_earned => {
+                let contract = options.contract.clone().unwrap_or_else(Contract::generic);
+                let (body, raw) = entry.document();
+                let content = verify_response(
+                    entry.status,
+                    &entry.headers,
+                    &body,
+                    &entry.final_url,
+                    &contract,
+                    options.contract.is_none(),
+                );
+                if content.passed {
+                    if let Some(origin) = self.state.origins.get_mut(&host) {
+                        origin.fresh_earned = false;
+                    }
+                    self.save_state();
+                    return served(url, host, entry, body, raw, content, options, started);
+                }
+                // The stored copy does not answer this request's contract.
+            }
+            Plan::Fresh(entry) => {
+                checking_promise = true;
+                let conditional = entry.has_validators() && trust != cache::Trust::Distrusted;
+                self.pending = Some(Pending { entry, conditional });
+            }
+            Plan::Revalidate(entry) => {
+                self.pending = Some(Pending {
+                    entry,
+                    conditional: true,
+                })
+            }
+            Plan::Full(previous) => {
+                self.pending = previous.map(|entry| Pending {
+                    entry,
+                    conditional: false,
+                })
+            }
+        }
+        let mut outcome = self.encounter(url, options);
+        let Some(captured) = self.captured.take() else {
+            // The page is gone: a copy of it is not served or confirmed again.
+            if matches!(outcome.status, 404 | 410) {
+                self.cache.remove(&key);
+                if let Some(pending) = &self.pending {
+                    self.cache.remove(&pending.entry.key);
+                }
+            }
+            return outcome;
+        };
+        let key = cache::key(captured.identity, options.proxy.as_deref(), url);
+        if checking_promise {
+            let kept = captured.revalidated.is_some()
+                || self.pending.as_ref().is_some_and(|pending| {
+                    pending.entry.text_hash == cache::text_hash(&captured.bytes)
+                });
+            let origin = self.state.origins.entry(host.clone()).or_default();
+            origin.fresh_earned = kept;
+            if !kept {
+                origin.fresh_broken_until_unix = now + cache::DISTRUST_SECS;
+            }
+            self.save_state();
+        }
+        if let Some(entry) = captured.revalidated {
+            // The 304 confirmed the copy its validators came from. It is the
+            // answer to this read either way; it is stored only while that copy
+            // is still the stored one (a concurrent fetch may have replaced or
+            // removed it since).
+            if let Some(pending) = &self.pending {
+                self.cache.put_confirmed(&entry, &pending.entry);
+            }
+            outcome.cache = Some("revalidated".into());
+            return outcome;
+        }
+        let fresh = cache::entry(
+            &key,
+            url,
+            &captured.final_url,
+            captured.identity,
+            captured.status,
+            &captured.headers,
+            &captured.bytes,
+            captured.cookie.as_deref(),
+            now,
+        )
+        .map(|mut entry| {
+            if cache::varies_on_navigation(&captured.headers) {
+                entry.vary_navigation = Some(navigation);
+            }
+            entry
+        });
+        let previous = self.pending.as_ref().map(|pending| &pending.entry);
+        if previous.is_some_and(|previous| previous.text_hash != cache::text_hash(&captured.bytes))
+        {
+            outcome.cache = Some("changed".into());
+        }
+        if let (Some(previous), Some(fresh)) = (previous, fresh.as_ref()) {
+            let origin = self.state.origins.entry(host).or_default();
+            if cache::validators_lied(previous, fresh) {
+                origin.distrust_until_unix = now + cache::DISTRUST_SECS;
+                origin.validators_proven = false;
+                self.save_state();
+            } else if cache::validators_tracked(previous, fresh) && !origin.validators_proven {
+                origin.validators_proven = true;
+                self.save_state();
+            }
+        }
+        match fresh {
+            Some(entry) => self.cache.put(&entry),
+            None => self.cache.remove(&key),
+        }
+        outcome
+    }
+
+    /// One encounter: identities in order, each one request, until content verifies.
+    fn encounter(&mut self, url: &str, options: &Options) -> Outcome {
+        let started = Instant::now();
+        self.proxy = options.proxy.clone();
+        let parsed = match url::Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Outcome {
+                    url: url.to_string(),
+                    cache: None,
+                    host: String::new(),
+                    final_url: url.to_string(),
+                    class: Class::Network,
+                    identity: None,
+                    status: 0,
+                    ms_total: 0.0,
+                    ms_first: 0.0,
+                    attempts: Vec::new(),
+                    title: String::new(),
+                    text_chars: 0,
+                    wall: None,
+                    evidence: vec![format!("bad url: {error}")],
+                    failures: Vec::new(),
+                    spent_state: false,
+                    transport: "document".to_string(),
+                    items: 0,
+                    sample: Vec::new(),
+                    sample_urls: Vec::new(),
+                    body_text: String::new(),
+                    body: None,
+                    headers: Vec::new(),
+                    bytes: None,
+                }
+            }
+        };
+        let host = parsed.host_str().unwrap_or_default().to_string();
+        let prior = identity::names();
+        let order = match &options.identity {
+            Some(forced) => vec![forced.clone()],
+            None => self.state.order(&host, &prior),
+        };
+        // What is already known about this origin decides how much it is asked in
+        // one encounter. A class another identity cannot change costs one request;
+        // a class we own costs two; a first contact gets three.
+        let remembered = self
+            .state
+            .origins
+            .get(&host)
+            .and_then(|state| state.wall_class.clone());
+        // Measured (identity matrix, 2026-11-06): shells, empty documents, program
+        // walls and most interaction walls answer differently to another
+        // identity, so a remembered failure still earns a second identity. A 404,
+        // and an interaction wall whose vendor no identity is known to pass, do
+        // not: one request.
+        let remembered_vendor = self
+            .state
+            .origins
+            .get(&host)
+            .and_then(|state| state.wall_vendor.clone());
+        let vendor_passable = remembered_vendor
+            .map(|vendor| !self.state.vendor_order(&vendor).is_empty())
+            .unwrap_or(false);
+        let budget = match remembered.as_deref() {
+            Some("http_error") => 1,
+            Some("wall_interaction") if !vendor_passable => 1,
+            Some(_) => 2,
+            None => options.max_tries,
+        };
+        let contract = options.contract.clone().unwrap_or_else(Contract::generic);
+        let generic = options.contract.is_none();
+
+        let mut attempts: Vec<Attempt> = Vec::new();
+        let mut first_ms = 0.0;
+        let mut spent_state = false;
+        let mut data_tried = false;
+        let mut engine_tried = false;
+        let mut last_body = String::new();
+        let mut last_headers: Vec<(String, String)> = Vec::new();
+        let mut last_raw: Option<Vec<u8>> = None;
+        let mut handoff_taken = false;
+        let mut handoff_steps = 0;
+        if options.pace_ms > 0 {
+            self.state.pace(&host, options.pace_ms);
+        }
+
+        // An origin whose interface answered last time is asked there first: the
+        // document it walls or leaves empty is not requested again. If the
+        // interface fails, the route is forgotten and the encounter runs whole;
+        // an interface that only asked for time (paced, cooling down, 429) is
+        // still the route, and is asked first again once the time has passed.
+        let routed = self
+            .state
+            .origins
+            .get(&host)
+            .and_then(|origin| origin.route.clone());
+        if routed.as_deref() == Some("data") && datapath::plan(url).is_some() {
+            if let Some(identity) = order.first().and_then(|name| identity::lookup(name)) {
+                data_tried = true;
+                match self.ask_interface(
+                    url,
+                    &host,
+                    identity,
+                    options,
+                    started,
+                    first_ms,
+                    &mut attempts,
+                ) {
+                    Interface::Answered(outcome) => return *outcome,
+                    Interface::Wait => {}
+                    Interface::Unanswered
+                        if attempts.last().is_some_and(|attempt| attempt.status == 429) => {}
+                    Interface::Unanswered => {
+                        if let Some(origin) = self.state.origins.get_mut(&host) {
+                            origin.route = None;
+                        }
+                        self.save_state();
+                    }
+                }
+            }
+        }
+
+        // The order is a queue: a wall that names its vendor moves the identities
+        // that vendor has let through to the front of what is left.
+        let mut queue: std::collections::VecDeque<String> = order.iter().cloned().collect();
+        let mut tries = 0usize;
+        let mut last_wall: Option<crate::classify::Wall> = None;
+        // The previous attempt's answer: class, status and body hash.
+        let mut last_answer: Option<(Class, u16, u64)> = None;
+        let mut last_evidence: Vec<String> = Vec::new();
+        while tries < budget.max(1) {
+            let Some(name) = queue.pop_front() else { break };
+            let index = tries;
+            tries += 1;
+            let name = &name;
+            let Some(identity) = identity::lookup(name) else {
+                continue;
+            };
+            let remaining = options.deadline.saturating_sub(started.elapsed());
+            // Do not start a request that cannot finish inside the encounter's
+            // budget: a half-finished attempt costs the same as a finished one.
+            if remaining.as_millis() < 1200 {
+                break;
+            }
+            // Space attempts inside one encounter too: a burst of identities is
+            // as suspicious as a burst of requests.
+            if index > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            // Arrival: a browser that has been on this site before does not jump
+            // straight to an inner page from nowhere. One priming request to the
+            // origin root, its cookies kept, costs a request once per origin.
+            if options.arrival
+                && index == 0
+                && !self.state.seen_origin(&host)
+                && parsed.path() != "/"
+            {
+                let origin = format!("{}://{}/", parsed.scheme(), host);
+                if let Ok(wire) = self.wire(identity) {
+                    let remaining = options.deadline.saturating_sub(started.elapsed());
+                    if remaining.as_millis() > 800 {
+                        if let Ok(prime) = wire.get(&origin, None, identity, remaining / 2) {
+                            let cookies: Vec<StoredCookie> =
+                                prime.cookies.iter().map(stored).collect();
+                            self.state.store_cookies(&host, identity.name, cookies);
+                            self.state.mark_seen(&host);
+                            self.save_state();
+                        }
+                    }
+                }
+            }
+            // A minted credential is renewed before the age at which this origin
+            // has been seen to refuse one, so the refusal is paid once.
+            self.state
+                .expire_stale_credential(&host, identity.name, crate::state::now_unix());
+            let credential_vendor = self
+                .state
+                .credentials
+                .get(&host)
+                .and_then(|per_identity| per_identity.get(identity.name))
+                .map(|credential| credential.vendor.clone());
+            let cookie_header = self.state.cookie_header_for(url, identity.name);
+            if cookie_header.is_some() {
+                spent_state = true;
+            }
+            let spent_credential = credential_vendor.is_some() && cookie_header.is_some();
+            let referer = format!("{}://{}/", parsed.scheme(), host);
+            let arriving = options.arrival && self.state.seen_origin(&host) && parsed.path() != "/";
+            // Revisit a cached page the way a browser does: its validators, sent by
+            // the client that received it.
+            let conditional: Vec<(&'static str, String)> = match &self.pending {
+                Some(pending)
+                    if pending.conditional
+                        && pending.entry.identity == identity.name
+                        && !arriving =>
+                {
+                    pending.entry.conditionals()
+                }
+                _ => Vec::new(),
+            };
+            let pending_entry = self.pending.as_ref().map(|pending| pending.entry.clone());
+            let mut validators_sent = !conditional.is_empty();
+            let mut response = {
+                let wire = match self.wire(identity) {
+                    Ok(wire) => wire,
+                    Err(error) => {
+                        attempts.push(Attempt {
+                            identity: identity.name.to_string(),
+                            transport: "document".to_string(),
+                            class: Class::Network,
+                            status: 0,
+                            ms: 0.0,
+                            bytes: 0,
+                            version: String::new(),
+                            title: String::new(),
+                            note: Some(error),
+                        });
+                        continue;
+                    }
+                };
+                let mut attempt = if arriving {
+                    wire.get_arriving(url, cookie_header.as_deref(), identity, remaining, &referer)
+                } else if conditional.is_empty() {
+                    wire.get(url, cookie_header.as_deref(), identity, remaining)
+                } else {
+                    let headers: Vec<(&str, &str)> = conditional
+                        .iter()
+                        .map(|(name, value)| (*name, value.as_str()))
+                        .collect();
+                    wire.request(
+                        "GET",
+                        url,
+                        cookie_header.as_deref(),
+                        identity,
+                        remaining,
+                        &headers,
+                        None,
+                    )
+                };
+                // A 304 that answers the validators but names another
+                // representation (RFC 9111 §4.3.4) confirms nothing: ask once
+                // more, without validators.
+                if let (Ok(answer), Some(entry)) = (&attempt, pending_entry.as_ref()) {
+                    if answer.status == 304
+                        && validators_sent
+                        && same_url(&answer.url, url)
+                        && !cache::selects(entry, &answer.headers)
+                    {
+                        attempt = wire.get(url, cookie_header.as_deref(), identity, remaining);
+                        validators_sent = false;
+                    }
+                }
+                match attempt {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let ms = started.elapsed().as_secs_f64() * 1000.0;
+                        // A hop the caller refused, a redirect loop or a caller
+                        // that stopped waiting is the same for every identity:
+                        // no other one is asked.
+                        let final_error = error.starts_with("denied:")
+                            || error.starts_with("redirect:")
+                            || error.starts_with("cancelled:");
+                        attempts.push(Attempt {
+                            identity: identity.name.to_string(),
+                            transport: "document".to_string(),
+                            class: Class::Network,
+                            status: 0,
+                            ms,
+                            bytes: 0,
+                            version: String::new(),
+                            title: String::new(),
+                            note: Some(error),
+                        });
+                        if final_error {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            };
+            if index == 0 {
+                first_ms = response.elapsed_ms;
+            }
+            // The server confirmed the cached page: it is the response. Only a
+            // 304 to the request that carried the validators confirms anything;
+            // any other 304 (no validator sent, or after a redirect) is an
+            // answer no client asked for, and no identity changes that.
+            let mut revalidated: Option<cache::Entry> = None;
+            if response.status == 304 && !(validators_sent && same_url(&response.url, url)) {
+                attempts.push(Attempt {
+                    identity: identity.name.to_string(),
+                    transport: "document".to_string(),
+                    class: Class::HttpError,
+                    status: response.status,
+                    ms: response.elapsed_ms,
+                    bytes: response.body.len(),
+                    version: response.version.clone(),
+                    title: String::new(),
+                    note: Some("unsolicited 304".to_string()),
+                });
+                return ended(
+                    url,
+                    host,
+                    &response,
+                    identity.name,
+                    "unsolicited 304",
+                    Ended {
+                        started,
+                        first_ms,
+                        attempts,
+                        spent_state,
+                        capture: options.capture_body,
+                    },
+                );
+            }
+            if response.status == 304 {
+                if let Some(pending) = self.pending.as_ref() {
+                    let entry = cache::confirmed(
+                        pending.entry.clone(),
+                        &response.headers,
+                        cookie_header.as_deref(),
+                        crate::state::now_unix(),
+                    );
+                    let (body, raw) = entry.document();
+                    response.status = entry.status;
+                    response.body = body;
+                    response.raw = raw;
+                    response.headers = entry.headers.clone();
+                    revalidated = Some(entry);
+                }
+            }
+            last_body = response.body.clone();
+            if options.capture_body {
+                last_headers = response.headers.clone();
+                last_raw = response.raw.clone();
+            }
+            // A redirect the wire did not follow (the caller's policy, or its hop
+            // guard stopped it) is the site's answer, not a wall: it ends the
+            // encounter as it is, and no identity is scored on it.
+            if matches!(response.status, 301 | 302 | 303 | 307 | 308)
+                && response
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("location"))
+            {
+                if self.persist {
+                    let cookies: Vec<StoredCookie> = response.cookies.iter().map(stored).collect();
+                    self.state.store_cookies(&host, identity.name, cookies);
+                    self.save_state();
+                }
+                attempts.push(Attempt {
+                    identity: identity.name.to_string(),
+                    transport: "document".to_string(),
+                    class: Class::HttpError,
+                    status: response.status,
+                    ms: response.elapsed_ms,
+                    bytes: response.body.len(),
+                    version: response.version.clone(),
+                    title: String::new(),
+                    note: Some("redirect not followed".to_string()),
+                });
+                return ended(
+                    url,
+                    host,
+                    &response,
+                    identity.name,
+                    "redirect not followed",
+                    Ended {
+                        started,
+                        first_ms,
+                        attempts,
+                        spent_state,
+                        capture: options.capture_body,
+                    },
+                );
+            }
+            let content: Content = verify_response(
+                response.status,
+                &response.headers,
+                &response.body,
+                &response.url,
+                &contract,
+                generic,
+            );
+            let verdict: Verdict = classify(Evidence {
+                status: response.status,
+                body: &response.body,
+                content_ok: content.passed,
+                headers: &response.headers,
+            });
+
+            // The origin's verdict on a credential the engine minted earlier: a
+            // content answer extends what we know of its lifetime; a 202/401/403
+            // wall ends it, and the one re-mint below replaces it.
+            let credential_refused = spent_credential
+                && verdict.class != Class::Content
+                && (verdict.class == Class::WallProgram
+                    || matches!(response.status, 202 | 401 | 403));
+            if spent_credential {
+                let now = crate::state::now_unix();
+                if verdict.class == Class::Content {
+                    self.state
+                        .credential_verdict(&host, identity.name, true, now);
+                } else if credential_refused {
+                    self.state
+                        .credential_verdict(&host, identity.name, false, now);
+                }
+            }
+            let cookies: Vec<StoredCookie> = response.cookies.iter().map(stored).collect();
+            if self.persist {
+                self.state
+                    .store_cookies(&host, identity.name, cookies.clone());
+            }
+            let class_name = class_name(verdict.class);
+            if self.persist {
+                self.state.record(
+                    &host,
+                    identity.name,
+                    class_name,
+                    verdict.class == Class::Content,
+                    response.elapsed_ms,
+                );
+                if verdict.class != Class::Content {
+                    self.state.record_wall(
+                        &host,
+                        class_name,
+                        verdict.wall.as_ref().map(|wall| wall.vendor.as_str()),
+                        &verdict.evidence,
+                    );
+                }
+                let upcoming = order.iter().find(|name| *name != identity.name).cloned();
+                if let Some(state) = self.state.origins.get_mut(&host) {
+                    state.next = upcoming;
+                }
+            }
+            attempts.push(Attempt {
+                identity: identity.name.to_string(),
+                transport: "document".to_string(),
+                class: verdict.class,
+                status: response.status,
+                ms: response.elapsed_ms,
+                bytes: response.body.len(),
+                version: response.version.clone(),
+                title: content.title.clone(),
+                note: if content.passed {
+                    None
+                } else {
+                    Some(content.failures.join("; "))
+                },
+            });
+
+            last_wall = verdict.wall.clone();
+            last_evidence = verdict.evidence.clone();
+            // A named vendor reorders what is left: the identities it has let
+            // through come next. A forced identity has nothing to reorder.
+            let mut escalation: Vec<String> = Vec::new();
+            if options.identity.is_none() && verdict.class != Class::Content {
+                if let Some(vendor) = verdict.wall.as_ref().map(|wall| wall.vendor.clone()) {
+                    escalation = self
+                        .state
+                        .vendor_order(&vendor)
+                        .into_iter()
+                        .filter(|name| queue.contains(name))
+                        .collect();
+                    queue.retain(|name| !escalation.contains(name));
+                    for name in escalation.iter().rev() {
+                        queue.push_front(name.clone());
+                    }
+                }
+            }
+
+            if verdict.class == Class::Content {
+                if self.persist {
+                    self.state.record_vendor_success(&host, identity.name);
+                    if let Some(origin) = self.state.origins.get_mut(&host) {
+                        origin.route = None;
+                    }
+                    self.save_state();
+                }
+                self.captured = Some(Captured {
+                    identity: identity.name,
+                    final_url: response.url.clone(),
+                    status: response.status,
+                    headers: response.headers.clone(),
+                    bytes: response
+                        .raw
+                        .clone()
+                        .unwrap_or_else(|| response.body.clone().into_bytes()),
+                    cookie: cookie_header.clone(),
+                    revalidated: revalidated.take(),
+                });
+                return Outcome {
+                    url: url.to_string(),
+                    cache: None,
+                    host,
+                    final_url: response.url.clone(),
+                    class: verdict.class,
+                    identity: Some(identity.name.to_string()),
+                    status: response.status,
+                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                    ms_first: first_ms,
+                    attempts,
+                    title: content.title,
+                    text_chars: content.text_chars,
+                    wall: verdict.wall,
+                    evidence: verdict.evidence,
+                    failures: Vec::new(),
+                    spent_state,
+                    transport: "document".to_string(),
+                    items: 0,
+                    sample: Vec::new(),
+                    sample_urls: Vec::new(),
+                    body_text: String::new(),
+                    body: options.capture_body.then(|| response.body.clone()),
+                    headers: if options.capture_body {
+                        response.headers.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    bytes: if options.capture_body {
+                        response.raw.clone()
+                    } else {
+                        None
+                    },
+                };
+            }
+
+            // A native challenge handoff: the page tells the client to come back
+            // with a token after a delay. Doing that as the same client is what a
+            // browser without JavaScript does.
+            if verdict.class != Class::Content {
+                if let Some(handoff) = akamai_bm_verify(&response.body) {
+                    if !handoff_taken && handoff_steps < 2 {
+                        handoff_taken = true;
+                        handoff_steps += 1;
+                        let wait = std::time::Duration::from_secs(handoff.delay_secs);
+                        std::thread::sleep(wait);
+                        let target = if handoff.target.starts_with("http") {
+                            handoff.target.clone()
+                        } else {
+                            format!("{}://{}{}", parsed.scheme(), host, handoff.target)
+                        };
+                        // One request to the handoff URL, same identity, same jar.
+                        let cookie = self.state.cookie_header_for(&target, identity.name);
+                        let handed = {
+                            let wire = self.wire(identity).ok();
+                            match wire {
+                                Some(wire) => wire.get(
+                                    &target,
+                                    cookie.as_deref(),
+                                    identity,
+                                    std::time::Duration::from_secs(8),
+                                ),
+                                None => Err("no wire".to_string()),
+                            }
+                        };
+                        if let Ok(next) = handed {
+                            let content = verify_response(
+                                next.status,
+                                &next.headers,
+                                &next.body,
+                                &next.url,
+                                &contract,
+                                generic,
+                            );
+                            let verdict2 = classify(Evidence {
+                                status: next.status,
+                                body: &next.body,
+                                content_ok: content.passed,
+                                headers: &next.headers,
+                            });
+                            attempts.push(Attempt {
+                                identity: identity.name.to_string(),
+                                transport: "document".to_string(),
+                                class: verdict2.class,
+                                status: next.status,
+                                ms: next.elapsed_ms,
+                                bytes: next.body.len(),
+                                version: next.version.clone(),
+                                title: content.title.clone(),
+                                note: Some(format!(
+                                    "bm-verify followed after {} s",
+                                    handoff.delay_secs
+                                )),
+                            });
+                            if verdict2.class == Class::Content {
+                                if self.persist {
+                                    self.state.record(
+                                        &host,
+                                        identity.name,
+                                        "content",
+                                        true,
+                                        next.elapsed_ms,
+                                    );
+                                    self.state.record_vendor_success(&host, identity.name);
+                                    self.save_state();
+                                }
+                                return Outcome {
+                                    url: url.to_string(),
+                                    cache: None,
+                                    host,
+                                    final_url: next.url.clone(),
+                                    class: Class::Content,
+                                    identity: Some(identity.name.to_string()),
+                                    status: next.status,
+                                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                                    ms_first: first_ms,
+                                    attempts,
+                                    title: content.title,
+                                    text_chars: content.text_chars,
+                                    wall: None,
+                                    evidence: vec!["akamai bm-verify".into()],
+                                    failures: Vec::new(),
+                                    spent_state: cookie.is_some(),
+                                    transport: "document".to_string(),
+                                    items: 0,
+                                    sample: Vec::new(),
+                                    sample_urls: Vec::new(),
+                                    body_text: String::new(),
+                                    body: options.capture_body.then(|| next.body.clone()),
+                                    headers: if options.capture_body {
+                                        next.headers.clone()
+                                    } else {
+                                        Vec::new()
+                                    },
+                                    bytes: if options.capture_body {
+                                        next.raw.clone()
+                                    } else {
+                                        None
+                                    },
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The document is walled, a shell, or incomplete. The site's own data
+            // interface usually answers the same question openly, and a request to
+            // it is exactly what the app itself sends.
+            if !data_tried && datapath::plan(url).is_some() {
+                data_tried = true;
+                match self.ask_interface(
+                    url,
+                    &host,
+                    identity,
+                    options,
+                    started,
+                    first_ms,
+                    &mut attempts,
+                ) {
+                    Interface::Answered(outcome) => return *outcome,
+                    Interface::Wait => continue,
+                    Interface::Unanswered => {}
+                }
+            }
+
+            // AWS WAF decides on the client class: a plain client is served a
+            // different page than a browser. Ask as the Chrome class first, then
+            // run the site's own program in our process. One mint per encounter;
+            // the credential is bound to the identity that minted it, and only
+            // what the server accepts counts.
+            if (verdict.class == Class::WallProgram || credential_refused) && !engine_tried {
+                engine_tried = true;
+                // Which vendor's program is this? AWS WAF decides by client class;
+                // Cloudflare serves its managed challenge as a page of its own.
+                // Both are the site's own program and both run in our engine.
+                let program_vendor: Option<&'static str> = if verdict
+                    .wall
+                    .as_ref()
+                    .map(|wall| wall.vendor == "aws-waf")
+                    .unwrap_or(false)
+                    || credential_vendor.as_deref() == Some("aws-waf")
+                    || crate::engine::is_aws_waf_page(&response.body)
+                {
+                    Some("aws-waf")
+                } else if verdict
+                    .wall
+                    .as_ref()
+                    .map(|wall| wall.vendor == "cloudflare")
+                    .unwrap_or(false)
+                    && tries >= budget
+                    && crate::engine::is_cloudflare_page(&response.body)
+                {
+                    // Cloudflare serves the challenge payload only to a client
+                    // class it means to challenge: a header alone (`cf-mitigated`
+                    // on an empty 403) names the wall but carries no program, and
+                    // identity selection is what answers that. The engine runs
+                    // only on a page that holds the program, and only on the last
+                    // attempt the encounter allows — identity first, always.
+                    Some("cloudflare")
+                } else {
+                    None
+                };
+                if let Some(program_vendor) = program_vendor {
+                    let mut engine_identity = identity;
+                    let mut engine_body = response.body.clone();
+                    let mut engine_url = response.url.clone();
+
+                    // 1. Identity before engine. AWS WAF decides by client class:
+                    // a plain client is served a stub, the Chrome class the
+                    // challenge page. Cloudflare does not need this hop — its
+                    // vendor order already tries the identities that passed it.
+                    if program_vendor == "aws-waf" && identity.family == identity::Family::Plain {
+                        if let Some(chrome) = identity::lookup("chrome-local") {
+                            let budget = options
+                                .deadline
+                                .max(Duration::from_millis(8000))
+                                .saturating_sub(started.elapsed());
+                            if budget.as_millis() >= 900 {
+                                let cookie = self.state.cookie_header_for(url, chrome.name);
+                                let second = match self.wire(chrome) {
+                                    Ok(wire) => wire.get(url, cookie.as_deref(), chrome, budget),
+                                    Err(error) => Err(error),
+                                };
+                                if let Ok(second) = second {
+                                    let content = verify_response(
+                                        second.status,
+                                        &second.headers,
+                                        &second.body,
+                                        &second.url,
+                                        &contract,
+                                        generic,
+                                    );
+                                    let verdict2 = classify(Evidence {
+                                        status: second.status,
+                                        body: &second.body,
+                                        content_ok: content.passed,
+                                        headers: &second.headers,
+                                    });
+                                    attempts.push(Attempt {
+                                        identity: chrome.name.to_string(),
+                                        transport: "document".to_string(),
+                                        class: verdict2.class,
+                                        status: second.status,
+                                        ms: second.elapsed_ms,
+                                        bytes: second.body.len(),
+                                        version: second.version.clone(),
+                                        title: content.title.clone(),
+                                        note: Some(
+                                            "identity: chrome-local for aws-waf".to_string(),
+                                        ),
+                                    });
+                                    if verdict2.class == Class::Content {
+                                        if self.persist {
+                                            self.state.record(
+                                                &host,
+                                                chrome.name,
+                                                "content",
+                                                true,
+                                                second.elapsed_ms,
+                                            );
+                                            self.state.record_vendor_success(&host, chrome.name);
+                                            self.save_state();
+                                        }
+                                        return Outcome {
+                                            url: url.to_string(),
+                                            cache: None,
+                                            host,
+                                            final_url: second.url.clone(),
+                                            class: Class::Content,
+                                            identity: Some(chrome.name.to_string()),
+                                            status: second.status,
+                                            ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                                            ms_first: first_ms,
+                                            attempts,
+                                            title: content.title,
+                                            text_chars: content.text_chars,
+                                            wall: None,
+                                            evidence: vec!["identity: chrome-local".to_string()],
+                                            failures: Vec::new(),
+                                            spent_state: false,
+                                            transport: "document".to_string(),
+                                            items: 0,
+                                            sample: Vec::new(),
+                                            sample_urls: Vec::new(),
+                                            body_text: String::new(),
+                                            body: options.capture_body.then(|| second.body.clone()),
+                                            headers: if options.capture_body {
+                                                second.headers.clone()
+                                            } else {
+                                                Vec::new()
+                                            },
+                                            bytes: if options.capture_body {
+                                                second.raw.clone()
+                                            } else {
+                                                None
+                                            },
+                                        };
+                                    }
+                                    engine_identity = chrome;
+                                    engine_body = second.body.clone();
+                                    engine_url = second.url.clone();
+                                }
+                            }
+                        }
+                    }
+
+                    // A refused credential can come back as a bare 401/403 with no
+                    // challenge in it. Ask once more without it: the site's answer
+                    // to a client with no credential is the page the engine needs.
+                    if credential_refused && !is_program_page(program_vendor, &engine_body) {
+                        let cookie = self.state.cookie_header_for(url, engine_identity.name);
+                        let budget = options
+                            .deadline
+                            .max(Duration::from_millis(8000))
+                            .saturating_sub(started.elapsed());
+                        if budget.as_millis() >= 900 {
+                            let clean = match self.wire(engine_identity) {
+                                Ok(wire) => {
+                                    wire.get(url, cookie.as_deref(), engine_identity, budget)
+                                }
+                                Err(error) => Err(error),
+                            };
+                            if let Ok(clean) = clean {
+                                engine_body = clean.body.clone();
+                                engine_url = clean.url.clone();
+                            }
+                        }
+                    }
+
+                    // 2. The site's own program, inside the mint budget this host
+                    // has earned.
+                    let gate = self.state.engine_gate(&host, crate::state::now_unix());
+                    if let Err(reason) = &gate {
+                        // The engine did not run: the status is the wall's own.
+                        attempts.push(Attempt {
+                            identity: engine_identity.name.to_string(),
+                            transport: "document".to_string(),
+                            class: Class::WallProgram,
+                            status: response.status,
+                            ms: 0.0,
+                            bytes: 0,
+                            version: String::new(),
+                            title: String::new(),
+                            note: Some(format!("engine: {reason}")),
+                        });
+                    }
+                    if gate.is_ok() && is_program_page(program_vendor, &engine_body) {
+                        let cookie = self.state.cookie_header_for(url, engine_identity.name);
+                        let mut failure_reason: Option<String> = None;
+                        match crate::engine::mint_within_via(
+                            &options.engine,
+                            &engine_url,
+                            &engine_body,
+                            engine_identity,
+                            cookie.as_deref(),
+                            self.proxy.as_deref(),
+                        ) {
+                            Ok(mint) => {
+                                // The retry must spend what the mint produced, even
+                                // when state is not persisted to disk.
+                                self.state.store_cookies(
+                                    &host,
+                                    engine_identity.name,
+                                    mint.cookies.clone(),
+                                );
+                                self.state.mint_recorded(
+                                    &host,
+                                    engine_identity.name,
+                                    program_vendor,
+                                    &mint.cookies,
+                                    crate::state::now_unix(),
+                                );
+                                let retry_cookie =
+                                    self.state.cookie_header_for(url, engine_identity.name);
+                                let budget = options
+                                    .deadline
+                                    .max(Duration::from_millis(8000))
+                                    .saturating_sub(started.elapsed());
+                                // Follow the navigation the page itself chose (it may
+                                // be relative), but only on this host: never an
+                                // off-site redirect.
+                                let retry_url: String = mint
+                                    .redirect
+                                    .as_deref()
+                                    .and_then(|next| {
+                                        url::Url::parse(next)
+                                            .or_else(|_| {
+                                                url::Url::parse(url)
+                                                    .and_then(|base| base.join(next))
+                                            })
+                                            .ok()
+                                    })
+                                    .filter(|parsed| parsed.host_str() == Some(host.as_str()))
+                                    .map(|parsed| parsed.to_string())
+                                    .unwrap_or_else(|| url.to_string());
+                                // The engine spends its own credential on its own
+                                // client; that response is the retry. Only when it
+                                // produced none do we ask again ourselves.
+                                let retry: Option<Result<crate::http::Response, String>> =
+                                    if mint.page_status != 0 && !mint.page_body.is_empty() {
+                                        Some(Ok(crate::http::Response {
+                                            status: mint.page_status,
+                                            version: String::new(),
+                                            headers: Vec::new(),
+                                            body: mint.page_body.clone(),
+                                            url: mint.page_url.clone(),
+                                            elapsed_ms: mint.ms,
+                                            cookies: Vec::new(),
+                                            raw: None,
+                                        }))
+                                    } else if budget.as_millis() >= 800 {
+                                        match self.wire(engine_identity) {
+                                            Ok(wire) => Some(wire.get(
+                                                &retry_url,
+                                                retry_cookie.as_deref(),
+                                                engine_identity,
+                                                budget,
+                                            )),
+                                            Err(_) => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                if let Some(Ok(retry)) = retry {
+                                    if std::env::var("V5_ENGINE_LOG").is_ok() {
+                                        eprintln!(
+                                            "[engine] retry {} cookie={} -> {} ({}B)",
+                                            retry_url,
+                                            retry_cookie.is_some(),
+                                            retry.status,
+                                            retry.body.len()
+                                        );
+                                    }
+                                    let content = verify_response(
+                                        retry.status,
+                                        &retry.headers,
+                                        &retry.body,
+                                        &retry.url,
+                                        &contract,
+                                        generic,
+                                    );
+                                    let verdict2 = classify(Evidence {
+                                        status: retry.status,
+                                        body: &retry.body,
+                                        content_ok: content.passed,
+                                        headers: &retry.headers,
+                                    });
+                                    attempts.push(Attempt {
+                                        identity: engine_identity.name.to_string(),
+                                        transport: "document".to_string(),
+                                        class: verdict2.class,
+                                        status: retry.status,
+                                        ms: retry.elapsed_ms,
+                                        bytes: retry.body.len(),
+                                        version: retry.version.clone(),
+                                        title: content.title.clone(),
+                                        note: Some(format!(
+                                            "engine: {} cookies, {} surfaces, {} ms",
+                                            mint.cookies.len(),
+                                            mint.surfaces.len(),
+                                            mint.ms.round()
+                                        )),
+                                    });
+                                    if verdict2.class == Class::Content {
+                                        let now = crate::state::now_unix();
+                                        self.state.mint_succeeded(&host);
+                                        self.state.credential_verdict(
+                                            &host,
+                                            engine_identity.name,
+                                            true,
+                                            now,
+                                        );
+                                        if self.persist {
+                                            self.state.record(
+                                                &host,
+                                                engine_identity.name,
+                                                "content",
+                                                true,
+                                                retry.elapsed_ms,
+                                            );
+                                            self.state
+                                                .record_vendor_success(&host, engine_identity.name);
+                                            self.save_state();
+                                        }
+                                        return Outcome {
+                                            url: url.to_string(),
+                                            cache: None,
+                                            host,
+                                            final_url: retry.url.clone(),
+                                            class: Class::Content,
+                                            identity: Some(engine_identity.name.to_string()),
+                                            status: retry.status,
+                                            ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                                            ms_first: first_ms,
+                                            attempts,
+                                            title: content.title,
+                                            text_chars: content.text_chars,
+                                            wall: None,
+                                            evidence: vec![format!(
+                                                "engine: minted in {} ms",
+                                                mint.ms.round()
+                                            )],
+                                            failures: Vec::new(),
+                                            spent_state: true,
+                                            transport: "document".to_string(),
+                                            items: 0,
+                                            sample: Vec::new(),
+                                            sample_urls: Vec::new(),
+                                            body_text: String::new(),
+                                            body: options.capture_body.then(|| retry.body.clone()),
+                                            headers: if options.capture_body {
+                                                retry.headers.clone()
+                                            } else {
+                                                Vec::new()
+                                            },
+                                            bytes: if options.capture_body {
+                                                retry.raw.clone()
+                                            } else {
+                                                None
+                                            },
+                                        };
+                                    }
+                                    failure_reason = Some(format!(
+                                        "origin answered {} to the minted credential",
+                                        retry.status
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                failure_reason = Some(error.to_string());
+                                // The engine did not finish: the status is the
+                                // wall's own, not a made-up zero.
+                                attempts.push(Attempt {
+                                    identity: engine_identity.name.to_string(),
+                                    transport: "document".to_string(),
+                                    class: Class::WallProgram,
+                                    status: response.status,
+                                    ms: 0.0,
+                                    bytes: 0,
+                                    version: String::new(),
+                                    title: String::new(),
+                                    note: Some(format!("engine: {error}")),
+                                });
+                            }
+                        }
+                        // Reaching here means the mint did not end in content (the
+                        // success path returns above): the host's next mint waits.
+                        let reason = failure_reason
+                            .unwrap_or_else(|| "the mint produced no request to spend".to_string());
+                        self.state.mint_failed(
+                            &host,
+                            engine_identity.name,
+                            &reason,
+                            crate::state::now_unix(),
+                        );
+                        if self.persist {
+                            self.save_state();
+                        }
+                    }
+                }
+            }
+
+            // Classes that another identity cannot change: stop spending requests.
+            // An interaction wall is one only when no identity is known to pass
+            // its vendor: DataDome and PerimeterX are measured to let some through.
+            let interaction_final =
+                verdict.class == Class::WallInteraction && escalation.is_empty();
+            // A rate limit that names when to come back is about this address,
+            // not this client: asking again now as someone else is the burst
+            // that escalates a site. The wait is the answer.
+            let told_to_wait = response.status == 429 && retry_hint(&response.headers).is_some();
+            // Two identities in a row were shown the same text and no wall named
+            // itself: the client is not what the site is reacting to, and the
+            // next will be shown it too. Text, not bytes: a per-request nonce in
+            // a script or an attribute does not make the answer different.
+            let answer = (
+                verdict.class,
+                response.status,
+                cache::text_hash(response.body.as_bytes()),
+            );
+            let identity_blind = verdict.wall.is_none() && last_answer == Some(answer);
+            last_answer = Some(answer);
+            if interaction_final
+                || told_to_wait
+                || identity_blind
+                || matches!(
+                    verdict.class,
+                    Class::Shell | Class::HttpError | Class::Network
+                )
+            {
+                if self.persist {
+                    self.save_state();
+                }
+                return Outcome {
+                    url: url.to_string(),
+                    cache: None,
+                    host,
+                    final_url: response.url.clone(),
+                    class: verdict.class,
+                    identity: Some(identity.name.to_string()),
+                    status: response.status,
+                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                    ms_first: first_ms,
+                    attempts,
+                    title: content.title,
+                    text_chars: content.text_chars,
+                    wall: verdict.wall,
+                    evidence: verdict.evidence,
+                    failures: content.failures,
+                    spent_state,
+                    transport: "document".to_string(),
+                    items: 0,
+                    sample: Vec::new(),
+                    sample_urls: Vec::new(),
+                    body_text: String::new(),
+                    body: options.capture_body.then(|| response.body.clone()),
+                    headers: if options.capture_body {
+                        response.headers.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    bytes: if options.capture_body {
+                        response.raw.clone()
+                    } else {
+                        None
+                    },
+                };
+            }
+        }
+
+        if self.persist {
+            self.save_state();
+        }
+        // The answer the encounter ends on is the last one a server gave: a
+        // later attempt that never reached it (a network failure) does not
+        // erase what an earlier one was told.
+        let last = attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.status != 0)
+            .or(attempts.last())
+            .cloned();
+        Outcome {
+            url: url.to_string(),
+            cache: None,
+            host,
+            final_url: last.as_ref().map(|_| url.to_string()).unwrap_or_default(),
+            class: last
+                .as_ref()
+                .map(|attempt| attempt.class)
+                .unwrap_or(Class::Network),
+            identity: last.as_ref().map(|attempt| attempt.identity.clone()),
+            status: last.as_ref().map(|attempt| attempt.status).unwrap_or(0),
+            ms_total: started.elapsed().as_secs_f64() * 1000.0,
+            ms_first: first_ms,
+            attempts,
+            title: last
+                .as_ref()
+                .map(|attempt| attempt.title.clone())
+                .unwrap_or_default(),
+            text_chars: 0,
+            // The wall the last document showed: the vendor and what it asks.
+            wall: last_wall,
+            evidence: last_evidence,
+            failures: last
+                .and_then(|attempt| attempt.note)
+                .map(|note| vec![note])
+                .unwrap_or_default(),
+            spent_state,
+            transport: "document".to_string(),
+            items: 0,
+            sample: Vec::new(),
+            sample_urls: Vec::new(),
+            body_text: String::new(),
+            body: options.capture_body.then(|| last_body.clone()),
+            headers: last_headers,
+            bytes: last_raw,
+        }
+    }
+}
+
+/// Is this body the challenge page of the vendor whose program we are about to
+/// run? The page, not the header, decides: a header names the wall, only the
+/// body carries something to execute.
+fn is_program_page(vendor: &str, body: &str) -> bool {
+    match vendor {
+        "cloudflare" => crate::engine::is_cloudflare_page(body),
+        _ => crate::engine::is_aws_waf_page(body),
+    }
+}
+
+/// Two spellings of one URL (the wire may normalise what it was given).
+fn same_url(left: &str, right: &str) -> bool {
+    match (url::Url::parse(left), url::Url::parse(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// What an encounter that ends on an answer it does not judge carries along.
+struct Ended {
+    started: Instant,
+    first_ms: f64,
+    attempts: Vec<Attempt>,
+    spent_state: bool,
+    capture: bool,
+}
+
+/// The outcome of an encounter that ends on `response` as it is (a redirect not
+/// followed, an unsolicited 304): the site's answer, not a wall and not
+/// content, with nothing scored on it.
+fn ended(
+    url: &str,
+    host: String,
+    response: &crate::http::Response,
+    identity: &str,
+    evidence: &str,
+    ended: Ended,
+) -> Outcome {
+    Outcome {
+        url: url.to_string(),
+        cache: None,
+        host,
+        final_url: response.url.clone(),
+        class: Class::HttpError,
+        identity: Some(identity.to_string()),
+        status: response.status,
+        ms_total: ended.started.elapsed().as_secs_f64() * 1000.0,
+        ms_first: ended.first_ms,
+        attempts: ended.attempts,
+        title: String::new(),
+        text_chars: 0,
+        wall: None,
+        evidence: vec![evidence.to_string()],
+        failures: Vec::new(),
+        spent_state: ended.spent_state,
+        transport: "document".to_string(),
+        items: 0,
+        sample: Vec::new(),
+        sample_urls: Vec::new(),
+        body_text: String::new(),
+        body: ended.capture.then(|| response.body.clone()),
+        headers: if ended.capture {
+            response.headers.clone()
+        } else {
+            Vec::new()
+        },
+        bytes: if ended.capture {
+            response.raw.clone()
+        } else {
+            None
+        },
+    }
+}
+
+/// A `Set-Cookie` as the jar keeps it.
+fn stored(cookie: &crate::http::SetCookie) -> StoredCookie {
+    StoredCookie {
+        name: cookie.name.clone(),
+        value: cookie.value.clone(),
+        domain: cookie.domain.clone(),
+        path: cookie.path.clone(),
+        expires_unix: cookie.expires_unix,
+        secure: cookie.secure,
+        http_only: cookie.http_only,
+    }
+}
+
+/// How long an interface asked us to wait, in ms.
+fn retry_hint(headers: &[(String, String)]) -> Option<i64> {
+    for (name, value) in headers {
+        let name = name.to_ascii_lowercase();
+        if name == "x-ratelimit-reset" || name == "retry-after" {
+            if let Ok(seconds) = value.trim().parse::<f64>() {
+                return Some((seconds * 1000.0) as i64);
+            }
+        }
+    }
+    None
+}
+
+pub fn class_name(class: Class) -> &'static str {
+    match class {
+        Class::Content => "content",
+        Class::WallState => "wall_state",
+        Class::WallContract => "wall_contract",
+        Class::WallIdentity => "wall_identity",
+        Class::WallInteraction => "wall_interaction",
+        Class::WallProgram => "wall_program",
+        Class::Shell => "shell",
+        Class::Incomplete => "incomplete",
+        Class::Network => "network",
+        Class::HttpError => "http_error",
+    }
+}
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

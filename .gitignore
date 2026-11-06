@@ -11,6 +11,7 @@ v5/
 
 # Rust
 /target
+/v5core/target
 # Machine-specific cargo config (libclang/bindgen env — differs per OS)
 .cargo/
 
@@ -30,7 +31,7 @@ bench/battle-corpus/
 bench/improve/out/
 
 # Vendored PDFium static libraries (build.rs auto-downloads)
-# Root-anchored: the engine's own vendor/ tree (doncore/vendor) is committed.
+# Root-anchored: the committed forks live in v5core/vendor.
 /vendor/
 
 # PDF corpus binaries (download via scripts/download-corpus.sh)
@@ -48,10 +49,6 @@ npm/LICENSE
 bench/regression-results.json
 /libonnxruntime.so
 
-# The engine crate carries its own workspace + target until the swap links it
-# into the app graph (its vendored BoringSSL cannot share the app's).
-/doncore/target/
 
-# Engine debug dumps (DONCORE_DEBUG wire forensics land in scratch/ under the cwd)
+# Debug dumps under the cwd
 /scratch/
-/doncore/scratch/

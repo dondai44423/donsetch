@@ -559,7 +559,7 @@ async fn check_network(fetcher: &Fetcher) -> CheckResult {
     // misdiagnosis sent the report to the deployment instead of here.
     // fetch_persona reports no timing of its own (elapsed is zero on that
     // path), so only the generic lane's RTT is quoted.
-    match fetcher.fetch_persona("https://example.com", None).await {
+    match fetcher.fetch_persona("https://example.com").await {
         Ok(t) if t.status == 200 => CheckResult::Pass(format!(
             "example.com 200 OK ({:.0}ms, generic and tool lanes)",
             generic.elapsed.as_secs_f64() * 1000.0,

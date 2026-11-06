@@ -1,49 +1,24 @@
-//! Fetch orchestrator over the v5 engine.
+//! The fetcher every caller shares, over the v5 core (`src/fetch/v5.rs`).
 //!
-//! One wire, two entry points (the engine's construction contract):
-//! - documents (`fetch`, `fetch_via*`, `fetch_persona*`) go through
-//!   `Engine::fetch_with` — the cache, the JS runtime and the learned hosts
-//!   live there;
-//! - one-shot API/subresource reads (`fetch_once_via*`, `fetch_cold_probe`)
-//!   go through the engine's `Wire` with the per-request knobs (egress,
-//!   jar suppression, raw bytes, redirects re-gated per hop).
+//! Two entry points:
+//! - documents (`fetch`, `fetch_via*`, `fetch_persona*`, `fetch_cold_probe`)
+//!   are one v5 encounter: identity order, page cache, data paths and the
+//!   challenge engine, with learned state kept under the cache root;
+//! - one-shot reads (`fetch_once_via*`) are one request with the caller's
+//!   headers, for APIs, subresources and search endpoints.
 //!
 //! The app keeps what is the app's: egress lanes and their health, the
-//! URL/SSRF guards, wall scoring, the public outcome surface, and the crawl
-//! hop loop (an async scope/robots gate must refuse BEFORE a hop is dialed,
-//! which the sync redirect consult cannot await — that consult carries the
-//! rules/SSRF gate for every engine-followed hop).
-//!
-//! The app's jar IS the engine's jar now — one store under
-//! `DONSETCH_CACHE_DIR` — and the vault flows (session replay, warm
-//! handoff, login/logout rebuilds) sync records through `Jar::upsert` /
-//! `Jar::remove_domains`.
+//! URL/SSRF guards (asked before the first request and before every redirect
+//! hop), wall scoring and the public outcome surface. Cookies are the ones a
+//! site set for an identity during a fetch; nothing is imported into them.
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use doncore::engine::{CacheState as EngineCacheState, FetchOpts, JsMode};
-use doncore::wire::{HopConsult, HopDecision, ReqKind, WireReq, WireResp};
-
-use crate::detect::walls::{self, Verdict};
+use crate::detect::walls::Verdict;
 use crate::egress::proxy;
 use crate::egress::request_route::RequestRoute;
 use crate::error::FetchError;
 use crate::profile::{BrowserProfile, RequestClass};
-use crate::state::CookieRecord;
-
-const MAX_REDIRECTS: u8 = 10;
-
-/// The engine's wall budget for one document fetch (`Engine::fetch_with`):
-/// the corpus' few-seconds ceiling. One-shot wire reads carry no budget of
-/// their own; their callers wrap them in timeouts.
-const DOC_BUDGET_MS: u64 = 25_000;
-
-/// The engine's identity persona. `"156"` is the live ClientHello-parity
-/// class (synced 2026-10-24 to the reference Chromium's wire values; the engine
-/// also accepts the legacy `"154"` tag as the same class). Anything else is
-/// the stock preset.
-const ENGINE_PERSONA: &str = "156";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheState {
@@ -60,23 +35,20 @@ pub struct FetchOutcome {
     /// Final URL after redirects.
     pub url: String,
     pub status: u16,
-    /// The engine's route label for documents (`"wire"`, `"wire+js"`,
-    /// `"wire+clearance"`), `"wire"` for one-shot reads. Dev-only surface.
+    /// `v5:<transport>:<identity>`: how the answer was read. Dev-only surface.
     pub alpn: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    /// Redirect hops taken. The engine owns the chain on the document path,
-    /// so this is populated only on the app's own hop loop (dev-only field).
+    /// Redirect hops taken (v5 follows them itself; dev-only, 0).
     pub redirects: u8,
     pub cache: CacheState,
-    /// True when the request rode a pooled (pre-existing) connection. The
-    /// engine owns pooling now; dev-only field, always false.
+    /// Dev-only, always false: v5 owns connection pooling.
     pub used_pool: bool,
     pub verdict: Verdict,
     pub elapsed: Duration,
-    /// Wave W / D5: the engine's harvested inline JSON state (present only
-    /// on the document path, only when the final content stayed thin).
-    pub state: Option<doncore::engine::StateJson>,
+    /// The fetch layer read this body against a content contract and found
+    /// content, not a wall: later bot-wall markers in it are passive scripts.
+    pub verified: bool,
 }
 
 /// Pre-navigation redirect policy (v4.6): consulted for every
@@ -89,27 +61,9 @@ pub type RedirectGate = std::sync::Arc<
     dyn Fn(url::Url) -> futures_util::future::BoxFuture<'static, bool> + Send + Sync,
 >;
 
-/// Per-request identity knobs. Copy: the redirect driver hands
-/// the same identity to every hop.
-#[derive(Clone, Copy)]
-struct RequestIdentity<'a> {
-    class: RequestClass,
-    legacy_user_agent: Option<&'a str>,
-    /// Persona-coherent Accept-Language (v4 E2). None = TLD/script default.
-    accept_language: Option<&'a str>,
-}
-
 pub struct Fetcher {
     profile: BrowserProfile,
-    /// The one engine: identity, wire, state plane (cache / warm jar /
-    /// learned hosts) under `state_root()`. Shared behind an `Arc` so the
-    /// synchronous wire calls can bridge onto a blocking thread without
-    /// moving the `Fetcher`.
-    engine: std::sync::Arc<doncore::engine::Engine>,
-    /// Domains currently fed from the session vault (the last rewrite).
-    /// A vault rewrite drops only these: warm solve cookies from the
-    /// engine's own pipeline are never collateral.
-    vault_domains: Mutex<std::collections::HashSet<String>>,
+    v5: crate::fetch::v5::V5Fetcher,
     /// Shared egress fabric (v4 A2). When present and a proxy pool
     /// is configured, fetch sticks to one lane per host and rotates
     /// on 429/407/dead/timeout. None = historical env/slot path.
@@ -118,17 +72,9 @@ pub struct Fetcher {
 
 impl Fetcher {
     pub fn new(profile: BrowserProfile) -> Result<Self, FetchError> {
-        #[cfg(test)]
-        crate::test_support::sandbox_state_dir();
-        let engine = std::sync::Arc::new(doncore::client::open(
-            ENGINE_PERSONA,
-            Vec::new(),
-            doncore::client::Features::default(),
-        ));
         Ok(Self {
             profile,
-            engine,
-            vault_domains: Mutex::new(std::collections::HashSet::new()),
+            v5: crate::fetch::v5::V5Fetcher::new(true),
             egress: None,
         })
     }
@@ -144,538 +90,12 @@ impl Fetcher {
         &self.profile
     }
 
-    // ── the jar bridge ──────────────────────────────────────────────────
-    //
-    // The engine jar is THE jar: one store that the wire, the JS runtime
-    // and these vault flows all share. A CookieRecord → Cookie conversion
-    // keeps name/value/domain/expiry/Secure; Path/SameSite cannot be
-    // represented in the flat store (Recorded limitations, status.md).
-
-    fn jar(&self) -> std::sync::MutexGuard<'_, doncore::wire::Jar> {
-        self.engine
-            .wire
-            .jar
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    /// Names of the cookies any identity holds for `host` (values stay inside
+    /// the fetch layer).
+    pub fn cookie_names(&self, host: &str) -> Vec<String> {
+        self.v5.cookie_names(host)
     }
 
-    fn engine_cookie(rec: &CookieRecord) -> doncore::wire::Cookie {
-        let now = doncore::state::now_secs();
-        doncore::wire::Cookie {
-            name: rec.name.clone(),
-            value: rec.value.clone(),
-            domain: rec.domain.clone(),
-            secure: rec.secure,
-            expires: rec.expires_at,
-            created: now,
-            updated: now,
-        }
-    }
-
-    fn record_of(c: &doncore::wire::Cookie) -> CookieRecord {
-        CookieRecord {
-            name: c.name.clone(),
-            value: c.value.clone(),
-            domain: c.domain.clone(),
-            path: "/".into(),
-            expires_at: c.expires,
-            secure: c.secure,
-            http_only: false,
-            same_site: "lax".into(),
-        }
-    }
-
-    /// Import cookies harvested by DonGhost (tier-2 solve) into the
-    /// shared jar so the next fetch carries the clearance.
-    pub async fn import_cookies(&self, cookies: &[CookieRecord]) {
-        let list: Vec<_> = cookies.iter().map(Self::engine_cookie).collect();
-        self.jar().upsert(list);
-    }
-
-    /// Import VAULT-backed cookies (session harvests, the boot vault
-    /// replay): as `import_cookies`, and the domains register as
-    /// vault-fed so a login/logout jar rebuild really clears them. The
-    /// ledger only ever grows here — an empty replay must not wipe what a
-    /// previous session's vault owned.
-    pub async fn import_vault_cookies(&self, cookies: &[CookieRecord]) {
-        let list: Vec<_> = cookies.iter().map(Self::engine_cookie).collect();
-        self.jar().upsert(list);
-        let mut vault = self.vault_domains.lock().unwrap_or_else(|p| p.into_inner());
-        for c in cookies {
-            if let Some(d) = normalize_domain(&c.domain) {
-                vault.insert(d);
-            }
-        }
-        let stored = load_vault_domains();
-        let mut ledger = stored.clone();
-        ledger.extend(vault.iter().cloned());
-        if ledger != stored {
-            save_vault_domains(&ledger);
-        }
-    }
-
-    /// Replace the vault-sourced subset (login or logout just happened on
-    /// disk). Only domains the vault owns are dropped: warm solve cookies
-    /// from other domains survive untouched. Ownership survives restarts
-    /// through the ledger beside the jar — a fresh process replaying an
-    /// EMPTY vault must still clear the previous session's vault cookies,
-    /// or a logged-out login would ride the next boot.
-    pub async fn reset_to(&self, cookies: &[CookieRecord]) {
-        let stored = load_vault_domains();
-        let mut touched: std::collections::HashSet<String> = stored.clone();
-        touched.extend(
-            self.vault_domains
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .cloned(),
-        );
-        let mut incoming: std::collections::HashSet<String> = Default::default();
-        for c in cookies {
-            if let Some(d) = normalize_domain(&c.domain) {
-                touched.insert(d.clone());
-                incoming.insert(d);
-            }
-        }
-        let domains: Vec<String> = touched.into_iter().collect();
-        self.jar().remove_domains(&domains);
-        let list: Vec<_> = cookies.iter().map(Self::engine_cookie).collect();
-        self.jar().upsert(list);
-        *self.vault_domains.lock().unwrap_or_else(|p| p.into_inner()) = incoming.clone();
-        if incoming != stored {
-            save_vault_domains(&incoming);
-        }
-    }
-
-    /// Whole-jar export for the tier-1 cookie vault (v4 phase 1.4): the
-    /// browser cookie store view that makes a returning agent replay like
-    /// a returning device across process restarts.
-    pub async fn jar_all_snapshot(&self) -> Vec<CookieRecord> {
-        let now = doncore::state::now_secs();
-        let jar = self.jar();
-        jar.cookies
-            .iter()
-            .filter(|c| c.expires.map(|e| e > now).unwrap_or(true))
-            .map(Self::record_of)
-            .collect()
-    }
-
-    /// Export all cookies for a host with their expiry, for write-back to
-    /// the persistent domain profile after a successful warm fetch.
-    pub fn jar_snapshot(&self, host: &str) -> Vec<CookieRecord> {
-        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-        let now = doncore::state::now_secs();
-        let jar = self.jar();
-        jar.cookies
-            .iter()
-            .filter(|c| c.expires.map(|e| e > now).unwrap_or(true))
-            .filter(|c| {
-                let d = c.domain.to_ascii_lowercase();
-                !d.is_empty() && (d == host || host.ends_with(&format!(".{d}")))
-            })
-            .map(Self::record_of)
-            .collect()
-    }
-
-    // ── request identity ────────────────────────────────────────────────
-
-    /// The app-side extras layered over the engine's identity: a persona
-    /// accept-language, a legacy User-Agent, the referer/`sec-fetch-site`
-    /// pair, conditionals. The engine merges request headers over its
-    /// emulation: the same name wins from the request.
-    fn extra_headers(
-        target: &str,
-        conditional: &[(String, String)],
-        referer: Option<&str>,
-        site: Option<&'static str>,
-        identity: RequestIdentity<'_>,
-        profile_ua: &str,
-        profile_sec_ch_ua: &str,
-    ) -> Vec<(String, String)> {
-        let mut h: Vec<(String, String)> = Vec::new();
-        if let Some(al) = identity.accept_language.filter(|al| !al.is_empty()) {
-            h.push(("accept-language".to_owned(), al.to_owned()));
-        }
-        // The profile owns the User-Agent: the engine's emulation carries
-        // the engine persona's own version, which must not leak through
-        // when the product profile runs a different one. A legacy UA
-        // (request-local lane) still wins here.
-        h.push((
-            "user-agent".to_owned(),
-            identity.legacy_user_agent.unwrap_or(profile_ua).to_owned(),
-        ));
-        // Client hints ride with the profile too (the ghost and tier 1
-        // must claim the same brand/version list); a legacy identity
-        // carries no hints at all.
-        if identity.legacy_user_agent.is_none() {
-            h.push(("sec-ch-ua".to_owned(), profile_sec_ch_ua.to_owned()));
-        }
-        // The chain fold keeps the worst sec-fetch-site seen (Fetch Metadata
-        // §2.3): a link-initiated hop derives it from the initiator, later
-        // hops carry the worst so far. One value, never a duplicate header.
-        if let Some(sev) = site.or_else(|| referer.map(|r| classify_site(r, target).value())) {
-            h.push(("sec-fetch-site".to_owned(), sev.to_owned()));
-        }
-        if let Some(ref_url) = referer {
-            h.push(("referer".to_owned(), referer_value(ref_url, target)));
-        }
-        h.extend(conditional.iter().cloned());
-        h
-    }
-
-    // ── the two wire entry points ───────────────────────────────────────
-
-    /// One request through the engine's wire with the product's knobs.
-    #[allow(clippy::too_many_arguments)]
-    async fn wire_once(
-        &self,
-        url_str: &str,
-        kind: ReqKind,
-        proxy: Option<&proxy::Proxy>,
-        use_jar: bool,
-        extra_headers: Vec<(String, String)>,
-        follow_redirects: bool,
-        legacy_identity: bool,
-    ) -> Result<FetchOutcome, FetchError> {
-        // Centralized gate: credentials/host checks and the DNS-aware SSRF
-        // tier run before any dial.
-        crate::fetch::guards::ensure_url_safe(url_str).await?;
-        // Values synthesized from responses (referer, cookies) must never
-        // split the request line.
-        if extra_headers.iter().any(|(n, v)| {
-            !crate::fetch::guards::valid_header_value(n)
-                || !crate::fetch::guards::valid_header_value(v)
-        }) {
-            return Err(FetchError::Http(
-                "invalid header value (CR/LF/NUL) : refused to send".into(),
-            ));
-        }
-        let started = Instant::now();
-        let refusal: std::sync::Arc<Mutex<Option<FetchError>>> = Default::default();
-        let req = WireReq {
-            method: "GET".into(),
-            url: url_str.to_string(),
-            kind,
-            extra_headers,
-            body: None,
-            bytes: true,
-            no_cookies: !use_jar,
-            proxy: proxy.map(proxy::Proxy::wire_url),
-            follow_redirects: if follow_redirects { None } else { Some(false) },
-            legacy_identity,
-            hop_consult: Some(hop_consult(std::sync::Arc::clone(&refusal))),
-            ..Default::default()
-        };
-        let resp = match wire_call_cancel(self.engine.wire.clone(), req).await {
-            Ok(resp) => resp,
-            Err(raw) => return Err(prefer_refusal(raw, &refusal)),
-        };
-        let mut out = self.wire_outcome(resp);
-        out.route = proxy
-            .cloned()
-            .map(RequestRoute::pinned)
-            .unwrap_or_else(RequestRoute::direct);
-        out.elapsed = started.elapsed();
-        Ok(out)
-    }
-
-    fn wire_outcome(&self, resp: WireResp) -> FetchOutcome {
-        let body = resp.raw.unwrap_or_else(|| resp.body.clone().into_bytes());
-        let verdict = walls::detect(resp.status, &resp.headers, &body);
-        FetchOutcome {
-            route: RequestRoute::direct(),
-            url: resp.final_url,
-            status: resp.status,
-            alpn: "wire".into(),
-            headers: resp.headers,
-            body,
-            redirects: 0,
-            cache: CacheState::None,
-            used_pool: false,
-            verdict,
-            elapsed: Duration::ZERO,
-            state: None,
-        }
-    }
-
-    /// One document fetch through the engine pipeline (cache, JS, learned
-    /// hosts). The guard runs on the initial URL; every redirect hop the
-    /// engine follows is re-gated through the hop consult BEFORE its dial.
-    /// A PDF-shaped or PDF-answering URL takes the raw wire instead: the
-    /// engine's document path decodes bodies as text, and DonSheet needs
-    /// the bytes verbatim.
-    async fn doc_fetch(
-        &self,
-        url_str: &str,
-        proxy: Option<proxy::Proxy>,
-        use_jar: bool,
-        route: RequestRoute,
-        extra: Vec<(String, String)>,
-    ) -> Result<FetchOutcome, FetchError> {
-        crate::fetch::guards::ensure_url_safe(url_str).await?;
-        let started = Instant::now();
-        // The URL shape alone decides the easy case: no text pipeline for
-        // a PDF (arXiv serves /pdf/1706.03762 with no extension).
-        if crate::fetch::guards::is_pdf_url_like(url_str) {
-            return self
-                .raw_document_fetch(url_str, proxy, use_jar, extra, route, started)
-                .await;
-        }
-        let refusal: std::sync::Arc<Mutex<Option<FetchError>>> = Default::default();
-        let raw_extra = extra.clone();
-        let opts = FetchOpts {
-            proxy: proxy.as_ref().map(proxy::Proxy::wire_url),
-            no_cookies: !use_jar,
-            extra_headers: extra,
-            hop_consult: Some(hop_consult(std::sync::Arc::clone(&refusal))),
-        };
-        let engine = std::sync::Arc::clone(&self.engine);
-        let url_owned = url_str.to_string();
-        let out = match wire_call(move || {
-            engine.fetch_with(&url_owned, JsMode::Auto, DOC_BUDGET_MS, &opts)
-        })
-        .await
-        {
-            Ok(out) => out,
-            Err(raw) => return Err(prefer_refusal(raw, &refusal)),
-        };
-        // A 304 that reaches the app is never a valid revalidation — the
-        // engine consumes those. It is an unsolicited or redirected answer
-        // with no matching validator snapshot, and serving it would be an
-        // empty wall.
-        if out.status == 304 {
-            return Err(FetchError::Http(
-                "304 response without a matching request validator snapshot".into(),
-            ));
-        }
-        // A URL that did not LOOK like a PDF answered as one: the engine
-        // already decoded the bytes as text, so read them again raw.
-        let ct = out
-            .headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("");
-        if crate::fetch::guards::is_pdf(out.html.as_bytes(), ct) {
-            return self
-                .raw_document_fetch(url_str, proxy, use_jar, raw_extra, route, started)
-                .await;
-        }
-        // The engine's `html` is the final document (post-JS when JS ran);
-        // a non-HTML body lands there verbatim too.
-        let body: Vec<u8> = if !out.html.is_empty() {
-            out.html.into_bytes()
-        } else {
-            out.text.into_bytes()
-        };
-        let mut verdict = walls::detect(out.status, &out.headers, &body);
-        // Wave W / D3: the engine's own wall typing is evidence the body
-        // cannot always carry — a challenge widget re-renders the DOM and can
-        // strip every vendor marker from it. When the engine says `walled`
-        // (it ran the challenge cycle and knows it never cleared), a
-        // body-only ContentOk is overridden: the request was not served.
-        if out.label == "walled" && verdict == Verdict::ContentOk {
-            verdict = Verdict::Challenge(crate::detect::walls::Vendor::Generic);
-        }
-        Ok(FetchOutcome {
-            route,
-            url: out.url,
-            status: out.status,
-            alpn: out.label,
-            headers: out.headers,
-            body,
-            redirects: 0,
-            cache: Self::app_cache(out.cache),
-            used_pool: false,
-            verdict,
-            elapsed: started.elapsed(),
-            state: out.state.clone(),
-        })
-    }
-
-    /// One raw wire read for a document-shaped binary: the engine's text
-    /// decode never sees it, so the bytes stay exact (DonSheet reads them
-    /// verbatim). Same guards, same hop consult, same jar knobs as the
-    /// text path; never cache-served (a raw read is fresh by definition).
-    async fn raw_document_fetch(
-        &self,
-        url_str: &str,
-        proxy: Option<proxy::Proxy>,
-        use_jar: bool,
-        extra: Vec<(String, String)>,
-        route: RequestRoute,
-        started: Instant,
-    ) -> Result<FetchOutcome, FetchError> {
-        let mut out = self
-            .wire_once(
-                url_str,
-                ReqKind::Document,
-                proxy.as_ref(),
-                use_jar,
-                extra,
-                true,
-                false,
-            )
-            .await?;
-        out.route = route;
-        out.elapsed = started.elapsed();
-        Ok(out)
-    }
-
-    fn app_cache(state: Option<doncore::engine::CacheOutcome>) -> CacheState {
-        match state.map(|c| c.state) {
-            Some(EngineCacheState::Fresh) => CacheState::Fresh,
-            Some(EngineCacheState::Revalidated) => CacheState::Revalidated,
-            _ => CacheState::None,
-        }
-    }
-
-    /// The app's own redirect loop, for paths that carry a `RedirectGate`
-    /// (crawl scope/robots): each hop is a single request
-    /// (`follow_redirects: Some(false)`), validated and gated BEFORE the
-    /// next target is dialed. Also the honest-return path for non-http(s)
-    /// redirect targets.
-    #[allow(clippy::too_many_arguments)]
-    async fn hop_loop(
-        &self,
-        url_str: &str,
-        proxy: Option<proxy::Proxy>,
-        use_jar: bool,
-        referer: Option<&str>,
-        identity: RequestIdentity<'_>,
-        redirect_gate: RedirectGate,
-        route: RequestRoute,
-        pool_lane: Option<(String, String)>,
-    ) -> Result<FetchOutcome, FetchError> {
-        crate::fetch::guards::validate_url_basic(url_str)?;
-        let started = Instant::now();
-        let mut current = url_str.to_string();
-        let mut redirects = 0u8;
-        let mut first = true;
-        let mut site_worst = SiteClass::SameOrigin;
-        let mut prev: Option<String> = None;
-        loop {
-            if let Some(initiator) = referer {
-                let hop_site = classify_site(initiator, &current);
-                site_worst = if first {
-                    hop_site
-                } else {
-                    site_worst.max(hop_site)
-                };
-            }
-            let ref_arg = if first {
-                referer
-            } else if referer.is_some() {
-                prev.as_deref()
-            } else {
-                None
-            };
-            let site_arg = if referer.is_some() && !first {
-                Some(site_worst.value())
-            } else {
-                None
-            };
-            let extra = Self::extra_headers(
-                &current,
-                &[],
-                ref_arg,
-                site_arg,
-                identity,
-                self.profile.user_agent.as_str(),
-                self.profile.sec_ch_ua.as_str(),
-            );
-            let hop_started = Instant::now();
-            let out = match self
-                .wire_once(
-                    &current,
-                    kind_for(identity.class),
-                    proxy.as_ref(),
-                    use_jar,
-                    extra,
-                    false,
-                    identity.legacy_user_agent.is_some(),
-                )
-                .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    if let (Some(pool), Some((host, id))) = (&self.egress, &pool_lane) {
-                        note_lane_outcome(pool, host, id, &e);
-                    }
-                    return Err(e);
-                }
-            };
-            if let (Some(pool), Some((host, id))) = (&self.egress, &pool_lane) {
-                match out.status {
-                    429 => pool.note_fetch_rate_limited(host, id),
-                    200..=299 => {
-                        pool.report_ok(host, id);
-                        pool.observe_rtt(id, hop_started.elapsed());
-                    }
-                    _ => {}
-                }
-            }
-            match out.status {
-                301 | 302 | 303 | 307 | 308 => {
-                    redirects += 1;
-                    first = false;
-                    if redirects > MAX_REDIRECTS {
-                        return Err(FetchError::TooManyRedirects);
-                    }
-                    let Some(loc) = header_value(&out.headers, "location") else {
-                        let mut o = out;
-                        o.elapsed = started.elapsed();
-                        o.redirects = redirects;
-                        o.route = route;
-                        return Ok(o);
-                    };
-                    let base = url::Url::parse(&current)
-                        .map_err(|_| FetchError::InvalidUrl(current.clone()))?;
-                    // Centralized redirect SSRF guard: validates scheme,
-                    // credentials and host, and rejects private literals.
-                    let next = match crate::fetch::guards::validate_redirect_url(&base, &loc) {
-                        Ok(u) => u,
-                        Err(e) => {
-                            // Non-web scheme: return the redirect honestly
-                            // (matched on the variant, never the text).
-                            if matches!(e, FetchError::NonHttpRedirect(_)) {
-                                let mut o = out;
-                                o.elapsed = started.elapsed();
-                                o.redirects = redirects;
-                                o.route = route;
-                                return Ok(o);
-                            }
-                            return Err(e);
-                        }
-                    };
-                    // Pre-navigation redirect policy (crawl scope and
-                    // robots): a refused hop is never dialed; the redirect
-                    // response returns as the outcome so the caller records
-                    // the honest skip.
-                    if !redirect_gate(next.clone()).await {
-                        let mut o = out;
-                        o.elapsed = started.elapsed();
-                        o.redirects = redirects;
-                        o.route = route;
-                        return Ok(o);
-                    }
-                    prev = Some(current.clone());
-                    current = next.to_string();
-                }
-                _ => {
-                    let mut o = out;
-                    o.elapsed = started.elapsed();
-                    o.redirects = redirects;
-                    o.route = route;
-                    return Ok(o);
-                }
-            }
-        }
-    }
-
-    // ── public surface (kept verbatim for the 13 importers) ─────────────
-
-    /// Fetch with browser-correct redirects, cookies, cache revalidation.
     pub async fn fetch(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
         self.fetch_via(url_str, None).await
     }
@@ -690,8 +110,8 @@ impl Fetcher {
         self.fetch_via_jar(url_str, proxy, true).await
     }
 
-    /// Full lane control: `use_jar=false` keeps the shared cookie
-    /// jar OUT of the request.
+    /// Full lane control: `use_jar=false` is a cold read: no learned state
+    /// (cookies, identity order, page cache) is spent or kept.
     pub async fn fetch_via_jar(
         &self,
         url_str: &str,
@@ -701,9 +121,8 @@ impl Fetcher {
         self.fetch_via_jar_ref(url_str, proxy, use_jar, None).await
     }
 
-    /// Evidence-grade cold probe (v4 phase 0.2): no shared cookie
-    /// jar (a true cold client) and no state-plane cache (a cached page is
-    /// not evidence about the wall RIGHT NOW). One wire read.
+    /// Evidence-grade cold probe (v4 phase 0.2): no learned state and no
+    /// page cache (a cached page is not evidence about the wall RIGHT NOW).
     pub async fn fetch_cold_probe(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
         self.fetch_via_jar_opts(url_str, None, false, None, true, true, None)
             .await
@@ -723,8 +142,8 @@ impl Fetcher {
             .await
     }
 
-    /// Full-knobs variant: `skip_cache` bypasses the state plane entirely
-    /// (probe path only; everything else keeps it). `pool_pick` gates the
+    /// Full-knobs variant: `skip_cache` bypasses the page cache (a
+    /// recrawl must see the live page). `pool_pick` gates the
     /// opt-in pool lane (`proxy.fetch_rotate`); crawl passes `false`
     /// because it owns its lane choice. `redirect_gate` is consulted for
     /// every redirect hop before the target is dialed (crawl scope/robots;
@@ -740,7 +159,7 @@ impl Fetcher {
         pool_pick: bool,
         redirect_gate: Option<RedirectGate>,
     ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_via_jar_language(
+        self.document(
             url_str,
             proxy,
             use_jar,
@@ -753,11 +172,8 @@ impl Fetcher {
         .await
     }
 
-    /// As `fetch_via_jar_opts`, with the caller's persona language: a
-    /// crawl page must present the same language identity as web_fetch
-    /// and the ghost for the same host (v4 E2 coherence).
     #[allow(clippy::too_many_arguments)]
-    pub async fn fetch_via_jar_language(
+    async fn document(
         &self,
         url_str: &str,
         proxy: Option<&proxy::Proxy>,
@@ -765,44 +181,12 @@ impl Fetcher {
         referer: Option<&str>,
         skip_cache: bool,
         pool_pick: bool,
-        accept_language: Option<&str>,
-        redirect_gate: Option<RedirectGate>,
-    ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_via_jar_identity(
-            url_str,
-            proxy,
-            use_jar,
-            referer,
-            skip_cache,
-            pool_pick,
-            RequestIdentity {
-                class: RequestClass::Navigation,
-                legacy_user_agent: None,
-                accept_language,
-            },
-            None,
-            redirect_gate,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn fetch_via_jar_identity(
-        &self,
-        url_str: &str,
-        proxy: Option<&proxy::Proxy>,
-        use_jar: bool,
-        referer: Option<&str>,
-        skip_cache: bool,
-        pool_pick: bool,
-        identity: RequestIdentity<'_>,
         route_override: Option<&RequestRoute>,
         redirect_gate: Option<RedirectGate>,
     ) -> Result<FetchOutcome, FetchError> {
         // Centralized URL safety gate: scheme, credentials, localhost and
-        // private literals. No dial can follow a cached return. The async
-        // DNS-aware tier runs exactly once per request, inside the wire
-        // call (or the engine's document GETs).
+        // private literals, before any route is chosen. The DNS-aware tier
+        // runs once per request inside the v5 adapter.
         crate::fetch::guards::validate_url_basic(url_str)?;
         let fetch_host = url::Url::parse(url_str)
             .ok()
@@ -839,89 +223,57 @@ impl Fetcher {
             .pool_lane()
             .map(|(h, id)| (h.to_string(), id.to_string()));
         let hop_proxy = route.proxy_for(url_str)?;
-
-        // The app's hop loop owns every gate-carrying or state-plane-bypassing
-        // fetch: the async scope/robots gate must run BEFORE a redirect target
-        // is dialed (a crawl read is also a live probe) and it cannot ride the
-        // engine's sync redirect consult. Document fetches WITHOUT a gate take
-        // the engine path, whose hops the consult re-gates (rules/SSRF).
-        if redirect_gate.is_some() || skip_cache {
-            let gate = redirect_gate.unwrap_or_else(allow_all_gate);
-            return self
-                .hop_loop(
-                    url_str,
-                    hop_proxy,
-                    use_jar,
-                    referer,
-                    identity,
-                    gate,
-                    route,
-                    pool_lane_key,
-                )
-                .await;
-        }
-
-        // Documents: the engine's pipeline (cache, JS, learned hosts).
-        let extra = Self::extra_headers(
-            url_str,
-            &[],
-            referer,
-            None,
-            identity,
-            self.profile.user_agent.as_str(),
-            self.profile.sec_ch_ua.as_str(),
-        );
-        let mut out = self
-            .doc_fetch(url_str, hop_proxy, use_jar, route.clone(), extra)
-            .await?;
+        let out = self
+            .v5
+            .document(crate::fetch::v5::Document {
+                url: url_str,
+                proxy: hop_proxy,
+                route: route.clone(),
+                learn: use_jar,
+                skip_cache,
+                referer,
+                gate: redirect_gate,
+            })
+            .await;
         if let (Some(pool), Some((host, id))) = (&self.egress, &pool_lane_key) {
-            match out.status {
-                429 => pool.note_fetch_rate_limited(host, id),
-                200..=299 => {
+            match &out {
+                Ok(out) if out.status == 429 => pool.note_fetch_rate_limited(host, id),
+                Ok(out) if (200..300).contains(&out.status) => {
                     pool.report_ok(host, id);
                     pool.observe_rtt(id, out.elapsed);
                 }
-                _ => {}
+                Ok(_) => {}
+                Err(e) => note_lane_outcome(pool, host, id, e),
             }
         }
-        out.route = route;
-        Ok(out)
+        out
     }
 
-    /// One cookie-less hop with a request-local legacy User-Agent.
-    /// The legacy identity strips client hints and fetch metadata so the
-    /// swapped UA reads coherent; URL guards still run.
+    /// One cookie-less request with a request-local User-Agent: the plain
+    /// identity, so no client hints or fetch metadata contradict the swapped
+    /// UA. URL guards still run.
     pub async fn fetch_once_via_user_agent(
         &self,
         url_str: &str,
         proxy: Option<&proxy::Proxy>,
         user_agent: &str,
     ) -> Result<FetchOutcome, FetchError> {
-        if user_agent.is_empty()
-            || !user_agent.is_ascii()
-            || user_agent.bytes().any(|b| b.is_ascii_control())
-        {
-            return Err(FetchError::Http("invalid User-Agent".into()));
-        }
-        self.fetch_once_via_identity(
-            url_str,
-            &[],
-            proxy,
-            false,
-            None,
-            RequestIdentity {
+        self.v5
+            .once(crate::fetch::v5::OneShot {
+                url: url_str,
+                conditional: &[],
+                proxy,
+                use_jar: false,
+                referer: None,
                 class: RequestClass::Navigation,
-                legacy_user_agent: Some(user_agent),
-                accept_language: None,
-            },
-        )
-        .await
+                user_agent: Some(user_agent),
+            })
+            .await
     }
 
-    /// Same, optionally through a CONNECT proxy.
-    /// `use_jar=false` keeps cookies out entirely : search
-    /// engines get cookie-less requests so egress lanes
-    /// stay unlinked and the fetch-tool jar stays clean.
+    /// One request, optionally through a proxy. `use_jar=false` keeps
+    /// cookies out entirely: search engines get cookie-less requests so
+    /// egress lanes stay unlinked.
     pub async fn fetch_once_via(
         &self,
         url_str: &str,
@@ -941,8 +293,8 @@ impl Fetcher {
         .await
     }
 
-    /// Class-aware variant (v4 phase 1.2): subresource fetches
-    /// carry the per-class header set on the wire.
+    /// Class-aware variant (v4 phase 1.2): subresource reads carry the
+    /// per-class header set on the wire.
     pub async fn fetch_once_via_class(
         &self,
         url_str: &str,
@@ -952,61 +304,23 @@ impl Fetcher {
         referer: Option<&str>,
         class: RequestClass,
     ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_once_via_identity(
-            url_str,
-            conditional,
-            proxy,
-            use_jar,
-            referer,
-            RequestIdentity {
+        self.v5
+            .once(crate::fetch::v5::OneShot {
+                url: url_str,
+                conditional,
+                proxy,
+                use_jar,
+                referer,
                 class,
-                legacy_user_agent: None,
-                accept_language: None,
-            },
-        )
-        .await
-    }
-
-    async fn fetch_once_via_identity(
-        &self,
-        url_str: &str,
-        conditional: &[(String, String)],
-        proxy: Option<&proxy::Proxy>,
-        use_jar: bool,
-        referer: Option<&str>,
-        identity: RequestIdentity<'_>,
-    ) -> Result<FetchOutcome, FetchError> {
-        let extra = Self::extra_headers(
-            url_str,
-            conditional,
-            referer,
-            None,
-            identity,
-            self.profile.user_agent.as_str(),
-            self.profile.sec_ch_ua.as_str(),
-        );
-        self.wire_once(
-            url_str,
-            kind_for(identity.class),
-            proxy,
-            use_jar,
-            extra,
-            true,
-            identity.legacy_user_agent.is_some(),
-        )
-        .await
-    }
-
-    /// Tier-1 navigation-identity fetch (the daemon's Chrome-class
-    /// hop). Follows redirects (bounded, engine-side). Honors the fetch
-    /// pool opt-in like every other fetch path (`proxy.fetch_rotate`).
-    pub async fn fetch_persona(
-        &self,
-        url_str: &str,
-        accept_language: Option<&str>,
-    ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_persona_on_route(url_str, accept_language, None)
+                user_agent: None,
+            })
             .await
+    }
+
+    /// The daemon's document read. Honors the fetch pool opt-in like every
+    /// other fetch path (`proxy.fetch_rotate`).
+    pub async fn fetch_persona(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
+        self.fetch_persona_on_route(url_str, None).await
     }
 
     /// Select once for the whole fetch call, including related fallback URLs.
@@ -1027,234 +341,19 @@ impl Fetcher {
         RequestRoute::configured()
     }
 
-    /// Repeat HTTP under the policy that produced the browser document.
+    /// A document read on a route chosen earlier in the same call (a related
+    /// fallback URL keeps the lane the first read used).
     pub async fn fetch_persona_on_route(
         &self,
         url_str: &str,
-        accept_language: Option<&str>,
         route: Option<&RequestRoute>,
     ) -> Result<FetchOutcome, FetchError> {
-        self.fetch_via_jar_identity(
-            url_str,
-            None,
-            true,
-            None,
-            false,
-            true,
-            RequestIdentity {
-                class: RequestClass::Navigation,
-                legacy_user_agent: None,
-                accept_language,
-            },
-            route,
-            None,
-        )
-        .await
+        self.document(url_str, None, true, None, false, true, route, None)
+            .await
     }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
-
-/// The allow-all gate for callers without a scope policy: the hop loop
-/// still runs — every hop is validated — nothing is refused by policy.
-fn allow_all_gate() -> RedirectGate {
-    std::sync::Arc::new(|_url: url::Url| Box::pin(async { true }))
-}
-
-/// The class → wire-kind mapping for the engine's per-kind header sets.
-fn kind_for(class: RequestClass) -> ReqKind {
-    match class {
-        RequestClass::Script => ReqKind::Script,
-        RequestClass::Style => ReqKind::Style,
-        RequestClass::Font => ReqKind::Font,
-        RequestClass::Image | RequestClass::Favicon => ReqKind::Image,
-        RequestClass::Navigation => ReqKind::Document,
-    }
-}
-
-/// The per-hop consult behind engine-followed redirect chains: the same
-/// sync gate the app's own hop loop runs (scheme / credentials / rules /
-/// SSRF literal), BEFORE the engine dials the hop target. A refusal lands
-/// in `refusal` as its typed error — the engine carries only the `denied:`
-/// marker + URL — and a non-web scheme stops the chain so the 3xx itself
-/// returns as the outcome (v4 semantics).
-fn hop_consult(refusal: std::sync::Arc<Mutex<Option<FetchError>>>) -> HopConsult {
-    HopConsult::new(move |prev, next| {
-        let verdict = match url::Url::parse(prev) {
-            Ok(base) => crate::fetch::guards::validate_redirect_url(&base, next),
-            // The engine hands resolved absolute URLs; an unparseable
-            // previous URL means something upstream is broken — refuse.
-            Err(_) => return HopDecision::Deny(next.to_string()),
-        };
-        match verdict {
-            Ok(_) => HopDecision::Follow,
-            Err(FetchError::NonHttpRedirect(_)) => HopDecision::Stop,
-            Err(e) => {
-                *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-                HopDecision::Deny(next.to_string())
-            }
-        }
-    })
-}
-
-/// The error path shared by the engine-backed fetches: a `denied:` failure
-/// returns the typed refusal the consult recorded (the engine carries only
-/// the URL); anything else maps by class.
-fn prefer_refusal(raw: String, refusal: &Mutex<Option<FetchError>>) -> FetchError {
-    if raw.contains("denied:")
-        && let Some(e) = refusal.lock().unwrap_or_else(|p| p.into_inner()).take()
-    {
-        return e;
-    }
-    map_engine_err(raw)
-}
-
-/// Path of the vault-domain ledger: beside the engine jar under the same
-/// state root — the ledger and the jar are one state plane and must move
-/// together.
-fn vault_domains_path() -> Option<std::path::PathBuf> {
-    doncore::state::state_root().map(|root| root.join("v1").join("vault-domains.json"))
-}
-
-/// The domains the vault fed the jar, across runs. Read fresh (never cached
-/// at construction); missing or unreadable reads as empty — the ledger is
-/// best-effort and never fails a fetch.
-fn load_vault_domains() -> std::collections::HashSet<String> {
-    let Some(path) = vault_domains_path() else {
-        return Default::default();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Default::default();
-    };
-    serde_json::from_str::<Vec<String>>(&text)
-        .map(|v| v.into_iter().filter_map(|d| normalize_domain(&d)).collect())
-        .unwrap_or_default()
-}
-
-/// Persist the ledger atomically (tmp + rename). Best-effort: a failed
-/// write leaves the in-memory set authoritative and says so once.
-fn save_vault_domains(domains: &std::collections::HashSet<String>) {
-    let Some(path) = vault_domains_path() else {
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let mut list: Vec<&str> = domains.iter().map(String::as_str).collect();
-    list.sort_unstable();
-    let Ok(json) = serde_json::to_string(&list) else {
-        return;
-    };
-    let tmp = path.with_extension("json.tmp");
-    let write = std::fs::create_dir_all(parent)
-        .and_then(|_| std::fs::write(&tmp, json.as_bytes()))
-        .and_then(|_| std::fs::rename(&tmp, &path));
-    if let Err(e) = write {
-        crate::diag!("[fetch] vault-domain ledger write failed: {e}");
-    }
-}
-
-/// The jar's flat domain form: lowercase, no leading dot.
-fn normalize_domain(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_start_matches('.').to_ascii_lowercase();
-    (!s.is_empty()).then_some(s)
-}
-
-/// Map a classified engine failure onto the app taxonomy. The engine's
-/// class prefixes are pinned by its tests (`dns:`, `dns-timeout:`,
-/// `timeout:`, `tls:`, `connect:`, `proxy:`, `body:`, `redirect:`,
-/// `request:`, `internal:`, `denied:`); the engine may wrap them in a phase
-/// prefix (`wire: …`), stripped first. An unrecognized shape stays an
-/// honest `Http` message rather than a guessed class.
-fn map_engine_err(raw: String) -> FetchError {
-    let msg = raw.strip_prefix("wire: ").unwrap_or(&raw);
-    let (class, detail) = msg
-        .split_once(':')
-        .map_or(("", msg), |(c, d)| (c, d.trim()));
-    match class {
-        "dns" => FetchError::Dns(detail.to_owned()),
-        "dns-timeout" => FetchError::DnsTimeout(detail.to_owned()),
-        "timeout" => FetchError::Timeout,
-        "tls" => FetchError::Tls(detail.to_owned()),
-        "connect" => FetchError::Io(std::io::Error::other(detail.to_owned())),
-        "proxy" => {
-            // A proxy demanding credentials keeps the old auth-fail shape
-            // (lane_note keys on it); anything else is a dead lane. The
-            // engine names the 407 (its tunnel text alone carries only
-            // "proxy authorization required"); the marker phrase is
-            // accepted too so either side reads alone.
-            if detail.contains("407") || detail.contains("proxy authorization required") {
-                FetchError::Http(format!("CONNECT -> 407 ({detail})"))
-            } else {
-                FetchError::Io(std::io::Error::other(format!("proxy: {detail}")))
-            }
-        }
-        "denied" => {
-            // A hop the engine's redirect consult refused: rebuild the
-            // typed refusal (rules/SSRF payload) from the refused URL.
-            match crate::fetch::guards::validate_url_basic(detail) {
-                Err(e) => e,
-                Ok(_) => FetchError::Http(format!("denied: {detail}")),
-            }
-        }
-        "redirect" => FetchError::TooManyRedirects,
-        "body" | "request" | "internal" => FetchError::Http(format!("{class}: {detail}")),
-        _ => FetchError::Http(raw),
-    }
-}
-
-/// As `wire_call`, but the job is cooperatively cancelled when the async
-/// caller goes away: a task abort or daemon shutdown drops this future,
-/// the guard flags the watch channel, and the worker tears down a pending
-/// dial or read instead of holding the connection open.
-struct CancelOnDrop(tokio::sync::watch::Sender<bool>);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.send(true);
-    }
-}
-
-async fn wire_call_cancel(
-    wire: doncore::wire::Wire,
-    mut req: doncore::wire::WireReq,
-) -> Result<doncore::wire::WireResp, String> {
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    req.cancel = Some(rx);
-    let join = tokio::task::spawn_blocking(move || wire.fetch(req));
-    let guard = CancelOnDrop(tx);
-    let out = match join.await {
-        Ok(r) => r,
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => panic!("wire bridge task failed: {e}"),
-    };
-    drop(guard);
-    out
-}
-
-/// The engine's wire and document fetches are synchronous by design (its
-/// worker thread owns the IO). This async bridge runs the blocking wait on
-/// a dedicated blocking thread — never on a runtime worker — so a peer on
-/// the same runtime (in-process test servers, loopback mocks) keeps being
-/// polled while the fetch is pending.
-async fn wire_call<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => panic!("wire bridge task failed: {e}"),
-    }
-}
-
-fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
-}
 
 /// Schemeful same-site relationship for `sec-fetch-site` (Fetch
 /// Metadata §2.3); the ordering is the chain fold's worst-wins.
@@ -1305,9 +404,14 @@ fn classify_site(initiator: &str, target: &str) -> SiteClass {
     SiteClass::CrossSite
 }
 
+/// Chrome's `sec-fetch-site` value for a navigation from `initiator` to `target`.
+pub(crate) fn fetch_site(initiator: &str, target: &str) -> &'static str {
+    classify_site(initiator, target).value()
+}
+
 /// Chrome's default referrer policy `strict-origin-when-cross-origin`:
 /// same-origin = full URL, cross-origin = origin only.
-fn referer_value(referer: &str, target: &str) -> String {
+pub(crate) fn referer_value(referer: &str, target: &str) -> String {
     let ref_url = url::Url::parse(referer).ok();
     let tgt_url = url::Url::parse(target).ok();
     let same_origin = match (&ref_url, &tgt_url) {
@@ -1409,7 +513,7 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
 }
 
 #[cfg(test)]
-mod engine_exit_tests {
+mod fetcher_tests {
     use super::*;
     use crate::error::FetchError;
 
@@ -1769,8 +873,8 @@ mod engine_exit_tests {
         owned_status_fetch(200).await;
     }
 
-    // In-process loopback mock for the wire-bridge regression: the runtime
-    // hosting the mock must keep polling while the fetch is pending.
+    // In-process loopback mock: the runtime hosting the mock must keep
+    // polling while the fetch is pending.
     fn loopback_config() {
         let mut config = crate::config::DonsetchConfig::default();
         config.proxy.from_environment = false;
@@ -1805,12 +909,11 @@ mod engine_exit_tests {
         (url, h)
     }
 
-    // v5: the app bridges the engine's synchronous wire onto a blocking
-    // thread; the runtime hosting an in-process loopback peer must keep
-    // polling while the fetch is pending (an inline call deadlocked every
-    // same-runtime mock until the wire's own 25s timeout).
+    // v5 runs synchronously on a blocking thread; the runtime hosting an
+    // in-process loopback peer must keep polling while the fetch is pending
+    // (an inline call would deadlock every same-runtime mock).
     #[tokio::test]
-    async fn stealth_v5_oneshot_wire_call_keeps_the_loopback_peer_polled() {
+    async fn a_one_shot_read_keeps_the_loopback_peer_polled() {
         loopback_config();
         let (url, mock) = loopback_mock().await;
         let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
@@ -1898,10 +1001,8 @@ mod engine_exit_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // v5 parity: the engine's document path decodes bodies as text, so a
-    // PDF must ride the raw wire — byte-exact, or DonSheet reads mojibake.
-    // Both the URL-shape route (`/paper.pdf`) and the surprise
-    // content-type route (`/download`) must return the exact bytes.
+    // A PDF must arrive byte-exact, or DonSheet reads mojibake: both a
+    // `.pdf` URL and a PDF answer on a URL that does not look like one.
     #[tokio::test]
     async fn pdf_documents_keep_their_bytes_exact() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1933,15 +1034,12 @@ mod engine_exit_tests {
             }
         });
         let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
-        // 1) The URL shape routes raw before any document pipeline runs.
         let shaped = fetcher.fetch(&format!("{base}/paper.pdf")).await.unwrap();
         assert_eq!(shaped.status, 200);
         assert_eq!(
             shaped.body, PDF_BODY,
             "a .pdf URL must arrive byte-exact (lossy text decode would alter the bytes)"
         );
-        // 2) A URL that does not look like a PDF but answers as one: the
-        //    surprise case re-reads the bytes raw.
         let surprise = fetcher.fetch(&format!("{base}/download")).await.unwrap();
         assert_eq!(surprise.status, 200);
         assert_eq!(

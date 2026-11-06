@@ -1211,6 +1211,9 @@ pub fn cookies_fresh_at(profile: &DomainProfile, now: u64) -> bool {
 // ────────────────────────── GhostState impl ──────────────────────────
 
 impl GhostState {
+    /// The vault revision this snapshot carries (what `disk_session_stamp`
+    /// reads from disk).
+    #[cfg(test)]
     pub(crate) fn session_stamp(&self) -> String {
         self.session_revision
             .as_ref()

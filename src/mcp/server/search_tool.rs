@@ -13,7 +13,6 @@ pub(super) async fn search_tool(
     args: &Value,
     mut ctx: Option<ToolCtx>,
 ) -> Value {
-    daemon.refresh_vault().await;
     let deadline = args
         .get("deadline_ms")
         .and_then(Value::as_u64)

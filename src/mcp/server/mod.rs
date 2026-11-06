@@ -26,7 +26,7 @@ use crate::search::byok::ByokSearcher;
 use crate::search::egress::EgressPool;
 use crate::search::intent::Intent;
 use crate::search::{self, Searcher};
-use crate::state::{CookieRecord, GhostState, RouteDecision};
+use crate::state::GhostState;
 use errors::*;
 // The uniform failure predicate (v4.7 envelope) : the CLI's exit-code and
 // rendering paths branch on the same signal the wire carries.
@@ -46,9 +46,6 @@ pub struct Daemon {
     /// Session-local search references are useful only to a persistent caller.
     pub(crate) search_handles: bool,
     history: Arc<std::sync::Mutex<crate::pages::history::PageHistory>>,
-    /// Cookie revision from the atomic vault snapshot. Timestamps and size
-    /// cannot identify equal-size replacements on every supported platform.
-    vault_seen: tokio::sync::Mutex<Option<String>>,
     /// Background route-memory prober handle (v4 phase 0.2);
     /// aborted on shutdown.
     probe_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -67,31 +64,8 @@ impl Daemon {
         crate::state::ensure_session_identity();
         let state = Arc::new(Mutex::new(GhostState::load()));
 
-        // Tier 1 starts the session with the vault too: a domain
-        // that serves without JS gets an authenticated plain-HTTP
-        // fetch on the very first request after a restart, not
-        // only after the browser has visited it once.
-        {
-            let sessions = crate::state::load_session_cookies();
-            // Tier-1 jar persistence (v4 phase 1.4), kill-switched.
-            // The vault outranks the jar echo for a key both hold: a
-            // logged-out render can write anonymous values for a
-            // login cookie's name, and replaying those keeps every
-            // later fetch anonymous until the jar is cleared (#319).
-            let jar = if crate::config::cfg().state.cookie_vault {
-                state.lock().await.tier1_cookies.clone()
-            } else {
-                Vec::new()
-            };
-            let replay = crate::state::vault_over_jar(&sessions, &jar);
-            fetcher.import_vault_cookies(&replay).await;
-        }
-
-        let (crawler, _gov) = crawl_real::build(
-            Arc::clone(&fetcher),
-            std::sync::Arc::clone(&egress),
-            Some(Arc::clone(&state)),
-        );
+        let (crawler, _gov) =
+            crawl_real::build(Arc::clone(&fetcher), std::sync::Arc::clone(&egress));
 
         let searcher = Arc::new(Searcher::new_shared(
             Fetcher::new(profile.clone())?.with_egress(std::sync::Arc::clone(&egress)),
@@ -110,7 +84,6 @@ impl Daemon {
             history: Arc::new(std::sync::Mutex::new(
                 crate::pages::history::PageHistory::load(),
             )),
-            vault_seen: tokio::sync::Mutex::new(None),
             probe_task: std::sync::Mutex::new(None),
             preflight_task: std::sync::Mutex::new(Some(preflight_task)),
         })
@@ -158,35 +131,6 @@ impl Daemon {
         if let Some(task) = prober {
             task.abort();
             let _ = task.await;
-        }
-    }
-
-    /// Resync the tier-1 cookie jar after login/logout/rotation. The
-    /// hot path reads a bounded trailer; parse only after a real cookie change.
-    pub async fn refresh_vault(&self) {
-        let Some(sig) = crate::state::disk_session_stamp() else {
-            return;
-        };
-        let mut seen = self.vault_seen.lock().await;
-        if seen.as_ref() != Some(&sig) {
-            let disk = GhostState::load();
-            let stamp = disk.session_stamp();
-            let sessions: Vec<_> = disk
-                .profiles
-                .values()
-                .flat_map(|p| &p.session_cookies)
-                .filter(|c| crate::state::is_session_usable(c))
-                .cloned()
-                .collect();
-            self.state.lock().await.merge_vault_from_disk(&disk);
-            let jar = if crate::config::cfg().state.cookie_vault {
-                disk.tier1_cookies.clone()
-            } else {
-                Vec::new()
-            };
-            let cookies = crate::state::vault_over_jar(&sessions, &jar);
-            self.fetcher.reset_to(&cookies).await;
-            *seen = Some(stamp);
         }
     }
 }

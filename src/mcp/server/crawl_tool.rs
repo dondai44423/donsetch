@@ -7,7 +7,6 @@ use std::borrow::Cow;
 use super::*;
 #[allow(clippy::field_reassign_with_default)]
 pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<ToolCtx>) -> Value {
-    daemon.refresh_vault().await;
     // Resume can work without a url (the seed is stored in the
     // resume state). If url is missing AND no resume token, error.
     let url = match args.get("url").and_then(Value::as_str) {
@@ -100,18 +99,6 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         && let Some(refusal) = seed_guard_error(seed)
     {
         return refusal;
-    }
-
-    // Warm vault: if this host carries verified clearance cookies,
-    // they ride from page one.
-    if let Some(host) = url::Url::parse(&url)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from))
-    {
-        let route = daemon.state.lock().await.route_for(&host);
-        if let RouteDecision::Warm(cookies) = route {
-            daemon.fetcher.import_cookies(&cookies).await;
-        }
     }
 
     let requested_mode = opts.mode;
