@@ -64,6 +64,9 @@ jobs:
     # stable no matter how the matrix evolves.
     name: build-test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    # A lane can pin a linker: aarch64 needs lld for a binary this size.
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +93,12 @@ jobs:
             extra-args: -E 'not test(pdf)'
             release-check: false
             tests: full
+            # The release build for this target has forced lld since #93
+            # (bfd on 22.04 cannot parse rustc 1.98's .crel relocations);
+            # CI linked with bfd and the result segfaulted on load: the
+            # test binary aborted with SIGSEGV before printing a test
+            # list. Same linker as the artifact it stands in for.
+            rustflags: -C link-arg=-fuse-ld=lld
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
@@ -290,6 +299,17 @@ jobs:
         if: matrix.tests == 'full'
         run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }}
         timeout-minutes: 60
+
+      # A test list is not proof the binary runs: link a fault that only
+      # shows at exec (the aarch64 lane hit exactly that) and nextest
+      # reports "creating test list failed" instead of naming it. This
+      # starts the product binary the release will actually ship.
+      - name: The shipped binary starts
+        if: matrix.tests == 'full'
+        run: |
+          cargo build --profile ci ${{ matrix.features }} --target ${{ matrix.target }} --bin donsetch
+          ./target/${{ matrix.target }}/ci/donsetch --version
+        timeout-minutes: 20
 
       # Everywhere else the risk is platform COMPILATION (cfg paths,
       # linkage, process semantics), and the expensive part of a test run
