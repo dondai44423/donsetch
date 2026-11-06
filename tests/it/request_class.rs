@@ -77,11 +77,28 @@ async fn legacy_user_agent_is_single_and_request_local() {
     let raw = normal_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
-    assert_eq!(
-        header(&raw, "user-agent"),
-        Some(fetcher.profile().user_agent.as_str())
+    // The one-shot identity must describe the host it runs on: a Linux user
+    // agent leaving a Windows machine is the incoherence this asserts. The
+    // client hints must agree with it (Chromium sends them, Safari does
+    // not).
+    let ua = header(&raw, "user-agent").expect("a one-shot read sends a UA");
+    #[cfg(windows)]
+    assert!(
+        ua.contains("Windows NT"),
+        "a Windows host must not present {ua}"
     );
-    assert!(header(&raw, "sec-ch-ua").is_some());
+    #[cfg(target_os = "macos")]
+    assert!(
+        ua.contains("Macintosh"),
+        "a macOS host must not present {ua}"
+    );
+    #[cfg(not(any(windows, target_os = "macos")))]
+    assert!(ua.contains("Linux"), "a Linux host must not present {ua}");
+    if ua.contains("Chrome/") {
+        assert!(header(&raw, "sec-ch-ua").is_some());
+    } else {
+        assert!(header(&raw, "sec-ch-ua").is_none(), "hints contradict {ua}");
+    }
 }
 
 #[tokio::test]

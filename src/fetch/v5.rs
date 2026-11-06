@@ -32,7 +32,15 @@ const DOCUMENT_DEADLINE: Duration = Duration::from_secs(20);
 /// (the update tarball) is the longest thing read this way.
 const ONCE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The reference browser's own identity: what a one-shot read presents.
+/// The identity a one-shot read presents: a real client profile from the
+/// platform this binary runs on. A Linux user agent leaving a Windows
+/// machine (or a Mac) is exactly the incoherence the identity rule forbids,
+/// and the client hints would contradict it too.
+#[cfg(target_os = "windows")]
+const ONCE_IDENTITY: &str = "chrome-win";
+#[cfg(target_os = "macos")]
+const ONCE_IDENTITY: &str = "safari";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 const ONCE_IDENTITY: &str = "chrome-local";
 
 /// A request-local legacy client (a User-Agent the caller names) rides the
