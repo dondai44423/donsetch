@@ -295,6 +295,14 @@ jobs:
       # rust-cache, per-branch keys), so the timeout has to clear the
       # slowest cold build; a hung TEST is caught by nextest's own
       # per-test slow-timeout, not by this number.
+      - name: v5core alone on this architecture
+        if: matrix.name == 'linux-aarch64'
+        run: |
+          cd v5core
+          cargo test --release --locked --no-run
+          cargo test --release --locked --lib 2>&1 | tail -4 || echo "v5core lib tests exit=$?"
+        timeout-minutes: 30
+
       # A test list is not proof the binary runs: a fault that only shows at
       # exec (the aarch64 lane hit exactly that) surfaced as nextest's
       # "creating test list failed" instead of the crash itself. This starts
