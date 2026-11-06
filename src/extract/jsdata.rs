@@ -350,6 +350,9 @@ fn finish(
         thin: total < 800,
         content_kind: ContentKind::Page,
         lang: guess_lang(&md),
+
+        lang_source: None,
+        script: None,
         quality: 0.7,
         pdf_pages: None,
         images: Vec::new(),

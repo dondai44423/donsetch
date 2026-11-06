@@ -691,7 +691,12 @@ fn stem(token: &str, lang: &str) -> String {
 /// The result is a list of normalized tokens ready for
 /// BM25 scoring.
 pub fn tokenize(text: &str, lang: &LanguageInfo) -> Vec<String> {
-    if language::needs_char_tokenize(lang.script) {
+    if lang
+        .scripts
+        .iter()
+        .copied()
+        .any(language::needs_char_tokenize)
+    {
         tokenize_cjk(text, &lang.code)
     } else {
         tokenize_word_split(text, &lang.code)
@@ -706,7 +711,7 @@ pub fn tokenize_simple(text: &str) -> Vec<String> {
 }
 
 fn tokenize_word_split(text: &str, lang: &str) -> Vec<String> {
-    let folded = if lang == "en" || lang == "es" || lang == "fr" || lang == "de" || lang == "pt" {
+    let folded = if matches!(lang, "en" | "es" | "fr" | "de" | "pt" | "unknown") {
         fold_str(text)
     } else {
         text.to_string()
@@ -764,7 +769,7 @@ fn tokenize_cjk(text: &str, lang: &str) -> Vec<String> {
     let flush_word = |buf: &mut String, tokens: &mut Vec<String>| {
         let t = buf.trim().to_lowercase();
         if t.chars().count() >= 2 && !is_stopword(&t, "en") {
-            let stemmed = stem(&t, "en");
+            let stemmed = stem(&t, if lang == "unknown" { "unknown" } else { "en" });
             if !stemmed.is_empty() && stemmed.chars().count() >= 2 {
                 tokens.push(stemmed);
             }
@@ -1397,6 +1402,7 @@ mod tests {
     fn en() -> LanguageInfo {
         LanguageInfo {
             code: "en".to_string(),
+            source: Some("html_lang"),
             script: Script::Latin,
             scripts: vec![Script::Latin],
         }
@@ -1405,6 +1411,7 @@ mod tests {
     fn zh() -> LanguageInfo {
         LanguageInfo {
             code: "zh".to_string(),
+            source: Some("html_lang"),
             script: Script::Han,
             scripts: vec![Script::Han],
         }
@@ -1413,6 +1420,7 @@ mod tests {
     fn ja() -> LanguageInfo {
         LanguageInfo {
             code: "ja".to_string(),
+            source: Some("html_lang"),
             script: Script::Han,
             scripts: vec![Script::Han, Script::Kana],
         }
@@ -1421,9 +1429,21 @@ mod tests {
     fn ko() -> LanguageInfo {
         LanguageInfo {
             code: "ko".to_string(),
+            source: Some("html_lang"),
             script: Script::Hangul,
             scripts: vec![Script::Hangul],
         }
+    }
+
+    #[test]
+    fn undeclared_latin_is_folded_without_english_stemming() {
+        let info = language::detect_from_text("Les propositions parlementaires sont étudiées.");
+        let tokens = tokenize("propositions parlementaires étudiées", &info);
+        assert_eq!(tokens, ["propositions", "parlementaires", "etudiees"]);
+        assert_eq!(
+            tokenize("programming libraries", &en()),
+            ["program", "librari"]
+        );
     }
 
     // ── English tokenizer ──

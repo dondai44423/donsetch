@@ -348,8 +348,21 @@ fn lang_detect_from_script_analysis() {
         "<html><body>한국어 텍스트입니다. 이것은 기계 학습에 대한 글입니다.</body></html>",
     );
     let info = language::detect(&doc);
-    assert_eq!(info.code, "ko");
+    // Undeclared: the script is observed, the language is not guessed.
+    assert_eq!(info.code, "unknown");
+    assert_eq!(info.source, None);
     assert_eq!(info.script, Script::Hangul);
+}
+
+#[test]
+fn lang_detect_does_not_guess_from_script() {
+    // No declaration: the language is unknown. Script (Latin here) is
+    // observed, and drives tokenization, but does not name a language.
+    let doc = Html::parse_document("<html><body>Some plain English prose.</body></html>");
+    let info = language::detect(&doc);
+    assert_eq!(info.code, "unknown");
+    assert_eq!(info.source, None);
+    assert_eq!(info.script, Script::Latin);
 }
 
 #[test]
@@ -358,16 +371,11 @@ fn lang_detect_mixed_japanese() {
         "<html><body>これは日本語の文章です。機械学習について説明します。</body></html>",
     );
     let info = language::detect(&doc);
-    assert_eq!(info.code, "ja");
+    // Undeclared: Kana/Han are observed (and drive tokenization), the
+    // language itself is not inferred from them.
+    assert_eq!(info.code, "unknown");
     assert!(info.scripts.contains(&Script::Kana));
     assert!(info.scripts.contains(&Script::Han));
-}
-
-#[test]
-fn lang_detect_default_english() {
-    let doc = Html::parse_document("<html><body></body></html>");
-    let info = language::detect(&doc);
-    assert_eq!(info.code, "en");
 }
 
 // ════════════════════════════════════════════════════════════

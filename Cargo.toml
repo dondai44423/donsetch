@@ -1,6 +1,6 @@
 [package]
 name = "donsetch"
-version = "4.10.2"
+version = "4.10.5"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Web fetch, search and crawl for AI agents. Custom stealthy fetch tier: the in-tree v5 core."
@@ -14,7 +14,7 @@ url = "2"
 brotli = "9"
 memchr = "2"
 flate2 = "1"
-zstd = "0.14"
+zstd = "0.14.3"
 rustls-native-certs = "0.8"
 scraper = "0.27.0"
 encoding_rs = "0.8.35"
@@ -56,7 +56,7 @@ tar = "0.4"
 semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-psl = { version = "=2.1.241" }
+psl = { version = "=2.1.243" }
 # OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
 # below, never here: Cargo unions features across every matching target
 # section, so declaring it in more than one place is how `load-dynamic` once

@@ -2836,6 +2836,9 @@ mod fetch_output_contract_tests {
             thin: false,
             content_kind: ContentKind::Article,
             lang: "en".into(),
+
+            lang_source: None,
+            script: None,
             quality: 0.91,
             pdf_pages: None,
             images: Vec::new(),

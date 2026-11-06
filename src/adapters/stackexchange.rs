@@ -122,6 +122,9 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         thin: false,
         content_kind: ContentKind::Forum,
         lang: "en".to_string(),
+
+        lang_source: None,
+        script: None,
         quality: 0.9,
         pdf_pages: None,
         images: Vec::new(),

@@ -85,6 +85,13 @@ pub struct Extracted {
     /// Best-guess content kind from block composition.
     /// Conservative: only non-Page when confident.
     pub content_kind: ContentKind,
+    /// Where `lang` came from: "html_lang" or "meta" (a declaration, which
+    /// can be wrong), or None when the page declared nothing. Without a
+    /// declaration `lang` is "unknown" rather than a guess from the script.
+    pub lang_source: Option<&'static str>,
+    /// Dominant writing script actually observed in the text, independent of
+    /// any declaration (drives tokenization: CJK, Devanagari, Latin).
+    pub script: Option<language::Script>,
     /// Detected language (BCP-47 code: "en", "zh", "ja", etc.).
     #[allow(dead_code)]
     pub lang: String,
@@ -417,6 +424,9 @@ pub fn extract(
             thin: false,
             content_kind: ContentKind::Page,
             lang: "unknown".to_string(),
+
+            lang_source: None,
+            script: None,
             quality: 0.0,
             pdf_pages: None,
             images: Vec::new(),
@@ -645,6 +655,9 @@ fn empty_pdf(url: &str, reason: &str) -> Extracted {
         thin: false,
         content_kind: ContentKind::Page,
         lang: "unknown".to_string(),
+
+        lang_source: None,
+        script: None,
         quality: 0.0,
         pdf_pages: None,
         images: Vec::new(),
@@ -873,6 +886,9 @@ fn downstream(
         thin,
         content_kind,
         lang: lang_info.code.clone(),
+
+        lang_source: lang_info.source,
+        script: Some(lang_info.script),
         quality,
         pdf_pages,
         images,

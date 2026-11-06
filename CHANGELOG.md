@@ -60,6 +60,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Lockfile: tokio 1.54.1 and zstd-sys 2.1.2 for RUSTSEC-2026-0386, -0391,
   -0398, -0403 and -0410.
+## [4.10.5] - 2026-11-03
+
+### Fixed
+
+- `donsetch stop` keeps live temporary browser profiles whose names include
+  a nonce and sequence, as well as the older PID-only names. Cleanup had
+  mistaken every current-format profile for a crash leftover (#397).
+- PDF word spacing uses glyph bounds including side bearings rather than
+  ink gaps, preserving numbers such as `15 %` and exact `must_contain`
+  matches. Ink bounds still drive layout and table geometry. Rotated PDF
+  text also keeps its reading direction through frame canonicalization (#399).
+- Fetch language metadata no longer identifies Latin text as English,
+  Cyrillic text as Russian, or Devanagari text as Hindi. `lang` is present
+  only for supported HTML declarations, with `lang_source`; observed writing
+  scripts use a separate `script` field. PDFs and API cards no longer claim
+  an unestablished language. Undeclared text retains script-aware tokenization
+  and accent folding without language-specific stemming (#398).
+- Google's browser search lane keeps one or two usable results instead of
+  discarding them as a captcha. Zero parsed results report `empty-parse`;
+  confirmed captcha failures retain `blocked:captcha`. The existing breadcrumb
+  URL limitations are documented and retained in v4 (#396).
+
+### Changed
+
+- Additions to the native featured BYOK search-provider list are paused.
+  Existing providers remain supported; new integrations can use the existing
+  search plugin interface.
+
+## [4.10.4] - 2026-10-31
+
+### Added
+
+- A README section on how MCP clients handle large results: where a client
+  stops returning a result inline and how much of it still reaches the model
+  after that, how to measure both for your client, a sample rule for the
+  agent's rules file, and thresholds measured on Claude Code 2.1.309 and
+  OpenCode 1.19.1.
+- Inline `style` attributes set bold and italic in fetched HTML:
+  `font-weight` of `bold`, `bolder` or 600 and up, and `font-style` of
+  `italic` or `oblique`, on inline elements such as `span`. An element's
+  own style overrides its tag, so the `<b style="font-weight: normal">`
+  wrapper around text pasted from Google Docs no longer makes the whole
+  paste bold. Stylesheets, classes and styles on block elements are not
+  read; `!important` follows CSS.
+
+### Fixed
+
+- `web_fetch` no longer drops `focus`, `section` or `toc` silently when the
+  response has no structure for them to act on: a plain-text, markdown or JSON
+  response, a sitemap, or a reddit or package API card. The body now leads
+  with a notice naming the skipped filters; for raw text it also gives the
+  Content-Type and the body size and points at curl/wget, `must_contain` and
+  `max_chars`. The result state carries `filters_skipped`, in batch results
+  too. The tool descriptions and README say these filters apply to HTML and
+  PDF only.
+- Nested bold and italic render as valid markdown: `<em><strong>x</strong></em>`
+  is `***x***` again, where a backslash on the bold marker left the text
+  italic between literal asterisks. A tag nested in its own kind
+  (`<em><em>`, `<strong><b>`) adds no second marker, which had turned
+  italic into bold. Adjacent runs of one kind merge, so `<b>foo</b><b>bar</b>`
+  is `**foobar**`, not four literal asterisks in a bold run. Whitespace at a
+  tag's edge moves outside the markers, so `<strong>Note: </strong>text` is
+  `**Note:** text`, not literal asterisks.
+- A space between two inline elements is kept: `<strong>foo</strong>
+  <em>bar</em>` and two links separated by a space no longer run their
+  words together. Whitespace at a link's edge moves outside its brackets
+  (`[Title](…) next`, not `[ Title ](…)next`), faithful reads keep the
+  space at an inline element's edge, and no stray space is left on either
+  side of a `<br>` (`a\nb`, not `a \n b`).
+- `web_search`'s Google ghost lane works again on Google's 2026 desktop
+  SERP: organic results are now wrapped in opaque `/goto?url=` redirects
+  whose payload is not a URL, so every result was dropped and a
+  challenge-free page came back as `blocked:captcha` with 0 hits. The lane
+  reads the breadcrumb each result displays instead, refuses a breadcrumb
+  Google shortened (`…`, `...`), and reports the hits (#393).
+
+## [4.10.3] - 2026-10-30
+
+### Added
+
+- `web_fetch` accepts `faithful: true` (CLI `--faithful`) for reading an HTML
+  article without dropping repeated paragraphs or short answers. It preserves
+  selected body text in source order, skips adapter rewrites and generated
+  summaries, and retains the existing pagination contract. `selector` and
+  `section` can narrow the body; reducing projections are rejected (#389).
+
+### Fixed
+
+- Xvfb stderr is drained throughout its lifetime into a bounded diagnostic
+  tail, so repeated xkbcomp warnings cannot fill its pipe and wedge the
+  browser tier. Startup probes the X11 protocol without needing `xdpyinfo`.
+  Stale recovery targets only the exact, same-user Xvfb display, escalates
+  from TERM to KILL, and refuses to rebind while either socket is occupied.
+  Wrapper scripts and neighboring display numbers are not matched (#391).
+- A fetch URL that looks like an array encoded inside one string gets an
+  actionable error: pass a real JSON array or one URL/handle. It is not
+  silently coerced, including when the string contains valid JSON (#390).
+
+### Changed
+
+- Update boring/boring-sys to 5.3.0, libc to 0.2.191, tokio to 1.53.3, psl
+  to 2.1.243 and rustls-native-certs to 0.8.5 (#384–388).
+- Upgrade zstd to 0.14.3, zstd-safe to 8.2.0 and zstd-sys to 2.1.2, resolving
+  RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403 and RUSTSEC-2026-0410.
+- V5 remains in private redesign; v4 maintenance continues while it develops.
 
 ## [4.10.2] - 2026-10-22
 

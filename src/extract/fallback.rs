@@ -73,6 +73,7 @@ pub fn text_fallback(
     // escalate to ghost. Only pages with >= 800 chars of real
     // visible text are non-thin : those are genuinely complex
     // DOMs where block extraction failed but text is real.
+    let lang_info = crate::extract::language::detect(&doc);
     Some(Extracted {
         markdown: slice,
         title: meta.title.clone(),
@@ -87,7 +88,9 @@ pub fn text_fallback(
         tokens_est,
         thin: total_text < FALLBACK_THIN_TEXT,
         content_kind: ContentKind::Page,
-        lang: "unknown".to_string(),
+        lang: lang_info.code.clone(),
+        lang_source: lang_info.source,
+        script: Some(lang_info.script),
         quality: 0.3, // lower quality than block-based extraction
         pdf_pages: None,
         images: Vec::new(),
