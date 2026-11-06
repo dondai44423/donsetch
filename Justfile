@@ -57,11 +57,16 @@
 budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
 feat := "--features ocr,rerank,http"
 
-# Storage guard: one implementation, three entry points (scripts/guard.sh).
-# Cargo never GCs stale artifacts; how the bloat actually regrew, and why
-# the previous fixed-profile-list guard went green while doing nothing, is
-# in the script header. Ceiling 80G; the floor under it is legitimate warm
-# artifacts (fast+ci deps, sccache's own 10G cap, receipts).
+# Storage guard: one implementation, four entry points (scripts/guard.sh):
+# `just guard`/`just all`/pre-push measure and reclaim at the ceiling,
+# `just clean-bloat` forces it, `just space` only measures, and every build
+# command in the repo prunes stale incremental variants on the way through
+# scripts/budget.sh — that last one is what stops the growth, because a
+# session that builds and never pushes never reaches the other three.
+# Ceiling 45G; the floor under it is the warm artifact set (fast ~15G,
+# ci ~4G, v5core ~4G, sccache <=10G, a 3-day incremental window ~8G).
+# How the bloat regrew, and why the previous fixed-profile-list guard went
+# green while doing nothing, is in the script header.
 guard:
 	@sh scripts/guard.sh
 
@@ -70,10 +75,12 @@ guard:
 clean-bloat:
 	@sh scripts/guard.sh --force
 
-# Instant size report: what each shell of target/ costs.
+# Instant size report: what each shell of the build tree costs, and how
+# much of the incremental caches is already reclaimable.
 space:
-	@du -shx target 2>/dev/null
+	@du -shx target v5core/target fuzz/target v5/proof/target 2>/dev/null || true
 	@du -shx target/*/ 2>/dev/null | sort -rh | head -8
+	@sh scripts/guard.sh --report
 
 # Pre-push net. Deliberately NOT the suite: CI is the full gate and runs
 # it on 5 platforms in parallel; a local full run only serializes it.

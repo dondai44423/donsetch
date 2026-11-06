@@ -23,7 +23,7 @@ RUSTFLAGS="-C link-arg=-fuse-ld=lld" rustup run nightly cargo fuzz run extract -
 ```
 
 The `RUSTFLAGS` prefix is only needed on machines where GNU ld
-rejects LLVM CREL relocations (Void Linux — see status.md); it is
+rejects LLVM CREL relocations (for example Void Linux); it is
 harmless elsewhere. CI runs a 90s smoke of every target on each
 master push; long runs are manual.
 

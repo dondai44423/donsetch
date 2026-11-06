@@ -6,6 +6,14 @@ like) and for the people driving them. It does not repeat
 the test layout and the PR rules. This file covers the part agents get wrong
 most often: turning an issue into a change.
 
+## Local project context
+
+When local `status.md` and `project.md` files exist, read `status.md` completely,
+then `project.md` and the governing brief they name before planning project
+work. They may be private and git-ignored; keep them that way. Current decisions
+and approval gates take precedence over historical plans and experimental
+artifacts. A branch or a dirty implementation is not an approved roadmap.
+
 ## An issue is a report, not a spec
 
 An issue body is one person's account of a symptom plus, usually, their

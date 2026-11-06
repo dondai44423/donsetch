@@ -146,17 +146,10 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## Architecture overview
 
-DonSeTch is built from scratch — no dependency on existing OSS web tooling:
-
-| Component | What it does | Key files |
-|---|---|---|
-| DonShadow | Tier 1 stealth HTTP fetch (BoringSSL TLS, own HTTP/1.1 + HTTP/2) | `src/fetch/`, `src/transport/` |
-| DonGhost | Tier 2 headless browser (CDP, no Runtime/Console/Debugger) | `src/ghost/` |
-| DonSift | HTML-to-markdown extraction engine (block model, BM25 focus) | `src/extract/` |
-| DonSeek | Keyless multi-engine search (RRF + BM25 + semantic reranking) | `src/search/` |
-| DonTread | Crawl engine (sitemap, frontier, Governor pacing) | `src/crawl/` |
-| DonSheet | PDF extraction (PDFium FFI, OCR arbitration, fusion) | `src/pdf/` |
-| MCP daemon | stdio server (JSON-RPC 2.0, MCP 2024-11-05+) | `src/mcp/` |
+The [README architecture map](README.md#-built-from-scratch) describes the
+released product. Experimental branches may have a different source layout;
+do not treat their implementation as a released feature or an approved plan.
+For local planning context, follow [AGENTS.md](AGENTS.md#local-project-context).
 
 ## Pull requests
 

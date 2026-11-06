@@ -2,6 +2,8 @@
 
 **The web, for AI agents.** Fetch, search, crawl and screenshot from one local binary. Zero API keys, zero accounts.
 
+**v5 beta:** a new fetch engine. No browser in the fetch path: a wall is answered by the right client identity, the site's own challenge program run in-process, or the site's own public interface.
+
 [![Release](https://img.shields.io/github/v/release/dondai44423/donsetch?color=00d4aa&style=flat-square)](https://github.com/dondai44423/donsetch/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/dondai44423/donsetch/ci.yml?label=CI&style=flat-square)](https://github.com/dondai44423/donsetch/actions/workflows/ci.yml)
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&style=flat-square&label=downloads)](https://www.npmjs.com/package/donsetch)
@@ -10,7 +12,7 @@
 
 ![DonSeTch, the web, for AI agents](https://raw.githubusercontent.com/dondai44423/donsetch/master/assets/herobanner.png)
 
-DonSeTch gives any AI agent full web research from a single local process: four tools, one Rust binary, no API keys, no accounts, nothing to configure. The transport is built from scratch (no hyper, no Playwright, no Selenium), which is why the fetch tier is fast *and* stealthy and the tool schema fits in ~2.4k tokens.
+DonSeTch gives any AI agent full web research from a single local process: four tools, one Rust binary, no API keys, no accounts, nothing to configure. Fetching launches no browser (no Playwright, no Selenium, no headless Chrome): pages are read as a real client reads them, at curl's cost, and all four tool schemas fit in ~2k tokens.
 
 Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a standalone CLI.
 
@@ -18,13 +20,12 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 
 | | What it does |
 |---|---|
-| **Real Chrome TLS** | Drives Chrome's own BoringSSL natively: your ClientHello IS Chrome's, ML-DSA signature algorithms included. Emergent from the real engine, not a faked table that rots. |
-| **Temporal stealth** | TLS session resumption, 304 revalidation, persistent cookies, connection pooling, TCP Fast Open. The loudest remaining bot tell, and nobody else fakes it. |
-| **Solve-and-bounce** | The browser solves the challenge and hands cookies to tier 1, which then fetches at full speed. The browser almost never fetches content. |
+| **Real clients, whole** | Eight client identities (Chrome on Linux, Windows and Android, Firefox, Safari, an Android app client, a plain client), each carrying one real profile's TLS, HTTP/2, header order and client hints, chosen per site. The Chrome identities match real Chrome's JA4 and HTTP/2 fingerprint exactly. |
+| **Challenges, in one process** | A wall that needs the page's own program gets it run in an embedded V8 against a small bounded host, and the credential it mints is spent by the same identity. AWS WAF passes cold in 2-5 s. No browser, no rendering. |
 | **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus plus local semantic reranking. No keys, $0 forever. BYOK is optional. |
 | **Pixel-fusion PDF** | Glyphs and rendered pixels come from the same stream and are fused deterministically, with a per-region trust audit. Scanned PDFs auto-OCR. |
-| **Token control** | MCP results use compact, unguessable link and search handles; one-shot CLI search prints reusable URLs. `focus`, `toc`, `section`, `must_contain` and `since_last` cut a page to what the agent actually needs. |
-| **Self-improving fetch** | Cookie lifetimes adapt, walls that beat a real browser twice go into cooldown, searches pre-solve known walls. All local state, receipts in `status` and `doctor --improve`. |
+| **Read only what you need** | `must_contain` answers "is X on this page?" per term with counts, sections and excerpts in a few hundred characters; `focus` returns the passages that answer, best first; `toc` then `section` reads one part. Every view searches the whole page, PDFs and site adapters included. |
+| **Self-improving fetch** | Remembers which identity each site accepts, what each bot-wall vendor lets through, which route answered and how far each site's cache headers can be trusted. Hard-corpus first-try content: 13/28 cold, 26/28 learned. All local state, receipts in `status` and `doctor --improve`. |
 | **One command to verify** | `donsetch doctor` sweeps config, search health, egress, TLS, browser, DNS, secret permissions, and fixes what is mechanically fixable. |
 
 ## Install
@@ -87,7 +88,7 @@ Every client gets the `[meta]` fold by default: compact state and source evidenc
 ### 2. As a CLI (for humans and scripts)
 
 ```bash
-donsetch fetch https://example.com --focus "pricing"
+donsetch fetch https://example.com/pricing --must-contain "free tier"
 donsetch search "rust async patterns" --intent code
 donsetch crawl https://docs.python.org --mode map --topic asyncio
 donsetch screenshot https://example.com --out page.png
@@ -99,10 +100,10 @@ donsetch update
 
 | Tool | What it does |
 |---|---|
-| `web_fetch` | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes. |
+| `web_fetch` | Any URL as clean markdown, or only the part that answers: `must_contain` probes, `focus` passages, `toc` → `section`. Walls answered in-process, never by a browser. PDFs with OCR and per-page confidence, site adapters, page memory, batches of up to 12. |
 | `web_search` | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | `web_crawl` | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
-| `web_screenshot` | Rendered PNG of any URL through the same browser tier, with the usual URL safety guards. |
+| `web_screenshot` | Rendered PNG of any URL through DonSeTch's browser (used only for screenshots and login), with the usual URL safety guards. |
 
 MCP results default to self-contained text: leading `[meta]` JSON followed by source evidence, including for unknown client bridges. PNGs remain image blocks.
 
@@ -113,8 +114,8 @@ Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `d
 - **Search without keys.** Six keyless engines across four independent index families plus eight official verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv, StackExchange, MDN, Google News), merged by consensus and re-ranked locally by an ONNX cross-encoder. 95.5% answer-in-snippet over 110 questions across 11 niches with no keys at all.
 - **PDFs done properly.** A custom PDFium FFI, no Python subprocess. Tables and borders come from the rendered bitmap, text from the glyph stream, and the trust audit flags exactly the regions that need OCR.
 - **Crawl with manners.** Per-host adaptive pacing that honors `Retry-After` and robots `Crawl-delay`, cross-process politeness so two crawls do not double a site's rate, near-duplicate detection, resume tokens that survive restarts, and honest stop reasons.
-- **Fetch that answers honestly.** `content_ok`, `thin`, `changed` with section diffs, `decoy suspected` instead of silently passing a cloaked page. No fake success.
-- **Login to walled sites.** `donsetch login x.com` opens YOUR browser, you sign in, and the session cookies land in the 0600 vault that tier-1 fetches and tier-2 renders already replay. Credentials never enter DonSeTch.
+- **Fetch that answers honestly.** `content_ok`, `thin`, `changed` with section diffs, and `must_contain` says `unverified` instead of a false "not found" when part of a page was unread. No fake success.
+- **Walls named, not guessed.** A bot wall names its vendor and what it asks for; a login wall is a declared `wall.auth` (fetch carries no session in v5; session support is planned).
 - **Works everywhere.** Linux, macOS, Windows. npm, Homebrew, the Pi agent as a native extension, and the DeepSeek Harness as a first-class plugin.
 
 ## Sponsors

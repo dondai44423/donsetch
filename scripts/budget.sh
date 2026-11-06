@@ -33,6 +33,19 @@
 # Both are escapes for a known-idle box, not the default.
 set -eu
 
+# DISK citizenship, same choke point as the CPU cap below: every build, test
+# and fuzz command in this repo comes through this script, so this is where
+# the tree's disk growth is bounded. Cargo never garbage-collects target/:
+# incremental variants accrete one per dep-graph hash change and the dead
+# ones stay forever (measured 2026-10-30: 499 variants, 42G, 370 of them >3
+# days old). guard.sh owns the policy and is age-gated, so it can never
+# delete the variant a build is using right now; ~20ms, and a failure here
+# never fails the build.
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -f "$root/scripts/guard.sh" ]; then
+    sh "$root/scripts/guard.sh" --prune-stale || true
+fi
+
 nproc_now=$(nproc 2>/dev/null || echo 4)
 core_jobs=$(( (nproc_now + 3) / 4 ))
 

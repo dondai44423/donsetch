@@ -3,7 +3,7 @@
 # DonSeTch
 
 **The web, for AI agents.**
-**V5 on works (Update stalled for 3-5 days): major change incoming**
+**v5 beta:** a new fetch engine. No browser in the fetch path: a wall is answered by the right client identity, the site's own challenge program run in-process, or the site's own public interface. [What changed](CHANGELOG.md).
 <div align="center">
 <a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="dondai44423%2Fdonsetch | Trendshift" width="250" height="55"/></a>
 </div>
@@ -14,12 +14,12 @@
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/license-AGPL%203.0-2563eb)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1%2C300%2B%20passing-00d4aa)](.github/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-1%2C900%2B%20passing-00d4aa)](.github/workflows/ci.yml)
 [![npm](https://img.shields.io/badge/npm-donsetch-cb3837?logo=npm)](https://www.npmjs.com/package/donsetch)
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
 
-[Why](#-why-its-different) · [Demo](#-demo) · [Sponsors](#-our-sponsors) · [Install](#-install) · [Quickstart](#-quickstart) · [The 4 tools](#-the-4-tools) · [Fetch](#-fetch) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Stealth](#-stealth-chrome-tls-not-chrome-like) · [Compare](#-how-it-compares) · [Limits](#-gotchas--honest-limits) · [CLI](#-cli)
+[Why](#-why-its-different) · [Demo](#-demo) · [Sponsors](#-our-sponsors) · [Install](#-install) · [Quickstart](#-quickstart) · [The 4 tools](#-the-4-tools) · [Fetch](#-fetch) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Stealth](#-stealth-real-clients-not-chrome-like) · [Compare](#-how-it-compares) · [Limits](#-gotchas--honest-limits) · [CLI](#-cli)
 
 </div>
 
@@ -27,7 +27,7 @@
 
 <img src="assets/herobanner.png" alt="DonSeTch, the web, for AI agents" width="100%">
 
-DonSeTch gives any AI agent full web research from a single local process: fetch, search, crawl, screenshot. Four tools, zero API keys, zero accounts, Rust, one binary. The transport is built from scratch (no hyper, no Playwright, no Selenium), so fetching is fast *and* stealthy, and the tool surface stays small enough to fit an agent's context.
+DonSeTch gives any AI agent full web research from a single local process: fetch, search, crawl, screenshot. Four tools, zero API keys, zero accounts, Rust, one binary. Fetching launches no browser (no Playwright, no Selenium, no headless Chrome): pages are read as a real client would read them, at curl's cost, and the tool surface stays small enough to fit an agent's context.
 
 Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a standalone CLI.
 
@@ -43,15 +43,15 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 
 | | What it does |
 |---|---|
-| 🛡️ **Real Chrome TLS** | Drives Chrome's own BoringSSL natively. Your ClientHello IS Chrome's ClientHello, ML-DSA signature algorithms included. Emergent from the real engine, not a faked table that rots. |
-| ⏱️ **Temporal stealth** | TLS session resumption, conditional revalidation (304), persistent cookies, connection pooling, TCP Fast Open. The loudest remaining bot tell, and nobody else fakes it. |
-| 🧪 **In-engine challenge handling** | Challenge and JS pages run their scripts in the fetch process; clearance cookies land in the same session and the fetch continues at full speed. |
-| 🧠 **Self-improving fetch** | Learns from every fetch: cookie lifetimes adapt, walls that beat a real browser twice go into cooldown, searches pre-solve known walls. Receipts in `status` and `doctor --improve`. |
+| 🛡️ **Real clients, whole** | Eight client identities: Chrome (Linux, Windows, Android), Firefox, Safari, an Android app (OkHttp) and a plain client. Each carries one real profile's TLS, HTTP/2 settings, header order and client hints as a whole. The Chrome identities match real Chrome's JA4 and Akamai HTTP/2 fingerprint exactly. Chosen per site, never patched per field. |
+| ⚙️ **Challenges, in one process** | When a wall needs the page's own program, it runs in an embedded V8 against a small, bounded host, on the same identity, and the credential it mints is spent by that identity. AWS WAF passes cold in 2-5 s. No browser, no layout, no rendering. |
+| 🧠 **Self-improving fetch** | Remembers which identity each site accepts, what each bot-wall vendor lets through, which route answered, and how far each site's cache headers can be trusted. Measured: first-try content on a hard corpus went from 13/28 to 26/28 once learned, with 40% fewer requests. |
+| 🎯 **Read only what you need** | `must_contain` answers "is X on this page?" per term with counts, sections and excerpts, in a few hundred characters. `focus` returns the passages that answer a question, best first. `toc` then `section` reads one part. Every view searches the whole page, PDFs and site adapters included. |
+| 🧾 **Honest outcomes** | Every read says what it is: content, or a wall with its vendor and what it asks for (a login, a human, a program). A probe on a partly read page says `unverified`, never a false "not found". |
 | 🔑 **Keyless search** | 10+ backends in parallel, fused by cross-engine consensus plus local semantic reranking. No keys, $0 forever. BYOK optional. |
 | 📄 **Pixel-fusion PDF** | Glyphs and rendered pixels come from the same content stream and are fused deterministically, with a per-region trust audit. Scanned PDFs auto-OCR. |
-| 🧬 **Built from scratch** | Own HTTP/2 (HPACK, flow control, priority), own extraction engine, own PDF parser, own search aggregator, own crawl engine. |
-| 🔗 **Token control** | MCP results use compact, unguessable link and search handles; one-shot CLI search prints reusable URLs. `focus`, `toc`, `section`, `must_contain` and `since_last` each cut a page down to what the agent actually needs. |
-| 🪶 **~2.4k tool schema** | All four tools: 2,369 tokens (`o200k_base`, compact `tools/list` JSON). |
+| 🧬 **Built from scratch** | Own fetch engine, extraction engine, PDF parser, search aggregator and crawl engine. |
+| 🪶 **~2k tool schema** | All four tools: 2,042 tokens (`o200k_base`, compact `tools/list` JSON). |
 | 🩺 **`doctor`** | One command sweeps config, search health, egress, TLS, browser, DNS, captive portal, secret-store permissions, and fixes what is mechanically fixable. |
 
 ## 🎬 Demo
@@ -75,10 +75,6 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 ## 💛 Our Sponsors
 
 <div align="center">
-
-<a href="https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH"><img src="assets/sponsors/sidrune-ai-partner-banner.png" alt="Sidrune AI: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through the DonSeTch partner link." width="100%"></a>
-
-**Sidrune AI**: one API for GPT, Claude, and other leading AI models. Sign up and get $3 in API credit through [this link](https://fluxionai.space/register?source=github&campaign=github-sidrune-donsetch&promo=SDRDONSETCH).
 
 <a href="https://proxy-seller.com/"><img src="assets/sponsors/proxy-seller-banner.png" alt="Proxy-Seller: private residential, mobile, ISP and datacenter proxies with HTTP(S) and SOCKS5 support. Promo code DON15 for 15% off." width="100%"></a>
 
@@ -141,7 +137,7 @@ Homebrew and dsh auto-track published releases.
 **Verify the install:**
 
 ```bash
-donsetch doctor          # grouped health checks, including a real browser launch
+donsetch doctor          # grouped health checks, including a browser launch for screenshots
 donsetch doctor --deep   # adds live egress, provider and captive-portal probes
 donsetch doctor --fix    # repairs mechanical problems automatically
 donsetch doctor --json   # appends machine-readable check results
@@ -176,13 +172,15 @@ donsetch doctor --mcp    # detects clients and prints absolute-path registration
 | **Clang** | bindgen | `apt install clang libclang-dev` | bundled | `choco install llvm` |
 | **LLD** | PDFium link (aarch64) | `apt install lld` | not needed | not needed |
 
+The challenge engine embeds V8 through `deno_core`. The build downloads a prebuilt V8 static library for your target; on an offline box, point `RUSTY_V8_ARCHIVE` at a downloaded copy.
+
 ```bash
 git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
 cargo build --release --features ocr,rerank,http
 ```
 
-First build compiles BoringSSL (~2 min), cached after. Chromium is optional (screenshots and actions only): DonSeTch auto-discovers system Chromium, Playwright's cached builds, or Edge on Windows.
+First build compiles BoringSSL and links V8 (a few minutes), cached after. Chromium is optional and never fetches pages: it serves `web_screenshot` and `donsetch login`. DonSeTch auto-discovers system Chromium, Playwright's cached builds, or Edge on Windows.
 
 On Ubuntu 22.04 and anything with bfd 2.38, link with lld: bfd cannot parse the `.crel` relocations rustc 1.86+ emits for aarch64, and the default link dies with "unknown architecture".
 
@@ -200,7 +198,7 @@ The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built 
 <details>
 <summary><b>Selectable browser backend</b></summary>
 
-Chromium is the default: headful on Xvfb/off-screen when a display exists, `--headless=new` only when none does. CloakBrowser is used only when explicitly selected, a bare `CLOAKBROWSER_BINARY_PATH` never switches it.
+The browser serves screenshots and `donsetch login`, never page reads. Chromium is the default: headful on Xvfb/off-screen when a display exists, `--headless=new` only when none does. CloakBrowser is used only when explicitly selected, a bare `CLOAKBROWSER_BINARY_PATH` never switches it.
 
 ```bash
 DONSETCH_BROWSER_BACKEND=chromium donsetch doctor             # default backend
@@ -209,7 +207,7 @@ DONSETCH_BROWSER_BACKEND=cloakbrowser \
   CLOAKBROWSER_BINARY_PATH=/path/to/chrome donsetch doctor --deep
 ```
 
-You do not have to install CloakBrowser yourself: with auto-download on, DonSeTch fetches the pinned release from GitHub the first time the cloak backend is needed (a screenshot or actions run, or `doctor`), unpacks it into its cache and reuses it from then on.
+You do not have to install CloakBrowser yourself: with auto-download on, DonSeTch fetches the pinned release from GitHub the first time the cloak backend is needed (a screenshot, a login or `doctor`), unpacks it into its cache and reuses it from then on.
 
 ```toml
 [browser]
@@ -245,7 +243,8 @@ HTTP transport instead of stdio: `donsetch mcp --http --port 8765`, clients conn
 **CLI (for humans and scripts).** Same engine, thin adapter:
 
 ```bash
-donsetch fetch https://example.com --focus "pricing"
+donsetch fetch https://example.com/pricing --must-contain "free tier" --must-contain '/\$\d+/'
+donsetch fetch https://docs.python.org/3/library/asyncio-task.html --focus "cancel a task"
 donsetch search "rust async patterns" --intent code
 donsetch crawl https://docs.python.org --mode map --topic asyncio
 ```
@@ -290,7 +289,7 @@ require compatibility folding after their MCP handshake.
 
 | Tool | What it does |
 |---|---|
-| 🌐 **`web_fetch`** | Any URL as clean markdown. HTTP first, escalates to a headless browser on bot walls. PDFs with OCR and per-page confidence, `focus` / `toc` / `section`, pagination, `actions` for in-page control, `must_contain` probes. |
+| 🌐 **`web_fetch`** | Any URL as clean markdown, or only the part that answers: `must_contain` probes, `focus` passages, `toc` → `section`. Walls answered in-process, never by a browser. PDFs with OCR and per-page confidence, site adapters, page memory, batches of up to 12. |
 | 🔎 **`web_search`** | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | 🕷️ **`web_crawl`** | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
 | 📸 **`web_screenshot`** | Rendered PNG of any URL through DonSeTch's browser. URL goes through the usual safety guards. CLI twin: `donsetch screenshot URL [--out PATH]`. |
@@ -299,99 +298,84 @@ Tool schemas: `donsetch tools` (same JSON as MCP `tools/list`). Every failure is
 
 ## 🌐 Fetch
 
-Plain HTTP first, ~100-300ms. Wall or JS shell detected, auto-escalate to the ghost browser, solve, bounce the cookies back, refetch at full speed.
+One request, as a real client, at curl's cost: about half a second median on defended corpora, 47 ms on a trivial origin (curl: 46 ms). No browser is launched to read a page. When a site walls the request, DonSeTch answers the wall the way the site asks, and when nothing passes it says which wall it met instead of returning a guess.
 
-**DonSift extraction**: HTML bytes in, agent-native markdown out. Typed blocks (heading, paragraph, list, table, code, quote, media) with heading breadcrumbs.
+**How a read goes:**
 
-- **`focus`**: BM25-relevant passages with heading context. Scores use each passage's own text; a repeated page title or common subject cannot make every paragraph relevant. Tables keep selected rows with their headers and complete cells; unordered lists keep selected items with their nested conditions. Omitted blocks, rows and items are counted. Lexical hits stay fast; no match or less than 20% saving returns full content with a notice. 12-language BM25: CJK unigrams and bigrams, stopword lists, stemming, accent folding.
-- **`selector`**: extract only matching HTML subtrees. A miss returns `selector.nomatch` with the inspected element count; invalid syntax returns `selector.invalid`. Non-HTML responses cannot satisfy a CSS scope.
-- **`toc` + `section`**: see the outline first, then target one section. Two cheap calls instead of one expensive one.
-- **Token policy**: links stripped by default (~30% off), link farms and wiki junk dropped, duplicates suppressed.
-- **Classification**: `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page`, a 0-1 quality score, and inline trust signals (focus-miss, JS-shell warning, empty content).
-- **Page memory**: every fetch is fingerprinted, so a re-fetch reports `changed` with section-level diffs, and `since_last=true` collapses a re-check to one line (~30 tokens).
-- **`must_contain`**: verifies a claim against the full page but returns MATCH/NO-MATCH plus up to 3 excerpts (~60 tokens instead of 4k).
-- **`stitch=true`**: collects up to six same-host parts within 1 MiB. Output obeys `max_chars`; `next_offset` resumes collected text and `next_part` identifies an unfinished part.
-- **Read budgets**: `mode=scan` / `read` / `deep` set 800 / 4000 / 16000 extracted bytes; explicit `max_chars` wins. The source title/URL header and structured metadata sit outside this body budget. `read_status` and `content_complete` distinguish partial output from a complete read. Reddit subsets expose `partial` and known item counts.
-- **`deadline_ms` everywhere**: real MCP cancellation, progress notifications, ms cost footer. Nothing can silently hang.
-- **API/JSON endpoints**: `.json` URLs and JSON responses are terminal at the local fetch; a browser pass cannot improve a structured payload.
-- **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites get restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable.
+1. **Cache.** A stored copy is served only as far as it has been earned: a repeat read sends the conditional request Chrome sends, and the server's 304 is the proof. A page is served from its declared lifetime (capped at 60 s) only after the last check found it unchanged; a site whose validators lie is distrusted for a week.
+2. **Spend.** One request as the identity this site accepted before, with that identity's own cookies, paced per site.
+3. **Classify.** Content, or a wall named by its vendor (Cloudflare, AWS WAF, DataDome, PerimeterX, Akamai) and its ask: a different client, the page's program, a human, or a login. Vendors are read from their own headers before any body.
+4. **Answer the wall.** Move to the identities that vendor has let through; follow a native hand-off (Akamai's `bm-verify`); run the page's challenge program in-process ([below](#-challenges-in-one-process)); or ask the site's own public interface (Reddit's feed, the Stack Exchange API, crates.io's API and others), which comes back as `transport: data`.
+5. **Remember.** The identity that answered, the vendor's verdict, the route and the cookies persist, so the next read of that site starts in the right place ([self-improving fetch](#-self-improving-fetch)).
 
-`read_status` describes the returned projection: `content` has no remaining
-rendered bytes, `partial` has withheld bytes or a source subset, `probe` is a
-MATCH/NO-MATCH answer, `unchanged` is a history comparison, and `thin` is a
-suspected shell. Failures use `walled`, `notfound`, or `error`. Always pair it
-with `content_complete`: a projection can be exhausted while the source is
-incomplete. `next_offset` is a byte offset into collected markdown, not a page
-number. `links` and `media` share the rendered markdown budget, including their
-markup; `budget_scope` makes that accounting explicit.
+Measured from a home IP, cold, on a hard corpus of 28 defended sites × 2 rounds: **42/56 content through DonSeTch, 22/56 for curl.**
 
-For parallel reads, pass an array to `web_fetch`: successful siblings remain
-available beside individual error rows. Classified failures return normally
-with `ok:false`, `code`, and `next_action`; protocol errors remain JSON-RPC
-errors. Inspect each result before using its evidence.
+### Read only what you need
 
-`shot` always returns a receipt (`requested`, `saved_to`, `reason`), including
-when no captcha capture was needed. `web_screenshot` returns the inline PNG
-and a private local `path` containing the same bytes; remote clients should
-use the inline image because the path belongs to the server host.
+Every view is computed over the whole extracted page (up to 8 MiB), whatever the source: HTML, PDF, a site adapter, a feed or plain text. Only the view is returned.
 
-**Wall time and freshness (observed).** Plain HTTP reads 0.3-2s; search
-0.7-2.9s; guards are instant (an SSRF block ~13ms, a solve-cooldown
-refusal ~33ms); auth-wall refusals 11-14s; a browser escalation 17-31s;
-an interactive-captcha give-up 41-42s (the suite worst case). Dead URLs return the live failure directly; automatic archive recovery has
-been removed. A readable URL path may supply a `suggested_query` for locating
-a moved copy; query parameters and fragments are excluded. Repeat calls
-are cache-backed: a repeated search returned in ~10ms against ~5.0s
-cold, a re-fetched page 1.5s against ~11.9s cold. `changed` and
-`since_last` verdicts compare stored history, not a live revalidation:
-fast and fresh are different axes.
+| Option | What comes back |
+|---|---|
+| `must_contain` | Is it on the page? One term or up to 8: a phrase (case, spacing, quote and dash style and markdown emphasis ignored) or a `/regex/`. Per term: `found ×count`, the sections it occurs in and short excerpts, or `not found` with a near-miss hint ("its words all appear in §s4, not as one phrase"). Verdict `match`, `partial`, `no_match`, or `unverified` when part of the page was not read, so absence is never claimed without proof. With `section`, it searches only that part. |
+| `focus` | The passages that answer a question, best first, each under its section path (`§s21 · Syntax and features › Ownership and references › Lifetimes`): paragraphs, list items, table rows with their header row, code. Names the query words the page does not contain. A miss returns the outline, never the whole page. 12-language BM25: CJK unigrams and bigrams, stopwords, stemming, accent folding. |
+| `toc` | The heading outline with `sN` ids and sizes, no body. |
+| `section` | One part by `sN` id or heading text, subsections included. A miss returns the outline. |
+| `max_chars`, `offset` | Length cap (16,000 by default; the batch total for a URL array, 48,000 by default). A cut-off response carries `next_offset`; a paginated article names its next part as `next_page`. |
+| `since_last` | Re-check against your previous read: one `unchanged` line, or only the changed sections. |
+| `links` | Keep links as compact `[text](L-handle)` references; pass a handle as `url` to follow it. Off by default (~30% fewer tokens). |
+| `image_text` | OCR the first four content images into an `image text` section that every view searches. |
+| `deadline_ms` | Hard time limit: a deadline error on expiry, never a hang. Real MCP cancellation and progress notifications. |
 
-**A worked reading ladder** (approximate costs): search, then `toc`
-(~170 tokens for the outline), then `section` on the right part (~840
-tokens, a complete read), or `must_contain` for a yes/no (~70 tokens).
-`focus` is a convenience reducer; `toc` -> `section` is the guaranteed
-one. Truncated output resumes with `next_offset` (same URL, offset
-verbatim); a stopped crawl resumes with `resume` alone.
+```text
+$ donsetch fetch https://doc.rust-lang.org/std/vec/struct.Vec.html --must-contain with_capacity --must-contain amortized
+# Vec in std::vec - Rust
+https://doc.rust-lang.org/std/vec/struct.Vec.html
 
-Stack Overflow question reads use the public question API with answers and
-comments. Empty, failed or incompatible API responses retain the website
-fallback; service-declared backoff is honored. Deleted/private questions and
-login-only dashboards require their own access. Fetch keeps its direct-IP
-default even with a configured proxy pool; search and crawl retain their pool
-routing.
+must_contain: MATCH 2/2
++ "with_capacity" ×27 in §s3, §s6, §s7, §s12, §s14, §s15, +17 more
+  …]); // The following is equivalent, but potentially slower: let mut vec = Vec::with_capacity(5); vec.resize(5, 0); assert_eq!(vec, [0, 0, 0, 0, 0]); ``` For more informati…
+  …reallocate, which can be slow. For this reason, it is recommended to use `Vec::with_capacity` whenever possible to specify how big the vector is expected to get. ## §Guara…
++ "amortized" ×4 in §s7, §s37, §s41, §s607
+  …nstant growth factor. Whatever strategy is used will of course guarantee *O*(1) amortized `push`. It is guaranteed, in order to respect the intentions of the programmer…
+  …2]; vec.push(3); assert_eq!(vec, [1, 2, 3]); ``` ##### §Time complexity Takes amortized *O*(1) time. If the vector’s length would exceed its capacity after the push, *…
+```
 
-Crawl caps apply to each page's rendered markdown and the aggregate page
-content. Headers and inventory metadata are separate. A capped page carries
-`next_offset` and `content_complete: false`; it never becomes a full-content
-history baseline. Full crawl output summarizes the unfetched inventory;
-structured `map` retains the URLs. Map mode reports `mode: "map"`, `discovered`,
-and `InventoryComplete` when finished, without an empty content-page array.
-Map is sitemap-backed when the site has one; without a sitemap it falls
-back to the seed page's links.
-Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
+**A reading ladder** (approximate costs): search, then `must_contain` for a yes/no with evidence (100-250 tokens), `focus` for the answer (a few hundred to a few thousand), or `toc` (a few hundred) then `section` for a complete read of one part. The page itself is the last resort. Contradictory options (`must_contain` with `focus`, `toc` with `focus`, `since_last` with a view) are refused before anything is fetched, with a `fetch.args` error that says why.
 
-Search reports `requested_results`, `returned_results`, and `underfilled`
-when engines cannot supply the requested count. `weak` considers lexical
-query coverage as well as engine agreement; it is a retrieval warning, not a
-fact-check. `source_type` identifies video, community, paper, reference,
-publisher, official, institutional, and general web sources from known hosts.
-It does not certify a page's claims or assign trust to lookalike domains.
+**Extraction (DonSift)**: HTML bytes in, agent-native markdown out. Typed blocks with heading breadcrumbs; link farms, wiki junk and duplicates dropped; links off unless asked for. Pages are classified `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page` with a 0-1 quality score.
 
-The diagnostic domain-profile route `cold` means ordinary HTTP without verified bot-wall clearance cookies. Repeated successful reads can stay on that route while reusing connections; it does not mean transport caching or learning failed.
+- **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites are restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable. Every view applies to them.
+- **Page memory**: every read is fingerprinted, so a re-read reports `changed` with section-level diffs, and `since_last` collapses a re-check to one line (~30 tokens).
+- **API/JSON endpoints**: `.json` URLs and JSON responses come back as structured data.
+- **Batches**: pass up to 12 URLs; they are read in parallel with the same view, and successful siblings stay available beside individual error rows.
 
-**Optional unlocker (opt-in).** When a local fetch hits a hard wall, it falls back to Bright Data Web Unlocker once, if a key is configured (`donsetch keys add unlocker "<token>::<Web Unlocker zone>"`). It returns HTML into the normal extraction pipeline; a challenge or empty shell remains a failed fetch. Failures carry recovery guidance on the escalation trace. `donsetch doctor --deep` checks token access, zone name and product type for free; tokens without account-zone read permission report an unverified check. Successful responses are cached locally (URL and render-mode keyed, sliding 6h TTL, 200 entries); concurrent calls within one daemon share the cache. The daily cap counts every API attempt, including retries, and the whole operation shares one timeout. A timed-out paid request is not replayed automatically. Settings live in `[bypass]`: `donsetch config show`. See the [setup guide](docs/brightdata.md). DonSeTch works without it.
+`read_status` names what was returned: `content` (the whole page), `partial` (cut off, or a known subset), `probe` (a `must_contain` answer), `focus`, `section`, `outline`, `unchanged`, or `thin` (a suspected empty shell). Failures use `walled`, `notfound` or `error`. `content_complete` says whether you have the whole page. `next_offset` is a character offset into the rendered markdown, not a page number.
+
+**Walls are answers, not errors to retry.** A wall comes back fast with its kind: `wall.challenge` (naming the vendor), `wall.captcha`, `wall.auth` (a login: fetch carries no session), `wall.paywall`, `wall.blocked`, `wall.empty_shell`, with a `next_action` line. Classified failures return normally with `ok:false`; protocol errors remain JSON-RPC errors.
+
+**Time and freshness (observed).** Median read 0.5-0.6 s on defended corpora; an AWS WAF first contact 2-5 s, then cookie-carried; guards are instant. Dead URLs return the live failure directly; a readable URL path may supply a `suggested_query` for locating a moved copy. `changed` and `since_last` compare stored history: they are not a live revalidation.
+
+Stack Overflow question reads use the public question API with answers and comments; an empty, failed or incompatible API response falls back to the website, and service-declared backoff is honored. Fetch keeps its direct-IP default even with a configured proxy pool; search and crawl keep their pool routing.
+
+`web_screenshot` returns the inline PNG and a private local `path` containing the same bytes; remote clients should use the inline image because the path belongs to the server host.
+
+**Optional unlocker (opt-in).** When a local fetch hits a hard wall, it falls back to Bright Data Web Unlocker once, if a key is configured (`donsetch keys add unlocker "<token>::<Web Unlocker zone>"`). It returns HTML into the normal extraction pipeline; a challenge or empty shell remains a failed fetch. `donsetch doctor --deep` checks token access, zone name and product type for free. Successful responses are cached locally (URL and render-mode keyed, sliding 6h TTL, 200 entries). The daily cap counts every API attempt, including retries, and a timed-out paid request is not replayed automatically. Settings live in `[bypass]`: `donsetch config show`. See the [setup guide](docs/brightdata.md). DonSeTch works without it.
 
 <details>
-<summary><b>Anti-bot results (headless tier)</b></summary>
+<summary><b>Walls, measured (home IP, 2026-11)</b></summary>
 
-| Site | Protection | Status |
+| Protection | Sites | Result |
 |---|---|---|
-| Cloudflare-protected sites | interstitial | ✅ 200 OK |
-| DataDome sites | DataDome | ✅ 200 OK |
-| Stack Overflow | Cloudflare | Public questions use the keyless API first; HTML remains a fallback |
-| Medium | Cloudflare | Challenge-dependent; unresolved walls are reported honestly |
-| Reddit | bot detection | ✅ 200 OK |
-| Interactive captchas | hCaptcha / reCAPTCHA / Turnstile | ⛔ honest block without a key (with an unlocker key: ✅) |
+| AWS WAF, all three shapes | IMDb, Booking, Trustpilot | ✅ the challenge program runs in-process, cold 2-5 s, then cookie-carried |
+| Akamai Bot Manager | Amazon | ✅ native `bm-verify` hand-off, ~1.5 s first contact |
+| Cloudflare managed challenge | Glassdoor, Indeed, npm, Medium, Product Hunt | ✅ content through the identity Cloudflare lets through; the challenge program itself runs but does not pass yet |
+| App shells and walled documents | Reddit, Stack Overflow, crates.io, 4chan, Twitch, NYT, WSJ | ✅ the site's own feed or API (`transport: data`) |
+| PerimeterX press-and-hold | Bloomberg, Zillow | ⚠️ passes intermittently by identity, otherwise declared |
+| DataDome captcha | Etsy, Yelp | ⛔ declared: it asks a human |
+| Interactive captchas | hCaptcha / reCAPTCHA / Turnstile | ⛔ declared without a key (with an unlocker key: ✅) |
+| Login walls | x.com, gated docs | ⛔ declared as `wall.auth`: fetch carries no session yet |
+
+From a datacenter IP (what a VPS user has) the same corpus answers about half as often: the egress class decides many walls, which is why `donsetch proxy` exists.
 
 </details>
 
@@ -418,6 +402,16 @@ Same-domain, best-first. Two phases: sitemap discovery (cheap URL inventory), th
 - **Honest stop reasons**: `FrontierEmpty`, `MaxPages`, `CharBudget`, `DepthLimit`, `Deadline`, `ThrottledOut`, `Cancelled`, `InventoryLimit`. A drained frontier is complete only when the requested evidence was obtained without failures or excluded pages.
 - **Cross-process politeness**: one host-pace store shared by every crawler on the box, so two runs against one site do not double the rate.
 
+Crawl caps apply to each page's rendered markdown and the aggregate page
+content. Headers and inventory metadata are separate. A capped page carries
+`next_offset` and `content_complete: false`; it never becomes a full-content
+history baseline. Full crawl output summarizes the unfetched inventory;
+structured `map` retains the URLs. Map mode reports `mode: "map"`, `discovered`,
+and `InventoryComplete` when finished, without an empty content-page array.
+Map is sitemap-backed when the site has one; without a sitemap it falls
+back to the seed page's links.
+Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
+
 <div align="center">
 
 <img src="assets/crawl.png" alt="DonSeTch Crawl">
@@ -435,10 +429,17 @@ No API key, no account. Six keyless engines across four independent index famili
 - **Learned engine health**: per-engine trust EWMAs and chronic-failure quarantine survive restarts, so dead engines get benched instead of burning fan-out slots on every query.
 - **Entity coverage**: anchor entities (B-tree, version numbers, years) are checked against results. Wrong entity, 0.3x.
 - **Honest reporting**: `weak=true` means low consensus, per-engine status is always visible, and there is no fake "no results".
-- **Warm handoff**: search pre-fetches the top results, so the next MCP fetch serves from cache in ~3ms. It also pre-solves: if the top result's domain is a known wall, a bounded background solve starts while the agent reads.
+- **Warm handoff**: search pre-fetches the top results, so the next MCP fetch serves from cache in ~3ms.
 - **Query compiler**: `site:`, `filetype:` and `intitle:` are sent only to engines that honor them, and SERP instant answers are extracted with their source URLs.
 
 Keyless quality, 110 questions across 11 niches with no keys: **95.5%** answer-in-snippet against Tavily's published 93.3% (LLM-graded). Reproduce with `python3 bench/search_quality.py --verbose`; methodology and per-niche numbers live in the script. Search-quality caching for the bench lives in `~/.cache/donsetch/bench-search/`, delete it when comparing binaries.
+
+Search reports `requested_results`, `returned_results`, and `underfilled`
+when engines cannot supply the requested count. `weak` considers lexical
+query coverage as well as engine agreement; it is a retrieval warning, not a
+fact-check. `source_type` identifies video, community, paper, reference,
+publisher, official, institutional, and general web sources from known hosts.
+It does not certify a page's claims or assign trust to lookalike domains.
 
 ### BYOK, optional and never required
 
@@ -525,122 +526,85 @@ Tier B, lazy: OCR through the PP-OCR cascade (En → Zh → Deva) for scans and 
 
 </details>
 
-## 🖱️ Browser actions: page control inside one fetch
+## 🛡️ Stealth: real clients, not Chrome-like
 
-`web_fetch` takes an `actions` array, executed in the real browser before extraction:
+A site decides before it serves content on two things: **who is asking** (TLS and HTTP/2 shape, header set and order, client hints, pacing) and **what they already hold** (cookies, clearance). DonSeTch carries both. A fingerprint is never assembled field by field: each identity is one real client's profile, carried whole, and the identity is chosen per site.
 
-```json
-{
-  "url": "https://duckduckgo.com",
-  "actions": [
-    { "do": "type", "selector": "input[name=q]", "text": "rust async tokio" },
-    { "do": "press", "key": "Enter" },
-    { "do": "wait_text", "text": "tokio" }
-  ],
-  "focus": "tokio"
-}
-```
-
-Steps: `wait`, `wait_selector`, `wait_text`, `click`, `hover`, `type` (human cadence), `press`, `scroll`. Up to 16 steps, deterministic waits, per-step results in `structuredContent.actions`. Search flows, form submits, load-more buttons: one call, no separate browser tool.
-
-## 🛡️ Stealth: Chrome TLS, not Chrome-like
-
-Everyone else patches a foreign TLS stack to resemble Chrome and ships hardcoded fingerprint tables that rot. DonSeTch drives Chrome's own BoringSSL with Chrome's native behaviors on: GREASE, extension permutation, ECH-GREASE, ALPS, SCT, OCSP, cert compression. The ClientHello comes out of the same machinery Chrome uses.
+| Identity | Profile |
+|---|---|
+| `plain` | A plain HTTP client: the cheapest first ask |
+| `chrome-local` | Chrome 156 on Linux, captured from a real browser |
+| `chrome` | Chrome 149 on Linux |
+| `chrome-win` | Chrome on Windows |
+| `chrome-android` | Chrome on Android |
+| `firefox` | Firefox 151 |
+| `safari` | Safari 26.4 on macOS |
+| `okhttp` | OkHttp 5, the client inside Android apps |
 
 <details>
-<summary><b>Verified against live Chromium, including the browser installed on your machine</b></summary>
+<summary><b>Verified against the real browsers</b></summary>
 
-A dev rig in the repo captures the real browser's raw stream, and the parity expectations are generated from those captures, never hand-edited. New browser version: re-run the rig, diff.
-
-| Signal | Match |
-|---|---|
-| **JA4** | cipher hash identical to Chrome |
-| **Akamai h2 fingerprint** | exact match |
-| **SETTINGS + WINDOW_UPDATE preface** | byte-identical, CI-asserted |
-| **Request HEADERS priority** | `[E=1 dep=0 weight=255]` plus the PRIORITY flag, exact |
-| **h2 header order** | `sec-ch-ua` → `sec-ch-ua-mobile` → `sec-ch-ua-platform`, exact |
-| **sec-ch-ua brands** | reflects the installed binary: Chromium first, greased `Not=A?Brand v=99`, Google Chrome brand only when the binary is branded |
-| **Extension set** | identical, contents differ only in random key material |
+Each identity is fingerprinted and diffed against the browser it claims to be. The Chrome identities reproduce real Chrome exactly: JA4 `t13d1517h2_8daaf6152771_cb7bf5808d99`, the same Akamai HTTP/2 fingerprint, the same 17 headers in the same order. Chrome permutes its ClientHello extension order per connection, and so do they, so JA3 varies as the real browser's does. An identity that does not match is removed, not relabelled: a `curl` identity was dropped because it was the native stack with a curl user-agent, a claim no detector would believe.
 
 </details>
 
-**Own HTTP/2 stack.** Off-the-shelf h2 does not expose pseudo-header order, the exact SETTINGS set, WINDOW_UPDATE values or HPACK indexing strategy, all of which are fingerprintable. So DonSeTch has its own: full HPACK (257 Huffman symbols, 61 static entries), frame engine (SETTINGS, DATA, WINDOW_UPDATE, PING, GOAWAY, RST_STREAM, CONTINUATION, PRIORITY), request HEADERS carrying Chromium's priority flag and block, flow control with replenishment, TLS 1.3 session resumption, connection pool. The h2 preface is asserted byte-identical to Chromium in CI, so a detectability regression is a build failure.
+**What is not in the bytes:**
 
-**Temporal stealth.** The part that is not in the bytes:
-
-| Mechanism | Why it matters |
+| Behavior | Why it matters |
 |---|---|
-| TLS session resumption | Scrapers never resume. Chrome always does. |
-| TCP Fast Open (warm hosts, Linux) | Repeat navigations send data on the SYN, like Chrome. |
-| h2 connection pooling | A fresh connection per request is a bot signal. |
-| Conditional revalidation | 304 means serving from cache. Browsers do this. |
-| Happy Eyeballs | IPv6/IPv4 race with a 250ms stagger. |
-| Persistent cookie jar | No cookie memory is a bot. |
-
-**One identity per fetch.** Per-domain personas drive Accept-Language, the ghost viewport and `navigator.languages`, so every fetch and any browser run claim the same person. The profile is derived from the browser actually installed, and `donsetch --version` tells you which one it detected.
+| Cookies per site and identity | A jar per (host, identity), with expiry. Cookies never cross hosts or identities, and a clearance is never spent by a different client class: a fingerprint mismatch burns the request and looks like a wall. |
+| Conditional revalidation | A repeat read sends `If-None-Match` / `If-Modified-Since` in Chrome's order. A 304 is what a returning browser gets. |
+| Pacing | At least 900 ms between reads of one site and 250 ms between attempts. A burst is a signature even when every request is perfect. |
+| Page-load realism | After an HTML read on a site that has walled before, a bounded background burst of the page's own subresources with the page as referer, as a browser loads them (`[fetch] shadow_fetch`). |
+| The OS's trust store | The bundled Mozilla roots plus the OS store and `SSL_CERT_FILE` / `SSL_CERT_DIR`, as Chrome trusts the OS: an enterprise inspection root installed the OS's way works. The ClientHello does not change. |
 
 ## ⚡ Challenges, in one process
 
-> **One local engine.** The wire and a JavaScript runtime share one identity and one cookie jar: a challenge script or a JS-rendered page runs in the fetch process itself, and its cookies land in the same session; the next request is one more fetch, not a second engine.
+> **No browser fetches content, and no browser earns state for a fetch.** A wall that needs the page's own program gets it run inside the fetch process, by an embedded V8, against a small bounded host. The credential the site issues is spent by the identity whose request minted it.
 
-| Step | What happens | Speed |
+| Step | What happens | Cost |
 |---|---|---|
-| 1. Local fetch | Stealth engine; JS runs in-process when a page needs it | ~100-300ms |
-| 2. Wall or JS shell detected | Cloudflare / DataDome / PerimeterX / Akamai | - |
-| 3. Scripts run | The page's own script executes in-process; clearance cookies land in the same jar | ~2-3s |
-| 4. Continue | One more request in the same engine, full speed | ~100-300ms |
-| 5. After | Warm cookies ride future fetches; a wall that will not clear answers honestly in about a second | - |
+| 1. Read | The identity's request comes back as a challenge page, named by its vendor | one request |
+| 2. Run | V8 runs the page's scripts in document order with its own inline bootstrap, fetching each script as the same identity. The host is a minimal DOM, the browser surfaces those programs read, and WebCrypto on BoringSSL. Nothing is laid out or rendered. | AWS WAF's 690 KB bundle compiles in ~9 ms; the mint is network-bound |
+| 3. Spend | The same identity sends the credential and re-classifies the answer. A credential the origin refuses is a failed mint, reported as the wall it is. | one request |
+| 4. Reuse | The credential is kept for its learned lifetime and re-minted once when refused; mints are capped and backed off per site. | none |
 
-Raw CDP launch without automation flags, so `navigator.webdriver` is natively false. Nothing is injected before page scripts: a real window, real GPU, real locale, a real `PluginArray`, and the `window.chrome` object Chrome actually ships. Where a stealth plugin patches a property so it looks less automated, this leaves the real one alone, because a patched property is a fingerprint of its own.
+Measured cold from a home IP, no state: all three AWS WAF shapes (IMDb, Booking, Trustpilot) reach content in 2-5 s, then ride their cookie. Cloudflare's managed challenge is run and does not pass yet, so identity is spent first: the identity Cloudflare lets through answers every Cloudflare site in the corpus.
 
-<details>
-<summary><b>Process lifecycle, the RAM-smart part</b></summary>
-
-The ghost is SIGSTOP'd (frozen) after 20s idle and reaped after 10 minutes frozen.
-
-| State | RAM | CPU | Wake time |
-|---|---|---|---|
-| Active | full | real | - |
-| Frozen | mapped but cold | 0 | ~50ms |
-| Reaped | freed | 0 | ~1-2s relaunch (the profile keeps its warmth) |
-
-Crash-transparent: a thaw that finds a dead browser silently relaunches. The persistent profile keeps cookies and clearance state across restarts.
-
-</details>
+Hostile pages end bounded and named: an endless loop stops at the 10 s wall clock, a heap bomb in 0.15 s, a 1 GB buffer is refused, a WebAssembly loop stops in 18 ms. Memory is checked on Linux, Windows and macOS; one engine runs at a time, and its memory exists only while a mint runs.
 
 ## 🧠 Self-improving fetch
 
-Every fetch is an action and an observation. Pure deterministic state, no ML, and the loop converges: the more you use it, the less it escalates.
+Every read is an action and an observation. Deterministic state, no ML, all local: one compact file under the cache directory (`<cache>/v5/state.json`), with cached pages beside it.
 
-| Visit | Route | What happens |
-|---|---|---|
-| 1, unknown | `Cold` | tier 1 → walled → solve → store cookies |
-| 2, fresh | `Warm` | tier 1 with cookies, browser asleep |
-| N, expired | `SkipToSolve` | straight to ghost, no doomed round-trip |
-| M, 24h later | `RecheckCold` | the wall may be gone, try tier 1 cold |
-| Wall beat the browser twice | `SolveCooldown` | honest sub-ms failure with exponential backoff (15m → 2h cap) instead of burning a 20-40s browser cycle per attempt |
+| It learns | So that |
+|---|---|
+| Which identity each site accepts | The next read starts there. It stays until it fails; scores halve after 32 attempts, so a site that changed is believed. |
+| What each bot-wall vendor lets through | Learned across sites over a measured seed: a new site behind a known vendor starts with the identities that vendor passes. |
+| The route that answered | A site whose public interface answered is asked there first. |
+| Published limits | A 429 with `x-ratelimit-reset` becomes a cooldown: the next read answers in ~150 ms naming the wait owed, instead of getting blocked. |
+| Minted credentials | Reused for their learned lifetime, re-minted once when refused. |
+| How far each site's cache headers can be trusted | Validators are audited by occasional full reads; a site whose validators lie is re-read in full for 7 days, and a page that changes inside its declared lifetime is always re-checked. |
 
-Cookie lifetime converges: `observed_lifetime = min(previous, now - last_solved)`. Only clearance cookies persist (`cf_clearance`, `datadome`, `_abck`); tracking cookies are filtered out.
+Measured with persisted state on a hard corpus of 28 defended sites: first-try content **13/28 cold → 26/28 learned**, requests per round 48 → 29, median 1.1 s → 0.63-0.85 s. On a friendly corpus of 17 sites: 10/17 → 15-16/17.
 
-A wall that survives **two** real-browser solves is remembered, so future fetches answer honestly in milliseconds until the backoff lapses. A single failure never gates a domain, and any real solve or tier-1 cold success clears the memory. The daemon learns what its own environment cannot do.
-
-Per-intent engine trust, egress-class domain profiles (cookies never cross exits), domain quality priors and crawl governor ladders all feed the same loop, all local, with receipts in `donsetch status` and `donsetch doctor --improve`. Disable disk state with `DONSEEK_NO_DISK_STATE=1`.
+The state is bounded (4,096 sites, least recently used go first with their cookies and credentials) and written by merging into the file under a lock, so processes sharing it keep each other's learning. Search engine trust, domain quality priors and crawl pacing ladders learn the same way. Receipts in `donsetch status` and `donsetch doctor --improve`; `DONSEEK_NO_DISK_STATE=1` keeps all of it in memory.
 
 ## 🏗️ Built from scratch
 
-Every layer in Rust, no dependency on existing OSS web tooling.
+Every layer in Rust.
 
 | Component | What | Where |
 |---|---|---|
-| 🛡️ **DonShadow** | Tier-1 stealth HTTP, BoringSSL TLS, own h1 + h2, temporal stealth, cookie jar | `src/fetch/` `src/transport/` |
-| 👻 **DonGhost** | Tier-2 ghost browser, CDP without Runtime/Console/Debugger, solve-and-bounce, SIGSTOP lifecycle | `src/ghost/` |
-| 📝 **DonSift** | HTML → markdown, block model, 12-language BM25 focus, token policy | `src/extract/` |
+| 🛡️ **v5 core** | The fetch engine: client identities, learned state, page cache, wall classification, the site's own interfaces, the in-process V8 challenge engine | `v5core/` |
+| 📝 **DonSift** | HTML → markdown, block model, 12-language BM25, the page views (`must_contain`, `focus`, `toc`, `section`) | `src/extract/` |
 | 🔎 **DonSeek** | Keyless multi-engine search, RRF + BM25 + consensus + semantic reranking | `src/search/` |
 | 🕷️ **DonTread** | Crawl engine, sitemap, focus frontier, Governor pacing, resume tokens | `src/crawl/` |
 | 📄 **DonSheet** | PDF extraction, PDFium FFI, pixel-truth fusion, OCR cascade, forms | `src/pdf/` |
+| 📸 **Browser** | Screenshots and `donsetch login` only; never a page read | `src/browser/` |
 | 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, four tools, crash-only supervisor | `src/mcp/` |
 
-1,300+ tests. Zero clippy warnings: `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` is the law, and CI runs the full matrix on Linux, macOS and Windows.
+1,900+ tests. Zero clippy warnings: `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` is the law, and CI runs the full matrix on Linux, macOS and Windows.
 
 ## ⚙️ Configuration
 
@@ -655,8 +619,7 @@ Sections: `transport`, `mcp`, `paths`, `state`, `proxy`, `tls`, `persona`, `cli`
 
 ```toml
 [fetch]
-h3 = true               # opt into the h3 lane
-shadow_fetch = "never"  # or "auto" / "always"
+shadow_fetch = "never"  # or "auto" / "always": the page-load burst
 pdf_max_mb = 100
 dns_cache_ttl_secs = 30 # seconds a resolved name is reused in-process, 0 disables
 
@@ -694,7 +657,7 @@ Thin adapter over the same engine the MCP server uses.
 
 | Command | What it does |
 |---|---|
-| `donsetch fetch <url>` | Fetch as clean markdown (`--focus`, `--max-chars`, `--json`) |
+| `donsetch fetch <url>` | Fetch as clean markdown (`--must-contain`, `--focus`, `--toc`, `--section`, `--max-chars`, `--since-last`, `--json`) |
 | `donsetch search <query>` | Search, keyless + BYOK (`--intent`, `--max-results`) |
 | `donsetch crawl <url>` | Crawl (`--mode map\|full\|content`, `--topic`, `--max-pages`) |
 | `donsetch screenshot <url>` | Render to PNG (`--out`) |
@@ -703,7 +666,7 @@ Thin adapter over the same engine the MCP server uses.
 | `donsetch status` | Version, keys, proxies, cache, health overview (`--json` for scripts and agents) |
 | `donsetch keys` | BYOK providers and plugins (`add`, `list`, `default`, `export`) |
 | `donsetch proxy` | Proxy management (`add`, `list`, `check`, `test`, `import`, `export`, `remove`, `clear`, `fetch on\|off`, `crawl on\|off`) |
-| `donsetch login` | Authenticated sessions for walled sites (`--list`, `--status`, `--logout`, `--import`) |
+| `donsetch login` | Store a signed-in session in the private vault (`--list`, `--status`, `--logout`, `--import`); fetch does not send it yet |
 | `donsetch config` | `show`, `--markdown`, `--legacy` |
 | `donsetch rules test <url>` | Explain what the local rules do with a URL, offline |
 | `donsetch tools` | Tool schemas as JSON, same as MCP `tools/list` |
@@ -748,12 +711,14 @@ Set the environment and every fetch follows the curl convention:
 
 - `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (any case) route fetches through that proxy, and `NO_PROXY` exempts hosts (suffix match, `*`, `host:port`, CIDR). `DONSETCH_NO_ENV_PROXY=1` disables the convention entirely. `[proxy] http` / `https` / `all` in `donsetch.toml` do the same thing without environment variables.
 - A configured proxy is a promise: if it cannot be dialled the fetch fails and says so, instead of quietly leaving on your own IP. Same for a pool lane: a dead lane is benched, not replaced by a direct read of a host it was carrying.
-- In an intercepting network (a TLS-terminating middlebox), HTTP CONNECT gets an interception-safe handshake (no GREASE/ALPS/ECH/compress-cert, which some middleboxes reset on) and `SSL_CERT_FILE` / `SSL_CERT_DIR` load into the trust store, exactly like curl. SOCKS5 keeps the Chrome-true handshake with TLS end to end. `donsetch doctor` reports the whole posture and names the interception fix when a live check fails.
-- Authenticated lanes work in the browser too: Chrome cannot carry proxy credentials, so it is pointed at a local credential-free relay that authenticates upstream, instead of dying as `ERR_SOCKS_CONNECTION_FAILED`.
+- In an intercepting network (a TLS-terminating middlebox), trust its root the OS's way, or with `SSL_CERT_FILE` / `SSL_CERT_DIR` as with curl: both are added to the bundled roots. The handshake stays the identity's own. `donsetch doctor` reports the whole posture.
+- The challenge engine leaves through the same proxy as the read it is answering.
 
 ## 🔐 Logged-in sessions
 
-Pages behind a login (x.com, gated docs, internal tools) need a real session. `donsetch login` gives you one without ever seeing your credentials:
+**In v5, `web_fetch` never signs in and never sends a stored session.** A page behind a login (x.com, gated docs, internal tools) comes back as a declared `wall.auth`, not as content, and no cookie a browser harvested is ever spent by a fetch. Session support for fetch is planned as its own feature.
+
+`donsetch login` still stores sessions in the private vault, without ever seeing your credentials, ready for that feature:
 
 ```bash
 donsetch login x.com          # opens YOUR browser, you sign in, press Enter
@@ -764,8 +729,8 @@ donsetch login --import cookies.txt x.com   # servers and CI, Netscape format
 ```
 
 - Credentials never enter DonSeTch. It opens a real Chromium on your display in a dedicated profile, never the automation one. You type into the browser. No keystroke capture, no screenshots, no CDP attach until you press Enter.
-- Afterwards, cookies selected by your domain or explicit import are stored regardless of whether their names look like authentication tokens. Known analytics and clearance cookies, expired records and invalid values are excluded. Names and paths retain their identity, including opaque persistent names such as `c_user`, `xs` and `li_at`. Cookie values stay in the private vault; `Saved`/`Imported` lists names only. Fetches and warm browsers reload the session without a daemon restart. Login changes invalidate cached account documents; captures from older browsers cannot overwrite the replacement session.
-- A named-domain post-login probe checks reachability and reports login/access redirects as unverified. A public home-page HTTP 200 cannot prove authentication, so it never earns a verified checkmark. Multi-site saves avoid one probe per domain. Verify the actual protected page you need with `web_fetch`.
+- Afterwards, cookies selected by your domain or explicit import are stored regardless of whether their names look like authentication tokens. Known analytics and clearance cookies, expired records and invalid values are excluded. Names and paths retain their identity, including opaque persistent names such as `c_user`, `xs` and `li_at`. Cookie values stay in the private vault; `Saved`/`Imported` lists names only. Captures from older browsers cannot overwrite the replacement session.
+- A named-domain post-login probe checks reachability and reports login/access redirects as unverified. A public home-page HTTP 200 cannot prove authentication, so it never earns a verified checkmark. Multi-site saves avoid one probe per domain.
 - Failed writes and captures return an error instead of reporting success. EOF and Ctrl+C save nothing to the vault; `--fresh` waits for the exclusive profile lock before wiping it. The dedicated browser profile may retain its own cookies until cleared with `--fresh`.
 - The registry (`auth-state.json`) stores metadata only: names, counts, expiries, probe verdicts. Never values.
 - Multi-site: run bare `donsetch login`, sign into as many tabs as you like, press Enter once. New cookies and rotated values are captured, including opaque persistent cookies.
@@ -799,10 +764,12 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 
 | Surprise | Why |
 |---|---|
-| First build ~2 min | BoringSSL compiles from source, cached after. Go is a build dependency too, BoringSSL's build system is Go-based. |
+| First build takes a few minutes | BoringSSL compiles from source and V8 is downloaded and linked, cached after. Go is a build dependency too: BoringSSL's build system is Go-based. |
+| v5 is a beta | The fetch engine is new. Its suite runs on Linux; Windows and macOS builds compile from the same code and are being verified on real machines. Report anything that regressed from v4. |
+| A login wall is an answer | `web_fetch` carries no session in v5: a signed-in page returns `wall.auth`. |
 | OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. |
 | First OCR/rerank use downloads models | ~24MB reranker, ~37MB OCR, cached forever. |
-| Captchas need an unlocker key | hCaptcha, reCAPTCHA and Turnstile cannot be solved locally, by design. With `donsetch keys add unlocker <key>[::zone]` they come through rendered; without one you get a clear honest error, never a hang. |
+| Captchas need an unlocker key | hCaptcha, reCAPTCHA, Turnstile and press-and-hold walls ask a human; they are not solved locally, by design. With `donsetch keys add unlocker <key>[::zone]` they come through rendered; without one you get a clear honest error, never a hang. |
 | robots.txt is ON for crawl | `respect_robots=true` for crawl. `fetch` does not check robots. |
 | Keyless search rate-limits without a proxy | It hits engines from your IP. Set `DONSEEK_PROXIES` for heavy use. |
 | Rerank in a CPU-limited container | Auto-clamped to cgroup parallelism on Linux, `DONSEEK_RERANK_THREADS` to override. |
@@ -810,30 +777,29 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | It cannot | Why |
 |---|---|
 | Solve interactive captchas locally | hCaptcha, reCAPTCHA, Turnstile: an honest dead end, no solving service by design. |
-| Send ML-DSA post-quantum signatures | BoringSSL 5.1 lacks them. Lands when BoringSSL has it. |
+| Render a page | Nothing is laid out or painted in the fetch path. A page whose content exists only after rendering, with no interface behind it, is reported as a shell. |
 | Search with every engine down | An error with per-engine status. Honest, never fake. |
 | Replace a human working a defended site | See "Pick the right tool" above. |
 
 ## 🆚 How it compares
 
-The honest summary: nothing else in this space combines a real Chrome TLS stack, browser-free keyless search, PDF pixel-fusion and local-only operation in one binary.
+The honest summary: nothing else in this space combines browser-free challenge handling, real client identities, keyless search, PDF pixel-fusion and local-only operation in one binary.
 
 | | **DonSeTch** | Hound | Crawl4AI | Jina Reader | Firecrawl |
 |---|---|---|---|---|---|
 | Language | **Rust, one binary** | Python | Python | Python (API) | TypeScript |
-| TLS fingerprint | **Chrome's own BoringSSL** | curl-impersonate | requests | their servers | their servers |
-| Own HTTP/2 + temporal stealth | **yes** | no | no | no | no |
-| Browser tier | **solve-and-bounce** | browser fetches all | browser fetches all | n/a | n/a |
+| TLS fingerprint | **8 whole client profiles, chosen per site** | curl-impersonate | requests | their servers | their servers |
+| JS challenges | **site's own program in embedded V8, no browser** | browser fetches all | browser fetches all | their servers | their servers |
 | Search | **keyless, 10+ engines, local rerank** | keyed | no | yes | no |
 | Crawl | **yes, resume tokens** | yes | yes | no | cloud only |
 | PDF + OCR | **pixel-fusion + PP-OCR** | yes | partial | yes | cloud, paid |
 | Self-improving routing | **yes, local state** | no | no | no | no |
 | Runs locally, no account | **yes** | yes | yes | no | self-host or paid |
 | MCP server | **first-class** | yes | community | yes | build it |
-| Tool schema | **~2.4k tokens** | ~2.7k | varies | n/a | varies |
+| Tool schema | **~2.0k tokens** | ~2.7k | varies | n/a | varies |
 | License | AGPL v3 | MIT | Apache 2.0 | proprietary | MIT |
 
-**Against Firecrawl, head to head, same tasks, live.** Firecrawl is a paid cloud API, DonSeTch is free, local and keyless:
+**Against Firecrawl, head to head, same tasks, live** (measured with v4; v5 numbers are coming). Firecrawl is a paid cloud API, DonSeTch is free, local and keyless:
 
 - **Fetch**: Wikipedia comes back 16x smaller (16KB against 267KB). An arXiv PDF is 22x faster and 4.4x smaller (1.4s/16KB against 32.6s/71KB). Reddit: Firecrawl refuses the site, DonSeTch returns the real feed.
 - **Crawl**: 2.5x faster on the same docs target (18.7s against 47.6s), with `--topic` ranking the frontier instead of firehosing, and an honest small failure when the topic has no match instead of verbose unrelated content.
