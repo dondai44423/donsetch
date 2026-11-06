@@ -684,3 +684,59 @@ fn a_gated_document_is_content_once_its_own_program_has_run() {
     );
     assert!(engine_notes(&outcome) >= 1, "{:?}", outcome.attempts);
 }
+
+/// The same origin, with Reddit's other door: the class the state learned to
+/// trust is served a human check, and every other class the JS gate. The
+/// encounter must cross to the class that is asked for a program instead of
+/// declaring the human step on the first answer.
+#[test]
+fn a_human_check_on_the_learned_client_sends_the_encounter_to_the_class_that_gets_a_program() {
+    let answered = Arc::new(AtomicU32::new(0));
+    let server = {
+        let answered = Arc::clone(&answered);
+        Server::start(move |request| {
+            if request
+                .path
+                .contains(&format!("solution={GATE_SEED}{GATE_SEED}"))
+            {
+                answered.fetch_add(1, Ordering::SeqCst);
+                return Reply::ok(content_page());
+            }
+            let agent = request.header("user-agent").unwrap_or_default();
+            if agent.contains("Chrome/") {
+                // The human check: a widget, no program to run.
+                return Reply::ok(
+                    "<html><head><title>Prove your humanity</title>\
+                     <script src=\"https://www.google.com/recaptcha/api.js\"></script>\
+                     </head><body>Prove your humanity</body></html>",
+                );
+            }
+            Reply::ok(gate_page())
+        })
+    };
+    let mut session = Worker::new(false);
+    session
+        .state
+        .origins
+        .entry(host().to_string())
+        .or_default()
+        .chosen = Some("chrome".to_string());
+    let portfolio = Options {
+        identity: None,
+        pace_ms: 0,
+        persist: false,
+        deadline: Duration::from_secs(20),
+        ..Options::default()
+    };
+    let outcome = session.fetch(&server.url("/"), &portfolio);
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
+    assert!(answered.load(Ordering::SeqCst) >= 1, "{:?}", outcome.attempts);
+    assert!(
+        outcome
+            .attempts
+            .iter()
+            .any(|attempt| attempt.class == Class::WallInteraction),
+        "the human check was seen, and crossed: {:?}",
+        outcome.attempts
+    );
+}

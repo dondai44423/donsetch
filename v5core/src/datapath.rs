@@ -44,17 +44,26 @@ pub struct DataPath {
     /// Minimum spacing between two calls to this interface, in ms. Interfaces
     /// publish their own limits; going faster is how a client gets blocked.
     pub min_interval_ms: i64,
+    /// The interface answers this URL's question *better* than the document
+    /// does, so it is asked first and the document is the fallback. True only
+    /// where the document is a partial rendering of what the interface returns
+    /// whole.
+    pub preferred: bool,
 }
 
 pub static PATHS: &[DataPath] = &[
     DataPath {
-        id: "reddit-feed",
+        id: "reddit",
         hosts: &["reddit.com", "redd.it"],
         resolve: resolve_reddit,
-        parse: parse_reddit_feed,
+        parse: parse_reddit_listing,
         min_items: 5,
-        // Reddit's feed publishes x-ratelimit-reset≈9s on this IP.
-        min_interval_ms: 11_000,
+        // No published rate limit: three calls in a row answered in full. The
+        // encounter's own per-origin pacing is the one that applies.
+        min_interval_ms: 0,
+        // A subreddit's document server-renders three posts and leaves the rest
+        // to JavaScript; this endpoint is what the page's own feed reloads with.
+        preferred: true,
     },
     DataPath {
         id: "news-feed",
@@ -63,6 +72,7 @@ pub static PATHS: &[DataPath] = &[
         parse: parse_rss_items,
         min_items: 5,
         min_interval_ms: 0,
+        preferred: false,
     },
     DataPath {
         id: "stackexchange-api",
@@ -78,6 +88,7 @@ pub static PATHS: &[DataPath] = &[
         parse: parse_stackexchange,
         min_items: 5,
         min_interval_ms: 0,
+        preferred: false,
     },
     DataPath {
         id: "fourchan-catalog",
@@ -86,6 +97,7 @@ pub static PATHS: &[DataPath] = &[
         parse: parse_fourchan,
         min_items: 5,
         min_interval_ms: 0,
+        preferred: false,
     },
     DataPath {
         id: "crates-api",
@@ -95,6 +107,7 @@ pub static PATHS: &[DataPath] = &[
         min_items: 5,
         // crates.io's data-access policy: at most one request per second.
         min_interval_ms: 1_000,
+        preferred: false,
     },
     DataPath {
         id: "twitch-gql",
@@ -103,6 +116,7 @@ pub static PATHS: &[DataPath] = &[
         parse: parse_twitch,
         min_items: 3,
         min_interval_ms: 0,
+        preferred: false,
     },
 ];
 
@@ -122,6 +136,7 @@ static TEST_PATHS: &[DataPath] = &[DataPath {
     parse: parse_rss_items,
     min_items: 2,
     min_interval_ms: 0,
+    preferred: false,
 }];
 #[cfg(not(test))]
 static TEST_PATHS: &[DataPath] = &[];
@@ -145,26 +160,31 @@ pub fn plan(url: &str) -> Option<(&'static DataPath, Request)> {
 
 // ---- reddit -------------------------------------------------------------
 
-/// Reddit's `.json` is refused to non-session clients, its document is a shell,
-/// and its Atom feed is open. The feed carries the same items the page shows.
+/// Reddit's listing interface: the endpoint the page's own feed reloads with
+/// (`<shreddit-feed reload-url=...>`). One call is a whole page of posts -- the
+/// same markup the page renders, every field on the `shreddit-post` element --
+/// it answers the plain client without a session, and it is not rate limited the
+/// way the Atom feed is (three calls in a row, three full pages, 2026-11-07).
+/// The document server-renders three posts and leaves the rest to JavaScript,
+/// which is why this path is `preferred`.
 fn resolve_reddit(url: &Url) -> Option<Request> {
-    // Ask for the feed of the page that was requested, not of a different one.
-    let path = url.path().trim_end_matches('/').to_string();
-    // A thread is not a listing. Its feed carries the comments alone, without the
-    // post the reader asked for, so it is not equivalent to the page: a thread is
-    // answered by its own document (and the engine behind its gate). The feed
-    // answers the listings it mirrors item for item.
-    if path.contains("/comments/") {
-        return None;
+    let (subreddit, sort) = reddit_listing(url)?;
+    let mut target = format!(
+        "https://www.reddit.com/svc/shreddit/community-more-posts/{sort}/?name={subreddit}"
+    );
+    // A window the caller named (`?t=week`) is part of the question.
+    if let Some((_, window)) = url.query_pairs().find(|(key, _)| key == "t") {
+        if !window.is_empty() {
+            target.push_str(&format!("&t={window}"));
+        }
     }
-    let target = format!("https://www.reddit.com{path}/.rss");
     Some(Request {
         method: "GET",
         url: target,
         headers: vec![
             (
                 "accept",
-                "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             ),
             ("sec-fetch-dest", "empty"),
             ("sec-fetch-mode", "cors"),
@@ -174,23 +194,64 @@ fn resolve_reddit(url: &Url) -> Option<Request> {
     })
 }
 
-fn parse_reddit_feed(body: &str, _source: &str) -> Vec<Item> {
+/// Where a listing URL lives in the interface: `(subreddit, sort)`. `None` for
+/// everything that is not a subreddit listing -- a thread is answered by its own
+/// document, the front page's interface answers with no posts, and a service
+/// path is nobody's listing.
+fn reddit_listing(url: &Url) -> Option<(String, String)> {
+    const SORTS: [&str; 6] = ["hot", "new", "top", "rising", "controversial", "best"];
+    let segments: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        ["r", subreddit] => Some(((*subreddit).to_string(), "hot".to_string())),
+        ["r", subreddit, sort] if SORTS.contains(sort) => {
+            Some(((*subreddit).to_string(), (*sort).to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// The posts in a shreddit listing: title, permalink, and the line the reader
+/// needs to choose one -- domain, score, author, comment count.
+fn parse_reddit_listing(body: &str, source: &str) -> Vec<Item> {
+    let document = scraper::Html::parse_document(body);
+    let Ok(selector) = scraper::Selector::parse("shreddit-post") else {
+        return Vec::new();
+    };
+    let root = Url::parse(source).ok();
     let mut items = Vec::new();
-    for chunk in body.split("<entry>").skip(1) {
-        let title = tag_text(chunk, "title").unwrap_or_default();
-        let updated = tag_text(chunk, "updated").unwrap_or_default();
-        let link = chunk
-            .split("href=\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .map(str::to_string);
-        if title.is_empty() {
+    for element in document.select(&selector) {
+        let value = element.value();
+        let title = value.attr("post-title").unwrap_or_default().trim();
+        let link = value.attr("permalink").unwrap_or_default();
+        if title.is_empty() || link.is_empty() {
             continue;
         }
+        let url = root
+            .as_ref()
+            .and_then(|root| root.join(link).ok())
+            .map(|url| url.to_string());
+        let mut detail: Vec<String> = Vec::new();
+        if value.attr("post-type") == Some("link") {
+            if let Some(domain) = value.attr("domain").filter(|domain| !domain.is_empty()) {
+                detail.push(format!("({domain})"));
+            }
+        }
+        if let Some(score) = value.attr("score").filter(|score| !score.is_empty()) {
+            detail.push(format!("{score} pts"));
+        }
+        if let Some(author) = value.attr("author").filter(|author| !author.is_empty()) {
+            detail.push(format!("u/{author}"));
+        }
+        if let Some(comments) = value
+            .attr("comment-count")
+            .filter(|count| !count.is_empty() && *count != "0")
+        {
+            detail.push(format!("{comments} comments"));
+        }
         items.push(Item {
-            title: unescape(&title),
-            detail: updated,
-            url: link,
+            title: title.to_string(),
+            detail: detail.join(" · "),
+            url,
         });
     }
     items
@@ -602,12 +663,16 @@ fn unescape(value: &str) -> String {
 pub fn render(path: &DataPath, items: &[Item]) -> String {
     let mut out = format!("# {} ({} items)\n\n", path.id, items.len());
     for item in items {
-        out.push_str(&format!("- {}", item.title));
+        // A markdown link, so every item is followable: the fetch tool turns
+        // these into short handles when the caller asked for them, and the URL
+        // stays visible when it did not.
+        let title = item.title.replace('[', "\\[").replace(']', "\\]");
+        match &item.url {
+            Some(url) => out.push_str(&format!("- [{title}]({url})")),
+            None => out.push_str(&format!("- {title}")),
+        }
         if !item.detail.is_empty() {
             out.push_str(&format!(" — {}", item.detail));
-        }
-        if let Some(url) = &item.url {
-            out.push_str(&format!(" — {url}"));
         }
         out.push('\n');
     }
@@ -631,14 +696,46 @@ mod tests {
     }
 
     #[test]
-    fn reddit_resolves_a_listing_to_its_feed_and_leaves_a_thread_to_its_page() {
-        let (_, request) = plan("https://www.reddit.com/").unwrap();
-        assert_eq!(request.url, "https://www.reddit.com/.rss");
-        let (_, request) = plan("https://www.reddit.com/r/rust/").unwrap();
-        assert_eq!(request.url, "https://www.reddit.com/r/rust/.rss");
-        // A thread's feed is its comments alone, without the post the reader
-        // asked for: the document answers a thread, not the interface.
+    fn reddit_resolves_a_listing_to_its_own_feed_and_leaves_a_thread_to_its_page() {
+        let (path, request) = plan("https://www.reddit.com/r/rust/").unwrap();
+        assert_eq!(
+            request.url,
+            "https://www.reddit.com/svc/shreddit/community-more-posts/hot/?name=rust"
+        );
+        assert!(path.preferred, "the listing's document is the partial answer");
+        let (_, request) = plan("https://www.reddit.com/r/rust/top/?t=week").unwrap();
+        assert_eq!(
+            request.url,
+            "https://www.reddit.com/svc/shreddit/community-more-posts/top/?name=rust&t=week"
+        );
+        // The front page's interface answers with no posts: the document answers it.
+        assert!(plan("https://www.reddit.com/").is_none());
+        // A thread is answered by its own document, not by an interface.
         assert!(plan("https://www.reddit.com/r/rust/comments/abc/title/").is_none());
+        // A service path is nobody's listing.
+        assert!(plan("https://www.reddit.com/svc/shreddit/community-more-posts/hot/").is_none());
+        assert!(plan("https://www.reddit.com/r/rust/wiki/index").is_none());
+    }
+
+    #[test]
+    fn a_shreddit_listing_becomes_posts_with_their_permalinks() {
+        let listing = r#"<shreddit-feed><article data-post-id="t3_1xpb71b">
+            <shreddit-post post-title="Servo Browser Engine Continues" post-type="link"
+              permalink="/r/rust/comments/1xpb71b/servo_browser_engine/" domain="phoronix.com"
+              score="137" author="HimikoTogaFromUSSR" comment-count="11"></shreddit-post>
+            </article><article><shreddit-post post-title="Ask here" post-type="text"
+              permalink="/r/rust/comments/1xls6as/ask_here/" domain="self.rust" score="0"
+              author="nobody" comment-count="0"></shreddit-post></article></shreddit-feed>"#;
+        let items = parse_reddit_listing(listing, "https://www.reddit.com/r/rust/");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Servo Browser Engine Continues");
+        assert_eq!(items[0].detail, "(phoronix.com) · 137 pts · u/HimikoTogaFromUSSR · 11 comments");
+        assert_eq!(
+            items[0].url.as_deref(),
+            Some("https://www.reddit.com/r/rust/comments/1xpb71b/servo_browser_engine/")
+        );
+        // A self post names no domain, and a zero comment count says nothing.
+        assert_eq!(items[1].detail, "0 pts · u/nobody");
     }
 
     #[test]
@@ -666,10 +763,6 @@ mod tests {
 
     #[test]
     fn parsers_require_real_items() {
-        let feed = "<feed><entry><title>A post</title><updated>2026-11-04</updated><link href=\"https://r/1\"/></entry></feed>";
-        let items = parse_reddit_feed(feed, "https://www.reddit.com/r/popular/.rss");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "A post");
         let se = r#"{"items":[{"title":"How do I X?","score":3,"answer_count":2,"tags":["rust"],"link":"https://so/1"}]}"#;
         let items = parse_stackexchange(se, "https://api.stackexchange.com/2.3/questions");
         assert_eq!(items[0].title, "How do I X?");

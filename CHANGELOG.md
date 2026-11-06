@@ -69,15 +69,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine's learned state and page cache in memory.
 - **Reddit.** Its JS gate — a form whose one field the page's own inline
   program computes and submits — now runs in the in-process engine and is
-  spent as the same client: a page, a subreddit listing and a thread all come
-  back as content, and the anonymous session the solve opens makes every later
-  read one request. The `old.reddit.com` session hop and the `.json` rewrite
-  that went with it are gone; both were what put the fetcher behind Reddit's
-  interactive humanity check. A listing is answered by its own document once the
-  session is open; a gated or paced listing falls back to Reddit's own Atom feed,
-  which carries the 25 items the server-rendered page leaves to JavaScript, and a
-  thread is answered by its own document because a thread's feed carries the
-  comments alone.
+  spent as the same client: a thread is content in under a second, and the
+  anonymous session the solve opens makes every later read one request. A
+  subreddit listing is answered by the endpoint the page's own feed reloads
+  with, not by the three posts its document server-renders: 23–24 posts per
+  request, each with title, domain, score, author, comment count and a
+  followable permalink, and no session or rate limit to negotiate. A human
+  check served to the learned client class now sends the encounter to the class
+  that is asked for a program instead of ending the fetch. The `old.reddit.com`
+  session hop and the `.json` rewrite are gone; both were what put the fetcher
+  behind Reddit's interactive humanity check.
 
 ### Security
 

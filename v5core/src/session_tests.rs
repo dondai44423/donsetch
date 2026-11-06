@@ -261,7 +261,12 @@ fn a_named_vendor_sends_the_next_attempt_to_what_passed_it() {
 }
 
 #[test]
-fn a_human_check_no_identity_is_known_to_pass_costs_one_request() {
+fn a_human_check_costs_one_identity_beyond_the_class_that_saw_it() {
+    // A human widget is a class decision before it is a human step: the class
+    // that claims no browser is the one a site asks to run a program instead
+    // (Reddit serves the desktop Chrome class its captcha and every other class
+    // its JS gate). One more identity is spent finding that out, and the second
+    // human wall ends the encounter.
     let server = walled(
         || Reply::Full {
             status: 403,
@@ -272,8 +277,8 @@ fn a_human_check_no_identity_is_known_to_pass_costs_one_request() {
     );
     let outcome = Session::new(false).fetch(&cold(server.url("/")));
     assert_eq!(outcome.class, Class::WallInteraction);
-    assert_eq!(tried(&outcome), ["plain"]);
-    assert_eq!(server.hit_count(), 1);
+    assert_eq!(tried(&outcome), ["plain", "chrome"]);
+    assert_eq!(server.hit_count(), 2, "one identity past the class that saw it");
 }
 
 #[test]

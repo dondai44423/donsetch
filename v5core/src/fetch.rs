@@ -428,7 +428,10 @@ impl Worker {
                     url: url.to_string(),
                     cache: None,
                     host,
-                    final_url: request.url.clone(),
+                    // What answered is the interface, but the caller's question is
+                    // the page it named: an internal endpoint is not the
+                    // document's identity.
+                    final_url: url.to_string(),
                     class: Class::Content,
                     identity: Some(identity.name.to_string()),
                     status,
@@ -894,16 +897,20 @@ impl Worker {
         }
 
         // An origin whose interface answered last time is asked there first: the
-        // document it walls or leaves empty is not requested again. If the
-        // interface fails, the route is forgotten and the encounter runs whole;
-        // an interface that only asked for time (paced, cooling down, 429) is
-        // still the route, and is asked first again once the time has passed.
+        // document it walls or leaves empty is not requested again. A path whose
+        // interface answers the question *better* than the document is asked
+        // first always -- a listing's document is a partial rendering of it. If
+        // the interface fails, the route is forgotten and the encounter runs
+        // whole; an interface that only asked for time (paced, cooling down, 429)
+        // is still the route, and is asked first again once the time has passed.
+        let planned = datapath::plan(url);
+        let preferred = planned.as_ref().is_some_and(|(path, _)| path.preferred);
         let routed = self
             .state
             .origins
             .get(&host)
             .and_then(|origin| origin.route.clone());
-        if routed.as_deref() == Some("data") && datapath::plan(url).is_some() {
+        if planned.is_some() && (routed.as_deref() == Some("data") || preferred) {
             if let Some(identity) = order.first().and_then(|name| identity::lookup(name)) {
                 data_tried = true;
                 match self.ask_interface(
@@ -933,6 +940,8 @@ impl Worker {
         // that vendor has let through to the front of what is left.
         let mut queue: std::collections::VecDeque<String> = order.iter().cloned().collect();
         let mut tries = 0usize;
+        // One interaction wall is spent before the encounter stops on it.
+        let mut interaction_asked = false;
         let mut last_wall: Option<crate::classify::Wall> = None;
         // The previous attempt's answer: class, status and body hash.
         let mut last_answer: Option<(Class, u16, u64)> = None;
@@ -1891,11 +1900,28 @@ impl Worker {
                 }
             }
 
-            // Classes that another identity cannot change: stop spending requests.
-            // An interaction wall is one only when no identity is known to pass
-            // its vendor: DataDome and PerimeterX are measured to let some through.
+            // A human widget is a class decision before it is a human step: the
+            // class that claims no browser is the one a site asks to run a
+            // program instead (Reddit serves the desktop Chrome class its
+            // captcha and every other class its JS gate). One more identity, and
+            // the class that claims no browser goes first. The second human wall
+            // ends the encounter: the site is asking, not the class.
             let interaction_final =
-                verdict.class == Class::WallInteraction && escalation.is_empty();
+                verdict.class == Class::WallInteraction && escalation.is_empty() && interaction_asked;
+            if verdict.class == Class::WallInteraction && !interaction_asked {
+                interaction_asked = true;
+                if identity.family != identity::Family::Plain {
+                    let plain = queue.iter().position(|name| {
+                        identity::lookup(name)
+                            .is_some_and(|other| other.family == identity::Family::Plain)
+                    });
+                    if let Some(at) = plain {
+                        if let Some(moved) = queue.remove(at) {
+                            queue.push_front(moved);
+                        }
+                    }
+                }
+            }
             // A rate limit that names when to come back is about this address,
             // not this client: asking again now as someone else is the burst
             // that escalates a site. The wait is the answer.
