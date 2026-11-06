@@ -443,6 +443,10 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           draft: true
+          # A version with a prerelease component (-beta.1, -rc.2) is marked
+          # as such, so it never becomes the "latest release" that npm's
+          # installer and downstream dispatches resolve.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body_path: RELEASE_BODY.md
           generate_release_notes: true
           files: |
