@@ -262,8 +262,14 @@ ship version:
         echo "ship: Cargo.lock did not take the bump"; exit 1
     }
     git add Cargo.toml Cargo.lock npm/package.json CHANGELOG.md
-    git commit -q -m "chore(release): {{version}}"
+    # Idempotent: the manifests may already carry this version (a release
+    # prepared ahead of its tag), and an empty commit would abort the ship
+    # with "nothing to commit" after the checks passed.
+    if ! git diff --cached --quiet; then
+        git commit -q -m "chore(release): {{version}}"
+    fi
     git push -q origin master
+    git branch --show-current | grep -qx master || git push -q origin "HEAD:master"
     git tag "v{{version}}"
     git push -q origin "v{{version}}"
     # Match the run by its branch (the tag), not by "newest": the run for

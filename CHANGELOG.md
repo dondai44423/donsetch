@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [5.0.0-beta.1] - 2026-11-06
 
+### Known limitations in this beta
+
+- **No linux-arm64 asset.** The v5 core's binary does not start on aarch64
+  yet: the core's own suite passes there (164/164), the product binary that
+  links it segfaults before `main`. This beta ships x86_64 Linux, macOS
+  arm64 and x64, and Windows x64. 4.10.5 remains installable on arm64.
+- **Windows crawl egress is unverified.** On Windows a refused response does
+  not penalize its lane and a proxy that answered 429 is not debited the way
+  both are on Linux, so a crawl there may keep using the direct lane instead
+  of the configured proxy pool. Fetching still works; check your egress
+  before trusting a Windows crawl.
+
 ### Changed
 
 - **v5core is the only fetch engine.** Every document and one-shot read goes
