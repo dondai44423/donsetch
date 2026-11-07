@@ -1954,6 +1954,7 @@ fn concurrent_issues_survive_each_other() {
                     queue: Vec::new(),
                     seen: Vec::new(),
                     denied: Default::default(),
+                    depth_cut: Vec::new(),
                 };
                 super::resume_store_issue(&tok, &state);
                 barrier.wait();
@@ -2057,6 +2058,7 @@ async fn wave450_invalid_seed_does_not_consume_a_resume_token() {
         queue: Vec::new(),
         seen: Vec::new(),
         denied: Default::default(),
+        depth_cut: Vec::new(),
     };
     super::resume_store_issue(token, &state);
     let site = MockSite::new();
@@ -2761,6 +2763,7 @@ fn a_resume_state_without_denials_still_loads() {
         queue: Vec::new(),
         seen: Vec::new(),
         denied: denied.clone(),
+        depth_cut: Vec::new(),
     };
     let back: super::ResumeState =
         serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
@@ -2820,6 +2823,7 @@ fn resume_store_peek_reads_the_seed_without_consuming_the_token() {
         queue: Vec::new(),
         seen: Vec::new(),
         denied: Default::default(),
+        depth_cut: Vec::new(),
     };
     super::resume_store_issue(token, &state);
     assert_eq!(
@@ -2905,6 +2909,287 @@ async fn reliability_small_page_and_total_caps_are_hard() {
     assert_eq!(r.pages.len(), 1);
     assert!(r.pages[0].chars <= 100, "{}", r.pages[0].chars);
     assert!(r.pages[0].next_offset.is_some());
+}
+
+// ── Depth limit ───────────────────────────────────────────
+
+/// `https://ex.com/` links `/d1`, `/d1` links `/d2`, and so on down to
+/// `/d{deepest}`, which links nothing.
+fn depth_chain(deepest: usize) -> MockSite {
+    let path = |i: usize| {
+        if i == 0 {
+            "/".to_string()
+        } else {
+            format!("/d{i}")
+        }
+    };
+    let mut site = MockSite::new();
+    for i in 0..deepest {
+        site = site.page(
+            &format!("https://ex.com{}", path(i)),
+            200,
+            &linking_page(&format!("page {i}"), &[&path(i + 1)]),
+        );
+    }
+    site.page(
+        &format!("https://ex.com{}", path(deepest)),
+        200,
+        &html("Deepest", "the end of the chain"),
+    )
+}
+
+fn depth_opts(max_depth: u32) -> CrawlOptions {
+    CrawlOptions {
+        mode: CrawlMode::Content,
+        max_pages: 10,
+        max_depth,
+        ..opts()
+    }
+}
+
+// max_depth 2 reads `/`, `/d1` and `/d2`, and `/d2` links `/d3`: the
+// frontier drains, but the reachable scope was not read.
+#[tokio::test]
+async fn a_crawl_cut_by_max_depth_stops_depth_limit() {
+    let (fetch, hits) = depth_chain(3).fetcher();
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", depth_opts(2), None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(got.len(), 3, "pages={got:?}");
+    assert_eq!(hits_matching(&hits, "/d3"), 0, "/d3 is past max_depth");
+    assert_eq!(
+        r.stop,
+        StopReason::DepthLimit,
+        "pages={got:?} skipped={:?} queued={:?}",
+        r.skipped,
+        r.queued
+    );
+    assert_eq!(r.depth_cut, ["https://ex.com/d3"]);
+    assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+    assert!(r.resume.is_none(), "nothing was queued to resume");
+}
+
+// Negative: a site whose last page sits within max_depth, read with the
+// limit at that page or past it, drains as a complete read.
+#[tokio::test]
+async fn a_crawl_that_reads_its_scope_within_max_depth_stays_frontier_empty() {
+    for (deepest, max_depth) in [(2, 2), (3, 3), (2, 8)] {
+        let (fetch, hits) = depth_chain(deepest).fetcher();
+        let r = Crawler::new(fetch, gov())
+            .crawl("https://ex.com/", depth_opts(max_depth), None)
+            .await
+            .unwrap();
+        let case = format!("deepest={deepest} max_depth={max_depth}");
+        assert_eq!(r.pages.len(), deepest + 1, "{case}");
+        assert_eq!(hits_matching(&hits, &format!("/d{deepest}")), 1, "{case}");
+        assert_eq!(
+            r.stop,
+            StopReason::FrontierEmpty,
+            "{case}: {:?}",
+            r.depth_cut
+        );
+        assert!(r.depth_cut.is_empty(), "{case}: {:?}", r.depth_cut);
+    }
+}
+
+// Negative: at the limit, a link the harvest would not have queued is no
+// cut: already seen (fetched or queued, fragment or not), another host,
+// excluded, disallowed by robots.txt, a translated variant of a fetched
+// page, or not a web link.
+#[tokio::test]
+async fn links_the_harvest_would_not_queue_are_not_depth_cut() {
+    let (fetch, hits) = MockSite::new()
+        .page(
+            "https://ex.com/robots.txt",
+            200,
+            "User-agent: *\nDisallow: /private/\n",
+        )
+        .page(
+            "https://ex.com/",
+            200,
+            &linking_page("root", &["/d1", "/side"]),
+        )
+        .page(
+            "https://ex.com/side",
+            200,
+            &html("Side", "linked by the seed"),
+        )
+        .page("https://ex.com/d1", 200, &linking_page("d1", &["/d2"]))
+        .page(
+            "https://ex.com/d2",
+            200,
+            &linking_page(
+                "d2",
+                &[
+                    "/",
+                    "/d1",
+                    "/side",
+                    "/d1#part",
+                    "https://other.example/x",
+                    "/skip/me",
+                    "/private/p",
+                    "/de/d1",
+                    "mailto:team@ex.com",
+                ],
+            ),
+        )
+        .fetcher();
+    let o = CrawlOptions {
+        exclude_paths: vec!["/skip/*".into()],
+        ..depth_opts(2)
+    };
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.pages.len(), 4, "{:?}", r.skipped);
+    assert!(r.depth_cut.is_empty(), "{:?}", r.depth_cut);
+    assert_eq!(r.stop, StopReason::FrontierEmpty);
+    for never in ["other.example", "/skip/", "/private/", "/de/"] {
+        assert_eq!(hits_matching(&hits, never), 0, "{never}");
+    }
+}
+
+// Negative: a link a local rule refuses is no cut, since the harvest
+// would have refused it too. Control: the same link without the rule.
+#[tokio::test]
+async fn a_rule_denied_link_at_the_limit_is_not_depth_cut() {
+    let site = || {
+        MockSite::new()
+            .page("https://ex.com/", 200, &linking_page("root", &["/d1"]))
+            .page(
+                "https://ex.com/d1",
+                200,
+                &linking_page("d1", &["https://blocked.example/x"]),
+            )
+            .fetcher()
+            .0
+    };
+    let o = CrawlOptions {
+        same_host: false,
+        respect_robots: false,
+        ..depth_opts(1)
+    };
+    let r = Crawler::new(site(), gov())
+        .with_rules(deny_rules(&[("blocked.example", None)]))
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    assert!(r.depth_cut.is_empty(), "{:?}", r.depth_cut);
+    assert_eq!(r.stop, StopReason::FrontierEmpty);
+
+    let r = Crawler::new(site(), gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.depth_cut, ["https://blocked.example/x"]);
+    assert_eq!(r.stop, StopReason::DepthLimit);
+}
+
+// Below the seed the focus gate drops links that do not match: at the
+// limit those are no cut, a matching one is.
+#[tokio::test]
+async fn the_focus_gate_applies_at_the_limit() {
+    async fn focus_crawl(at_limit: &[&str]) -> super::CrawlResult {
+        let (fetch, hits) = MockSite::new()
+            .page("https://ex.com/", 200, &linking_page("root", &["/alpha-1"]))
+            .page(
+                "https://ex.com/alpha-1",
+                200,
+                &linking_page("alpha one", at_limit),
+            )
+            .fetcher();
+        let o = CrawlOptions {
+            focus: Some("alpha".into()),
+            ..depth_opts(1)
+        };
+        let r = Crawler::new(fetch, gov())
+            .crawl("https://ex.com/", o, None)
+            .await
+            .unwrap();
+        assert_eq!(hits_matching(&hits, "/alpha-1"), 1);
+        r
+    }
+    let r = focus_crawl(&["/beta"]).await;
+    assert!(r.depth_cut.is_empty(), "{:?}", r.depth_cut);
+    assert_eq!(r.stop, StopReason::FrontierEmpty);
+
+    let r = focus_crawl(&["/beta", "/alpha-2"]).await;
+    assert_eq!(r.depth_cut, ["https://ex.com/alpha-2"]);
+    assert_eq!(r.stop, StopReason::DepthLimit);
+}
+
+// Full mode queues sitemap entries at depth 1. Under max_depth 0 they
+// are the depth cut, never fetched and not a skip row each.
+#[tokio::test]
+async fn sitemap_entries_past_max_depth_zero_are_the_depth_cut() {
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/", 200, &html("Home", "the seed page"))
+        .page(
+            "https://ex.com/sitemap.xml",
+            200,
+            "<urlset><url><loc>https://ex.com/a</loc></url>\
+             <url><loc>https://ex.com/b</loc></url></urlset>",
+        )
+        .page("https://ex.com/a", 200, &html("A", "page a"))
+        .page("https://ex.com/b", 200, &html("B", "page b"))
+        .fetcher();
+    let o = CrawlOptions {
+        mode: CrawlMode::Full,
+        ..depth_opts(0)
+    };
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.pages.len(), 1);
+    assert_eq!(hits_matching(&hits, "ex.com/a"), 0);
+    assert_eq!(hits_matching(&hits, "ex.com/b"), 0);
+    assert!(
+        r.skipped.iter().all(|(_, why)| !why.contains("depth")),
+        "{:?}",
+        r.skipped
+    );
+    assert_eq!(r.depth_cut, ["https://ex.com/a", "https://ex.com/b"]);
+    assert_eq!(r.stop, StopReason::DepthLimit);
+}
+
+// A resumed crawl keeps the earlier run's depth cut: run 1 cuts the link
+// under the one page it reads past the seed and stops on its page budget,
+// run 2 reads the other page and drains. Uses the resume store under the
+// per-process test cache root, so it depends on nextest's
+// process-per-test.
+#[tokio::test]
+async fn a_resumed_crawl_keeps_the_earlier_depth_cut() {
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/", 200, &linking_page("root", &["/a", "/b"]))
+        .page("https://ex.com/a", 200, &linking_page("a", &["/deep-a"]))
+        .page("https://ex.com/b", 200, &linking_page("b", &["/deep-b"]))
+        .fetcher();
+    let crawler = Crawler::new(fetch, gov());
+    let o = CrawlOptions {
+        max_pages: 2,
+        ..depth_opts(1)
+    };
+    let r1 = crawler
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(r1.stop, StopReason::MaxPages);
+    assert_eq!(r1.depth_cut.len(), 1, "{:?}", r1.depth_cut);
+    let token = r1.resume.expect("stopped with a page queued");
+
+    let o = CrawlOptions { max_pages: 10, ..o };
+    let r2 = crawler.crawl("", o, Some(&token)).await.unwrap();
+    assert_eq!(r2.pages.len(), 1);
+    assert_eq!(
+        r2.depth_cut,
+        ["https://ex.com/deep-a", "https://ex.com/deep-b"]
+    );
+    assert_eq!(r2.stop, StopReason::DepthLimit);
+    assert_eq!(hits_matching(&hits, "/deep-"), 0);
 }
 
 #[tokio::test]

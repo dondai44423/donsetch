@@ -545,6 +545,12 @@ impl FrontierQueue {
         self.seen.insert(key)
     }
 
+    /// True when `key` (in `normalize` form) is in the seen set, the
+    /// set `push_with_parent` dedups on.
+    pub fn is_seen(&self, key: &str) -> bool {
+        self.seen.contains(key)
+    }
+
     /// Mark a URL as seen and remove its pending alias. Used for
     /// canonical URL resolution: when a page declares a
     /// canonical URL different from its fetched URL, the
