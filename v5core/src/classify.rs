@@ -225,6 +225,24 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
     let mut found: Vec<String> = Vec::new();
     let mut wall: Option<Wall> = None;
 
+    // SiteGround names its challenge in a header on every page of it, and its
+    // stub is a bare meta refresh that a generic contract cannot tell from a
+    // short page: the header decides before the contract does.
+    if evidence.headers.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("sg-captcha") && value.eq_ignore_ascii_case("challenge")
+    }) {
+        found.push("siteground:sg-captcha".into());
+        return Verdict {
+            class: Class::WallContract,
+            wall: Some(Wall {
+                vendor: "siteground".into(),
+                marker: "sg-captcha".into(),
+                asks: "proof of work",
+            }),
+            evidence: found,
+        };
+    }
+
     if evidence.content_ok {
         return Verdict {
             class: Class::Content,
@@ -499,6 +517,29 @@ mod tests {
             headers: &[],
         })
         .class
+    }
+
+    #[test]
+    fn a_siteground_stub_is_its_challenge_whatever_the_contract_says() {
+        let stub = r#"<html><head><meta http-equiv="refresh" content="0;/.well-known/sgcaptcha/?r=%2Fa"></meta></head></html>"#;
+        let headers = [("sg-captcha".to_string(), "challenge".to_string())];
+        let verdict = classify(Evidence {
+            status: 202,
+            body: stub,
+            content_ok: true,
+            headers: &headers,
+        });
+        assert_eq!(verdict.class, Class::WallContract);
+        assert_eq!(verdict.wall.map(|w| w.vendor), Some("siteground".into()));
+        // A SiteGround page that is not a challenge is content.
+        let served = [("x-sg-cdn".to_string(), "1".to_string())];
+        let verdict = classify(Evidence {
+            status: 200,
+            body: "<html><body><p>Article</p></body></html>",
+            content_ok: true,
+            headers: &served,
+        });
+        assert_eq!(verdict.class, Class::Content);
     }
 
     #[test]

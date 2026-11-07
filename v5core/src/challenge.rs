@@ -108,3 +108,230 @@ mod tests {
         assert_eq!(akamai_bm_verify(body).unwrap().delay_secs, 6);
     }
 }
+
+/// SiteGround's bot check (`sg-captcha: challenge`).
+///
+/// The guarded page is a stub whose meta refresh leads to
+/// `/.well-known/sgcaptcha/`. That page carries the whole challenge:
+/// `sgchallenge` (`<bits>:<nonce material>`) and `sgsubmit_url`. Its program
+/// searches for a counter whose SHA-1 over `challenge ‖ counter` starts with
+/// `bits` zero bits, then navigates to `sgsubmit_url&sol=<base64 of the hashed
+/// bytes>&s=<ms>:<hashes>`. The server answers with an `_I_` clearance cookie
+/// bound to the client, and the stub's own URL then serves the page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SgWork {
+    pub challenge: String,
+    pub submit: String,
+}
+
+/// The most work a SiteGround answer may cost: 2^24 hashes on average. Sites
+/// ask 20-22 bits; a larger ask is not answered.
+pub const SG_MAX_BITS: u32 = 24;
+
+/// The challenge page a SiteGround stub's meta refresh leads to.
+pub fn siteground_stub(body: &str) -> Option<String> {
+    let at = body.find("/.well-known/sgcaptcha/")?;
+    let rest = &body[at..];
+    let end = rest.find(['"', '\'', '>', ' '])?;
+    Some(rest[..end].replace("&amp;", "&"))
+}
+
+/// The work a SiteGround challenge page asks for.
+pub fn siteground_work(body: &str) -> Option<SgWork> {
+    let constant = |name: &str| {
+        let at = body.find(&format!("const {name}=\""))? + name.len() + 8;
+        let rest = &body[at..];
+        Some(rest[..rest.find('"')?].to_string())
+    };
+    let challenge = constant("sgchallenge")?;
+    let submit = constant("sgsubmit_url")?;
+    let bits: u32 = challenge.split(':').next()?.parse().ok()?;
+    (submit.starts_with("/.well-known/sgcaptcha/") && (1..=SG_MAX_BITS).contains(&bits))
+        .then_some(SgWork { challenge, submit })
+}
+
+/// The counter's bytes as the page encodes them: big-endian, as few bytes as
+/// hold it (at least one).
+fn sg_counter(n: u32) -> ([u8; 4], usize) {
+    let bytes = n.to_be_bytes();
+    let used = (4 - n.leading_zeros() as usize / 8).max(1);
+    (bytes, used)
+}
+
+/// Does this digest answer a `bits` challenge? Its first 32-bit word starts
+/// with `bits` zero bits. The page's program treats an all-zero first word as
+/// a failed hash, so it does here too.
+fn sg_meets(digest: &[u8; 20], bits: u32) -> bool {
+    let word = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    word != 0 && word >> (32 - bits) == 0
+}
+
+/// Solve `work`: the `sol` value and how many hashes it took, or `None` when
+/// the deadline passes first. Several threads search interleaved counters.
+pub fn siteground_solve(work: &SgWork, deadline: std::time::Instant) -> Option<(String, u64)> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let bits: u32 = work.challenge.split(':').next()?.parse().ok()?;
+    if !(1..=SG_MAX_BITS).contains(&bits) || std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let prefix = work.challenge.as_bytes();
+    let mut base = btls::sha::Sha1::new();
+    base.update(prefix);
+    let threads = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .clamp(1, 4) as u32;
+    let done = AtomicBool::new(false);
+    let hashes = AtomicU64::new(0);
+    let found: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for lane in 0..threads {
+            let (base, done, hashes, found) = (&base, &done, &hashes, &found);
+            scope.spawn(move || {
+                // The page's workers start from a non-zero counter.
+                let mut n = 1 + lane;
+                let mut local = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    let (bytes, used) = sg_counter(n);
+                    let mut hasher = base.clone();
+                    hasher.update(&bytes[4 - used..]);
+                    local += 1;
+                    if sg_meets(&hasher.finish(), bits) {
+                        done.store(true, Ordering::Relaxed);
+                        if let Ok(mut slot) = found.lock() {
+                            slot.get_or_insert(n);
+                        }
+                        break;
+                    }
+                    if local.is_multiple_of(4096) && std::time::Instant::now() >= deadline {
+                        done.store(true, Ordering::Relaxed);
+                    }
+                    n = match n.checked_add(threads) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+                hashes.fetch_add(local, Ordering::Relaxed);
+            });
+        }
+    });
+    let n = (*found.lock().ok()?)?;
+    let (bytes, used) = sg_counter(n);
+    let mut message = prefix.to_vec();
+    message.extend_from_slice(&bytes[4 - used..]);
+    Some((btls::base64::encode_block(&message), hashes.into_inner()))
+}
+
+/// Where the page's program navigates with its answer.
+pub fn siteground_answer_path(work: &SgWork, sol: &str, ms: u128, hashes: u64) -> String {
+    let joiner = if work.submit.contains('?') { '&' } else { '?' };
+    let sol: String = sol
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("{}{joiner}sol={sol}&s={ms}:{hashes}", work.submit)
+}
+
+#[cfg(test)]
+mod siteground_tests {
+    use super::*;
+
+    const STUB: &str = r#"<html><head><link rel="icon" href="data:;"><meta http-equiv="refresh" content="0;/.well-known/sgcaptcha/?r=%2Farticles%2Fx&y=ipc:1.2.3.4:1794082224.253"></meta></head></html>"#;
+
+    #[test]
+    fn the_stub_names_the_challenge_page() {
+        assert_eq!(
+            siteground_stub(STUB).as_deref(),
+            Some("/.well-known/sgcaptcha/?r=%2Farticles%2Fx&y=ipc:1.2.3.4:1794082224.253")
+        );
+        assert_eq!(
+            siteground_stub("<html><p>about /.well-known/</p></html>"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_challenge_page_carries_its_work() {
+        let page = r#"<script>const sgchallenge="12:1794082256:7189c18e:9b5e:";
+const sgsubmit_url="/.well-known/sgcaptcha/?r=%2Fa";const sgfallback_url="/x";</script>"#;
+        let work = siteground_work(page).unwrap();
+        assert_eq!(work.challenge, "12:1794082256:7189c18e:9b5e:");
+        assert_eq!(work.submit, "/.well-known/sgcaptcha/?r=%2Fa");
+        // Too much work, or a submit address off the challenge path, is refused.
+        assert!(siteground_work(&page.replace("\"12:", "\"30:")).is_none());
+        assert!(siteground_work(
+            &page.replace("/.well-known/sgcaptcha/?r", "https://x.example/?r")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn the_counter_is_minimal_big_endian() {
+        let enc = |n| {
+            let (b, used) = sg_counter(n);
+            b[4 - used..].to_vec()
+        };
+        assert_eq!(enc(0), vec![0]);
+        assert_eq!(enc(255), vec![255]);
+        assert_eq!(enc(256), vec![1, 0]);
+        assert_eq!(enc(0x01_00_00_00), vec![1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_solution_meets_the_ask_and_encodes_the_hashed_bytes() {
+        let work = SgWork {
+            challenge: "14:1794082256:7189c18e:9b5e9f1d:".into(),
+            submit: "/.well-known/sgcaptcha/?r=%2Fa".into(),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let (sol, hashes) = siteground_solve(&work, deadline).unwrap();
+        assert!(hashes > 0);
+        // The answer decodes to challenge ‖ counter and its SHA-1 meets 14 bits.
+        let decoded = {
+            let mut out = Vec::new();
+            let table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let (mut acc, mut nbits) = (0u32, 0);
+            for c in sol.trim_end_matches('=').chars() {
+                acc = (acc << 6) | table.find(c).unwrap() as u32;
+                nbits += 6;
+                if nbits >= 8 {
+                    nbits -= 8;
+                    out.push((acc >> nbits) as u8);
+                    acc &= (1 << nbits) - 1;
+                }
+            }
+            out
+        };
+        assert!(decoded.starts_with(work.challenge.as_bytes()));
+        assert!(sg_meets(&btls::sha::sha1(&decoded), 14));
+        let path = siteground_answer_path(&work, &sol, 120, hashes);
+        assert!(
+            path.starts_with("/.well-known/sgcaptcha/?r=%2Fa&sol="),
+            "{path}"
+        );
+        let value = &path[path.find("sol=").unwrap() + 4..path.find("&s=").unwrap()];
+        assert!(!value.contains(['+', '/', '=']), "{path}");
+    }
+
+    #[test]
+    fn a_passed_deadline_gives_up() {
+        let work = SgWork {
+            challenge: "24:1:2:3:".into(),
+            submit: "/.well-known/sgcaptcha/?r=%2Fa".into(),
+        };
+        assert!(siteground_solve(&work, std::time::Instant::now()).is_none());
+    }
+}

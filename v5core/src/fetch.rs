@@ -944,6 +944,156 @@ impl Worker {
         }
     }
 
+    /// Answer SiteGround's proof of work as `identity`
+    /// ([`crate::challenge::siteground_work`]): reach the challenge page from
+    /// the stub, solve it, send the answer, and ask for the stub's page again
+    /// with the clearance it earned. `None` when a step fails, the deadline
+    /// cannot fit the work, or the page still does not pass.
+    #[allow(clippy::too_many_arguments)]
+    fn answer_siteground(
+        &mut self,
+        url: &str,
+        host: &str,
+        identity: &'static Identity,
+        options: &Options,
+        (contract, generic): (&Contract, bool),
+        response: &crate::http::Response,
+        (started, first_ms): (Instant, f64),
+        attempts: &mut Vec<Attempt>,
+    ) -> Option<Outcome> {
+        use crate::challenge::{
+            siteground_answer_path, siteground_solve, siteground_stub, siteground_work,
+        };
+        let base = url::Url::parse(&response.url).ok()?;
+        let page_host = base.host_str()?.to_ascii_lowercase();
+        // Every request stays on the page's own host and is asked of the
+        // caller's hop guard like any navigation.
+        let same_host = |next: &str| -> Option<String> {
+            let next = base.join(next).ok()?;
+            let host_ok = matches!(next.scheme(), "http" | "https")
+                && next.host_str().map(str::to_ascii_lowercase).as_deref()
+                    == Some(page_host.as_str());
+            let next = next.to_string();
+            let allowed = options
+                .policy
+                .hop
+                .as_ref()
+                .is_none_or(|guard| guard(&response.url, &next) == crate::http::Hop::Follow);
+            (host_ok && allowed).then_some(next)
+        };
+        let remaining = || options.deadline.saturating_sub(started.elapsed());
+        self.state.store_cookies(
+            &page_host,
+            identity.name,
+            response.cookies.iter().map(stored).collect(),
+        );
+        let work = match siteground_work(&response.body) {
+            Some(work) => work,
+            None => {
+                let page = same_host(&siteground_stub(&response.body)?)?;
+                let cookie = self.state.cookie_header_for(&page, identity.name);
+                let served = self
+                    .wire(identity)
+                    .ok()?
+                    .get_arriving(
+                        &page,
+                        cookie.as_deref(),
+                        identity,
+                        remaining(),
+                        &response.url,
+                    )
+                    .ok()?;
+                self.state.store_cookies(
+                    &page_host,
+                    identity.name,
+                    served.cookies.iter().map(stored).collect(),
+                );
+                siteground_work(&served.body)?
+            }
+        };
+        // The work must leave time for the answer and the page after it.
+        let solve_by = started + options.deadline.checked_sub(Duration::from_millis(1500))?;
+        let solving = Instant::now();
+        let (sol, hashes) = siteground_solve(&work, solve_by)?;
+        let answer_url = same_host(&siteground_answer_path(
+            &work,
+            &sol,
+            solving.elapsed().as_millis(),
+            hashes,
+        ))?;
+        let cookie = self.state.cookie_header_for(&answer_url, identity.name);
+        let answered = self
+            .wire(identity)
+            .ok()?
+            .get(&answer_url, cookie.as_deref(), identity, remaining())
+            .ok()?;
+        self.state.store_cookies(
+            &page_host,
+            identity.name,
+            answered.cookies.iter().map(stored).collect(),
+        );
+        let cookie = self.state.cookie_header_for(&response.url, identity.name);
+        let next = self
+            .wire(identity)
+            .ok()?
+            .get(&response.url, cookie.as_deref(), identity, remaining())
+            .ok()?;
+        let content = verify_response(
+            next.status,
+            &next.headers,
+            &next.body,
+            &next.url,
+            contract,
+            generic,
+        );
+        let verdict = classify(Evidence {
+            status: next.status,
+            body: &next.body,
+            content_ok: content.passed,
+            headers: &next.headers,
+        });
+        attempts.push(Attempt {
+            identity: identity.name.to_string(),
+            transport: "document".to_string(),
+            class: verdict.class,
+            status: next.status,
+            ms: next.elapsed_ms,
+            bytes: next.body.len(),
+            version: next.version.clone(),
+            title: content.title.clone(),
+            note: Some(format!(
+                "siteground proof of work answered ({hashes} hashes)"
+            )),
+        });
+        if verdict.class != Class::Content {
+            return None;
+        }
+        if self.persist {
+            self.state
+                .record(host, identity.name, "content", true, next.elapsed_ms);
+            self.save_state();
+        }
+        Some(Outcome {
+            title: content.title,
+            text_chars: content.text_chars,
+            evidence: vec!["siteground proof of work".into()],
+            ..answer(
+                url,
+                host.to_string(),
+                &next,
+                Class::Content,
+                identity.name,
+                Ended {
+                    started,
+                    first_ms,
+                    attempts: std::mem::take(attempts),
+                    spent_state: true,
+                    capture: options.capture_body,
+                },
+            )
+        })
+    }
+
     fn encounter(&mut self, url: &str, options: &Options) -> Outcome {
         let started = Instant::now();
         self.proxy = options.proxy.clone();
@@ -1026,6 +1176,7 @@ impl Worker {
         let mut last_headers: Vec<(String, String)> = Vec::new();
         let mut last_raw: Option<Vec<u8>> = None;
         let mut handoff_taken = false;
+        let mut siteground_taken = false;
         if options.pace_ms > 0 {
             self.state.pace(&host, options.pace_ms);
         }
@@ -1617,6 +1768,30 @@ impl Worker {
                             }
                         }
                     }
+                }
+            }
+
+            // SiteGround's proof of work: the challenge page carries all of it, and
+            // the answer is one request whose clearance the stub's own URL then
+            // accepts. Once per encounter, as the identity that was challenged.
+            if !siteground_taken
+                && verdict
+                    .wall
+                    .as_ref()
+                    .is_some_and(|wall| wall.vendor == "siteground")
+            {
+                siteground_taken = true;
+                if let Some(outcome) = self.answer_siteground(
+                    url,
+                    &host,
+                    identity,
+                    options,
+                    (&contract, generic),
+                    &response,
+                    (started, first_ms),
+                    &mut attempts,
+                ) {
+                    return outcome;
                 }
             }
 
