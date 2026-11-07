@@ -151,6 +151,22 @@ pub fn plain(el: ElementRef<'_>) -> String {
     visible_text(el)
 }
 
+/// True when text running straight on from an element's words starts a
+/// new word a browser would show apart: a badge or label (`TL;DR`,
+/// `Note:`, `NEW`) set off by style, then a capitalised word. A word split
+/// across elements (`<b>T</b>he`, `<span>Java</span>Script`) never
+/// matches: its left side ends in a lowercase letter or its right side
+/// does not start a capitalised word.
+fn label_glued(buf: &str, text: &str) -> bool {
+    let Some(left) = buf.trim_end_matches(['*', '_']).chars().next_back() else {
+        return false;
+    };
+    let mut right = text.chars();
+    let starts_word = right.next().is_some_and(char::is_uppercase)
+        && right.next().is_some_and(char::is_lowercase);
+    starts_word && (left.is_uppercase() || matches!(left, ':' | ';' | '.' | '!' | '?'))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     el: ElementRef<'_>,
@@ -169,11 +185,16 @@ fn render(
     // The last sibling run's closing marker, so the next run of the
     // same kind can continue it instead of opening right after it.
     let mut closer = None;
+    let mut after_element = false;
     for child in el.children() {
+        let element_before = std::mem::replace(&mut after_element, child.value().is_element());
         match child.value() {
             Node::Text(t) => {
                 let s = t.text.as_ref();
                 if !s.trim().is_empty() {
+                    if element_before && label_glued(buf, s) {
+                        buf.push(' ');
+                    }
                     buf.push_str(&escape_md_text(s, buf, emph.any()));
                     *total += s.trim().len();
                 } else if !s.is_empty() && !buf.is_empty() && !buf.ends_with(is_edge) {
@@ -546,7 +567,27 @@ fn push_emphasized(
 /// boundaries is handled.
 /// With `in_emphasis`, a `*` or `_` that is the node's first or last
 /// non-whitespace character is always escaped.
+/// The words of a text that is wholly `**words**`: one bold span, its
+/// words starting and ending on a visible character, no `*` inside.
+fn leaked_bold(s: &str) -> Option<&str> {
+    let inner = s.trim().strip_prefix("**")?.strip_suffix("**")?;
+    let edges_visible = inner
+        .chars()
+        .next()
+        .zip(inner.chars().next_back())
+        .is_some_and(|(a, z)| !a.is_whitespace() && !z.is_whitespace());
+    (edges_visible && !inner.contains('*')).then_some(inner)
+}
+
 fn escape_md_text(s: &str, buf: &str, in_emphasis: bool) -> String {
+    // A page whose CMS printed its markdown unrendered (`**Plan**` as
+    // the whole text of a table header) meant bold: keep the markers,
+    // escape only what is inside them.
+    if !in_emphasis && let Some(inner) = leaked_bold(s) {
+        let lead = &s[..s.len() - s.trim_start().len()];
+        let tail = &s[s.trim_end().len()..];
+        return format!("{lead}**{}**{tail}", escape_md_text(inner, "*", false));
+    }
     let chars: Vec<char> = s.chars().collect();
     // Inside emphasis, the node's outermost visible characters can
     // land next to a marker (`push_emphasized` moves edge whitespace
@@ -861,6 +902,60 @@ mod tests {
     fn intraword_asterisks_are_escaped() {
         let result = render_inline("<p>a*b*c</p>");
         assert_eq!(result, "a\\*b\\*c");
+    }
+
+    #[test]
+    fn a_label_badge_is_not_glued_to_the_sentence() {
+        let opts = super::super::ExtractOptions::default();
+        let md = |h: &str| {
+            let html = Html::parse_fragment(h);
+            let p = html
+                .select(&scraper::Selector::parse("p").unwrap())
+                .next()
+                .unwrap();
+            markdown(p, "https://example.com/", &opts).0
+        };
+        assert_eq!(
+            md("<p><span>TL;DR</span>Three tiers apply.</p>"),
+            "TL;DR Three tiers apply."
+        );
+        assert_eq!(
+            md("<p><b>Note:</b>The fee is due.</p>"),
+            "**Note:** The fee is due."
+        );
+        assert_eq!(
+            md("<p><span>NEW</span>Faster builds</p>"),
+            "NEW Faster builds"
+        );
+        // Words split across elements stay whole.
+        assert_eq!(md("<p><span>T</span>he cat</p>"), "The cat");
+        assert_eq!(
+            md("<p><span>Java</span>Script engines</p>"),
+            "JavaScript engines"
+        );
+        assert_eq!(md("<p><span>U.S.</span>-based</p>"), "U.S.-based");
+        assert_eq!(md("<p><abbr>HTML</abbr>5 parser</p>"), "HTML5 parser");
+    }
+
+    #[test]
+    fn leaked_markdown_bold_stays_bold() {
+        let html = Html::parse_fragment(
+            "<p><b>x</b></p><table><tr><th>**Maximum Penalty**</th><th>**a*b**</th><th>** spaced **</th></tr></table>",
+        );
+        let opts = super::super::ExtractOptions::default();
+        let th: Vec<String> = html
+            .select(&scraper::Selector::parse("th").unwrap())
+            .map(|el| markdown(el, "https://example.com/", &opts).0)
+            .collect();
+        assert_eq!(th[0], "**Maximum Penalty**");
+        // Anything else that looks like markers stays literal.
+        assert!(
+            th[1].starts_with("\\*") && th[2].starts_with("\\*"),
+            "{th:?}"
+        );
+        assert_eq!(leaked_bold("**x**"), Some("x"));
+        assert_eq!(leaked_bold("****"), None);
+        assert_eq!(leaked_bold("a **x**"), None);
     }
 
     #[test]

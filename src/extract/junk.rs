@@ -184,6 +184,16 @@ pub fn skip(el: ElementRef<'_>) -> bool {
     if name == "math" {
         return false;
     }
+    // An inactive tab is hidden until its tab is clicked: its panel is
+    // the page's content all the same (a pricing page's other plans).
+    // A carousel's cloned slide copies a real one and stays skipped.
+    if e.attr("role") == Some("tabpanel")
+        && !e
+            .attr("class")
+            .is_some_and(|c| c.to_ascii_lowercase().contains("clone"))
+    {
+        return false;
+    }
     if e.attr("hidden").is_some() && !has_math_descendant(el) {
         return true;
     }
@@ -302,6 +312,27 @@ mod ad_slot_tests {
         let root = document.root_element();
         let el = root.children().filter_map(ElementRef::wrap).next().unwrap();
         skip(el)
+    }
+
+    #[test]
+    fn an_inactive_tab_panel_is_content() {
+        assert!(!skipped(
+            r#"<div role="tabpanel" aria-hidden="true" inert=""><table><tr><td>CPU time</td><td>$0.02</td></tr></table></div>"#
+        ));
+        assert!(!skipped(
+            r#"<div role="tabpanel" hidden><p>Annual plans</p></div>"#
+        ));
+        assert!(!skipped(
+            r#"<div role="tabpanel" style="display:none"><p>Annual plans</p></div>"#
+        ));
+        // Hidden content that is not a tab panel stays out, and so does a
+        // carousel's clone of a slide.
+        assert!(skipped(
+            r#"<div aria-hidden="true"><p>Annual plans</p></div>"#
+        ));
+        assert!(skipped(
+            r#"<div role="tabpanel" class="slick-slide slick-cloned" aria-hidden="true"><p>Slide</p></div>"#
+        ));
     }
 
     // #288: ad slots never ship as content.

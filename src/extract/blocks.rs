@@ -395,6 +395,20 @@ fn walk<'a>(
                 );
             }
         }
+        // Old pages indent with <blockquote>: one that holds a table, a
+        // list, code or headings is layout, and quoting it would flatten
+        // that structure into one line of text.
+        "blockquote" if holds_structure(el) => {
+            for child in el.children() {
+                let Some(child_el) = ElementRef::wrap(child) else {
+                    continue;
+                };
+                if crate::extract::junk::skip(child_el) {
+                    continue;
+                }
+                walk(child_el, base, opts, headings, out, depth + 1, card);
+            }
+        }
         "blockquote" => {
             let (md, _) = inline::markdown(el, base, opts);
             if !md.is_empty() {
@@ -547,6 +561,17 @@ struct Card {
     url: String,
     /// Only a heading takes the link: the card has one.
     heading_only: bool,
+}
+
+/// True when an element holds structure a quote cannot carry: a table,
+/// a list, preformatted code or a heading.
+fn holds_structure(el: ElementRef<'_>) -> bool {
+    el.descendants().filter_map(ElementRef::wrap).any(|d| {
+        matches!(
+            d.value().name(),
+            "table" | "ul" | "ol" | "pre" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        )
+    })
 }
 
 /// True when an element holds a heading.

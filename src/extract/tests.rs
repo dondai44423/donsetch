@@ -3346,3 +3346,16 @@ fn an_empty_link_renders_nothing() {
     assert!(!ex.markdown.contains("[]("), "{}", ex.markdown);
     assert!(ex.markdown.contains("the report"), "{}", ex.markdown);
 }
+
+// sqlite.org indents its tables with <blockquote>: the table must stay a
+// table, not one quoted line of every cell run together.
+#[test]
+fn a_table_indented_by_a_blockquote_stays_a_table() {
+    let html = r#"<html><body><article><h2>Affinity</h2><p>The following table shows how common names map onto affinities in this database engine.</p>
+<blockquote><table><tr><th>Typename</th><th>Affinity</th></tr><tr><td>INT<br>BIGINT</td><td>INTEGER</td></tr><tr><td>TEXT</td><td>TEXT</td></tr></table></blockquote>
+<blockquote><p>A real quotation stays quoted, as a quotation should be.</p></blockquote></article></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(md.contains("| Typename | Affinity |"), "{md}");
+    assert!(md.contains("| TEXT | TEXT |"), "{md}");
+    assert!(md.contains("> A real quotation stays quoted"), "{md}");
+}
