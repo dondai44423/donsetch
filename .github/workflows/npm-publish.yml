@@ -14,13 +14,15 @@
 # - If the version is already on the registry the publish is skipped
 #   (re-publishing the same version is an npm error).
 #
-# Requires the NPM_TOKEN repo secret (an npm automation token for
-# the dondai1234 account, no 2FA prompt on CI).
+# Auth is npm trusted publishing (OIDC): npmjs.com trusts this repo's
+# npm-publish.yml, so no token secret exists. It needs `id-token: write`
+# and npm >= 11.5.1; provenance is attached automatically.
 
 name: npm publish
 
 permissions:
   contents: read
+  id-token: write
 
 on:
   release:
@@ -28,7 +30,7 @@ on:
     # `prereleased` instead, so without this line no prerelease ever reached
     # npm (the `beta` dist-tag still pointed at 0.5.0-beta.1).
     types: [released, prereleased]
-  # Manual run: proves the NPM_TOKEN secret and the guards without minting a
+  # Manual run: proves the trusted-publisher setup and the guards without minting a
   # release. Publishes the newest published release - prereleases included,
   # which `releases/latest` skips - or the tag given.
   workflow_dispatch:
@@ -52,6 +54,10 @@ jobs:
         with:
           node-version: '22'
           registry-url: https://registry.npmjs.org/
+
+      # Trusted publishing needs npm 11.5.1+; Node 22 ships npm 10.
+      - name: Upgrade npm
+        run: npm install -g npm@11
 
       - name: Assert npm version matches the release tag
         env:
@@ -105,8 +111,6 @@ jobs:
         run: cp LICENSE npm/LICENSE
 
       - name: Publish (skip if already on the registry)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: npm
         run: |
           VERSION=$(node -p "require('./package.json').version")
