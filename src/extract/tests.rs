@@ -3245,6 +3245,7 @@ fn content_figure_emits_each_image_once_and_keeps_its_caption() {
             ex.markdown
         );
     }
+}
 
 // Bare-digit and single-letter superscripts are exponents, units and
 // powers, not citation markers: km², 10⁹, mc², xⁿ.

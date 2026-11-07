@@ -1378,6 +1378,7 @@ fn outline_tree_with_repeated_titles_keeps_every_item() {
         ("Introduction".into(), 1, Some(0)),
     ];
     assert_eq!(items, want);
+}
 
 /// /Kids [missing, PUA-text page (, ordinary text page)]: PDFium trusts
 /// /Count, FPDF_LoadPage(0) returns null and the engine skips it, so
@@ -1492,6 +1493,7 @@ fn ocr_with_every_page_loaded_replaces_only_the_unreadable_page() {
     assert!(text.contains("KEEP-ME"), "text page lost: {text:?}");
     let pages: Vec<(usize, bool)> = parsed.pages_meta.iter().map(|m| (m.page, m.ocr)).collect();
     assert_eq!(pages, [(0, true), (1, false)]);
+}
 
 /// A borderless 3-column table, one text object per cell (the shape
 /// report generators and spreadsheet exports emit): the gap between two

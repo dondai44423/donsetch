@@ -1531,7 +1531,6 @@ mod session_tests {
     }
 }
 
-
 #[cfg(test)]
 mod launch_tests {
     use super::*;

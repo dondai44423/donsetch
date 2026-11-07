@@ -3837,7 +3837,6 @@ async fn same_site_twins_are_fetched_once() {
     assert_eq!(r.map, ["https://ex.com/a", "https://ex.com/b"]);
 }
 
-
 // A gate rides each worker request into the fetch layer, which can hold
 // the request after the crawl has returned.
 #[tokio::test]
