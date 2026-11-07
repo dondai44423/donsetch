@@ -24,11 +24,19 @@ permissions:
 
 on:
   release:
-    types: [released]
-  # Manual run: proves the NPM_TOKEN secret and the guards without
-  # minting a release. Resolves the repo's latest release as the
-  # tag under test.
+    # `released` is a normal release; publishing a beta or rc draft fires
+    # `prereleased` instead, so without this line no prerelease ever reached
+    # npm (the `beta` dist-tag still pointed at 0.5.0-beta.1).
+    types: [released, prereleased]
+  # Manual run: proves the NPM_TOKEN secret and the guards without minting a
+  # release. Publishes the newest published release - prereleases included,
+  # which `releases/latest` skips - or the tag given.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (default: the newest published release)'
+        required: false
+        type: string
 
 jobs:
   publish:
@@ -36,6 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The tag under test, so npm/package.json is the one being published.
+          ref: ${{ inputs.tag || github.event.release.tag_name || github.ref }}
 
       - uses: actions/setup-node@v7
         with:
@@ -45,13 +56,14 @@ jobs:
       - name: Assert npm version matches the release tag
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_VERSION: ${{ github.event.release.tag_name }}
+          TAG_VERSION: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
-          # Manual runs carry no release context: test against the
-          # repo's latest published release instead.
+          # Manual runs carry no release context: the newest published release,
+          # prereleases included, or the tag given.
           if [ -z "$TAG_VERSION" ]; then
-            TAG_VERSION=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
-            echo "manual run: testing against latest release $TAG_VERSION"
+            TAG_VERSION=$(gh api repos/${{ github.repository }}/releases \
+              --jq '[.[] | select(.draft == false)][0].tag_name')
+            echo "manual run: testing against the newest published release $TAG_VERSION"
           fi
           TAGVER="${TAG_VERSION#v}"
           PKGVER=$(node -p "require('./npm/package.json').version")
@@ -131,7 +143,8 @@ jobs:
           fi
           TAG="$RELEASE_TAG"
           if [ -z "$TAG" ]; then
-            TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq '.tag_name')
+            TAG=$(gh api repos/${{ github.repository }}/releases \
+              --jq '[.[] | select(.draft == false)][0].tag_name')
           fi
           export GH_TOKEN="$DOWNSTREAM_TOKEN"
           gh api repos/dondai44423/homebrew-donsetch/dispatches \
