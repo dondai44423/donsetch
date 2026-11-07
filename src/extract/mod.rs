@@ -384,7 +384,7 @@ pub fn extract(
     // types (text/xml, application/rss+xml…) never say "html".
     if !is_pdf
         && feed::is_feed(&ct, body)
-        && let Some(ex) = feed::extract(body, url, opts)
+        && let Some(ex) = feed::extract(body, content_type, url, opts)
     {
         return Ok(ex);
     }
@@ -404,7 +404,7 @@ pub fn extract(
         !ct.is_empty() && !ct.contains("html") && !is_pdf && body_starts_with_html(body);
 
     if !ct.is_empty() && !ct.contains("html") && !is_pdf && !plain_is_html {
-        let text = String::from_utf8_lossy(body);
+        let text = charset::decode_declared(body, content_type);
         if let Some(v) = crate::detect::walls::text_wall(&text)
             && !(opts.verified && bot_wall(v))
         {

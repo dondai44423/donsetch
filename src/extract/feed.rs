@@ -42,8 +42,16 @@ pub fn is_feed(content_type: &str, body: &[u8]) -> bool {
     false
 }
 
-pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracted> {
-    let text = String::from_utf8_lossy(body);
+/// Render a feed as markdown. `content_type` is the response's
+/// Content-Type header; the body is decoded with
+/// `charset::decode_declared`.
+pub fn extract(
+    body: &[u8],
+    content_type: &str,
+    url: &str,
+    opts: &ExtractOptions,
+) -> Option<Extracted> {
+    let text = super::charset::decode_declared(body, content_type);
     let trimmed = text.trim_start();
     if trimmed.starts_with('{') {
         extract_json_feed(&text, url, opts)
@@ -390,6 +398,7 @@ mod tests {
         </channel></rss>"#;
         let ex = extract(
             rss.as_bytes(),
+            "application/rss+xml",
             "https://feeds.example/rss.xml",
             &ExtractOptions::default(),
         )
@@ -421,6 +430,7 @@ mod tests {
         </feed>"#;
         let ex = extract(
             atom.as_bytes(),
+            "application/atom+xml",
             "https://example.com/feed.atom",
             &ExtractOptions::default(),
         )
@@ -437,6 +447,7 @@ mod tests {
         let jf = r#"{"version":"https://jsonfeed.org/version/1.1","title":"My Feed","home_page_url":"https://example.com","items":[{"id":"1","title":"Item One","url":"https://example.com/1","date_published":"2026-08-15T00:00:00Z","content_text":"Item one body text."}]}"#;
         let ex = extract(
             jf.as_bytes(),
+            "application/feed+json",
             "https://example.com/feed.json",
             &ExtractOptions::default(),
         )
@@ -449,7 +460,15 @@ mod tests {
     #[test]
     fn empty_channel_is_none() {
         let rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Empty</title></channel></rss>"#;
-        assert!(extract(rss.as_bytes(), "https://x/rss", &ExtractOptions::default()).is_none());
+        assert!(
+            extract(
+                rss.as_bytes(),
+                "application/rss+xml",
+                "https://x/rss",
+                &ExtractOptions::default()
+            )
+            .is_none()
+        );
     }
 }
 

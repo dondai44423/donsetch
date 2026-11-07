@@ -1444,6 +1444,97 @@ fn charset_meta_charset_tag() {
     assert!(r.markdown.contains("Café"));
 }
 
+const RU_FEED: &str = "<rss version=\"2.0\"><channel><title>Новости</title><link>https://news.example/</link><item><title>Первая новость дня</title><link>https://news.example/1</link><description>Текст.</description></item></channel></rss>";
+
+fn feed_markdown(body: &[u8], content_type: &str) -> String {
+    extract(
+        body,
+        content_type,
+        "https://news.example/feed",
+        &ExtractOptions::default(),
+    )
+    .unwrap()
+    .markdown
+}
+
+#[test]
+fn plain_text_honours_its_declared_charset() {
+    let (cp1251, _, _) = encoding_rs::WINDOWS_1251.encode("Привет, мир! Обычный текстовый файл.\n");
+    let ex = extract(
+        &cp1251,
+        "text/plain; charset=windows-1251",
+        "https://example.com/a.txt",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(ex.markdown.contains("Привет, мир!"), "{:?}", ex.markdown);
+    let (latin1, _, _) = encoding_rs::WINDOWS_1252.encode("Café crème, Größe 12 °C, £5.\n");
+    let ex = extract(
+        &latin1,
+        "text/plain; charset=iso-8859-1",
+        "https://example.com/b.txt",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert!(ex.markdown.contains("Café crème"), "{:?}", ex.markdown);
+}
+
+#[test]
+fn feed_honours_its_xml_encoding() {
+    let feed = format!("<?xml version=\"1.0\" encoding=\"windows-1251\"?>{RU_FEED}");
+    let (bytes, _, _) = encoding_rs::WINDOWS_1251.encode(&feed);
+    let md = feed_markdown(&bytes, "application/rss+xml");
+    assert!(md.contains("Первая новость дня"), "{md:?}");
+}
+
+#[test]
+fn feed_honours_a_header_charset() {
+    let (bytes, _, _) = encoding_rs::WINDOWS_1251.encode(RU_FEED);
+    let md = feed_markdown(&bytes, "application/rss+xml; charset=windows-1251");
+    assert!(md.contains("Первая новость дня"), "{md:?}");
+}
+
+// RFC 7303 §3.2: without a BOM, the charset parameter is authoritative
+// over the XML declaration.
+#[test]
+fn a_header_charset_outranks_the_xml_declaration() {
+    for (header, declared) in [("windows-1251", "iso-8859-1"), ("utf-8", "windows-1251")] {
+        let feed = format!("<?xml version=\"1.0\" encoding=\"{declared}\"?>{RU_FEED}");
+        let bytes = encoding_rs::Encoding::for_label(header.as_bytes())
+            .unwrap()
+            .encode(&feed)
+            .0;
+        let md = feed_markdown(&bytes, &format!("application/rss+xml; charset={header}"));
+        assert!(md.contains("Первая новость дня"), "{header}: {md:?}");
+    }
+}
+
+#[test]
+fn undeclared_utf8_text_and_feeds_still_decode_as_utf8() {
+    // The word "charset" in a text body is not a declaration.
+    let text = "Größe 12 °C, café.\nThe old copy was served with charset=iso-8859-1.\n";
+    let ex = extract(
+        text.as_bytes(),
+        "text/plain",
+        "https://example.com/c.txt",
+        &ExtractOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(ex.markdown, text);
+    for (prolog, content_type) in [
+        ("<?xml version=\"1.0\"?>", "application/rss+xml"),
+        (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "text/xml; charset=utf-8",
+        ),
+    ] {
+        let md = feed_markdown(format!("{prolog}{RU_FEED}").as_bytes(), content_type);
+        assert!(md.contains("# Новости"), "{md:?}");
+        assert!(md.contains("Первая новость дня"), "{md:?}");
+        assert!(!md.contains('\u{FFFD}'), "{md:?}");
+    }
+}
+
 // ════════════════════════════════════════════════════════════
 // 16. CSS SELECTOR
 // ════════════════════════════════════════════════════════════
