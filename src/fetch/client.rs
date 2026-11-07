@@ -886,91 +886,20 @@ mod fetcher_tests {
         owned_status_fetch(200).await;
     }
 
-    /// A fetch-pool lane whose proxy URL v5 cannot read fails each read with
-    /// a proxy configuration error, whatever the proxy's host is called. That
-    /// is the configuration, not the lane: the lane is not benched, so the
-    /// next read fails the same way instead of falling to the direct egress.
-    /// Sets DONSETCH_CACHE_DIR and installs the process config: depends on
-    /// nextest's one process per test.
-    #[tokio::test]
-    async fn a_lane_whose_proxy_url_v5_cannot_read_is_not_benched() {
-        use crate::search::egress::EgressPool;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir =
-            std::env::temp_dir().join(format!("donsetch-lane-proxy-config-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        // SAFETY: test-only mutation of the process env; nextest runs
-        // each test in its own process.
-        unsafe {
-            std::env::set_var("DONSETCH_CACHE_DIR", &dir);
-        }
-        let mut config = crate::config::DonsetchConfig::default();
-        config.proxy.from_environment = false;
-        config.proxy.fetch_rotate = true;
-        config.fetch.allow_private_egress = true;
-        crate::config::install(config).unwrap();
-        // The origin answers anyone who reaches it, and counts them.
-        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/page", origin.local_addr().unwrap());
-        let direct = Arc::new(AtomicUsize::new(0));
-        let reached = Arc::clone(&direct);
-        let server = tokio::spawn(async move {
-            while let Ok((mut socket, _)) = origin.accept().await {
-                reached.fetch_add(1, Ordering::SeqCst);
-                let mut head = Vec::new();
-                while !head.ends_with(b"\r\n\r\n") && head.len() < 16384 {
-                    let Ok(byte) = socket.read_u8().await else {
-                        break;
-                    };
-                    head.push(byte);
-                }
-                let body =
-                    "<article><h1>Direct</h1><p>From this machine's own address.</p></article>";
-                let _ = socket
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await;
-            }
-        });
+    /// A proxy URL v5 cannot read is the configuration, not the lane: the
+    /// error names the proxy's host ("connect.example.net"), and the text arms
+    /// must not read that as a dead lane, or the next read would fall to the
+    /// direct egress. A lane that refuses the connection is still benched.
+    #[test]
+    fn a_proxy_configuration_error_is_not_lane_health() {
         for host in ["proxy.example.net", "connect.example.net"] {
-            let lane = proxy::Proxy::parse(&format!("socks5://alice:pa/ss@{host}:1080")).unwrap();
-            let pool = Arc::new(EgressPool::new(vec![lane.clone()]));
-            let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default())
-                .unwrap()
-                .with_egress(Arc::clone(&pool));
-            let mut reads = Vec::new();
-            for _ in 0..2 {
-                let result = fetcher.fetch_persona(&url).await.map(|out| out.status);
-                reads.push((result, pool.is_dead(&lane.id())));
-            }
-            assert!(
-                reads.iter().all(|(result, benched)| {
-                    matches!(result, Err(FetchError::ProxyConfig(_))) && !benched
-                }),
-                "{host}: (read, lane benched after it) {reads:?}; the origin took {} direct request(s)",
-                direct.load(Ordering::SeqCst)
-            );
-            let error = FetchError::ProxyConfig(v5core::proxy_url(&lane.wire_url()).unwrap_err());
+            let error = FetchError::ProxyConfig(format!(
+                "cannot read proxy URL \"socks5h://***@{host}:1080\": invalid port number"
+            ));
             assert_eq!(lane_note(&error), None, "{error}");
-            // Negative: a lane that refuses the connection is still benched.
-            note_lane_outcome(
-                &pool,
-                "127.0.0.1",
-                &lane.id(),
-                &FetchError::Io(std::io::Error::other("connection refused")),
-            );
-            assert!(pool.is_dead(&lane.id()), "{host}");
         }
-        server.abort();
-        assert_eq!(direct.load(Ordering::SeqCst), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        let refused = FetchError::Io(std::io::Error::other("connection refused"));
+        assert!(lane_note(&refused).is_some(), "{refused}");
     }
 
     // In-process loopback mock: the runtime hosting the mock must keep

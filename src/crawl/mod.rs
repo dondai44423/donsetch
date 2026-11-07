@@ -2265,7 +2265,7 @@ impl Crawler {
                                 if opts_worker.respect_robots && !robots_cache.peek_allows(&cu) {
                                     continue;
                                 }
-                                if ls.contains(&frontier::locale_canonical(cu.path())) {
+                                if ls.contains(&frontier::locale_canonical(&cu, &seed_url_w)) {
                                     continue;
                                 }
                                 // The harvest's focus gate: soft only on

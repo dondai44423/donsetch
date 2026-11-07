@@ -1057,12 +1057,12 @@ mod tests {
         [document, once].map(|result| result.map(|out| out.status))
     }
 
-    /// A SOCKS5 proxy whose password holds a raw '/', '#' or '?' parses, but
-    /// the URL v5 is handed for it ends its address inside the password. The
-    /// fetch must fail, say which proxy it could not read without echoing the
-    /// credentials, and never reach the origin from this machine's own address.
+    /// A SOCKS5 proxy whose password holds a '/', '#' or '?' is handed to v5
+    /// with that password percent-encoded, so the read leaves through the
+    /// proxy with the password as written, and never from this machine's own
+    /// address.
     #[tokio::test]
-    async fn a_proxy_url_v5_cannot_read_fails_the_fetch_and_never_goes_direct() {
+    async fn a_proxy_password_with_reserved_characters_reaches_the_proxy_never_direct() {
         loopback_config();
         let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
         let (port, proxied, proxy_task) = socks5_server().await;
@@ -1070,37 +1070,30 @@ mod tests {
         for password in ["pa/ss", "pa#ss", "pa?ss"] {
             let proxy =
                 Proxy::parse(&format!("socks5://alice:{password}@127.0.0.1:{port}")).unwrap();
-            for result in both_paths(&proxy, &url).await {
-                let report = format!(
-                    "{password}: {result:?}; the origin took {} direct request(s), the proxy {} connection(s)",
-                    origin.lock().unwrap().len(),
-                    proxied.lock().unwrap().len()
-                );
-                let Err(FetchError::ProxyConfig(message)) = &result else {
-                    panic!("{report}");
-                };
-                assert!(
-                    message.contains(&format!("\"socks5h://***@127.0.0.1:{port}\"")),
-                    "the error names the proxy: {report}"
-                );
-                assert!(
-                    !message.contains("alice") && !message.contains(password),
-                    "the error echoes the credentials: {report}"
-                );
-            }
+            let before = proxied.lock().unwrap().len();
+            let results = both_paths(&proxy, &url).await;
+            let seen: Vec<String> = proxied.lock().unwrap()[before..].to_vec();
+            assert!(
+                results.iter().all(|result| matches!(result, Ok(200)))
+                    && seen.len() >= 2
+                    && seen
+                        .iter()
+                        .all(|credentials| *credentials == format!("alice:{password}")),
+                "{password}: {results:?}; the proxy saw {seen:?}"
+            );
         }
         origin_task.abort();
         proxy_task.abort();
         assert!(origin.lock().unwrap().is_empty(), "{:?}", origin.lock());
-        assert!(proxied.lock().unwrap().is_empty(), "{:?}", proxied.lock());
     }
 
-    /// With private egress not allowed the URL guard looks the target's name
-    /// up on this machine. A read whose proxy URL v5 cannot read fails before
-    /// that lookup; a read through a readable proxy still goes through the
-    /// guard's lookup.
+    /// With private egress not allowed the URL guard looks a direct read's
+    /// target name up on this machine. A SOCKS5 read leaves the name to the
+    /// proxy, whatever its password holds: nothing is looked up here, and a
+    /// proxy that cannot be reached is a network failure, not a configuration
+    /// one.
     #[tokio::test]
-    async fn a_proxy_url_v5_cannot_read_is_refused_before_the_target_name_is_looked_up() {
+    async fn a_proxied_read_leaves_the_target_name_to_the_proxy_whatever_its_password_holds() {
         let mut config = crate::config::DonsetchConfig::default();
         config.proxy.from_environment = false;
         config.fetch.allow_private_egress = false;
@@ -1108,27 +1101,19 @@ mod tests {
         let url = "http://no-such-host-for-donsetch.invalid/page";
         let lookups = || crate::egress::dns::stats().1;
         let before = lookups();
-        let proxy = Proxy::parse("socks5://alice:pa/ss@127.0.0.1:9").unwrap();
-        let results = both_paths(&proxy, url).await;
-        assert!(
-            results
-                .iter()
-                .all(|result| matches!(result, Err(FetchError::ProxyConfig(_))))
-                && lookups() == before,
-            "{results:?}; the target's name was looked up {} time(s)",
-            lookups() - before
-        );
-        // Negative: a readable proxy still goes through the guard's lookup.
-        let proxy = Proxy::parse("socks5://alice:s3cret@127.0.0.1:9").unwrap();
-        let results = both_paths(&proxy, url).await;
-        assert!(
-            results
-                .iter()
-                .all(|result| result.is_err() && !matches!(result, Err(FetchError::ProxyConfig(_))))
-                && lookups() > before,
-            "{results:?}; {} lookup(s)",
-            lookups() - before
-        );
+        for password in ["pa/ss", "s3cret"] {
+            let proxy = Proxy::parse(&format!("socks5://alice:{password}@127.0.0.1:9")).unwrap();
+            let results = both_paths(&proxy, url).await;
+            assert!(
+                results
+                    .iter()
+                    .all(|result| result.is_err()
+                        && !matches!(result, Err(FetchError::ProxyConfig(_))))
+                    && lookups() == before,
+                "{password}: {results:?}; the target's name was looked up {} time(s)",
+                lookups() - before
+            );
+        }
     }
 
     // Negative: a proxy URL v5 reads (SOCKS5 with and without credentials,
@@ -1347,12 +1332,13 @@ mod tests {
         );
     }
 
-    /// An environment proxy whose URL v5 cannot read (a raw '/', '#' or '?'
-    /// in the password) fails a read given no lane, document or one-shot, as
-    /// a proxy configuration error that names the proxy without its
-    /// credentials, and neither the origin nor the proxy is contacted.
+    /// An environment proxy whose password holds a '/', '#' or '?' carries a
+    /// read given no lane, document or one-shot, with the password as
+    /// written, and the origin is never reached from this machine's own
+    /// address.
     #[tokio::test]
-    async fn an_environment_proxy_v5_cannot_read_fails_a_read_without_a_lane() {
+    async fn an_environment_proxy_password_with_reserved_characters_carries_a_read_without_a_lane()
+    {
         install_config(|config| config.proxy.from_environment = true);
         let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
         let (port, proxied, proxy_task) = socks5_server().await;
@@ -1362,29 +1348,21 @@ mod tests {
                 "HTTP_PROXY",
                 &format!("socks5://alice:{password}@127.0.0.1:{port}"),
             )]);
-            for result in reads_without_a_lane(&url).await {
-                let report = format!(
-                    "{password}: {result:?}; the origin took {} direct request(s), the proxy {} connection(s)",
-                    origin.lock().unwrap().len(),
-                    proxied.lock().unwrap().len()
-                );
-                let Err(FetchError::ProxyConfig(message)) = &result else {
-                    panic!("{report}");
-                };
-                assert!(
-                    message.contains(&format!("://***@127.0.0.1:{port}\"")),
-                    "the error names the proxy: {report}"
-                );
-                assert!(
-                    !message.contains("alice") && !message.contains(password),
-                    "the error echoes the credentials: {report}"
-                );
-            }
+            let before = proxied.lock().unwrap().len();
+            let results = reads_without_a_lane(&url).await;
+            let seen: Vec<String> = proxied.lock().unwrap()[before..].to_vec();
+            assert!(
+                results.iter().all(|result| matches!(result, Ok(200)))
+                    && seen.len() >= 2
+                    && seen
+                        .iter()
+                        .all(|credentials| *credentials == format!("alice:{password}")),
+                "{password}: {results:?}; the proxy saw {seen:?}"
+            );
         }
         origin_task.abort();
         proxy_task.abort();
         assert!(origin.lock().unwrap().is_empty(), "{:?}", origin.lock());
-        assert!(proxied.lock().unwrap().is_empty(), "{:?}", proxied.lock());
     }
 
     // Negative: an environment proxy v5 reads carries both reads given no
