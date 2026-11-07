@@ -447,29 +447,6 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
 
     // Collapse runs of spaces and trim.
     let text = collapse_spaces(&text);
-    if std::env::var("DS_PROBE_SPLIT").is_ok() && (text.contains("google") || text.contains("41 ."))
-    {
-        crate::diag!(
-            "[probe] TEXT {:?} space_gap={:?} med={med_gap:.3}",
-            text,
-            space_gap
-        );
-        for w in reals.windows(2) {
-            let gap = w[1].x0 - w[0].x1;
-            let decor = decor_spaces
-                .iter()
-                .any(|&sx| sx > w[0].x1 - 0.5 && sx < w[1].x0 + 0.5);
-            if gap > 0.8 {
-                crate::diag!(
-                    "[probe]   {:?}->{:?} gap={gap:.3} prevsize={:.2} decor={decor} prev_is_space={}",
-                    w[0].cp,
-                    w[1].cp,
-                    w[0].size,
-                    w[0].cp == ' '
-                );
-            }
-        }
-    }
     if crate::config::cfg().debug.pdf_words {
         crate::diag!(
             "[words] {:?} -> {:?}",
