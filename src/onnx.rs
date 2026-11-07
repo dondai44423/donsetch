@@ -146,21 +146,26 @@
     any(target_os = "linux", target_os = "windows", target_os = "macos"),
     any(feature = "ocr", feature = "rerank")
 ))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(any(feature = "ocr", feature = "rerank"))]
 use std::sync::OnceLock;
 #[cfg(any(feature = "ocr", feature = "rerank"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "ocr", feature = "rerank"))]
 use std::time::Duration;
-/// Message when an init attempt deadlocked inside the dynamic
-/// loader (pykeio/ort #579/#560 class). Kept as a stable, actionable
-/// line: the user can still run without OCR/rerank.
+/// Message when an init attempt did not finish within
+/// [`ONNX_INIT_TIMEOUT_SECS`]. Kept as a stable, actionable line: the
+/// user can still run without OCR/rerank.
 pub const ONNX_HUNG_MSG: &str = "ONNX Runtime initialization hung (known upstream loader deadlock); OCR and rerank are disabled for this run. Fetch, PDF, crawl and search all continue to work normally.";
 
 /// How long the dedicated ONNX init thread may take before we
 /// declare the loader deadlocked and fail fast.
 pub const ONNX_INIT_TIMEOUT_SECS: u64 = 15;
+
+/// Error when no ONNX Runtime library is found beside the binary or in
+/// the cache fallback.
+pub const ONNX_NOT_FOUND_MSG: &str =
+    "ONNX Runtime shared library not found. OCR and rerank are disabled.";
 
 /// Ensure ONNX Runtime is loaded and initialized.
 ///
@@ -189,34 +194,54 @@ pub fn ensure_loaded() -> Result<(), String> {
             return Err(ONNX_HUNG_MSG.to_string());
         }
 
-        // ort's init path (dlopen on Linux/Windows, env construction on
-        // macOS) can deadlock inside the dynamic loader in
-        // complex binaries (pykeio/ort #579, #560) instead of
-        // returning an error. Run it on a dedicated thread with a
-        // bounded wait so a hung loader can never hang the MCP
-        // server; the stuck thread leaks (it cannot be killed) but
-        // the daemon keeps working and every later call fails fast.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("onnx-init".into())
-            .spawn(move || {
-                // Receiver may already be gone on timeout: ignore.
-                let _ = tx.send(load_and_init());
-            });
-        let outcome = match spawned {
-            Ok(_) => match rx.recv_timeout(Duration::from_secs(ONNX_INIT_TIMEOUT_SECS)) {
-                Ok(r) => r,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    HUNG.store(true, Ordering::Release);
-                    Err(ONNX_HUNG_MSG.to_string())
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    Err("ONNX init thread panicked".to_string())
-                }
-            },
-            Err(e) => Err(format!("cannot spawn ONNX init thread: {e}")),
+        // A load can block instead of returning an error: ort
+        // 2.0.0-rc.12 builds its own errors through the runtime's API,
+        // so a library that loads but that ort then rejects re-enters
+        // ort's init lock on the same thread and never returns
+        // (pykeio/ort #560), and a library constructor can block inside
+        // the loader. Run it on a dedicated thread with a bounded wait
+        // so a stuck init can never hang the MCP server; the stuck
+        // thread leaks (it cannot be killed) but the daemon keeps
+        // working and every later call fails fast.
+        let outcome = match init_within(load_and_init, Duration::from_secs(ONNX_INIT_TIMEOUT_SECS))
+        {
+            Some(r) => r,
+            None => {
+                HUNG.store(true, Ordering::Release);
+                Err(ONNX_HUNG_MSG.to_string())
+            }
         };
         STATE.get_or_init(|| outcome).clone()
+    }
+}
+
+/// Run `init` on a dedicated `onnx-init` thread and wait at most
+/// `timeout` for its result.
+///
+/// `None` means the wait expired: the thread is left running, since a
+/// thread blocked inside the loader cannot be stopped. A thread that
+/// panics or cannot be spawned yields `Some(Err(..))`.
+#[cfg(any(feature = "ocr", feature = "rerank"))]
+fn init_within<F>(init: F, timeout: Duration) -> Option<Result<(), String>>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("onnx-init".into())
+        .spawn(move || {
+            // Receiver may already be gone on timeout: ignore.
+            let _ = tx.send(init());
+        });
+    match spawned {
+        Ok(_) => match rx.recv_timeout(timeout) {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Some(Err("ONNX init thread panicked".to_string()))
+            }
+        },
+        Err(e) => Some(Err(format!("cannot spawn ONNX init thread: {e}"))),
     }
 }
 
@@ -230,16 +255,71 @@ fn load_and_init() -> Result<(), String> {
     // No AVX gate here: see "Why there is no AVX gate" at the top.
 
     // 1. Find the shared library.
-    let lib_path = find_shared_lib().ok_or_else(|| {
-        "ONNX Runtime shared library not found. \
-            OCR and rerank are disabled."
-            .to_string()
-    })?;
+    let lib_path = find_shared_lib().ok_or_else(|| ONNX_NOT_FOUND_MSG.to_string())?;
 
-    // 2. dlopen and init.
+    // 2. Make libstdc++ available to the runtime. libonnxruntime.so
+    //    needs libstdc++.so.6, and the loader looks for a dependency of
+    //    a library on LD_LIBRARY_PATH, that library's own RUNPATH
+    //    ($ORIGIN here) and the system paths, but not on the binary's
+    //    RUNPATH. dlopen of a bare name does search the calling object's
+    //    RUNPATH, and the caller here is this binary, so opening
+    //    libstdc++ first finds it wherever the binary's RUNPATH holds it,
+    //    as a binary that links libstdc++ itself would. A Nix-built
+    //    binary's RUNPATH names the toolchain's lib directory, where
+    //    libstdc++.so.6 sits beside the libgcc_s.so.1 the binary links;
+    //    the runtime alone finds no libstdc++ there. The runtime's load
+    //    below then reuses this copy by its soname. A binary with no
+    //    RUNPATH gets the copy the runtime's own lookup would find (none
+    //    is shipped beside the runtime). Best effort: if this fails, the
+    //    runtime's own load reports the loader's error.
+    #[cfg(target_os = "linux")]
+    let _ = ort::util::preload_dylib("libstdc++.so.6");
+
+    load_and_init_from(&lib_path)
+}
+
+/// Load the ONNX Runtime library at `lib_path` and initialize its
+/// environment. A library that cannot be loaded returns the loader's
+/// own error.
+///
+/// A library that loads but that ort then rejects, or whose
+/// constructor blocks, may never return: call it through
+/// [`init_within`].
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows", target_os = "macos"),
+    any(feature = "ocr", feature = "rerank")
+))]
+fn load_and_init_from(lib_path: &Path) -> Result<(), String> {
+    // 3. Open the library ourselves first, so a library that cannot be
+    //    loaded fails here with the loader's own message (on Linux the
+    //    dlerror text, e.g. "libstdc++.so.6: cannot open shared object
+    //    file"). ort 2.0.0-rc.12 builds its load error through the
+    //    runtime's own API, which is not loaded yet, so a failed load
+    //    inside ort::init_from re-enters ort's init lock on the same
+    //    thread and never returns (pykeio/ort #560). preload_dylib
+    //    reports a plain libloading error and keeps the library loaded,
+    //    so init_from below only ever opens a library that already
+    //    loaded once.
+    if let Err(e) = ort::util::preload_dylib(lib_path) {
+        let mut msg = format!(
+            "Failed to load ONNX Runtime from {}: {e}",
+            lib_path.display()
+        );
+        // libloading's own text is just "dlopen failed"; the loader's
+        // message is in the source chain.
+        let mut source = std::error::Error::source(&e);
+        while let Some(s) = source {
+            msg.push_str(": ");
+            msg.push_str(&s.to_string());
+            source = s.source();
+        }
+        return Err(msg);
+    }
+
+    // 4. dlopen and init.
     //    ort::init_from loads the .so via libloading.
     //    builder.commit() initializes the ONNX environment.
-    let builder = ort::init_from(&lib_path).map_err(|e| {
+    let builder = ort::init_from(lib_path).map_err(|e| {
         format!(
             "Failed to load ONNX Runtime from {}: {e}",
             lib_path.display()
@@ -336,5 +416,130 @@ mod tests {
         super::ensure_loaded().expect("ONNX Runtime failed to initialize");
         // A second call must reuse the memoized state, not re-init.
         super::ensure_loaded().expect("ONNX Runtime failed to initialize (recheck)");
+    }
+
+    /// The shipped runtime, when it cannot be loaded, is reported at
+    /// once with the loader's error, never as a hang after the init
+    /// timeout. Where it loads there is nothing to check; the next two
+    /// tests cover a failing load.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows", target_os = "macos"),
+        any(feature = "ocr", feature = "rerank")
+    ))]
+    #[test]
+    fn a_runtime_that_cannot_load_fails_at_once_with_the_loader_error() {
+        let started = std::time::Instant::now();
+        let outcome = super::ensure_loaded();
+        let took = started.elapsed();
+        if let Err(e) = &outcome {
+            assert_ne!(
+                e,
+                super::ONNX_HUNG_MSG,
+                "a runtime that failed to load was reported as a loader hang"
+            );
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "the load error took {took:?} (timeout {}s): {e}",
+                super::ONNX_INIT_TIMEOUT_SECS
+            );
+            assert!(
+                e.starts_with("Failed to load ONNX Runtime from "),
+                "not the loader's error: {e}"
+            );
+        }
+    }
+
+    /// `outcome` is the load error for `lib` within the wait: libloading's
+    /// own text followed by the loader's message.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows", target_os = "macos"),
+        any(feature = "ocr", feature = "rerank")
+    ))]
+    fn assert_loader_error(outcome: Option<Result<(), String>>, lib: &std::path::Path) {
+        let prefix = format!("Failed to load ONNX Runtime from {}: ", lib.display());
+        match outcome {
+            // e.g. "dlopen failed: <path>: file too short" on Linux.
+            Some(Err(e)) => assert!(
+                e.strip_prefix(&prefix)
+                    .is_some_and(|detail| detail.contains(": ")),
+                "not the loader's error: {e}"
+            ),
+            other => panic!("expected the loader's error within the wait, got {other:?}"),
+        }
+    }
+
+    /// The shipped runtime, loaded where the loader cannot find one of
+    /// its dependencies, fails at once with the loader's error. That
+    /// needs a host where the runtime's own lookup misses a dependency:
+    /// NixOS without `LD_LIBRARY_PATH`, where `libonnxruntime.so` finds
+    /// no `libstdc++.so.6` by itself (`load_and_init` opens it from the
+    /// binary's RUNPATH first; this test skips that step). Where the
+    /// runtime loads there is nothing to check. Relies on nextest's
+    /// process per test: this test commits ort's environment, and ort
+    /// accepts one commit per process, so in a shared process this test
+    /// and `ensure_loaded` cannot both succeed.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows", target_os = "macos"),
+        any(feature = "ocr", feature = "rerank")
+    ))]
+    #[test]
+    fn a_runtime_whose_dependency_is_missing_fails_at_once_with_the_loader_error() {
+        let lib = super::find_shared_lib().expect("the shipped runtime beside the test binary");
+        let target = lib.clone();
+        // Where the runtime loads, this wait also covers a successful
+        // load; the first one after a build has taken over 4 s on 9040.
+        let outcome = super::init_within(
+            move || super::load_and_init_from(&target),
+            std::time::Duration::from_secs(10),
+        );
+        if outcome != Some(Ok(())) {
+            assert_loader_error(outcome, &lib);
+        }
+    }
+
+    /// A file that is not a loadable library fails at once with the
+    /// loader's error, on every host.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows", target_os = "macos"),
+        any(feature = "ocr", feature = "rerank")
+    ))]
+    #[test]
+    fn a_file_that_is_not_a_library_fails_at_once_with_the_loader_error() {
+        // cache_dir() is this test process's own sandbox under cfg(test).
+        let dir = crate::paths::cache_dir().join("not-a-runtime");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join(super::shared_lib_name());
+        std::fs::write(&lib, b"not a shared library").unwrap();
+        let target = lib.clone();
+        let outcome = super::init_within(
+            move || super::load_and_init_from(&target),
+            std::time::Duration::from_secs(5),
+        );
+        assert_loader_error(outcome, &lib);
+    }
+
+    /// The timeout guard still reports an init that really blocks.
+    #[cfg(any(feature = "ocr", feature = "rerank"))]
+    #[test]
+    fn an_init_that_blocks_is_reported_when_the_wait_expires() {
+        let wait = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let outcome = super::init_within(
+            || -> Result<(), String> {
+                loop {
+                    std::thread::park();
+                }
+            },
+            wait,
+        );
+        let took = started.elapsed();
+        assert!(
+            outcome.is_none(),
+            "a blocked init must time out: {outcome:?}"
+        );
+        assert!(
+            took >= wait && took < std::time::Duration::from_secs(5),
+            "the guard returned after {took:?}, waiting {wait:?}"
+        );
     }
 }
