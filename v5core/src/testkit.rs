@@ -41,6 +41,13 @@ pub enum Reply {
     Trickle { every: Duration },
     /// A 200 with no length that never ends: `chunk` bytes, as fast as the client reads.
     Endless { chunk: usize },
+    /// A complete 200 sent `chunk` bytes at a time, one chunk every `every`:
+    /// a large file on a slow link.
+    Paced {
+        body: Vec<u8>,
+        chunk: usize,
+        every: Duration,
+    },
     /// Accept, read the request, answer nothing and hold the socket open.
     Silence,
 }
@@ -205,6 +212,20 @@ fn serve(
                 if stream.write_all(b"x").is_err() {
                     break;
                 }
+                std::thread::sleep(every);
+            }
+        }
+        Reply::Paced { body, chunk, every } => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            for piece in body.chunks(chunk.max(1)) {
+                if stop.load(Ordering::SeqCst) || stream.write_all(piece).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
                 std::thread::sleep(every);
             }
         }

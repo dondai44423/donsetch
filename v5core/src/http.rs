@@ -731,12 +731,16 @@ impl Wire {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        // The request ceiling bounds the wait for an answer and any silence
+        // inside one; a body that keeps arriving may use the caller's whole
+        // budget, since another client would not make the link faster.
+        let budget = call.timeout;
         let call = Call {
             timeout: call.timeout.min(policy.request_max),
             ..call
         };
         if self.guarded {
-            return self.send(identity, call);
+            return self.send(identity, call, budget);
         }
         let started = Instant::now();
         let first = host_and_scheme(call.url);
@@ -792,6 +796,7 @@ impl Wire {
                     cap: call.cap,
                     kind: call.kind,
                 },
+                budget.saturating_sub(started.elapsed()),
             )?;
             if same {
                 kept.append(&mut response.cookies);
@@ -846,7 +851,15 @@ impl Wire {
     }
 
     /// One request on the wire, no redirect followed by us.
-    fn send(&self, identity: &Identity, call: Call<'_>) -> Result<Response, String> {
+    /// One request. `timeout` bounds the wait for the response's head and
+    /// any silence while its body arrives; `budget` (never less than
+    /// `timeout`) bounds the whole exchange.
+    fn send(
+        &self,
+        identity: &Identity,
+        call: Call<'_>,
+        budget: Duration,
+    ) -> Result<Response, String> {
         let Call {
             method,
             url,
@@ -944,7 +957,7 @@ impl Wire {
                 url,
             )
             .headers(headers)
-            .timeout(timeout);
+            .timeout(budget.max(timeout));
         if let Some(order) = order {
             request = request.default_headers(false).orig_headers(order);
         }
@@ -967,8 +980,14 @@ impl Wire {
         if cancel.as_ref().is_some_and(Cancel::is_cancelled) {
             return Err(CANCELLED.to_string());
         }
+        let budget = budget.max(timeout);
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress = std::sync::Arc::clone(&received);
         let exchange = async move {
-            let response = request.send().await.map_err(|error| describe(&error))?;
+            let response = tokio::time::timeout(timeout, request.send())
+                .await
+                .map_err(|_| "timeout: operation timed out".to_string())?
+                .map_err(|error| describe(&error))?;
             let status = response.status().as_u16();
             let version = format!("{:?}", response.version());
             let url = response.uri().to_string();
@@ -1015,12 +1034,22 @@ impl Wire {
             }
             let mut stream = response.bytes_stream();
             let mut collected: Vec<u8> = Vec::new();
-            while let Some(chunk) = stream.next().await {
+            loop {
+                let Ok(next) = tokio::time::timeout(timeout, stream.next()).await else {
+                    return Err(format!(
+                        "timeout: the response went silent after {} bytes",
+                        collected.len()
+                    ));
+                };
+                let Some(chunk) = next else {
+                    break;
+                };
                 let chunk = chunk.map_err(|error| describe(&error))?;
                 if collected.len() + chunk.len() > cap {
                     return Err(format!("body: response larger than {cap} bytes"));
                 }
                 collected.extend_from_slice(&chunk);
+                progress.store(collected.len(), std::sync::atomic::Ordering::Relaxed);
             }
             // Text stays text; anything else keeps its own bytes beside a lossy
             // reading (classification reads text, callers may want the bytes).
@@ -1035,10 +1064,18 @@ impl Wire {
         };
         // wreq starts the request's timeout again for the body, so a slow body
         // could run to twice the budget; the whole exchange is bounded here.
+        // A transfer cut while it was still arriving says how far it got.
         let exchange = async move {
-            tokio::time::timeout(timeout, exchange)
+            tokio::time::timeout(budget, exchange)
                 .await
-                .unwrap_or_else(|_| Err("timeout: operation timed out".to_string()))
+                .unwrap_or_else(
+                    |_| match received.load(std::sync::atomic::Ordering::Relaxed) {
+                        0 => Err("timeout: operation timed out".to_string()),
+                        bytes => Err(format!(
+                            "timeout: the transfer was still arriving after {bytes} bytes"
+                        )),
+                    },
+                )
         };
         let outcome = runtime.block_on(async move {
             match cancel {

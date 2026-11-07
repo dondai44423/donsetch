@@ -783,3 +783,74 @@ fn a_slow_body_after_slow_headers_is_bounded_by_the_deadline() {
     assert_eq!(outcome.class, Class::Network, "{:?}", outcome.failures);
     assert!(took < Duration::from_millis(1300), "took {took:?}");
 }
+
+#[test]
+fn a_body_that_keeps_arriving_may_outlast_the_request_ceiling() {
+    // A large file on a slow link: every chunk well inside the ceiling, the
+    // whole transfer well past it. The server is answering; the encounter's
+    // deadline, not the one-request ceiling, bounds it.
+    let mut body = String::from("<html><head><title>Slow file</title></head><body>");
+    for i in 0..60 {
+        body.push_str(&format!(
+            "<p>Paragraph {i} of a long document that arrives slowly.</p>"
+        ));
+    }
+    body.push_str("</body></html>");
+    let size = body.len();
+    let server = Server::start(move |_| Reply::Paced {
+        body: body.clone().into_bytes(),
+        chunk: size / 12 + 1,
+        every: Duration::from_millis(100),
+    });
+    let mut slow = options();
+    slow.deadline = Duration::from_secs(10);
+    slow.policy.request_max = Duration::from_millis(400);
+    let outcome = Worker::new(false).fetch(&server.url("/"), &slow);
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.failures);
+    assert_eq!(outcome.title, "Slow file");
+}
+
+#[test]
+fn a_body_that_goes_silent_is_cut_at_the_request_ceiling() {
+    // Bytes, then nothing for longer than the ceiling: a stall, cut there,
+    // not at the encounter's deadline.
+    let server = Server::start(|_| Reply::Trickle {
+        every: Duration::from_millis(1500),
+    });
+    let mut short = options();
+    short.deadline = Duration::from_secs(10);
+    short.policy.request_max = Duration::from_millis(400);
+    let started = Instant::now();
+    let outcome = Worker::new(false).fetch(&server.url("/"), &short);
+    assert_eq!(outcome.class, Class::Network, "{:?}", outcome.failures);
+    assert!(
+        outcome.failures.iter().any(|f| f.contains("went silent")),
+        "{:?}",
+        outcome.failures
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_transfer_cut_by_the_deadline_says_how_far_it_got() {
+    let server = Server::start(|_| Reply::Trickle {
+        every: Duration::from_millis(50),
+    });
+    let mut short = options();
+    short.deadline = Duration::from_millis(1200);
+    short.policy.request_max = Duration::from_millis(400);
+    let outcome = Worker::new(false).fetch(&server.url("/"), &short);
+    assert_eq!(outcome.class, Class::Network, "{:?}", outcome.failures);
+    assert!(
+        outcome
+            .failures
+            .iter()
+            .any(|f| f.starts_with("timeout: the transfer was still arriving after ")),
+        "{:?}",
+        outcome.failures
+    );
+}
