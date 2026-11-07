@@ -135,8 +135,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Cancellation registry: request-id → cancel sender. The MCP
     // client fires notifications/cancelled with a requestId; the
     // in-flight tool observes it (fetch/search abort via select,
-    // crawl stops its workers gracefully and persists its resume
-    // token before returning).
+    // crawl stops its workers gracefully before returning).
     let cancels: CancelMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
     // Issue #27 compat mode: one session per process; the initialize
     // handshake records what the client renders.

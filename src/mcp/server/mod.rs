@@ -317,9 +317,31 @@ pub async fn handle(
         let (ptx, mut prx) = mpsc::unbounded_channel::<String>();
         let progress_tx = progress_token.as_ref().map(|_| ptx);
         let writer_tx = writer_tx.clone();
+        // Progress ends at the cancel: the client that cancelled no
+        // longer tracks the request's progress token (the TypeScript SDK
+        // drops the token's handler before it sends
+        // notifications/cancelled), and beats still queued then are
+        // dropped. A cancel sender dropped without a cancel is the call
+        // ending normally, and every beat it queued is still forwarded.
+        let mut cancel_seen = cancel_rx.clone();
         let forwarder = tokio::spawn(async move {
-            while let Some(line) = prx.recv().await {
-                let _ = writer_tx.send(line).await;
+            let cancelled = async move {
+                if cancel_seen.wait_for(|cancelled| *cancelled).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(cancelled);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut cancelled => break,
+                    line = prx.recv() => match line {
+                        Some(line) => {
+                            let _ = writer_tx.send(line).await;
+                        }
+                        None => break,
+                    },
+                }
             }
         });
         let ctx = ToolCtx {
@@ -328,8 +350,9 @@ pub async fn handle(
             progress_tx,
         };
         let result = call_tool_ctx(daemon, &params, Some(ctx)).await;
-        // Deregister + stop forwarding progress. The forwarder ends
-        // when ptx drops : it moved into ctx, dropped at await end.
+        // Deregister + stop forwarding progress. The forwarder ends at
+        // the cancel, or when ptx drops : it moved into ctx, dropped at
+        // await end.
         if let Some(r) = rid {
             cancels
                 .lock()
@@ -648,5 +671,275 @@ mod prober_lifecycle_tests {
         assert!(!abort.is_finished());
         drop(daemon);
         wait_finished(&abort).await;
+    }
+}
+
+#[cfg(test)]
+mod crawl_cancel_tests {
+    use super::{CancelMap, Daemon, cancel_key, handle};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    /// A loopback site. `/slow/` and `/fast/` each link to eight pages,
+    /// and a `/slow/` page answers 1.5 s after its request; `/lone/` links
+    /// nowhere. Every request path is reported on the returned channel.
+    async fn site() -> (String, mpsc::UnboundedReceiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, requests) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") && head.len() < 16384 {
+                        match socket.read_u8().await {
+                            Ok(byte) => head.push(byte),
+                            Err(_) => return,
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&head)
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    let _ = seen.send(path.clone());
+                    let section = path.trim_start_matches('/').split('/').next().unwrap_or("");
+                    let index = path.ends_with('/');
+                    if section == "slow" && !index {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    let links: String = if index && section != "lone" {
+                        (1..=8)
+                            .map(|i| {
+                                format!("<li><a href=\"/{section}/p{i}\">Field notes {i}</a></li>")
+                            })
+                            .collect()
+                    } else {
+                        String::new()
+                    };
+                    let body = format!(
+                        "<html><head><title>Notes {path}</title></head><body><article>\
+                         <h1>Notes {path}</h1><p>{}</p><ul>{links}</ul></article></body></html>",
+                        format!("An observation recorded at {path} for a reader. ").repeat(40)
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (base, requests)
+    }
+
+    async fn daemon() -> Arc<Daemon> {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        Arc::new(Daemon::new().await.unwrap())
+    }
+
+    fn crawl_call(id: i64, args: Value, progress_token: Option<&str>) -> String {
+        let mut params = json!({ "name": "web_crawl", "arguments": args });
+        if let Some(token) = progress_token {
+            params["_meta"] = json!({ "progressToken": token });
+        }
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params }).to_string()
+    }
+
+    fn progress_params(line: &str) -> Option<Value> {
+        let v: Value = serde_json::from_str(line).ok()?;
+        (v["method"] == "notifications/progress").then(|| v["params"].clone())
+    }
+
+    /// The call's state: `structuredContent`, or the leading `[meta]`
+    /// line a text-only session folds it into.
+    fn state(response: &Value) -> Value {
+        let result = &response["result"];
+        if result.get("structuredContent").is_some() {
+            return result["structuredContent"].clone();
+        }
+        let meta = result["content"][0]["text"].as_str().unwrap_or_default();
+        serde_json::from_str(meta.trim_start_matches("[meta] ").trim_end())
+            .unwrap_or_else(|_| panic!("no state in {response}"))
+    }
+
+    fn drain(out: &mut mpsc::Receiver<String>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = out.try_recv() {
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// The token files in the process cache root's resume store.
+    fn stored_tokens() -> Vec<String> {
+        let dir = crate::paths::cache_dir().join("crawl-resumes");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.ends_with(".json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// One uncancelled call through `handle`, with the writer lines its
+    /// progress forwarder sent.
+    async fn answered(daemon: &Arc<Daemon>, line: String) -> (Value, Vec<String>) {
+        let cancels: CancelMap = Arc::default();
+        let mode = crate::mcp::compat::ModeCell::new();
+        let (writer, mut out) = mpsc::channel::<String>(256);
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            handle(daemon, &line, &cancels, &writer, &mode),
+        )
+        .await
+        .expect("the call is answered when its crawl ends")
+        .expect("an uncancelled call gets a response");
+        (serde_json::from_str(&response).unwrap(), drain(&mut out))
+    }
+
+    // Drives `handle` the way the stdio transport does: one cancel
+    // registry, one writer channel, and the cancel delivered by taking
+    // the call's sender out of the registry and sending true. Installs the
+    // process config and reads the process cache root's resume store:
+    // depends on nextest's process-per-test.
+    #[tokio::test]
+    async fn a_cancelled_crawl_sends_no_progress_after_the_cancel_and_stores_no_token() {
+        let (base, mut requests) = site().await;
+        let daemon = daemon().await;
+        let cancels: CancelMap = Arc::default();
+        let (writer, mut out) = mpsc::channel::<String>(256);
+        let line = crawl_call(
+            7,
+            json!({
+                "url": format!("{base}/slow/"),
+                "mode": "content",
+                "respect_robots": false,
+                "max_pages": 20,
+                "deadline_s": 60,
+            }),
+            Some("pt-7"),
+        );
+        let call = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            let cancels = Arc::clone(&cancels);
+            async move {
+                let mode = crate::mcp::compat::ModeCell::new();
+                handle(&daemon, &line, &cancels, &writer, &mode).await
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_secs(20), out.recv())
+            .await
+            .expect("a first progress beat")
+            .expect("the writer is open");
+        assert!(progress_params(&first).is_some(), "{first}");
+        // Cancel while a page fetch is in flight: the fixture holds every
+        // /slow/pN answer for 1.5 s, so no page completes before the cancel.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(path) = requests.recv().await {
+                if path.starts_with("/slow/p") {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the crawl requests a /slow/ page");
+        let before = drain(&mut out);
+        assert!(before.is_empty(), "a page completed early: {before:?}");
+        let sender = cancels
+            .lock()
+            .unwrap()
+            .remove(&cancel_key(&json!(7)).unwrap())
+            .expect("the running call is registered");
+        let _ = sender.send(true);
+        drop(sender);
+
+        let returned = tokio::time::timeout(Duration::from_secs(15), call).await;
+        let after = drain(&mut out);
+        let beats: Vec<&String> = after
+            .iter()
+            .filter(|l| progress_params(l).is_some())
+            .collect();
+        assert!(beats.is_empty(), "progress after the cancel: {beats:?}");
+        assert!(after.is_empty(), "lines after the cancel: {after:?}");
+        let returned = returned
+            .expect("the cancelled call returns once its crawl stops")
+            .unwrap();
+        assert_eq!(returned, None, "a cancelled request gets no response");
+        assert_eq!(
+            stored_tokens(),
+            Vec::<String>::new(),
+            "a cancelled crawl stored a resume token no response carries"
+        );
+    }
+
+    // Negative: an uncancelled crawl keeps its progress and its response,
+    // and a budget stop still stores the token its response carries.
+    // Installs the process config and reads the process cache root's
+    // resume store: depends on nextest's process-per-test.
+    #[tokio::test]
+    async fn an_uncancelled_crawl_keeps_its_progress_and_its_resume_token() {
+        let (base, _requests) = site().await;
+        let daemon = daemon().await;
+
+        let (response, lines) = answered(
+            &daemon,
+            crawl_call(
+                8,
+                json!({
+                    "url": format!("{base}/lone/"),
+                    "mode": "content",
+                    "respect_robots": false,
+                    "deadline_s": 30,
+                }),
+                Some("pt-8"),
+            ),
+        )
+        .await;
+        assert_eq!(response["id"], 8);
+        let sc = &state(&response);
+        assert_eq!(sc["ok"], true, "{response}");
+        assert_eq!(sc["stop"], "FrontierEmpty", "{response}");
+        let beats: Vec<Value> = lines.iter().filter_map(|l| progress_params(l)).collect();
+        assert_eq!(
+            beats,
+            vec![json!({ "progressToken": "pt-8", "progress": 1, "message": "1 pages, 0 queued" })],
+            "{lines:?}"
+        );
+
+        let (response, _) = answered(
+            &daemon,
+            crawl_call(
+                9,
+                json!({
+                    "url": format!("{base}/fast/"),
+                    "mode": "content",
+                    "respect_robots": false,
+                    "max_pages": 2,
+                    "deadline_s": 30,
+                }),
+                None,
+            ),
+        )
+        .await;
+        let sc = &state(&response);
+        assert_eq!(sc["stop"], "MaxPages", "{response}");
+        let token = sc["resume"].as_str().unwrap_or_else(|| {
+            panic!("a budget stop with queued pages carries a token: {response}")
+        });
+        assert_eq!(stored_tokens(), vec![format!("{token}.json")]);
     }
 }

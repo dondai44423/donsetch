@@ -56,8 +56,8 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
     }
 
     // v3: cancellation + progress. The crawl stops its workers
-    // gracefully on cancel (the stop-flag mechanism) and persists
-    // its resume token : partial progress is never lost.
+    // gracefully on cancel (the stop-flag mechanism). A cancelled
+    // call gets no response, so it keeps no resume token either.
     if let Some(c) = &ctx {
         opts.cancel = Some(c.cancel_receiver());
         let parts = c.progress_parts();
@@ -877,7 +877,7 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
             "crawl hit the time deadline. Increase deadline_s or use resume to continue.".into()
         }
         StopReason::Cancelled => {
-            "crawl cancelled : resume with the token above to continue where it stopped.".into()
+            "crawl cancelled : it kept no resume token; start a new crawl to read the rest.".into()
         }
         StopReason::ThrottledOut => {
             "the host throttled the crawler. Wait a few minutes and resume.".into()
