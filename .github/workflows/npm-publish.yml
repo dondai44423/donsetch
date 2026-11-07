@@ -14,9 +14,10 @@
 # - If the version is already on the registry the publish is skipped
 #   (re-publishing the same version is an npm error).
 #
-# Auth is npm trusted publishing (OIDC): npmjs.com trusts this repo's
-# npm-publish.yml, so no token secret exists. It needs `id-token: write`
-# and npm >= 11.5.1; provenance is attached automatically.
+# Auth: the NPM_TOKEN secret, a granular write token for `donsetch` (it
+# expires; renew it on npmjs.com and `gh secret set NPM_TOKEN`). npm prefers
+# trusted publishing (OIDC) when npmjs.com trusts this workflow, which is why
+# the job keeps `id-token: write` and npm >= 11.5.1.
 
 name: npm publish
 
@@ -112,6 +113,8 @@ jobs:
 
       - name: Publish (skip if already on the registry)
         working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION=$(node -p "require('./package.json').version")
           if npm view "donsetch@$VERSION" version >/dev/null 2>&1; then
