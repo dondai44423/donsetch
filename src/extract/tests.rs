@@ -2115,6 +2115,261 @@ fn table_mixed_first_row_keeps_td_cells() {
 }
 
 // ════════════════════════════════════════════════════════════
+// 24c. ROWSPAN / COLSPAN : CELLS STAY IN THEIR GRID COLUMN
+// ════════════════════════════════════════════════════════════
+
+fn table_page(tables: &str) -> String {
+    format!("<html><body><article>{tables}</article></body></html>")
+}
+
+fn table_lines(md: &str) -> Vec<&str> {
+    md.lines().filter(|l| l.starts_with('|')).collect()
+}
+
+// A cell with rowspan="2" also fills its column in the next row. Read
+// as a flat cell list, that row's cells moved one column left: Banana
+// under Category, 120 g under Item, Weight empty.
+#[test]
+fn a_rowspan_keeps_the_next_rows_cells_under_their_headers() {
+    let md = extract_html(&table_page(
+        "<table><tr><th>Category</th><th>Item</th><th>Weight</th></tr>\
+         <tr><td rowspan=\"2\">Fruit</td><td>Apple</td><td>150 g</td></tr>\
+         <tr><td>Banana</td><td>120 g</td></tr></table>",
+    ))
+    .markdown;
+    assert_eq!(
+        table_lines(&md),
+        [
+            "| Category | Item | Weight |",
+            "| --- | --- | --- |",
+            "| Fruit | Apple | 150 g |",
+            "| Fruit | Banana | 120 g |",
+        ],
+        "{md}"
+    );
+}
+
+// A grouped header: "Price" spans two columns and its sub-headers sit
+// in a second <th> row. The first row had two cells for three columns
+// and the second became a data row; both rows form one header now.
+#[test]
+fn a_colspan_header_and_its_sub_headers_form_one_header_row() {
+    let md = extract_html(&table_page(
+        "<table><tr><th rowspan=\"2\">Model</th><th colspan=\"2\">Price</th></tr>\
+         <tr><th>Monthly</th><th>Yearly</th></tr>\
+         <tr><td>Basic</td><td>$5</td><td>$50</td></tr>\
+         <tr><td>Free</td><td colspan=\"2\">n/a</td></tr></table>",
+    ))
+    .markdown;
+    assert_eq!(
+        table_lines(&md),
+        [
+            "| Model | Price Monthly | Price Yearly |",
+            "| --- | --- | --- |",
+            "| Basic | $5 | $50 |",
+            "| Free | n/a | n/a |",
+        ],
+        "{md}"
+    );
+}
+
+// rowspan="0" spans the rest of its row group, and a rowspan larger
+// than the group stops at the group's last row instead of reaching
+// into the next tbody.
+#[test]
+fn a_rowspan_ends_with_its_row_group() {
+    let md = extract_html(&table_page(
+        "<table><thead><tr><th>Region</th><th>City</th></tr></thead>\
+         <tbody><tr><td rowspan=\"0\">North</td><td>Oslo</td></tr><tr><td>Bergen</td></tr></tbody>\
+         <tbody><tr><td rowspan=\"5\">South</td><td>Rome</td></tr><tr><td>Naples</td></tr></tbody>\
+         <tbody><tr><td>East</td><td>Delhi</td></tr></tbody></table>",
+    ))
+    .markdown;
+    assert_eq!(
+        table_lines(&md),
+        [
+            "| Region | City |",
+            "| --- | --- |",
+            "| North | Oslo |",
+            "| North | Bergen |",
+            "| South | Rome |",
+            "| South | Naples |",
+            "| East | Delhi |",
+        ],
+        "{md}"
+    );
+}
+
+// Focus keeps only the rows it selects, so a selected row has to carry
+// its rowspan group label itself.
+#[test]
+fn a_focused_table_row_keeps_its_rowspan_label() {
+    let html = table_page(
+        "<h1>Pantry</h1><p>Weights of the pantry stock, measured per item.</p>\
+         <table><tr><th>Group</th><th>Item</th><th>Weight</th></tr>\
+         <tr><td rowspan=\"4\">Fruit</td><td>Apple</td><td>150 g</td></tr>\
+         <tr><td>Banana</td><td>120 g</td></tr><tr><td>Cherry</td><td>8 g</td></tr>\
+         <tr><td>Grape</td><td>5 g</td></tr>\
+         <tr><td rowspan=\"4\">Root</td><td>Carrot</td><td>60 g</td></tr>\
+         <tr><td>Beet</td><td>90 g</td></tr><tr><td>Radish</td><td>20 g</td></tr>\
+         <tr><td>Turnip</td><td>110 g</td></tr></table>",
+    );
+    let md = extract_html_opts(
+        &html,
+        &ExtractOptions {
+            focus: Some("banana".into()),
+            ..Default::default()
+        },
+    )
+    .markdown;
+    assert!(md.contains("| Fruit | Banana | 120 g |"), "{md}");
+    assert!(!md.contains("Carrot"), "focus kept every row:\n{md}");
+}
+
+// Negative: without a span the table renders exactly as before. The
+// second all-<th> row stays a data row (no header cell above it spans
+// columns), the ragged row keeps its extra cell, the empty row is
+// dropped, and span attributes that parse to 1 or fail to parse change
+// nothing.
+#[test]
+fn a_table_without_spans_renders_as_before() {
+    let md = extract_html(&table_page(
+        "<table><tr><th>Name</th><th colspan=\"1\">Score</th></tr>\
+         <tr><th>Unit</th><th>pts</th></tr>\
+         <tr><th scope=\"row\">Ada</th><td rowspan=\"x\">9</td><td colspan=\"-2\">extra</td></tr>\
+         <tr><td></td><td></td></tr>\
+         <tr><td rowspan=\"1\">Bob</td></tr></table>",
+    ))
+    .markdown;
+    assert_eq!(
+        table_lines(&md),
+        [
+            "| Name | Score |  |",
+            "| --- | --- | --- |",
+            "| Unit | pts |  |",
+            "| Ada | 9 | extra |",
+            "| Bob |  |  |",
+        ],
+        "{md}"
+    );
+}
+
+// Negative: a cell over the table's whole width (an infobox title or
+// section row) is written once, in the first column, as before.
+#[test]
+fn a_full_width_cell_is_written_once() {
+    let md = extract_html(&table_page(
+        "<table><tr><th colspan=\"2\">Rust</th></tr>\
+         <tr><th>Paradigms</th><td>Multi-paradigm</td></tr>\
+         <tr><td colspan=\"2\">Influenced by</td></tr>\
+         <tr><td colspan=\"2\">Alef BETA CLU</td></tr></table>",
+    ))
+    .markdown;
+    assert_eq!(
+        table_lines(&md),
+        [
+            "| Rust |  |",
+            "| --- | --- |",
+            "| Paradigms | Multi-paradigm |",
+            "| Influenced by |  |",
+            "| Alef BETA CLU |  |",
+        ],
+        "{md}"
+    );
+}
+
+// Negative: a layout table (prose cells, no <th>) is still walked as
+// paragraphs, and a three-link strip still falls to the tab-nav filter
+// when one link spans two columns: that filter counts source cells, not
+// the slots a span fills.
+#[test]
+fn layout_and_link_strip_tables_are_not_turned_into_grids() {
+    let prose = "This cell holds a paragraph of running text, the way forum and email layouts put content in tables. ".repeat(4);
+    let md = extract_html(&table_page(&format!(
+        "<p>Lead paragraph of the article, long enough to stand as its body text here.</p>\
+         <table><tr><td><p>{prose}</p></td><td><p>Second column text.</p></td></tr></table>\
+         <table><tr><td colspan=\"2\"><a href=\"/home\">Home</a></td></tr>\
+         <tr><td><a href=\"/docs\">Docs</a></td><td><a href=\"/blog\">Blog</a></td></tr></table>"
+    )))
+    .markdown;
+    assert!(table_lines(&md).is_empty(), "{md}");
+    assert!(md.contains("Second column text."), "{md}");
+    assert!(!md.contains("Docs"), "{md}");
+}
+
+// Negative: hostile span values stay bounded. colspan=100000 and
+// rowspan=100000 on every row, and a long cell whose rowspan reaches
+// thousands of rows: the grid stays a few columns wide and the copies
+// of the long cell stop at the copy budget.
+#[test]
+fn hostile_span_values_stay_bounded() {
+    let long = "w".repeat(4000);
+    let mut t = format!("<table><tr><th colspan=\"100000\">{long}</th></tr>");
+    for i in 0..3000 {
+        t.push_str(&format!(
+            "<tr><td colspan=\"100000\" rowspan=\"100000\">c{i}</td><td rowspan=\"0\">d{i}</td></tr>"
+        ));
+    }
+    // The header row keeps this table a data table despite its long cell.
+    t.push_str("</table><table><tr><th>Note</th><th>Value</th></tr>");
+    t.push_str(&format!(
+        "<tr><td rowspan=\"100000\" colspan=\"100000\">{long}</td><td>v0</td></tr>"
+    ));
+    for i in 1..3000 {
+        t.push_str(&format!("<tr><td>v{i}</td></tr>"));
+    }
+    t.push_str("</table>");
+    let started = std::time::Instant::now();
+    let md = extract_html(&table_page(&t)).markdown;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "took {:?}",
+        started.elapsed()
+    );
+    let lines = table_lines(&md);
+    assert!(lines.len() <= 2 * (3000 + 2), "{} table lines", lines.len());
+    let widest = lines.iter().map(|l| l.matches(" | ").count() + 1).max();
+    assert!(widest.unwrap_or(0) <= 8, "{widest:?} columns");
+    assert!(md.len() < 512 << 10, "{} bytes of markdown", md.len());
+}
+
+// Negative: a few cells that span many rows cannot build a grid far
+// larger than the table's source. 2000 header cells with rowspan="0"
+// over 2000 one-cell rows would be 2000 x 2001 slots; past
+// max(65536, 8 x source cells) slots the spans end.
+#[test]
+fn a_rowspan_grid_stays_proportional_to_its_source_cells() {
+    let mut t = String::from("<table><tr>");
+    for i in 0..2000 {
+        t.push_str(&format!("<th rowspan=\"0\">k{i}</th>"));
+    }
+    t.push_str("</tr>");
+    for i in 0..2000 {
+        t.push_str(&format!("<tr><td>v{i}</td></tr>"));
+    }
+    t.push_str("</table>");
+    let doc = Html::parse_document(&table_page(&t));
+    let mut out = Vec::new();
+    blocks::segment(
+        doc.root_element(),
+        "https://example.com/",
+        &ExtractOptions::default(),
+        &mut out,
+    );
+    let slots: usize = out
+        .iter()
+        .map(|b| match b {
+            blocks::Block::Table { headers, rows, .. } => {
+                headers.len() + rows.iter().map(Vec::len).sum::<usize>()
+            }
+            _ => 0,
+        })
+        .sum();
+    assert!(slots >= 4000, "{slots} slots");
+    assert!(slots <= (1 << 16) + 2 * 2001, "{slots} slots");
+}
+
+// ════════════════════════════════════════════════════════════
 // 25. TABLE CELL TRUNCATION : CHAR-BASED (CJK)
 // ════════════════════════════════════════════════════════════
 

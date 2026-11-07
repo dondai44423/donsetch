@@ -736,26 +736,41 @@ fn is_link_farm_table(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptio
 /// per level, and the walk then recursed a level and did it again.
 /// 18 KB of `<table><tr><td>` × 1000 took minutes.
 fn own_rows<'a>(table: ElementRef<'a>) -> Vec<ElementRef<'a>> {
-    let mut rows = Vec::new();
+    own_row_groups(table).into_iter().flatten().collect()
+}
+
+/// A table's own rows by row group, in document order: each `thead`,
+/// `tbody` and `tfoot` is a group, and so is each run of `tr` children
+/// sitting directly in the table. Groups without rows are left out.
+fn own_row_groups<'a>(table: ElementRef<'a>) -> Vec<Vec<ElementRef<'a>>> {
+    let mut groups = Vec::new();
+    let mut loose = Vec::new();
     for child in table.children() {
         let Some(c) = ElementRef::wrap(child) else {
             continue;
         };
         match c.value().name() {
-            "tr" => rows.push(c),
+            "tr" => loose.push(c),
             "thead" | "tbody" | "tfoot" => {
-                for gc in c.children() {
-                    if let Some(g) = ElementRef::wrap(gc)
-                        && g.value().name() == "tr"
-                    {
-                        rows.push(g);
-                    }
+                if !loose.is_empty() {
+                    groups.push(std::mem::take(&mut loose));
+                }
+                let rows: Vec<ElementRef<'a>> = c
+                    .children()
+                    .filter_map(ElementRef::wrap)
+                    .filter(|g| g.value().name() == "tr")
+                    .collect();
+                if !rows.is_empty() {
+                    groups.push(rows);
                 }
             }
             _ => {}
         }
     }
-    rows
+    if !loose.is_empty() {
+        groups.push(loose);
+    }
+    groups
 }
 
 /// A row's own cells, in document order.
@@ -801,64 +816,367 @@ fn is_prose_table(el: ElementRef<'_>) -> bool {
     max_cols <= 1 && rows >= 2
 }
 
+/// A span stops before column `max(SPAN_COLS, widest row's cell count)`.
+const SPAN_COLS: usize = 64;
+/// Text copied into spanned slots is capped per table at the table's own
+/// cell text or this many bytes, whichever is larger.
+const SPAN_COPY_FLOOR: usize = 64 << 10;
+/// The grid's rows hold at most `max(SPAN_SLOTS, SPAN_SLOTS_PER_CELL *
+/// source cells)` slots in all; the rows after the one that passes it
+/// ignore spans.
+const SPAN_SLOTS: usize = 1 << 16;
+const SPAN_SLOTS_PER_CELL: usize = 8;
+
+/// One source cell on the table grid: anchored at (`row`, `col`), covering
+/// `cols` columns and `rows` rows once placed.
+struct GridCell {
+    th: bool,
+    text: String,
+    row: usize,
+    col: usize,
+    cols: usize,
+    rows: usize,
+}
+
+/// HTML "rules for parsing non-negative integers": leading ASCII
+/// whitespace, an optional sign, then the digits up to the first
+/// non-digit. `None` for a missing attribute, a parse error or a
+/// negative value; huge values saturate.
+fn span_attr(cell: ElementRef<'_>, name: &str) -> Option<usize> {
+    let v = cell
+        .value()
+        .attr(name)?
+        .trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, v) = match v.as_bytes().first() {
+        Some(b'-') => (true, &v[1..]),
+        Some(b'+') => (false, &v[1..]),
+        _ => (false, v),
+    };
+    let digits = v.bytes().take_while(u8::is_ascii_digit);
+    let mut seen = false;
+    let mut n = 0usize;
+    for d in digits {
+        seen = true;
+        n = n.saturating_mul(10).saturating_add(usize::from(d - b'0'));
+    }
+    (seen && (!negative || n == 0)).then_some(n)
+}
+
+/// The table as a pipe-table block, cells laid out on the HTML table
+/// grid: a `colspan`/`rowspan` cell fills every slot it covers, so later
+/// cells keep their column. A spanned slot repeats the cell's text. It
+/// is empty instead when the table's copy budget is spent, or, outside a
+/// merged header, when the cell spans the table's whole width (its text
+/// stays in its first column). Consecutive leading `<th>`-only rows form
+/// one header row when the row above holds a header cell spanning
+/// several columns; that header joins each column's distinct labels with
+/// a space ("Price Monthly"). Columns in which no cell starts hold only
+/// copies and are dropped. A table without span attributes produces the
+/// same block as reading each row as a flat list of its cells.
 fn table_block(
     el: ElementRef<'_>,
     headings: &[(u8, String)],
     base: &str,
     opts: &super::ExtractOptions,
 ) -> Option<Block> {
-    let mut headers = Vec::new();
-    let mut rows = Vec::new();
-    // Set when any filled cell holds text that is not a link.
-    let mut prose_cell = false;
     // Output pagination is the budget. Cutting source rows or cells here
     // makes later focus/probe/offset reads unable to recover the evidence.
-    for tr in own_rows(el) {
-        // One select over both cell kinds, in document order: a
-        // row's <th scope="row"> label has to stay in its column.
-        // Selecting <th> and <td> separately (the old shape) only
-        // ever used <th> for the header row, so every data row's
-        // label vanished and its remaining cells shifted left.
-        let cells: Vec<(bool, String)> = own_cells(tr)
-            .map(|c| {
-                let is_th = c.value().name() == "th";
+    // Set when any filled cell holds text that is not a link.
+    let mut prose_cell = false;
+    let groups = own_row_groups(el);
+    let mut cells: Vec<GridCell> = Vec::new();
+    // Per row: the range of its own cells in `cells`.
+    let mut row_cells: Vec<std::ops::Range<usize>> = Vec::new();
+    for group in &groups {
+        for tr in group {
+            let start = cells.len();
+            // One select over both cell kinds, in document order: a
+            // row's <th scope="row"> label has to stay in its column.
+            // Selecting <th> and <td> separately (the old shape) only
+            // ever used <th> for the header row, so every data row's
+            // label vanished and its remaining cells shifted left.
+            for c in own_cells(*tr) {
+                let th = c.value().name() == "th";
                 let (md, link_density) = inline::markdown(c, base, opts);
                 prose_cell |= !md.trim().is_empty() && link_density < 0.9;
-                let t = md.replace('|', "\\|"); // unescaped pipes break md tables
-                (is_th, t)
-            })
-            .collect();
-        // The header row is the first row made only of <th>.
-        if headers.is_empty()
-            && rows.is_empty()
-            && !cells.is_empty()
-            && cells.iter().all(|(is_th, _)| *is_th)
-        {
-            headers = cells.into_iter().map(|(_, t)| t).collect();
-            continue;
-        }
-        let row: Vec<String> = cells.into_iter().map(|(_, text)| text).collect();
-        if row.iter().any(|c| !c.is_empty()) {
-            rows.push(row);
+                let text = md.replace('|', "\\|"); // unescaped pipes break md tables
+                // WHATWG 4.9.12.1: colspan 0 or unparsable is 1, capped at
+                // 1000; rowspan unparsable is 1, capped at 65534, and 0
+                // means "to the end of the row group".
+                let cols = span_attr(c, "colspan")
+                    .filter(|&n| n > 0)
+                    .unwrap_or(1)
+                    .min(1000);
+                let rows = span_attr(c, "rowspan").unwrap_or(1).min(65534);
+                // Placement below replaces `col`, `cols` and `rows` with
+                // the cell's position and its clipped spans.
+                cells.push(GridCell {
+                    th,
+                    text,
+                    row: row_cells.len(),
+                    col: 0,
+                    cols,
+                    rows,
+                });
+            }
+            row_cells.push(start..cells.len());
         }
     }
-    if rows.is_empty() && headers.is_empty() {
+    let widest = row_cells
+        .iter()
+        .map(ExactSizeIterator::len)
+        .max()
+        .unwrap_or(0);
+    // Spans stop before column `limit`, and a cell pushed to or past it
+    // by spans keeps colspan and rowspan 1. Unclipped, a cell per row that
+    // spans 1000 columns to the end of the group would push the next
+    // row's cell 1000 columns further right, a grid growing with the
+    // square of the rows; clipped, a row has at most `limit + widest`
+    // slots.
+    let limit = SPAN_COLS.max(widest);
+
+    // Placement (WHATWG 4.9.12.1): a cell starts at the first slot of its
+    // row no earlier cell covers. `free_from[c]` is the first row at
+    // which column c is no longer covered.
+    let mut free_from: Vec<usize> = Vec::new();
+    let mut starts: Vec<bool> = Vec::new();
+    // Rows are as wide as their last covered column, so a few cells that
+    // span many rows can still make a grid far larger than the table's
+    // source (2000 header cells with rowspan="0" over 2000 one-cell rows
+    // is 4 million slots from 4000 cells). Past the slot cap the spans
+    // end and later rows are read as flat cell lists.
+    let max_slots = SPAN_SLOTS.max(SPAN_SLOTS_PER_CELL.saturating_mul(cells.len()));
+    let mut slots_used = 0usize;
+    let mut spans_on = true;
+    let mut y = 0;
+    for group in &groups {
+        let end = y + group.len();
+        for _ in group {
+            let mut x = 0;
+            for id in row_cells[y].clone() {
+                while free_from.get(x).is_some_and(|&f| f > y) {
+                    x += 1;
+                }
+                let (cols, rows) = (cells[id].cols, cells[id].rows);
+                // A rowspan stops at the end of its row group (the table
+                // model ends every downward-growing cell there).
+                let (cols, rows) = if spans_on && x < limit {
+                    let left = end - y;
+                    let rows = if rows == 0 { left } else { rows.min(left) };
+                    (cols.min(limit - x), rows)
+                } else {
+                    (1, 1)
+                };
+                if free_from.len() < x + cols {
+                    free_from.resize(x + cols, 0);
+                }
+                for f in &mut free_from[x..x + cols] {
+                    *f = (*f).max(y + rows);
+                }
+                if starts.len() <= x {
+                    starts.resize(x + 1, false);
+                }
+                starts[x] = true;
+                let cell = &mut cells[id];
+                (cell.col, cell.cols, cell.rows) = (x, cols, rows);
+                x += cols;
+            }
+            if spans_on {
+                slots_used += free_from.iter().rposition(|&f| f > y).map_or(0, |c| c + 1);
+                if slots_used > max_slots {
+                    spans_on = false;
+                    for f in &mut free_from {
+                        *f = (*f).min(y + 1);
+                    }
+                    for cell in &mut cells[..row_cells[y].end] {
+                        cell.rows = cell.rows.min(y + 1 - cell.row);
+                    }
+                }
+            }
+            y += 1;
+        }
+    }
+    starts.resize(free_from.len(), false);
+    // Columns where no cell starts hold only copies of cells to their
+    // left (a table model error per WHATWG): drop them.
+    let mut keep: Vec<Option<usize>> = Vec::with_capacity(starts.len());
+    let mut width = 0;
+    for &s in &starts {
+        keep.push(s.then(|| {
+            width += 1;
+            width - 1
+        }));
+    }
+    let kept_cols = |c: &GridCell| keep[c.col..c.col + c.cols].iter().flatten().count();
+
+    // Header rows: the first row made only of <th> (before any data
+    // row), then each following <th>-only row while the row above it
+    // has its own header cell over several columns: a group header
+    // whose sub-headers sit in the next row. Without that span a second
+    // <th> row stays a data row, so a table of <th> cells keeps its rows.
+    let own = |y: usize| &cells[row_cells[y].clone()];
+    let mut header_rows: Vec<usize> = Vec::new();
+    let mut is_header = vec![false; row_cells.len()];
+    let mut is_data = vec![false; row_cells.len()];
+    let mut any_data = false;
+    for y in 0..row_cells.len() {
+        let all_th = !own(y).is_empty() && own(y).iter().all(|c| c.th);
+        if all_th && !any_data {
+            let opens = header_rows
+                .last()
+                .is_none_or(|&above| own(above).iter().any(|c| kept_cols(c) > 1));
+            if opens {
+                header_rows.push(y);
+                is_header[y] = true;
+                continue;
+            }
+        }
+        if own(y).iter().any(|c| !c.text.is_empty()) {
+            is_data[y] = true;
+            any_data = true;
+        }
+    }
+    if header_rows.is_empty() && !any_data {
         return None;
     }
+    // Tab-nav junk: tiny tables that are only links. Counted on source
+    // cells, so a span cannot lift a link strip past it. A small table with
+    // a cell of plain text is a figure ("Maximum | EUR 15M or 3%"), and
+    // dropping it leaves a section that reads as complete without it.
+    let (mut counted, mut total_text) = (0usize, 0usize);
+    for y in (0..row_cells.len()).filter(|&y| is_header[y] || is_data[y]) {
+        for c in own(y) {
+            counted += 1;
+            total_text += c.text.len();
+        }
+    }
+    if counted <= 3 && total_text < 60 && !prose_cell {
+        return None;
+    }
+
+    // A spanned slot repeats the cell's text instead of staying empty.
+    // Focus narrows a table to the rows its query selects (each row
+    // scored on its own joined cells and kept with the headers), and
+    // views rank every row as its own passage under the header line, so
+    // a row read without its neighbours must still carry its rowspan
+    // label; a cell shared by some columns (n/a under Monthly and
+    // Yearly) holds for each of them, and the table model gives a header
+    // cell to every column it spans (WHATWG 4.9.12.2). Outside a merged
+    // header, a cell over the table's whole width keeps its text in its
+    // first column only: the row is read whole and has it once, and
+    // repeating it doubled the infobox title and full-width rows of the
+    // wiki-rust corpus page. The copies are budgeted; past the budget a
+    // spanned slot is empty and its column stays aligned.
+    let own_text: usize = cells.iter().map(|c| c.text.len()).sum();
+    let mut budget = own_text.max(SPAN_COPY_FLOOR);
+    let copy = |id: usize, budget: &mut usize| -> String {
+        let t = &cells[id].text;
+        if t.len() <= *budget {
+            *budget -= t.len();
+            t.clone()
+        } else {
+            String::new()
+        }
+    };
+    let row_text = |y: usize, slots: &[Option<usize>], budget: &mut usize| -> Vec<String> {
+        slots
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let Some(id) = *s else {
+                    return String::new();
+                };
+                let c = &cells[id];
+                if keep[c.col] == Some(k) {
+                    if c.row == y {
+                        c.text.clone()
+                    } else {
+                        copy(id, budget)
+                    }
+                } else if kept_cols(c) == width {
+                    String::new()
+                } else {
+                    copy(id, budget)
+                }
+            })
+            .collect()
+    };
+    // Several header rows merge column by column: each column's distinct
+    // labels, top to bottom, joined with a space.
+    let header_text = |slots: &[Vec<Option<usize>>], budget: &mut usize| -> Vec<String> {
+        match slots {
+            [] => Vec::new(),
+            [only] => row_text(header_rows[0], only, budget),
+            _ => {
+                let n = slots.iter().map(Vec::len).max().unwrap_or(0);
+                (0..n)
+                    .map(|k| {
+                        let mut parts: Vec<String> = Vec::new();
+                        let mut last = None;
+                        for id in slots.iter().filter_map(|r| r.get(k).copied().flatten()) {
+                            if last == Some(id) {
+                                continue;
+                            }
+                            last = Some(id);
+                            let t = if keep[cells[id].col] == Some(k) {
+                                cells[id].text.clone()
+                            } else {
+                                copy(id, budget)
+                            };
+                            if !t.is_empty() {
+                                parts.push(t);
+                            }
+                        }
+                        parts.join(" ")
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    // One sweep over the rows reads each kept row off `cover[k]`: the
+    // cell covering kept column k and the first row it no longer covers.
+    // An overlapping later cell does not take a slot from the earlier
+    // one. Header rows come before every data row, so the header is
+    // built (and served from the budget) before the first data row.
+    let mut cover: Vec<Option<(usize, usize)>> = vec![None; width];
+    let mut header_slots: Vec<Vec<Option<usize>>> = Vec::new();
+    let mut headers: Option<Vec<String>> = None;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for (y, ids) in row_cells.iter().enumerate() {
+        for id in ids.clone() {
+            let c = &cells[id];
+            for k in keep[c.col..c.col + c.cols].iter().flatten() {
+                if cover[*k].is_none_or(|(_, until)| until <= y) {
+                    cover[*k] = Some((id, y + c.rows));
+                }
+            }
+        }
+        if !is_header[y] && !is_data[y] {
+            continue;
+        }
+        let mut slots: Vec<Option<usize>> = cover
+            .iter()
+            .map(|s| s.filter(|&(_, until)| until > y).map(|(id, _)| id))
+            .collect();
+        while slots.last() == Some(&None) {
+            slots.pop();
+        }
+        if is_header[y] {
+            header_slots.push(slots);
+            continue;
+        }
+        if headers.is_none() {
+            headers = Some(header_text(&header_slots, &mut budget));
+        }
+        rows.push(row_text(y, &slots, &mut budget));
+    }
+    let mut headers = headers.unwrap_or_else(|| header_text(&header_slots, &mut budget));
     // No <th> found: promote the first data row to headers.
     // Without this, tables without <th> render with empty header
     // cells (| | | |) which is useless to agents.
     if headers.is_empty() && !rows.is_empty() {
         headers = rows.remove(0);
-    }
-    // Tab-nav junk: tiny tables that are only links. A small table with a
-    // cell of plain text is a figure ("Maximum | EUR 15M or 3%"), and
-    // dropping it leaves a section that reads as complete without it.
-    let total_text: usize = headers.iter().map(|h| h.len()).sum::<usize>()
-        + rows.iter().flatten().map(|c| c.len()).sum::<usize>();
-    let cells = headers.len() + rows.iter().map(|r| r.len()).sum::<usize>();
-    if cells <= 3 && total_text < 60 && !prose_cell {
-        return None;
     }
     Some(Block::Table {
         headers,
