@@ -185,7 +185,9 @@ pub enum ProxyScheme {
 pub struct Proxy {
     pub host: String,
     pub port: u16,
+    /// Decoded user name: the bytes the proxy receives.
     pub user: String,
+    /// Decoded password: the bytes the proxy receives.
     pub pass: String,
     pub scheme: ProxyScheme,
 }
@@ -212,6 +214,13 @@ impl Proxy {
     ///   "http://user:pass@host:port"
     ///   "user:pass@host:port"  (bare = HTTP CONNECT, backward compat)
     ///   "host:port"            (no auth, HTTP CONNECT)
+    ///
+    /// In every form `user` and `pass` are percent-decoded userinfo
+    /// (RFC 3986 §3.2.1): "p%40ss" is the password "p@ss". A '%' that does
+    /// not start two hex digits stays a literal '%', and a field whose
+    /// escapes do not decode to UTF-8 is kept as written. Raw reserved
+    /// characters are accepted as written: auth ends at the last '@' and the
+    /// user name at the first ':'.
     ///
     /// Errors are `FetchError::ProxyConfig`: a proxy reference that does not
     /// parse is a configuration problem, never origin evidence. `http:` in
@@ -240,7 +249,9 @@ impl Proxy {
                         "bad auth (expected scheme://user:pass@host:port)".into(),
                     )
                 })?;
-                (u.to_string(), p.to_string(), addr)
+                // Decode after splitting: an escaped '@' or ':' is part of
+                // a field, never a separator.
+                (decode_userinfo(u), decode_userinfo(p), addr)
             }
             None => (String::new(), String::new(), rest),
         };
@@ -648,7 +659,8 @@ impl Proxy {
     }
 
     /// Reconstruct the proxy URL string from parsed fields.
-    /// Handles IPv6 bracketing. Used for config-file round-trip.
+    /// Handles IPv6 bracketing. Used for config-file round-trip:
+    /// credentials are percent-encoded, so `parse` reads back this proxy.
     pub fn to_url(&self) -> String {
         self.url_with_scheme(scheme_str(self.scheme))
     }
@@ -657,7 +669,8 @@ impl Proxy {
     /// NAME to the proxy (`socks5h` = remote resolve — what the old
     /// transport sent too: ATYP=3 domain), so the egress lane resolves and
     /// the host is never leaked to the local resolver. `to_url` stays the
-    /// config/display form.
+    /// config/display form. Credentials are percent-encoded: the engine
+    /// decodes userinfo and sends `user` and `pass` byte for byte.
     pub fn wire_url(&self) -> String {
         let scheme = match self.scheme {
             ProxyScheme::Http => "http",
@@ -673,9 +686,14 @@ impl Proxy {
         if self.user.is_empty() && self.pass.is_empty() {
             format!("{scheme}://{host}:{}", self.port)
         } else {
+            // A raw '/', '?' or '#' in a field would end the authority
+            // there, and the URL parser would take a host out of the
+            // credential.
             format!(
                 "{scheme}://{}:{}@{host}:{}",
-                self.user, self.pass, self.port
+                encode_userinfo(&self.user, false),
+                encode_userinfo(&self.pass, true),
+                self.port
             )
         }
     }
@@ -705,6 +723,59 @@ fn bracketed_host(host: &str) -> String {
     } else {
         host.to_string()
     }
+}
+
+/// Percent-encode one credential field for a proxy URL. Unreserved and
+/// sub-delims characters stay raw (RFC 3986 §3.2.1 userinfo), and ':' too
+/// when `keep_colon` (the password: the user name ends at the first ':').
+/// Every other byte is escaped, '%' included, so the result holds no URL
+/// delimiter and `decode_userinfo` turns it back into `field`.
+fn encode_userinfo(field: &str, keep_colon: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(field.len());
+    for &byte in field.as_bytes() {
+        let raw = byte.is_ascii_alphanumeric()
+            || b"-._~!$&'()*+,;=".contains(&byte)
+            || (keep_colon && byte == b':');
+        if raw {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
+}
+
+/// Percent-decode one credential field (RFC 3986 §2.1). A '%' that does not
+/// start two hex digits stays a literal '%'. A field whose decoded bytes are
+/// not UTF-8 is returned as written.
+fn decode_userinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    // A `String` cannot hold such a credential; kept as written it still
+    // loads, round-trips through the config file and goes out literally.
+    String::from_utf8(out).unwrap_or_else(|_| field.to_string())
 }
 
 /// Bracket a bare IPv6 literal for wire use ("CONNECT host:port",
@@ -1772,5 +1843,384 @@ u:p@also_valid:8080
                 .proxy_authorization()
                 .is_none()
         );
+    }
+
+    // ── Credentials on the wire ──
+    //
+    // The fetching tests below install their own config and dial loopback
+    // fixtures; they rely on nextest's one process per test (`just t`).
+
+    #[test]
+    fn percent_encoded_credentials_parse_decoded_in_every_form() {
+        for raw in [
+            "http://alice:p%40ss%3Aword@proxy:3128",
+            "socks5://alice:p%40ss%3Aword@proxy:1080",
+            "socks5h://alice:p%40ss%3Aword@proxy:1080",
+            "alice:p%40ss%3Aword@proxy:3128",
+        ] {
+            let p = Proxy::parse(raw).unwrap();
+            assert_eq!((p.user.as_str(), p.pass.as_str()), ("alice", "p@ss:word"));
+        }
+        // An escaped ':' is the only way to put one in the user name.
+        let p = Proxy::parse("http://me%3Acorp:pw@proxy:3128").unwrap();
+        assert_eq!((p.user.as_str(), p.pass.as_str()), ("me:corp", "pw"));
+    }
+
+    #[test]
+    fn a_percent_that_starts_no_escape_stays_literal() {
+        for (raw, pass) in [
+            ("http://alice:100%@proxy:3128", "100%"),
+            ("http://alice:50%off@proxy:3128", "50%off"),
+            ("http://alice:ab%4@proxy:3128", "ab%4"),
+            ("http://alice:ab%+f@proxy:3128", "ab%+f"),
+            ("http://alice:s3cret@proxy:3128", "s3cret"),
+        ] {
+            assert_eq!(Proxy::parse(raw).unwrap().pass, pass, "{raw}");
+        }
+    }
+
+    // A v4 config may hold a password whose escape is not UTF-8 ("x%FFy",
+    // which v4 sent literally): it must still load and survive the save
+    // round trip, never be skipped by load_config and dropped on save.
+    #[test]
+    fn an_escape_that_does_not_decode_to_utf8_stays_as_written() {
+        for (raw, user, pass) in [
+            ("http://bob:x%FFy@proxy:3129", "bob", "x%FFy"),
+            ("alice:s3cret%C3@proxy:3128", "alice", "s3cret%C3"),
+            ("socks5://b%FFb:pw@proxy:1080", "b%FFb", "pw"),
+        ] {
+            let p = Proxy::parse(raw).unwrap();
+            assert_eq!((p.user.as_str(), p.pass.as_str()), (user, pass), "{raw}");
+            assert_eq!(Proxy::parse(&p.to_url()).unwrap(), p, "{raw}");
+        }
+        let (loaded, skipped) = parse_lines_verbose("http://bob:x%FFy@127.0.0.1:3129\n");
+        assert_eq!((loaded.len(), skipped), (1, 0));
+    }
+
+    // Credentials made only of characters userinfo allows raw are written
+    // back byte for byte: no churn in proxies.txt, `proxy export` or the
+    // engine URL the page cache keys on.
+    #[test]
+    fn credentials_that_need_no_escape_are_written_unchanged() {
+        for raw in [
+            "http://alice:s3cret@127.0.0.1:3128",
+            "socks5://dave:a+b=c!@127.0.0.1:1080",
+            "http://user-zone-us:tok~en_1.2@proxy.example:8080",
+            "http://alice:a!$&'()*+,;=:b@127.0.0.1:3128",
+            "http://:tok3n@proxy:8080",
+        ] {
+            assert_eq!(Proxy::parse(raw).unwrap().to_url(), raw);
+        }
+    }
+
+    // Every byte of a credential must come back from the URL the engine
+    // and the config file get: the authority must still end at the proxy.
+    #[test]
+    fn proxy_urls_carry_every_credential_byte() {
+        for (user, pass) in [
+            ("alice", "pa/ss"),
+            ("alice", "pa#ss"),
+            ("alice", "pa?ss"),
+            ("me@corp", "p@ss:w%rd"),
+            ("me:corp", "100%41 é"),
+            ("", "tok/en"),
+            ("a!$&'()*+,;=b", "c!$&'()*+,;=:d"),
+        ] {
+            for scheme in [ProxyScheme::Http, ProxyScheme::Socks5] {
+                let p = Proxy {
+                    host: "127.0.0.1".into(),
+                    port: 3128,
+                    user: user.into(),
+                    pass: pass.into(),
+                    scheme,
+                };
+                for url in [p.wire_url(), p.to_url()] {
+                    let parsed = url::Url::parse(&url).unwrap_or_else(|e| panic!("{url}: {e}"));
+                    assert_eq!(parsed.host_str(), Some("127.0.0.1"), "{url}");
+                    assert_eq!(parsed.port(), Some(3128), "{url}");
+                    assert_eq!(Proxy::parse(&url).unwrap(), p, "{url}");
+                }
+            }
+        }
+    }
+
+    async fn read_request_head<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            if bytes.len() > 16384 {
+                return None;
+            }
+            bytes.push(stream.read_u8().await.ok()?);
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The decoded `user:pass` of a request head's `Proxy-Authorization: Basic`.
+    fn basic_credentials(head: &str) -> Option<String> {
+        use base64::Engine as _;
+        let value = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("proxy-authorization")
+                .then(|| value.trim().to_string())
+        })?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(value.strip_prefix("Basic ")?)
+            .ok()?;
+        String::from_utf8(decoded).ok()
+    }
+
+    fn page_reply() -> Vec<u8> {
+        const PAGE: &[u8] = b"<!doctype html><html><head><title>Final page</title></head><body><article><h1>Final page</h1><p>The request reached the page it asked for, and this paragraph is that page's content.</p></article></body></html>";
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            PAGE.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(PAGE);
+        reply
+    }
+
+    type Heads = std::sync::Arc<Mutex<Vec<String>>>;
+
+    /// An HTTP proxy on 127.0.0.1 that records every request head, grants
+    /// CONNECT and answers any other request as the origin.
+    async fn http_proxy_fixture() -> (u16, Heads, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heads: Heads = Default::default();
+        let log = std::sync::Arc::clone(&heads);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let Some(head) = read_request_head(&mut stream).await else {
+                        return;
+                    };
+                    log.lock().unwrap().push(head.clone());
+                    let reply = if head.starts_with("CONNECT ") {
+                        b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec()
+                    } else {
+                        page_reply()
+                    };
+                    let _ = stream.write_all(&reply).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (port, heads, task)
+    }
+
+    fn loopback_fetch_config() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+    }
+
+    /// One plaintext read of `url` through `proxy`: the status, or the
+    /// error text.
+    async fn fetch_through(proxy: &Proxy, url: &str) -> Result<u16, String> {
+        let fetcher =
+            crate::fetch::client::Fetcher::new(crate::profile::BrowserProfile::host_default())
+                .unwrap();
+        fetcher
+            .fetch_once_via(url, &[], Some(proxy), false, None)
+            .await
+            .map(|out| out.status)
+            .map_err(|e| e.to_string())
+    }
+
+    /// What an HTTP proxy configured as `http://{userinfo}@…` receives from
+    /// the CONNECT probe behind `proxy add` / `proxy test` and from a fetch:
+    /// `(parsed user:pass, CONNECT credential, GET credential, report)`.
+    async fn sent_by_probe_and_fetch(
+        userinfo: &str,
+    ) -> (String, Option<String>, Option<String>, String) {
+        let (port, heads, server) = http_proxy_fixture().await;
+        let proxy = Proxy::parse(&format!("http://{userinfo}@127.0.0.1:{port}")).unwrap();
+        let parsed = format!("{}:{}", proxy.user, proxy.pass);
+        let tunnel = proxy.connect("example.test", 80).await.map(drop);
+        let fetch = fetch_through(&proxy, "http://127.0.0.1:9/page").await;
+        server.abort();
+        let heads = heads.lock().unwrap().clone();
+        let sent = |verb: &str| {
+            heads
+                .iter()
+                .find(|head| head.starts_with(verb))
+                .and_then(|head| basic_credentials(head))
+        };
+        let (connect, get) = (sent("CONNECT "), sent("GET "));
+        let report = format!(
+            "{userinfo}: parsed {parsed:?}; CONNECT probe ({tunnel:?}) sent {connect:?}; fetch ({fetch:?}) sent {get:?}"
+        );
+        (parsed, connect, get, report)
+    }
+
+    /// Credentials `Proxy::parse` accepts with a raw '/', '#' or '?', in the
+    /// password or the user name, must reach the proxy on the fetch path.
+    #[tokio::test]
+    async fn a_raw_reserved_character_in_proxy_credentials_reaches_the_proxy() {
+        loopback_fetch_config();
+        for userinfo in [
+            "alice:pa/ss",
+            "alice:pa#ss",
+            "alice:pa?ss",
+            "al/ice:pw",
+            "us#er:p?w",
+        ] {
+            let (port, heads, server) = http_proxy_fixture().await;
+            let proxy = Proxy::parse(&format!("http://{userinfo}@127.0.0.1:{port}")).unwrap();
+            assert_eq!(format!("{}:{}", proxy.user, proxy.pass), userinfo);
+            let fetch = fetch_through(&proxy, "http://127.0.0.1:9/page").await;
+            server.abort();
+            let sent: Vec<Option<String>> = heads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|head| basic_credentials(head))
+                .collect();
+            assert!(
+                matches!(fetch, Ok(200))
+                    && sent.first().cloned().flatten().as_deref() == Some(userinfo),
+                "{userinfo}: fetch: {fetch:?}; proxy received credentials {sent:?}"
+            );
+        }
+    }
+
+    /// Userinfo in a proxy URL is percent-encoded (RFC 3986 §3.2.1). The
+    /// CONNECT probe and the fetch must send the same decoded credential.
+    #[tokio::test]
+    async fn proxy_credentials_are_percent_decoded() {
+        loopback_fetch_config();
+        let (parsed, connect, get, report) = sent_by_probe_and_fetch("alice:p%40ss%3Aword").await;
+        assert_eq!(parsed, "alice:p@ss:word", "{report}");
+        assert_eq!(connect.as_deref(), Some("alice:p@ss:word"), "{report}");
+        assert_eq!(get.as_deref(), Some("alice:p@ss:word"), "{report}");
+    }
+
+    /// An escape that does not decode to UTF-8 ("x%FFy", a password v4 sent
+    /// literally) goes out as written on both paths.
+    #[tokio::test]
+    async fn an_escape_that_is_not_utf8_goes_out_as_written_on_every_path() {
+        loopback_fetch_config();
+        let (parsed, connect, get, report) = sent_by_probe_and_fetch("bob:x%FFy").await;
+        assert_eq!(parsed, "bob:x%FFy", "{report}");
+        assert_eq!(connect.as_deref(), Some("bob:x%FFy"), "{report}");
+        assert_eq!(get.as_deref(), Some("bob:x%FFy"), "{report}");
+    }
+
+    // Negative: what the fetch path sent for a plain password, an encoded
+    // one, a '%' that starts no escape and raw sub-delims stays what it was.
+    #[tokio::test]
+    async fn the_fetch_path_keeps_sending_plain_and_encoded_passwords_as_before() {
+        loopback_fetch_config();
+        for (userinfo, expected) in [
+            ("alice:s3cret", "alice:s3cret"),
+            ("alice:p%40ss%3Aword", "alice:p@ss:word"),
+            ("alice:100%", "alice:100%"),
+            ("alice:a!$&'()*+,;=:b", "alice:a!$&'()*+,;=:b"),
+        ] {
+            let (port, heads, server) = http_proxy_fixture().await;
+            let proxy = Proxy::parse(&format!("http://{userinfo}@127.0.0.1:{port}")).unwrap();
+            let fetch = fetch_through(&proxy, "http://127.0.0.1:9/page").await;
+            server.abort();
+            let sent = heads
+                .lock()
+                .unwrap()
+                .first()
+                .and_then(|h| basic_credentials(h));
+            assert!(
+                matches!(fetch, Ok(200)) && sent.as_deref() == Some(expected),
+                "{userinfo}: fetch: {fetch:?}; proxy received {sent:?}"
+            );
+        }
+    }
+
+    /// A SOCKS5 proxy on 127.0.0.1 that records each RFC 1929 `user:pass`,
+    /// grants the CONNECT and answers the tunnelled request itself.
+    async fn socks5_fixture() -> (u16, Heads, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // One RFC 1929 field: a length byte, then that many bytes.
+        async fn read_field(s: &mut tokio::net::TcpStream) -> Option<String> {
+            let len = s.read_u8().await.ok()?;
+            let mut bytes = vec![0u8; usize::from(len)];
+            s.read_exact(&mut bytes).await.ok()?;
+            String::from_utf8(bytes).ok()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Heads = Default::default();
+        let log = std::sync::Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 2];
+                    s.read_exact(&mut greeting).await.ok()?;
+                    let mut methods = vec![0u8; usize::from(greeting[1])];
+                    s.read_exact(&mut methods).await.ok()?;
+                    if !methods.contains(&0x02) {
+                        log.lock()
+                            .unwrap()
+                            .push("no username/password offer".into());
+                        s.write_all(&[0x05, 0xFF]).await.ok()?;
+                        return None;
+                    }
+                    s.write_all(&[0x05, 0x02]).await.ok()?;
+                    let _version = s.read_u8().await.ok()?;
+                    let user = read_field(&mut s).await?;
+                    let pass = read_field(&mut s).await?;
+                    log.lock().unwrap().push(format!("{user}:{pass}"));
+                    s.write_all(&[0x01, 0x00]).await.ok()?;
+                    let mut head = [0u8; 4];
+                    s.read_exact(&mut head).await.ok()?;
+                    let skip = match head[3] {
+                        0x01 => 4,
+                        0x04 => 16,
+                        _ => usize::from(s.read_u8().await.ok()?),
+                    };
+                    let mut rest = vec![0u8; skip + 2];
+                    s.read_exact(&mut rest).await.ok()?;
+                    s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                        .await
+                        .ok()?;
+                    read_request_head(&mut s).await?;
+                    s.write_all(&page_reply()).await.ok()?;
+                    s.shutdown().await.ok()
+                });
+            }
+        });
+        (port, seen, task)
+    }
+
+    /// The SOCKS5 lane takes the same URL: its RFC 1929 sub-negotiation must
+    /// carry the stored credential, and the read must never leave on a
+    /// direct connection to the origin.
+    #[tokio::test]
+    async fn a_socks5_lane_authenticates_with_the_stored_credential() {
+        loopback_fetch_config();
+        for (userinfo, expected) in [
+            ("alice:pa#ss", "alice:pa#ss"),
+            ("alice:pa/ss%40x", "alice:pa/ss@x"),
+        ] {
+            let (origin_port, direct, origin) = http_proxy_fixture().await;
+            let (port, seen, server) = socks5_fixture().await;
+            let proxy = Proxy::parse(&format!("socks5://{userinfo}@127.0.0.1:{port}")).unwrap();
+            let fetch =
+                fetch_through(&proxy, &format!("http://127.0.0.1:{origin_port}/page")).await;
+            server.abort();
+            origin.abort();
+            let seen = seen.lock().unwrap().clone();
+            let direct = direct.lock().unwrap().len();
+            assert!(
+                matches!(fetch, Ok(200))
+                    && seen.first().map(String::as_str) == Some(expected)
+                    && direct == 0,
+                "{userinfo}: fetch: {fetch:?}; proxy received {seen:?}; direct connections to the origin: {direct}"
+            );
+        }
     }
 }
