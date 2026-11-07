@@ -219,7 +219,10 @@ struct Section {
     body: String,
 }
 
+/// Sections compare by their words: link targets are left out, so a read
+/// that kept links and one that did not see the same page.
 fn split_sections(md: &str) -> Vec<Section> {
+    let md = crate::extract::view::link_text(md);
     let mut out: Vec<Section> = Vec::new();
     let mut cur = Section {
         title: "(intro)".to_string(),
@@ -397,6 +400,16 @@ mod tests {
         assert!(report.contains("changed: Install"), "{report}");
         assert!(report.contains("removed: Usage"), "{report}");
         assert!(report.contains("added: FAQ"), "{report}");
+    }
+
+    #[test]
+    fn a_read_with_links_and_one_without_are_the_same_page() {
+        let linked = "# T\n\n## [Floods close the line](https://e.com/a)\n\nSee [the report](https://e.com/r_(pdf)) today.\n";
+        let plain = "# T\n\n## Floods close the line\n\nSee the report today.\n";
+        assert!(matches!(
+            classify_change(linked, plain),
+            ChangeKind::Unchanged
+        ));
     }
 
     #[test]

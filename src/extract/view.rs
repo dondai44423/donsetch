@@ -223,9 +223,12 @@ fn heading_of(line: &str) -> Option<(u8, &str)> {
     (!text.is_empty()).then_some((hashes as u8, text))
 }
 
-/// A heading's words without link markup: `[Title](https://...)` reads
-/// as `Title` in the outline, in section paths and for section matching.
-fn link_text(title: &str) -> String {
+/// Markdown text without link targets: `[Title](https://...)` reads as
+/// `Title`. Headings use it in the outline, in section paths and for
+/// section matching; page history uses it so a read with links and one
+/// without compare equal. A target may hold balanced parentheses
+/// (`/wiki/Rust_(language)`).
+pub(crate) fn link_text(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     let mut rest = title;
     while let Some(open) = rest.find('[') {
@@ -234,7 +237,19 @@ fn link_text(title: &str) -> String {
             break;
         };
         let target = &after[close + 2..];
-        let Some(end) = target.find(')') else {
+        let mut depth = 0usize;
+        let Some(end) = target.char_indices().find_map(|(i, c)| match c {
+            '(' => {
+                depth += 1;
+                None
+            }
+            ')' if depth == 0 => Some(i),
+            ')' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        }) else {
             break;
         };
         out.push_str(&rest[..open]);
@@ -1388,6 +1403,10 @@ Intro text about widgets and how they work.\n\n\
         assert_eq!(link_text("[a](x) and [b](y)"), "a and b");
         assert_eq!(link_text("no [link here"), "no [link here");
         assert_eq!(link_text("[x](unclosed"), "[x](unclosed");
+        assert_eq!(
+            link_text("see [Rust](https://w.org/Rust_(lang)) now"),
+            "see Rust now"
+        );
     }
 
     #[test]
