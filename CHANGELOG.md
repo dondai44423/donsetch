@@ -5,6 +5,37 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0-beta.2] - 2026-11-07
+
+### Fixed
+
+- **Linux ARM64 starts, and ships again.** The beta.1 product binary died before
+  `main` on aarch64. PDFium's and libc++'s objects use CREL (compact
+  relocation) sections; GNU ld before 2.44 and any lld before LLVM 20 skip them
+  without an error, so their relocations stay unapplied and one constructor
+  slot in `.init_array` is null (`SIGSEGV` at address 0 in `call_init`).
+  Measured on real arm64 hardware: Ubuntu's lld 18 applied one of six
+  `.init_array` relocations and the binary crashed; the Rust toolchain's own
+  `rust-lld` (LLVM 22.1.8) started it and passed the suite. `build.rs` now links
+  with the toolchain's `rust-lld`, or an `ld.lld` of LLVM 20 or later on `PATH`,
+  and warns when neither exists; the system lld is no longer installed or
+  needed, and a build must not force an older one through `RUSTFLAGS`. CI builds
+  the shipped arm64 shape on an arm64 runner and gates on the binary starting.
+  The `donsetch-linux-arm64` asset is core-only (fetch, search, crawl, PDF): the
+  aarch64 ONNX Runtime deadlocks in its loader, so OCR and rerank stay off there.
+- **Windows reads a browser's version from the file.** `chrome.exe --version`
+  never exits (a GUI subsystem binary), so every process spent the whole probe
+  timeout asking. The version now comes from the executable's own version
+  resource (a pure-Rust PE reader), and a launch remains only as the fallback
+  for a file without one. On the Windows runner the seconds that beta.1 listed as
+  first-fetch setup are gone: a version-reporting CLI test fell from 12.3 s to
+  0.09 s and the crawl governor's lane-health tests from 6-8 s to 0.14 s. What
+  is left on that platform is the OS itself: refusing a loopback connection
+  takes about 2.2 s there, which is what the two lane tests that dial a closed
+  port still pay.
+- **A challenge program's timer errors say where they came from.** An exception
+  thrown from a timer callback is logged with its stack.
+
 ## [5.0.0-beta.1] - 2026-11-07
 
 ### Known limitations in this beta
