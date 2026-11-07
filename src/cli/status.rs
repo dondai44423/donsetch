@@ -13,13 +13,12 @@
 
 use crate::DISPLAY_NAME;
 use crate::cli;
+use crate::cli::update::{self, Offer};
 use crate::egress::proxy;
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
 use crate::search::byok::store::ByokConfig;
 use serde_json::json;
-
-const REPO: &str = "dondai44423/donsetch";
 
 /// Usage text, shared by `donsetch status --help` and `donsetch help status`.
 pub fn help() {
@@ -42,24 +41,13 @@ pub async fn run(args: &[String]) {
     // ── Version + update ────────────────────────────────────
 
     let fetcher = Fetcher::new(BrowserProfile::host_default());
-    let latest = match &fetcher {
-        Ok(f) => fetch_latest_version(f).await.ok(),
+    let feed = match &fetcher {
+        Ok(f) => update::fetch_feed(f).await.ok(),
         Err(_) => None,
     };
 
     // "update state" is the machine value; the human line renders it.
-    let update_state = match &latest {
-        Some(latest) => {
-            let cur = semver::Version::parse(current).ok();
-            let lat = semver::Version::parse(latest).ok();
-            match (cur, lat) {
-                (Some(c), Some(l)) if c == l => "up_to_date",
-                (Some(c), Some(l)) if c > l => "ahead",
-                _ => "update_available",
-            }
-        }
-        None => "offline",
-    };
+    let (latest, update_state) = update_fields(current, feed.as_deref());
     let version_human = match (update_state, latest.as_deref()) {
         ("up_to_date", _) => format!("{} (up to date)", cli::green(current)),
         ("ahead", Some(latest)) => format!("{} (ahead of {latest})", cli::green(current)),
@@ -367,40 +355,64 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Fetch the latest version from the GitHub releases.atom feed.
-/// Same logic as version.rs : no API, no rate limits.
-async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
-    let url = format!("https://github.com/{REPO}/releases.atom");
-    let out = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;
+/// `latest` and `update_state` for an install at `current`, from a
+/// releases.atom `feed` body (None: no answer, "offline"). The state
+/// is what `donsetch update` would do: "update_available" only when it
+/// would install `latest`, and "up_to_date" also when `latest` is a
+/// prerelease that a stable install stays off.
+fn update_fields(current: &str, feed: Option<&str>) -> (Option<String>, &'static str) {
+    match feed.map(|body| update::check_feed(body, current)) {
+        Some(Ok((latest, offer))) => {
+            let state = match offer {
+                Offer::UpToDate | Offer::Prerelease => "up_to_date",
+                Offer::Ahead => "ahead",
+                Offer::Newer => "update_available",
+            };
+            (Some(latest), state)
+        }
+        Some(Err(_)) | None => (None, "offline"),
+    }
+}
 
-    if out.status != 200 {
-        return Err(format!("HTTP {} from releases feed", out.status));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::update::tests::feed;
+
+    // `update` keeps a stable install on the newest stable release
+    // when a prerelease tops the feed. Agents act on update_state, so
+    // it must not say update_available for the prerelease.
+    #[test]
+    fn a_stable_install_is_not_told_to_update_to_a_prerelease() {
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0", "v4.10.5"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.0.0".to_string()), "up_to_date")
+        );
+        let body = feed(&["v5.1.0-beta.1", "v5.0.1", "v5.0.0"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.0.1".to_string()), "update_available")
+        );
+        let body = feed(&["v5.1.0-beta.2", "v5.1.0-beta.1"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.1.0-beta.2".to_string()), "up_to_date")
+        );
     }
 
-    let body = String::from_utf8_lossy(&out.body);
-
-    let entry_pos = body
-        .find("<entry>")
-        .ok_or_else(|| "no releases found in feed".to_string())?;
-
-    let id_tag = body[entry_pos..]
-        .find("<id>")
-        .ok_or_else(|| "could not parse feed: no <id> in first entry".to_string())?
-        + entry_pos;
-
-    let content_start = body[id_tag..]
-        .find('>')
-        .ok_or_else(|| "could not parse feed: malformed <id>".to_string())?
-        + id_tag
-        + 1;
-
-    let content_end = body[content_start..]
-        .find("</id>")
-        .ok_or_else(|| "could not parse feed: no </id>".to_string())?
-        + content_start;
-
-    let id_content = body[content_start..content_end].trim();
-    let tag = id_content.rsplit('/').next().unwrap_or(id_content);
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    Ok(version.to_string())
+    #[test]
+    fn a_newer_release_the_install_follows_is_update_available() {
+        let body = feed(&["v5.0.1", "v5.0.0"]);
+        assert_eq!(
+            update_fields("5.0.0", Some(body.as_str())),
+            (Some("5.0.1".to_string()), "update_available")
+        );
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0"]);
+        assert_eq!(
+            update_fields("5.0.0-beta.1", Some(body.as_str())),
+            (Some("5.1.0-beta.1".to_string()), "update_available")
+        );
+        assert_eq!(update_fields("5.0.0", None), (None, "offline"));
+    }
 }

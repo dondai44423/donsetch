@@ -71,7 +71,11 @@ pub async fn run(args: &[String]) {
     // ── Latest version (atom feed : no API, no rate limits) ──
 
     let spinner = cli::Spinner::new("checking for updates...");
-    let latest = match fetch_latest_version(&fetcher, is_prerelease(current)).await {
+    let checked = match fetch_feed(&fetcher).await {
+        Ok(body) => check_feed(&body, current),
+        Err(e) => Err(e),
+    };
+    let (latest, offer) = match checked {
         Ok(v) => v,
         Err(e) => {
             spinner.stop();
@@ -86,34 +90,28 @@ pub async fn run(args: &[String]) {
 
     // ── Version comparison ───────────────────────────────────
 
-    let cur_ver = semver::Version::parse(current).ok();
-    let lat_ver = semver::Version::parse(&latest).ok();
-
-    match (cur_ver, lat_ver) {
-        (Some(c), Some(l)) if c == l => {
+    match offer {
+        Offer::UpToDate => {
             println!("  Already up to date.");
             return;
         }
-        (Some(c), Some(l)) if c > l => {
+        Offer::Ahead => {
             println!(
-                "  {} You are ahead of the latest release ({c} > {l}).",
+                "  {} You are ahead of the latest release ({current} > {latest}).",
                 cli::icon_warn(),
             );
             println!("  No update needed.");
             return;
         }
-        _ => {} // Proceed : version is newer or unparseable.
-    }
-
-    // The atom feed lists prereleases too. A stable install never
-    // moves onto one; a prerelease install (a tester) follows them.
-    if is_prerelease(&latest) && !is_prerelease(current) {
-        println!(
-            "  {} Latest published is a prerelease ({latest}); staying on {current}.",
-            cli::icon_warn()
-        );
-        println!("    Install a prerelease explicitly if you want one.");
-        return;
+        Offer::Prerelease => {
+            println!(
+                "  {} Latest published is a prerelease ({latest}); staying on {current}.",
+                cli::icon_warn()
+            );
+            println!("    Install a prerelease explicitly if you want one.");
+            return;
+        }
+        Offer::Newer => {}
     }
 
     // ── Platform asset ───────────────────────────────────────
@@ -294,20 +292,11 @@ fn permission_advice(exe: &Path) -> String {
     return "Check write permissions on the binary's directory".to_string();
 }
 
-/// Fetch the releases.atom feed and parse the release an install
-/// moves to: the newest entry, or for a stable install
-/// (`follow_prereleases` false) the newest that is not a prerelease.
+/// Fetch the releases.atom feed body, for [`check_feed`].
 ///
 /// The atom feed is a regular GitHub web page (not an API call),
 /// so it is NOT subject to the 60-req/hour API rate limit.
-///
-/// Uses the `<id>` tag (not `<title>`) because release titles can
-/// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
-/// semver parsing. The `<id>` tag always ends with `/v<version>`.
-async fn fetch_latest_version(
-    fetcher: &Fetcher,
-    follow_prereleases: bool,
-) -> Result<String, String> {
+pub(crate) async fn fetch_feed(fetcher: &Fetcher) -> Result<String, String> {
     let url = format!("https://github.com/{REPO}/releases.atom");
     let out = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;
 
@@ -315,7 +304,52 @@ async fn fetch_latest_version(
         return Err(format!("HTTP {} from releases feed", out.status));
     }
 
-    latest_in_feed(&String::from_utf8_lossy(&out.body), follow_prereleases)
+    Ok(String::from_utf8_lossy(&out.body).into_owned())
+}
+
+/// What `donsetch update` does for an install offered a release by
+/// [`check_feed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// The offered release is the installed version: nothing to do.
+    UpToDate,
+    /// The installed version is newer than the offered release:
+    /// nothing to do.
+    Ahead,
+    /// The offered release is a prerelease, newer than the install
+    /// when both are semver, and the install is stable: `update` stays
+    /// put. From [`check_feed`] this happens only when every entry in
+    /// the feed is a prerelease.
+    Prerelease,
+    /// `update` installs the offered release. Also the verdict when
+    /// either version is not semver, outside the `Prerelease` case.
+    Newer,
+}
+
+/// The release a releases.atom `body` offers an install at `current`,
+/// and what `update` does about it. A prerelease install is offered
+/// the newest entry, a stable one the newest stable entry, or the
+/// newest entry when the feed holds only prereleases (see
+/// [`latest_in_feed`]). `update`, `version` and `status` all decide
+/// here.
+pub(crate) fn check_feed(body: &str, current: &str) -> Result<(String, Offer), String> {
+    let latest = latest_in_feed(body, is_prerelease(current))?;
+    let offer = offer(current, &latest);
+    Ok((latest, offer))
+}
+
+/// What `update` does for an install at `current` offered `latest`.
+fn offer(current: &str, latest: &str) -> Offer {
+    let cur = semver::Version::parse(current).ok();
+    let lat = semver::Version::parse(latest).ok();
+    match (cur, lat) {
+        (Some(c), Some(l)) if c == l => Offer::UpToDate,
+        (Some(c), Some(l)) if c > l => Offer::Ahead,
+        // The atom feed lists prereleases too. A stable install never
+        // moves onto one; a prerelease install (a tester) follows them.
+        _ if is_prerelease(latest) && !is_prerelease(current) => Offer::Prerelease,
+        _ => Offer::Newer,
+    }
 }
 
 /// The version a releases.atom body offers an install: its first
@@ -323,6 +357,10 @@ async fn fetch_latest_version(
 /// `follow_prereleases`. A feed holding nothing but prereleases
 /// yields the newest of them, so the caller can name what it is not
 /// moving to.
+///
+/// Uses the `<id>` tag (not `<title>`) because release titles can
+/// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
+/// semver parsing. The `<id>` tag always ends with `/v<version>`.
 fn latest_in_feed(body: &str, follow_prereleases: bool) -> Result<String, String> {
     let mut newest: Option<String> = None;
     // Everything before the first <entry> is the feed's own header,
@@ -813,7 +851,7 @@ fn cleanup_previous(exe: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -1249,7 +1287,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn feed(tags: &[&str]) -> String {
+    /// A releases.atom body listing `tags` in feed order.
+    pub(crate) fn feed(tags: &[&str]) -> String {
         let entries: String = tags
             .iter()
             .map(|t| {
@@ -1289,6 +1328,56 @@ mod tests {
     fn a_feed_of_only_prereleases_names_the_newest_one() {
         let body = feed(&["v5.0.0-beta.2", "v5.0.0-beta.1"]);
         assert_eq!(latest_in_feed(&body, false).as_deref(), Ok("5.0.0-beta.2"));
+    }
+
+    // `update`, `version` and `status` all take their verdict from
+    // check_feed, so these are what each of the three reports.
+    #[test]
+    fn a_stable_install_is_offered_the_newest_stable_release() {
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0", "v4.10.5"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0"),
+            Ok(("5.0.0".to_string(), Offer::UpToDate))
+        );
+        assert_eq!(
+            check_feed(&body, "4.10.5"),
+            Ok(("5.0.0".to_string(), Offer::Newer))
+        );
+        let body = feed(&["v5.1.0-beta.1", "v5.0.1", "v5.0.0"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0"),
+            Ok(("5.0.1".to_string(), Offer::Newer))
+        );
+        // Nothing stable listed: the newest prerelease is named, and
+        // the install stays put.
+        let body = feed(&["v5.1.0-beta.2", "v5.1.0-beta.1"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0"),
+            Ok(("5.1.0-beta.2".to_string(), Offer::Prerelease))
+        );
+    }
+
+    #[test]
+    fn a_prerelease_install_is_offered_the_newest_entry() {
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0", "v4.10.5"]);
+        assert_eq!(
+            check_feed(&body, "5.0.0-beta.1"),
+            Ok(("5.1.0-beta.1".to_string(), Offer::Newer))
+        );
+        assert_eq!(
+            check_feed(&body, "5.1.0-beta.1"),
+            Ok(("5.1.0-beta.1".to_string(), Offer::UpToDate))
+        );
+        assert_eq!(
+            check_feed(&body, "5.2.0-beta.1"),
+            Ok(("5.1.0-beta.1".to_string(), Offer::Ahead))
+        );
+    }
+
+    #[test]
+    fn a_version_that_is_not_semver_is_offered_the_release() {
+        assert_eq!(offer("dev", "5.0.0"), Offer::Newer);
+        assert_eq!(offer("5.0.0", "nightly"), Offer::Newer);
     }
 
     #[test]
