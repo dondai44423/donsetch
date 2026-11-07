@@ -57,12 +57,23 @@
             "description": "Most characters returned (default 16000, ~4 per token); longer results end with next_offset. For a url array it is the batch total (default 48000)."
           },
           "links": {
-            "type": "boolean",
-            "description": "Keep links as [text](L-handle); pass a handle as url to follow it. Off: link text only (~30% fewer tokens)."
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string",
+                "enum": [
+                  "handles",
+                  "urls"
+                ]
+              }
+            ],
+            "description": "Keep links. true: [text](L-handle), and a handle passed as url follows it. \"urls\": [text](real URL), to cite or check where a link goes (~2x tokens). Off: link text only (~30% fewer tokens)."
           },
           "since_last": {
             "type": "boolean",
-            "description": "Change check against your previous read of this url: an unchanged line, or only the changed sections. Not with view arguments."
+            "description": "Change check against your previous read of this url: an unchanged line, or only the changed sections; with no earlier read, the page itself. Not with view arguments."
           },
           "image_text": {
             "type": "boolean",

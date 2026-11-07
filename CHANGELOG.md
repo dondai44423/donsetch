@@ -35,6 +35,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   port still pay.
 - **A challenge program's timer errors say where they came from.** An exception
   thrown from a timer callback is logged with its stack.
+- **`section` and `focus` keep tables.** A small table of figures (a pricing or
+  results grid) was dropped as page furniture; it is kept now, and only a tiny
+  table of links is still removed. Series sidebars and navboxes on wiki pages no
+  longer count as article content. `focus` ranks passages with synonyms, boosts
+  passages that carry figures when the question asks for them, completes a table
+  it matched into whole rows, and says when only weaker matches exist instead of
+  returning a confident-looking excerpt. `section` accepts a `§sN` id as printed
+  in `toc`.
+- **`offset` past the end says so.** It returns `end_of_document` rather than a
+  short body labelled partial, and a continuation chunk no longer repeats the
+  title and canonical URL.
+- **`links` can return URLs.** `links: "urls"` resolves every link handle to its
+  address in the text (`links: true` still gives handles). On the CLI,
+  `--links=urls`.
+- **`since_last` works on pages read without the block extractor.** A page
+  served through the text fallback, a feed or a data rescue had no fingerprint,
+  so every `since_last` read answered `no_baseline` at full price (seen on a news
+  front page). Those reads are now fingerprinted from their text. An unchanged
+  page collapses to a short change report with `read_status: "change_report"`
+  and no `next_offset`.
 
 ## [5.0.0-beta.1] - 2026-11-07
 

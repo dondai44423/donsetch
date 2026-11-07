@@ -46,6 +46,9 @@ pub struct ExtractOptions {
     pub offset: usize,
     /// Keep [text](url) links; default strips to text (token saver).
     pub include_links: bool,
+    /// Keep links as their real addresses. The default hands the caller
+    /// short handles in their place, once the document is rendered.
+    pub link_urls: bool,
     /// The fetch layer verified this body as content: bot-wall markers in it
     /// (an interstitial's words, a vendor script) are not a wall. Login walls
     /// and paywalls are still reported.

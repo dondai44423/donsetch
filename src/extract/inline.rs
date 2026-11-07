@@ -742,6 +742,7 @@ mod tests {
             max_chars: None,
             offset: 0,
             include_links: false,
+            link_urls: false,
             verified: false,
         };
         markdown(root, "https://example.com/", &opts).0
@@ -777,6 +778,7 @@ mod tests {
             max_chars: None,
             offset: 0,
             include_links: links,
+            link_urls: false,
             verified: false,
         };
         markdown(root, "https://example.com/", &opts).0

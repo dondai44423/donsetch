@@ -46,7 +46,7 @@ async fn fetch_with_budget(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     drop(trace);
-    if args.get("links").and_then(Value::as_bool) == Some(true) {
+    if link_mode(args) != LinkMode::Off {
         result["structuredContent"]["budget_scope"] =
             json!("rendered markdown, including link markup");
     }
@@ -633,12 +633,31 @@ fn args_error(message: impl Into<String>, next_action: &str) -> Value {
     )
 }
 
+/// How a call wants the page's links: as text only, as short handles that
+/// `url` accepts, or as the real addresses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum LinkMode {
+    Off,
+    Handles,
+    Urls,
+}
+
+pub(super) fn link_mode(args: &Value) -> LinkMode {
+    match args.get("links") {
+        Some(Value::Bool(true)) => LinkMode::Handles,
+        Some(Value::String(mode)) if mode == "urls" => LinkMode::Urls,
+        Some(Value::String(mode)) if mode == "handles" => LinkMode::Handles,
+        _ => LinkMode::Off,
+    }
+}
+
 /// The extraction options and the agent's view, from the call's arguments.
 /// Extraction always reads the whole document; the view projects it.
 pub(super) fn fetch_view(args: &Value) -> Result<(ExtractOptions, extract::view::View), Value> {
     use extract::view::{MUST_CONTAIN_MAX_TERMS, Term, View};
     let opts = ExtractOptions {
-        include_links: args.get("links").and_then(Value::as_bool).unwrap_or(false),
+        include_links: link_mode(args) != LinkMode::Off,
+        link_urls: link_mode(args) == LinkMode::Urls,
         max_chars: Some(DOCUMENT_MAX_CHARS),
         ..ExtractOptions::default()
     };
@@ -1612,6 +1631,14 @@ async fn fetch_single_inner(
         &trace,
         t0.elapsed().as_millis(),
     );
+    // A resumed read continues text the caller already holds: the title and
+    // source line belong to the first chunk, and repeating them would put a
+    // second H1 into the stitched document.
+    if view.offset > 0
+        && let Some(cell) = res.pointer_mut("/content/0/text")
+    {
+        *cell = json!(ex.markdown.trim_start_matches('\n'));
+    }
     if let Some(sc) = res.pointer_mut("/structuredContent") {
         if !ex.thin {
             sc["read_status"] = json!(match (rendered.status, ex.partial.is_some()) {
@@ -1648,7 +1675,9 @@ async fn fetch_single_inner(
     if prewarmed {
         res["_meta"]["com.donsetch/fetch-debug"]["prewarmed_by_search"] = json!(true);
     }
-    apply_link_handles(daemon, &mut res).await;
+    if !opts.link_urls {
+        apply_link_handles(daemon, &mut res).await;
+    }
 
     // v3 freshness: the server's own Last-Modified, when it
     // deigns to tell the truth about it.
@@ -1664,13 +1693,21 @@ async fn fetch_single_inner(
         sc["server_modified"] = json!(lm);
     }
     // Every read records the page for since_last; only a since_last call
-    // replaces its output with the change report.
+    // replaces its output with the change report. A path that builds its
+    // markdown without the block extractor (text fallback, feeds, data
+    // rescue) has no fingerprint of its own, so the page's text is
+    // fingerprinted here: an unfingerprinted read could never be checked
+    // for change, and a news front page paid full price on every call.
+    let own_fingerprint = ex.fingerprint.clone().or_else(|| {
+        (!ex.thin && !document.trim().is_empty())
+            .then(|| crate::pages::history::PageHistory::fingerprint(&document))
+    });
     apply_page_history(
         daemon,
         &mut res,
         &display_url,
         PageFacts {
-            fingerprint: ex.fingerprint.as_deref(),
+            fingerprint: own_fingerprint.as_deref(),
             markdown: &document,
             title: ex.title.as_deref(),
             complete: incomplete.is_none() && !ex.thin,
@@ -1786,7 +1823,9 @@ pub(super) async fn try_bypass(
         "provider": "brightdata",
         "cache": outcome.cached,
     });
-    apply_link_handles(daemon, &mut res).await;
+    if !opts.link_urls {
+        apply_link_handles(daemon, &mut res).await;
+    }
     Some(res)
 }
 
@@ -2106,25 +2145,50 @@ pub(super) fn apply_page_history(
         None => ("new".to_string(), None, 0),
     };
 
-    // since_last: collapse the payload to the verdict.
+    // since_last: collapse the payload to the verdict. When there is
+    // nothing to compare against (a first read, or a copy too large to
+    // keep) the page itself is the answer, so the agent never pays a
+    // second call for what this one already fetched.
     if since_last {
         let title_line = ex_title.map(|t| format!("# {t}\n")).unwrap_or_default();
-        let body = match (changed.as_str(), &delta) {
-            ("unchanged", _) => {
-                format!("{title_line}{url}\n\n*unchanged since last fetch ({ago}s ago)*\n")
-            }
-            ("new", _) => format!(
-                "{title_line}{url}\n\n*no prior snapshot for this URL : refetch without since_last for full content*\n"
-            ),
-            (_, Some(d)) => format!(
+        let collapsed = match (changed.as_str(), &delta) {
+            ("unchanged", _) => Some(format!(
+                "{title_line}{url}\n\n*unchanged since last fetch ({ago}s ago)*\n"
+            )),
+            (_, Some(d)) => Some(format!(
                 "{title_line}{url}\n\n*changed since last fetch ({changed}, {ago}s ago):*\n\n- {d}\n\n*(full content: refetch without since_last)*\n"
-            ),
-            _ => format!(
-                "{title_line}{url}\n\n*{changed} since last fetch ({ago}s ago) : refetch without since_last for full content*\n"
-            ),
+            )),
+            _ => None,
         };
+        if let Some(body) = &collapsed {
+            // The answer is a change report, not the page: no cut-off to
+            // resume, and the size is the report's.
+            if let Some(sc) = res.pointer_mut("/structuredContent") {
+                if let Some(object) = sc.as_object_mut() {
+                    object.remove("next_offset");
+                }
+                sc["read_status"] = json!("change_report");
+                sc["content_complete"] = json!(false);
+            }
+            res["_meta"]["com.donsetch/fetch-debug"]["tokens_est"] = json!(body.len() / 4);
+        }
         if let Some(cell) = res.pointer_mut("/content/0/text") {
-            *cell = json!(body);
+            match collapsed {
+                Some(body) => *cell = json!(body),
+                None => {
+                    let note = if changed == "new" {
+                        "no earlier read of this URL to compare with".to_string()
+                    } else {
+                        format!(
+                            "changed since last fetch ({changed}, {ago}s ago), and no stored copy to compare with"
+                        )
+                    };
+                    let md = cell.as_str().unwrap_or_default().to_string();
+                    *cell = json!(format!(
+                        "*[since_last: {note} : full content follows]*\n\n{md}"
+                    ));
+                }
+            }
         }
     } else if changed != "new" && !ex_markdown.starts_with("probe: ") {
         // A change note in the content: ONE line, never the delta
@@ -2575,8 +2639,83 @@ mod page_history_signal_tests {
             true,
         );
         assert_eq!(res["structuredContent"]["changed"], "new");
+        // The page is the answer on a first read: one call, not two.
         let text = res["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("no prior snapshot"), "got: {text}");
+        assert!(text.contains("no earlier read"), "got: {text}");
+        assert!(text.contains("full content follows"), "got: {text}");
+        assert!(text.contains("\nbody"), "got: {text}");
+    }
+
+    // An unchanged page collapses to one line on the second since_last
+    // read, whatever path produced it; a page with no fingerprint of its
+    // own (a text fallback, a feed) is fingerprinted from its text.
+    #[tokio::test]
+    async fn since_last_collapses_an_unchanged_page_on_the_second_read() {
+        let daemon = Arc::new(Daemon::new().await.unwrap());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let url = format!("https://x.test/second-read-{unique}");
+        let fp = crate::pages::history::PageHistory::fingerprint("body of the page");
+        let mut texts = Vec::new();
+        let mut statuses = Vec::new();
+        let mut has_next = Vec::new();
+        for _ in 0..2 {
+            let mut res = json!({
+                "content": [{"type": "text", "text": "# T\nhttps://x.test/\n\nbody of the page"}],
+                "structuredContent": {"ok": true, "read_status": "partial", "next_offset": 15706},
+            });
+            apply_page_history(
+                &daemon,
+                &mut res,
+                &url,
+                PageFacts {
+                    fingerprint: Some(&fp),
+                    markdown: "body of the page",
+                    title: Some("T"),
+                    complete: true,
+                },
+                true,
+            );
+            texts.push(res["content"][0]["text"].as_str().unwrap().to_string());
+            statuses.push(
+                res["structuredContent"]["read_status"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            has_next.push(res["structuredContent"].get("next_offset").is_some());
+        }
+        assert_eq!(statuses[1], "change_report");
+        assert!(!has_next[1], "a change report has nothing to resume");
+        assert!(
+            texts[0].contains("full content follows"),
+            "got: {}",
+            texts[0]
+        );
+        assert!(
+            texts[1].contains("unchanged since last fetch"),
+            "got: {}",
+            texts[1]
+        );
+        assert!(!texts[1].contains("body of the page"), "got: {}", texts[1]);
+    }
+}
+
+#[cfg(test)]
+mod link_mode_tests {
+    use super::{LinkMode, link_mode};
+    use serde_json::json;
+
+    #[test]
+    fn links_are_off_handles_or_urls() {
+        assert_eq!(link_mode(&json!({})), LinkMode::Off);
+        assert_eq!(link_mode(&json!({"links": false})), LinkMode::Off);
+        assert_eq!(link_mode(&json!({"links": true})), LinkMode::Handles);
+        assert_eq!(link_mode(&json!({"links": "handles"})), LinkMode::Handles);
+        assert_eq!(link_mode(&json!({"links": "urls"})), LinkMode::Urls);
+        assert_eq!(link_mode(&json!({"links": "nonsense"})), LinkMode::Off);
     }
 }
 

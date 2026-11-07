@@ -24,6 +24,14 @@ pub const TERM_MAX_CHARS: usize = 500;
 const FOCUS_MAX_PASSAGES: usize = 40;
 /// A passage is kept when it scores at least this share of the best one.
 const FOCUS_KEEP_RATIO: f64 = 0.3;
+/// A passage that states a figure ("EUR 15 million", "7%", "$0.0033 per GB")
+/// scores this much more when the query asks how much, how many or how big.
+const FIGURE_BOOST: f64 = 1.6;
+/// A passage found only through a synonym of a query word counts for this
+/// share of a direct hit.
+const SYNONYM_WEIGHT: f64 = 0.5;
+/// Most sections the "also matched" note names.
+const ALSO_MATCHED_SECTIONS: usize = 6;
 /// Excerpt context on each side of a probe hit, in chars.
 const EXCERPT_PAD: usize = 80;
 /// Code fences longer than this are ranked in windows of `CODE_WINDOW` lines.
@@ -329,7 +337,13 @@ fn outline(doc: &Doc, within: Option<usize>) -> String {
 /// and the other candidates: the other exact matches when there is one,
 /// else the other headings that contain the text.
 fn find_section(doc: &Doc, wanted: &str) -> Option<(usize, Vec<usize>)> {
-    let wanted = wanted.trim();
+    // The label the focus view prints (`§s5`) and the outline's (`[s5]`) both
+    // name a section, so both are accepted back.
+    let wanted = wanted
+        .trim()
+        .trim_start_matches('§')
+        .trim_matches(['[', ']'])
+        .trim();
     let lower = wanted.to_lowercase();
     if let Some(n) = lower
         .strip_prefix('s')
@@ -362,6 +376,15 @@ struct Passage {
     start: usize,
     text: String,
     section: Option<usize>,
+    /// For a table row: the table (its header's offset), the header lines
+    /// and the row. Rows of one table that are kept print as one table.
+    table: Option<TableRow>,
+}
+
+struct TableRow {
+    id: usize,
+    head: String,
+    row: String,
 }
 
 fn list_item(line: &str) -> Option<usize> {
@@ -390,6 +413,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
     let mut cur: Option<(usize, String)> = None;
     let mut list_indent: Option<usize> = None;
     let mut table_head: Option<String> = None;
+    let mut table_id = 0usize;
     let mut fence: Option<(usize, String, Vec<&str>)> = None;
 
     let flush = |cur: &mut Option<(usize, String)>, out: &mut Vec<Passage>| {
@@ -400,6 +424,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
                 start,
                 text: text.trim_end().to_string(),
                 section: doc.section_at(start),
+                table: None,
             });
         }
     };
@@ -414,6 +439,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
                             start: *fstart + k,
                             text: format!("{open}\n{}\n```", window.join("\n")),
                             section,
+                            table: None,
                         });
                     }
                 } else {
@@ -421,6 +447,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
                         start: *fstart,
                         text: format!("{open}\n{}\n```", body.join("\n")),
                         section,
+                        table: None,
                     });
                 }
                 fence = None;
@@ -447,6 +474,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
                 None => {
                     flush(&mut cur, &mut out);
                     table_head = Some(line.to_string());
+                    table_id = start;
                 }
                 Some(head) if is_table_rule(line) && !head.contains('\n') => {
                     head.push('\n');
@@ -457,6 +485,11 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
                         start,
                         text: format!("{head}\n{line}"),
                         section: doc.section_at(start),
+                        table: Some(TableRow {
+                            id: table_id,
+                            head: head.clone(),
+                            row: line.to_string(),
+                        }),
                     });
                 }
             }
@@ -485,6 +518,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
             start: fstart,
             text: format!("{open}\n{}", body.join("\n")),
             section: doc.section_at(fstart),
+            table: None,
         });
     }
     flush(&mut cur, &mut out);
@@ -524,6 +558,146 @@ struct Focused {
     of: usize,
 }
 
+/// Query words that ask for a number: how much, how many, what price.
+const FIGURE_CUES: &[&str] = &[
+    "much",
+    "many",
+    "amount",
+    "amounts",
+    "cost",
+    "costs",
+    "price",
+    "prices",
+    "pricing",
+    "fee",
+    "fees",
+    "fine",
+    "fines",
+    "penalty",
+    "penalties",
+    "rate",
+    "rates",
+    "limit",
+    "limits",
+    "maximum",
+    "minimum",
+    "max",
+    "min",
+    "percent",
+    "percentage",
+    "percentages",
+    "total",
+    "threshold",
+    "quota",
+    "size",
+    "number",
+];
+
+/// Words used interchangeably for one thing, so a question in one of them
+/// finds the page's own. A passage found only this way scores
+/// [`SYNONYM_WEIGHT`] of a direct hit.
+const SYNONYM_GROUPS: &[&[&str]] = &[
+    &[
+        "fine",
+        "fines",
+        "penalty",
+        "penalties",
+        "sanction",
+        "sanctions",
+    ],
+    &[
+        "price", "prices", "pricing", "cost", "costs", "fee", "fees", "charge", "charges",
+    ],
+    &[
+        "limit",
+        "limits",
+        "cap",
+        "ceiling",
+        "maximum",
+        "max",
+        "quota",
+        "threshold",
+    ],
+    &["minimum", "min", "floor"],
+    &["amount", "amounts", "sum", "figure", "figures"],
+    &["percent", "percentage", "percentages"],
+    &["deadline", "due", "cutoff"],
+    &["delete", "remove", "erase"],
+    &["buy", "purchase", "order"],
+    &["error", "errors", "failure", "failures", "exception"],
+    &["begin", "start", "launch"],
+    &["end", "finish", "terminate"],
+];
+
+fn words_of(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric() && c != '$' && c != '€' && c != '£' && c != '%')
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Does the query ask for a figure? A cue word, or a number or currency in
+/// the query itself.
+fn wants_figures(query: &str) -> bool {
+    let words = words_of(query);
+    words.iter().any(|w| FIGURE_CUES.contains(&w.as_str()))
+        || query
+            .chars()
+            .any(|c| c.is_ascii_digit() || "$€£%".contains(c))
+}
+
+/// The query's synonyms that the query does not already say.
+fn synonyms_of(query: &str) -> Vec<String> {
+    let words = words_of(query);
+    let mut out: Vec<String> = Vec::new();
+    for group in SYNONYM_GROUPS {
+        if words.iter().any(|w| group.contains(&w.as_str())) {
+            for alt in *group {
+                if !words.iter().any(|w| w == alt) && !out.iter().any(|o| o == alt) {
+                    out.push((*alt).to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does the passage state a figure: an amount with a currency, a percentage,
+/// a number with a unit or a magnitude word?
+fn has_figure(text: &str) -> bool {
+    static FIGURE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?ix)
+            [$€£¥]\s?\d
+            | \b(?:usd|eur|gbp|chf|jpy|cad|aud)\s?\d
+            | \d\s?(?:%|percent\b|million\b|billion\b|thousand\b|k\b|usd\b|eur\b|gbp\b|€|\$|£)
+            | \d{1,3}(?:[,\u{202f}\u{a0}]\d{3})+
+            | \d+(?:\.\d+)?\s?(?:ms|gb|mb|kb|tb|km|kg|mph|hz|x)\b",
+        )
+        .expect("static regex")
+    });
+    FIGURE.is_match(text)
+}
+
+/// Headings every passage of the page sits under (its title, mostly):
+/// their words say what the page is about, not where a passage is, so they
+/// would make the page's own subject match everywhere.
+fn subject_headings(doc: &Doc, all: &[Passage]) -> Vec<bool> {
+    let mut covered = vec![0usize; doc.headings.len()];
+    for p in all {
+        let mut at = p.section;
+        while let Some(h) = at {
+            covered[h] += 1;
+            at = doc.headings[h].parent;
+        }
+    }
+    covered
+        .iter()
+        .map(|&n| all.len() >= 6 && n * 2 >= all.len())
+        .collect()
+}
+
 fn render_focus(
     doc: &Doc,
     (lo, hi): (usize, usize),
@@ -533,18 +707,47 @@ fn render_focus(
 ) -> Focused {
     let all = passages(doc, lo, hi);
     // A passage is scored with its heading path: a section whose heading
-    // names the topic ranks all of its passages.
+    // names the topic ranks all of its passages. The headings that every
+    // passage sits under are left out, or the page's subject would match
+    // everywhere and decide nothing.
+    let subject = subject_headings(doc, &all);
     let docs: Vec<Vec<String>> = all
         .iter()
         .map(|p| {
             let mut tokens = focus::passage_tokens(&p.text, lang);
-            if let Some(s) = p.section {
-                tokens.extend(focus::passage_tokens(&doc.path(s), lang));
+            let mut at = p.section;
+            while let Some(h) = at {
+                if !subject[h] {
+                    tokens.extend(focus::passage_tokens(&doc.headings[h].text, lang));
+                }
+                at = doc.headings[h].parent;
             }
             tokens
         })
         .collect();
-    let scores = focus::bm25_rank(&docs, focus::passage_tokens(query, lang));
+    let query_tokens = focus::passage_tokens(query, lang);
+    let mut scores = focus::bm25_rank(&docs, query_tokens.clone());
+    // Synonyms add to the passages they find; they never remove a direct hit.
+    let alts = synonyms_of(query);
+    if !alts.is_empty() {
+        let alt_tokens: Vec<String> = focus::passage_tokens(&alts.join(" "), lang)
+            .into_iter()
+            .filter(|t| !query_tokens.contains(t))
+            .collect();
+        if !alt_tokens.is_empty() {
+            let via = focus::bm25_rank(&docs, alt_tokens);
+            for (score, alt) in scores.iter_mut().zip(via) {
+                *score += alt * SYNONYM_WEIGHT;
+            }
+        }
+    }
+    if wants_figures(query) {
+        for (score, p) in scores.iter_mut().zip(&all) {
+            if *score > 0.0 && has_figure(&p.text) {
+                *score *= FIGURE_BOOST;
+            }
+        }
+    }
     let absent = absent_words(query, &docs, lang);
     let best = scores.iter().copied().fold(0.0f64, f64::max);
     let absent_note = if absent.is_empty() {
@@ -568,17 +771,102 @@ fn render_focus(
     ranked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
     ranked.truncate(FOCUS_MAX_PASSAGES);
 
+    // A query word the page has must show up in what is kept. When the best
+    // passages leave one out, its own best passage is added: a view that
+    // silently omits half of what was asked for reads as complete.
+    let mut kept_tokens: std::collections::HashSet<&str> = ranked
+        .iter()
+        .flat_map(|&i| docs[i].iter().map(String::as_str))
+        .collect();
+    let wanted: Vec<&String> = {
+        let mut seen: Vec<&String> = Vec::new();
+        for t in &query_tokens {
+            if !seen.contains(&t) && docs.iter().any(|d| d.contains(t)) {
+                seen.push(t);
+            }
+        }
+        seen
+    };
+    for token in wanted {
+        if kept_tokens.contains(token.as_str()) || ranked.len() >= FOCUS_MAX_PASSAGES {
+            continue;
+        }
+        let top = (0..all.len())
+            .filter(|&i| scores[i] > 0.0 && !ranked.contains(&i) && docs[i].contains(token))
+            .max_by(|&a, &b| scores[a].total_cmp(&scores[b]).then(b.cmp(&a)));
+        if let Some(i) = top {
+            kept_tokens.extend(docs[i].iter().map(String::as_str));
+            ranked.push(i);
+        }
+    }
+
+    // A question about an amount is answered by the figures, and a table of
+    // them scores low next to the prose that explains it. In a section that
+    // is already shown, the table rows and the sentences that state a figure
+    // are shown too, when they match at all.
+    if wants_figures(query) {
+        let shown: std::collections::HashSet<Option<usize>> =
+            ranked.iter().map(|&i| all[i].section).collect();
+        for i in 0..all.len() {
+            if ranked.len() >= FOCUS_MAX_PASSAGES {
+                break;
+            }
+            if scores[i] > 0.0
+                && shown.contains(&all[i].section)
+                && (all[i].table.is_some() || has_figure(&all[i].text))
+                && !ranked.contains(&i)
+            {
+                ranked.push(i);
+            }
+        }
+    }
+
+    // What matched and was not kept is named, by section: the reader decides
+    // whether to go on, instead of trusting a cut it cannot see.
+    let kept_set: std::collections::HashSet<usize> = ranked.iter().copied().collect();
+    let mut below: Vec<(Option<usize>, usize)> = Vec::new();
+    for i in (0..all.len()).filter(|i| scores[*i] > 0.0 && !kept_set.contains(i)) {
+        match below.iter_mut().find(|(s, _)| *s == all[i].section) {
+            Some((_, n)) => *n += 1,
+            None => below.push((all[i].section, 1)),
+        }
+    }
+    let below_total: usize = below.iter().map(|(_, n)| n).sum();
+    below.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let also_note = if below_total == 0 {
+        String::new()
+    } else {
+        let named: Vec<String> = below
+            .iter()
+            .take(ALSO_MATCHED_SECTIONS)
+            .map(|(s, n)| format!("{} ×{n}", place(*s)))
+            .collect();
+        format!(
+            "; {below_total} weaker matches not shown ({}{})",
+            named.join(", "),
+            if below.len() > ALSO_MATCHED_SECTIONS {
+                ", …"
+            } else {
+                ""
+            }
+        )
+    };
+
     // Group by section; a group ranks by its best passage and reads in
     // document order inside.
     let mut groups: Vec<(Option<usize>, f64, Vec<usize>)> = Vec::new();
     for &i in &ranked {
         match groups.iter_mut().find(|g| g.0 == all[i].section) {
-            Some(group) => group.2.push(i),
+            Some(group) => {
+                group.1 = group.1.max(scores[i]);
+                group.2.push(i);
+            }
             None => groups.push((all[i].section, scores[i], vec![i])),
         }
     }
+    groups.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut text = format!(
-        "*[focus {query:?}: {} of {} passages, best first{absent_note}]*\n",
+        "*[focus {query:?}: {} of {} passages, best first{absent_note}{also_note}]*\n",
         ranked.len(),
         all.len()
     );
@@ -588,10 +876,29 @@ fn render_focus(
             Some(s) => text.push_str(&format!("\n### §s{} · {}\n", s + 1, doc.path(s))),
             None => text.push_str("\n### (top of page)\n"),
         }
+        let mut open_table: Option<usize> = None;
         for i in members {
-            text.push('\n');
-            text.push_str(&all[i].text);
-            text.push('\n');
+            match &all[i].table {
+                // Rows of one table that are kept read as one table.
+                Some(t) if open_table == Some(t.id) => {
+                    text.push_str(&t.row);
+                    text.push('\n');
+                }
+                Some(t) => {
+                    text.push('\n');
+                    text.push_str(&t.head);
+                    text.push('\n');
+                    text.push_str(&t.row);
+                    text.push('\n');
+                    open_table = Some(t.id);
+                }
+                None => {
+                    open_table = None;
+                    text.push('\n');
+                    text.push_str(&all[i].text);
+                    text.push('\n');
+                }
+            }
         }
     }
     Focused {
@@ -836,13 +1143,13 @@ pub struct Rendered {
 pub fn render(markdown: &str, view: &View, incomplete: Option<&str>) -> Rendered {
     let doc = Doc::parse(markdown);
     let page = |text: &str, status: &'static str, state: Value| {
-        let (slice, next) = super::paginate_public(text, view.offset, view.max_chars);
+        let (slice, next, past_end) = window(text, view);
         Rendered {
             text: slice,
             next_offset: next,
-            status,
+            status: if past_end { "end_of_document" } else { status },
             complete: false,
-            state,
+            state: ending(state, view, next),
             verdict: None,
         }
     };
@@ -913,16 +1220,47 @@ pub fn render(markdown: &str, view: &View, incomplete: Option<&str>) -> Rendered
         let text = format!("{also_note}{}", &markdown[lo..hi]);
         return page(&text, "section", json!({"section": format!("s{}", s + 1)}));
     }
-    let (slice, next) = super::paginate_public(markdown, view.offset, view.max_chars);
+    let (slice, next, past_end) = window(markdown, view);
     let complete = view.offset == 0 && next.is_none() && incomplete.is_none();
     Rendered {
-        status: if complete { "content" } else { "partial" },
+        status: if past_end {
+            "end_of_document"
+        } else if complete {
+            "content"
+        } else {
+            "partial"
+        },
         text: slice,
         next_offset: next,
         complete,
-        state: json!({}),
+        state: ending(json!({}), view, next),
         verdict: None,
     }
+}
+
+/// The window `view` selects of `text`: the slice, the offset that resumes
+/// it, and whether the window starts at or past the end. An offset past the
+/// end says so in the text instead of returning nothing under a partial label.
+fn window(text: &str, view: &View) -> (String, Option<usize>, bool) {
+    if view.offset > 0 && view.offset >= text.len() {
+        let note = format!(
+            "*[end of document: offset {} is at or past its end ({} chars); nothing follows]*\n",
+            view.offset,
+            text.len()
+        );
+        return (note, None, true);
+    }
+    let (slice, next) = super::paginate_public(text, view.offset, view.max_chars);
+    (slice, next, false)
+}
+
+/// Marks the response that reaches the document's end after a resume, so a
+/// loop over `next_offset` can tell the last chunk from a cut one.
+fn ending(mut state: Value, view: &View, next: Option<usize>) -> Value {
+    if view.offset > 0 && next.is_none() {
+        state["end_of_document"] = json!(true);
+    }
+    state
 }
 
 #[cfg(test)]
@@ -1032,6 +1370,21 @@ Intro text about widgets and how they work.\n\n\
             assert!(r.text.contains("MSI"));
             assert!(!r.text.contains("Plan"));
             assert_eq!(r.state["section"], "s1");
+        }
+    }
+
+    #[test]
+    fn a_section_id_may_be_written_as_the_views_print_it() {
+        for wanted in ["s1", "§s1", "§S1", "[s1]", " § s1 "] {
+            let r = render(
+                DOC,
+                &View {
+                    section: Some(wanted.into()),
+                    ..view()
+                },
+                None,
+            );
+            assert_eq!(r.state["section"], "s1", "{wanted:?}: {}", r.text);
         }
     }
 
@@ -1229,6 +1582,192 @@ Intro text about widgets and how they work.\n\n\
             None,
         );
         assert!(r.text.contains("the answer is the needle"), "{}", r.text);
+    }
+
+    /// A page about penalties, as a law firm writes it: the title is the
+    /// topic, the fines sit in a table, and the prose around the table is
+    /// longer and says "penalty" more often than the table does.
+    const PENALTIES: &str = "# EU AI Act Penalties\nhttps://x.test/penalties\n\n\
+## Tiered Penalty System\n\n\
+Three tiers apply, by the severity of the violation and the size of the company.\n\n\
+| Violation | Maximum Penalty | Turnover |\n|---|---|---|\n\
+| Prohibited AI | EUR 35 million | 7% |\n\
+| General compliance breach | EUR 15 million | 3% |\n\
+| Information accuracy | EUR 7.5 million | 1.5% |\n\n\
+Similar to the GDPR, the Act employs tiered penalties, and the penalties are set by the type of system, the seriousness of the violation and the size of the company.\n\n\
+Small enterprises benefit: the lower of the two amounts applies to them, which is a different rule from the one the GDPR uses for penalties.\n\n\
+## Responsible entities\n\n\
+Providers, deployers and importers can all face penalties when they do not meet their obligations under the Act.\n\n\
+## Enforcement\n\n\
+National authorities enforce the Act and decide on penalties, with the AI Office coordinating how penalties are applied across the Union.\n\n\
+## FAQ\n\n\
+Do penalties apply outside the EU? Yes, when the system's output is used in the Union.\n\n\
+Who collects penalties? The national authority of the member state that imposed them.\n";
+
+    #[test]
+    fn focus_on_the_page_topic_still_surfaces_the_figure_table() {
+        for query in [
+            "penalty amounts",
+            "how much is the fine",
+            "maximum penalty EUR",
+        ] {
+            let r = render(
+                PENALTIES,
+                &View {
+                    focus: Some(query.into()),
+                    ..view()
+                },
+                None,
+            );
+            assert!(r.text.contains("EUR 15 million"), "{query}: {}", r.text);
+            assert!(r.text.contains("| 7% |"), "{query}: {}", r.text);
+        }
+    }
+
+    #[test]
+    fn a_figure_table_is_shown_beside_prose_that_repeats_the_topic() {
+        // The prose says "penalty" six times in a short paragraph, so a row
+        // that says it once scores far under the cut. The question asks for
+        // amounts: the rows are the answer.
+        let md = "# Guide\nhttps://x.test/g\n\n## Tiers\n\n\
+Penalty penalty penalty: the penalty rules, the penalty tiers and the penalty process all matter.\n\n\
+| Tier | Maximum Penalty |\n|---|---|\n| One | EUR 35 million |\n| Two | EUR 15 million |\n\n\
+## Process\n\nAuthorities open a case.\n\n## Appeals\n\nA company may appeal.\n\n\
+## Scope\n\nThe rules cover providers.\n\n## Dates\n\nThe rules apply from August.\n\n\
+## Contact\n\nWrite to the office.\n";
+        for query in ["penalty amounts", "how much is the penalty"] {
+            let r = render(
+                md,
+                &View {
+                    focus: Some(query.into()),
+                    ..view()
+                },
+                None,
+            );
+            assert!(r.text.contains("EUR 15 million"), "{query}: {}", r.text);
+            assert!(r.text.contains("EUR 35 million"), "{query}: {}", r.text);
+        }
+    }
+
+    #[test]
+    fn kept_rows_of_one_table_read_as_one_table() {
+        let r = render(
+            PENALTIES,
+            &View {
+                focus: Some("EUR million".into()),
+                ..view()
+            },
+            None,
+        );
+        assert_eq!(
+            r.text.matches("| Violation | Maximum Penalty |").count(),
+            1,
+            "{}",
+            r.text
+        );
+        assert!(r.text.contains("EUR 35 million"), "{}", r.text);
+        assert!(r.text.contains("EUR 7.5 million"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_query_word_the_page_has_is_never_dropped_from_the_view() {
+        // "alpha" fills the best passages; "zebra" is in one weak passage.
+        let md = "# T\nhttps://x.test/\n\n## A\n\nalpha alpha alpha alpha alpha\n\n\
+alpha alpha alpha alpha\n\n## B\n\nthe zebra crossed the road once\n\n## C\n\nunrelated words only\n\n\
+## D\n\nmore unrelated words\n\n## E\n\nstill unrelated\n\n## F\n\nand more\n";
+        let r = render(
+            md,
+            &View {
+                focus: Some("alpha zebra".into()),
+                ..view()
+            },
+            None,
+        );
+        assert!(r.text.contains("zebra crossed"), "{}", r.text);
+    }
+
+    #[test]
+    fn weaker_matches_that_are_not_shown_are_named_by_section() {
+        // Direct hits on "fine", and a tail of passages that say "penalty":
+        // a synonym finds them, but weakly, and they fall below the cut.
+        let mut md = String::from(
+            "# T\nhttps://x.test/\n\n## Core\n\nthe fine fine fine fine is stated here\n\n",
+        );
+        for i in 0..6 {
+            md.push_str(&format!(
+                "## Aside {i}\n\nan aside number {i} that mentions a penalty once among many other unrelated words of padding\n\n"
+            ));
+        }
+        for i in 0..14 {
+            md.push_str(&format!(
+                "## Other {i}\n\nunrelated text number {i} about nothing in particular\n\n"
+            ));
+        }
+        let r = render(
+            &md,
+            &View {
+                focus: Some("fine".into()),
+                ..view()
+            },
+            None,
+        );
+        assert!(r.text.contains("weaker matches not shown"), "{}", r.text);
+        assert!(r.text.contains("§s"), "{}", r.text);
+        assert!(!r.text.contains("aside number 3"), "{}", r.text);
+    }
+
+    #[test]
+    fn an_offset_past_the_end_says_so_instead_of_returning_nothing() {
+        let r = render(
+            DOC,
+            &View {
+                offset: DOC.len() + 10,
+                max_chars: 16_000,
+                ..View::default()
+            },
+            None,
+        );
+        assert_eq!(r.status, "end_of_document");
+        assert!(r.text.contains("end of document"), "{}", r.text);
+        assert!(r.next_offset.is_none());
+        assert_eq!(r.state["end_of_document"], true);
+    }
+
+    #[test]
+    fn the_last_chunk_of_a_resumed_read_is_marked_the_end() {
+        let first = render(
+            DOC,
+            &View {
+                max_chars: 200,
+                ..View::default()
+            },
+            None,
+        );
+        let mut at = first.next_offset.unwrap();
+        let mut stitched = first.text.clone();
+        loop {
+            let next = render(
+                DOC,
+                &View {
+                    offset: at,
+                    max_chars: 200,
+                    ..View::default()
+                },
+                None,
+            );
+            stitched.push_str(&next.text);
+            match next.next_offset {
+                Some(n) => {
+                    assert!(next.state.get("end_of_document").is_none());
+                    at = n;
+                }
+                None => {
+                    assert_eq!(next.state["end_of_document"], true);
+                    break;
+                }
+            }
+        }
+        assert!(stitched.contains("## FAQ"));
     }
 
     #[test]

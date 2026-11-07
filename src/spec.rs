@@ -36,6 +36,10 @@ pub enum ParamKind {
     StrOrListMax(usize),
     /// JSON string from a fixed set; CLI validated choices.
     Enum(&'static [&'static str]),
+    /// JSON `true`/`false` or one string of a fixed set. On the CLI the
+    /// bare flag selects the first string (it sends `true`) and
+    /// `--flag=<value>` selects another.
+    BoolOr(&'static [&'static str]),
     /// JSON array of strings; CLI repeatable + comma-splittable.
     StrList,
     /// Bounded JSON array of strings; CLI repeatable + comma-splittable.
@@ -183,12 +187,12 @@ const FETCH_PARAMS: &[ParamSpec] = &[
     ParamSpec {
         name: "links",
         flag: "links",
-        kind: ParamKind::SetTrue,
+        kind: ParamKind::BoolOr(&["handles", "urls"]),
         cli: CliKind::Flag,
         required: false,
-        help: "Keep the page's links as [text](handle): a short L-handle that fetch accepts as its url, to follow a link without copying it. Off by default: link text only, which saves about a third of the tokens.",
+        help: "Keep the page's links. --links gives [text](handle): a short L-handle that fetch accepts as its url, to follow a link without copying it. --links=urls gives [text](https://...) with the real address, for citing a source or checking where a link goes (about twice the tokens). Off by default: link text only, which saves about a third of the tokens.",
         mcp_help: Some(
-            "Keep links as [text](L-handle); pass a handle as url to follow it. Off: link text only (~30% fewer tokens).",
+            "Keep links. true: [text](L-handle), and a handle passed as url follows it. \"urls\": [text](real URL), to cite or check where a link goes (~2x tokens). Off: link text only (~30% fewer tokens).",
         ),
     },
     ParamSpec {
@@ -197,9 +201,9 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::SetTrue,
         cli: CliKind::Flag,
         required: false,
-        help: "Check a page you read before for changes: one line when it is unchanged, else only the sections that changed. Every read records the page, so any earlier fetch of the URL is the baseline. On its own: not with a view option.",
+        help: "Check a page you read before for changes: one line when it is unchanged, else only the sections that changed. Every read records the page, so any earlier fetch of the URL is the baseline; with none, you get the page itself. On its own: not with a view option.",
         mcp_help: Some(
-            "Change check against your previous read of this url: an unchanged line, or only the changed sections. Not with view arguments.",
+            "Change check against your previous read of this url: an unchanged line, or only the changed sections; with no earlier read, the page itself. Not with view arguments.",
         ),
     },
     ParamSpec {
@@ -643,6 +647,9 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
             ParamKind::StrList => strings(usize::MAX),
             ParamKind::StrListMax(max) => strings(max),
             ParamKind::SetTrue | ParamKind::SetFalse => value.is_boolean(),
+            ParamKind::BoolOr(variants) => {
+                value.is_boolean() || value.as_str().is_some_and(|s| variants.contains(&s))
+            }
             ParamKind::Enum(_) => unreachable!("enums checked above"),
         };
         if !valid {
@@ -680,6 +687,18 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
                 if p.required {
                     required.push(json!(p.name));
                 }
+                continue;
+            }
+            ParamKind::BoolOr(variants) => {
+                schema.insert(
+                    "anyOf".into(),
+                    json!([
+                        { "type": "boolean" },
+                        { "type": "string", "enum": variants }
+                    ]),
+                );
+                schema.insert("description".into(), json!(p.mcp_help.unwrap_or(p.help)));
+                props.insert(p.name.into(), Value::Object(schema));
                 continue;
             }
             ParamKind::Usize => "integer",
@@ -836,6 +855,16 @@ fn cli_arg(p: &ParamSpec) -> Arg {
                     .value_delimiter(','),
                 ParamKind::SetTrue => arg.action(ArgAction::SetTrue),
                 ParamKind::SetFalse => arg.action(ArgAction::SetFalse),
+                // `--links` alone, or `--links=urls`: the value must be glued
+                // on, or it would swallow the URL that follows the flag.
+                ParamKind::BoolOr(variants) => arg
+                    .value_name("MODE")
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .default_missing_value(variants[0])
+                    .value_parser(clap::builder::PossibleValuesParser::new(
+                        variants.iter().copied(),
+                    )),
             }
         }
     }
@@ -905,6 +934,16 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
                 ParamKind::SetFalse => {
                     if !m.get_flag(p.name) {
                         map.insert(p.name.into(), json!(false));
+                    }
+                }
+                ParamKind::BoolOr(variants) => {
+                    if let Some(v) = m.get_one::<String>(p.name) {
+                        let value = if v == variants[0] {
+                            json!(true)
+                        } else {
+                            json!(v)
+                        };
+                        map.insert(p.name.into(), value);
                     }
                 }
             },
@@ -1017,6 +1056,48 @@ mod tests {
         // A url batch keeps its own bound.
         let thirteen: Vec<String> = (0..13).map(|i| format!("https://e.test/{i}")).collect();
         assert!(check_args(tool, &json!({ "url": thirteen })).is_err());
+    }
+
+    #[test]
+    fn links_take_true_or_a_named_mode_on_the_wire_and_on_the_cli() {
+        let tool = fetch_tool();
+        for ok in [json!(true), json!(false), json!("urls"), json!("handles")] {
+            check_args(tool, &json!({ "url": "https://e.test/", "links": ok }))
+                .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [json!("raw"), json!(1), json!(["urls"])] {
+            assert!(
+                check_args(tool, &json!({ "url": "https://e.test/", "links": bad })).is_err(),
+                "{bad}"
+            );
+        }
+        let parse = |argv: &[&str]| {
+            matches_to_json(tool, &cli_command(tool).try_get_matches_from(argv).unwrap())
+        };
+        // The bare flag keeps its old meaning; the mode is glued on, so the
+        // URL after the flag is still the URL.
+        assert_eq!(
+            parse(&["fetch", "https://e.test/", "--links"])["links"],
+            true
+        );
+        assert_eq!(
+            parse(&["fetch", "--links", "https://e.test/"])["links"],
+            true
+        );
+        assert_eq!(
+            parse(&["fetch", "https://e.test/", "--links=urls"])["links"],
+            "urls"
+        );
+        assert_eq!(
+            parse(&["fetch", "--links", "https://e.test/"])["url"],
+            "https://e.test/"
+        );
+        assert!(parse(&["fetch", "https://e.test/"]).get("links").is_none());
+        assert!(
+            cli_command(tool)
+                .try_get_matches_from(["fetch", "https://e.test/", "--links=raw"])
+                .is_err()
+        );
     }
 
     #[test]
