@@ -396,9 +396,11 @@ fn map_error(raw: String) -> FetchError {
         "connect" => FetchError::Io(std::io::Error::other(detail.to_owned())),
         "proxy" => {
             // A proxy demanding credentials keeps the auth-fail shape the
-            // lane health reads; anything else is a dead lane.
+            // lane health reads; anything else is a dead lane. v5 leads a
+            // refused credential with its status, so a port that happens to
+            // contain 407 is not read as one.
             let lower = detail.to_ascii_lowercase();
-            if lower.contains("407") || lower.contains("authentication required") {
+            if lower.starts_with("407") || lower.contains("authentication required") {
                 FetchError::Http(format!("CONNECT -> 407 ({detail})"))
             } else {
                 FetchError::Io(std::io::Error::other(format!("proxy: {detail}")))

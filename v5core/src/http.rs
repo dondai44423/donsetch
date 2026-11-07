@@ -304,6 +304,17 @@ fn host_and_scheme(url: &str) -> Option<(String, String)> {
     ))
 }
 
+/// Whether an error's words carry the status 407 itself, not those digits
+/// inside a port or a longer number (`127.0.0.1:40789`).
+fn names_407(lower: &str) -> bool {
+    lower.match_indices("407").any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + 3..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit() || c == ':' || c == '.')
+            && !after.is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
 /// A transport failure as one line whose prefix names its class (`timeout:`,
 /// `dns:`, `tls:`, `proxy:`, `connect:`, `body:`, `request:`), so a caller maps
 /// it without guessing from prose.
@@ -320,7 +331,7 @@ fn describe(error: &wreq::Error) -> String {
         "timeout"
     } else if error.is_proxy_connect()
         || lower.contains("proxy")
-        || lower.contains("407")
+        || names_407(&lower)
         || lower.contains("socks")
     {
         "proxy"
@@ -341,8 +352,7 @@ fn describe(error: &wreq::Error) -> String {
     };
     // The tunnel error names a refused credential only in words; the status is
     // what a caller benches a lane on.
-    if class == "proxy" && lower.contains("proxy authorization required") && !lower.contains("407")
-    {
+    if class == "proxy" && lower.contains("proxy authorization required") && !names_407(&lower) {
         return format!("proxy: 407 {chain}");
     }
     format!("{class}: {chain}")
@@ -984,4 +994,21 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|delta| delta.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::names_407;
+
+    #[test]
+    fn a_407_is_a_status_and_not_a_port() {
+        assert!(names_407("proxy: 407 proxy authentication required"));
+        assert!(names_407("unsuccessful tunnel (407)"));
+        assert!(!names_407(
+            "error sending request for uri (http://127.0.0.1:40789/)"
+        ));
+        assert!(!names_407("http://127.0.0.1:4070/"));
+        assert!(!names_407("body of 14070 bytes"));
+        assert!(!names_407("version 1.407"));
+    }
 }
