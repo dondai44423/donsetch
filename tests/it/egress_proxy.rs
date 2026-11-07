@@ -577,8 +577,10 @@ async fn stealth_v3_selected_route_keeps_lane_health_for_the_next_call() {
             .await
             .unwrap();
     });
+    // A hang guard, not a speed assertion: a cold Windows runner pays its
+    // one-time process setup (trust store, client, engine) inside this call.
     let out = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(15),
         fetcher.fetch_persona_on_route(url, Some(&selected)),
     )
     .await

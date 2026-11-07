@@ -636,7 +636,9 @@ mod tests {
                     respect_robots: false,
                     max_pages: 1,
                     max_depth: 0,
-                    deadline: std::time::Duration::from_secs(2),
+                    // A hang guard, not a speed assertion: a cold Windows runner
+                    // pays its one-time process setup inside this crawl.
+                    deadline: std::time::Duration::from_secs(15),
                     ..Default::default()
                 },
                 None,
