@@ -525,7 +525,9 @@ pub async fn discover(
 pub struct Discovery {
     pub robots: Robots,
     pub entries: Vec<SitemapEntry>,
-    /// Exhausted the published sitemap inventory without hitting a guard.
+    /// Exhausted the published sitemap inventory without hitting a
+    /// guard, and it listed at least one page. False when no sitemap
+    /// was read or the sitemaps read listed no page.
     pub complete: bool,
 }
 
@@ -556,7 +558,6 @@ pub async fn discover_inventory(fetch: &PageFetcher, origin: &str, cap: usize) -
     let mut fetched = 0usize;
     let mut visited = std::collections::HashSet::new();
     let mut first = true;
-    let mut parsed = false;
     let mut complete = true;
     let declared = !robots.sitemaps.is_empty();
     while !queue.is_empty() && entries.len() < cap && fetched < 32 {
@@ -574,7 +575,6 @@ pub async fn discover_inventory(fetch: &PageFetcher, origin: &str, cap: usize) -
             visited.insert(loc.clone());
             fetched += 1;
             if let Some(text) = fetch_sitemap_text(fetch, &loc).await {
-                parsed = true;
                 complete &= absorb(text, &mut queue, &mut entries, cap);
                 queue.retain(|loc| !conventional.contains(loc));
             } else if declared {
@@ -601,7 +601,6 @@ pub async fn discover_inventory(fetch: &PageFetcher, origin: &str, cap: usize) -
                 break;
             }
             if let Some(text) = text {
-                parsed = true;
                 complete &= absorb(text, &mut queue, &mut entries, cap);
                 queue.retain(|loc| !conventional.contains(loc));
             } else if declared || !conventional.contains(loc) {
@@ -610,7 +609,10 @@ pub async fn discover_inventory(fetch: &PageFetcher, origin: &str, cap: usize) -
         }
     }
     queue.retain(|loc| !visited.contains(loc));
-    complete &= parsed && queue.is_empty() && entries.len() < cap;
+    // Sitemaps that list no page leave the crawl's map to the seed's
+    // links, and a seed-link map cannot establish site-wide
+    // completeness (README, crawl inventory).
+    complete &= !entries.is_empty() && queue.is_empty() && entries.len() < cap;
     entries.truncate(cap);
     Discovery {
         robots,
@@ -619,21 +621,31 @@ pub async fn discover_inventory(fetch: &PageFetcher, origin: &str, cap: usize) -
     }
 }
 
-/// Fetch one sitemap candidate and decode it to text.
-/// None = non-200, binary, or undecodable.
+/// Fetch one sitemap candidate and decode it to text, with one leading
+/// UTF-8 byte-order mark, then leading whitespace, removed.
+/// None = non-200, binary, undecodable, or neither sitemap XML nor a
+/// list that starts with an http(s) URL.
 async fn fetch_sitemap_text(fetch: &PageFetcher, loc: &str) -> Option<String> {
     let page = fetch(loc.to_string(), "direct".to_string(), None, None).await;
     if page.status != 200 {
         return None;
     }
     let body = maybe_gunzip(&page.body);
-    String::from_utf8(body).ok().filter(|text| {
-        let t = text.trim_start();
-        t.contains("<urlset")
-            || t.contains("<sitemapindex")
-            || t.starts_with("http://")
-            || t.starts_with("https://")
-    })
+    let mut text = String::from_utf8(body).ok()?;
+    // U+FEFF is not whitespace to trim_start, and both the check below
+    // and absorb's XML-or-text choice read the first character.
+    let lead = text.len()
+        - text
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&text)
+            .trim_start()
+            .len();
+    text.replace_range(..lead, "");
+    (text.contains("<urlset")
+        || text.contains("<sitemapindex")
+        || text.starts_with("http://")
+        || text.starts_with("https://"))
+    .then_some(text)
 }
 
 /// Parse one sitemap body: child indexes go back to the queue,
@@ -901,6 +913,183 @@ mod tests {
                 .all(|u| u.starts_with("http://seed.localhost:8001/")),
             "nothing may be probed outside the seed origin; requested: {hits:?}"
         );
+    }
+
+    /// One origin's discovered page locs, in sitemap order, and
+    /// whether the inventory is complete.
+    async fn inventory_of(fetch: &crate::crawl::PageFetcher, origin: &str) -> (Vec<String>, bool) {
+        let d = discover_inventory(fetch, origin, 100).await;
+        (d.entries.into_iter().map(|e| e.loc).collect(), d.complete)
+    }
+
+    /// Checks each (origin, expected locs, expected complete) row and
+    /// returns the rows that differ.
+    async fn inventory_mismatches(
+        fetch: &crate::crawl::PageFetcher,
+        rows: &[(&str, &[&str], bool)],
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        for (origin, want, want_complete) in rows {
+            let (locs, complete) = inventory_of(fetch, origin).await;
+            if locs != *want || complete != *want_complete {
+                wrong.push(format!("{origin}: entries={locs:?} complete={complete}"));
+            }
+        }
+        wrong
+    }
+
+    // A UTF-8 byte-order mark before the first character: an XML
+    // sitemap, a sitemap index and its child, and a plain-text list
+    // that robots.txt declares.
+    #[tokio::test]
+    async fn discover_reads_sitemaps_behind_a_byte_order_mark() {
+        let (fetch, _) = recording_fetcher(vec![
+            (
+                "https://xml.test/sitemap.xml",
+                200,
+                "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
+                 <url><loc>https://xml.test/a</loc></url>\n\
+                 <url><loc>https://xml.test/b</loc></url>\n\
+                 </urlset>\n",
+            ),
+            (
+                "https://index.test/sitemap.xml",
+                200,
+                "\u{feff}<?xml version=\"1.0\"?>\n<sitemapindex>\
+                 <sitemap><loc>https://index.test/pages.xml</loc></sitemap>\
+                 </sitemapindex>\n",
+            ),
+            (
+                "https://index.test/pages.xml",
+                200,
+                "\u{feff}<urlset><url><loc>https://index.test/a</loc></url></urlset>",
+            ),
+            (
+                "https://text.test/robots.txt",
+                200,
+                "User-agent: *\nSitemap: https://text.test/sitemap.txt\n",
+            ),
+            (
+                "https://text.test/sitemap.txt",
+                200,
+                "\u{feff}https://text.test/a\nhttps://text.test/b\n",
+            ),
+        ]);
+        let wrong = inventory_mismatches(
+            &fetch,
+            &[
+                (
+                    "https://xml.test",
+                    &["https://xml.test/a", "https://xml.test/b"],
+                    true,
+                ),
+                ("https://index.test", &["https://index.test/a"], true),
+                (
+                    "https://text.test",
+                    &["https://text.test/a", "https://text.test/b"],
+                    true,
+                ),
+            ],
+        )
+        .await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // Sitemaps read to their end that list no page: an empty urlset,
+    // and an index whose only child is itself.
+    #[tokio::test]
+    async fn sitemaps_that_list_no_page_are_not_a_complete_inventory() {
+        let (fetch, _) = recording_fetcher(vec![
+            (
+                "https://empty.test/sitemap.xml",
+                200,
+                "<?xml version=\"1.0\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n</urlset>\n",
+            ),
+            (
+                "https://loop.test/sitemap.xml",
+                200,
+                "<sitemapindex><sitemap><loc>https://loop.test/sitemap.xml</loc></sitemap></sitemapindex>",
+            ),
+        ]);
+        let wrong = inventory_mismatches(
+            &fetch,
+            &[
+                ("https://empty.test", &[], false),
+                ("https://loop.test", &[], false),
+            ],
+        )
+        .await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // What the byte-order-mark strip and the no-page rule leave as they
+    // were: sitemaps without a mark (XML, XML after blank lines, an
+    // index, plain text), an HTML page with a mark at a sitemap
+    // location, and an origin with no sitemap.
+    #[tokio::test]
+    async fn sitemaps_without_a_byte_order_mark_read_as_before() {
+        let (fetch, _) = recording_fetcher(vec![
+            (
+                "https://xml.test/sitemap.xml",
+                200,
+                "<?xml version=\"1.0\"?>\n<urlset>\
+                 <url><loc>https://xml.test/a</loc></url>\
+                 <url><loc>https://xml.test/b</loc></url>\
+                 </urlset>",
+            ),
+            (
+                "https://blank.test/sitemap.xml",
+                200,
+                "\n  <?xml version=\"1.0\"?>\n<urlset><url><loc>https://blank.test/a</loc></url></urlset>",
+            ),
+            (
+                "https://index.test/sitemap.xml",
+                200,
+                "<sitemapindex><sitemap><loc>https://index.test/pages.xml</loc></sitemap></sitemapindex>",
+            ),
+            (
+                "https://index.test/pages.xml",
+                200,
+                "<urlset><url><loc>https://index.test/a</loc></url></urlset>",
+            ),
+            (
+                "https://text.test/robots.txt",
+                200,
+                "User-agent: *\nSitemap: https://text.test/sitemap.txt\n",
+            ),
+            (
+                "https://text.test/sitemap.txt",
+                200,
+                "https://text.test/a\nhttps://text.test/b\n",
+            ),
+            (
+                "https://html.test/sitemap.xml",
+                200,
+                "\u{feff}<!doctype html><html><body><a href=\"https://html.test/a\">a</a></body></html>",
+            ),
+        ]);
+        let wrong = inventory_mismatches(
+            &fetch,
+            &[
+                (
+                    "https://xml.test",
+                    &["https://xml.test/a", "https://xml.test/b"],
+                    true,
+                ),
+                ("https://blank.test", &["https://blank.test/a"], true),
+                ("https://index.test", &["https://index.test/a"], true),
+                (
+                    "https://text.test",
+                    &["https://text.test/a", "https://text.test/b"],
+                    true,
+                ),
+                ("https://html.test", &[], false),
+                ("https://none.test", &[], false),
+            ],
+        )
+        .await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[tokio::test]
