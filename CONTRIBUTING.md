@@ -133,7 +133,10 @@ Scope optional: `feat(search): add scholar vertical`.
 - **Bug fixes** with a test that would have caught the bug.
 - **New search engines** that are keyless and don't require API keys.
 - **Fixes to existing BYOK search providers.** These remain optional and must never weaken the keyless experience.
-- **Anti-bot improvements**: new wall vendors, better detection heuristics.
+- **Fetch improvements inside the four classes** — identity, state, request contract,
+  egress: a new coherent client profile, a wall classified with a witness, a site's own
+  interface as a contract. A new heuristic that guesses at a wall instead of classifying
+  it is not a contribution.
 - **PDF extraction** edge cases: corrupt files, weird encodings, exotic tables.
 - **Performance**: measured improvements, not micro-optimizations.
 
@@ -147,10 +150,24 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## Architecture overview
 
-The [README architecture map](README.md#-built-from-scratch) describes the
-released product. Experimental branches may have a different source layout;
-do not treat their implementation as a released feature or an approved plan.
-For local planning context, follow [AGENTS.md](AGENTS.md#local-project-context).
+The fetch layer is `v5core/` (repo root, its own crate and CI job): carried client
+identity, carried state, a page cache, wall classification, the site's own interfaces,
+and an in-process V8 engine that runs a challenge page's own program. No browser is in
+the fetch path — Chromium serves `web_screenshot` and `donsetch login` only. The
+[README architecture map](README.md#-built-from-scratch) is the public description of
+the whole product.
+
+Fetch work is measured, not argued. The crate has `fetch`, `probe` (identity × target
+matrix), `bench` (cold, paired with curl in the same window) and `state`, and the rules
+for improving it — classify the wall first, then identity, state, request contract or
+egress, with a witness — are in
+[AGENTS.md](AGENTS.md#the-fetch-path-is-v5-and-it-has-a-shape). Its suite runs as its
+own CI job on linux-x86_64 and linux-aarch64: `cd v5core && cargo test --release
+--locked`.
+
+Experimental branches may have a different source layout; do not treat their
+implementation as a released feature or an approved plan. For local planning context,
+follow [AGENTS.md](AGENTS.md#local-project-context).
 
 ## Pull requests
 
