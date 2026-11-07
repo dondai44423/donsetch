@@ -196,28 +196,18 @@ The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built 
 </details>
 
 <details>
-<summary><b>Selectable browser backend</b></summary>
+<summary><b>Browser</b></summary>
 
-The browser serves screenshots and `donsetch login`, never page reads. Chromium is the default: headful on Xvfb/off-screen when a display exists, `--headless=new` only when none does. CloakBrowser is used only when explicitly selected, a bare `CLOAKBROWSER_BINARY_PATH` never switches it.
+The browser serves screenshots and `donsetch login`, never page reads. DonSeTch drives an installed Chromium-family browser (Chromium, Chrome, or Edge on Windows) and downloads none: screenshots run it with `--headless=new`, and `donsetch login` opens a normal window on a profile of its own so you can sign in.
 
-```bash
-DONSETCH_BROWSER_BACKEND=chromium donsetch doctor             # default backend
-DONSETCH_BROWSER_BACKEND=headless donsetch doctor --deep      # forced headless
-DONSETCH_BROWSER_BACKEND=cloakbrowser \
-  CLOAKBROWSER_BINARY_PATH=/path/to/chrome donsetch doctor --deep
-```
-
-You do not have to install CloakBrowser yourself: with auto-download on, DonSeTch fetches the pinned release from GitHub the first time the cloak backend is needed (a screenshot, a login or `doctor`), unpacks it into its cache and reuses it from then on.
+`browser.chromium_path` picks the binary; the legacy `DONGHOST_CHROME` sets the same value. Without it, DonSeTch takes the first executable among the usual install locations, Playwright's browser caches (including `browser.playwright_path` or `PLAYWRIGHT_BROWSERS_PATH`) and `PATH`.
 
 ```toml
 [browser]
-backend = "cloak"
-cloak_auto_download = true
+chromium_path = "/path/to/chrome"
 ```
 
-The same from the environment: `DONSETCH_BROWSER__BACKEND=cloak DONSETCH_BROWSER__CLOAK_AUTO_DOWNLOAD=true donsetch doctor`.
-
-Aliases: `original` for `chromium`, `original-headless` for `headless`. Public CloakBrowser downloads are opt-in (`DONSETCH_CLOAK_AUTO_DOWNLOAD=1`) and verified: Ed25519-signed `SHA256SUMS`, manifest bound to the requested Chromium version, archive SHA-256 checked, unsafe paths rejected. `CLOAKBROWSER_VERSION` pins a version. CloakBrowser binaries are never bundled in releases or images.
+The same from the environment: `DONSETCH_BROWSER__CHROMIUM_PATH=/path/to/chrome donsetch doctor`.
 
 </details>
 
