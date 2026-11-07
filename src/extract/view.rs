@@ -579,12 +579,26 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
 fn absent_words(query: &str, docs: &[Vec<String>], lang: &LanguageInfo) -> Vec<String> {
     let present: std::collections::HashSet<&str> =
         docs.iter().flatten().map(String::as_str).collect();
+    // "Not on the page" sends the caller elsewhere, so it is said only
+    // when no form of the word is there: a page token that differs from
+    // the query's only in its last letters (an inflection the stemmer
+    // does not know) counts as the word.
+    let near = |t: &str| {
+        let n = t.chars().count();
+        n >= 5
+            && present.iter().any(|p| {
+                let common = t.chars().zip(p.chars()).take_while(|(a, b)| a == b).count();
+                common >= 5 && common + 1 >= n.min(p.chars().count())
+            })
+    };
     let mut absent = Vec::new();
     for word in query.split_whitespace() {
         let word = word.trim_matches(|c: char| !c.is_alphanumeric());
         let tokens = focus::passage_tokens(word, lang);
         if !tokens.is_empty()
-            && tokens.iter().all(|t| !present.contains(t.as_str()))
+            && tokens
+                .iter()
+                .all(|t| !present.contains(t.as_str()) && !near(t))
             && !absent.iter().any(|a: &String| a.eq_ignore_ascii_case(word))
         {
             absent.push(word.to_string());
@@ -1336,6 +1350,30 @@ Intro text about widgets and how they work.\n\n\
 
     fn terms(raw: &[&str]) -> Vec<Term> {
         raw.iter().map(|t| Term::parse(t).unwrap()).collect()
+    }
+
+    #[test]
+    fn an_inflected_query_word_is_not_called_absent() {
+        let doc = "# Rules\nhttps://example.com/\n\n## Fines\n\nMember States shall lay down the rules on penalties applicable to infringements by operators.\n\nThe analysers report each infringement.\n";
+        let r = render(
+            doc,
+            &View {
+                focus: Some("penalty for an operator".into()),
+                ..view()
+            },
+            None,
+        );
+        assert!(!r.text.contains("\"penalty\""), "{}", r.text);
+        assert!(!r.text.contains("\"operator\""), "{}", r.text);
+        let r = render(
+            doc,
+            &View {
+                focus: Some("zebra penalties".into()),
+                ..view()
+            },
+            None,
+        );
+        assert!(r.text.contains("not on the page: \"zebra\""), "{}", r.text);
     }
 
     #[test]

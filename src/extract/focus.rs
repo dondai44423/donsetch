@@ -524,7 +524,25 @@ fn fold_str(s: &str) -> String {
 /// Conservative: only strips when stem ≥ 3 chars. Better to
 /// under-stem than over-stem (over-stemming merges
 /// unrelated words, hurting BM25 precision).
+/// English stem, with a final consonant + `y` read as `i` (Porter step
+/// 1c) so the singular meets its `-ies` plural: penalty and penalties both
+/// stem to `penalti`.
 fn stem_en(word: &str) -> String {
+    let mut stem = stem_en_suffix(word);
+    let mut rev = stem.chars().rev();
+    if stem.len() >= 3
+        && rev.next() == Some('y')
+        && rev
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() && !"aeiou".contains(c))
+    {
+        stem.pop();
+        stem.push('i');
+    }
+    stem
+}
+
+fn stem_en_suffix(word: &str) -> String {
     let w = word;
     if w.len() < 4 {
         return w.to_string();
@@ -575,10 +593,11 @@ fn stem_en(word: &str) -> String {
             return stem_en_double(stem);
         }
     }
-    // -ly
+    // -ly, but not the verbs in -ply (apply, reply, supply), whose
+    // inflections keep the stem
     if w.ends_with("ly") && w.len() > 3 {
         let stem = &w[..w.len() - 2];
-        if stem.len() >= 3 {
+        if stem.len() >= 3 && !stem.ends_with('p') {
             return stem.to_string();
         }
     }
@@ -1576,7 +1595,24 @@ mod tests {
     fn stem_ing() {
         assert_eq!(stem_en("running"), "run");
         assert_eq!(stem_en("typing"), "typ");
-        assert_eq!(stem_en("flying"), "fly");
+        assert_eq!(stem_en("flying"), "fli");
+    }
+
+    #[test]
+    fn stem_singular_meets_its_ies_plural() {
+        for (one, many) in [
+            ("penalty", "penalties"),
+            ("company", "companies"),
+            ("study", "studies"),
+            ("city", "cities"),
+            ("apply", "applies"),
+            ("reply", "replied"),
+        ] {
+            assert_eq!(stem_en(one), stem_en(many), "{one} / {many}");
+        }
+        // A vowel before the y keeps it.
+        assert_eq!(stem_en("keys"), "key");
+        assert_eq!(stem_en("days"), stem_en("day"));
     }
 
     #[test]
