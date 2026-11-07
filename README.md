@@ -765,7 +765,7 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | Surprise | Why |
 |---|---|
 | First build takes a few minutes | BoringSSL compiles from source and V8 is downloaded and linked, cached after. Go is a build dependency too: BoringSSL's build system is Go-based. |
-| v5 is a beta | The fetch engine is new. Its suite runs on Linux; Windows and macOS builds compile from the same code and are being verified on real machines. Report anything that regressed from v4. |
+| v5 is a beta | The fetch engine is new. Its suite runs on Linux and on Windows (the core suite runs there on every push); the macOS builds compile from the same code and are verified on real machines at release. Report anything that regressed from v4. |
 | A login wall is an answer | `web_fetch` carries no session in v5: a signed-in page returns `wall.auth`. |
 | OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. |
 | First OCR/rerank use downloads models | ~24MB reranker, ~37MB OCR, cached forever. |

@@ -9,15 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known limitations in this beta
 
-- **No linux-arm64 asset.** The v5 core's binary does not start on aarch64
-  yet: the core's own suite passes there (164/164), the product binary that
-  links it segfaults before `main`. This beta ships x86_64 Linux, macOS
-  arm64 and x64, and Windows x64. 4.10.5 remains installable on arm64.
-- **Windows crawl egress is unverified.** On Windows a refused response does
-  not penalize its lane and a proxy that answered 429 is not debited the way
-  both are on Linux, so a crawl there may keep using the direct lane instead
-  of the configured proxy pool. Fetching still works; check your egress
-  before trusting a Windows crawl.
+- **No linux-arm64 asset.** The product binary that links the v5 core stops
+  before `main` on aarch64: an ELF constructor is called through a null
+  `.init_array` entry (`call_init`, address 0). The core's own suite passes there
+  (182/182) and CI now captures the fault on real arm64 hardware on every push.
+  This beta ships x86_64 Linux, macOS arm64 and x64, and Windows x64; 4.10.5
+  remains installable on arm64.
+- **Windows pays its setup on the first fetch of a process.** Measured on a CI
+  runner: one proxied request took 2.5 s and a crawl's first read 9.0 s, where a
+  Linux process pays tens of milliseconds. The lane accounting and wall
+  classification this used to leave unverified are covered by the suite on
+  Windows now; why that setup costs seconds there is open.
 
 ### Changed
 
