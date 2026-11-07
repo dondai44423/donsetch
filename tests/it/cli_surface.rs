@@ -162,6 +162,52 @@ fn status_json_is_one_document() {
     assert!(!text.contains("DonSeTch "), "human title in machine output");
 }
 
+/// The browser health line names only what still needs the browser:
+/// screenshots and login.
+#[test]
+fn status_browser_warning_names_only_what_uses_the_browser() {
+    let sb = Sandbox::new("status-browser");
+    let missing = sb.root.join("no-such-chrome");
+    let out = sb.run_with(
+        &["status"],
+        &[(
+            "DONSETCH_BROWSER__CHROMIUM_PATH",
+            missing.to_str().expect("utf-8 sandbox path"),
+        )],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    let health = text
+        .lines()
+        .find(|l| l.contains("browser unavailable"))
+        .unwrap_or_else(|| panic!("no browser warning in: {text}"));
+    assert!(
+        health.contains("screenshot and login will not work"),
+        "{health}"
+    );
+    assert!(!health.contains("actions"), "{health}");
+
+    // Negative case: with a browser present there is no warning at all.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = sb.root.join("chrome-stub");
+        std::fs::write(&stub, "#!/bin/sh\necho 'Chromium 140.0.0.0'\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = sb.run_with(
+            &["status"],
+            &[(
+                "DONSETCH_BROWSER__CHROMIUM_PATH",
+                stub.to_str().expect("utf-8 sandbox path"),
+            )],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let text = stdout(&out);
+        assert!(text.contains("browser ready"), "{text}");
+        assert!(!text.contains("will not work"), "{text}");
+    }
+}
+
 /// `donsetch help <cmd>` and `donsetch <cmd> --help` are one text. The
 /// copy in main.rs had gone stale (`proxy fetch|crawl on|off` was missing
 /// from it), which is the whole reason the routes are pinned together.
