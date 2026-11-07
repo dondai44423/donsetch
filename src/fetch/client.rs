@@ -511,6 +511,10 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
         FetchError::Tls(msg) if crate::error::is_cert_verify_failure(msg) => {
             Some(LaneNote::OriginTls)
         }
+        // The lane's proxy answered that it could not reach the target, which
+        // is how a name it cannot resolve can come back: the lane connected,
+        // so it stays seated, as for a name the local guard cannot resolve.
+        FetchError::Io(error) if crate::fetch::v5::proxy_refused_the_target(error) => None,
         FetchError::Io(_) | FetchError::Tls(_) => Some(LaneNote::Dead),
         // A proxy that demands credentials. Ahead of the text arms:
         // "CONNECT -> 407" must never read as a dead lane.

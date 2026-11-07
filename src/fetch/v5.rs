@@ -125,7 +125,7 @@ impl V5Fetcher {
         // The proxy is read before the URL guard looks the target's name
         // up: a read that cannot leave through its proxy resolves nothing.
         let proxy = engine_proxy(document.proxy.as_ref())?;
-        crate::fetch::guards::ensure_url_safe(document.url).await?;
+        crate::fetch::guards::ensure_url_safe_via(document.url, document.proxy.as_ref()).await?;
         let direct = document.proxy.is_none().then(|| document.route.clone());
         let refusal: Arc<Mutex<Option<FetchError>>> = Arc::default();
         let mut request = v5core::Request::new(document.url);
@@ -174,7 +174,7 @@ impl V5Fetcher {
         };
         // Read before the URL guard's lookup, as in `document`.
         let proxy = engine_proxy(lane.as_ref())?;
-        crate::fetch::guards::ensure_url_safe(shot.url).await?;
+        crate::fetch::guards::ensure_url_safe_via(shot.url, lane.as_ref()).await?;
         let direct = lane.is_none().then(|| route.clone());
         let mut headers: Vec<(String, String)> = Vec::new();
         let kind = if shot.class == RequestClass::Navigation {
@@ -452,14 +452,18 @@ fn map_error(raw: String) -> FetchError {
         "connect" => FetchError::Io(std::io::Error::other(detail.to_owned())),
         "proxy" => {
             // A proxy demanding credentials keeps the auth-fail shape the
-            // lane health reads; anything else is a dead lane. v5 leads a
-            // refused credential with its status, so a port that happens to
-            // contain 407 is not read as one.
+            // lane health reads; a proxy that answered it could not reach the
+            // target is marked so lane health leaves the lane alone; anything
+            // else is a dead lane. v5 leads a refused credential with its
+            // status, so a port that happens to contain 407 is not read as one.
             let lower = detail.to_ascii_lowercase();
+            let message = format!("proxy: {detail}");
             if lower.starts_with("407") || lower.contains("authentication required") {
                 FetchError::Http(format!("CONNECT -> 407 ({detail})"))
+            } else if TARGET_REFUSALS.iter().any(|reply| lower.contains(reply)) {
+                FetchError::Io(std::io::Error::other(TargetRefused(message)))
             } else {
-                FetchError::Io(std::io::Error::other(format!("proxy: {detail}")))
+                FetchError::Io(std::io::Error::other(message))
             }
         }
         "denied" => match crate::fetch::guards::validate_url_basic(detail) {
@@ -470,6 +474,44 @@ fn map_error(raw: String) -> FetchError {
         "body" | "request" | "identity" => FetchError::Http(format!("{class}: {detail}")),
         _ => FetchError::Http(raw),
     }
+}
+
+/// A proxy's answer that it took the request and could not reach the target,
+/// in the lowercase words of the transport's error chain: the SOCKS5 replies
+/// about the route to the target (RFC 1928: 0x03 network unreachable, 0x04
+/// host unreachable, 0x05 connection refused, 0x06 TTL expired) as tokio-socks
+/// names them, and a CONNECT answered with a status other than 200 and 407,
+/// which wreq reports without the status. The other SOCKS5 replies (general
+/// server failure, ruleset, command or address type not supported) are about
+/// the proxy and are not listed.
+const TARGET_REFUSALS: &[&str] = &[
+    "error during socks handshake: network unreachable",
+    "error during socks handshake: host unreachable",
+    "error during socks handshake: connection refused",
+    "error during socks handshake: ttl expired",
+    "tunnel error: unsuccessful",
+];
+
+/// A proxy's refusal of the target (`TARGET_REFUSALS`), carried inside
+/// `FetchError::Io` with the message it would have had without the mark.
+#[derive(Debug)]
+struct TargetRefused(String);
+
+impl std::fmt::Display for TargetRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TargetRefused {}
+
+/// True when `error` is a proxy's answer that it could not reach the target:
+/// the lane connected and answered, so the failure is the target's, not the
+/// lane's.
+pub(crate) fn proxy_refused_the_target(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<TargetRefused>())
 }
 
 /// v5's outcome as the product's. The product's own wall detector reads the

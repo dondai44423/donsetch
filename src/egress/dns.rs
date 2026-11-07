@@ -174,6 +174,16 @@ fn store(host: &str, port: u16, addrs: &[SocketAddr], ttl: Duration) {
     );
 }
 
+/// Test-only: `resolve` answers `host:port` with `addrs` from the cache for
+/// the configured TTL, as after a lookup, so a test can give a name an
+/// address on every platform.
+#[cfg(test)]
+pub(crate) fn remember(host: &str, port: u16, addrs: &[SocketAddr]) {
+    if let Some(ttl) = ttl() {
+        store(host, port, addrs, ttl);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
