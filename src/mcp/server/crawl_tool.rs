@@ -795,6 +795,13 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
 
     // Resume available : always suggest it first.
     if let Some(tok) = &result.resume {
+        // A resume made while the host is still in the penalty box
+        // can stop ThrottledOut again without fetching a queued URL.
+        if result.stop == StopReason::ThrottledOut {
+            return format!(
+                "the host throttled the crawler. Wait a few minutes, then resume={tok} to continue crawling."
+            );
+        }
         return format!(
             "resume={tok} to continue crawling (stopped: {:?}).",
             result.stop
@@ -1374,6 +1381,24 @@ mod crawl_output_contract_tests {
             "wall.challenge Blocked".into(),
         )];
         assert!(super::compute_crawl_next_action(&result).contains("blocked the crawler"));
+    }
+
+    #[test]
+    fn a_throttled_out_stop_with_a_token_says_to_wait_before_resuming() {
+        let mut result = empty_result();
+        result.stop = StopReason::ThrottledOut;
+        result.queued = vec!["https://example.com/docs/b".into()];
+        result.resume = Some("c1a2".into());
+        assert_eq!(
+            super::compute_crawl_next_action(&result),
+            "the host throttled the crawler. Wait a few minutes, then resume=c1a2 to continue crawling."
+        );
+        // Negative: another stop with a token is told to resume, no wait.
+        result.stop = StopReason::MaxPages;
+        assert_eq!(
+            super::compute_crawl_next_action(&result),
+            "resume=c1a2 to continue crawling (stopped: MaxPages)."
+        );
     }
 
     fn seed_failure(status: u16, verdict: Option<&str>) -> crate::crawl::SeedFailure {
