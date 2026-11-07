@@ -46,6 +46,54 @@ impl PageBitmap {
     }
 }
 
+/// Test probe over the bitmaps `engine::rasterize_page_at` returns (the
+/// OCR pass's renders) on the current thread: how many were made, and the
+/// most alive at once. A render is alive until its bitmap is dropped.
+#[cfg(test)]
+pub(crate) mod ocr_probe {
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Counts {
+        made: usize,
+        live: Vec<usize>,
+        peak: usize,
+    }
+
+    thread_local! {
+        static COUNTS: RefCell<Counts> = RefCell::default();
+    }
+
+    pub(crate) fn rendered(bitmap: &super::PageBitmap) {
+        COUNTS.with_borrow_mut(|c| {
+            c.made += 1;
+            c.live.push(bitmap.buf.as_ptr() as usize);
+            c.peak = c.peak.max(c.live.len());
+        });
+    }
+
+    pub(super) fn dropped(bitmap: &super::PageBitmap) {
+        let at = bitmap.buf.as_ptr() as usize;
+        let _ = COUNTS.try_with(|c| c.borrow_mut().live.retain(|&p| p != at));
+    }
+
+    /// (renders made, most alive at once) since the last call; resets both.
+    pub(crate) fn take() -> (usize, usize) {
+        COUNTS.with_borrow_mut(|c| {
+            let out = (c.made, c.peak);
+            *c = Counts::default();
+            out
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for PageBitmap {
+    fn drop(&mut self) {
+        ocr_probe::dropped(self);
+    }
+}
+
 /// A detected rule line (axis-aligned ink ridge), pixel coords (y down).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rule {
