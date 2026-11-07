@@ -267,11 +267,11 @@ fn render(
                         }
                     }
                     // Superscript: keep the content (`^{...}`)
-                    // unless it is a wiki-citation marker ([1],
-                    // bare digits) : those are pure token waste.
+                    // unless it is a citation marker ([1], a linked
+                    // footnote number) : those are pure token waste.
                     "sup" => {
                         let t = plain(c);
-                        if !t.is_empty() && !is_citation_marker(&t) {
+                        if !t.is_empty() && !is_citation_marker(c, &t) {
                             buf.push_str(&format!("^{{{t}}}"));
                             *total += t.len();
                         }
@@ -633,10 +633,14 @@ fn is_punct_or_ws(c: char) -> bool {
     c.is_whitespace() || is_punct(c)
 }
 
-/// Wiki citation markers: "[1]", "[12]", "[a]", "[1][2]".
-/// These superscripts are reference noise; real superscripts
-/// (exponents, ordinal suffixes like "th") survive.
-fn is_citation_marker(t: &str) -> bool {
+/// Whether the superscript `sup`, with plain text `t`, is a citation
+/// marker: up to three digits or one lowercase letter, either
+/// bracketed ("[1]", "[12]", "[a]") or linked
+/// (`<sup><a href="#fn1">1</a></sup>`, or `<a href="#fn1"><sup>1</sup></a>`
+/// where the link holds nothing else). These are reference noise.
+/// Every other superscript is content and survives: bare numbers and
+/// letters (km^{2}, 10^{9}, x^{n}) and ordinal suffixes ("th").
+fn is_citation_marker(sup: ElementRef<'_>, t: &str) -> bool {
     let stripped: String = t.chars().filter(|c| !c.is_whitespace()).collect();
     if stripped.is_empty() {
         return true;
@@ -646,8 +650,25 @@ fn is_citation_marker(t: &str) -> bool {
         return true;
     }
     // Digits (up to 3) or a single footnote letter.
-    (inner.len() <= 3 && inner.chars().all(|c| c.is_ascii_digit()))
-        || inner.len() == 1 && inner.chars().all(|c| c.is_ascii_lowercase())
+    let shaped = (inner.len() <= 3 && inner.chars().all(|c| c.is_ascii_digit()))
+        || inner.len() == 1 && inner.chars().all(|c| c.is_ascii_lowercase());
+    // That shape is also the shape of an exponent or a unit power
+    // (km<sup>2</sup>, 10<sup>9</sup>, x<sup>n</sup>): only brackets
+    // or a link mark it as a reference.
+    shaped && (inner.len() < stripped.len() || is_linked(sup, t))
+}
+
+/// Whether the superscript holds a link, or is the whole text of the
+/// nearest link around it.
+fn is_linked(sup: ElementRef<'_>, t: &str) -> bool {
+    let is_link =
+        |el: ElementRef<'_>| el.value().name() == "a" && el.value().attr("href").is_some();
+    sup.descendent_elements().any(is_link)
+        || sup
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .find(|el| el.value().name() == "a")
+            .is_some_and(|a| is_link(a) && plain(a) == t)
 }
 
 /// Collapse raw inline-rendered text the same way markdown() does.
@@ -1161,6 +1182,37 @@ mod tests {
             density(r#"<p>x <a href="https://e.example/"> y </a></p>"#),
             0.75
         );
+    }
+
+    // A bare number or letter in <sup> is an exponent or a unit
+    // power, never dropped as a citation, including inside a link
+    // that carries more text than the superscript.
+    #[test]
+    fn bare_superscripts_are_kept() {
+        assert_eq!(
+            render_inline(
+                "<p>1,000 km<sup>2</sup>, 10<sup>9</sup>, x<sup>n</sup>, the 19<sup>th</sup></p>"
+            ),
+            "1,000 km^{2}, 10^{9}, x^{n}, the 19^{th}"
+        );
+        assert_eq!(
+            render_inline(r##"<p>See <a href="#volume">10<sup>9</sup> cubic metres</a>.</p>"##),
+            "See 10^{9} cubic metres."
+        );
+    }
+
+    // Negative case: footnote markers that are bracketed or linked
+    // stay dropped (kramdown/Hugo, pandoc, Wikipedia shapes).
+    #[test]
+    fn bracketed_and_linked_footnote_markers_are_dropped() {
+        for html in [
+            r##"<p>Claim.<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" class="footnote">1</a></sup> Next</p>"##,
+            r##"<p>Claim.<a href="#fn1" class="footnote-ref" id="fnref1" role="doc-noteref"><sup>1</sup></a> Next</p>"##,
+            r##"<p>Claim.<sup class="reference"><a href="#cite_note-a">[a]</a></sup> Next</p>"##,
+            "<p>Claim.<sup>[12]</sup> Next</p>",
+        ] {
+            assert_eq!(render_inline(html), "Claim. Next", "{html}");
+        }
     }
 }
 
