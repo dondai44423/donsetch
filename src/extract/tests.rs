@@ -2610,3 +2610,84 @@ fn a_highlighter_wrapper_class_names_the_fence() {
         "prefix stripped wrong:\n{md}"
     );
 }
+
+const AUDIT_PAD: &str = "<p>This paragraph is ordinary article prose that exists only so the scorer sees a real article body with enough text, punctuation, and paragraphs to win.</p><p>A second distinct paragraph of filler prose, again present only so that the article container clearly wins the main-content scoring pass.</p>";
+
+fn audit_page(body: &str) -> String {
+    format!(
+        "<!doctype html><html><head><title>Audit</title></head><body><article><h1>Audit</h1>{AUDIT_PAD}{body}</article></body></html>"
+    )
+}
+
+// <figure> is walked only for its images: a table, code listing or
+// quote wrapped in one is dropped. WordPress wraps every table block in
+// <figure class="wp-block-table">; Jekyll's highlight tag emits
+// <figure class="highlight"><pre>.
+#[test]
+fn audit_figure_wrapped_table_code_and_quote_are_kept() {
+    let html = audit_page(
+        r#"<h2>Pricing</h2><figure class="wp-block-table"><table><thead><tr><th>Plan</th><th>Price</th></tr></thead><tbody><tr><td>Basic</td><td>$5 per month</td></tr><tr><td>Pro</td><td>$25 per month</td></tr></tbody></table></figure>
+<h2>Code</h2><figure class="highlight"><pre><code class="language-ruby">def hello
+  puts "UNIQUE_CODE_LINE"
+end</code></pre></figure>
+<h2>Quote</h2><figure class="wp-block-pullquote"><blockquote><p>UNIQUE_QUOTE_TEXT is what the speaker said.</p></blockquote></figure>"#,
+    );
+    let md = extract_html(&html).markdown;
+    for needle in ["$25 per month", "UNIQUE_CODE_LINE", "UNIQUE_QUOTE_TEXT"] {
+        assert!(md.contains(needle), "lost {needle:?}:\n{md}");
+    }
+}
+
+// Negative for the figure walk: a figure holding only images and a
+// caption stays a media block. Bare, linked and <picture> images each
+// yield one image with the caption as alt, and no caption paragraph
+// reaches the output; a gallery of nested figures does not turn its
+// captions into paragraphs either.
+#[test]
+fn image_only_figures_stay_on_the_media_path() {
+    let html = audit_page(
+        r#"<h2>Photos</h2>
+<figure><img src="/bare.png"><figcaption>BARE_CAPTION</figcaption></figure>
+<figure><a href="/full.png"><img src="/linked.png"></a><figcaption>LINKED_CAPTION</figcaption></figure>
+<figure><picture><source srcset="/pic.webp" type="image/webp"><img src="/pic.png"></picture><figcaption>PICTURE_CAPTION</figcaption></figure>
+<figure class="wp-block-gallery"><figure><img src="/g1.png" alt="first"><figcaption>G1_CAPTION</figcaption></figure><figure><img src="/g2.png" alt="second"></figure><figcaption>GALLERY_CAPTION</figcaption></figure>"#,
+    );
+    let ex = extract_html(&html);
+    let img = |alt: &str, path: &str| (alt.to_string(), format!("https://example.com{path}"));
+    assert_eq!(
+        ex.images,
+        vec![
+            img("BARE_CAPTION", "/bare.png"),
+            img("LINKED_CAPTION", "/linked.png"),
+            img("PICTURE_CAPTION", "/pic.png"),
+            img("first", "/g1.png"),
+            img("second", "/g2.png"),
+        ]
+    );
+    assert!(!ex.markdown.contains("_CAPTION"), "{}", ex.markdown);
+}
+
+// A figure that wraps content and a linked image: the image is recorded
+// once (not by both the media path and the walk), and the caption is
+// kept as text next to the table it describes.
+#[test]
+fn content_figure_emits_each_image_once_and_keeps_its_caption() {
+    let html = audit_page(
+        r#"<h2>Results</h2><figure><a href="/big.png"><img src="/chart.png" alt="Chart"></a><table><tr><th>Run</th><th>Score</th></tr><tr><td>First</td><td>UNIQUE_SCORE_ONE</td></tr><tr><td>Second</td><td>UNIQUE_SCORE_TWO</td></tr></table><figcaption>TABLE_CAPTION</figcaption></figure>"#,
+    );
+    let ex = extract_html(&html);
+    assert_eq!(
+        ex.images,
+        vec![(
+            "Chart".to_string(),
+            "https://example.com/chart.png".to_string()
+        )]
+    );
+    for needle in ["UNIQUE_SCORE_TWO", "TABLE_CAPTION"] {
+        assert!(
+            ex.markdown.contains(needle),
+            "lost {needle:?}:\n{}",
+            ex.markdown
+        );
+    }
+}
