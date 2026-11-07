@@ -491,6 +491,16 @@ jobs:
         with:
           workspaces: v5core
           save-if: ${{ github.event_name != 'pull_request' }}
+      # The cache keeps v8's build-script fingerprint but not the archive it
+      # downloaded into target/release/gn_out, so a v8 rebuild fails to link
+      # ("could not find native static library rusty_v8"). Without the
+      # archive, the build script runs again and fetches it.
+      - name: Re-fetch the V8 archive the cache dropped
+        working-directory: v5core
+        run: |
+          if [ ! -s target/release/gn_out/obj/librusty_v8.a ]; then
+            rm -rf target/release/.fingerprint/v8-* target/release/build/v8-*
+          fi
       - name: Test
         working-directory: v5core
         run: cargo test --release --locked
