@@ -37,7 +37,8 @@ FROM rust:slim AS builder
 
 # Install build dependencies for boring-sys (BoringSSL) and PDFium.
 # Go is required by BoringSSL's build system; NASM builds the x86_64
-# crypto assembly; libclang drives bindgen.
+# crypto assembly; libclang drives bindgen. No system linker is needed:
+# build.rs links PDFium with the Rust toolchain's own rust-lld.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         g++ \
@@ -47,7 +48,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         make \
         nasm \
-        lld \
         curl \
         tar \
         git \

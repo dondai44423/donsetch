@@ -19,12 +19,22 @@ charset multi-byte, js_unescape, paginate overflow, sitemap bomb).
 rustup toolchain install nightly
 rustup run nightly cargo install cargo-fuzz
 cd fuzz
-RUSTFLAGS="-C link-arg=-fuse-ld=lld" rustup run nightly cargo fuzz run extract -s none -- -max_total_time=300
+rustup run nightly cargo fuzz run extract -s none -- -max_total_time=300
 ```
 
-The `RUSTFLAGS` prefix is only needed on machines where GNU ld
-rejects LLVM CREL relocations (for example Void Linux); it is
-harmless elsewhere. CI runs a 90s smoke of every target on each
+The linked PDFium archives use CREL relocations, which a GNU ld before 2.44
+and an lld before LLVM 20 skip without an error (the binary then dies before
+`main`). x86_64 Linux toolchains link with their own `rust-lld` by default, so
+nothing is needed there. On a host that defaults to GNU ld (aarch64, say), point
+the link at the toolchain's lld instead of a system one:
+
+```sh
+T=$(rustup run nightly rustc -vV | sed -n 's/^host: //p')
+D=$(rustup run nightly rustc --print sysroot)/lib/rustlib/$T/bin/gcc-ld
+RUSTFLAGS="-C link-arg=-fuse-ld=lld -C link-arg=-B$D" rustup run nightly cargo fuzz run extract -s none -- -max_total_time=300
+```
+
+CI runs a 90s smoke of every target on each
 master push; long runs are manual.
 
 When a crash is found: the artifact lands in `fuzz/artifacts/`,
