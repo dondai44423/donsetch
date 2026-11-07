@@ -578,3 +578,186 @@ fn pdf_date_non_ascii_does_not_panic() {
         Some("2026-05-25".to_string())
     );
 }
+
+// ---------- audit repros (audit/pdfops) ----------
+
+/// Serialize `objects` (bodies of objects 1..=n) into a PDF with a
+/// correct xref table. Object 1 is the catalog.
+fn audit_pdf(objects: &[String]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn audit_stream(content: &str) -> String {
+    format!(
+        "<< /Length {} >>\nstream\n{content}\nendstream",
+        content.len()
+    )
+}
+
+/// Two outline items whose /Next entries point at each other. PDFium
+/// guards only a self-loop in FPDFBookmark_GetNextSibling; the caller
+/// owns cycle detection. `walk_outlines` checks `out.len()` only on
+/// entry to a level, never inside the sibling loop, so this walks
+/// forever and grows `out` until the allocator fails (abort).
+#[test]
+fn audit_outline_sibling_cycle_terminates() {
+    let bytes = audit_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>".into(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 8 0 R >> >> /Contents 4 0 R >>".into(),
+        audit_stream("BT /F1 14 Tf 72 720 Td (Outline cycle fixture) Tj ET"),
+        "<< /Type /Outlines /First 6 0 R /Last 7 0 R /Count 2 >>".into(),
+        "<< /Title (Chapter A) /Parent 5 0 R /Next 7 0 R >>".into(),
+        "<< /Title (Chapter B) /Parent 5 0 R /Prev 6 0 R /Next 6 0 R >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+    ]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = crate::pdf::engine::load_document(&bytes, &Default::default(), |_| ());
+        let _ = tx.send(
+            r.map(|(raw, _)| raw.outline.len())
+                .map_err(|e| e.to_string()),
+        );
+    });
+    // A two-entry outline takes microseconds. The bound is generous on
+    // purpose and still short enough that the runaway walk stays well
+    // under a gigabyte before this test gives up.
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(n)) => assert!(n <= 10_001, "outline walk returned {n} items"),
+        Ok(Err(e)) => panic!("load failed: {e}"),
+        Err(_) => panic!(
+            "walk_outlines did not terminate within 5s on a 2-item /Next cycle \
+             (it holds the global PDFium lock and grows without bound)"
+        ),
+    }
+}
+
+/// The outline `load_document` reports for a one-page PDF whose catalog
+/// points /Outlines at object 4; `outline` holds objects 4.. with the
+/// outline root first. Fails after 5 s instead of hanging, because a walk
+/// that never stops holds the global PDFium lock and grows without bound.
+fn outline_of(outline: &[String]) -> Vec<(String, usize, Option<usize>)> {
+    let mut objects: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>".into(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+    ];
+    objects.extend_from_slice(outline);
+    let bytes = audit_pdf(&objects);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = crate::pdf::engine::load_document(&bytes, &Default::default(), |_| ());
+        let _ = tx.send(
+            r.map(|(raw, _)| {
+                raw.outline
+                    .into_iter()
+                    .map(|o| (o.title, o.level, o.page))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| e.to_string()),
+        );
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(items)) => items,
+        Ok(Err(e)) => panic!("load failed: {e}"),
+        Err(_) => panic!("outline walk did not finish within 5s"),
+    }
+}
+
+fn titles_and_levels(items: &[(String, usize, Option<usize>)]) -> Vec<(&str, usize)> {
+    items.iter().map(|(t, l, _)| (t.as_str(), *l)).collect()
+}
+
+/// A /Next chain that leads back to an item already listed: each item is
+/// reported once, in walk order, and the walk ends.
+#[test]
+fn outline_next_cycle_lists_each_item_once() {
+    // Chapter A -> Chapter B -> Chapter A.
+    let items = outline_of(&[
+        "<< /Type /Outlines /First 5 0 R /Last 6 0 R >>".into(),
+        "<< /Title (Chapter A) /Parent 4 0 R /Next 6 0 R >>".into(),
+        "<< /Title (Chapter B) /Parent 4 0 R /Prev 5 0 R /Next 5 0 R >>".into(),
+    ]);
+    assert_eq!(
+        titles_and_levels(&items),
+        [("Chapter A", 0), ("Chapter B", 0)]
+    );
+}
+
+/// A /First link that points back at an ancestor: the ancestor is not
+/// listed again under itself.
+#[test]
+fn outline_first_cycle_lists_each_item_once() {
+    // Part -> Section -> Part: the child's /First is its own parent.
+    let items = outline_of(&[
+        "<< /Type /Outlines /First 5 0 R /Last 5 0 R >>".into(),
+        "<< /Title (Part) /Parent 4 0 R /First 6 0 R /Last 6 0 R >>".into(),
+        "<< /Title (Section) /Parent 5 0 R /First 5 0 R /Last 5 0 R >>".into(),
+    ]);
+    assert_eq!(titles_and_levels(&items), [("Part", 0), ("Section", 1)]);
+}
+
+/// The item cap holds inside one level, not only when a level starts: a
+/// flat outline longer than the cap stops at 10_001 items.
+#[test]
+fn outline_item_cap_holds_within_a_level() {
+    let n = 10_050;
+    let first = 5;
+    let last = first + n - 1;
+    let mut outline = vec![format!(
+        "<< /Type /Outlines /First {first} 0 R /Last {last} 0 R >>"
+    )];
+    for obj in first..=last {
+        let next = if obj < last {
+            format!(" /Next {} 0 R", obj + 1)
+        } else {
+            String::new()
+        };
+        outline.push(format!("<< /Title (Item {obj}) /Parent 4 0 R{next} >>"));
+    }
+    assert_eq!(outline_of(&outline).len(), 10_001);
+}
+
+/// Negative case: a well-formed tree whose items repeat titles and
+/// destinations keeps every item. A repeat is judged by the outline item
+/// itself, never by its title or page.
+#[test]
+fn outline_tree_with_repeated_titles_keeps_every_item() {
+    let items = outline_of(&[
+        "<< /Type /Outlines /First 5 0 R /Last 8 0 R >>".into(),
+        "<< /Title (Part) /Parent 4 0 R /Next 8 0 R /First 6 0 R /Last 7 0 R /Dest [3 0 R /Fit] >>"
+            .into(),
+        "<< /Title (Introduction) /Parent 5 0 R /Next 7 0 R /Dest [3 0 R /Fit] >>".into(),
+        "<< /Title (Introduction) /Parent 5 0 R /Prev 6 0 R >>".into(),
+        "<< /Title (Part) /Parent 4 0 R /Prev 5 0 R /First 9 0 R /Last 9 0 R >>".into(),
+        "<< /Title (Introduction) /Parent 8 0 R /Dest [3 0 R /Fit] >>".into(),
+    ]);
+    let want: Vec<(String, usize, Option<usize>)> = vec![
+        ("Part".into(), 0, Some(0)),
+        ("Introduction".into(), 1, Some(0)),
+        ("Introduction".into(), 1, None),
+        ("Part".into(), 0, None),
+        ("Introduction".into(), 1, Some(0)),
+    ];
+    assert_eq!(items, want);
+}
