@@ -614,6 +614,83 @@ async fn map_mode_falls_back_to_seed_links_without_a_sitemap() {
     assert!(!hits.iter().any(|h| h.ends_with("/b")));
 }
 
+const ONE_LINK_SEED: &str = "<html><head><title>seed</title></head><body><article>\
+    <p>content words here for extraction threshold passing yes indeed</p>\
+    <a href=\"/a\">Page A</a></article></body></html>";
+
+// A UTF-8 byte-order mark before `<?xml`: the map is the sitemap's
+// three pages, not the one link the seed page carries.
+#[tokio::test]
+async fn map_mode_reads_a_sitemap_behind_a_byte_order_mark() {
+    let sitemap = "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n\
+        <url><loc>https://ex.com/a</loc></url>\n\
+        <url><loc>https://ex.com/b</loc></url>\n\
+        <url><loc>https://ex.com/c</loc></url>\n\
+        </urlset>\n";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .page("https://ex.com/", 200, ONE_LINK_SEED)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (r.map.as_slice(), r.inventory.source, r.inventory.complete),
+        (
+            &[
+                "https://ex.com/a".to_string(),
+                "https://ex.com/b".to_string(),
+                "https://ex.com/c".to_string()
+            ][..],
+            "sitemap",
+            true
+        ),
+        "(map, inventory.source, inventory.complete)"
+    );
+}
+
+// A sitemap read to its end that lists no page leaves the map to the
+// seed's links, and a seed-link map does not make the inventory
+// complete.
+#[tokio::test]
+async fn map_mode_seed_links_behind_an_empty_sitemap_are_not_complete() {
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/robots.txt", 200, "User-agent: *\n")
+        .page(
+            "https://ex.com/sitemap.xml",
+            200,
+            "<?xml version=\"1.0\"?>\n<urlset></urlset>\n",
+        )
+        .page("https://ex.com/", 200, ONE_LINK_SEED)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            r.map.as_slice(),
+            r.inventory.source,
+            r.inventory.complete,
+            r.stop
+        ),
+        (
+            &["https://ex.com/a".to_string()][..],
+            "seed-links",
+            false,
+            StopReason::FrontierEmpty
+        ),
+        "(map, inventory.source, inventory.complete, stop)"
+    );
+}
+
 // V06: the map is relevance-ranked against the seed, not a pure
 // recency slice. A topic seed pulls its own neighborhood to the
 // front of the inventory; ranking reorders, it never filters.
