@@ -560,17 +560,21 @@ pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, 
     result
 }
 
+/// The browser's version banner, read without launching it; a file with no
+/// version resource is an error at once.
+#[cfg(windows)]
 fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
-    // Windows: `chrome.exe --version` neither prints nor exits (a GUI subsystem
-    // binary), so the spawn below would burn its whole timeout on every
-    // process. The file's own version resource answers without launching it.
-    #[cfg(windows)]
-    if let Some(banner) = pe_version::banner(std::path::Path::new(path)) {
-        return Ok(banner);
-    }
+    // `chrome.exe --version` neither prints nor exits (a GUI subsystem
+    // binary), so spawning it would burn the whole timeout on every process.
+    pe_version::banner(std::path::Path::new(path))
+        .ok_or_else(|| format!("no version resource in {path}"))
+}
+
+#[cfg(not(windows))]
+fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
     let mut cmd = std::process::Command::new(path);
     cmd.arg("--version");
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         let tmp = std::env::temp_dir().join("donsetch-chrome-probe");
         let _ = std::fs::create_dir_all(&tmp);

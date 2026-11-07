@@ -636,8 +636,9 @@ mod tests {
                     respect_robots: false,
                     max_pages: 1,
                     max_depth: 0,
-                    // A hang guard, not a speed assertion: a cold Windows runner
-                    // pays its one-time process setup inside this crawl.
+                    // A hang guard, not a speed assertion. Windows takes ~2 s to
+                    // refuse a loopback connection (measured on a runner), so a
+                    // test that touches a closed port costs seconds there.
                     deadline: std::time::Duration::from_secs(15),
                     ..Default::default()
                 },
