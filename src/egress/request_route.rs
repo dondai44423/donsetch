@@ -1,4 +1,5 @@
-//! Immutable routing policy shared by a fetch, browser recovery and replay.
+//! Immutable routing policy a fetch selects once and the requests that
+//! follow it (the subresource shadow burst) reuse.
 
 use super::proxy::{Proxy, env_proxy_var, no_proxy_match_value, no_proxy_value};
 use crate::error::FetchError;

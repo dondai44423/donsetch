@@ -61,10 +61,8 @@ flowchart TD
     B --> I["fetch_single_inner"]
     I --> R["adapter rewrite"]
     I --> T1["local redirect loop, every hop"]
-    I --> T2["browser: navigate + CDP request guard"]
     R --> G["guard core: validate_url_basic_with_policy"]
     T1 --> G
-    T2 --> G
     G -->|Denied| E
 ```
 
@@ -75,8 +73,8 @@ flowchart TD
    because an explicit code outranks the text classifier.
 2. **Backstop**: the guard core that both `validate_url_basic` and
    `ensure_url_safe` call. That one place covers the local fetch's redirect loop
-   (`validate_redirect_url` on every hop), adapter rewrites, the browser
-   lane's navigation checks and its CDP request guard, search's engine
+   (`validate_redirect_url` on every hop), adapter rewrites,
+   `web_screenshot`'s two checks of the URL it is given, search's engine
    queries and prefetch, and doctor. The rule check sits after the
    scheme, credential and host checks and before the SSRF check, so a deny
    holds even with `fetch.allow_private_egress`.
@@ -94,7 +92,7 @@ flowchart TD
   Adding the key back reopens that.
 - **Every routing site calls `policy_error_value`** before the error turns
   into text: `fetch_input`, the rewritten-URL guard, the transport `Err` arm
-  (above its adapter branch), `fetch_with_actions`, `web_screenshot`'s four
+  (above its adapter branch), `web_screenshot`'s two
   sites,
   and the crawl's seed guard. A missed site degrades rather than lies:
   `error_code` has a first arm on the fixed text that yields
@@ -107,7 +105,7 @@ flowchart TD
   it, never by hand.
 - **Catch-all sites that would be silently wrong** got explicit arms:
   `fetch_error_kind`, `fetch_error_code` (now `Option<Cow<str>>`),
-  `lane_note` (no lane verdict), ghost probe stats (no failure class; the
+  `lane_note` (no lane verdict), `state_probe` stats (no failure class; the
   probe re-arms its cadence), search engine outcome (`invalid-config:`, so
   the engine is not quarantined), and the search prefetch (the bot-wall
   shape: score untouched, no quality recorded).

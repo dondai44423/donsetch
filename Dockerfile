@@ -8,7 +8,8 @@
 # Run:      docker compose run --rm donsetch     (recommended — see docker-compose.yml)
 #   or:     docker run -i --rm --init donsetch-mcp donsetch mcp --supervised
 #
-# Optional Chrome for tier 2 browser escalation:
+# Optional Chrome for web_screenshot (see the sandbox note in the runtime
+# stage before relying on it):
 #   docker build --build-arg INSTALL_CHROME=true -t donsetch-mcp .
 #
 # The container runs the MCP server on stdio. Connect from your MCP
@@ -21,7 +22,7 @@
 # does (curl + tar are needed).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Optional: install Chrome for tier 2 browser escalation (bot-wall bypass).
+# Optional: install Chrome for web_screenshot (page reads never use a browser).
 # Adds ~350MB. Enable with:  docker build --build-arg INSTALL_CHROME=true .
 ARG INSTALL_CHROME=false
 
@@ -133,11 +134,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Optional: install Chrome for tier 2 browser escalation
+# Optional: install Chrome for web_screenshot
 ARG INSTALL_CHROME=false
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         apt-get update && \
-        apt-get install -y --no-install-recommends chromium xvfb && \
+        apt-get install -y --no-install-recommends chromium && \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
@@ -166,24 +167,25 @@ RUN useradd -m -u 1000 donsetch \
 USER donsetch
 WORKDIR /home/donsetch
 
-# Cache directory for fetch/search results and ghost browser profile.
+# Cache directory for fetch/search results and stored login sessions.
 # The server resolves it as $HOME/.cache/donsetch (XDG_CACHE_HOME is
 # honoured too); no env var is needed. VOLUME makes plain `docker run`
 # persist it in an anonymous volume.
 
-# Chromium's sandbox cannot initialize inside a default Docker container
-# (no unprivileged user namespaces): the browser dies at launch before the
-# DevTools handshake. Upstream's documented container escape hatch
-# (`DONGHOST_NO_SANDBOX=1`, see ghost docs) is therefore the correct
-# default for this image. The container boundary + non-root user provide
-# the isolation the sandbox would on a host.
-ENV DONGHOST_NO_SANDBOX=1
+# Chromium launches with its sandbox on. 5.0.0-beta.1 removed
+# `browser.no_sandbox` / `DONGHOST_NO_SANDBOX`, the switch this image used
+# to set, and nothing else turns the sandbox off. The sandbox needs
+# unprivileged user namespaces, which a default Docker container does not
+# provide, so with INSTALL_CHROME=true expect web_screenshot and doctor's
+# browser check to fail at launch unless the container allows them. Not yet
+# tested in this image.
 VOLUME /home/donsetch/.cache/donsetch
 
-# Set Chrome path if Chrome was installed
+# Report the installed Chrome. Browser discovery finds /usr/bin/chromium
+# without DONGHOST_CHROME.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         echo "chromium found at $(which chromium)" && \
-        echo "Set DONGHOST_CHROME=/usr/bin/chromium for browser escalation"; \
+        echo "web_screenshot finds it without DONGHOST_CHROME"; \
     fi
 
 # Healthcheck: verify binary responds to version check

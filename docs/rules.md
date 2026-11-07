@@ -536,8 +536,8 @@ and origins, like every other knob. The rule table itself is not listed; use
 - **A denied CDN can hide a sitemap.** If a site serves its sitemap from a
   host you deny, a CDN most plausibly, that sitemap is not loaded and the
   crawl says nothing about it: discovery is quietly smaller and the crawl
-  still reports a normal finish. In map mode the inventory then falls back to the seed page's links
-  and one rendered read of the seed, so the map comes back smaller rather than
+  still reports a normal finish. In map mode the inventory then falls back to the seed page's links,
+  so the map comes back smaller rather than
   empty. If that finds nothing either, the map is not reported complete and
   its skip reason reads "no sitemap found at common locations and the seed
   page exposed no usable links", which is misleading when a sitemap existed

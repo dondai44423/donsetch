@@ -497,8 +497,7 @@ fn registry_string(
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Probe a specific Chromium-family executable without changing the selected
-/// backend. Used by the browser resolver for Chromium and CloakBrowser alike.
+/// Probe a specific Chromium-family executable and return its major version.
 pub(crate) fn probe_version_at_path(path: &str) -> Option<u32> {
     probe_version_string_at_path(path).and_then(|v| parse_version_major(&v))
 }
@@ -509,11 +508,11 @@ pub(crate) fn probe_version_string_at_path(path: &str) -> Option<String> {
 }
 
 pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, String> {
-    // One spawn per binary per process. Ghost launches, doctor,
-    // status, and cloak resolution all walk through here, and each
+    // One spawn per binary per process. Browser resolution for
+    // screenshots, login, doctor and status walks through here, and each
     // call used to pay a chrome --version spawn (~100-200ms plus a
-    // fork on some platforms). The daemon launches ghosts often
-    // enough that caching is a real win; Ok results never change
+    // fork on some platforms). The daemon resolves the browser on every
+    // screenshot, so caching is a real win; Ok results never change
     // for a given on-disk path, and Err results stay recalculated
     // so a transient startup hiccup is not sticky.
     static PROBE_CACHE: std::sync::OnceLock<
@@ -546,8 +545,8 @@ pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, 
         if result.is_ok() {
             guard.insert(path.to_string(), result.clone().ok());
             // Small cache: this map holds one entry per distinct binary
-            // path (system chromium, a playwright build, a cloak binary,
-            // an edge install). Never grows unbounded in practice; the
+            // path (system chromium, a playwright build, an edge
+            // install). Never grows unbounded in practice; the
             // paths are bounded by discoverable binaries on the host.
             if guard.len() > 16 {
                 guard.clear();
