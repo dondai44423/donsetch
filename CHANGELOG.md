@@ -5,6 +5,51 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0-beta.3] - 2026-11-07
+
+### Fixed
+
+- **Vendor priors learn again.** A wall that was passed never taught the vendor
+  which identity got through: the success was recorded before the wall's vendor
+  was known, so the prior stayed empty (seen live on Product Hunt, which okhttp
+  passes cold). The passing identity is now credited when a walled origin first
+  answers with content, and a wall decays a vendor's prior for the identity it
+  stopped instead of leaving it untouched.
+- **A new host starts from its site.** A host with no scores of its own orders
+  identities from a sibling host on the same site (`www.` and `api.` of one
+  domain) before falling back to the global order.
+- **The caller's `deadline_ms` bounds the whole encounter.** The budget was
+  applied to the document fetch only; challenge rounds and retries could run
+  past it. The fetch now gets the caller's remaining time, and every wait in the
+  encounter (attempt spacing, a `Retry-After`, Akamai's verify delay) is
+  cancel-aware and fits the deadline. A `Retry-After` past one hour is ignored.
+  A deadline under about 1.6 s no longer fails before sending anything: the
+  first request goes out with whatever time is left (Wikipedia now answers
+  inside `deadline_ms: 600`).
+- **Akamai's bm-verify hand-off follows the page as served.** The refresh target
+  is read in any quoting and with HTML entities, resolved against the page,
+  kept on the same host, and its cookies are kept for the next request.
+- **An exhausted fetch reports the last URL it reached**, not the one asked.
+- **Learning is cheaper and still merges.** Carried state shares unchanged
+  origins and jars between workers instead of copying them, and a save skips
+  re-reading the state file when no other process wrote it. At the 4096-origin
+  cap, the cost a learning fetch pays fell from about 60 ms to about 24 ms.
+- **`must_contain` matches amounts in the page's own notation.** `$1.5bn`
+  matches `US$1,500 million` and `1.5 billion dollars`, `£3k` matches `£3,000`,
+  `12000` matches `12 000`, and `15%` matches `15 percent`; decimal commas and
+  dot thousands are read. A number matches only whole: `15%` does not match
+  `115%` or `1.5%`, and `$1.5bn` does not match `$1.6 billion`.
+- **Private CAs.** `[tls] cert_file` and `cert_dir` add PEM roots to the fetch
+  path's trust store; a bundle that does not parse is reported and left out.
+
+### Removed
+
+- The shadow asset fetch and its counters (`shadowed_assets_total`). v5 makes one
+  request per read; `fetch.shadow_fetch`, `shadow_deadline_ms`, `h3` and
+  `alt_svc` are still accepted so older configs load, and have no effect.
+- Dead code paths in the challenge engine (an unused page hand-back) and the PDF
+  reader.
+
 ## [5.0.0-beta.2] - 2026-11-07
 
 ### Fixed
