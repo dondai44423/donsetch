@@ -612,9 +612,12 @@ impl Worker {
         Ok(wire)
     }
 
-    /// The fetch is over: its policy goes, and when its caller stopped waiting,
-    /// every connection it may have left mid-request goes with the wires (a
-    /// wire's runtime runs its connections only while a request is in flight).
+    /// The fetch is over: its policy goes, from the worker and from every wire
+    /// it keeps, so an idle worker holds none of the request's policy (its hop
+    /// guard and whatever the guard captured). When its caller stopped
+    /// waiting, every connection it may have left mid-request goes with the
+    /// wires (a wire's runtime runs its connections only while a request is
+    /// in flight).
     fn release(&mut self) {
         let policy = std::mem::take(&mut self.policy);
         if policy
@@ -623,6 +626,12 @@ impl Worker {
             .is_some_and(crate::Cancel::is_cancelled)
         {
             self.wires.clear();
+        } else {
+            // `wire` sets the policy of the request that uses a wire before
+            // every use, so the default left here is never applied.
+            for wire in self.wires.values() {
+                wire.set_policy(crate::http::Policy::default());
+            }
         }
     }
 

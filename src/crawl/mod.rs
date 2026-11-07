@@ -2797,6 +2797,11 @@ fn host_matches(a: &str, b: &str) -> bool {
 /// every redirect hop BEFORE it is dialed. Refuses same-host,
 /// scope and robots violations; the hop's response then returns as
 /// the bare redirect and the caller records the skip.
+///
+/// Of `opts` the gate keeps only the scope it rules on (`same_host`,
+/// `include_paths`, `exclude_paths`, `respect_robots`): the callbacks
+/// and channels the options carry (progress, cancel, page history) are
+/// never held by a gate.
 fn build_redirect_gate(
     fetch: &PageFetcher,
     robots: &Arc<sitemap::RobotsCache>,
@@ -2809,27 +2814,33 @@ fn build_redirect_gate(
         let robots = Arc::clone(robots);
         let governor = Arc::clone(governor);
         let seed = seed_host.to_string();
-        let policy = opts.clone();
+        // The gate rides each worker request into the fetch layer, and a
+        // request the crawl deadline cut runs on there until it next looks
+        // at its cancel. Holding the whole options would keep the caller's
+        // progress sink alive that long, and the MCP answer waits for it.
+        let same_host = opts.same_host;
+        let respect_robots = opts.respect_robots;
+        let include: Arc<[String]> = opts.include_paths.clone().into();
+        let exclude: Arc<[String]> = opts.exclude_paths.clone().into();
         move |target: url::Url| {
             let fetch = fetch.clone();
             let robots = Arc::clone(&robots);
             let governor = Arc::clone(&governor);
             let seed = seed.clone();
-            let policy = policy.clone();
+            let include = Arc::clone(&include);
+            let exclude = Arc::clone(&exclude);
             Box::pin(async move {
-                if policy.same_host
+                if same_host
                     && !target
                         .host_str()
                         .is_some_and(|host| host_matches(host, &seed))
                 {
                     return false;
                 }
-                if !scope_allowed(target.path(), &policy.include_paths, &policy.exclude_paths) {
+                if !scope_allowed(target.path(), &include, &exclude) {
                     return false;
                 }
-                if policy.respect_robots
-                    && !robots_allows(&fetch, &governor, &robots, &target).await
-                {
+                if respect_robots && !robots_allows(&fetch, &governor, &robots, &target).await {
                     return false;
                 }
                 true
