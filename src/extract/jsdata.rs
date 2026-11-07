@@ -856,6 +856,15 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     if t.starts_with("Mozilla/") {
         return (0.0, false);
     }
+    // Machine names: a space-free ASCII token that is a module or bundle name
+    // ("RSTWebWorkerEntrypointBundle"), a hash ("914fa4f6f16ffaeccc81bd5264e520d2"),
+    // or a route key ("www/collage-creation-tool", "conversation/:id"). A
+    // reader's word has no inner capitals after a lowercase run more than
+    // twice, no hex run, no path separator. Space-free scripts (CJK) are not
+    // ASCII and never reach this.
+    if !t.contains(char::is_whitespace) && t.is_ascii() && machine_token(t) {
+        return (0.0, false);
+    }
     let letters: usize = t.chars().filter(|c| c.is_ascii_alphabetic()).count();
     let tot: usize = t.chars().count();
     if letters == 0 || (letters as f32 / tot.max(1) as f32) < 0.25 {
@@ -926,6 +935,17 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     }
 
     (score.max(0.0), title_like)
+}
+
+/// A space-free token that names something to a program, not to a reader.
+fn machine_token(t: &str) -> bool {
+    let humps = t
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
+        .count();
+    let hex = t.len() >= 16 && t.bytes().all(|b| b.is_ascii_hexdigit());
+    humps >= 3 || hex || t.contains(['/', '_', ':', '[', '"', '\\'])
 }
 
 /// `key=value[_]key=value` attribute fragments (viewports, meta
@@ -1224,6 +1244,51 @@ mod tests {
         };
         let cut = super::extract(&html, "https://www.figma.com/", &opts).unwrap();
         assert!(cut.markdown.len() <= 200 && cut.next_offset.is_some());
+    }
+
+    #[test]
+    fn machine_names_in_page_data_are_not_content() {
+        // Shapes captured 2026-11-07: WhatsApp's worker bundles (under `name`),
+        // Pinterest's route table and asset hashes (under `children`). Alone
+        // they were served as the page; beside real text they must not lead it.
+        let payload = serde_json::json!({
+            "workers": [
+                {"name": "RSTWebWorkerEntrypointBundle"},
+                {"name": "WAWebVoipVideoRendererWorkerBundle"},
+                {"name": "ZenonSignalingSharedWorkerV2Bundle"}
+            ],
+            "children": [
+                {"id": "www/collage-creation-tool", "entry": "www/creator-onboarding-landing"},
+                {"text": "conversation/:conversation_id"},
+                {"text": "914fa4f6f16ffaeccc81bd5264e520d2"},
+                {"title": "Today was my last day at the old start-up"},
+                {"text": "Next up is a little start-up in Palo Alto, where the work is about sharing what people find. ".repeat(5)}
+            ]
+        });
+        let html = format!(
+            "<html><title>Pin</title><script type='application/json'>{payload}</script><body></body></html>"
+        );
+        let ex = super::extract(&html, "https://www.pinterest.com/pin/1/", &opts()).unwrap();
+        for junk in [
+            "WorkerBundle",
+            "collage-creation",
+            ":conversation_id",
+            "914fa4f6",
+        ] {
+            assert!(!ex.markdown.contains(junk), "{junk} in {}", ex.markdown);
+        }
+        assert!(ex.markdown.contains("Today was my last day"));
+        assert!(ex.markdown.contains("little start-up in Palo Alto"));
+        // Machine names alone recover nothing.
+        let names = serde_json::json!({"workers": (0..40)
+            .map(|n| serde_json::json!({"name": format!("WAWebModule{n}RendererWorkerBundle")}))
+            .collect::<Vec<_>>()});
+        let html = format!("<html><script type='application/json'>{names}</script></html>");
+        assert!(super::extract(&html, "https://web.whatsapp.com/", &opts()).is_none());
+        // Words a reader uses stay: a product name with one inner capital, CJK.
+        assert!(!super::machine_token("PlayStation"));
+        assert!(!super::machine_token("McDonald's"));
+        assert!(super::machine_token("RSTWebWorkerEntrypointBundle"));
     }
 
     /// Fuzzer find (CI, 2026-08-22): a global-assignment match at

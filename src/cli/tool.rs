@@ -371,8 +371,13 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
             {
                 parts.push(format!("next_offset {off}"));
             }
+            // A page the fetch read but found (almost) nothing on is not "ok":
+            // the headline says what the meta says (`content_ok: false`).
             if sc.get("thin").and_then(|v| v.as_bool()).unwrap_or(false) {
-                parts.push("thin".into());
+                return format!(
+                    "[{cmd}] thin: little or no readable content · {}",
+                    parts.join(" · ")
+                );
             }
             format!("[{cmd}] ok · {}", parts.join(" · "))
         }
@@ -782,6 +787,17 @@ mod tests {
         assert!(s.contains("fetch: local"));
         assert!(s.contains("ContentOk"));
         assert!(s.contains("next_offset 15923"));
+    }
+
+    #[test]
+    fn a_thin_fetch_does_not_say_ok() {
+        let v = json!({
+            "structuredContent": {"content_ok": false, "read_status": "thin", "thin": true},
+            "_meta": {"com.donsetch/fetch-debug": {"tokens_est": 85, "fetch": "local", "verdict": "ContentOk"}}
+        });
+        let s = stats_line("fetch", &v, 339);
+        assert!(s.starts_with("[fetch] thin:"), "{s}");
+        assert!(!s.contains("] ok"), "{s}");
     }
 
     #[test]

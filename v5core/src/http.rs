@@ -256,6 +256,43 @@ pub fn default_hop(next: &str) -> Hop {
     }
 }
 
+/// The `Cookie` header of a redirect hop: the request's own, with what the
+/// earlier hops of this host set applied in order (a later value replaces an
+/// earlier one; an expired one removes it), as far as their paths cover `url`.
+fn hop_cookie_header(original: Option<&str>, set: &[SetCookie], url: &str) -> Option<String> {
+    let path = url::Url::parse(url)
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|_| "/".to_string());
+    let mut jar: Vec<(String, String)> = original
+        .unwrap_or_default()
+        .split(';')
+        .filter_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+    let now = unix_now();
+    for cookie in set {
+        if cookie
+            .path
+            .as_deref()
+            .is_some_and(|scope| !path.starts_with(scope))
+        {
+            continue;
+        }
+        jar.retain(|(name, _)| name != &cookie.name);
+        if cookie.expires_unix.is_none_or(|expires| expires > now) {
+            jar.push((cookie.name.clone(), cookie.value.clone()));
+        }
+    }
+    (!jar.is_empty()).then(|| {
+        jar.iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 /// Headers that validate one URL's cached copy; a redirect hop never carries them.
 const CONDITIONALS: &[&str] = &["if-none-match", "if-modified-since"];
 
@@ -603,6 +640,15 @@ impl Wire {
         for hop in 0..=REDIRECTS_MAX {
             let here = host_and_scheme(&url);
             let same = here.is_some() && here == first;
+            // A browser's next hop carries what the redirect just set (a gate
+            // that validates on the first hop opens its session there).
+            let hop_cookie = if same && hop > 0 {
+                hop_cookie_header(call.cookie, &kept, &url)
+            } else if same {
+                call.cookie.map(str::to_string)
+            } else {
+                None
+            };
             let headers: Vec<(&str, &str)> = if hop == 0 {
                 extra.clone()
             } else {
@@ -621,7 +667,7 @@ impl Wire {
                 Call {
                     method: &method,
                     url: &url,
-                    cookie: if same { call.cookie } else { None },
+                    cookie: hop_cookie.as_deref(),
                     timeout: call.timeout.saturating_sub(started.elapsed()),
                     extra: &headers,
                     body,

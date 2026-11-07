@@ -106,6 +106,19 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// The client stack this identity puts on the wire (TLS and HTTP/2
+    /// shape): identities that share one differ only in headers, so a
+    /// transport failure on one says nothing new about another of the class.
+    pub fn wire_class(&self) -> &'static str {
+        match self.profile.map(|(profile, _)| profile) {
+            None => "native",
+            Some(Profile::Firefox151) => "firefox",
+            Some(Profile::Safari26_4) => "safari",
+            Some(Profile::OkHttp5) => "okhttp",
+            Some(_) => "chrome",
+        }
+    }
+
     pub fn emulation(&self) -> Option<wreq::Emulation> {
         let mut emulation = self.profile.map(|(profile, platform)| {
             Emulation::builder()

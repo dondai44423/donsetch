@@ -185,6 +185,14 @@ pub(crate) const ASKS_HUMAN: &[&str] = &[
     "prove your humanity",
     "press &amp; hold",
     "press & hold",
+    "press and hold the button",
+    "activate and hold the button",
+    "confirm that you're human",
+    "confirm that you are human",
+    "confirm you're human",
+    "verify you're human",
+    "verify you're a human",
+    "verify that you're human",
     "slide right to verify",
     "drag the slider",
     "human verification",
@@ -361,7 +369,14 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
         };
     }
 
-    if let Some(phrase) = ASKS_HUMAN.iter().find(|phrase| lower.contains(*phrase)) {
+    // Typographic apostrophes ("you’re human") read as ASCII ones; folded only
+    // when the page has one, so an ordinary body is not copied again.
+    let folded = if lower.contains(['\u{2019}', '\u{2018}', '\u{02bc}']) {
+        std::borrow::Cow::Owned(crate::contract::fold_quotes(&lower))
+    } else {
+        std::borrow::Cow::Borrowed(lower.as_str())
+    };
+    if let Some(phrase) = ASKS_HUMAN.iter().find(|phrase| folded.contains(*phrase)) {
         found.push(format!("asks-human:{phrase}"));
         return Verdict {
             class: Class::WallInteraction,
@@ -408,6 +423,28 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
         return Verdict {
             class: Class::HttpError,
             wall: None,
+            evidence: found,
+        };
+    }
+
+    // A refusal served as a 2xx: a short page whose title or heading is the
+    // site's "Access Denied" or interstitial. It is about this client, so it is
+    // an identity wall, and another identity is asked. Akamai's refusal names
+    // itself only by its reference link.
+    if let Some(refusal) = crate::contract::refusal_page(evidence.body) {
+        let vendor = if lower.contains("errors.edgesuite.net") || lower.contains("akamaighost") {
+            "akamai"
+        } else {
+            "unknown"
+        };
+        found.push(format!("refusal:{refusal}"));
+        return Verdict {
+            class: Class::WallIdentity,
+            wall: Some(Wall {
+                vendor: vendor.into(),
+                marker: refusal.to_string(),
+                asks: "refusal of this client",
+            }),
             evidence: found,
         };
     }
@@ -568,6 +605,32 @@ mod tests {
         let body =
             "<div id=\"root\"></div><script>a()</script><script>b()</script><script>c()</script>";
         assert_eq!(class_of(200, body, false), Class::Shell);
+    }
+
+    #[test]
+    fn a_refusal_served_as_200_is_an_identity_wall() {
+        let akamai = "<HTML><HEAD><TITLE>Access Denied</TITLE></HEAD><BODY><H1>Access Denied</H1>\
+            You don't have permission to access this server.<P>Reference #18.a5f4\
+            <P>https://errors.edgesuite.net/18.a5f4</BODY></HTML>";
+        let verdict = classify(Evidence {
+            status: 200,
+            body: akamai,
+            content_ok: false,
+            headers: &[],
+        });
+        assert_eq!(verdict.class, Class::WallIdentity);
+        assert_eq!(
+            verdict.wall.map(|wall| wall.vendor),
+            Some("akamai".to_string())
+        );
+        // A typographic apostrophe does not hide a human ask.
+        let hold = "<title>Robot or human?</title><p>Activate and hold the button to confirm that you\u{2019}re human.</p>";
+        assert_eq!(class_of(200, hold, false), Class::WallInteraction);
+        // An ordinary short page that failed its contract is not a refusal.
+        assert_eq!(
+            class_of(200, "<title>Docs</title><p>Short.</p>", false),
+            Class::Incomplete
+        );
     }
 
     #[test]

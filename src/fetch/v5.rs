@@ -428,6 +428,13 @@ fn verdict_for(class: v5core::Class, wall_vendor: Option<&str>, detected: Verdic
     match (class, detected) {
         (v5core::Class::Content, Verdict::Challenge(_) | Verdict::Blocked) => Verdict::ContentOk,
         (class, Verdict::ContentOk) if is_wall(class) => Verdict::Challenge(vendor(wall_vendor)),
+        // Both see a wall; v5 may know whose it is (Akamai names its refusal
+        // only by its reference link).
+        (class, Verdict::Challenge(Vendor::Generic))
+            if is_wall(class) && vendor(wall_vendor) != Vendor::Generic =>
+        {
+            Verdict::Challenge(vendor(wall_vendor))
+        }
         (_, detected) => detected,
     }
 }
@@ -536,6 +543,29 @@ mod tests {
             verdict_for(
                 v5core::Class::Incomplete,
                 None,
+                Verdict::Challenge(Vendor::Cloudflare)
+            ),
+            Verdict::Challenge(Vendor::Cloudflare)
+        );
+    }
+
+    #[test]
+    fn v5_names_the_vendor_of_a_wall_both_saw() {
+        // Akamai's 200 refusal: the product's detector sees a generic wall, v5
+        // read the reference link.
+        assert_eq!(
+            verdict_for(
+                v5core::Class::WallIdentity,
+                Some("akamai"),
+                Verdict::Challenge(Vendor::Generic)
+            ),
+            Verdict::Challenge(Vendor::Akamai)
+        );
+        // A vendor the product named itself is kept.
+        assert_eq!(
+            verdict_for(
+                v5core::Class::WallIdentity,
+                Some("akamai"),
                 Verdict::Challenge(Vendor::Cloudflare)
             ),
             Verdict::Challenge(Vendor::Cloudflare)

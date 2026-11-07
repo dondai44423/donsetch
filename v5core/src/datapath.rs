@@ -49,6 +49,9 @@ pub struct DataPath {
     /// where the document is a partial rendering of what the interface returns
     /// whole.
     pub preferred: bool,
+    /// The interface's own next page, read from an answer too short to be
+    /// content: asked once, its items appended. `None` where an answer is whole.
+    pub next: Option<fn(&str, &str) -> Option<String>>,
 }
 
 pub static PATHS: &[DataPath] = &[
@@ -64,6 +67,9 @@ pub static PATHS: &[DataPath] = &[
         // A subreddit's document server-renders three posts and leaves the rest
         // to JavaScript; this endpoint is what the page's own feed reloads with.
         preferred: true,
+        // The popular feed's first page is the three posts the front page
+        // server-renders; the rest follow its `load-after` cursor.
+        next: Some(reddit_next_page),
     },
     DataPath {
         id: "news-feed",
@@ -73,6 +79,7 @@ pub static PATHS: &[DataPath] = &[
         min_items: 5,
         min_interval_ms: 0,
         preferred: false,
+        next: None,
     },
     DataPath {
         id: "stackexchange-api",
@@ -89,6 +96,7 @@ pub static PATHS: &[DataPath] = &[
         min_items: 5,
         min_interval_ms: 0,
         preferred: false,
+        next: None,
     },
     DataPath {
         id: "fourchan-catalog",
@@ -98,6 +106,7 @@ pub static PATHS: &[DataPath] = &[
         min_items: 5,
         min_interval_ms: 0,
         preferred: false,
+        next: None,
     },
     DataPath {
         id: "crates-api",
@@ -108,6 +117,7 @@ pub static PATHS: &[DataPath] = &[
         // crates.io's data-access policy: at most one request per second.
         min_interval_ms: 1_000,
         preferred: false,
+        next: None,
     },
     DataPath {
         id: "twitch-gql",
@@ -117,6 +127,7 @@ pub static PATHS: &[DataPath] = &[
         min_items: 3,
         min_interval_ms: 0,
         preferred: false,
+        next: None,
     },
 ];
 
@@ -137,6 +148,7 @@ static TEST_PATHS: &[DataPath] = &[DataPath {
     min_items: 2,
     min_interval_ms: 0,
     preferred: false,
+    next: None,
 }];
 #[cfg(not(test))]
 static TEST_PATHS: &[DataPath] = &[];
@@ -161,17 +173,23 @@ pub fn plan(url: &str) -> Option<(&'static DataPath, Request)> {
 // ---- reddit -------------------------------------------------------------
 
 /// Reddit's listing interface: the endpoint the page's own feed reloads with
-/// (`<shreddit-feed reload-url=...>`). One call is a whole page of posts -- the
-/// same markup the page renders, every field on the `shreddit-post` element --
-/// it answers the plain client without a session, and it is not rate limited the
-/// way the Atom feed is (three calls in a row, three full pages, 2026-11-07).
-/// The document server-renders three posts and leaves the rest to JavaScript,
-/// which is why this path is `preferred`.
+/// (`<shreddit-feed reload-url=...>`) for a subreddit, and the popular feed the
+/// front page's own document loads its posts from. One call is a whole page of
+/// posts -- the same markup the page renders, every field on the `shreddit-post`
+/// element -- it answers the plain client without a session, and it is not rate
+/// limited the way the Atom feed is (three calls in a row, three full pages,
+/// 2026-11-07). The document server-renders three posts and leaves the rest to
+/// JavaScript, which is why this path is `preferred`.
 fn resolve_reddit(url: &Url) -> Option<Request> {
-    let (subreddit, sort) = reddit_listing(url)?;
-    let mut target = format!(
-        "https://www.reddit.com/svc/shreddit/community-more-posts/{sort}/?name={subreddit}"
-    );
+    let mut target = match reddit_listing(url)? {
+        Listing::Community(subreddit, sort) => format!(
+            "https://www.reddit.com/svc/shreddit/community-more-posts/{sort}/?name={subreddit}"
+        ),
+        Listing::Popular(sort) => format!(
+            "https://www.reddit.com/svc/shreddit/feeds/popular-feed?sort={}",
+            sort.to_ascii_uppercase()
+        ),
+    };
     // A window the caller named (`?t=week`) is part of the question.
     if let Some((_, window)) = url.query_pairs().find(|(key, _)| key == "t") {
         if !window.is_empty() {
@@ -194,20 +212,60 @@ fn resolve_reddit(url: &Url) -> Option<Request> {
     })
 }
 
-/// Where a listing URL lives in the interface: `(subreddit, sort)`. `None` for
-/// everything that is not a subreddit listing -- a thread is answered by its own
-/// document, the front page's interface answers with no posts, and a service
+fn is_popular(name: &str) -> bool {
+    name.eq_ignore_ascii_case("popular") || name.eq_ignore_ascii_case("all")
+}
+
+enum Listing {
+    Community(String, String),
+    Popular(String),
+}
+
+/// Where a listing URL lives in the interface. `None` for everything that is
+/// not a listing -- a thread is answered by its own document, and a service
 /// path is nobody's listing.
-fn reddit_listing(url: &Url) -> Option<(String, String)> {
+fn reddit_listing(url: &Url) -> Option<Listing> {
     const SORTS: [&str; 6] = ["hot", "new", "top", "rising", "controversial", "best"];
     let segments: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
     match segments.as_slice() {
-        ["r", subreddit] => Some(((*subreddit).to_string(), "hot".to_string())),
-        ["r", subreddit, sort] if SORTS.contains(sort) => {
-            Some(((*subreddit).to_string(), (*sort).to_string()))
+        // The front page, signed out, is the popular feed (`?sort=BEST`).
+        [] => Some(Listing::Popular("best".to_string())),
+        [sort] if SORTS.contains(sort) => Some(Listing::Popular((*sort).to_string())),
+        // Signed out, r/popular and r/all are the same feed: r/all's own
+        // document loads the popular one (its `all-feed` asks for a human).
+        ["r", feed] if is_popular(feed) => Some(Listing::Popular("best".to_string())),
+        ["r", feed, sort] if is_popular(feed) && SORTS.contains(sort) => {
+            Some(Listing::Popular((*sort).to_string()))
         }
+        ["r", subreddit] => Some(Listing::Community(
+            (*subreddit).to_string(),
+            "hot".to_string(),
+        )),
+        ["r", subreddit, sort] if SORTS.contains(sort) => Some(Listing::Community(
+            (*subreddit).to_string(),
+            (*sort).to_string(),
+        )),
         _ => None,
     }
+}
+
+/// The feed's own next page: the `load-after` partial it names, on the same
+/// origin, only for a feed path.
+fn reddit_next_page(body: &str, source: &str) -> Option<String> {
+    let start = body.find("id=\"feed-next-page-partial\"")?;
+    let tag_end = body[start..].find('>')? + start;
+    let tag_start = body[..start].rfind('<')?;
+    let tag = &body[tag_start..tag_end];
+    let src = tag.split(" src=\"").nth(1)?.split('"').next()?;
+    let src = src.replace("&amp;", "&");
+    let base = Url::parse(source).ok()?;
+    let next = base.join(&src).ok()?;
+    (next.host_str() == base.host_str()
+        && next.path().starts_with("/svc/shreddit/")
+        && next
+            .query_pairs()
+            .any(|(key, value)| key == "after" && !value.is_empty()))
+    .then(|| next.to_string())
 }
 
 /// The posts in a shreddit listing: title, permalink, and the line the reader
@@ -702,19 +760,63 @@ mod tests {
             request.url,
             "https://www.reddit.com/svc/shreddit/community-more-posts/hot/?name=rust"
         );
-        assert!(path.preferred, "the listing's document is the partial answer");
+        assert!(
+            path.preferred,
+            "the listing's document is the partial answer"
+        );
         let (_, request) = plan("https://www.reddit.com/r/rust/top/?t=week").unwrap();
         assert_eq!(
             request.url,
             "https://www.reddit.com/svc/shreddit/community-more-posts/top/?name=rust&t=week"
         );
-        // The front page's interface answers with no posts: the document answers it.
-        assert!(plan("https://www.reddit.com/").is_none());
+        // The front page, signed out, is the popular feed its own document loads.
+        let (_, request) = plan("https://www.reddit.com/").unwrap();
+        assert_eq!(
+            request.url,
+            "https://www.reddit.com/svc/shreddit/feeds/popular-feed?sort=BEST"
+        );
+        let (_, request) = plan("https://www.reddit.com/top/?t=day").unwrap();
+        assert_eq!(
+            request.url,
+            "https://www.reddit.com/svc/shreddit/feeds/popular-feed?sort=TOP&t=day"
+        );
+        let (_, request) = plan("https://www.reddit.com/r/popular/new/").unwrap();
+        assert_eq!(
+            request.url,
+            "https://www.reddit.com/svc/shreddit/feeds/popular-feed?sort=NEW"
+        );
+        let (_, request) = plan("https://www.reddit.com/r/all/").unwrap();
+        assert_eq!(
+            request.url,
+            "https://www.reddit.com/svc/shreddit/feeds/popular-feed?sort=BEST"
+        );
+        // A bare path that is not a sort is nobody's listing.
+        assert!(plan("https://www.reddit.com/settings/").is_none());
         // A thread is answered by its own document, not by an interface.
         assert!(plan("https://www.reddit.com/r/rust/comments/abc/title/").is_none());
         // A service path is nobody's listing.
         assert!(plan("https://www.reddit.com/svc/shreddit/community-more-posts/hot/").is_none());
         assert!(plan("https://www.reddit.com/r/rust/wiki/index").is_none());
+    }
+
+    #[test]
+    fn the_popular_feed_names_its_own_next_page() {
+        let source = "https://www.reddit.com/svc/shreddit/feeds/popular-feed?sort=BEST";
+        let page = r#"<shreddit-post post-title="a" permalink="/r/a/comments/1/a/"></shreddit-post>
+            <faceplate-partial slot="load-after" id="feed-next-page-partial" loading="programmatic"
+              src="/svc/shreddit/feeds/popular-feed?after=dDNf%3D%3D&amp;distance=3&amp;sort=BEST" method="GET">"#;
+        assert_eq!(
+            reddit_next_page(page, source).as_deref(),
+            Some("https://www.reddit.com/svc/shreddit/feeds/popular-feed?after=dDNf%3D%3D&distance=3&sort=BEST")
+        );
+        // Another origin, a page that is not the interface, or no cursor: no next page.
+        let foreign = page.replace("src=\"/svc", "src=\"https://evil.example/svc");
+        assert!(reddit_next_page(&foreign, source).is_none());
+        let elsewhere = page.replace("/svc/shreddit/feeds/", "/settings/");
+        assert!(reddit_next_page(&elsewhere, source).is_none());
+        let no_cursor = page.replace("after=dDNf%3D%3D&amp;", "");
+        assert!(reddit_next_page(&no_cursor, source).is_none());
+        assert!(reddit_next_page("<shreddit-feed></shreddit-feed>", source).is_none());
     }
 
     #[test]
@@ -729,7 +831,10 @@ mod tests {
         let items = parse_reddit_listing(listing, "https://www.reddit.com/r/rust/");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title, "Servo Browser Engine Continues");
-        assert_eq!(items[0].detail, "(phoronix.com) · 137 pts · u/HimikoTogaFromUSSR · 11 comments");
+        assert_eq!(
+            items[0].detail,
+            "(phoronix.com) · 137 pts · u/HimikoTogaFromUSSR · 11 comments"
+        );
         assert_eq!(
             items[0].url.as_deref(),
             Some("https://www.reddit.com/r/rust/comments/1xpb71b/servo_browser_engine/")

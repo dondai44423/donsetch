@@ -281,6 +281,32 @@ impl Worker {
         self.dirty.set(true);
     }
 
+    /// One call to a data interface as `identity`: the app's own request, not a
+    /// page load, with fetch metadata from the path's headers.
+    fn interface_call(
+        &mut self,
+        identity: &'static Identity,
+        request: &datapath::Request,
+        url: &str,
+        cookie: Option<&str>,
+        timeout: Duration,
+    ) -> Option<Result<crate::http::Response, String>> {
+        let wire = self.wire(identity).ok()?;
+        Some(wire.subresource(
+            identity,
+            crate::http::Call {
+                method: request.method,
+                url,
+                cookie,
+                timeout,
+                extra: &request.headers,
+                body: request.body.as_deref().map(str::as_bytes),
+                cap: None,
+                kind: crate::http::Kind::Subresource,
+            },
+        ))
+    }
+
     /// Ask the origin's own interface (a data path), as `identity`. `Wait` means
     /// the interface asked for time (a cooldown or its published interval) and the
     /// attempt is spent.
@@ -343,27 +369,13 @@ impl Worker {
             }
             self.state.mark_call(&data_host);
             let cookie = self.state.cookie_header_for(&request.url, identity.name);
-            let response = {
-                let wire = self.wire(identity).ok();
-                match wire {
-                    // The app's own call, not a page load: fetch
-                    // metadata from the path, no navigation-only header.
-                    Some(wire) => Some(wire.subresource(
-                        identity,
-                        crate::http::Call {
-                            method: request.method,
-                            url: &request.url,
-                            cookie: cookie.as_deref(),
-                            timeout: remaining,
-                            extra: &request.headers,
-                            body: request.body.as_deref().map(str::as_bytes),
-                            cap: None,
-                            kind: crate::http::Kind::Subresource,
-                        },
-                    )),
-                    None => None,
-                }
-            };
+            let response = self.interface_call(
+                identity,
+                &request,
+                &request.url,
+                cookie.as_deref(),
+                remaining,
+            );
             let (status, body, elapsed, version, size, cooldown) = match response {
                 Some(Ok(response)) => {
                     let size = response.body.len();
@@ -387,11 +399,36 @@ impl Worker {
                 self.state
                     .set_cooldown(&data_host, cooldown.unwrap_or(60_000));
             }
-            let items = if status == 200 {
+            let mut items = if status == 200 {
                 (path.parse)(&body, &request.url)
             } else {
                 Vec::new()
             };
+            let (mut elapsed, mut size, mut calls) = (elapsed, size, 1);
+            // A first page too short to be content, from an interface that names
+            // its own next page: ask that page once, as the page itself would.
+            let next = path
+                .next
+                .filter(|_| status == 200 && items.len() < path.min_items)
+                .and_then(|next| next(&body, &request.url));
+            let remaining = options.deadline.saturating_sub(started.elapsed());
+            if let Some(next) = next.filter(|_| remaining.as_millis() >= 700) {
+                if let Some(Ok(more)) =
+                    self.interface_call(identity, &request, &next, cookie.as_deref(), remaining)
+                {
+                    calls += 1;
+                    elapsed += more.elapsed_ms;
+                    size += more.body.len();
+                    if more.status == 200 {
+                        for item in (path.parse)(&more.body, &next) {
+                            if item.url.is_none() || !items.iter().any(|seen| seen.url == item.url)
+                            {
+                                items.push(item);
+                            }
+                        }
+                    }
+                }
+            }
             attempts.push(Attempt {
                 identity: identity.name.to_string(),
                 transport: "data".to_string(),
@@ -409,10 +446,15 @@ impl Worker {
                     .map(|item| item.title.clone())
                     .unwrap_or_default(),
                 note: Some(format!(
-                    "{}: {} items (min {})",
+                    "{}: {} items (min {}){}",
                     path.id,
                     items.len(),
-                    path.min_items
+                    path.min_items,
+                    if calls > 1 {
+                        format!(", {calls} calls")
+                    } else {
+                        String::new()
+                    }
                 )),
             });
             if items.len() >= path.min_items {
@@ -812,6 +854,70 @@ impl Worker {
     }
 
     /// One encounter: identities in order, each one request, until content verifies.
+    /// A document whose only content is a navigation it makes on load (Reddit
+    /// sends a thread's slugless address to its canonical one this way, after
+    /// its gate) is followed once, as the same client with its cookies, the way
+    /// the browser it claims to be would. Same host only, asked of the caller's
+    /// hop guard; any other answer leaves the document as it came.
+    fn follow_page_navigation(
+        &mut self,
+        response: crate::http::Response,
+        identity: &'static Identity,
+        host: &str,
+        options: &Options,
+        started: Instant,
+    ) -> crate::http::Response {
+        if !(200..300).contains(&response.status) {
+            return response;
+        }
+        let Some(next) = page_navigation(&response.body, &response.url) else {
+            return response;
+        };
+        // The page's own host, which a redirect may have moved off the asked one
+        // (a short link): its navigation stays there.
+        let page_host = url::Url::parse(&response.url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| host.to_string());
+        let same_host = url::Url::parse(&next)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|next_host| next_host == page_host);
+        if !same_host || same_url(&next, &response.url) {
+            return response;
+        }
+        if let Some(guard) = &options.policy.hop {
+            if guard(&response.url, &next) != crate::http::Hop::Follow {
+                return response;
+            }
+        }
+        let remaining = options.deadline.saturating_sub(started.elapsed());
+        if remaining.as_millis() < 800 {
+            return response;
+        }
+        // The answer's own cookies ride the navigation, as they would in a browser.
+        self.state.store_cookies(
+            &page_host,
+            identity.name,
+            response.cookies.iter().map(stored).collect(),
+        );
+        let cookie = self.state.cookie_header_for(&next, identity.name);
+        let referer = response.url.clone();
+        let Ok(wire) = self.wire(identity) else {
+            return response;
+        };
+        match wire.get_arriving(&next, cookie.as_deref(), identity, remaining, &referer) {
+            Ok(mut followed) if (200..300).contains(&followed.status) => {
+                let mut cookies = response.cookies;
+                cookies.append(&mut followed.cookies);
+                followed.cookies = cookies;
+                followed.elapsed_ms += response.elapsed_ms;
+                followed
+            }
+            _ => response,
+        }
+    }
+
     fn encounter(&mut self, url: &str, options: &Options) -> Outcome {
         let started = Instant::now();
         self.proxy = options.proxy.clone();
@@ -946,6 +1052,11 @@ impl Worker {
         // The previous attempt's answer: class, status and body hash.
         let mut last_answer: Option<(Class, u16, u64)> = None;
         let mut last_evidence: Vec<String> = Vec::new();
+        // Transport failures so far, the wire classes they happened on, and
+        // whether one of them was a server that went silent.
+        let mut transport_failures = 0usize;
+        let mut failed_wires: Vec<&'static str> = Vec::new();
+        let mut stalled = false;
         while tries < budget.max(1) {
             let Some(name) = queue.pop_front() else { break };
             let index = tries;
@@ -960,6 +1071,15 @@ impl Worker {
             if remaining.as_millis() < 1200 {
                 break;
             }
+            // After a server went silent on one client, the other client is
+            // asked on a short clock: a host that stalls one fingerprint answers
+            // another at its ordinary speed, and a host that stalls everyone is
+            // not waited on twice.
+            let remaining = if stalled {
+                remaining.min(STALL_RETRY_MAX)
+            } else {
+                remaining
+            };
             // Space attempts inside one encounter too: a burst of identities is
             // as suspicious as a burst of requests.
             if index > 0 {
@@ -1072,12 +1192,39 @@ impl Worker {
                     Ok(response) => response,
                     Err(error) => {
                         let ms = started.elapsed().as_secs_f64() * 1000.0;
-                        // A hop the caller refused, a redirect loop or a caller
-                        // that stopped waiting is the same for every identity:
-                        // no other one is asked.
+                        // A hop the caller refused, a redirect loop, a caller
+                        // that stopped waiting, or a failure that happens before
+                        // any client is shown (the name, the route, the socket,
+                        // the certificate) is the same for every identity: no
+                        // other one is asked. A failure after the client spoke
+                        // may be about the client: one identity of another wire
+                        // class is asked, never a third.
+                        transport_failures += 1;
+                        failed_wires.push(identity.wire_class());
                         let final_error = error.starts_with("denied:")
                             || error.starts_with("redirect:")
-                            || error.starts_with("cancelled:");
+                            || error.starts_with("cancelled:")
+                            || transport_scope(&error) == TransportScope::Host
+                            || transport_failures >= TRANSPORT_FAILURES_MAX;
+                        if !final_error {
+                            // A connect that timed out is a dead route or a slow
+                            // handshake (badssl.com: 0.3 s RTT, 1.1 s TLS), not a
+                            // server that heard the request and went silent.
+                            stalled |= error.starts_with("timeout:") && !connect_phase(&error);
+                            let fresh = queue.iter().position(|name| {
+                                identity::lookup(name)
+                                    .is_some_and(|next| !failed_wires.contains(&next.wire_class()))
+                            });
+                            match fresh {
+                                Some(at) => {
+                                    if let Some(moved) = queue.remove(at) {
+                                        queue.push_front(moved);
+                                    }
+                                }
+                                // Every wire class left has already failed here.
+                                None => queue.clear(),
+                            }
+                        }
                         attempts.push(Attempt {
                             identity: identity.name.to_string(),
                             transport: "document".to_string(),
@@ -1147,11 +1294,6 @@ impl Worker {
                     revalidated = Some(entry);
                 }
             }
-            last_body = response.body.clone();
-            if options.capture_body {
-                last_headers = response.headers.clone();
-                last_raw = response.raw.clone();
-            }
             // A redirect the wire did not follow (the caller's policy, or its hop
             // guard stopped it) is the site's answer, not a wall: it ends the
             // encounter as it is, and no identity is scored on it.
@@ -1191,6 +1333,16 @@ impl Worker {
                         capture: options.capture_body,
                     },
                 );
+            }
+            let response = if revalidated.is_none() {
+                self.follow_page_navigation(response, identity, &host, options, started)
+            } else {
+                response
+            };
+            last_body = response.body.clone();
+            if options.capture_body {
+                last_headers = response.headers.clone();
+                last_raw = response.raw.clone();
             }
             let content: Content = verify_response(
                 response.status,
@@ -1679,10 +1831,18 @@ impl Worker {
                             self.proxy.as_deref(),
                         ) {
                             Ok(mint) => {
+                                // The challenge's own host: the asked one, or where a
+                                // redirect (a short link) took the document.
+                                let page_host = url::Url::parse(&engine_url)
+                                    .ok()
+                                    .and_then(|parsed| {
+                                        parsed.host_str().map(str::to_ascii_lowercase)
+                                    })
+                                    .unwrap_or_else(|| host.clone());
                                 // The retry must spend what the mint produced, even
                                 // when state is not persisted to disk.
                                 self.state.store_cookies(
-                                    &host,
+                                    &page_host,
                                     engine_identity.name,
                                     mint.cookies.clone(),
                                 );
@@ -1693,29 +1853,34 @@ impl Worker {
                                     &mint.cookies,
                                     crate::state::now_unix(),
                                 );
-                                let retry_cookie =
-                                    self.state.cookie_header_for(url, engine_identity.name);
+
                                 let budget = options
                                     .deadline
                                     .max(Duration::from_millis(8000))
                                     .saturating_sub(started.elapsed());
                                 // Follow the navigation the page itself chose (it may
-                                // be relative), but only on this host: never an
-                                // off-site redirect.
+                                // be relative), but only on the challenge's own host:
+                                // never an off-site redirect.
                                 let retry_url: String = mint
                                     .redirect
                                     .as_deref()
                                     .and_then(|next| {
                                         url::Url::parse(next)
                                             .or_else(|_| {
-                                                url::Url::parse(url)
+                                                url::Url::parse(&engine_url)
                                                     .and_then(|base| base.join(next))
                                             })
                                             .ok()
                                     })
-                                    .filter(|parsed| parsed.host_str() == Some(host.as_str()))
+                                    .filter(|parsed| {
+                                        parsed.host_str().map(str::to_ascii_lowercase).as_deref()
+                                            == Some(page_host.as_str())
+                                    })
                                     .map(|parsed| parsed.to_string())
                                     .unwrap_or_else(|| url.to_string());
+                                let retry_cookie = self
+                                    .state
+                                    .cookie_header_for(&retry_url, engine_identity.name);
                                 // The engine spends its own credential on its own
                                 // client; that response is the retry. Only when it
                                 // produced none do we ask again ourselves.
@@ -1744,6 +1909,21 @@ impl Worker {
                                     } else {
                                         None
                                     };
+                                let solved_url = retry
+                                    .as_ref()
+                                    .and_then(|retry| retry.as_ref().ok())
+                                    .map(|retry| retry.url.clone());
+                                let retry = retry.map(|retry| {
+                                    retry.map(|retry| {
+                                        self.follow_page_navigation(
+                                            retry,
+                                            engine_identity,
+                                            &host,
+                                            options,
+                                            started,
+                                        )
+                                    })
+                                });
                                 if let Some(Ok(retry)) = retry {
                                     if std::env::var("V5_ENGINE_LOG").is_ok() {
                                         eprintln!(
@@ -1752,6 +1932,16 @@ impl Worker {
                                             retry_cookie.is_some(),
                                             retry.status,
                                             retry.body.len()
+                                        );
+                                    }
+                                    // Inspection only: the answer the mint was spent on,
+                                    // beside the requests the page made.
+                                    if let Some(directory) = std::env::var_os("V5_ENGINE_DUMP_DIR")
+                                    {
+                                        let _ = std::fs::write(
+                                            std::path::Path::new(&directory)
+                                                .join(format!("spend-{}.html", retry.status)),
+                                            &retry.body,
                                         );
                                     }
                                     let content = verify_response(
@@ -1821,12 +2011,19 @@ impl Worker {
                                             url: url.to_string(),
                                             cache: None,
                                             host,
-                                            // The document the caller asked for. A
-                                            // challenge hand-off is a handshake, not
-                                            // a redirect: its solved URL carries a
-                                            // single-use token and is not the page's
-                                            // identity.
-                                            final_url: url.to_string(),
+                                            // The document the challenge stood in
+                                            // front of, or where the page then
+                                            // navigated. A challenge hand-off is a
+                                            // handshake, not a redirect: its solved
+                                            // URL carries a single-use token and is
+                                            // not the page's identity.
+                                            final_url: if solved_url.as_deref()
+                                                == Some(retry.url.as_str())
+                                            {
+                                                engine_url.clone()
+                                            } else {
+                                                retry.url.clone()
+                                            },
                                             class: Class::Content,
                                             identity: Some(engine_identity.name.to_string()),
                                             status: retry.status,
@@ -1906,8 +2103,9 @@ impl Worker {
             // captcha and every other class its JS gate). One more identity, and
             // the class that claims no browser goes first. The second human wall
             // ends the encounter: the site is asking, not the class.
-            let interaction_final =
-                verdict.class == Class::WallInteraction && escalation.is_empty() && interaction_asked;
+            let interaction_final = verdict.class == Class::WallInteraction
+                && escalation.is_empty()
+                && interaction_asked;
             if verdict.class == Class::WallInteraction && !interaction_asked {
                 interaction_asked = true;
                 if identity.family != identity::Family::Plain {
@@ -2036,6 +2234,82 @@ impl Worker {
     }
 }
 
+/// The request ceiling for the identity asked after a server went silent.
+const STALL_RETRY_MAX: Duration = Duration::from_secs(4);
+
+/// Transport failures one encounter spends before it ends on the last one: the
+/// first client, and one of another wire class.
+const TRANSPORT_FAILURES_MAX: usize = 2;
+
+/// Whom a transport failure is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportScope {
+    /// It happened before any client was shown — the name did not resolve,
+    /// the proxy or the socket refused, the certificate did not verify — or
+    /// the body broke a limit, so every identity meets it alike.
+    Host,
+    /// It happened after the client spoke (a reset stream, a handshake alert, a
+    /// server gone silent): it may be about this client.
+    Client,
+}
+
+/// The scope of a wire error, read from its class prefix and the transport's
+/// own words (`http::describe`), which are the same on every OS.
+fn transport_scope(error: &str) -> TransportScope {
+    let lower = error.to_ascii_lowercase();
+    let host = lower.starts_with("dns:")
+        || lower.starts_with("proxy:")
+        // A refused or unreachable socket: no byte of the client was sent.
+        || lower.contains("tcp connect error")
+        // A connect to a cleartext URL that timed out has no handshake in it to
+        // be slow: the route is dead. (Over TLS it may be a slow handshake.)
+        || (connect_phase(&lower) && lower.contains("timed out") && lower.contains("(http://"))
+        // Trust is the host's certificate against our one store.
+        || lower.contains("certificate_verify_failed")
+        || lower.contains("certificate verify failed")
+        || lower.contains("certificate has expired")
+        || lower.contains("self signed certificate")
+        || lower.contains("self-signed certificate")
+        || lower.contains("hostname mismatch")
+        || lower.starts_with("body: response larger than");
+    if host {
+        TransportScope::Host
+    } else {
+        TransportScope::Client
+    }
+}
+
+/// The address a document navigates to on load, resolved against `base`:
+/// Reddit's `shreddit-redirect` (`location.replace("<path>")`, run on init).
+fn page_navigation(body: &str, base: &str) -> Option<String> {
+    let at = body.find("id=\"shreddit-redirect\"")?;
+    let mut end = body.len().min(at + 1024);
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let window = &body[at..end];
+    let call = "location.replace(";
+    let rest = &window[window.find(call)? + call.len()..];
+    let rest = rest
+        .strip_prefix("&quot;")
+        .or_else(|| rest.strip_prefix('"'))
+        .or_else(|| rest.strip_prefix('\''))?;
+    let target = &rest[..rest.find("&quot;").or_else(|| rest.find(['"', '\'']))?];
+    let target = target.replace("&amp;", "&");
+    url::Url::parse(base)
+        .ok()?
+        .join(&target)
+        .ok()
+        .filter(|next| matches!(next.scheme(), "http" | "https"))
+        .map(|next| next.to_string())
+}
+
+/// Did this failure happen while connecting (TCP and TLS), before a request
+/// was sent?
+fn connect_phase(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("(connect)")
+}
+
 /// Is this body the challenge page of the vendor whose program we are about to
 /// run? The page, not the header, decides: a header names the wall, only the
 /// body carries something to execute.
@@ -2155,3 +2429,71 @@ pub fn class_name(class: Class) -> &'static str {
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod transport_tests {
+    use super::{transport_scope, TransportScope};
+
+    #[test]
+    fn failures_before_the_client_spoke_are_the_hosts() {
+        // The transport's own words, as `http::describe` prints them (measured).
+        for host in [
+            "dns: error sending request for uri (https://x.invalid/): client error (Connect): dns error: failed to lookup address information: Name or service not known",
+            "connect: error sending request for uri (http://127.0.0.1:9/): client error (Connect): tcp connect error: Connection refused (os error 111)",
+            "tls: error sending request for uri (https://expired.badssl.com/): client error (Connect): [CERTIFICATE_VERIFY_FAILED]: [CERTIFICATE_VERIFY_FAILED]",
+            "proxy: 407 Proxy Authentication Required",
+            "timeout: error sending request for uri (http://example.org:81/): client error (Connect): client error (Connect): operation timed out",
+            "body: response larger than 67108864 bytes",
+        ] {
+            assert_eq!(transport_scope(host), TransportScope::Host, "{host}");
+        }
+    }
+
+    #[test]
+    fn failures_after_the_client_spoke_may_be_about_it() {
+        // bestbuy and united reset the transparent client's stream and serve
+        // Chrome (identity matrix, 2026-11-07): another wire class is asked.
+        for client in [
+            "request: error sending request for uri (https://www.united.com/en/us): client error (SendRequest): connection error",
+            "timeout: error sending request for uri (https://a.test/): operation timed out",
+            "tls: error sending request for uri (https://a.test/): client error (Connect): [SSLV3_ALERT_HANDSHAKE_FAILURE]",
+            "connect: error sending request for uri (https://a.test/): connection reset by peer",
+            // A TLS connect that timed out: a dead route, or a slow handshake
+            // that another (smaller) ClientHello may finish.
+            "timeout: error sending request for uri (https://example.com:8443/): client error (Connect): client error (Connect): operation timed out",
+        ] {
+            assert_eq!(transport_scope(client), TransportScope::Client, "{client}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::page_navigation;
+
+    #[test]
+    fn reddits_redirect_shell_names_its_target() {
+        let body = "<div id=\"shreddit-redirect\"><ac-call nonce=\"n\" delay=\"0\" \
+                    method=\"location.replace(&quot;/r/rust/comments/1xpfpc5/is_it/?a=1&amp;b=2&quot;)\" \
+                    target=\"window\" trigger=\"init\"></ac-call></div>";
+        assert_eq!(
+            page_navigation(
+                body,
+                "https://www.reddit.com/r/rust/comments/1xpfpc5/?solution=x"
+            )
+            .as_deref(),
+            Some("https://www.reddit.com/r/rust/comments/1xpfpc5/is_it/?a=1&b=2")
+        );
+        // A page that only mentions location.replace navigates nowhere.
+        assert_eq!(
+            page_navigation(
+                "<script>location.replace('/elsewhere')</script>",
+                "https://a.test/"
+            ),
+            None
+        );
+        // Never off the web's schemes.
+        let javascript = "<div id=\"shreddit-redirect\"><ac-call method=\"location.replace(&quot;javascript:alert(1)&quot;)\"></ac-call></div>";
+        assert_eq!(page_navigation(javascript, "https://a.test/"), None);
+    }
+}

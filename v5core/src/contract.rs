@@ -42,6 +42,89 @@ pub struct Contract {
 /// far longer.
 pub const HUMAN_ASK_TEXT_MAX: usize = 1500;
 
+/// Titles of the pages a site serves *instead of* the document — a refusal or
+/// an interstitial — matched against the `<title>` and the first `<h1>` of a
+/// page no longer than [`HUMAN_ASK_TEXT_MAX`]. A title *starts with* one of
+/// these (a site suffix may follow).
+const REFUSAL_TITLE_PREFIXES: &[&str] = &[
+    "access denied",
+    "access to this page has been denied",
+    "robot or human",
+    "are you a robot",
+    "are you human",
+    "just a moment",
+    "attention required",
+    "pardon our interruption",
+    "request rejected",
+    "request blocked",
+    "request unsuccessful",
+    "you have been blocked",
+    "you've been blocked",
+    "you are blocked",
+    "human verification",
+    "bot verification",
+    "verify you are human",
+    "verify you're human",
+    "verifying you are human",
+    "security check",
+    "one more step",
+    "checking your browser",
+    "403 forbidden",
+    "error 403",
+    "429 too many requests",
+    "too many requests",
+];
+
+/// Single words that are a refusal only when they are the whole title: a
+/// page titled "Forbidden Planet" is not one.
+const REFUSAL_TITLES_EXACT: &[&str] = &["forbidden", "blocked", "denied", "error"];
+
+/// The refusal or interstitial a short page's title or first heading names,
+/// if any. `title` and `heading` are as the page shows them.
+pub fn refusal_title(title: &str, heading: &str) -> Option<&'static str> {
+    [title, heading].into_iter().find_map(|line| {
+        let line = fold_quotes(&line.trim().to_lowercase());
+        let line = line.trim_end_matches(['.', '!', '?', ' ']);
+        REFUSAL_TITLE_PREFIXES
+            .iter()
+            // A whole-word prefix: "Security Checklist" is not "Security Check".
+            .find(|prefix| {
+                line.strip_prefix(**prefix)
+                    .is_some_and(|rest| !rest.starts_with(|next: char| next.is_alphanumeric()))
+            })
+            .or_else(|| REFUSAL_TITLES_EXACT.iter().find(|exact| line == **exact))
+            .copied()
+    })
+}
+
+/// The refusal or interstitial a short document is, read from its title and
+/// first heading; `None` for a page with more visible text than an
+/// interstitial carries, or one too large to be one.
+pub fn refusal_page(body: &str) -> Option<&'static str> {
+    // An interstitial is a few KB of markup and script; a megabyte is a page.
+    if body.len() > 1 << 20 {
+        return None;
+    }
+    let document = Html::parse_document(&strip_noise(body));
+    let text = normalize(&document.root_element().text().collect::<Vec<_>>().join(" "));
+    if text.chars().count() > HUMAN_ASK_TEXT_MAX {
+        return None;
+    }
+    let first = |selector: &str| {
+        document
+            .select(&Selector::parse(selector).expect("static selector"))
+            .next()
+            .map(|node| node.text().collect::<String>())
+            .unwrap_or_default()
+    };
+    refusal_title(&first("title"), &first("h1"))
+}
+
+/// Typographic quotes as their ASCII forms, so `you’re` matches `you're`.
+pub(crate) fn fold_quotes(text: &str) -> String {
+    text.replace(['\u{2019}', '\u{2018}', '\u{02bc}'], "'")
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Content {
     pub title: String,
@@ -155,12 +238,24 @@ pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
         }
     }
     if contract.refuse_human_asks && text.chars().count() <= HUMAN_ASK_TEXT_MAX {
-        let seen = format!("{title} {text}").to_lowercase();
+        let seen = fold_quotes(&format!("{title} {text}").to_lowercase());
         if let Some(phrase) = crate::classify::ASKS_HUMAN
             .iter()
             .find(|phrase| seen.contains(*phrase))
         {
             failures.push(format!("asks for a human: {phrase:?}"));
+        } else {
+            // A site's refusal or interstitial is often served with a 200 and a
+            // few hundred characters of text (Akamai's "Access Denied" with its
+            // reference number): long enough for the minimum, and not the page.
+            let heading = document
+                .select(&Selector::parse("h1").expect("h1 selector"))
+                .next()
+                .map(|node| node.text().collect::<String>())
+                .unwrap_or_default();
+            if let Some(refusal) = refusal_title(&title, &heading) {
+                failures.push(format!("refusal page: {refusal:?}"));
+            }
         }
     }
     if let Some(rules) = &contract.selectors {
@@ -323,6 +418,74 @@ mod tests {
             ..Contract::default()
         };
         assert!(verify(interstitial, "https://www.reddit.com/", &named).passed);
+    }
+
+    #[test]
+    fn a_refusal_served_as_200_is_not_generic_content() {
+        // Lowe's, to the transparent client (2026-11-07): Akamai's refusal with
+        // a 200 and 207 characters of text, past the minimum.
+        let akamai = "<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD><BODY>\n<H1>Access Denied</H1>\n\
+            You don't have permission to access \"http&#58;&#47;&#47;www&#46;lowes&#46;com&#47;\" on this server.<P>\n\
+            Reference&#32;&#35;18&#46;a5f43717&#46;1794020675&#46;1e1ea2d1\n<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;a5f43717&#46;1794020675&#46;1e1ea2d1</P>\n</BODY>\n</HTML>";
+        let verdict = verify(akamai, "https://www.lowes.com/", &Contract::generic());
+        assert!(!verdict.passed, "{verdict:?}");
+        assert_eq!(refusal_page(akamai), Some("access denied"));
+        // Walmart's press-and-hold, typographic apostrophe and all.
+        let hold = "<html><head><title>Robot or human?</title></head><body><h1>Robot or human?</h1>\
+            <p>Activate and hold the button to confirm that you\u{2019}re human. Thank You!</p>\
+            <div id=\"px-captcha\"></div><footer>Terms of Use Privacy Policy Do Not Sell My Personal \
+            Information Request My Personal Information \u{a9} Walmart Stores, Inc.</footer></body></html>";
+        assert!(
+            !verify(
+                hold,
+                "https://www.walmart.com/blocked",
+                &Contract::generic()
+            )
+            .passed
+        );
+    }
+
+    #[test]
+    fn a_title_only_resembling_a_refusal_stays_content() {
+        // Whole words only, and only on a page as short as an interstitial.
+        for title in [
+            "Security Checklist for small teams",
+            "Forbidden Planet (1956)",
+            "Access Denied: a novel",
+        ] {
+            let body = format!(
+                "<html><head><title>{title}</title></head><body><article>{}</article></body></html>",
+                "A paragraph a reader came for, with several sentences of its own. ".repeat(4)
+            );
+            let verdict = verify(&body, "https://a.test/", &Contract::generic());
+            if title.starts_with("Access Denied") {
+                // Short and titled as a refusal: not content.
+                assert!(!verdict.passed, "{title}");
+            } else {
+                assert!(verdict.passed, "{title}: {verdict:?}");
+            }
+            let long = format!(
+                "<html><head><title>{title}</title></head><body><article>{}</article></body></html>",
+                "A paragraph a reader came for, with several sentences of its own. ".repeat(30)
+            );
+            assert!(
+                verify(&long, "https://a.test/", &Contract::generic()).passed,
+                "{title}"
+            );
+        }
+        // A caller's own contract decides for itself.
+        let named = Contract {
+            min_text_chars: Some(20),
+            ..Contract::default()
+        };
+        assert!(
+            verify(
+                "<title>Access Denied</title><p>The film's plot, in brief.</p>",
+                "https://a.test/",
+                &named
+            )
+            .passed
+        );
     }
 
     #[test]

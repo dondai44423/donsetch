@@ -278,7 +278,11 @@ fn a_human_check_costs_one_identity_beyond_the_class_that_saw_it() {
     let outcome = Session::new(false).fetch(&cold(server.url("/")));
     assert_eq!(outcome.class, Class::WallInteraction);
     assert_eq!(tried(&outcome), ["plain", "chrome"]);
-    assert_eq!(server.hit_count(), 2, "one identity past the class that saw it");
+    assert_eq!(
+        server.hit_count(),
+        2,
+        "one identity past the class that saw it"
+    );
 }
 
 #[test]
@@ -514,4 +518,183 @@ fn a_stored_winner_that_starts_failing_is_replaced_inside_one_encounter() {
         [winner.as_str()],
         "the replacement goes first next time"
     );
+}
+
+/// An encounter that lets the session choose (no forced identity), cold.
+fn chosen(url: String) -> Request {
+    Request {
+        identity: None,
+        learn: false,
+        pace: Duration::ZERO,
+        deadline: Duration::from_secs(10),
+        ..Request::new(url)
+    }
+}
+
+#[test]
+fn a_refused_connection_is_asked_once() {
+    // A port nothing listens on: the refusal comes before any client is
+    // shown, so no other identity is asked.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let started = std::time::Instant::now();
+    let outcome = Session::new(false).fetch(&chosen(format!("http://127.0.0.1:{port}/")));
+    assert_eq!(outcome.class, Class::Network);
+    assert_eq!(outcome.attempts.len(), 1, "{:?}", outcome.attempts);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_silent_server_is_asked_by_one_other_wire_class_on_a_short_clock() {
+    let silent = Server::start(|_| Reply::Silence);
+    let mut request = chosen(silent.url("/"));
+    request.policy.request_max = Duration::from_millis(1500);
+    let started = std::time::Instant::now();
+    let outcome = Session::new(false).fetch(&request);
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.class, Class::Network);
+    // The first client and one of another wire class; never a third.
+    assert_eq!(outcome.attempts.len(), 2, "{:?}", outcome.attempts);
+    let wires: Vec<&str> = outcome
+        .attempts
+        .iter()
+        .map(|attempt| {
+            crate::identity::lookup(&attempt.identity)
+                .unwrap()
+                .wire_class()
+        })
+        .collect();
+    assert_ne!(wires[0], wires[1], "{wires:?}");
+    // Two short clocks, not the encounter's whole deadline.
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+#[test]
+fn a_refusal_served_as_200_to_one_client_moves_to_the_next() {
+    // Akamai's shape: "Access Denied" with a 200 and a reference link, to the
+    // transparent client; the page to a browser.
+    let server = Server::start(|request| {
+        if request
+            .header("user-agent")
+            .is_some_and(|agent| agent.starts_with("donsetch/"))
+        {
+            Reply::ok(
+                "<HTML><HEAD><TITLE>Access Denied</TITLE></HEAD><BODY><H1>Access Denied</H1>\
+                 You don't have permission to access \"http://www.example.test/\" on this server.<P>\
+                 Reference #18.a5f43717.1794020675.1e1ea2d1<P>\
+                 https://errors.edgesuite.net/18.a5f43717.1794020675.1e1ea2d1</BODY></HTML>",
+            )
+        } else {
+            Reply::ok(page("Fixture"))
+        }
+    });
+    let outcome = Session::new(false).fetch(&chosen(server.url("/")));
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
+    assert_eq!(outcome.attempts[0].class, Class::WallIdentity);
+    assert_ne!(outcome.identity.as_deref(), Some("plain"));
+}
+
+#[test]
+fn a_page_that_navigates_on_load_is_followed_once_as_the_same_client() {
+    // Reddit's slugless thread after its gate: a shell whose only job is
+    // `location.replace` to the canonical address (2026-11-07).
+    let server = Server::start(|request| match request.path.as_str() {
+        "/r/x/comments/abc/" => Reply::ok(
+            "<html><head><title>Reddit - The heart of the internet</title>\
+             <script src=\"https://www.google.com/recaptcha/api.js\"></script></head><body>\
+             <div id=\"shreddit-redirect\"><ac-call nonce=\"n\" delay=\"0\" \
+             method=\"location.replace(&quot;/r/x/comments/abc/a_title/&quot;)\" target=\"window\" \
+             trigger=\"init\"></ac-call></div></body></html>",
+        ),
+        "/r/x/comments/abc/a_title/" => Reply::ok(page("A thread")),
+        _ => Reply::Full {
+            status: 404,
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
+    });
+    let outcome = Session::new(false).fetch(&request(server.url("/r/x/comments/abc/")));
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
+    assert!(
+        outcome.final_url.ends_with("/r/x/comments/abc/a_title/"),
+        "{}",
+        outcome.final_url
+    );
+    assert_eq!(server.hit_count(), 2, "{:?}", server.hits());
+}
+
+#[test]
+fn a_short_link_that_lands_on_another_host_follows_that_pages_navigation() {
+    // redd.it/<id> lands on www.reddit.com, whose shell navigates on its own
+    // host: the navigation belongs to the page that asked for it, not to the
+    // host the caller named.
+    let server = Server::start(|request| {
+        let host = request.header("host").unwrap_or_default().to_string();
+        let on_short_host = host.starts_with("127.0.0.1");
+        match request.path.as_str() {
+            "/abc" if on_short_host => Reply::Full {
+                status: 301,
+                headers: vec![(
+                    "Location".into(),
+                    format!("http://{}/r/x/comments/abc/", host.replace("127.0.0.1", "localhost")),
+                )],
+                body: Vec::new(),
+            },
+            "/r/x/comments/abc/" if !on_short_host => Reply::ok(
+                "<html><head><title>Reddit - The heart of the internet</title></head><body>\
+                 <div id=\"shreddit-redirect\"><ac-call nonce=\"n\" delay=\"0\" \
+                 method=\"location.replace(&quot;/r/x/comments/abc/a_title/&quot;)\" target=\"window\" \
+                 trigger=\"init\"></ac-call></div></body></html>",
+            ),
+            "/r/x/comments/abc/a_title/" if !on_short_host => Reply::ok(page("A thread")),
+            _ => Reply::Full {
+                status: 404,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        }
+    });
+    let outcome = Session::new(false).fetch(&request(server.url("/abc")));
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
+    assert!(
+        outcome.final_url.contains("localhost") && outcome.final_url.ends_with("/a_title/"),
+        "{}",
+        outcome.final_url
+    );
+    assert_eq!(server.hit_count(), 3, "{:?}", server.hits());
+}
+
+#[test]
+fn a_redirect_hop_carries_the_cookie_the_redirect_set() {
+    // A gate that validates on the first hop and opens its session there.
+    let server = Server::start(|request| match request.path.as_str() {
+        "/gate" => Reply::Full {
+            status: 302,
+            headers: vec![
+                ("Location".into(), "/page".into()),
+                ("Set-Cookie".into(), "session=open; Path=/".into()),
+            ],
+            body: Vec::new(),
+        },
+        _ if request
+            .header("cookie")
+            .is_some_and(|cookie| cookie.contains("session=open")) =>
+        {
+            Reply::ok(page("Behind the gate"))
+        }
+        _ => Reply::Full {
+            status: 403,
+            headers: Vec::new(),
+            body: b"Forbidden".to_vec(),
+        },
+    });
+    let outcome = Session::new(false).fetch(&request(server.url("/gate")));
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
 }
