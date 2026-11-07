@@ -170,7 +170,7 @@ donsetch doctor --mcp    # detects clients and prints absolute-path registration
 | **NASM** | BoringSSL asm | `apt install nasm` | `brew install nasm` | `choco install nasm` |
 | **CMake** | BoringSSL build | `apt install cmake` | `brew install cmake` | `winget install cmake` |
 | **Clang** | bindgen | `apt install clang libclang-dev` | bundled | `choco install llvm` |
-| **LLD** | PDFium link (aarch64) | `apt install lld` | not needed | not needed |
+| **LLD** | PDFium link | none: the Rust toolchain's own `rust-lld` is used (a system `ld.lld` must be LLVM 20+) | not needed | not needed |
 
 The challenge engine embeds V8 through `deno_core`. The build downloads a prebuilt V8 static library for your target; on an offline box, point `RUSTY_V8_ARCHIVE` at a downloaded copy.
 
@@ -182,16 +182,16 @@ cargo build --release --features ocr,rerank,http
 
 First build compiles BoringSSL and links V8 (a few minutes), cached after. Chromium is optional and never fetches pages: it serves `web_screenshot` and `donsetch login`. DonSeTch auto-discovers system Chromium, Playwright's cached builds, or Edge on Windows.
 
-On Ubuntu 22.04 and anything with bfd 2.38, link with lld: bfd cannot parse the `.crel` relocations rustc 1.86+ emits for aarch64, and the default link dies with "unknown architecture".
+PDFium's static archives use CREL (compact relocation) sections. A linker that does not know them, GNU ld before 2.44 and any lld before LLVM 20 (Ubuntu 22.04 and 24.04 ship bfd 2.38/2.42 and lld 14/18), skips them without an error and the link succeeds, but every relocation in those objects is left unapplied: the binary then calls a null constructor and dies with SIGSEGV before `main`. `build.rs` therefore links with the toolchain's own `rust-lld` (as new as rustc's LLVM, nothing to install) and falls back to an `ld.lld` of LLVM 20 or later on `PATH`. Do not force an older lld through `RUSTFLAGS`.
 
 ```bash
-sudo apt-get install -y cmake build-essential pkg-config libclang-dev clang lld nasm golang-go
-RUSTFLAGS="-C link-arg=-fuse-ld=lld" cargo build --release
+sudo apt-get install -y cmake build-essential pkg-config libclang-dev clang nasm golang-go
+cargo build --release
 ```
 
 The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built on Ubuntu 22.04 and runs there directly.
 
-**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. On macOS, OCR and rerank need macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary). **Linux ARM64 is not in the 5.0 beta:** the v5 core's binary does not start on aarch64 yet (the core's own suite passes there; the product's link does not), so the beta ships no arm64 asset — 4.10.5 remains the installable release on that target.
+**Feature set:** default is `[]` (fetch, search, crawl, PDF). `ocr,rerank` pulls in ONNX Runtime, `http` enables the HTTP MCP transport. npm prebuilts ship all three on linux-x64, macOS-arm64, macOS-x64 and Windows-x64; linux-arm64 is core-only, because the aarch64 ONNX runtime deadlocks in its loader. On macOS, OCR and rerank need macOS 13.4 or newer (the minimum of the Microsoft-signed ONNX dylib that ships beside the binary).
 
 </details>
 

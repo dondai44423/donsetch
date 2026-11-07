@@ -51,15 +51,20 @@ jobs:
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             features: --features ocr,rerank,http
-            rustflags: -C target-cpu=x86-64 -C link-arg=-fuse-ld=lld
-          # linux-arm64 is deliberately absent from this matrix. The v5
-          # core's binary does not start on aarch64-linux: v5core's own
-          # suite passes there (164/164), the product binary that links it
-          # segfaults before main in every profile and with either linker,
-          # so the fault is in how the product links the core on this
-          # target. Shipping a binary that cannot start is not an option,
-          # and v4.10.5 remains installable for arm64 users meanwhile.
-          # Evidence and next step: status.md, "the aarch64 product binary".
+            rustflags: -C target-cpu=x86-64
+          - name: linux-arm64
+            # Ubuntu 22.04 for the same glibc 2.35 baseline as linux-x64.
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            # PDF (core) is in; OCR/rerank off: the official ONNX
+            # aarch64 prebuilt deadlocks at dlopen on native arm64.
+            features: ''
+            # No linker flag here on purpose: build.rs links PDFium with
+            # the toolchain's own rust-lld. A RUSTFLAGS -fuse-ld=lld would
+            # let the runner's apt lld (18) win, which skips PDFium's CREL
+            # relocations without an error and yields a binary that
+            # segfaults before main.
+            rustflags: ''
           - name: darwin-arm64
             os: macos-latest
             target: aarch64-apple-darwin
@@ -92,10 +97,13 @@ jobs:
         with:
           go-version: '>=1.22.0'
 
-      - name: Install NASM + LLD (Linux)
+      # No lld from apt: the runner's (14 on 22.04, 18 on 24.04) cannot read
+      # PDFium's CREL relocations and does not say so. build.rs links with the
+      # toolchain's own rust-lld.
+      - name: Install NASM (Linux)
         if: startsWith(matrix.os, 'ubuntu-')
         timeout-minutes: 5
-        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm lld
+        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
 
       - name: Install NASM (macOS)
         if: startsWith(matrix.os, 'macos')
@@ -156,8 +164,8 @@ jobs:
           # ONNX Runtime AVX is handled separately via dynamic loading
           # (ort load-dynamic; build.rs fetches Microsoft's shared
           # library for Linux and Windows).
-          # Linux legs also pin -fuse-ld=lld per matrix.rustflags:
-          # bfd 2.38 (22.04) cannot link rustc 1.98 output (.crel).
+          # Linux legs link PDFium with rust-lld (build.rs): neither bfd
+          # 2.38 (22.04) nor an apt lld reads its CREL relocations.
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
         timeout-minutes: 30

@@ -83,6 +83,8 @@ jobs:
           expected=(
             donsetch-linux-x64.tar.gz
             donsetch-linux-x64.tar.gz.sha256
+            donsetch-linux-arm64.tar.gz
+            donsetch-linux-arm64.tar.gz.sha256
             donsetch-darwin-arm64.tar.gz
             donsetch-darwin-arm64.tar.gz.sha256
             donsetch-darwin-x64.tar.gz
