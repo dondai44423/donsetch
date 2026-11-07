@@ -1336,6 +1336,7 @@ dependencies = [
  "config",
  "dirs",
  "ed25519-dalek",
+ "ego-tree",
  "encoding_rs",
  "flate2",
  "futures-util",

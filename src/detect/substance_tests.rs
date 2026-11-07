@@ -393,3 +393,42 @@ fn an_empty_language_picker_names_its_english_alternate() {
             .is_none()
     );
 }
+
+#[test]
+fn an_article_inside_a_page_wide_header_is_content() {
+    // holisticai.com /blog/: a Webflow article inside
+    // <header class="section-hero-header">, a short real footer below.
+    let html = format!(
+        r#"<body class="hai-body"><nav><a href="/">Blog</a><a href="/demo">Get a demo</a></nav>
+        <header class="section-hero-header"><div class="lr_blog-child-content"><div class="lr-rich w-richtext">
+        <h1>Penalties of the EU AI Act: The High Cost of Non-Compliance</h1>
+        <p>Non-compliance with the prohibitions can result in fines of up to <strong>35 million EUR</strong> or 7% of worldwide annual turnover.</p>
+        <p>Other obligations carry fines of up to <strong>15 million EUR</strong> or 3% of turnover, whichever is higher.</p>
+        <p>Supplying incorrect information to authorities can cost up to 7.5 million EUR or 1% of turnover.</p>
+        </div></div></header>{FOOTER}</body>"#
+    );
+    assert_eq!(verdict(&html), Verdict::Content);
+}
+
+#[test]
+fn a_mega_menu_holding_most_text_is_still_frame() {
+    let items: String = (0..40)
+        .map(|i| format!(r#"<li><a href="/t{i}">Keyword Tool {i}</a></li>"#))
+        .collect();
+    let html = format!(
+        r#"<body><nav><ul>{items}</ul></nav><main><h1>Overview</h1></main>{FOOTER}</body>"#
+    );
+    assert!(!verdict(&html).is_content());
+}
+
+#[test]
+fn a_page_wide_banner_without_prose_is_still_frame() {
+    // huggingface.co/spaces/...: the banner holds the Space name, a like
+    // count and a status; the app itself loads into an iframe.
+    let html = r#"<body><header class="space-header"><h1><a href="/spaces">Spaces</a>
+        <a href="/org">open-llm-leaderboard</a> / <a href="/s">open_llm_leaderboard</a>
+        <button>Like</button><span>14.2k</span><span>Running on CPU Upgrade</span></h1>
+        <div><a href="/app">App</a><a href="/files">Files</a><a href="/c">Community</a><span>1168</span></div></header>
+        <main><div>Fetching metadata from the HF Docker repository...</div><div>Refreshing</div><iframe src="https://x.hf.space"></iframe></main></body>"#;
+    assert!(!verdict(html).is_content());
+}

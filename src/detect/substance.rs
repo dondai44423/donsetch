@@ -654,6 +654,9 @@ struct Ctx {
     heading: u8,
     pre: bool,
     row: usize,
+    /// A header or footer kept out of the frame for holding most of the
+    /// page's text (see `walk`).
+    wrapper: usize,
 }
 
 /// One block of visible text and the structure around it.
@@ -757,6 +760,61 @@ fn tokens(attr: &str) -> Vec<String> {
     out
 }
 
+/// Visible text characters under each header, footer and frame-classed
+/// element, and under the body: one iterative pass, no recursion.
+fn region_sizes(doc: &Html) -> (std::collections::HashMap<ego_tree::NodeId, usize>, usize) {
+    let mut sizes = std::collections::HashMap::new();
+    let root = doc.root_element();
+    let body = root
+        .children()
+        .find(|c| c.value().as_element().is_some_and(|e| e.name() == "body"))
+        .unwrap_or(*root);
+    // (node, entered): on exit a node's total is folded into its parent's.
+    let mut stack = vec![(body, false)];
+    let mut sums: Vec<usize> = vec![0];
+    while let Some((node, entered)) = stack.pop() {
+        if entered {
+            let total = sums.pop().unwrap_or(0);
+            if let Some(el) = node.value().as_element() {
+                let tracked = matches!(el.name(), "header" | "footer") || {
+                    let attr = format!(
+                        "{} {}",
+                        el.attr("class").unwrap_or(""),
+                        el.attr("id").unwrap_or("")
+                    );
+                    tokens(&attr)
+                        .iter()
+                        .any(|t| FRAME_CLASS.contains(&t.as_str()))
+                };
+                if tracked {
+                    sizes.insert(node.id(), total);
+                }
+            }
+            if let Some(parent) = sums.last_mut() {
+                *parent += total;
+            }
+            continue;
+        }
+        match node.value() {
+            Node::Text(t) => {
+                if let Some(top) = sums.last_mut() {
+                    *top += t.trim().chars().count();
+                }
+            }
+            Node::Element(el) if !SKIP.contains(&el.name()) => {
+                stack.push((node, true));
+                sums.push(0);
+                for child in node.children() {
+                    stack.push((child, false));
+                }
+            }
+            _ => {}
+        }
+    }
+    let body_text = sums.pop().unwrap_or(0);
+    (sizes, body_text)
+}
+
 struct Walk {
     units: Vec<Unit>,
     mounts: usize,
@@ -798,6 +856,7 @@ fn walk(doc: &Html) -> Walk {
         }
     }
 
+    let (region_text, body_text) = region_sizes(doc);
     let mut out = Walk {
         units: Vec::new(),
         mounts: 0,
@@ -899,14 +958,29 @@ fn walk(doc: &Html) -> Walk {
                             .iter()
                             .any(|t| FRAME_CLASS.contains(&t.as_str()))
                     };
+                    // A header, footer or footer-classed block holding most
+                    // of the page's text is a layout wrapper, not a banner
+                    // (a Webflow article inside `<header class=
+                    // "section-hero-header">`). Navigation and dialogs stay
+                    // frame whatever they hold: a mega-menu is all labels.
+                    let minority = || {
+                        region_text
+                            .get(&node.id())
+                            .is_none_or(|n| n * 2 <= body_text)
+                    };
+                    let banner_like =
+                        class_frame || (matches!(name, "header" | "footer") && !parent.main);
                     if !wraps
                         && (matches!(name, "nav" | "dialog")
                             || FRAME_ROLES.contains(&role.as_str())
                             || el.attr("aria-modal") == Some("true")
-                            || class_frame
-                            || (matches!(name, "header" | "footer") && !parent.main))
+                            || (banner_like && minority()))
                     {
                         ctx.frame = true;
+                    } else if !wraps && banner_like && ctx.wrapper == 0 {
+                        // Judged after classification: a wrapper with no
+                        // prose in it is frame after all.
+                        ctx.wrapper = next_id;
                     }
                     if matches!(name, "main" | "article") || role == "main" {
                         ctx.main = true;
@@ -1402,6 +1476,24 @@ pub fn assess(doc: &Html, url: &str) -> Page {
         kinds.push(kind);
     }
 
+    // A page-wide header or footer without a sentence in it was a frame
+    // region after all (a near-empty app page whose banner holds most of
+    // its text: a name, a like count, a status).
+    let prose_wrappers: HashSet<usize> = w
+        .units
+        .iter()
+        .zip(&kinds)
+        .filter(|(u, k)| u.ctx.wrapper != 0 && **k == Kind::Sentence)
+        .map(|(u, _)| u.ctx.wrapper)
+        .collect();
+    for (u, k) in w.units.iter().zip(kinds.iter_mut()) {
+        if u.ctx.wrapper != 0
+            && !prose_wrappers.contains(&u.ctx.wrapper)
+            && matches!(k, Kind::Data | Kind::Entity | Kind::Sentence)
+        {
+            *k = Kind::Frame;
+        }
+    }
     let count = |k: Kind| kinds.iter().filter(|x| **x == k).count();
     let sentences = count(Kind::Sentence);
     let data = count(Kind::Data);

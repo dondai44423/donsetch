@@ -89,6 +89,11 @@ pub(super) fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String 
             format!("authentication required at {url} (HTTP {status})")
         }
         Verdict::Paywall => format!("paywall: {url} requires payment to view content"),
+        // A 2xx "not found" is the page saying so (a soft 404); naming the
+        // status alone would read as a contradiction.
+        Verdict::SoftNotFound if (200..300).contains(&status) => format!(
+            "not found: {url} is a \"page not found\" page (the server answered HTTP {status}, but the page says the content does not exist)"
+        ),
         Verdict::SoftNotFound => format!("not found: {url} returned HTTP {status}"),
         Verdict::Blocked => {
             // 403/429 without challenge markers = upstream block, not a bot wall.
