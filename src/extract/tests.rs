@@ -3245,4 +3245,18 @@ fn content_figure_emits_each_image_once_and_keeps_its_caption() {
             ex.markdown
         );
     }
+
+// Bare-digit and single-letter superscripts are exponents, units and
+// powers, not citation markers: km², 10⁹, mc², xⁿ.
+#[test]
+fn audit_numeric_superscripts_are_not_citation_markers() {
+    let html = audit_page(
+        r##"<p>The lake covers 1,000 km<sup>2</sup> and holds 10<sup>9</sup> cubic metres.</p><p>Einstein wrote E = mc<sup>2</sup> and the series sums x<sup>n</sup> terms.</p><p>A cited claim.<sup class="reference"><a href="#cite_note-1">[1]</a></sup></p>"##,
+    );
+    let md = extract_html(&html).markdown;
+    for needle in ["km^{2}", "10^{9}", "mc^{2}", "x^{n}"] {
+        assert!(md.contains(needle), "lost {needle:?}:\n{md}");
+    }
+    // Negative case: a bracketed wiki citation stays dropped.
+    assert!(!md.contains("[1]"), "{md}");
 }
