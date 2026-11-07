@@ -711,7 +711,7 @@ impl Searcher {
         // site:github.com / site:stackoverflow.com / etc. join the
         // fan-out as the site's own API.
         if let Some(site) = &compiled.site
-            && let Some(sv) = query::site_vertical(site)
+            && let Some(sv) = query::site_vertical(query::site_scope(site).0)
             && !verticals.contains(&sv)
         {
             verticals.push(sv);
@@ -1405,6 +1405,9 @@ fn width_for_stress(stress: f64, available: usize) -> usize {
 ///
 /// Matches `domain.com` and any subdomain `*.domain.com`.
 /// Case-insensitive. Strips `www.` prefix before comparison.
+/// `site:domain.com/path` also requires the URL path to start with
+/// `/path`; a scheme in the value (`site:https://domain.com`) is
+/// ignored.
 /// (#190) site: filters BYOK results too: the same filtering and count
 /// semantics as the local engine sweeps. Redirect rows whose target
 /// host can not match the scanned domain (google goto proxies) drop;
@@ -1421,18 +1424,20 @@ pub(crate) fn site_filter(query: &str, results: &mut Vec<Merged>) {
             }
         }
     }
-    let Some(domain) = site_domain else {
+    let Some(site) = site_domain else {
         return;
     };
+    let (domain, path) = query::site_scope(&site);
     // Use raw host (not host_of which strips www.) so
     // `site:www.wikipedia.org` matches only www., while
     // `site:wikipedia.org` matches all subdomains.
     results.retain(|r| {
-        let host = url::Url::parse(&r.url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
-            .unwrap_or_default();
-        host == domain || host.ends_with(&format!(".{domain}"))
+        let Ok(u) = url::Url::parse(&r.url) else {
+            return false;
+        };
+        let host = u.host_str().map(|h| h.to_lowercase()).unwrap_or_default();
+        (host == domain || host.ends_with(&format!(".{domain}")))
+            && query::site_path_matches(&u, path)
     });
 }
 
@@ -2558,5 +2563,57 @@ mod tests {
         ];
         site_filter("rust site:www.wikipedia.org", &mut results);
         assert_eq!(results.len(), 1, "www.wikipedia.org matches www. only");
+    }
+
+    #[test]
+    fn site_filter_with_a_path_keeps_only_that_subtree() {
+        let mut results = vec![
+            merged("https://github.com/tokio-rs/tokio"),
+            merged("https://github.com/rust-lang/rust"),
+            merged("https://example.com/tokio-rs/tokio"),
+            merged("https://github.com/"),
+            merged("https://github.com/Tokio-RS/mio"),
+        ];
+        site_filter("runtime site:github.com/tokio-rs/", &mut results);
+        let kept: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "https://github.com/tokio-rs/tokio",
+                "https://github.com/Tokio-RS/mio"
+            ],
+            "on-host hits outside /tokio-rs and off-host hits on the same path drop"
+        );
+    }
+
+    #[test]
+    fn site_filter_ignores_a_scheme_in_the_value() {
+        let mut results = vec![
+            merged("https://docs.rs/tokio/latest/tokio/"),
+            merged("http://docs.rs/serde"),
+            merged("https://crates.io/crates/tokio"),
+        ];
+        site_filter("tokio site:https://docs.rs", &mut results);
+        assert_eq!(results.len(), 2, "docs.rs on any scheme, crates.io drops");
+        assert!(results.iter().all(|r| r.url.contains("://docs.rs/")));
+    }
+
+    #[test]
+    fn site_operator_with_a_path_keeps_on_site_results() {
+        let mut results = vec![
+            merged("https://github.com/tokio-rs/tokio"),
+            merged("https://github.com/tokio-rs/axum"),
+            merged("https://example.com/tokio"),
+        ];
+        site_filter("runtime site:github.com/tokio-rs", &mut results);
+        let kept: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "https://github.com/tokio-rs/tokio",
+                "https://github.com/tokio-rs/axum"
+            ],
+            "site:github.com/tokio-rs must keep the github.com/tokio-rs results"
+        );
     }
 }

@@ -197,6 +197,30 @@ pub(crate) fn filetype_filter(query: &str, results: &mut Vec<super::rank::Merged
     });
 }
 
+/// Split a `site:` value into the host to match and an optional path
+/// prefix (with its leading `/`). A scheme is ignored:
+/// `https://docs.rs` scopes to the host `docs.rs`, and
+/// `github.com/tokio-rs` scopes to github.com paths starting with
+/// `/tokio-rs`. A value with no host before its first `/` is
+/// returned whole as the host, so it matches nothing.
+pub(crate) fn site_scope(site: &str) -> (&str, Option<&str>) {
+    let rest = match site.split_once("://") {
+        Some((scheme, rest)) if !scheme.contains('/') => rest,
+        _ => site,
+    };
+    match rest.find('/') {
+        Some(at) if at > 0 => (&rest[..at], Some(&rest[at..])),
+        _ => (rest, None),
+    }
+}
+
+/// True when `url`'s path starts with the `site:` path prefix, or
+/// when there is none. `prefix` comes lowercased from the query, so
+/// the path is compared ASCII case-insensitively.
+pub(crate) fn site_path_matches(url: &url::Url, prefix: Option<&str>) -> bool {
+    prefix.is_none_or(|prefix| url.path().to_ascii_lowercase().starts_with(prefix))
+}
+
 /// site: routes to a matching vertical so a scoped search gets the
 /// site's own API instead of only web-engine leftovers.
 pub(crate) fn site_vertical(site: &str) -> Option<&'static str> {
@@ -326,6 +350,48 @@ mod tests {
         assert_eq!(site_vertical("stackoverflow.com"), Some("stackexchange"));
         assert_eq!(site_vertical("en.wikipedia.org"), Some("wikipedia"));
         assert_eq!(site_vertical("example.com"), None);
+    }
+
+    #[test]
+    fn site_scope_splits_host_from_path_and_drops_a_scheme() {
+        assert_eq!(
+            site_scope("github.com/tokio-rs"),
+            ("github.com", Some("/tokio-rs"))
+        );
+        assert_eq!(site_scope("https://docs.rs"), ("docs.rs", None));
+        assert_eq!(
+            site_scope("http://docs.python.org/3/library"),
+            ("docs.python.org", Some("/3/library"))
+        );
+        // Negative: a bare domain keeps no path, and a value with no
+        // host stays whole so it matches no host.
+        assert_eq!(site_scope("docs.rs"), ("docs.rs", None));
+        assert_eq!(site_scope("/tokio-rs"), ("/tokio-rs", None));
+        // A `://` inside the path is not a scheme.
+        assert_eq!(
+            site_scope("example.com/go?to=https://other.example"),
+            ("example.com", Some("/go?to=https://other.example"))
+        );
+        // The site's own API is routed on the host part.
+        let compiled = compile("runtime site:github.com/tokio-rs");
+        let (host, _) = site_scope(compiled.site.as_deref().unwrap());
+        assert_eq!(site_vertical(host), Some("github"));
+    }
+
+    #[test]
+    fn site_path_matches_only_the_prefixed_subtree() {
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        let in_scope = |u: &str| site_path_matches(&url(u), Some("/tokio-rs"));
+        assert!(in_scope("https://github.com/tokio-rs/tokio"));
+        assert!(in_scope("https://github.com/Tokio-RS/axum"));
+        // Negative: other paths on the host are out of scope, and no
+        // prefix scopes nothing.
+        assert!(!in_scope("https://github.com/rust-lang/rust"));
+        assert!(!in_scope("https://github.com/"));
+        assert!(site_path_matches(
+            &url("https://github.com/rust-lang/rust"),
+            None
+        ));
     }
 
     #[test]
