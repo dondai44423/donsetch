@@ -134,7 +134,34 @@ fn regex_parts(raw: &str) -> Option<(&str, &str)> {
 /// Between two phrase words: whitespace or markdown emphasis and quoting.
 const WORD_GAP: &str = r"[\s*_~`>]+";
 
+/// A phrase as a pattern: its words in order (see [`Term::parse`]), and each
+/// quantity in it (`€15M`, `15%`, `12,000`) by value, in whichever spelling the
+/// page uses (`super::amount`).
 fn phrase_pattern(phrase: &str) -> String {
+    let amounts = super::amount::amounts(phrase);
+    if amounts.is_empty() {
+        return words_pattern(phrase);
+    }
+    // Pieces meet across whatever the page puts between words, or nothing
+    // (`€15M`'s currency is inside the amount's own pattern).
+    let gap = WORD_GAP.replace('+', "*");
+    let mut pieces: Vec<String> = Vec::new();
+    let mut at = 0;
+    for amount in amounts {
+        let before = &phrase[at..amount.start];
+        if !before.trim().is_empty() {
+            pieces.push(words_pattern(before));
+        }
+        pieces.push(amount.pattern);
+        at = amount.end;
+    }
+    if !phrase[at..].trim().is_empty() {
+        pieces.push(words_pattern(&phrase[at..]));
+    }
+    pieces.join(&gap)
+}
+
+fn words_pattern(phrase: &str) -> String {
     phrase
         .split_whitespace()
         .map(|word| {

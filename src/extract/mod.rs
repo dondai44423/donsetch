@@ -9,6 +9,7 @@
 //! density-scored main → segment blocks → focus filter → render
 //! markdown → paginate.
 
+mod amount;
 pub mod blocks;
 pub mod charset;
 pub mod fallback;
