@@ -10,11 +10,10 @@
 //! clients expect after initialize (OpenCode among them fails the whole
 //! connection on a bare 405 here). DonSeTch never pushes unsolicited
 //! messages : no server tools, no sampling requests : so the stream
-//! carries keep-alive comments only. It self-terminates just inside
-//! SESSION_TTL: graceful shutdown is never blocked by an idle stream,
-//! clients simply reconnect per SSE convention, and each reconnect
-//! refreshes the session's idle timer. DELETE /mcp terminates a session
-//! per the spec.
+//! carries keep-alive comments only. It ends just inside SESSION_TTL,
+//! or as soon as the server starts to stop; clients reconnect per SSE
+//! convention, and each reconnect refreshes the session's idle timer.
+//! DELETE /mcp terminates a session per the spec.
 //!
 //! Sessions: the server assigns an `Mcp-Session-Id` response header on
 //! `initialize`. Clients that echo it back get a dedicated cancellation
@@ -28,8 +27,11 @@
 //! Hardening: optional bearer auth via `DONSETCH_HTTP_TOKEN`, a
 //! configurable per-request timeout via `DONSETCH_HTTP_TIMEOUT_SECS`
 //! (default 300), and JSON-RPC error envelopes for malformed bodies.
-//! The server drains in-flight requests on SIGTERM/SIGINT before
-//! shutting the daemon down.
+//!
+//! Stopping: the first SIGTERM or SIGINT stops accepting connections,
+//! ends the open GET streams and waits for the POST requests in flight
+//! to be answered, then shuts the daemon down. A second signal stops
+//! the wait and shuts the daemon down without those answers.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -49,7 +51,7 @@ use axum::{
 };
 use futures_util::Stream;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -63,9 +65,9 @@ const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 /// Upper bound on tracked sessions; the oldest are evicted beyond it.
 const MAX_SESSIONS: usize = 1024;
 /// The GET /mcp SSE stream closes itself after this long (just inside
-/// SESSION_TTL): an unbounded idle stream would hold graceful shutdown
-/// open forever, and a closed stream is a routine reconnect for SSE
-/// clients : one that usefully refreshes the session idle timer.
+/// SESSION_TTL), unless the server stops first: a closed stream is a
+/// routine reconnect for SSE clients : one that usefully refreshes the
+/// session idle timer.
 const SSE_MAX_LIFETIME: Duration = Duration::from_secs(25 * 60);
 
 struct Session {
@@ -93,6 +95,8 @@ struct HttpState {
     timeout: Duration,
     cors_enabled: bool,
     bound: Bound,
+    /// Turns true once the server starts to stop; GET streams end on it.
+    stopping: watch::Receiver<bool>,
 }
 
 /// Run the HTTP MCP server until SIGTERM/SIGINT.
@@ -114,6 +118,7 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
     let daemon = Arc::new(Daemon::new().await.map_err(|e| e.to_string())?);
     daemon.start_prober();
 
+    let (stop_streams, stopping) = watch::channel(false);
     let state = HttpState {
         daemon: Arc::clone(&daemon),
         sessions: Arc::new(SessionTable {
@@ -123,6 +128,7 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
         timeout,
         cors_enabled,
         bound: Bound::new(&host, port),
+        stopping,
     };
 
     let app = Router::new()
@@ -151,38 +157,89 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
         crate::diag!("[mcp] HTTP server listening on http://{host}:{port}");
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let signals = stop_signals();
+    let mut first = signals.clone();
+    let drain = axum::serve(listener, app).with_graceful_shutdown(async move {
+        signals_reach(&mut first, 1).await;
+        crate::diag!(
+            "[mcp] shutdown signal received; draining in-flight requests \
+             (a second signal stops waiting)"
+        );
+        // The drain waits for every open connection, a GET stream's
+        // too, and a stream carries nothing: end them, so the drain
+        // waits for the tool calls.
+        stop_streams.send_replace(true);
+    });
+    let mut second = signals;
+    tokio::select! {
+        served = drain.into_future() => {
+            served?;
+            crate::diag!("[mcp] draining complete, shutting daemon down");
+        }
+        () = signals_reach(&mut second, 2) => {
+            crate::diag!(
+                "[mcp] second signal received; shutting daemon down \
+                 without the requests still in flight"
+            );
+        }
+    }
 
-    // Drain done; stop the daemon so no orphan browsers survive.
-    crate::diag!("[mcp] draining complete, shutting daemon down");
+    // Stop the daemon so no orphan browsers survive.
     daemon.shutdown().await;
     Ok(())
 }
 
-/// Resolve SIGTERM/SIGINT into a future that completes on either.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+/// The stop signals delivered, counted for the life of the runtime. On
+/// Unix: SIGTERM and SIGINT, counted from this call on. Off Unix:
+/// Ctrl-C, counted from the spawned task's first run through a listener
+/// made anew on each pass, so a press between two passes is not counted.
+fn stop_signals() -> watch::Receiver<u32> {
+    let (count, counted) = watch::channel(0u32);
+    // Registered here, not in the task, so a signal that lands before
+    // the task first runs is counted too.
     #[cfg(unix)]
-    let terminate = async {
+    let (mut term, mut int) = {
         use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
+        (
+            signal(SignalKind::terminate()).ok(),
+            signal(SignalKind::interrupt()).ok(),
+        )
     };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    tokio::spawn(async move {
+        loop {
+            #[cfg(unix)]
+            tokio::select! {
+                () = next_signal(&mut term) => {}
+                () = next_signal(&mut int) => {}
+            }
+            #[cfg(not(unix))]
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            count.send_modify(|n| *n += 1);
+        }
+    });
+    counted
+}
+
+/// The next delivery of `sig`; pending forever when it could not be
+/// registered or its driver is gone.
+#[cfg(unix)]
+async fn next_signal(sig: &mut Option<tokio::signal::unix::Signal>) {
+    if let Some(sig) = sig
+        && sig.recv().await.is_some()
+    {
+        return;
     }
-    crate::diag!("[mcp] shutdown signal received; draining in-flight requests");
+    std::future::pending().await
+}
+
+/// Resolves once `signals` has counted `n`; pending forever if the
+/// counter is gone.
+async fn signals_reach(signals: &mut watch::Receiver<u32>, n: u32) {
+    if signals.wait_for(|&seen| seen >= n).await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Liveness probe for orchestrators and load balancers.
@@ -350,12 +407,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// A stream that stays silent for `max` and then ends. While silent, the
-/// SSE body emits keep-alive comments; ending triggers the client's
-/// routine reconnect.
-fn silent_stream(max: Duration) -> impl Stream<Item = Result<Event, Infallible>> {
-    futures_util::stream::unfold((), move |()| async move {
-        tokio::time::sleep(max).await;
+/// A stream that stays silent and ends after `max`, or once `stopping`
+/// is true (at once if it already is). While silent, the SSE body emits
+/// keep-alive comments; ending triggers the client's routine reconnect.
+fn silent_stream(
+    max: Duration,
+    stopping: watch::Receiver<bool>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    futures_util::stream::unfold(stopping, move |mut stopping| async move {
+        tokio::select! {
+            () = tokio::time::sleep(max) => {}
+            // Err: the sender went with the server, so it is stopping too.
+            _ = stopping.wait_for(|&stop| stop) => {}
+        }
         None
     })
 }
@@ -382,7 +446,7 @@ async fn sse_handler(State(state): State<HttpState>, headers: HeaderMap) -> Resp
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    Sse::new(silent_stream(SSE_MAX_LIFETIME))
+    Sse::new(silent_stream(SSE_MAX_LIFETIME, state.stopping.clone()))
         .keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(15))

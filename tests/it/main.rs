@@ -73,6 +73,8 @@ mod disk_state;
 mod egress_proxy;
 mod fetch_views;
 mod focus_regressions;
+#[cfg(all(unix, feature = "http"))]
+mod mcp_http_stop;
 mod mcp_tool_call_does_not_abort;
 mod request_class;
 mod revalidate_redirect;
