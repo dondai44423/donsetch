@@ -2610,3 +2610,26 @@ fn a_highlighter_wrapper_class_names_the_fence() {
         "prefix stripped wrong:\n{md}"
     );
 }
+
+const AUDIT_PAD: &str = "<p>This paragraph is ordinary article prose that exists only so the scorer sees a real article body with enough text, punctuation, and paragraphs to win.</p><p>A second distinct paragraph of filler prose, again present only so that the article container clearly wins the main-content scoring pass.</p>";
+
+fn audit_page(body: &str) -> String {
+    format!(
+        "<!doctype html><html><head><title>Audit</title></head><body><article><h1>Audit</h1>{AUDIT_PAD}{body}</article></body></html>"
+    )
+}
+
+// Bare-digit and single-letter superscripts are exponents, units and
+// powers, not citation markers: km², 10⁹, mc², xⁿ.
+#[test]
+fn audit_numeric_superscripts_are_not_citation_markers() {
+    let html = audit_page(
+        r##"<p>The lake covers 1,000 km<sup>2</sup> and holds 10<sup>9</sup> cubic metres.</p><p>Einstein wrote E = mc<sup>2</sup> and the series sums x<sup>n</sup> terms.</p><p>A cited claim.<sup class="reference"><a href="#cite_note-1">[1]</a></sup></p>"##,
+    );
+    let md = extract_html(&html).markdown;
+    for needle in ["km^{2}", "10^{9}", "mc^{2}", "x^{n}"] {
+        assert!(md.contains(needle), "lost {needle:?}:\n{md}");
+    }
+    // Negative case: a bracketed wiki citation stays dropped.
+    assert!(!md.contains("[1]"), "{md}");
+}
