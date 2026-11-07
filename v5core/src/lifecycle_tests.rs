@@ -763,3 +763,23 @@ fn a_short_deadline_still_asks_once() {
     assert_eq!(outcome.class, Class::Network);
     assert!(outcome.attempts.is_empty(), "{:?}", outcome.attempts);
 }
+
+#[test]
+fn a_slow_body_after_slow_headers_is_bounded_by_the_deadline() {
+    // Headers after half the budget, then a body that never finishes: the
+    // transport's own timeout restarts for the body, the encounter's must not.
+    let server = Server::start(|_| {
+        std::thread::sleep(Duration::from_millis(500));
+        Reply::Trickle {
+            every: Duration::from_millis(50),
+        }
+    });
+    let mut session = Worker::new(false);
+    let mut short = options();
+    short.deadline = Duration::from_millis(1000);
+    let started = Instant::now();
+    let outcome = session.fetch(&server.url("/"), &short);
+    let took = started.elapsed();
+    assert_eq!(outcome.class, Class::Network, "{:?}", outcome.failures);
+    assert!(took < Duration::from_millis(1300), "took {took:?}");
+}

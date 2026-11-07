@@ -946,6 +946,13 @@ impl Wire {
             };
             Ok::<_, String>((status, version, url, headers, body, cookies, raw))
         };
+        // wreq starts the request's timeout again for the body, so a slow body
+        // could run to twice the budget; the whole exchange is bounded here.
+        let exchange = async move {
+            tokio::time::timeout(timeout, exchange)
+                .await
+                .unwrap_or_else(|_| Err("timeout: operation timed out".to_string()))
+        };
         let outcome = runtime.block_on(async move {
             match cancel {
                 Some(cancel) => tokio::select! {

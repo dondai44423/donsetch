@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancel-aware and fits the deadline. A `Retry-After` past one hour is ignored.
   A deadline under about 1.6 s no longer fails before sending anything: the
   first request goes out with whatever time is left (Wikipedia now answers
-  inside `deadline_ms: 600`).
+  inside `deadline_ms: 600`). A slow body no longer runs past its budget: the
+  HTTP client started the timeout again when headers arrived, so a page whose
+  headers took 0.6 s could take 3.6 s on a 3 s budget; the whole exchange is
+  bounded now.
 - **Akamai's bm-verify hand-off follows the page as served.** The refresh target
   is read in any quoting and with HTML entities, resolved against the page,
   kept on the same host, and its cookies are kept for the next request.
