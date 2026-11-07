@@ -819,6 +819,21 @@ fn edge_empty_page() {
     assert!(r.thin || r.markdown.contains("no extractable content"));
 }
 
+// HTML passes no engine notes: an empty page still gets the bare
+// empty marker under the shell warning.
+#[test]
+fn edge_empty_page_keeps_the_empty_marker() {
+    let r = extract_html("<html><head></head><body></body></html>");
+    assert!(r.thin);
+    assert!(
+        r.markdown
+            .ends_with("\n\nhttps://example.com/page\n\n*(no extractable content)*\n"),
+        "{:?}",
+        r.markdown
+    );
+    assert!(!r.markdown.contains("*[pdf:"));
+}
+
 #[test]
 fn edge_malformed_html() {
     let html = r#"<html><body><div><p>Unclosed paragraph<div>More text</div></p></div><span>Loose text</span>"#;

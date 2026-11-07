@@ -764,21 +764,22 @@ fn downstream(
     // Render markdown (frontmatter + blocks) then paginate.
     let mut full = render::render(meta, url, &kept, opts);
 
+    // Empty page → silence looks like a bug. Judged on the render
+    // alone, before the engine notes go on top: a document that
+    // yields nothing keeps the notes that say why.
+    if !focus_fell_back && (full.trim().is_empty() || (blocks_total == 0 && meta.title.is_none())) {
+        full = format!("{url}\n\n*(no extractable content)*\n");
+    }
+
     // Engine notes first (PDF scan flags etc.) : they frame any
     // other trust signal that follows.
     for note in &notes {
         full = format!("*[pdf: {note}]*\n\n{full}");
     }
 
-    // Agent-trust signals, inline in the content:
-    // - focus miss → agent must not quote wrong content
-    // - empty page → silence looks like a bug
-    if focus_fell_back {
-        if let Some(q) = &opts.focus {
-            full = format!("*[focus \"{q}\": no matches : showing full content]*\n\n{full}");
-        }
-    } else if full.trim().is_empty() || (blocks_total == 0 && meta.title.is_none()) {
-        full = format!("{url}\n\n*(no extractable content)*\n");
+    // Focus miss → agent must not quote wrong content.
+    if focus_fell_back && let Some(q) = &opts.focus {
+        full = format!("*[focus \"{q}\": no matches : showing full content]*\n\n{full}");
     }
 
     // The manifest goes after the fell-back/missed notices (which
