@@ -578,3 +578,155 @@ fn pdf_date_non_ascii_does_not_panic() {
         Some("2026-05-25".to_string())
     );
 }
+
+// ---------- audit repros (audit/pdfops) ----------
+
+/// Serialize `objects` (bodies of objects 1..=n) into a PDF with a
+/// correct xref table. Object 1 is the catalog.
+#[cfg(feature = "ocr")]
+fn audit_pdf(objects: &[String]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[cfg(feature = "ocr")]
+fn audit_stream(content: &str) -> String {
+    format!(
+        "<< /Length {} >>\nstream\n{content}\nendstream",
+        content.len()
+    )
+}
+
+/// /Kids [missing, PUA-text page (, ordinary text page)]: PDFium trusts
+/// /Count, FPDF_LoadPage(0) returns null and the engine skips it, so
+/// `pages` (a Vec of LOADED pages) is shorter than the document and
+/// `pages[k].index != k`.
+#[cfg(feature = "ocr")]
+fn audit_broken_kid_pdf(trailing_text_page: bool) -> Vec<u8> {
+    if trailing_text_page {
+        ocr_kids_pdf("99 0 R 3 0 R 9 0 R", 3)
+    } else {
+        ocr_kids_pdf("99 0 R 3 0 R", 2)
+    }
+}
+
+/// A page tree with /Count `count` over `kids`, where `3 0 R` is a page
+/// whose text extracts as PUA glyph soup (an OCR candidate) and `9 0 R`
+/// is an ordinary text page carrying "KEEP-ME".
+#[cfg(feature = "ocr")]
+fn ocr_kids_pdf(kids: &str, count: usize) -> Vec<u8> {
+    // Helvetica glyphs, ToUnicode mapping every printable byte into the
+    // private use area: renders as clean Latin text, extracts as PUA.
+    let cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 beginbfrange\n<20> <7E> <E020>\nendbfrange\nendcmap\nCMapName currentdict /CMapType get pop end\nend";
+    audit_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        format!("<< /Type /Pages /Count {count} /Kids [{kids}] >>"),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".into(),
+        audit_stream("BT /F1 28 Tf 72 720 Td 48 TL (THE QUICK BROWN FOX JUMPS) Tj T* (OVER THE LAZY DOG 12345) Tj T* (SCANNED INVOICE TOTAL DUE) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>".into(),
+        audit_stream(cmap),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        audit_stream("BT /F1 14 Tf 72 720 Td 20 TL (KEEP-ME page three ordinary text layer.) Tj T* (This line must survive extraction.) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 8 0 R >>".into(),
+    ])
+}
+
+/// Needs the OCR feature and the English OCR models in the cache dir
+/// (DONSETCH_CACHE_DIR); skips otherwise, like smoke_scanned_detection.
+#[cfg(feature = "ocr")]
+fn audit_ocr_models_present() -> bool {
+    let dir = crate::pdf::ocr::ocr_cache_dir();
+    let ok = dir.join("en_pp-ocrv5_mobile_rec.onnx").exists()
+        && dir.join("pp-ocrv5_mobile_det.onnx").exists();
+    if !ok {
+        crate::diag!("SKIP: OCR models missing in {}", dir.display());
+    }
+    ok
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn audit_ocr_after_unloadable_page_does_not_panic() {
+    if !audit_ocr_models_present() {
+        return;
+    }
+    let parsed = crate::pdf::parse(&audit_broken_kid_pdf(false)).expect("parse");
+    assert!(
+        all_block_text(&parsed.blocks).contains("QUICK BROWN FOX"),
+        "OCR text missing: {:?}",
+        parsed.notes
+    );
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn audit_ocr_after_unloadable_page_keeps_the_next_page() {
+    if !audit_ocr_models_present() {
+        return;
+    }
+    let parsed = crate::pdf::parse(&audit_broken_kid_pdf(true)).expect("parse");
+    let text = all_block_text(&parsed.blocks);
+    assert!(
+        text.contains("QUICK BROWN FOX"),
+        "OCR text missing: {text:?}"
+    );
+    assert!(
+        text.contains("KEEP-ME"),
+        "page 3's own text layer was overwritten by page 2's OCR: {text:?}"
+    );
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn ocr_after_unloadable_page_flags_the_page_it_read() {
+    if !audit_ocr_models_present() {
+        return;
+    }
+    let parsed = crate::pdf::parse(&audit_broken_kid_pdf(true)).expect("parse");
+    let pages: Vec<(usize, bool, bool)> = parsed
+        .pages_meta
+        .iter()
+        .map(|m| (m.page, m.ocr, m.chars > 0))
+        .collect();
+    // (page index, OCR'd, has text): page 0 never loaded, page 1 is the
+    // OCR'd one, page 2 keeps its own text layer.
+    assert_eq!(pages, [(1, true, true), (2, false, true)]);
+}
+
+// Negative case: with every page loaded, positions and indices agree,
+// and OCR must still replace only the PUA page.
+#[cfg(feature = "ocr")]
+#[test]
+fn ocr_with_every_page_loaded_replaces_only_the_unreadable_page() {
+    if !audit_ocr_models_present() {
+        return;
+    }
+    let parsed = crate::pdf::parse(&ocr_kids_pdf("3 0 R 9 0 R", 2)).expect("parse");
+    let text = all_block_text(&parsed.blocks);
+    assert!(
+        text.contains("QUICK BROWN FOX"),
+        "OCR text missing: {text:?}"
+    );
+    assert!(text.contains("KEEP-ME"), "text page lost: {text:?}");
+    let pages: Vec<(usize, bool)> = parsed.pages_meta.iter().map(|m| (m.page, m.ocr)).collect();
+    assert_eq!(pages, [(0, true), (1, false)]);
+}
