@@ -482,8 +482,9 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
 }
 
 /// Interstitial titles/phrases that vendor challenge pages use in
-/// `<title>` / `<h1>`. Real pages virtually never title themselves
-/// these : a page ABOUT Cloudflare has its own title.
+/// `<title>` / `<h1>`. They are ordinary English too, so a heading
+/// match counts only on a page that is not a substantive document
+/// (see `interstitial_heading`).
 const INTERSTITIAL_TITLES: &[&str] = &[
     "you've been blocked by network security",
     "you are blocked by network security",
@@ -514,13 +515,14 @@ const INTERSTITIAL_MARKERS: &[&str] = &[
 ];
 
 /// Strong interstitial detection: a page whose TITLE or first H1 is
-/// vendor challenge boilerplate, or a near-empty DOM (< 400 visible
-/// chars) that loads a challenge script and has no form. Returns the
-/// vendor when the page is an interstitial.
+/// vendor challenge boilerplate and whose visible text is at most 1200
+/// chars, or a near-empty DOM (< 400 visible chars) that loads a
+/// challenge script and has no form. Returns the vendor when the page
+/// is an interstitial.
 ///
 /// This is the layer that keeps the ghost oracle honest: a rendered
-/// "Just a moment..." page must never satisfy the content-quality
-/// oracle, no matter how many visible chars its boilerplate carries.
+/// "Just a moment..." page must not satisfy the content-quality
+/// oracle on the strength of its boilerplate's visible chars.
 pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let scan = &body[..body.len().min(96 * 1024)];
     let text = String::from_utf8_lossy(scan).to_lowercase();
@@ -542,8 +544,12 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
         }
     }
 
-    // Title/H1 route: strongest signal, immune to visible-text counts.
-    if interstitial_heading(&text) {
+    // Title/H1 route: overrides the near-empty bound below, because a
+    // modern interstitial renders a few hundred chars of boilerplate.
+    // Visible text counts over the whole body, not the scan window,
+    // which can end inside a long head before the prose starts.
+    let visible = visible_text_count(body);
+    if interstitial_heading(&text, visible) {
         return Some(vendor_from_markers(&text).unwrap_or(Vendor::Generic));
     }
 
@@ -557,7 +563,6 @@ pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     // widget on the page, the bare `cf-turnstile` shell.
     let turnstile_shell =
         text.contains("challenges.cloudflare.com") && text.contains("cf-turnstile");
-    let visible = visible_text_count(body);
     if visible < 80
         && text.contains("<script")
         && text.contains("kpsdk")
@@ -781,7 +786,10 @@ pub fn text_wall(text: &str) -> Option<Verdict> {
 }
 
 /// Inspect both the title and first H1, including text inside nested tags.
-fn interstitial_heading(lower_text: &str) -> bool {
+/// `visible` is the caller's `visible_text_count` for the page: a listed
+/// phrase counts only when `visible` is at most 1200, while the PX
+/// human-gate heading with its widget counts at any size.
+fn interstitial_heading(lower_text: &str, visible: usize) -> bool {
     for (open, close) in [("<title", "</title>"), ("<h1", "</h1>")] {
         let Some(start) = lower_text.find(open) else {
             continue;
@@ -817,7 +825,13 @@ fn interstitial_heading(lower_text: &str) -> bool {
                 {
                     return true;
                 }
-                if INTERSTITIAL_TITLES.iter().any(|m| cleaned.contains(m)) {
+                // The phrases also title ordinary documents ("Troubleshoot
+                // access denied errors", "Just a Moment (song) lyrics").
+                // An interstitial's own words are a handful of lines, so
+                // a substantive page keeps its content verdict. 1200 is
+                // the visible-text bound content_gate already uses for
+                // substantive articles.
+                if visible <= 1200 && INTERSTITIAL_TITLES.iter().any(|m| cleaned.contains(m)) {
                     return true;
                 }
             }
@@ -1109,7 +1123,10 @@ fn classify_wall(
     if (text.contains("prove your humanity")
         || text.contains("not for bots")
         || text.contains("please wait for verification"))
-        && (interstitial_heading(text) || visible_text_count(text.as_bytes()) < 120)
+        && {
+            let visible = visible_text_count(text.as_bytes());
+            interstitial_heading(text, visible) || visible < 120
+        }
     {
         return Verdict::Challenge(Vendor::Generic);
     }
@@ -1572,6 +1589,62 @@ mod tests {
         // Interstitial signature via title alone (no scripts needed).
         let body = b"<html><head><title>Please Wait... | Access Denied</title></head><body><p>Checking your browser before accessing the site.</p></body></html>";
         assert!(detect_interstitial(body).is_some());
+    }
+
+    #[test]
+    fn wall_heading_on_block_page_with_boilerplate_stays_interstitial() {
+        // Block pages render a few hundred chars of vendor prose: more
+        // than the near-empty route admits, far short of a document. The
+        // heading route must keep them walls in the title and in the h1.
+        let prose = "This website is using a security service to protect itself from online attacks. The action you just performed triggered the security solution. ";
+        for (title, h1) in [
+            ("Access denied", "Access denied"),
+            ("Just a moment...", "Just a moment..."),
+            ("example.com", "One more step"),
+        ] {
+            let html = format!(
+                "<html><head><title>{title}</title></head><body><h1>{h1}</h1><p>{}</p><p>Ray ID: 8a1b2c3d4e5f6789</p></body></html>",
+                prose.repeat(4)
+            );
+            let visible = visible_text_count(html.as_bytes());
+            assert!((400..=1200).contains(&visible), "{h1}: visible={visible}");
+            assert!(detect_interstitial(html.as_bytes()).is_some(), "{h1}");
+            let http = detect(200, &[], html.as_bytes());
+            let dom = detect_dom_smart(html.as_bytes());
+            assert!(
+                matches!(http, Verdict::Challenge(_)) && matches!(dom, Verdict::Challenge(_)),
+                "{h1}: http={http:?} dom={dom:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn articles_whose_titles_contain_wall_phrases_are_content() {
+        // Ordinary documents titled with a listed phrase, at both layers.
+        let mut wrong = Vec::new();
+        for title in [
+            "Troubleshoot access denied (403 Forbidden) errors in Amazon S3",
+            "Access denied error when you open a file in Windows",
+            "Airport security check: what to expect",
+            "Just a Moment (song) lyrics",
+            "One more step: finishing your Python setup",
+        ] {
+            let html = format!(
+                "<html><head><title>{title}</title></head><body><main><article><h1>{title}</h1>{}</article></main></body></html>",
+                "<p>This guide walks through bucket policies, IAM conditions and the request headers the service evaluates before it answers a request.</p>"
+                    .repeat(20)
+            );
+            let http = detect(200, &[], html.as_bytes());
+            let dom = detect_dom_smart(html.as_bytes());
+            if http != Verdict::ContentOk || dom != Verdict::ContentOk {
+                wrong.push(format!("{title:?}: http={http:?} dom={dom:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "articles scored as walls:\n{}",
+            wrong.join("\n")
+        );
     }
 
     #[test]
