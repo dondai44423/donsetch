@@ -544,6 +544,163 @@ fn extract_integration_magic_sniff() {
     assert!(out.markdown.contains("Form W-9"), "magic sniff failed");
 }
 
+/// A well-formed PDF from object bodies (object 1 is the catalog), with
+/// an optional /Info dictionary and a correct xref table.
+fn pdf_from_objects(objects: &[String], info: Option<String>) -> Vec<u8> {
+    let has_info = info.is_some();
+    let mut bodies: Vec<String> = objects.to_vec();
+    bodies.extend(info);
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    let info_ref = if has_info {
+        format!(" /Info {} 0 R", offsets.len())
+    } else {
+        String::new()
+    };
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R{info_ref} >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// One Letter page whose only content is an image of bars: no text
+/// layer, so with OCR off the parser reports it as a scan.
+fn scan_pdf(title: Option<&str>) -> Vec<u8> {
+    // 64x16 grayscale, ASCIIHex-encoded so the stream stays ASCII and
+    // the xref offsets stay exact.
+    let (w, h) = (64usize, 16usize);
+    let hex: String = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            if (4..=11).contains(&y) && (x / 3) % 2 == 0 && (4..=59).contains(&x) {
+                "00"
+            } else {
+                "FF"
+            }
+        })
+        .collect::<String>()
+        + ">";
+    let content = "q 500 0 0 125 56 600 cm /Im1 Do Q";
+    pdf_from_objects(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Count 1 /Kids [5 0 R] >>".into(),
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /ASCIIHexDecode /Length {} >>\nstream\n{hex}\nendstream",
+                hex.len()
+            ),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im1 3 0 R >> >> /Contents 4 0 R >>".into(),
+        ],
+        title.map(|t| format!("<< /Title ({t}) >>")),
+    )
+}
+
+fn extract_pdf(bytes: &[u8]) -> crate::extract::Extracted {
+    crate::extract::extract(
+        bytes,
+        "application/pdf",
+        "https://example.com/scan.pdf",
+        &Default::default(),
+    )
+    .expect("extract")
+}
+
+const SCANNED_NOTE: &str = "*[pdf: scanned/image-only PDF (1 pages): no text layer could be recovered; the pages could not be extracted]*";
+
+// A document that yields no blocks and has no /Title gets the empty
+// marker; the engine notes that say why stay above it.
+// Sets DONSHEET_OCR before the config loads: depends on nextest's
+// process per test.
+#[test]
+fn untitled_scan_keeps_its_scanned_note() {
+    unsafe { std::env::set_var("DONSHEET_OCR", "off") };
+    let out = extract_pdf(&scan_pdf(None));
+    assert_eq!(out.blocks_total, 0);
+    assert!(
+        out.markdown.starts_with(SCANNED_NOTE),
+        "scanned note missing: {:?}",
+        out.markdown
+    );
+    assert!(
+        out.markdown
+            .contains("https://example.com/scan.pdf\n\n*(no extractable content)*"),
+        "empty marker missing: {:?}",
+        out.markdown
+    );
+}
+
+// Same path with no image and no OCR candidate: empty pages carry the
+// parser's "no extractable text" note.
+#[test]
+fn untitled_text_free_pdf_keeps_its_note() {
+    let out = extract_pdf(&empty_pages_pdf(2));
+    assert!(
+        out.markdown
+            .starts_with("*[pdf: no extractable text found in this PDF]*"),
+        "note missing: {:?}",
+        out.markdown
+    );
+    assert!(out.markdown.contains("*(no extractable content)*"));
+}
+
+// Negative: a /Title keeps the empty marker away; the output is the
+// note, the title and the URL.
+// Sets DONSHEET_OCR before the config loads: depends on nextest's
+// process per test.
+#[test]
+fn titled_scan_output_is_unchanged() {
+    unsafe { std::env::set_var("DONSHEET_OCR", "off") };
+    let out = extract_pdf(&scan_pdf(Some("Quarterly scan")));
+    assert_eq!(
+        out.markdown,
+        format!("{SCANNED_NOTE}\n\n# Quarterly scan\nhttps://example.com/scan.pdf\n")
+    );
+}
+
+// Negative: a PDF with a text layer has blocks, no notes and no empty
+// marker.
+#[test]
+fn pdf_with_text_gets_no_empty_marker() {
+    let content = "BT /F1 18 Tf 72 700 Td (Quarterly revenue grew in every region.) Tj ET";
+    let bytes = pdf_from_objects(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".into(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        ],
+        None,
+    );
+    let out = extract_pdf(&bytes);
+    assert_eq!(
+        out.markdown,
+        "https://example.com/scan.pdf\n\nQuarterly revenue grew in every region.\n"
+    );
+}
+
 // ---------- metadata ----------
 
 #[test]
