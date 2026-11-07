@@ -94,7 +94,15 @@ fn main() {
     let os = env::var("CARGO_CFG_TARGET_OS").expect("no target os");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("no target arch");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("no manifest dir"));
-    let vendored = manifest.join("vendor").join("pdfium");
+    // `vendor/pdfium` holds whatever archive the last host build downloaded, so a
+    // cross build (an aarch64 binary from an x86_64 machine) would link the
+    // host's objects and fail with "incompatible with aarch64linux". The override
+    // gives that target its own directory, fetched and verified like the default.
+    println!("cargo:rerun-if-env-changed=DONSETCH_PDFIUM_DIR");
+    let vendored = env::var_os("DONSETCH_PDFIUM_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest.join("vendor").join("pdfium"));
     let libdir = vendored.join("lib");
 
     let is_windows = os == "windows";
@@ -211,33 +219,40 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src/display_name.rs");
 
-    // ── LLD auto-detection (Linux) ────────────────────────────
+    // ── Linker selection (Linux) ──────────────────────────────
     //
-    // The PDFium static archives are produced by LLVM/Clang. GNU ld
-    // on some versions/architectures can't parse the ELF machine type
-    // of LLVM-generated archive members — notably aarch64 with GNU
-    // ld 2.42+ reports "architecture: UNKNOWN!" and skips them as
-    // incompatible. Newer GNU binutils (2.44+) on x86_64 also reject
-    // LLVM CREL relocations in the same archives.
+    // The PDFium static archives are produced by LLVM/Clang with CREL
+    // (compact relocation) sections. A linker that does not know CREL does not
+    // always say so: GNU ld before 2.44 and lld before 20 skip the unknown
+    // section type, the link succeeds, and every relocation in those objects is
+    // silently left unapplied. libc++'s `iostream` init is one: its
+    // `.init_array` slot stays zero, so the binary calls a null constructor
+    // before `main` and dies with SIGSEGV at address 0 (linux-aarch64 CI,
+    // 2026-11-07, where apt's lld 18 was the linker). Newer GNU ld (2.44+)
+    // rejects CREL outright; aarch64 GNU ld also skips LLVM members as
+    // "architecture: UNKNOWN".
     //
-    // LLD handles both correctly. If ld.lld is available, we inject
-    // -fuse-ld=lld into the link step so the compiler driver (cc/gcc)
-    // uses LLD instead of GNU ld. This is transparent to the user —
-    // no RUSTFLAGS or .cargo/config.toml needed.
+    // So the link must be done by an lld of LLVM 20 or later. The toolchain's
+    // own `rust-lld` is always as new as rustc's LLVM and needs no install, so it
+    // is preferred; `ld.lld` from PATH is the fallback when it is at least that new.
+    // Both are handed to the compiler driver (`-fuse-ld=lld` plus `-B` for where
+    // the driver finds `ld.lld`), so an older `ld.lld` earlier in PATH cannot win.
     if os == "linux" || os == "android" {
-        let lld_available = Command::new("ld.lld")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if lld_available {
-            println!("cargo:rustc-link-arg=-fuse-ld=lld");
-        } else if arch == "aarch64" {
-            eprintln!(
-                "warning: donsetch: LLD not found. GNU ld on aarch64 may fail \
-                 to link LLVM-produced PDFium archives. \
-                 Install lld (e.g., apt install lld / pkg install lld) and rebuild."
-            );
+        match crel_capable_lld() {
+            Some(dir) => {
+                println!("cargo:rustc-link-arg=-fuse-ld=lld");
+                if let Some(dir) = dir {
+                    println!("cargo:rustc-link-arg=-B{}", dir.display());
+                }
+            }
+            None if user_chose_a_linker() => {}
+            None => println!(
+                "cargo:warning=donsetch: no lld of LLVM 20 or later found. The PDFium \
+                 static archives use CREL relocations, which an older linker skips \
+                 without an error, producing a binary that crashes before main. \
+                 Use a Rust toolchain that ships rust-lld, install lld 20+, or name \
+                 a CREL-capable linker (mold 2.38+) in RUSTFLAGS."
+            ),
         }
     }
 
@@ -433,6 +448,80 @@ fn target_pair(os: &str, arch: &str) -> &'static str {
         ("windows", "aarch64") => "win-arm64",
         (o, a) => panic!("pdfium: unsupported target pair {o}-{a}"),
     }
+}
+
+/// The oldest LLVM whose lld reads CREL relocations without an experimental flag.
+const LLD_WITH_CREL: u32 = 20;
+
+/// `Some(None)`: the `ld.lld` the driver already finds is new enough.
+/// `Some(Some(dir))`: pass `-B<dir>` so the driver finds the `ld.lld` in `dir`.
+/// `None`: no lld that reads CREL.
+fn crel_capable_lld() -> Option<Option<PathBuf>> {
+    // The toolchain's own lld, as new as rustc's LLVM.
+    if let Some(dir) = toolchain_lld_dir()
+        && lld_major(&dir.join("ld.lld")).is_some_and(|major| major >= LLD_WITH_CREL)
+    {
+        return Some(Some(dir));
+    }
+    // Otherwise the newest `ld.lld` on PATH, if it is new enough.
+    let path = env::var_os("PATH")?;
+    let mut best: Option<(u32, PathBuf)> = None;
+    let mut first: Option<PathBuf> = None;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join("ld.lld");
+        if let Some(major) = lld_major(&candidate) {
+            first.get_or_insert_with(|| dir.clone());
+            if best.as_ref().is_none_or(|(have, _)| major > *have) {
+                best = Some((major, dir));
+            }
+        }
+    }
+    let (major, dir) = best?;
+    if major < LLD_WITH_CREL {
+        return None;
+    }
+    // The first `ld.lld` in PATH is the one the driver would pick on its own.
+    Some((first.as_ref() != Some(&dir)).then_some(dir))
+}
+
+/// `<sysroot>/lib/rustlib/<host>/bin/gcc-ld`: the directory where the toolchain
+/// keeps an `ld.lld` for a compiler driver to find through `-B`.
+fn toolchain_lld_dir() -> Option<PathBuf> {
+    let rustc = env::var_os("RUSTC")?;
+    let host = env::var("HOST").ok()?;
+    let out = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    let sysroot = String::from_utf8(out.stdout).ok()?;
+    let dir = PathBuf::from(sysroot.trim())
+        .join("lib")
+        .join("rustlib")
+        .join(host)
+        .join("bin")
+        .join("gcc-ld");
+    dir.join("ld.lld").is_file().then_some(dir)
+}
+
+/// The LLVM major version of the lld at `path`, from "LLD 22.1.8 (...)" (a distro
+/// prefixes its name: "Debian LLD 18.1.3 (...)").
+fn lld_major(path: &Path) -> Option<u32> {
+    let out = Command::new(path).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut words = text.split_whitespace().skip_while(|word| *word != "LLD");
+    words.next()?;
+    words.next()?.split('.').next()?.parse().ok()
+}
+
+/// True when RUSTFLAGS already names a linker or a `-fuse-ld`, which is the
+/// user's decision (this repo's own mold config is one).
+fn user_chose_a_linker() -> bool {
+    env::var("CARGO_ENCODED_RUSTFLAGS")
+        .map(|flags| flags.contains("fuse-ld") || flags.contains("linker="))
+        .unwrap_or(false)
 }
 
 /// Download the pinned PDFium release into `vendored` when missing.
