@@ -292,7 +292,18 @@ fn build_line(cluster: &[&PdfChar], page_index: usize) -> Line {
     }
     g.retain(|x| *x > 0.01);
     g.sort_by(|a, b| a.total_cmp(b));
-    let med_gap = g.get(g.len() / 2).copied().unwrap_or(0.0);
+    // The median baseline samples ink-box gaps, where glyphs inside a word
+    // keep positive side-bearing gaps. Loose boxes of adjacent glyphs abut
+    // (gap ~0, dropped above), which would leave only word and column gaps
+    // in the sample and lift `1.4 * med_gap` above them. The per-line
+    // word-space estimate and the break decision stay on loose gaps.
+    let mut ink_gaps: Vec<f32> = reals
+        .windows(2)
+        .map(|w| w[1].x0 - w[0].x1)
+        .filter(|x| *x > 0.01)
+        .collect();
+    ink_gaps.sort_by(|a, b| a.total_cmp(b));
+    let med_gap = ink_gaps.get(ink_gaps.len() / 2).copied().unwrap_or(0.0);
     // The gap a word space makes on THIS line (see `word_space_threshold`):
     // a font-size fraction alone splits numbers and citations apart
     // ("[1 8]", "41 .8") in LaTeX-set PDFs, where a kern gap inside a
