@@ -578,3 +578,233 @@ fn pdf_date_non_ascii_does_not_panic() {
         Some("2026-05-25".to_string())
     );
 }
+
+// The reported French amendment (#399) sets "15 %" in Times at 12pt.
+// Its narrow digit ink boxes must not create a word boundary. Use a
+// self-contained PDF with standard text plus a Type3 narrow-digit font,
+// so the side-bearing regression is independent of host font substitution.
+fn spacing_pdf(matrix: &str) -> Vec<u8> {
+    let stream = format!(
+        "BT /F1 12 Tf {matrix} Tm (At most 15 % of revenue, or 2 % of total revenue.) Tj 0 -24 Td [(15) -500 (16)] TJ 0 -24 Td (1 5 %) Tj 0 -24 Td /F2 12 Tf (555515555 15 1 5) Tj ET\n"
+    );
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 6 0 R >> >> /Contents 5 0 R >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len()),
+        "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 500 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /one 7 0 R /five 8 0 R /space 9 0 R >> /Encoding << /Type /Encoding /Differences [32 /space 49 /one 53 /five] >> /FirstChar 32 /LastChar 53 /Widths [250 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500 500] /Resources << >> >>".to_string(),
+        {
+            let glyph = "500 0 0 0 240 700 d1 0 0 240 700 re f\n";
+            format!("<< /Length {} >>\nstream\n{glyph}endstream", glyph.len())
+        },
+        {
+            let glyph = "500 0 10 0 490 700 d1 10 0 480 700 re f\n";
+            format!("<< /Length {} >>\nstream\n{glyph}endstream", glyph.len())
+        },
+        {
+            let glyph = "250 0 d0\n";
+            format!("<< /Length {} >>\nstream\n{glyph}endstream", glyph.len())
+        },
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0];
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn spacing_preserves_digits_and_real_word_gaps() {
+    for matrix in [
+        "1 0 0 1 72 720",
+        "0 1 -1 0 300 72",
+        "-1 0 0 -1 500 72",
+        "0 -1 1 0 72 650",
+    ] {
+        let bytes = spacing_pdf(matrix);
+        let (_, pages) = crate::pdf::engine::load_document(
+            &bytes,
+            &Default::default(),
+            |mut input: crate::pdf::engine::PageInput| {
+                crate::pdf::rotate::canonicalize(&mut input.chars);
+                crate::pdf::layout::assemble(input.chars)
+            },
+        )
+        .expect("load spacing PDF");
+        let lines: Vec<_> = pages[0]
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert!(
+            lines.contains(&"At most 15 % of revenue, or 2 % of total revenue."),
+            "matrix {matrix}: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"555515555 15 1 5"),
+            "side bearings became spaces: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"15 16"),
+            "positioned word gap lost: {lines:?}"
+        );
+        assert!(lines.contains(&"1 5 %"), "explicit space lost: {lines:?}");
+        for line in &pages[0].lines {
+            let words: Vec<_> = line.words.iter().map(|word| word.text.as_str()).collect();
+            let expected: Vec<_> = line.text.split_whitespace().collect();
+            assert_eq!(
+                words, expected,
+                "word geometry lost boundaries: {}",
+                line.text
+            );
+            assert!(line.words.iter().all(|word| word.x1 > word.x0));
+        }
+    }
+}
+
+// ---------- audit repros (audit/pdfops) ----------
+
+/// Serialize `objects` (bodies of objects 1..=n) into a PDF with a
+/// correct xref table. Object 1 is the catalog.
+fn audit_pdf(objects: &[String]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn audit_stream(content: &str) -> String {
+    format!(
+        "<< /Length {} >>\nstream\n{content}\nendstream",
+        content.len()
+    )
+}
+
+/// A borderless 3-column table, one text object per cell (the shape
+/// report generators and spreadsheet exports emit): the gap between two
+/// cells is a word break even when no space glyph fills it and the
+/// column gaps are the only positive loose-box gaps on the line.
+#[test]
+fn audit_sparse_row_keeps_column_gaps_as_word_breaks() {
+    let rows = [
+        ("Item", "Qty", "Price"),
+        ("Wheel", "2", "50"),
+        ("Frame", "1", "300"),
+        ("Gear", "4", "80"),
+        ("Total", "7", "430"),
+    ];
+    let mut ops = Vec::new();
+    for (i, (a, b, c)) in rows.iter().enumerate() {
+        let base = 700 - 30 * (i as i32 + 1) + 10;
+        for (x, t) in [(80, a), (280, b), (380, c)] {
+            ops.push(format!("BT /F1 12 Tf {x} {base} Td ({t}) Tj ET"));
+        }
+    }
+    let bytes = audit_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".into(),
+        audit_stream(&ops.join("\n")),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+    ]);
+    let (_, pages) = crate::pdf::engine::load_document(
+        &bytes,
+        &Default::default(),
+        |input: crate::pdf::engine::PageInput| crate::pdf::layout::assemble(input.chars),
+    )
+    .expect("load table PDF");
+    let lines: Vec<&str> = pages[0].lines.iter().map(|l| l.text.as_str()).collect();
+    for want in [
+        "Item Qty Price",
+        "Wheel 2 50",
+        "Frame 1 300",
+        "Gear 4 80",
+        "Total 7 430",
+    ] {
+        assert!(lines.contains(&want), "{want:?} not found in {lines:?}");
+    }
+}
+
+/// The same sparse table shape with spacing inside the cells: the
+/// word-break threshold stays above it, so a letterspaced cell (3 pt of
+/// Tc on 12 pt type, above the 0.16 em floor) and a cell whose TJ
+/// kerning tightens and loosens pairs each remain one word.
+#[test]
+fn sparse_row_keeps_letterspaced_and_kerned_words_whole() {
+    let rows = [
+        (680, "3 Tc", ["(ITEM) Tj", "(QTY) Tj", "(PRICE) Tj"]),
+        (
+            650,
+            "0 Tc",
+            [
+                "[(T) 70 (o) -120 (t) 20 (a) -40 (l)] TJ",
+                "[(1) -40 (2)] TJ",
+                "[(4) 30 (3) -60 (0)] TJ",
+            ],
+        ),
+    ];
+    let mut ops = Vec::new();
+    for (y, tc, cells) in rows {
+        for (x, show) in [80, 280, 380].into_iter().zip(cells) {
+            ops.push(format!("BT /F1 12 Tf {tc} {x} {y} Td {show} ET"));
+        }
+    }
+    let bytes = audit_pdf(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".into(),
+        audit_stream(&ops.join("\n")),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+    ]);
+    let (_, pages) = crate::pdf::engine::load_document(
+        &bytes,
+        &Default::default(),
+        |input: crate::pdf::engine::PageInput| crate::pdf::layout::assemble(input.chars),
+    )
+    .expect("load table PDF");
+    let lines: Vec<&str> = pages[0].lines.iter().map(|l| l.text.as_str()).collect();
+    for want in ["ITEM QTY PRICE", "Total 12 430"] {
+        assert!(lines.contains(&want), "{want:?} not found in {lines:?}");
+    }
+    for line in &pages[0].lines {
+        let words: Vec<_> = line.words.iter().map(|word| word.text.as_str()).collect();
+        let expected: Vec<_> = line.text.split_whitespace().collect();
+        assert_eq!(
+            words, expected,
+            "word geometry lost boundaries: {}",
+            line.text
+        );
+    }
+}
