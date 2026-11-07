@@ -44,6 +44,17 @@ fn norm_key(t: &str) -> String {
 }
 
 /// Drop repeated running heads/footers.
+///
+/// Only lines in the top band (bottom edge in the top 10% of the page) or
+/// the bottom band (top edge at or below 92% of the page height) are
+/// candidates, and documents under four pages are left untouched. A band
+/// line is dropped when it is a bare page number, when its normalized text
+/// recurs in the same band on at least three pages and on at least half of
+/// them (rounded down), or when it is at most 90 bytes long and more than
+/// half of its word bigrams are frequent in its band: carried by that band
+/// on at least three of the first six pages. Lines set at 1.18 times the
+/// document's dominant text size or larger are left out of that bigram
+/// test.
 pub fn suppress_furniture(pages: &mut [PageLines]) {
     if pages.len() < 4 {
         return;
@@ -92,11 +103,36 @@ pub fn suppress_furniture(pages: &mut [PageLines]) {
     // ---- pass 2: band bigram families --------------------------------------
     // Exact keys fragment on per-page variation (roman numerals, mixed
     // prefixes). A footer family like "© adobe systems incorporated …
-    // reserved 81 / iii / 420" shares word bigrams that recur broadly;
-    // suppress any SHORT band line containing a high-frequency band
-    // bigram. Lines >90 chars are live content and never family-killed.
+    // reserved 81 / iii / 420" shares word bigrams that recur broadly.
+    // A bigram is frequent in a band when at least `cutoff` sampled pages
+    // carry it in that band. Counts are kept per band: a phrase in a page's
+    // head and in its foot, or in the heads of some pages and the feet of
+    // others, does not add up to more pages than either band shows. The
+    // floor of three pages is pass 1's: two pages sharing a phrase are not
+    // a recurrence, even in a four-page document.
+    // A SHORT band line is family when more than half of its bigrams are
+    // frequent in its own band. Running heads and footers repeat nearly
+    // all of their words; a body sentence or a slide title that shares one
+    // phrase with other band lines ("of the", "q# revenue", "form w-#")
+    // survives when it has at least as many bigrams of its own. Lines
+    // >90 chars are live content and never family-killed.
+    // Lines set at 1.18x the body size or larger (the block classifier's
+    // size-only heading cutoff) are neither counted nor family-killed:
+    // slide and section titles are set that much larger than the body
+    // text, running heads and footers rarely are. The classifier's other
+    // branch, 1.08x and bold, is not used here: the PDF 32000 footer above
+    // is 11 pt bold over a 10 pt body. A title that repeats exactly on most
+    // pages is still pass 1's to drop.
     if pages.len() >= 4 {
-        let mut bfreq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let body = {
+            let all: Vec<&Line> = pages.iter().flat_map(|p| p.lines.iter()).collect();
+            super::blocks::font_ctx(&all).body_size.max(0.1)
+        };
+        let heading_size = |l: &Line| l.size / body >= 1.18;
+        let mut bfreq: [std::collections::HashMap<String, usize>; 2] = [
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        ];
         let sample = pages.len().min(6);
         for p in pages.iter().take(sample) {
             let h = p.height;
@@ -113,32 +149,45 @@ pub fn suppress_furniture(pages: &mut [PageLines]) {
                     None
                 };
                 let Some(b) = band else { continue };
+                if heading_size(l) {
+                    continue;
+                }
                 let k = norm_key(&l.text);
                 let words: Vec<&str> = k.split_whitespace().collect();
                 for w in words.windows(2) {
                     let bg = format!("{} {}", w[0], w[1]);
                     if seen[b].insert(bg.clone()) {
-                        *bfreq.entry(bg).or_default() += 1;
+                        *bfreq[b].entry(bg).or_default() += 1;
                     }
                 }
             }
         }
-        let cutoff = (sample / 2).max(2);
+        let cutoff = (sample / 2).max(3);
         for p in pages.iter_mut() {
             let h = p.height;
             p.lines.retain(|l| {
-                let in_band = l.y1 <= h * 0.10 || l.y0 >= h * 0.92;
-                if !in_band || l.text.len() > 90 {
+                let b = if l.y1 <= h * 0.10 {
+                    0
+                } else if l.y0 >= h * 0.92 {
+                    1
+                } else {
+                    return true;
+                };
+                if l.text.len() > 90 || heading_size(l) {
                     return true;
                 }
                 let k = norm_key(&l.text);
                 let words: Vec<&str> = k.split_whitespace().collect();
-                !words.windows(2).any(|w| {
-                    bfreq
-                        .get(&format!("{} {}", w[0], w[1]))
-                        .map(|&n| n >= cutoff)
-                        .unwrap_or(false)
-                })
+                let bigrams = words.len().saturating_sub(1);
+                let frequent = words
+                    .windows(2)
+                    .filter(|w| {
+                        bfreq[b]
+                            .get(&format!("{} {}", w[0], w[1]))
+                            .is_some_and(|&n| n >= cutoff)
+                    })
+                    .count();
+                frequent * 2 <= bigrams
             });
         }
     }
@@ -352,5 +401,181 @@ mod furniture_tests {
                 .iter()
                 .any(|l| l.text == "Unique proceedings note")
         );
+    }
+
+    /// Slide-shaped pages (720x540): one 26 pt bold title per page in the
+    /// top 10% band, over a body line that is outside both bands.
+    fn slide_deck(titles: &[&str]) -> Vec<PageLines> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| PageLines {
+                index,
+                width: 720.0,
+                height: 540.0,
+                images: 0,
+                fusion: None,
+                lines: vec![
+                    Line {
+                        y1: 46.0,
+                        size: 26.0,
+                        weight: 700,
+                        ..line(title, 20.0, index)
+                    },
+                    line("Body point for this slide.", 160.0, index),
+                ],
+            })
+            .collect()
+    }
+
+    fn assert_titles_survive(titles: &[&str]) {
+        let mut pages = slide_deck(titles);
+        suppress_furniture(&mut pages);
+        for (p, t) in pages.iter().zip(titles) {
+            assert!(
+                p.lines.iter().any(|l| l.text == *t),
+                "distinct title {t:?} was suppressed as furniture"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_titles_sharing_a_common_bigram_survive() {
+        // Every title shares "of the"; no title repeats.
+        assert_titles_survive(&[
+            "Origins of the Project",
+            "Scope of the Work",
+            "Design of the System",
+            "Cost of the Plan",
+            "Risks of the Rollout",
+            "Review of the Results",
+        ]);
+    }
+
+    #[test]
+    fn a_four_slide_deck_keeps_titles_sharing_a_numbered_phrase() {
+        // "q# revenue" is on every slide and "revenue growth" on two.
+        assert_titles_survive(&[
+            "Q1 Revenue Growth",
+            "Q2 Revenue Growth",
+            "Q3 Revenue Decline",
+            "Q4 Revenue Outlook",
+        ]);
+    }
+
+    #[test]
+    fn titles_sharing_most_of_their_words_survive() {
+        // "of the" and "the design" are on every title: two of each
+        // title's three bigrams. Only their size marks them as titles.
+        assert_titles_survive(&[
+            "Overview of the Design",
+            "Scope of the Design",
+            "Cost of the Design",
+            "Risks of the Design",
+            "Goals of the Design",
+            "Review of the Design",
+        ]);
+    }
+
+    #[test]
+    fn a_title_repeated_on_every_slide_is_still_furniture() {
+        // Heading size keeps a line out of the bigram families only: the
+        // same title on every page is recurring furniture for pass 1.
+        let mut pages = slide_deck(&["Quarterly Review"; 6]);
+        suppress_furniture(&mut pages);
+        for p in &pages {
+            assert!(
+                !p.lines.iter().any(|l| l.text == "Quarterly Review"),
+                "page {} kept the repeated title",
+                p.index
+            );
+            assert!(
+                p.lines
+                    .iter()
+                    .any(|l| l.text == "Body point for this slide.")
+            );
+        }
+    }
+
+    #[test]
+    fn a_bold_footer_family_a_point_above_the_body_is_still_furniture() {
+        // The PDF 32000 footer: 11 pt bold over a 10 pt body, its page
+        // label alternating sides, so no exact key recurs.
+        let notice = "© Adobe Systems Incorporated 2008 – All rights reserved";
+        let labels = ["i", "ii", "iii", "iv", "v", "vi", "81", "420"];
+        let mut pages: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, n)| {
+                let foot = if index % 2 == 0 {
+                    format!("{notice} {n}")
+                } else {
+                    format!("{n} {notice}")
+                };
+                PageLines {
+                    index,
+                    width: 612.0,
+                    height: 792.0,
+                    images: 0,
+                    fusion: None,
+                    lines: vec![
+                        line(
+                            "Body text set at ten points carries most of the glyphs",
+                            300.0,
+                            index,
+                        ),
+                        line(
+                            "on every page, so ten points is the body size.",
+                            314.0,
+                            index,
+                        ),
+                        Line {
+                            size: 11.0,
+                            weight: 700,
+                            ..line(&foot, 760.0, index)
+                        },
+                    ],
+                }
+            })
+            .collect();
+        suppress_furniture(&mut pages);
+        for p in &pages {
+            assert!(
+                !p.lines.iter().any(|l| l.text.contains("Adobe")),
+                "page {} kept its footer",
+                p.index
+            );
+            assert_eq!(p.lines.len(), 2, "page {} lost body text", p.index);
+        }
+    }
+
+    #[test]
+    fn a_phrase_on_two_pages_of_a_four_page_document_is_not_a_family() {
+        // Body-size page-top lines on pages 1 and 3 share "of the" and
+        // "the treasury": two of their three bigrams, on two pages.
+        let mut pages: Vec<_> = (0..4)
+            .map(|index| PageLines {
+                index,
+                width: 612.0,
+                height: 792.0,
+                images: 0,
+                fusion: None,
+                lines: vec![line("Body evidence", 300.0, index)],
+            })
+            .collect();
+        pages[0]
+            .lines
+            .push(line("Department of the Treasury", 20.0, 0));
+        pages[2].lines.push(line("Office of the Treasury", 20.0, 2));
+        suppress_furniture(&mut pages);
+        for (p, t) in [
+            (0, "Department of the Treasury"),
+            (2, "Office of the Treasury"),
+        ] {
+            assert!(
+                pages[p].lines.iter().any(|l| l.text == t),
+                "{t:?} was suppressed as furniture"
+            );
+        }
     }
 }
