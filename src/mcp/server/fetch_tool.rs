@@ -798,7 +798,6 @@ fn adapter_hop_failed(verdict: Verdict, adapter_host: bool, no_adapter: bool) ->
     adapter_host && !no_adapter && !matches!(verdict, Verdict::ContentOk)
 }
 
-
 /// Retry the caller's URL without the adapter rewrite, and fold the
 /// adapter hop's trail in front of the retry's so the trail reads
 /// as ONE story rather than two unrelated hops. The retry runs the
@@ -1166,13 +1165,7 @@ async fn fetch_single_inner(
             _ if adapter_hop_failed(o.verdict, adapter_host, no_adapter) => {
                 let why = format!("{:?} : retrying original URL", o.verdict);
                 return adapter_fallback(
-                    daemon,
-                    args,
-                    &orig_url,
-                    &mut trace,
-                    "fallback",
-                    &why,
-                    call,
+                    daemon, args, &orig_url, &mut trace, "fallback", &why, call,
                 )
                 .await;
             }
@@ -2998,7 +2991,6 @@ mod budget_tests {
 mod adapter_hop_tests {
     use super::*;
     use crate::detect::walls::Vendor;
-
 
     #[test]
     fn the_adapter_rewrite_runs_unless_the_read_is_its_own_fallback() {

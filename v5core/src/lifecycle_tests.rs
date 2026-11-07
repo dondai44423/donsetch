@@ -730,7 +730,11 @@ fn a_human_check_on_the_learned_client_sends_the_encounter_to_the_class_that_get
     };
     let outcome = session.fetch(&server.url("/"), &portfolio);
     assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
-    assert!(answered.load(Ordering::SeqCst) >= 1, "{:?}", outcome.attempts);
+    assert!(
+        answered.load(Ordering::SeqCst) >= 1,
+        "{:?}",
+        outcome.attempts
+    );
     assert!(
         outcome
             .attempts
