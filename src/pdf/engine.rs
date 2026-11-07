@@ -277,7 +277,10 @@ fn bookmark_title(bm: FpdfBookmark) -> String {
     }
 }
 
-/// Walk the outline tree depth-first, flattened with levels.
+/// Walk the outline tree depth-first, flattened with levels. Returns at
+/// most 10_001 items over at most 13 levels. An item reached a second
+/// time through /Next or /First (a cycle in a malformed file) is not
+/// listed again, and the chain that reached it ends there.
 fn walk_outlines(doc: FpdfDocument) -> Vec<OutlineItem> {
     let mut out = Vec::new();
     fn walk_level(
@@ -285,12 +288,20 @@ fn walk_outlines(doc: FpdfDocument) -> Vec<OutlineItem> {
         parent: FpdfBookmark,
         level: usize,
         out: &mut Vec<OutlineItem>,
+        seen: &mut std::collections::HashSet<FpdfBookmark>,
     ) {
         if level > 12 || out.len() > 10_000 {
             return;
         }
         let mut bm = unsafe { FPDFBookmark_GetFirstChild(doc, parent) };
-        while !bm.is_null() {
+        // fpdf_doc.h leaves circular bookmark references to the caller.
+        // In a malformed file a /Next cycle would keep this loop going
+        // forever, and a /First cycle would relist its items down to the
+        // depth cap. Stop at a handle already walked, and check the item
+        // cap on every item, not only when a level starts, so the walk
+        // stays bounded even if a repeat ever came back under a
+        // different handle.
+        while !bm.is_null() && out.len() <= 10_000 && seen.insert(bm) {
             let title = bookmark_title(bm);
             let dest = unsafe { FPDFBookmark_GetDest(doc, bm) };
             let page = if !dest.is_null() {
@@ -300,11 +311,12 @@ fn walk_outlines(doc: FpdfDocument) -> Vec<OutlineItem> {
                 None
             };
             out.push(OutlineItem { title, level, page });
-            walk_level(doc, bm, level + 1, out);
+            walk_level(doc, bm, level + 1, out, seen);
             bm = unsafe { FPDFBookmark_GetNextSibling(doc, bm) };
         }
     }
-    walk_level(doc, std::ptr::null_mut(), 0, &mut out);
+    let mut seen = std::collections::HashSet::new();
+    walk_level(doc, std::ptr::null_mut(), 0, &mut out, &mut seen);
     out
 }
 
