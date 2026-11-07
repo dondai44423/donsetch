@@ -35,15 +35,25 @@ tokio::task_local! {
     pub static CALLER_DEADLINE: Instant;
 }
 
+/// The longest deadline a caller can set (`deadline_ms` is clamped to it). A
+/// caller horizon past it means the caller set none.
+const CALLER_DEADLINE_MAX: Duration = Duration::from_secs(600);
+
 /// What is left for one document under the caller's deadline, keeping a slice
-/// for the reading that follows the fetch (extraction, PDF parsing).
+/// for the reading that follows the fetch (extraction, PDF parsing). Without a
+/// caller deadline it is [`DOCUMENT_DEADLINE`]; a caller who set one gave the
+/// document that long, so a slow transfer can finish inside it.
 fn document_budget() -> Duration {
     let Ok(until) = CALLER_DEADLINE.try_with(|until| *until) else {
         return DOCUMENT_DEADLINE;
     };
     let left = until.saturating_duration_since(Instant::now());
-    left.saturating_sub((left / 5).min(Duration::from_millis(600)))
-        .min(DOCUMENT_DEADLINE)
+    let left = left.saturating_sub((left / 5).min(Duration::from_millis(600)));
+    if left > CALLER_DEADLINE_MAX {
+        DOCUMENT_DEADLINE
+    } else {
+        left
+    }
 }
 
 /// A one-shot read's ceiling; callers wrap tighter deadlines around it. A file
@@ -447,7 +457,14 @@ fn map_error(raw: String) -> FetchError {
         .map_or(("", raw.as_str()), |(class, detail)| (class, detail.trim()));
     match class {
         "dns" => FetchError::Dns(detail.to_owned()),
-        "timeout" => FetchError::Timeout,
+        "timeout" => match detail
+            .strip_prefix("the transfer was still arriving after ")
+            .and_then(|rest| rest.strip_suffix(" bytes"))
+            .and_then(|bytes| bytes.parse().ok())
+        {
+            Some(received) => FetchError::SlowTransfer(received),
+            None => FetchError::Timeout,
+        },
         "tls" => FetchError::Tls(detail.to_owned()),
         "connect" => FetchError::Io(std::io::Error::other(detail.to_owned())),
         "proxy" => {
@@ -781,6 +798,10 @@ mod tests {
     fn no_answer_is_an_error_named_by_its_class() {
         for (failure, expected) in [
             ("timeout: operation timed out", "Timeout"),
+            (
+                "timeout: the transfer was still arriving after 1048576 bytes",
+                "SlowTransfer(1048576)",
+            ),
             ("dns: failed to lookup address", "Dns"),
             ("tls: certificate verify failed", "Tls"),
             ("connect: connection refused", "Io"),
@@ -834,9 +855,21 @@ mod tests {
             budget <= Duration::from_millis(4400) && budget > Duration::from_millis(4300),
             "{budget:?}"
         );
+        // A caller who gave two minutes gave them to the document: a slow
+        // transfer may use them.
         let later = Instant::now() + Duration::from_secs(120);
         let budget = CALLER_DEADLINE
             .scope(later, async { document_budget() })
+            .await;
+        assert!(
+            budget > Duration::from_secs(118) && budget <= Duration::from_millis(119_400),
+            "{budget:?}"
+        );
+        // The horizon set when the caller gave no deadline keeps the
+        // document's own budget.
+        let none = Instant::now() + Duration::from_secs(86_400);
+        let budget = CALLER_DEADLINE
+            .scope(none, async { document_budget() })
             .await;
         assert_eq!(budget, DOCUMENT_DEADLINE);
         let past = Instant::now();

@@ -260,7 +260,9 @@ fn vertical_failure_status(e: &FetchError) -> String {
 /// proxy configuration error are in the `invalid-config:` family.
 fn engine_fetch_status(e: &FetchError) -> String {
     match e {
-        FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout".into(),
+        FetchError::Timeout | FetchError::SlowTransfer(_) | FetchError::DnsTimeout(_) => {
+            "timeout".into()
+        }
         FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail".into(),
         FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy".into(),
         // A local rule refused the engine's host. That is the

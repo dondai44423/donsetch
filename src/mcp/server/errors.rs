@@ -12,6 +12,10 @@ use super::*;
 pub(super) fn friendly_fetch_error(e: &FetchError) -> String {
     match e {
         FetchError::Timeout => "request timed out (the server took too long to respond)".into(),
+        FetchError::SlowTransfer(received) => format!(
+            "the transfer did not finish in time: {} KB arrived and more was coming (a large file or a slow link)",
+            received.div_ceil(1024)
+        ),
         FetchError::TooManyRedirects => "too many redirects (the URL loops)".into(),
         FetchError::InvalidUrl(u) => format!("invalid URL: {u}"),
         FetchError::Tls(msg) => {
@@ -592,6 +596,9 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
 /// compromised-CA blocklist, which gets advice of its own.
 pub(super) fn transport_next_action(e: &FetchError, kind: &str) -> String {
     match e {
+        FetchError::SlowTransfer(_) => {
+            "the server is sending: retry with a larger deadline_ms (up to 600000) so the transfer can finish".into()
+        }
         // Still kind tls.verify, but its advice (trust another CA
         // bundle) is the one thing that must not be done here.
         FetchError::Tls(msg) if crate::error::is_blocked_ca_failure(msg) => {
@@ -668,7 +675,10 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
         // A resolver that did not answer is as retryable as a connect
         // that did not: the same name can resolve a second later. A name
         // that does not exist (Dns) stays permanent, like an Ssrf block.
-        FetchError::Timeout | FetchError::Io(_) | FetchError::DnsTimeout(_) => "transient",
+        FetchError::Timeout
+        | FetchError::SlowTransfer(_)
+        | FetchError::Io(_)
+        | FetchError::DnsTimeout(_) => "transient",
         // Match on the classifier's own leading sentences, never on
         // hint text : "SSL_CERT_FILE" appears in BOTH hints, and
         // with it in the verify arm (checked first) every egress
@@ -695,7 +705,9 @@ pub(super) fn fetch_error_kind(e: &FetchError) -> &'static str {
 /// (`TooManyRedirects`) failures never count: the wire delivered an
 /// answer, the answer was "no".
 pub(super) fn transport_failure_evidence(e: &FetchError) -> bool {
-    fetch_error_kind(e) == "transient" || matches!(e, FetchError::Http(_))
+    // A slow transfer reached the server and kept receiving: the route works.
+    !matches!(e, FetchError::SlowTransfer(_))
+        && (fetch_error_kind(e) == "transient" || matches!(e, FetchError::Http(_)))
 }
 
 /// The stable machine code for a transport failure, taken from the
@@ -715,6 +727,7 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<Cow<'static, str>> {
         // signal (DnsTimeout is transient).
         FetchError::Dns(_) | FetchError::DnsTimeout(_) => Some(Cow::Borrowed("network.dns")),
         FetchError::Ssrf(_) => Some(Cow::Borrowed("guard.ssrf")),
+        FetchError::SlowTransfer(_) => Some(Cow::Borrowed("network.timeout")),
         FetchError::ProxyConfig(_) => Some(Cow::Borrowed("proxy.config")),
         FetchError::Denied { reason, .. } => {
             Some(Cow::Owned(crate::rules::policy_code(reason.as_deref())))
@@ -728,7 +741,7 @@ pub(super) fn fetch_error_code(e: &FetchError) -> Option<Cow<'static, str>> {
 /// failures. Mirrors friendly_fetch_error; the strings are API surface.
 pub(super) fn transport_class(e: &FetchError) -> &'static str {
     match e {
-        FetchError::Timeout => "timeout",
+        FetchError::Timeout | FetchError::SlowTransfer(_) => "timeout",
         FetchError::TooManyRedirects => "too_many_redirects",
         FetchError::Dns(_) => "dns",
         FetchError::DnsTimeout(_) => "dns_timeout",

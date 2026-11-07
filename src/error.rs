@@ -12,6 +12,10 @@ pub enum FetchError {
     /// browser module and its callers produce these.
     Browser(String),
     Timeout,
+    /// The response was still arriving when the time ran out: the server
+    /// answered and kept sending, the transfer was slower than the budget.
+    /// Carries the bytes received.
+    SlowTransfer(usize),
     TooManyRedirects,
     /// The host could not be resolved at all: NXDOMAIN, no addresses,
     /// a resolver error. Deliberately its own variant rather than an
@@ -60,6 +64,9 @@ impl fmt::Display for FetchError {
             Self::ProxyConfig(e) => write!(f, "proxy configuration: {e}"),
             Self::Browser(e) => write!(f, "browser: {e}"),
             Self::Timeout => write!(f, "timeout"),
+            Self::SlowTransfer(received) => {
+                write!(f, "timeout: slow transfer, {received} bytes received")
+            }
             Self::TooManyRedirects => write!(f, "too many redirects"),
             // The DNS prose carries no "SSRF guard" tail: that tail is
             // what made a typo look like a policy decision.

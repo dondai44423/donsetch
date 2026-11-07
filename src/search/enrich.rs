@@ -347,7 +347,10 @@ fn extract_description(html: &str) -> Option<String> {
 /// still matched `Timeout` alone, so a 5s resolver blip during enrich
 /// demoted a live result 50% and marked its host's quality down.
 fn slow_not_dead(e: &FetchError) -> bool {
-    matches!(e, FetchError::Timeout | FetchError::DnsTimeout(_))
+    matches!(
+        e,
+        FetchError::Timeout | FetchError::SlowTransfer(_) | FetchError::DnsTimeout(_)
+    )
 }
 
 #[cfg(test)]
