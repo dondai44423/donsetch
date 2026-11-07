@@ -62,11 +62,6 @@ use crate::mcp::server::{CancelMap, Daemon, cancel_key, handle};
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 /// Upper bound on tracked sessions; the oldest are evicted beyond it.
 const MAX_SESSIONS: usize = 1024;
-/// Default per-request timeout when DONSETCH_HTTP_TIMEOUT_SECS is unset.
-/// Historical default; the live default lives in config ([transport]
-/// timeout_secs).
-#[allow(dead_code)]
-const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// The GET /mcp SSE stream closes itself after this long (just inside
 /// SESSION_TTL): an unbounded idle stream would hold graceful shutdown
 /// open forever, and a closed stream is a routine reconnect for SSE

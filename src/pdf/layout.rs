@@ -693,12 +693,6 @@ fn is_devanagari(cp: char) -> bool {
     matches!(cp as u32, 0x0900..=0x097F | 0x1CD0..=0x1CFF | 0xA800..=0xA8FF)
 }
 
-/// Back-compat name for legacy callers (includes Hangul)
-#[allow(dead_code)]
-fn is_cjk(cp: char) -> bool {
-    is_han_kana(cp) || matches!(cp as u32, 0x1100..=0x11FF | 0xAC00..=0xD7AF)
-}
-
 /// Split off the last whitespace-separated word. Read-only on `text`:
 /// trailing whitespace is skipped BEFORE locating the word start
 /// (real-space glyphs in the stream make trailing spaces common).

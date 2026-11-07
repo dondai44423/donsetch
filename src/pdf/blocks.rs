@@ -70,11 +70,6 @@ pub fn classify(pages: &[PageLines], ordered_by_page: &[Vec<Line>], ctx: &FontCt
     blocks
 }
 
-#[allow(dead_code)]
-fn classify_page(lines: &[Line], ctx: &FontCtx, multi: bool, blocks: &mut Vec<Block>) {
-    classify_page_fused(lines, ctx, multi, blocks, None)
-}
-
 #[allow(clippy::too_many_lines)]
 fn classify_page_fused(
     lines: &[Line],
