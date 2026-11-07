@@ -858,6 +858,9 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     if t.starts_with("Mozilla/") {
         return (0.0, false);
     }
+    if class_list(t) {
+        return (0.0, false);
+    }
     // Machine names: a space-free ASCII token that is a module or bundle name
     // ("RSTWebWorkerEntrypointBundle"), a hash ("914fa4f6f16ffaeccc81bd5264e520d2"),
     // or a route key ("www/collage-creation-tool", "conversation/:id"). A
@@ -937,6 +940,36 @@ fn score_string(s: &str, path: &str) -> (f32, bool) {
     }
 
     (score.max(0.0), title_like)
+}
+
+/// A style class list that app state carries as a `className` string
+/// ("font-semibold m-0 break-words", "mt-(--spacing-sm-px) text-muted"):
+/// lowercase ASCII tokens, no sentence punctuation, mostly hyphenated or
+/// variant-prefixed. Three or more such tokens, or two when one has a
+/// utility's mark (a digit step `m-0`, `--`, `(`, `:`, `[`, `/`). A pair of
+/// plain hyphenated words ("machine-learning deep-learning") is not one.
+fn class_list(t: &str) -> bool {
+    let tokens: Vec<&str> = t.split_whitespace().collect();
+    let n = tokens.len();
+    if n < 2
+        || !tokens.iter().all(|tok| {
+            tok.is_ascii()
+                && !tok.bytes().any(|b| b.is_ascii_uppercase())
+                && !tok.ends_with(['.', ',', ';', '!', '?'])
+        })
+    {
+        return false;
+    }
+    let styled = tokens.iter().filter(|tok| tok.contains(['-', ':'])).count();
+    let marked = tokens.iter().any(|tok| {
+        tok.contains("--")
+            || tok.contains(['(', ':', '[', '/'])
+            || tok
+                .as_bytes()
+                .windows(2)
+                .any(|w| w[0] == b'-' && w[1].is_ascii_digit())
+    });
+    (n >= 3 && styled * 3 >= n * 2) || (styled * 2 >= n && marked)
 }
 
 /// A space-free token that names something to a program, not to a reader.
@@ -1288,6 +1321,17 @@ mod tests {
         let html = format!("<html><script type='application/json'>{names}</script></html>");
         assert!(super::extract(&html, "https://web.whatsapp.com/", &opts()).is_none());
         // Words a reader uses stay: a product name with one inner capital, CJK.
+        assert!(super::class_list(
+            "font-semibold m-0 break-words font-heading-3 text-heading-3 leading-heading-3"
+        ));
+        assert!(super::class_list(
+            "mt-(--spacing-sm-px) text-(length:--text-caption-1-size) text-muted-foreground"
+        ));
+        assert!(super::class_list("flex px-4"));
+        assert!(!super::class_list("machine-learning deep-learning"));
+        assert!(!super::class_list("a well-known, state-of-the-art tool"));
+        assert!(!super::class_list("Use --dry-run first"));
+        assert!(!super::class_list("e-mail"));
         assert!(!super::machine_token("PlayStation"));
         assert!(!super::machine_token("McDonald's"));
         assert!(super::machine_token("RSTWebWorkerEntrypointBundle"));

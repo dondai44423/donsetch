@@ -625,6 +625,19 @@ pub fn extract(
         if js.images.is_empty() {
             js.images = extracted.images.clone();
         }
+        // A document already judged content stays content. Otherwise the
+        // recovered state is judged like the document: by its substance,
+        // never by its length.
+        let verdict = if page.verdict.is_content() {
+            page.verdict
+        } else {
+            match crate::detect::substance::assess_lines(js.markdown.lines()) {
+                v if v.is_content() => v,
+                _ => page.verdict,
+            }
+        };
+        js.thin = !verdict.is_content();
+        js.page = Some(verdict);
         return Ok(js);
     }
 

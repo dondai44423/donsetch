@@ -432,3 +432,26 @@ fn a_page_wide_banner_without_prose_is_still_frame() {
         <main><div>Fetching metadata from the HF Docker repository...</div><div>Refreshing</div><iframe src="https://x.hf.space"></iframe></main></body>"#;
     assert!(!verdict(html).is_content());
 }
+
+#[test]
+fn recovered_state_is_judged_by_its_substance() {
+    // A short product record: a sentence and a price, far under any size bar.
+    assert!(assess_lines(["# Trail Runner 2", "Light shoe for wet rock.", "$129.00"]).is_content());
+    // One figure is enough.
+    assert!(assess_lines(["Population", "8,804,190"]).is_content());
+    // UI strings from an app bundle are not content, however many.
+    assert!(
+        !assess_lines([
+            "Loading...",
+            "Sign in",
+            "Log in",
+            "Create account",
+            "Privacy Policy",
+            "Terms of Service",
+        ])
+        .is_content()
+    );
+    // Machine identifiers recover nothing.
+    assert!(!assess_lines(["is_latency_sensitive_broadcast", "FDSTooltipDef"]).is_content());
+    assert_eq!(assess_lines(Vec::<&str>::new()), Verdict::Empty);
+}

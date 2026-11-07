@@ -1579,6 +1579,57 @@ pub fn assess(doc: &Html, url: &str) -> Page {
     }
 }
 
+/// The verdict on text recovered outside the document's markup (a page's
+/// embedded application state): each line is one unit of main-region text,
+/// judged by the same classifier as the document. Content needs a sentence,
+/// a figure, code, or a listing of three or more named things; text with
+/// none of those is not content, whatever its length.
+pub fn assess_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Verdict {
+    let echoes = HashSet::new();
+    let units: Vec<Unit> = lines
+        .into_iter()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let heading = trimmed.chars().take_while(|c| *c == '#').count() as u8;
+            let text = trimmed
+                .trim_start_matches(['#', '-', '*', '>', '|'])
+                .trim_end_matches('|')
+                .trim();
+            let text = crate::extract::view::link_text(text);
+            (!text.is_empty()).then(|| Unit {
+                segments: vec![text.clone()],
+                text,
+                link_chars: 0,
+                ctx: Ctx {
+                    main: true,
+                    heading,
+                    ..Ctx::default()
+                },
+            })
+        })
+        .collect();
+    if units.is_empty() {
+        return Verdict::Empty;
+    }
+    let kinds: Vec<Kind> = units.iter().map(|u| classify(u, false, &echoes)).collect();
+    let count = |k: Kind| kinds.iter().filter(|x| **x == k).count();
+    let core = count(Kind::Sentence) + count(Kind::Data) + count(Kind::Code);
+    let auth = count(Kind::Auth);
+    let entity = if auth >= 2 { 0 } else { count(Kind::Entity) };
+    let listing = if entity >= 3 { entity } else { 0 };
+    if auth >= 2 && core <= 1 && listing == 0 {
+        Verdict::AuthGate
+    } else if core + listing > 0 {
+        Verdict::Content
+    } else if count(Kind::Loading) > 0 {
+        Verdict::Loading
+    } else if count(Kind::Notice) + count(Kind::ScriptsRequired) > 0 {
+        Verdict::Notice
+    } else {
+        Verdict::Shell
+    }
+}
+
 /// Path segments that name a sign-in endpoint (a segment's stem before
 /// any extension: `login.php` is `login`).
 const LOGIN_SEGMENTS: &[&str] = &[
