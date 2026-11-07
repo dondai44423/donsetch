@@ -517,7 +517,7 @@ pub fn extract(
     }
 
     let doc = Html::parse_document(&html_text);
-    let base = metadata::base_url(&doc).unwrap_or_else(|| url.to_string());
+    let base = metadata::base_url(&doc, url);
     let mut meta = metadata::metadata(&doc);
     if url::Url::parse(url)
         .ok()
