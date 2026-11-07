@@ -3262,3 +3262,87 @@ fn audit_numeric_superscripts_are_not_citation_markers() {
     // Negative case: a bracketed wiki citation stays dropped.
     assert!(!md.contains("[1]"), "{md}");
 }
+
+// A front page lays its stories out as cards: a link around a headline and
+// a summary. The link is on the card, not on any text inline, so the
+// headline must carry it; and a grid of cards is the page's content, not a
+// navigation list to scope away from.
+const CARD_GRID: &str = r#"<!doctype html><html><head><title>Front page</title></head><body>
+<nav><a href="/">Home</a> <a href="/world">World</a> <a href="/sport">Sport</a></nav>
+<main><div class="grid">
+<div class="card"><a href="/news/one?utm_source=home"><div><span>Live</span><h2>Floods close the northern rail line</h2><p>Engineers expect repairs to take until the end of the month, the operator said on Sunday.</p></div><span>2 hrs ago</span></a></div>
+<div class="card"><a href="/news/two"><div><h2>Vote count delayed in three districts</h2><p>Officials blamed a software fault for the hold-up in the count on Saturday night.</p></div></a></div>
+<div class="card"><a href="/news/three"><div><h2>Museum returns looted bronze</h2><p>The statue was taken in 1897 and has been in the collection ever since then.</p></div></a></div>
+<div class="card"><a href="/news/four"><div><div>Opinion</div></div></a></div>
+</div></main></body></html>"#;
+
+#[test]
+fn card_links_reach_their_headlines() {
+    let ex = extract_html_opts(
+        CARD_GRID,
+        &ExtractOptions {
+            include_links: true,
+            ..Default::default()
+        },
+    );
+    let md = &ex.markdown;
+    assert!(
+        md.contains("## [Floods close the northern rail line](https://example.com/news/one)"),
+        "{md}"
+    );
+    assert!(
+        md.contains("## [Vote count delayed in three districts](https://example.com/news/two)"),
+        "{md}"
+    );
+    assert!(
+        md.contains("## [Museum returns looted bronze](https://example.com/news/three)"),
+        "{md}"
+    );
+    // The headline takes the link, not the kicker above it or the summary.
+    assert!(!md.contains("[Live]"), "{md}");
+    assert!(!md.contains("[Engineers"), "{md}");
+    // A card without a headline links its first line of text.
+    assert!(
+        md.contains("[Opinion](https://example.com/news/four)"),
+        "{md}"
+    );
+}
+
+#[test]
+fn card_links_stay_off_without_links() {
+    let ex = extract_html(CARD_GRID);
+    assert!(
+        ex.markdown
+            .contains("## Floods close the northern rail line"),
+        "{}",
+        ex.markdown
+    );
+    assert!(!ex.markdown.contains("]("), "{}", ex.markdown);
+}
+
+#[test]
+fn a_grid_of_cards_is_the_main_content() {
+    let ex = extract_html(CARD_GRID);
+    for title in [
+        "Floods close the northern rail line",
+        "Vote count delayed in three districts",
+        "Museum returns looted bronze",
+    ] {
+        assert!(ex.markdown.contains(title), "{title}: {}", ex.markdown);
+    }
+}
+
+// An anchor with no words renders nothing, not an empty `[](url)`.
+#[test]
+fn an_empty_link_renders_nothing() {
+    let html = r#"<html><body><main><a href="/card"><h2>Read <a href="/inner">the report</a> today</h2></a><p>Body text of the page, long enough to be read as the article itself by the scorer.</p></main></body></html>"#;
+    let ex = extract_html_opts(
+        html,
+        &ExtractOptions {
+            include_links: true,
+            ..Default::default()
+        },
+    );
+    assert!(!ex.markdown.contains("[]("), "{}", ex.markdown);
+    assert!(ex.markdown.contains("the report"), "{}", ex.markdown);
+}

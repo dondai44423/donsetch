@@ -22,7 +22,7 @@ pub fn element_markdown(
     let emph = Emphasis::of(el);
     let (text, density) = markdown_impl(el, base, opts, false, emph);
     let md = match el.value().name() {
-        "a" if opts.include_links => el
+        "a" if opts.include_links && !text.trim().is_empty() => el
             .value()
             .attr("href")
             .and_then(|href| absolutize(base, href))

@@ -223,6 +223,28 @@ fn heading_of(line: &str) -> Option<(u8, &str)> {
     (!text.is_empty()).then_some((hashes as u8, text))
 }
 
+/// A heading's words without link markup: `[Title](https://...)` reads
+/// as `Title` in the outline, in section paths and for section matching.
+fn link_text(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut rest = title;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find("](") else {
+            break;
+        };
+        let target = &after[close + 2..];
+        let Some(end) = target.find(')') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&after[..close]);
+        rest = &target[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Lines with their byte offsets (`\n` excluded, `\r` trimmed).
 fn lines_from(text: &str, from: usize) -> impl Iterator<Item = (usize, &str)> {
     let mut at = from;
@@ -249,7 +271,7 @@ impl<'a> Doc<'a> {
             if let Some((level, title)) = heading_of(line) {
                 headings.push(Heading {
                     level,
-                    text: title.to_string(),
+                    text: link_text(title),
                     start,
                     end: text.len(),
                     parent: None,
@@ -1314,6 +1336,20 @@ Intro text about widgets and how they work.\n\n\
 
     fn terms(raw: &[&str]) -> Vec<Term> {
         raw.iter().map(|t| Term::parse(t).unwrap()).collect()
+    }
+
+    #[test]
+    fn linked_headings_outline_as_their_words() {
+        let doc = Doc::parse(
+            "# Front\nhttps://example.com/\n\n## [Floods close the line](https://example.com/a)\n\nText.\n\n\
+## Read [the report](L1) today\n\nMore.\n",
+        );
+        let names: Vec<&str> = doc.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(names, ["Floods close the line", "Read the report today"]);
+        assert!(find_section(&doc, "floods close the line").is_some());
+        assert_eq!(link_text("[a](x) and [b](y)"), "a and b");
+        assert_eq!(link_text("no [link here"), "no [link here");
+        assert_eq!(link_text("[x](unclosed"), "[x](unclosed");
     }
 
     #[test]

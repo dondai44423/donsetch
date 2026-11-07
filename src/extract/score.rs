@@ -13,6 +13,7 @@ struct Stats {
     link_text_len: usize,
     punct: usize,
     paras: usize,
+    heads: usize,
 }
 
 pub fn find_main<'a>(doc: &'a Html) -> Option<ElementRef<'a>> {
@@ -115,6 +116,7 @@ fn walk<'a>(el: ElementRef<'a>, depth: usize) -> (Stats, Option<(f64, ElementRef
                 stats.link_text_len += cs.link_text_len;
                 stats.punct += cs.punct;
                 stats.paras += cs.paras;
+                stats.heads += cs.heads;
                 if let Some((score, cand)) = cb
                     && best.is_none_or(|(b, _)| score > b)
                 {
@@ -129,7 +131,13 @@ fn walk<'a>(el: ElementRef<'a>, depth: usize) -> (Stats, Option<(f64, ElementRef
     if name == "p" {
         stats.paras += 1;
     }
-    if name == "a" {
+    if matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+        stats.heads += 1;
+    }
+    // A link around a headline or a paragraph is a card of a listing (a
+    // news front page, a blog index): its words are the page's content.
+    // Only a link around a label is navigation.
+    if name == "a" && stats.paras == 0 && stats.heads == 0 {
         stats.link_text_len = stats.text_len;
     }
 

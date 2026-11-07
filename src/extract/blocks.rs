@@ -112,7 +112,7 @@ pub fn segment(
     out: &mut Vec<Block>,
 ) {
     let mut headings: Vec<(u8, String)> = Vec::new();
-    walk(root, base, opts, &mut headings, out, 0);
+    walk(root, base, opts, &mut headings, out, 0, &mut None);
     fold_code_labels(out);
 }
 
@@ -260,6 +260,9 @@ fn push_block(block: Block, out: &mut Vec<Block>) {
     }
 }
 
+/// `card` is the target of an enclosing link that wraps block content
+/// (a news card: `<a href><h2>Title</h2><p>Summary</p></a>`): the card's
+/// first heading takes the link, or with no heading its first paragraph.
 fn walk<'a>(
     el: ElementRef<'a>,
     base: &str,
@@ -267,6 +270,7 @@ fn walk<'a>(
     headings: &mut Vec<(u8, String)>,
     out: &mut Vec<Block>,
     depth: usize,
+    card: &mut Option<Card>,
 ) {
     if depth > MAX_DEPTH {
         return;
@@ -281,6 +285,7 @@ fn walk<'a>(
                     headings.pop();
                 }
                 headings.push((level, text.clone()));
+                let text = card_link(text, card, true);
                 push_block(
                     Block::Heading {
                         level,
@@ -294,6 +299,7 @@ fn walk<'a>(
         "p" => {
             let (md, ld) = inline::markdown(el, base, opts);
             if !md.is_empty() {
+                let md = card_link(md, card, false);
                 push_block(
                     Block::Para {
                         md,
@@ -345,7 +351,7 @@ fn walk<'a>(
                     if crate::extract::junk::skip(child_el) {
                         continue;
                     }
-                    walk(child_el, base, opts, headings, out, depth + 1);
+                    walk(child_el, base, opts, headings, out, depth + 1, card);
                 }
             } else if let Some(t) = table_block(el, headings, base, opts) {
                 push_block(t, out);
@@ -456,6 +462,30 @@ fn walk<'a>(
             media_block(el, base, headings, out);
         }
         "hr" => {}
+        "a" if opts.include_links && contains_block(el) => {
+            let target = el
+                .value()
+                .attr("href")
+                .and_then(|href| inline::absolutize(base, href))
+                .map(|url| Card {
+                    url: inline::strip_trackers(&url),
+                    // A card with a headline links the headline, not a
+                    // kicker or timestamp printed above it.
+                    heading_only: has_heading(el),
+                });
+            let outer = std::mem::replace(card, target.or_else(|| card.clone()));
+            for child in el.children() {
+                let Some(child_el) = ElementRef::wrap(child) else {
+                    continue;
+                };
+                if crate::extract::junk::skip(child_el) {
+                    continue;
+                }
+                walk(child_el, base, opts, headings, out, depth + 1, card);
+            }
+            // An unclaimed card link ends with its card.
+            *card = outer;
+        }
         _ => {
             // Container or unknown: emit direct loose text as a
             // paragraph (div-soup), then recurse into children.
@@ -466,7 +496,7 @@ fn walk<'a>(
                 if !loose.0.is_empty() {
                     push_block(
                         Block::Para {
-                            md: loose.0,
+                            md: card_link(loose.0, card, false),
                             link_density: loose.1,
                             path: current_path(headings),
                         },
@@ -488,10 +518,42 @@ fn walk<'a>(
                 // content (Reddit/HN comments have class "comment"
                 // which is in NEGATIVE_SUBSTR : the gate was
                 // silently dropping all short comments).
-                walk(child_el, base, opts, headings, out, depth + 1);
+                walk(child_el, base, opts, headings, out, depth + 1, card);
             }
         }
     }
+}
+
+/// Link a heading or paragraph to the card it sits in, once: the card's
+/// target is taken, and text that already carries a link keeps its own.
+fn card_link(text: String, card: &mut Option<Card>, heading: bool) -> String {
+    let Some(c) = card.as_ref() else {
+        return text;
+    };
+    if !heading && c.heading_only {
+        return text;
+    }
+    let url = card.take().map(|c| c.url).unwrap_or_default();
+    if text.contains("](") {
+        text
+    } else {
+        format!("[{text}]({url})")
+    }
+}
+
+/// The target of a link that wraps block content.
+#[derive(Clone)]
+struct Card {
+    url: String,
+    /// Only a heading takes the link: the card has one.
+    heading_only: bool,
+}
+
+/// True when an element holds a heading.
+fn has_heading(el: ElementRef<'_>) -> bool {
+    el.descendants()
+        .filter_map(ElementRef::wrap)
+        .any(|d| matches!(d.value().name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
 }
 
 /// Direct (non-element-wrapped) text of an element : the
