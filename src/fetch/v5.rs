@@ -73,6 +73,8 @@ pub struct V5Fetcher {
 /// A document request as the product describes it.
 pub struct Document<'a> {
     pub url: &'a str,
+    /// The proxy `route` names for `url`, kept for every redirect hop; `None`
+    /// is a direct read, which refuses a hop `route` sends through a proxy.
     pub proxy: Option<Proxy>,
     pub route: RequestRoute,
     /// Spend and earn learned state (cookies, scores, the page cache).
@@ -90,6 +92,10 @@ pub struct Document<'a> {
 pub struct OneShot<'a> {
     pub url: &'a str,
     pub conditional: &'a [(String, String)],
+    /// The lane. `None` is the configured route, as for a document read
+    /// without a lane ([`RequestRoute::configured`]): the proxy it names for
+    /// `url` is kept for every redirect hop, and a read it sends direct
+    /// refuses a hop it sends through a proxy.
     pub proxy: Option<&'a Proxy>,
     pub use_jar: bool,
     pub referer: Option<&'a str>,
@@ -120,6 +126,7 @@ impl V5Fetcher {
         // up: a read that cannot leave through its proxy resolves nothing.
         let proxy = engine_proxy(document.proxy.as_ref())?;
         crate::fetch::guards::ensure_url_safe(document.url).await?;
+        let direct = document.proxy.is_none().then(|| document.route.clone());
         let refusal: Arc<Mutex<Option<FetchError>>> = Arc::default();
         let mut request = v5core::Request::new(document.url);
         request.proxy = proxy;
@@ -128,7 +135,7 @@ impl V5Fetcher {
         request.deadline = document_budget();
         let cancel = v5core::Cancel::new();
         request.policy = v5core::Policy {
-            hop: Some(hop_guard(Arc::clone(&refusal), document.gate)),
+            hop: Some(hop_guard(Arc::clone(&refusal), document.gate, direct)),
             navigation: navigation_headers(document.referer, document.url),
             cancel: Some(cancel.clone()),
             ..v5core::Policy::default()
@@ -151,9 +158,24 @@ impl V5Fetcher {
         {
             return Err(FetchError::Http("invalid User-Agent".into()));
         }
+        let (route, lane) = match shot.proxy {
+            Some(proxy) => (RequestRoute::pinned(proxy.clone()), Some(proxy.clone())),
+            None => {
+                // No lane: the route a document read takes without one
+                // (Fetcher::document), so [proxy], proxy.from_environment and
+                // the bypass lists decide here too, and the URL's own checks
+                // come first as they do there. v5 is handed no proxy only for
+                // a direct read: it reads none from the environment itself.
+                crate::fetch::guards::validate_url_basic(shot.url)?;
+                let route = RequestRoute::configured();
+                let lane = route.proxy_for(shot.url)?;
+                (route, lane)
+            }
+        };
         // Read before the URL guard's lookup, as in `document`.
-        let proxy = engine_proxy(shot.proxy)?;
+        let proxy = engine_proxy(lane.as_ref())?;
         crate::fetch::guards::ensure_url_safe(shot.url).await?;
+        let direct = lane.is_none().then(|| route.clone());
         let mut headers: Vec<(String, String)> = Vec::new();
         let kind = if shot.class == RequestClass::Navigation {
             v5core::Kind::Navigate
@@ -206,18 +228,13 @@ impl V5Fetcher {
             timeout: ONCE_TIMEOUT,
             cap: None,
             policy: v5core::Policy {
-                hop: Some(hop_guard(Arc::clone(&refusal), None)),
+                hop: Some(hop_guard(Arc::clone(&refusal), None, direct)),
                 request_max: Duration::MAX,
                 cancel: Some(cancel.clone()),
                 ..v5core::Policy::default()
             },
             ..v5core::Once::new(shot.url)
         };
-        let route = shot
-            .proxy
-            .cloned()
-            .map(RequestRoute::pinned)
-            .unwrap_or_else(RequestRoute::direct);
         let started = Instant::now();
         let session = Arc::clone(&self.session);
         let reply = blocking(cancel, move || session.once(&once))
@@ -298,14 +315,11 @@ fn configured_roots(file: &str, dir: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// The URL v5 is handed for `proxy`. With none, v5 takes the proxy the
-/// environment names (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`). A proxy URL
-/// v5 cannot read, either way, is a proxy configuration error naming the
-/// proxy, credentials masked (and its variable, for the environment), and
-/// nothing is sent.
+/// The URL v5 is handed for `proxy`; with none the read is direct. A proxy
+/// URL v5 cannot read is a proxy configuration error naming the proxy, its
+/// user name and password masked, and nothing is sent.
 fn engine_proxy(proxy: Option<&Proxy>) -> Result<Option<String>, FetchError> {
     let Some(proxy) = proxy else {
-        v5core::environment_proxies().map_err(FetchError::ProxyConfig)?;
         return Ok(None);
     };
     let url = proxy.wire_url();
@@ -345,30 +359,52 @@ where
 
 /// The product's redirect rule for every hop, asked before it is dialed: the
 /// same scheme / credentials / rules / private-address gate as the first URL,
-/// then the caller's own gate (crawl scope and robots). A refused hop records
-/// its typed error in `refusal`; a hop the gate declines ends the chain on the
-/// 3xx, which the caller reads as the honest skip.
+/// then the caller's own gate (crawl scope and robots), then the route. Every
+/// hop leaves through the egress of the first URL; `direct` is the route of a
+/// read that started direct, and a hop that route sends through a proxy is
+/// refused as a proxy configuration error instead of being dialed direct. A
+/// refused hop records its typed error in `refusal`; a hop the gate declines
+/// ends the chain on the 3xx, which the caller reads as the honest skip.
 fn hop_guard(
     refusal: Arc<Mutex<Option<FetchError>>>,
     gate: Option<RedirectGate>,
+    direct: Option<RequestRoute>,
 ) -> v5core::HopGuard {
     let handle = tokio::runtime::Handle::try_current().ok();
     Arc::new(move |previous: &str, next: &str| {
+        let refuse = |error: FetchError| {
+            *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
+            v5core::Hop::Deny(next.to_string())
+        };
         let Ok(base) = url::Url::parse(previous) else {
             return v5core::Hop::Deny(next.to_string());
         };
-        match crate::fetch::guards::validate_redirect_url(&base, next) {
-            Ok(url) => match (&gate, &handle) {
-                // The session runs on a blocking thread, outside the runtime:
-                // waiting on the async gate here is allowed and parks only it.
-                (Some(gate), Some(handle)) if !handle.block_on(gate(url)) => v5core::Hop::Stop,
-                _ => v5core::Hop::Follow,
-            },
-            Err(FetchError::NonHttpRedirect(_)) => v5core::Hop::Stop,
-            Err(error) => {
-                *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
-                v5core::Hop::Deny(next.to_string())
-            }
+        let url = match crate::fetch::guards::validate_redirect_url(&base, next) {
+            Ok(url) => url,
+            Err(FetchError::NonHttpRedirect(_)) => return v5core::Hop::Stop,
+            Err(error) => return refuse(error),
+        };
+        // The session runs on a blocking thread, outside the runtime: waiting
+        // on the async gate here is allowed and parks only it.
+        if let (Some(gate), Some(handle)) = (&gate, &handle)
+            && !handle.block_on(gate(url.clone()))
+        {
+            return v5core::Hop::Stop;
+        }
+        let Some(route) = &direct else {
+            return v5core::Hop::Follow;
+        };
+        // The chain's client has no proxy, so this hop would leave from this
+        // machine's own address; where the route names a proxy for it, the
+        // read fails instead.
+        match route.proxy_for(url.as_str()) {
+            Ok(None) => v5core::Hop::Follow,
+            Ok(Some(_)) => refuse(FetchError::ProxyConfig(format!(
+                "redirect to {} refused: the configured route sends it through a proxy, \
+                 and this read started direct",
+                url.origin().ascii_serialization()
+            ))),
+            Err(error) => refuse(error),
         }
     })
 }
@@ -796,7 +832,7 @@ mod tests {
     #[test]
     fn the_hop_guard_refuses_private_targets_and_stops_on_other_schemes() {
         let refusal: Arc<Mutex<Option<FetchError>>> = Arc::default();
-        let guard = hop_guard(Arc::clone(&refusal), None);
+        let guard = hop_guard(Arc::clone(&refusal), None, None);
         assert_eq!(
             guard("https://a.test/", "https://b.test/next"),
             v5core::Hop::Follow
@@ -867,6 +903,13 @@ mod tests {
     /// answers each one with a page titled `title`. As a proxy it answers an
     /// absolute-form request for any origin itself.
     async fn http_server(title: &'static str) -> (u16, Log, tokio::task::JoinHandle<()>) {
+        reply_server(page_reply(title)).await
+    }
+
+    /// A plain-HTTP server on 127.0.0.1 that logs every request head and
+    /// answers each one with `reply`, a CONNECT included.
+    async fn reply_server(reply: Vec<u8>) -> (u16, Log, tokio::task::JoinHandle<()>) {
+        let reply: Arc<[u8]> = reply.into();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let log: Log = Arc::default();
@@ -874,12 +917,29 @@ mod tests {
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let seen = Arc::clone(&seen);
+                let reply = Arc::clone(&reply);
                 tokio::spawn(async move {
                     let head = read_head(&mut stream).await?;
                     seen.lock().unwrap().push(head);
-                    stream.write_all(&page_reply(title)).await.ok()?;
+                    stream.write_all(&reply).await.ok()?;
                     stream.shutdown().await.ok()
                 });
+            }
+        });
+        (port, log, task)
+    }
+
+    /// A listener on 127.0.0.1 that logs each connection it accepts and closes
+    /// it unread: a TLS client gets no handshake from it.
+    async fn counting_listener() -> (u16, Log, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log: Log = Arc::default();
+        let seen = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                seen.lock().unwrap().push(peer.to_string());
+                drop(stream);
             }
         });
         (port, log, task)
@@ -1075,26 +1135,28 @@ mod tests {
         assert!(origin.lock().unwrap().is_empty(), "{:?}", origin.lock());
     }
 
-    // ── A read handed no proxy ─────────────────────────────────────────
+    // ── A read given no lane ───────────────────────────────────────────
     //
-    // v5's transport then takes a proxy from the environment itself. These
-    // tests set the process environment and install the process config:
-    // they depend on nextest's one process per test.
+    // A document read and a one-shot read given no lane take the configured
+    // route. These tests set the process environment and install the
+    // process config: they depend on nextest's one process per test.
 
-    /// Environment proxies on (the default); loopback targets allowed.
-    fn environment_config() {
+    /// Loopback targets allowed; `edit` sets the rest.
+    fn install_config(edit: impl FnOnce(&mut crate::config::DonsetchConfig)) {
         let mut config = crate::config::DonsetchConfig::default();
-        config.proxy.from_environment = true;
         config.fetch.allow_private_egress = true;
+        edit(&mut config);
         crate::config::install(config).unwrap();
     }
 
-    /// The process environment names `HTTP_PROXY=value` and no other proxy.
-    fn set_http_proxy(value: &str) {
+    /// The process environment names exactly `vars` among the proxy
+    /// variables.
+    fn set_proxy_environment(vars: &[(&str, &str)]) {
         // SAFETY: test-only mutation of the process env; nextest runs each
         // test in its own process.
         unsafe {
             for name in [
+                "HTTP_PROXY",
                 "http_proxy",
                 "HTTPS_PROXY",
                 "https_proxy",
@@ -1106,65 +1168,176 @@ mod tests {
             ] {
                 std::env::remove_var(name);
             }
-            std::env::set_var("HTTP_PROXY", value);
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
         }
     }
 
-    async fn once_without_a_lane(url: &str) -> Result<u16, FetchError> {
-        let fetcher = Fetcher::new(BrowserProfile::host_default()).unwrap();
-        fetcher
+    /// A document read and a one-shot read of `url`, neither given a lane:
+    /// each one's status, or its error. Each read has its own fetcher, so no
+    /// client is reused across reads, and the document read is a cold probe,
+    /// so no page comes from the cache.
+    async fn reads_without_a_lane(url: &str) -> [Result<u16, FetchError>; 2] {
+        let document = Fetcher::new(BrowserProfile::host_default())
+            .unwrap()
+            .fetch_cold_probe(url)
+            .await;
+        let once = Fetcher::new(BrowserProfile::host_default())
+            .unwrap()
             .fetch_once_via(url, &[], None, false, None)
-            .await
-            .map(|out| out.status)
+            .await;
+        [document, once].map(|result| result.map(|out| out.status))
     }
 
-    /// A one-shot read handed no proxy (a first-wave search vertical,
-    /// `donsetch update`) whose environment proxy the transport cannot read
-    /// must fail as a proxy configuration error that names the variable and
-    /// the proxy without its credentials, and reach neither the origin nor
-    /// the proxy.
+    /// With environment proxies turned off (`proxy.from_environment = false`,
+    /// what `DONSETCH_NO_ENV_PROXY=1` sets), a readable proxy in the
+    /// environment carries neither read: both reach the origin directly.
+    #[tokio::test]
+    async fn with_environment_proxies_off_neither_read_takes_the_environment_proxy() {
+        install_config(|config| config.proxy.from_environment = false);
+        let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
+        let (proxy_port, proxied, proxy_task) = http_server("Through the proxy").await;
+        let proxy = format!("http://127.0.0.1:{proxy_port}");
+        set_proxy_environment(&[
+            ("HTTP_PROXY", &proxy),
+            ("http_proxy", &proxy),
+            ("ALL_PROXY", &proxy),
+            ("all_proxy", &proxy),
+        ]);
+        let results = reads_without_a_lane(&format!("http://127.0.0.1:{origin_port}/page")).await;
+        let (direct, through) = (origin.lock().unwrap().len(), proxied.lock().unwrap().len());
+        origin_task.abort();
+        proxy_task.abort();
+        assert!(
+            results.iter().all(|result| matches!(result, Ok(200))) && direct >= 2 && through == 0,
+            "{results:?}; the origin took {direct} request(s), the proxy {through}"
+        );
+    }
+
+    /// A host in `[proxy] no_proxy` is read directly on both reads while the
+    /// environment names a readable proxy; a host the list does not name
+    /// rides that proxy.
+    #[tokio::test]
+    async fn a_host_in_proxy_no_proxy_is_read_directly() {
+        install_config(|config| {
+            config.proxy.from_environment = true;
+            config.proxy.no_proxy = "127.0.0.1".into();
+        });
+        let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
+        let (proxy_port, proxied, proxy_task) = http_server("Through the proxy").await;
+        set_proxy_environment(&[("HTTP_PROXY", &format!("http://127.0.0.1:{proxy_port}"))]);
+        // Negative: "localhost" is not in the list. The proxy answers for any
+        // origin, so the name is never looked up.
+        let other = format!("http://localhost:{origin_port}/page");
+        let results = reads_without_a_lane(&other).await;
+        let heads = std::mem::take(&mut *proxied.lock().unwrap());
+        assert!(
+            results.iter().all(|result| matches!(result, Ok(200)))
+                && heads.len() >= 2
+                && heads
+                    .iter()
+                    .all(|head| head.starts_with(&format!("GET {other} ")))
+                && origin.lock().unwrap().is_empty(),
+            "{results:?}; the proxy saw {heads:?}; the origin {:?}",
+            origin.lock()
+        );
+        let results = reads_without_a_lane(&format!("http://127.0.0.1:{origin_port}/page")).await;
+        let (direct, through) = (origin.lock().unwrap().len(), proxied.lock().unwrap().len());
+        origin_task.abort();
+        proxy_task.abort();
+        assert!(
+            results.iter().all(|result| matches!(result, Ok(200))) && direct >= 2 && through == 0,
+            "{results:?}; the origin took {direct} request(s), the proxy {through}"
+        );
+    }
+
+    /// `[proxy] all` carries a read given no lane, one-shot as well as
+    /// document, with no proxy in the environment.
+    #[tokio::test]
+    async fn proxy_all_carries_a_read_without_a_lane() {
+        let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
+        let (proxy_port, proxied, proxy_task) = http_server("Through the proxy").await;
+        install_config(|config| {
+            config.proxy.from_environment = false;
+            config.proxy.all = format!("http://127.0.0.1:{proxy_port}");
+        });
+        set_proxy_environment(&[]);
+        let url = format!("http://127.0.0.1:{origin_port}/page");
+        let results = reads_without_a_lane(&url).await;
+        let heads = proxied.lock().unwrap().clone();
+        let direct = origin.lock().unwrap().len();
+        origin_task.abort();
+        proxy_task.abort();
+        assert!(
+            results.iter().all(|result| matches!(result, Ok(200)))
+                && heads.len() >= 2
+                && heads
+                    .iter()
+                    .all(|head| head.starts_with(&format!("GET {url} ")))
+                && direct == 0,
+            "{results:?}; the proxy saw {heads:?}; the origin took {direct} request(s)"
+        );
+    }
+
+    /// A host `NO_PROXY` exempts is read directly on both reads, whatever the
+    /// proxy it is exempted from: a proxy URL v5 cannot read is not read for
+    /// it.
+    #[tokio::test]
+    async fn a_host_no_proxy_exempts_is_read_directly_past_a_proxy_v5_cannot_read() {
+        install_config(|config| config.proxy.from_environment = true);
+        let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
+        let (port, proxied, proxy_task) = socks5_server().await;
+        set_proxy_environment(&[
+            (
+                "HTTP_PROXY",
+                &format!("socks5://alice:pa/ss@127.0.0.1:{port}"),
+            ),
+            ("NO_PROXY", "127.0.0.1"),
+        ]);
+        let results = reads_without_a_lane(&format!("http://127.0.0.1:{origin_port}/page")).await;
+        let (direct, through) = (origin.lock().unwrap().len(), proxied.lock().unwrap().len());
+        origin_task.abort();
+        proxy_task.abort();
+        assert!(
+            results.iter().all(|result| matches!(result, Ok(200))) && direct >= 2 && through == 0,
+            "{results:?}; the origin took {direct} request(s), the proxy {through}"
+        );
+    }
+
+    /// An environment proxy whose URL v5 cannot read (a raw '/', '#' or '?'
+    /// in the password) fails a read given no lane, document or one-shot, as
+    /// a proxy configuration error that names the proxy without its
+    /// credentials, and neither the origin nor the proxy is contacted.
     #[tokio::test]
     async fn an_environment_proxy_v5_cannot_read_fails_a_read_without_a_lane() {
-        environment_config();
+        install_config(|config| config.proxy.from_environment = true);
         let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
         let (port, proxied, proxy_task) = socks5_server().await;
         let url = format!("http://127.0.0.1:{origin_port}/page");
-        for (value, named) in [
-            // A raw '/' in the password ends the address early.
-            (
-                format!("socks5://alice:pa/ss@127.0.0.1:{port}"),
-                format!("HTTP_PROXY: cannot read proxy URL \"socks5://***@127.0.0.1:{port}\": "),
-            ),
-            // The url crate reads these two; the transport does not.
-            (
-                format!("SOCKS5://alice:s3cret@127.0.0.1:{port}"),
-                format!("HTTP_PROXY: cannot read proxy URL \"SOCKS5://***@127.0.0.1:{port}\": "),
-            ),
-            (
-                format!("socks5://127.0.0.1:{port} "),
-                format!("HTTP_PROXY: cannot read proxy URL \"socks5://127.0.0.1:{port} \": "),
-            ),
-        ] {
-            set_http_proxy(&value);
-            let result = once_without_a_lane(&url).await;
-            let report = format!(
-                "{value:?}: {result:?}; the origin took {} direct request(s), the proxy {} connection(s)",
-                origin.lock().unwrap().len(),
-                proxied.lock().unwrap().len()
-            );
-            let Err(FetchError::ProxyConfig(message)) = &result else {
-                panic!("{report}");
-            };
-            assert!(
-                message.starts_with(&named),
-                "the error names the variable and the proxy: {report}"
-            );
-            assert!(
-                ["alice", "pa/ss", "s3cret"]
-                    .iter()
-                    .all(|secret| !message.contains(secret)),
-                "the error echoes the credentials: {report}"
-            );
+        for password in ["pa/ss", "pa#ss", "pa?ss"] {
+            set_proxy_environment(&[(
+                "HTTP_PROXY",
+                &format!("socks5://alice:{password}@127.0.0.1:{port}"),
+            )]);
+            for result in reads_without_a_lane(&url).await {
+                let report = format!(
+                    "{password}: {result:?}; the origin took {} direct request(s), the proxy {} connection(s)",
+                    origin.lock().unwrap().len(),
+                    proxied.lock().unwrap().len()
+                );
+                let Err(FetchError::ProxyConfig(message)) = &result else {
+                    panic!("{report}");
+                };
+                assert!(
+                    message.contains(&format!("://***@127.0.0.1:{port}\"")),
+                    "the error names the proxy: {report}"
+                );
+                assert!(
+                    !message.contains("alice") && !message.contains(password),
+                    "the error echoes the credentials: {report}"
+                );
+            }
         }
         origin_task.abort();
         proxy_task.abort();
@@ -1172,37 +1345,137 @@ mod tests {
         assert!(proxied.lock().unwrap().is_empty(), "{:?}", proxied.lock());
     }
 
-    // Negative: an environment proxy the transport reads still carries a read
-    // handed no proxy; a value without a scheme is an HTTP proxy.
+    // Negative: an environment proxy v5 reads carries both reads given no
+    // lane (a value without a scheme is an HTTP proxy), and a host NO_PROXY
+    // exempts from it is still read directly.
     #[tokio::test]
     async fn a_readable_environment_proxy_still_carries_a_read_without_a_lane() {
-        environment_config();
+        install_config(|config| config.proxy.from_environment = true);
         let (origin_port, origin, origin_task) = http_server("Direct from the origin").await;
         let (socks_port, socks, socks_task) = socks5_server().await;
         let (http_port, http, http_task) = http_server("Through the proxy").await;
         let url = format!("http://127.0.0.1:{origin_port}/page");
-        set_http_proxy(&format!("socks5://alice:s3cret@127.0.0.1:{socks_port}"));
-        let result = once_without_a_lane(&url).await;
+        set_proxy_environment(&[(
+            "HTTP_PROXY",
+            &format!("socks5://alice:s3cret@127.0.0.1:{socks_port}"),
+        )]);
+        let results = reads_without_a_lane(&url).await;
         let seen = socks.lock().unwrap().clone();
         assert!(
-            matches!(result, Ok(200))
-                && !seen.is_empty()
+            results.iter().all(|result| matches!(result, Ok(200)))
+                && seen.len() >= 2
                 && seen.iter().all(|credentials| credentials == "alice:s3cret"),
-            "socks5: {result:?}; the proxy saw {seen:?}"
+            "socks5: {results:?}; the proxy saw {seen:?}"
         );
-        set_http_proxy(&format!("127.0.0.1:{http_port}"));
-        let result = once_without_a_lane(&url).await;
+        set_proxy_environment(&[("HTTP_PROXY", &format!("127.0.0.1:{http_port}"))]);
+        let results = reads_without_a_lane(&url).await;
         let heads = http.lock().unwrap().clone();
-        let target = format!("GET http://127.0.0.1:{origin_port}/");
         assert!(
-            matches!(result, Ok(200))
-                && !heads.is_empty()
-                && heads.iter().all(|head| head.starts_with(&target)),
-            "http: {result:?}; the proxy saw {heads:?}"
+            results.iter().all(|result| matches!(result, Ok(200)))
+                && heads.len() >= 2
+                && heads
+                    .iter()
+                    .all(|head| head.starts_with(&format!("GET {url} "))),
+            "http: {results:?}; the proxy saw {heads:?}"
+        );
+        assert!(origin.lock().unwrap().is_empty(), "{:?}", origin.lock());
+        set_proxy_environment(&[
+            ("HTTP_PROXY", &format!("http://127.0.0.1:{http_port}")),
+            ("NO_PROXY", "127.0.0.1"),
+        ]);
+        let results = reads_without_a_lane(&url).await;
+        let (direct, through) = (
+            origin.lock().unwrap().len(),
+            http.lock().unwrap().len() - heads.len(),
         );
         origin_task.abort();
         socks_task.abort();
         http_task.abort();
-        assert!(origin.lock().unwrap().is_empty(), "{:?}", origin.lock());
+        assert!(
+            results.iter().all(|result| matches!(result, Ok(200))) && direct >= 2 && through == 0,
+            "NO_PROXY: {results:?}; the origin took {direct} request(s), the proxy {through}"
+        );
+    }
+
+    /// A read that starts direct dials no redirect hop its route sends
+    /// through a proxy. With `HTTPS_PROXY` alone, an `http://` page that
+    /// redirects to `https://` fails both reads given no lane as a proxy
+    /// configuration error that names the hop's origin, and the `https://`
+    /// target gets no connection, direct or through the proxy. Negatives:
+    /// with `HTTP_PROXY` set too, the proxy carries both hops; with no proxy
+    /// anywhere, the redirect is followed direct.
+    #[tokio::test]
+    async fn a_read_that_starts_direct_dials_no_hop_its_route_proxies() {
+        install_config(|config| config.proxy.from_environment = true);
+        let (target_port, target, target_task) = counting_listener().await;
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: https://localhost:{target_port}/page\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let (origin_port, origin, origin_task) = reply_server(redirect.clone()).await;
+        // As a proxy it answers the first hop with the same redirect, and the
+        // CONNECT for the second with a 302, which refuses the tunnel.
+        let (proxy_port, proxied, proxy_task) = reply_server(redirect).await;
+        let proxy = format!("http://127.0.0.1:{proxy_port}");
+        let url = format!("http://127.0.0.1:{origin_port}/start");
+        let connect = format!("CONNECT localhost:{target_port} ");
+        let taken = |log: &Log| std::mem::take(&mut *log.lock().unwrap());
+
+        set_proxy_environment(&[("HTTPS_PROXY", &proxy)]);
+        let results = reads_without_a_lane(&url).await;
+        let (direct, dialed, through) = (taken(&origin), taken(&target), taken(&proxied));
+        let hop = format!("redirect to https://localhost:{target_port} refused");
+        assert!(
+            results.iter().all(|result| matches!(
+                result,
+                Err(FetchError::ProxyConfig(message)) if message.contains(&hop)
+            )) && direct.len() >= 2
+                && dialed.is_empty()
+                && through.is_empty(),
+            "HTTPS_PROXY alone: {results:?}; the origin saw {} request(s), the target took {} \
+             connection(s), the proxy saw {through:?}",
+            direct.len(),
+            dialed.len()
+        );
+
+        set_proxy_environment(&[("HTTP_PROXY", &proxy), ("HTTPS_PROXY", &proxy)]);
+        let results = reads_without_a_lane(&url).await;
+        let (direct, dialed, through) = (taken(&origin), taken(&target), taken(&proxied));
+        let count = |prefix: &str| {
+            through
+                .iter()
+                .filter(|head| head.starts_with(prefix))
+                .count()
+        };
+        assert!(
+            results
+                .iter()
+                .all(|result| result.is_err() && !matches!(result, Err(FetchError::ProxyConfig(_))))
+                && count(&format!("GET {url} ")) >= 2
+                && count(&connect) >= 2
+                && direct.is_empty() && dialed.is_empty(),
+            "both proxies: {results:?}; the origin saw {} request(s), the target took {} \
+             connection(s), the proxy saw {through:?}",
+            direct.len(),
+            dialed.len()
+        );
+
+        set_proxy_environment(&[]);
+        let results = reads_without_a_lane(&url).await;
+        let (direct, dialed, through) = (taken(&origin), taken(&target), taken(&proxied));
+        origin_task.abort();
+        target_task.abort();
+        proxy_task.abort();
+        assert!(
+            results
+                .iter()
+                .all(|result| result.is_err() && !matches!(result, Err(FetchError::ProxyConfig(_))))
+                && direct.len() >= 2
+                && dialed.len() >= 2 && through.is_empty(),
+            "no proxy: {results:?}; the origin saw {} request(s), the target took {} \
+             connection(s), the proxy saw {through:?}",
+            direct.len(),
+            dialed.len()
+        );
     }
 }

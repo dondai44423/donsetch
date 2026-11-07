@@ -273,9 +273,10 @@ impl Fetcher {
             .await
     }
 
-    /// One request, optionally through a proxy. `use_jar=false` keeps
-    /// cookies out entirely: search engines get cookie-less requests so
-    /// egress lanes stay unlinked.
+    /// One request through `proxy`, or with `None` on the configured route,
+    /// as a document read without a lane. `use_jar=false` keeps cookies out
+    /// entirely: search engines get cookie-less requests so egress lanes stay
+    /// unlinked.
     pub async fn fetch_once_via(
         &self,
         url_str: &str,

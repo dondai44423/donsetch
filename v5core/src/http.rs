@@ -513,96 +513,10 @@ fn masked(raw: &str) -> String {
     }
 }
 
-/// The variables a client built without a proxy takes one from, each name
-/// in capitals before the same name in lowercase.
-const ENVIRONMENT_PROXIES: [[&str; 2]; 3] = [
-    ["HTTP_PROXY", "http_proxy"],
-    ["HTTPS_PROXY", "https_proxy"],
-    ["ALL_PROXY", "all_proxy"],
-];
-
-/// Checks the proxies a client built without one takes from the environment:
-/// from `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, each the first of the
-/// name in capitals and in lowercase that is set and holds Unicode, and none
-/// at all while `REQUEST_METHOD` is set. A value without `://` is an
-/// `http://` proxy; an empty or blank one is none. A value the transport
-/// cannot read, or that
-/// [`proxy_url`] cannot, is an error that names its variable and the proxy
-/// with its user name and password masked.
-pub fn environment_proxies() -> Result<(), String> {
-    environment_proxies_in(|name| std::env::var_os(name))
-}
-
-pub(crate) fn environment_proxies_in(
-    var: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Result<(), String> {
-    // The transport reads these itself (vendor/wreq/src/proxy/matcher.rs:
-    // Builder::from_env, get_first_env, Builder::build), and for a value it
-    // cannot read it keeps no proxy and returns no error, so the request
-    // would leave direct. wreq exposes none of that reading, so its rules are
-    // repeated here: nothing under CGI; per pair, the first name that holds
-    // Unicode, even an empty value.
-    if var("REQUEST_METHOD").is_some() {
-        return Ok(());
-    }
-    for names in ENVIRONMENT_PROXIES {
-        let Some((name, value)) = names
-            .into_iter()
-            .find_map(|name| Some((name, var(name)?.into_string().ok()?)))
-        else {
-            continue;
-        };
-        // A blank value is no proxy to the transport either.
-        if value.trim().is_empty() {
-            continue;
-        }
-        let url = if value.contains("://") {
-            value.clone()
-        } else {
-            format!("http://{value}")
-        };
-        proxy_url(&url).map_err(|error| format!("{name}: {error}"))?;
-        transport_reads(&value)
-            .map_err(|why| format!("{name}: cannot read proxy URL {:?}: {why}", masked(&value)))?;
-    }
-    Ok(())
-}
-
-/// Whether the transport takes `value`, read from the environment, as a
-/// proxy, and why not.
-fn transport_reads(value: &str) -> Result<(), String> {
-    // vendor/wreq/src/proxy/matcher.rs, parse_env_uri: an `http::Uri`; `http`
-    // and `https` in any case (http::Uri reads them so), the SOCKS schemes as
-    // spelled, none as `http`; a SOCKS proxy without a port gets ":1080".
-    let uri = value
-        .parse::<wreq::Uri>()
-        .map_err(|error| format!("the transport cannot parse it ({error})"))?;
-    let socks = match uri.scheme_str() {
-        None | Some("http" | "https") => false,
-        Some("socks4" | "socks4a" | "socks5" | "socks5h") => true,
-        Some(_) => {
-            return Err(
-                "the transport reads socks4, socks4a, socks5 and socks5h only in lowercase".into(),
-            );
-        }
-    };
-    let Some(authority) = uri.authority() else {
-        return Err("no host".into());
-    };
-    if socks
-        && authority.port().is_none()
-        && format!("{authority}:1080").parse::<wreq::Uri>().is_err()
-    {
-        return Err("the transport cannot add the SOCKS port 1080 to it".into());
-    }
-    Ok(())
-}
-
 impl Wire {
     /// A client that presents `identity` coherently, through an egress proxy (`http://`, `https://`,
-    /// `socks5://` URL, credentials in the userinfo). With `None` it takes the proxy the
-    /// environment names ([`environment_proxies`]), and is direct when there is none; an
-    /// environment proxy that cannot be read is an error.
+    /// `socks5://` URL, credentials in the userinfo), or direct when `None`: the proxy variables of
+    /// the environment are not read.
     pub fn via(identity: &Identity, proxy: Option<&str>) -> Result<Self, String> {
         Self::build(identity, None, proxy)
     }
@@ -661,11 +575,11 @@ impl Wire {
                 wreq::Proxy::all(url).map_err(|error| format!("proxy: {}", error.without_uri()))?;
             builder = builder.proxy(proxy);
         } else {
-            // With no proxy handed over, wreq's builder reads one from the
-            // environment itself (auto_sys_proxy, on unless proxy() or
-            // no_proxy() is called) and would dial direct in place of a value
-            // it cannot read.
-            environment_proxies().map_err(|error| format!("proxy: {error}"))?;
+            // wreq's builder otherwise reads HTTP_PROXY, HTTPS_PROXY and
+            // ALL_PROXY itself (auto_sys_proxy, on unless proxy() or
+            // no_proxy() is called). The caller chose the route: with none
+            // handed over, the client is direct.
+            builder = builder.no_proxy();
         }
         if let Some(mut emulation) = identity.emulation() {
             if identity.name.starts_with("chrome") {
