@@ -497,6 +497,191 @@ fn pages_past_the_cap_are_reported_not_read() {
     assert_eq!(crate::pdf::engine::MAX_PAGES, 500);
 }
 
+// ---------- OCR pass: what it renders, and how much at once ----------
+
+/// Serialize `objects` (bodies of objects 1..=n; object 1 is the
+/// catalog) into a PDF with a correct xref table.
+fn pdf_of_objects(objects: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes(),
+    );
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn stream_object(dict_entries: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = format!("<< /Length {} {dict_entries} >>\nstream\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+/// `n` Letter pages of Helvetica text whose ToUnicode map sends every
+/// printable byte into the private use area: each renders as clean Latin
+/// text and extracts as PUA glyph soup, so each is an OCR candidate.
+fn pua_text_pages_pdf(n: usize) -> Vec<u8> {
+    let cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n1 beginbfrange\n<20> <7E> <E020>\nendbfrange\nendcmap\nCMapName currentdict /CMapType get pop end\nend";
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 5 + 2 * i)).collect();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Count {n} /Kids [{}] >>", kids.join(" ")).into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 4 0 R >>".to_vec(),
+        stream_object("", cmap.as_bytes()),
+    ];
+    for i in 0..n {
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                6 + 2 * i
+            )
+            .into_bytes(),
+        );
+        objects.push(stream_object(
+            "",
+            b"BT /F1 28 Tf 72 720 Td 48 TL (THE QUICK BROWN FOX JUMPS) Tj T* (OVER THE LAZY DOG 12345) Tj T* (SCANNED INVOICE TOTAL DUE) Tj ET",
+        ));
+    }
+    pdf_of_objects(&objects)
+}
+
+/// Clears the OCR stand-in when a test ends, pass or fail.
+struct OcrSeamGuard;
+
+impl Drop for OcrSeamGuard {
+    fn drop(&mut self) {
+        crate::pdf::ocr::test_ocr::clear();
+    }
+}
+
+// OCR that cannot run (feature off, ONNX Runtime not loadable, models not
+// fetchable) used to render every candidate page at 150 dpi first and
+// hold all the bitmaps, then throw them away.
+#[test]
+fn ocr_that_cannot_run_renders_no_page() {
+    let _guard = OcrSeamGuard;
+    crate::pdf::ocr::test_ocr::unavailable("model download failed");
+    crate::pdf::pixels::ocr_probe::take();
+    let parsed = crate::pdf::parse(&pua_text_pages_pdf(3)).expect("parse");
+    let (made, _) = crate::pdf::pixels::ocr_probe::take();
+    assert_eq!(made, 0, "pages rendered for an OCR that cannot run");
+    assert!(
+        parsed
+            .notes
+            .iter()
+            .any(|n| n.contains("3 page(s)") && n.contains("OCR was unavailable")),
+        "notes={:?}",
+        parsed.notes
+    );
+}
+
+// With OCR running, all candidate pages used to be rendered before the
+// first was recognized, so every bitmap was alive at once.
+#[test]
+fn ocr_holds_one_page_of_pixels_at_a_time() {
+    let _guard = OcrSeamGuard;
+    // A different line per page, mid-page: identical lines in the same
+    // place on every page would be dropped as running furniture.
+    let mut words = ["ALPHA", "BRAVO", "CHARLIE"].into_iter();
+    crate::pdf::ocr::test_ocr::fake(move |bitmap| {
+        let word = words.next().unwrap_or("EXTRA");
+        let y = bitmap.page_h_pt / 2.0;
+        vec![crate::pdf::ocr::OcrLine {
+            x0: 72.0,
+            y0: y,
+            x1: 72.0 + bitmap.page_w_pt / 2.0,
+            y1: y + 28.0,
+            text: format!("RECOGNIZED {word} PARAGRAPH TEXT"),
+            confidence: 0.9,
+        }]
+    });
+    crate::pdf::pixels::ocr_probe::take();
+    let parsed = crate::pdf::parse(&pua_text_pages_pdf(3)).expect("parse");
+    let (made, peak) = crate::pdf::pixels::ocr_probe::take();
+    assert_eq!(made, 3, "one render per candidate page");
+    assert_eq!(peak, 1, "OCR bitmaps alive at once");
+    let ocr: Vec<(usize, bool)> = parsed.pages_meta.iter().map(|m| (m.page, m.ocr)).collect();
+    assert_eq!(ocr, [(0, true), (1, true), (2, true)]);
+    let text = all_block_text(&parsed.blocks);
+    for word in ["ALPHA", "BRAVO", "CHARLIE"] {
+        assert!(
+            text.contains(&format!("RECOGNIZED {word}")),
+            "{word} missing: {text:?}"
+        );
+    }
+}
+
+/// An image-only (scanned) copy of `text_pdf`'s first page: its 100 dpi
+/// render as a grayscale image XObject, and no text layer.
+#[cfg(feature = "ocr")]
+fn scanned_copy_pdf(text_pdf: &[u8]) -> Vec<u8> {
+    let bmp = crate::pdf::engine::rasterize_page_at(text_pdf, 0, 100.0)
+        .expect("reopen")
+        .expect("render");
+    // BGRA to luma, the weights `PageBitmap::ink_mask` uses.
+    let (pixels, _) = bmp.buf.as_chunks::<4>();
+    let gray: Vec<u8> = pixels
+        .iter()
+        .map(|[b, g, r, _]| ((114 * *b as u32 + 587 * *g as u32 + 299 * *r as u32) / 1000) as u8)
+        .collect();
+    let content = b"q 612 0 0 792 0 0 cm /Im0 Do Q";
+    pdf_of_objects(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        stream_object(
+            &format!(
+                "/Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /DeviceGray /BitsPerComponent 8",
+                bmp.w, bmp.h
+            ),
+            &gray,
+        ),
+        stream_object("", content),
+    ])
+}
+
+// Negative case: a scan that OCR can read still gets its text. Needs the
+// English OCR models in DONSETCH_CACHE_DIR/ocr and a loadable ONNX
+// Runtime; skips when the models are missing.
+#[cfg(feature = "ocr")]
+#[test]
+fn a_scanned_page_is_still_read_by_ocr() {
+    let dir = crate::pdf::ocr::ocr_cache_dir();
+    if !(dir.join("en_pp-ocrv5_mobile_rec.onnx").exists()
+        && dir.join("pp-ocrv5_mobile_det.onnx").exists())
+    {
+        crate::diag!("SKIP: OCR models missing in {}", dir.display());
+        return;
+    }
+    let scan = scanned_copy_pdf(&pua_text_pages_pdf(1));
+    let parsed = crate::pdf::parse(&scan).expect("parse");
+    let text = all_block_text(&parsed.blocks);
+    assert!(
+        text.contains("QUICK BROWN FOX") && text.contains("LAZY DOG"),
+        "OCR text missing: {text:?} notes={:?}",
+        parsed.notes
+    );
+    let ocr: Vec<(usize, bool)> = parsed.pages_meta.iter().map(|m| (m.page, m.ocr)).collect();
+    assert_eq!(ocr, [(0, true)]);
+}
+
 // ---------- integration: extract() treats PDF bytes natively ----------
 
 #[test]

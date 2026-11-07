@@ -399,13 +399,16 @@ fn rasterize_page(
     }
 }
 
-/// Re-open a document and rasterize selected pages (OCR orchestration
-/// needs high-dpi pixels after the main walk has closed the doc).
-pub fn rasterize_pages(
+/// Re-open a document and rasterize page `index` (OCR orchestration
+/// needs high-dpi pixels after the main walk has closed the doc). The
+/// global PDFium lock is held for this call only, so a caller can render,
+/// use and drop one page before the next. `Ok(None)` when the page is
+/// out of range, does not load, or is over the per-page pixel cap.
+pub fn rasterize_page_at(
     bytes: &[u8],
-    indices: &[usize],
+    index: usize,
     dpi: f32,
-) -> Result<Vec<Option<super::pixels::PageBitmap>>, LoadError> {
+) -> Result<Option<super::pixels::PageBitmap>, LoadError> {
     if bytes.len() < 5 || !bytes.starts_with(b"%PDF-") {
         return Err(LoadError::NotPdf);
     }
@@ -432,29 +435,28 @@ pub fn rasterize_pages(
         }
         let _guard = DocGuard2(doc);
         let count = FPDF_GetPageCount(doc).max(0) as usize;
-        let mut out = Vec::with_capacity(indices.len());
-        for &pi in indices {
-            if pi >= count {
-                out.push(None);
-                continue;
-            }
-            let page = FPDF_LoadPage(doc, pi as i32);
-            if page.is_null() {
-                out.push(None);
-                continue;
-            }
-            struct Pg2(FpdfPage);
-            impl Drop for Pg2 {
-                fn drop(&mut self) {
-                    unsafe { FPDF_ClosePage(self.0) };
-                }
-            }
-            let _pg = Pg2(page);
-            let w = FPDF_GetPageWidthF(page) as f32;
-            let h = FPDF_GetPageHeightF(page) as f32;
-            out.push(rasterize_page(page, w, h, dpi));
+        if index >= count {
+            return Ok(None);
         }
-        Ok(out)
+        let page = FPDF_LoadPage(doc, index as i32);
+        if page.is_null() {
+            return Ok(None);
+        }
+        struct Pg2(FpdfPage);
+        impl Drop for Pg2 {
+            fn drop(&mut self) {
+                unsafe { FPDF_ClosePage(self.0) };
+            }
+        }
+        let _pg = Pg2(page);
+        let w = FPDF_GetPageWidthF(page) as f32;
+        let h = FPDF_GetPageHeightF(page) as f32;
+        let bitmap = rasterize_page(page, w, h, dpi);
+        #[cfg(test)]
+        if let Some(b) = &bitmap {
+            super::pixels::ocr_probe::rendered(b);
+        }
+        Ok(bitmap)
     }
 }
 

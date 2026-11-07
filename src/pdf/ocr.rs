@@ -92,6 +92,36 @@ pub fn max_pages() -> usize {
     if n == 0 { 25 } else { n as usize }
 }
 
+/// Whether [`ocr_page`] can recognize a page now: the tier is enabled,
+/// the `ocr` feature is compiled, ONNX Runtime loads, and the recognizer
+/// `script_hint` starts with initializes, its models fetched on first use
+/// as [`ocr_page`] would. `Err` carries the reason. A recognizer keeps its
+/// first outcome for the life of the process, so a repeat call is cheap.
+pub fn ready(script_hint: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(r) = test_ocr::ready() {
+        return r;
+    }
+    if !enabled() {
+        return Err("ocr disabled".to_string());
+    }
+    #[cfg(feature = "ocr")]
+    {
+        // The "auto" cascade in `ocr_page` starts with the English recognizer.
+        let kind = match script_hint {
+            "zh" => imp::RecKind::Zh,
+            "deva" => imp::RecKind::Deva,
+            _ => imp::RecKind::En,
+        };
+        imp::init(&kind)
+    }
+    #[cfg(not(feature = "ocr"))]
+    {
+        let _ = script_hint;
+        Err("ocr feature not compiled".to_string())
+    }
+}
+
 #[cfg(feature = "ocr")]
 mod imp {
     use super::*;
@@ -295,6 +325,11 @@ mod imp {
         }
         Ok(lines)
     }
+
+    /// Initialize the recognizer for `kind` without running it.
+    pub fn init(kind: &RecKind) -> Result<(), String> {
+        engine(kind).map(|_| ())
+    }
 }
 
 /// An OCR'd line in PDF point space (y-down).
@@ -318,6 +353,10 @@ pub fn ocr_page(
     bitmap: &PageBitmap,
     script_hint: &str,
 ) -> Result<(Vec<OcrLine>, &'static str), String> {
+    #[cfg(test)]
+    if let Some(r) = test_ocr::recognize(bitmap) {
+        return r.map(|lines| (lines, "en"));
+    }
     if !enabled() {
         return Err("ocr disabled".to_string());
     }
@@ -354,6 +393,10 @@ pub fn ocr_page(
     _bitmap: &PageBitmap,
     _script_hint: &str,
 ) -> Result<(Vec<OcrLine>, &'static str), String> {
+    #[cfg(test)]
+    if let Some(r) = test_ocr::recognize(_bitmap) {
+        return r.map(|lines| (lines, "en"));
+    }
     Err("ocr feature not compiled".to_string())
 }
 
@@ -409,4 +452,49 @@ pub fn mean_confidence(ocr_lines: &[OcrLine]) -> f32 {
     }
     let s: f32 = ocr_lines.iter().map(|l| l.confidence).sum();
     s / ocr_lines.len() as f32
+}
+
+/// Test seam: a stand-in for the ONNX recognizer on the current thread.
+/// While one is set, [`ready`] and [`ocr_page`] answer from it instead of
+/// the tier switch, the feature, ONNX Runtime and the models.
+#[cfg(test)]
+pub(crate) mod test_ocr {
+    use super::{OcrLine, PageBitmap};
+    use std::cell::RefCell;
+
+    type Fake = Box<dyn FnMut(&PageBitmap) -> Vec<OcrLine>>;
+
+    thread_local! {
+        static SEAM: RefCell<Option<Result<Fake, String>>> = const { RefCell::new(None) };
+    }
+
+    /// OCR cannot run: both entry points fail with `why`.
+    pub(crate) fn unavailable(why: &str) {
+        SEAM.set(Some(Err(why.to_string())));
+    }
+
+    /// OCR runs `recognize` on each page it is handed.
+    pub(crate) fn fake(recognize: impl FnMut(&PageBitmap) -> Vec<OcrLine> + 'static) {
+        SEAM.set(Some(Ok(Box::new(recognize))));
+    }
+
+    pub(crate) fn clear() {
+        SEAM.set(None);
+    }
+
+    pub(super) fn ready() -> Option<Result<(), String>> {
+        SEAM.with_borrow(|s| {
+            s.as_ref()
+                .map(|r| r.as_ref().map(|_| ()).map_err(Clone::clone))
+        })
+    }
+
+    pub(super) fn recognize(bitmap: &PageBitmap) -> Option<Result<Vec<OcrLine>, String>> {
+        SEAM.with_borrow_mut(|s| {
+            s.as_mut().map(|r| match r {
+                Ok(f) => Ok(f(bitmap)),
+                Err(why) => Err(why.clone()),
+            })
+        })
+    }
 }

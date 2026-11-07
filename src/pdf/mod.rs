@@ -304,10 +304,23 @@ pub(crate) fn parse_with(bytes: &[u8], max_pages: usize) -> Result<ParsedPdf, Pd
     }
     if !needs_ocr.is_empty() && ocr::enabled() {
         needs_ocr.truncate(ocr::max_pages());
-        match engine::rasterize_pages(bytes, &needs_ocr, 150.0) {
-            Ok(bitmaps) => {
-                for (slot, pi) in needs_ocr.iter().enumerate() {
-                    let Some(bmp) = &bitmaps[slot] else {
+        // A 150 dpi render is up to 80 Mpx (320 MB of BGRA): nothing is
+        // rendered unless OCR can run, and a page's pixels are dropped
+        // before the next page renders. The PDFium lock is held while a
+        // page renders, not while it is recognized.
+        match ocr::ready(script_hint) {
+            Ok(()) => {
+                for pi in &needs_ocr {
+                    let pixels = match engine::rasterize_page_at(bytes, *pi, 150.0) {
+                        Ok(pixels) => pixels,
+                        Err(e) => {
+                            if crate::config::cfg().debug.pdf {
+                                crate::diag!("[ocr] rasterize failed: {e:?}");
+                            }
+                            break;
+                        }
+                    };
+                    let Some(bmp) = &pixels else {
                         continue;
                     };
                     let t0 = std::time::Instant::now();
@@ -362,8 +375,9 @@ pub(crate) fn parse_with(bytes: &[u8], max_pages: usize) -> Result<ParsedPdf, Pd
                 }
             }
             Err(e) => {
+                ocr_failed = true;
                 if crate::config::cfg().debug.pdf {
-                    crate::diag!("[ocr] rasterize_pages failed: {e:?}");
+                    crate::diag!("[ocr] not run, no page rendered: {e}");
                 }
             }
         }
