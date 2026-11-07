@@ -190,7 +190,7 @@ pub async fn run(args: &[String]) {
         (
             "warn",
             format!(
-                "{} browser unavailable: screenshot, actions and login will not work",
+                "{} browser unavailable: screenshot and login will not work",
                 cli::red("warn")
             ),
         )
