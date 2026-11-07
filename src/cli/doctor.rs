@@ -1466,14 +1466,25 @@ fn check_onnx() -> CheckResult {
             // workflow's no-AVX doctor run assert nothing about the
             // runtime (review of #300). Same payload probe on every
             // platform.
-            match crate::onnx::ensure_loaded() {
-                Ok(()) => CheckResult::Pass(format!("{cpu}, shared library present")),
-                Err(e) if e.contains("not found") => CheckResult::Warn(format!(
-                    "{cpu} but shared library missing : reinstall donsetch"
-                )),
-                Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e),
-            }
+            onnx_probe_verdict(cpu, crate::onnx::ensure_loaded())
         }
+    }
+}
+
+/// The ONNX Runtime check's verdict on a load `outcome`, with `cpu`
+/// leading the line. A runtime that is not found is a warning; any
+/// other load error fails the check with that error's own text.
+#[cfg(any(feature = "ocr", feature = "rerank"))]
+fn onnx_probe_verdict(cpu: &str, outcome: Result<(), String>) -> CheckResult {
+    match outcome {
+        Ok(()) => CheckResult::Pass(format!("{cpu}, shared library present")),
+        // The exact message, not any "not found": a loader error can
+        // say it too ("version `GLIBCXX_3.4.32' not found"), and then
+        // the runtime is present and reinstalling does not help.
+        Err(e) if e == crate::onnx::ONNX_NOT_FOUND_MSG => CheckResult::Warn(format!(
+            "{cpu} but shared library missing : reinstall donsetch"
+        )),
+        Err(e) => CheckResult::Fail("ONNX payload probe failed".into(), e),
     }
 }
 
@@ -3058,5 +3069,36 @@ mod bright_probe_tests {
     fn json_escape_handles_windows_paths() {
         let path = r#"C:\Users\A "B"\donsetch.exe"#;
         assert_eq!(json_escape(path), serde_json::to_string(path).unwrap());
+    }
+}
+
+#[cfg(all(test, any(feature = "ocr", feature = "rerank")))]
+mod onnx_verdict_tests {
+    use super::{CheckResult, onnx_probe_verdict};
+
+    /// A loader error that says "not found" names a runtime that is
+    /// present: it fails the check with the loader's text.
+    #[test]
+    fn a_loader_error_that_says_not_found_fails_with_its_text() {
+        let e = "Failed to load ONNX Runtime from /opt/donsetch/libonnxruntime.so: \
+                 dlopen failed: /lib/x86_64-linux-gnu/libstdc++.so.6: version \
+                 `GLIBCXX_3.4.32' not found (required by /opt/donsetch/libonnxruntime.so)";
+        match onnx_probe_verdict("AVX detected", Err(e.to_string())) {
+            CheckResult::Fail(_, detail) => assert_eq!(detail, e),
+            other => panic!("expected a failed check with the loader's text, got {other:?}"),
+        }
+    }
+
+    /// A runtime that is not found is still the reinstall warning.
+    #[test]
+    fn a_runtime_that_is_not_found_warns_to_reinstall() {
+        let verdict = onnx_probe_verdict(
+            "AVX detected",
+            Err(crate::onnx::ONNX_NOT_FOUND_MSG.to_string()),
+        );
+        assert!(
+            matches!(&verdict, CheckResult::Warn(w) if w == "AVX detected but shared library missing : reinstall donsetch"),
+            "{verdict:?}"
+        );
     }
 }
