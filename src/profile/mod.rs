@@ -561,6 +561,13 @@ pub(crate) fn probe_version_string_at_path_result(path: &str) -> Result<String, 
 }
 
 fn probe_version_string_at_path_uncached(path: &str) -> Result<String, String> {
+    // Windows: `chrome.exe --version` neither prints nor exits (a GUI subsystem
+    // binary), so the spawn below would burn its whole timeout on every
+    // process. The file's own version resource answers without launching it.
+    #[cfg(windows)]
+    if let Some(banner) = pe_version::banner(std::path::Path::new(path)) {
+        return Ok(banner);
+    }
     let mut cmd = std::process::Command::new(path);
     cmd.arg("--version");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -675,6 +682,12 @@ mod probe_cache_tests {
 }
 
 mod version_probe;
+
+// Windows reads the browser's version out of the file instead of running it
+// (`chrome.exe --version` never answers there); the reader is portable, so every
+// platform's suite exercises it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pe_version;
 
 /// Capture stdout and process completion under one post-spawn deadline.
 /// OS spawn and teardown latency are not a hard real-time guarantee.
