@@ -713,12 +713,31 @@ fn decode_screenshot_data(data: &str) -> Result<Vec<u8>, FetchError> {
 /// How long a page may take to reach `document.readyState === complete`.
 const LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a running browser may take to open its DevTools page target.
+const START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Stderr lines a launch-failure message carries at most.
+const STDERR_TAIL_LINES: usize = 12;
+
+/// Characters kept of each stderr line a launch-failure message carries.
+const STDERR_LINE_CHARS: usize = 200;
+
+/// Bytes of one stderr line held while reading it; the rest of a longer
+/// line is discarded.
+const STDERR_LINE_BYTES: usize = 4096;
+
+/// How long a launch that saw the browser exit waits for the rest of its
+/// stderr.
+const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A throwaway headless browser. One per capture; killed on drop.
 pub struct HeadlessSession {
     child: tokio::process::Child,
     cdp: cdp::Cdp,
     profile: PathBuf,
     guard: Option<cdp::RequestGuard>,
+    /// Keeps the browser's stderr drained until the session ends.
+    _stderr: StderrTail,
 }
 
 impl HeadlessSession {
@@ -858,8 +877,19 @@ impl HeadlessSession {
 }
 
 /// Launch the resolved browser headless with a throwaway profile and
-/// connect to its first page target.
+/// connect to its first page target. A browser that exits unsuccessfully
+/// before its DevTools endpoint is up fails the launch at once, with the
+/// last lines it wrote to stderr; otherwise the launch waits up to
+/// `START_DEADLINE` for the endpoint.
 pub async fn launch_headless(binary: &Path) -> Result<HeadlessSession, String> {
+    launch_headless_within(binary, START_DEADLINE).await
+}
+
+/// `launch_headless` with the DevTools deadline as a parameter.
+async fn launch_headless_within(
+    binary: &Path,
+    deadline: std::time::Duration,
+) -> Result<HeadlessSession, String> {
     let profile = temporary_profile_dir();
     std::fs::create_dir_all(&profile).map_err(|e| format!("browser profile: {e}"))?;
     let port = {
@@ -884,14 +914,19 @@ pub async fn launch_headless(binary: &Path) -> Result<HeadlessSession, String> {
         .arg("--window-size=1280,800")
         .arg("about:blank")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| format!("launch browser: {e}"))?;
     let cleanup = |child: &mut tokio::process::Child, profile: &Path| {
         let _ = child.start_kill();
         let _ = std::fs::remove_dir_all(profile);
     };
-    let ws = match page_ws(port, 30_000).await {
+    let Some(pipe) = child.stderr.take() else {
+        cleanup(&mut child, &profile);
+        return Err("launch browser: no stderr pipe".into());
+    };
+    let mut stderr = StderrTail::spawn(pipe);
+    let ws = match page_ws(port, &mut child, &mut stderr, deadline).await {
         Ok(ws) => ws,
         Err(e) => {
             cleanup(&mut child, &profile);
@@ -910,13 +945,21 @@ pub async fn launch_headless(binary: &Path) -> Result<HeadlessSession, String> {
         cdp,
         profile,
         guard: None,
+        _stderr: stderr,
     })
 }
 
-/// The DevTools ws URL of the first page target (`/json/list`), or an
-/// error on the deadline. The client here runs inside the tokio
-/// runtime driving the caller, so it must stay async.
-async fn page_ws(port: u16, total_ms: u64) -> Result<String, String> {
+/// The DevTools ws URL of the first page target (`/json/list`). Fails as
+/// soon as `child` has exited unsuccessfully, naming its exit status and
+/// what it wrote to stderr last, or once `deadline` has passed. The
+/// client here runs inside the tokio runtime driving the caller, so it
+/// must stay async.
+async fn page_ws(
+    port: u16,
+    child: &mut tokio::process::Child,
+    stderr: &mut StderrTail,
+    deadline: std::time::Duration,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -935,10 +978,120 @@ async fn page_ws(port: u16, total_ms: u64) -> Result<String, String> {
         {
             return Ok(ws.to_string());
         }
-        if start.elapsed().as_millis() as u64 > total_ms {
+        // A browser that died can never open DevTools: report it now,
+        // with its own words, instead of polling a dead port until the
+        // deadline. A clean exit keeps polling, because a launcher that
+        // hands the browser to a background process and exits 0 still
+        // gets its endpoint.
+        if let Ok(Some(status)) = child.try_wait()
+            && !status.success()
+        {
+            stderr.settle(STDERR_SETTLE).await;
+            return Err(format!(
+                "browser exited before opening DevTools ({status}); {}",
+                stderr.describe()
+            ));
+        }
+        if start.elapsed() > deadline {
             return Err("timeout waiting for the browser to start".into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// A launched browser's stderr, read for as long as the browser runs so
+/// it never blocks on a full pipe. Keeps only the last
+/// `STDERR_TAIL_LINES` non-empty lines, each cut to `STDERR_LINE_CHARS`
+/// characters. Dropping it stops the reader.
+struct StderrTail {
+    lines: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl StderrTail {
+    fn spawn<R>(stderr: R) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES),
+        ));
+        let sink = std::sync::Arc::clone(&lines);
+        let reader = tokio::spawn(async move {
+            let mut stderr = tokio::io::BufReader::new(stderr);
+            let mut line = Vec::new();
+            while let Ok(true) = read_capped_line(&mut stderr, &mut line).await {
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let mut lines = sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if lines.len() == STDERR_TAIL_LINES {
+                    lines.pop_front();
+                }
+                lines.push_back(text.chars().take(STDERR_LINE_CHARS).collect());
+            }
+        });
+        Self { lines, reader }
+    }
+
+    /// Wait at most `grace` for the reader to reach the end of the
+    /// stream, so lines written just before an exit are kept.
+    async fn settle(&mut self, grace: std::time::Duration) {
+        if !self.reader.is_finished() {
+            let _ = tokio::time::timeout(grace, &mut self.reader).await;
+        }
+    }
+
+    /// `browser said: <line> | <line>`, oldest first, or `browser wrote
+    /// nothing to stderr` when no non-empty line was read.
+    fn describe(&self) -> String {
+        let lines = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lines.is_empty() {
+            "browser wrote nothing to stderr".into()
+        } else {
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            format!("browser said: {}", lines.join(" | "))
+        }
+    }
+}
+
+impl Drop for StderrTail {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// Read one `\n`-terminated line into `line`, keeping at most
+/// `STDERR_LINE_BYTES` of it and discarding the rest. `Ok(false)` at the
+/// end of the stream.
+async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    use tokio::io::AsyncBufReadExt as _;
+    line.clear();
+    let mut any = false;
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            return Ok(any);
+        }
+        any = true;
+        let end = bytes.iter().position(|&b| b == b'\n');
+        let taken = end.map_or(bytes.len(), |i| i + 1);
+        let room = STDERR_LINE_BYTES.saturating_sub(line.len());
+        line.extend_from_slice(&bytes[..taken.min(room)]);
+        reader.consume(taken);
+        if end.is_some() {
+            return Ok(true);
+        }
     }
 }
 
@@ -1362,6 +1515,7 @@ mod session_tests {
             cdp,
             profile: PathBuf::new(),
             guard: None,
+            _stderr: StderrTail::spawn(tokio::io::empty()),
         };
         let started = Instant::now();
         let error = session.navigate("http://127.0.0.1/").await.unwrap_err();
@@ -1374,5 +1528,108 @@ mod session_tests {
             error.starts_with("cdp link closed while the page loaded ("),
             "{error}"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// An executable stand-in for the browser that runs `body` under sh,
+    /// alone in a directory of its own.
+    #[cfg(unix)]
+    fn stub_browser(tag: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-launch-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("chromium");
+        std::fs::write(&stub, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    // The browser dies before DevTools comes up, the way Chromium does
+    // when its sandbox cannot start. The launch must say so at once, in
+    // the browser's own words, instead of timing out 30 s later.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_browser_that_dies_at_start_is_reported_at_once_with_its_stderr() {
+        let stub = stub_browser(
+            "dies",
+            "echo 'FATAL: No usable sandbox! (stub)' >&2\nexit 3",
+        );
+        let launched = tokio::time::timeout(Duration::from_secs(10), launch_headless(&stub)).await;
+        std::fs::remove_dir_all(stub.parent().unwrap()).ok();
+        let error = match launched {
+            Err(_) => panic!("a browser that exited at start was still unreported after 10 s"),
+            Ok(Ok(_)) => panic!("a stub that exits cannot start a browser session"),
+            Ok(Err(error)) => error,
+        };
+        assert!(
+            error.contains("FATAL: No usable sandbox! (stub)"),
+            "{error}"
+        );
+        assert!(error.contains("exit status: 3"), "{error}");
+    }
+
+    // Negative: a browser that is still running but slow keeps the whole
+    // start deadline and ends as a timeout, even when it writes to
+    // stderr meanwhile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_running_browser_without_devtools_still_times_out() {
+        let stub = stub_browser("alive", "echo 'still starting (stub)' >&2\nexec sleep 30");
+        let deadline = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let launched = launch_headless_within(&stub, deadline).await;
+        let waited = started.elapsed();
+        std::fs::remove_dir_all(stub.parent().unwrap()).ok();
+        let Err(error) = launched else {
+            panic!("a stub without DevTools cannot start a browser session");
+        };
+        assert_eq!(error, "timeout waiting for the browser to start");
+        assert!(waited >= deadline, "gave up after {waited:?}");
+    }
+
+    // Negative: a launcher that hands the browser to a background process
+    // exits 0 while the endpoint may still come up; that exit is not a
+    // crash and the launch keeps waiting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_clean_exit_during_start_keeps_waiting_for_devtools() {
+        let stub = stub_browser("handoff", "echo 'handed off (stub)' >&2\nexit 0");
+        let deadline = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let launched = launch_headless_within(&stub, deadline).await;
+        let waited = started.elapsed();
+        std::fs::remove_dir_all(stub.parent().unwrap()).ok();
+        let Err(error) = launched else {
+            panic!("a stub without DevTools cannot start a browser session");
+        };
+        assert_eq!(error, "timeout waiting for the browser to start");
+        assert!(waited >= deadline, "gave up after {waited:?}");
+    }
+
+    // A flood, an endless line and non-UTF-8 bytes all stay inside the
+    // tail's bounds, and the reader still reaches what follows them.
+    #[tokio::test]
+    async fn the_stderr_tail_stays_bounded() {
+        let mut wire = Vec::new();
+        for n in 0..20 {
+            wire.extend_from_slice(format!("line {n}\n").as_bytes());
+        }
+        wire.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+        wire.extend_from_slice(b"\nlast \xff line without newline");
+        let mut tail = StderrTail::spawn(std::io::Cursor::new(wire));
+        tail.settle(Duration::from_secs(5)).await;
+        assert!(tail.reader.is_finished(), "the reader must reach the end");
+        let lines = tail.lines.lock().unwrap();
+        assert_eq!(lines.len(), STDERR_TAIL_LINES);
+        assert_eq!(lines[0], "line 10");
+        assert_eq!(lines[10], "x".repeat(STDERR_LINE_CHARS));
+        assert_eq!(lines[11], "last \u{fffd} line without newline");
     }
 }
