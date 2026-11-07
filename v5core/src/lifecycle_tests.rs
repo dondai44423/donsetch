@@ -132,11 +132,12 @@ impl Origin {
     fn elapse(&self, session: &mut Worker, seconds: i64) {
         self.clock.fetch_add(seconds, Ordering::SeqCst);
         for per_identity in session.state.credentials.values_mut() {
-            for credential in per_identity.values_mut() {
+            for credential in std::sync::Arc::make_mut(per_identity).values_mut() {
                 credential.minted_unix -= seconds;
             }
         }
         for ledger in session.state.mints.values_mut() {
+            let ledger = std::sync::Arc::make_mut(ledger);
             for at in ledger.recent.iter_mut() {
                 *at -= seconds;
             }
@@ -715,12 +716,7 @@ fn a_human_check_on_the_learned_client_sends_the_encounter_to_the_class_that_get
         })
     };
     let mut session = Worker::new(false);
-    session
-        .state
-        .origins
-        .entry(host().to_string())
-        .or_default()
-        .chosen = Some("chrome".to_string());
+    session.state.origin_mut(host()).chosen = Some("chrome".to_string());
     let portfolio = Options {
         identity: None,
         pace_ms: 0,
@@ -743,4 +739,27 @@ fn a_human_check_on_the_learned_client_sends_the_encounter_to_the_class_that_get
         "the human check was seen, and crossed: {:?}",
         outcome.attempts
     );
+}
+
+// ---- a caller's short deadline ---------------------------------------------------
+
+#[test]
+fn a_short_deadline_still_asks_once() {
+    let server = Server::start(|_| Reply::Full {
+        status: 200,
+        headers: vec![("content-type".to_string(), "text/html".to_string())],
+        body: content_page().into_bytes(),
+    });
+    let mut session = Worker::new(false);
+    let mut short = options();
+    short.deadline = Duration::from_millis(400);
+    let outcome = session.fetch(&server.url("/"), &short);
+    assert_eq!(outcome.class, Class::Content, "{:?}", outcome.failures);
+    assert_eq!(outcome.attempts.len(), 1);
+
+    // A budget too small to send anything still ends without a request.
+    short.deadline = Duration::from_millis(50);
+    let outcome = session.fetch(&server.url("/other"), &short);
+    assert_eq!(outcome.class, Class::Network);
+    assert!(outcome.attempts.is_empty(), "{:?}", outcome.attempts);
 }

@@ -461,9 +461,9 @@ impl Worker {
                 if self.persist {
                     self.state
                         .record(&host, identity.name, "content", true, elapsed);
-                    self.state.record_vendor_success(&host, identity.name);
                     // The interface answered: next time it is asked first.
-                    self.state.origins.entry(host.clone()).or_default().route = Some("data".into());
+                    Arc::make_mut(self.state.origins.entry(host.clone()).or_default()).route =
+                        Some("data".into());
                     self.save_state();
                 }
                 return Interface::Answered(Box::new(Outcome {
@@ -612,6 +612,23 @@ impl Worker {
         Ok(wire)
     }
 
+    /// Sleep `wait`, or less when the caller stops waiting: a cancelled fetch
+    /// does not hold its thread through a pause it will never spend.
+    fn nap(&self, wait: Duration) {
+        let until = Instant::now() + wait;
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if self
+                .policy
+                .cancel
+                .as_ref()
+                .is_some_and(crate::Cancel::is_cancelled)
+            {
+                return;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(50)));
+        }
+    }
+
     /// The fetch is over: its policy goes, and when its caller stopped waiting,
     /// every connection it may have left mid-request goes with the wires (a
     /// wire's runtime runs its connections only while a request is in flight).
@@ -752,7 +769,7 @@ impl Worker {
                     options.contract.is_none(),
                 );
                 if content.passed {
-                    if let Some(origin) = self.state.origins.get_mut(&host) {
+                    if let Some(origin) = self.state.origins.get_mut(&host).map(Arc::make_mut) {
                         origin.fresh_earned = false;
                     }
                     self.save_state();
@@ -795,7 +812,7 @@ impl Worker {
                 || self.pending.as_ref().is_some_and(|pending| {
                     pending.entry.text_hash == cache::text_hash(&captured.bytes)
                 });
-            let origin = self.state.origins.entry(host.clone()).or_default();
+            let origin = Arc::make_mut(self.state.origins.entry(host.clone()).or_default());
             origin.fresh_earned = kept;
             if !kept {
                 origin.fresh_broken_until_unix = now + cache::DISTRUST_SECS;
@@ -836,7 +853,7 @@ impl Worker {
             outcome.cache = Some("changed".into());
         }
         if let (Some(previous), Some(fresh)) = (previous, fresh.as_ref()) {
-            let origin = self.state.origins.entry(host).or_default();
+            let origin = Arc::make_mut(self.state.origins.entry(host).or_default());
             if cache::validators_lied(previous, fresh) {
                 origin.distrust_until_unix = now + cache::DISTRUST_SECS;
                 origin.validators_proven = false;
@@ -979,8 +996,10 @@ impl Worker {
         let vendor_passable = remembered_vendor
             .map(|vendor| !self.state.vendor_order(&vendor).is_empty())
             .unwrap_or(false);
+        // An HTTP error is about the URL that drew it (an agent's guessed path
+        // that 404s), not the client: it does not shrink what the next URL on
+        // this origin may try. An error answer still ends its own encounter.
         let budget = match remembered.as_deref() {
-            Some("http_error") => 1,
             Some("wall_interaction") if !vendor_passable => 1,
             Some(_) => 2,
             None => options.max_tries,
@@ -994,10 +1013,10 @@ impl Worker {
         let mut data_tried = false;
         let mut engine_tried = false;
         let mut last_body = String::new();
+        let mut last_final_url = String::new();
         let mut last_headers: Vec<(String, String)> = Vec::new();
         let mut last_raw: Option<Vec<u8>> = None;
         let mut handoff_taken = false;
-        let mut handoff_steps = 0;
         if options.pace_ms > 0 {
             self.state.pace(&host, options.pace_ms);
         }
@@ -1033,7 +1052,7 @@ impl Worker {
                     Interface::Unanswered
                         if attempts.last().is_some_and(|attempt| attempt.status == 429) => {}
                     Interface::Unanswered => {
-                        if let Some(origin) = self.state.origins.get_mut(&host) {
+                        if let Some(origin) = self.state.origins.get_mut(&host).map(Arc::make_mut) {
                             origin.route = None;
                         }
                         self.save_state();
@@ -1066,9 +1085,12 @@ impl Worker {
                 continue;
             };
             let remaining = options.deadline.saturating_sub(started.elapsed());
-            // Do not start a request that cannot finish inside the encounter's
-            // budget: a half-finished attempt costs the same as a finished one.
-            if remaining.as_millis() < 1200 {
+            // Do not start another request that cannot finish inside the
+            // encounter's budget: a half-finished attempt costs the same as a
+            // finished one. The first request always goes out with whatever is
+            // left, or a caller's short deadline would end the read unasked.
+            let floor = if index == 0 { 100 } else { 1200 };
+            if remaining.as_millis() < floor {
                 break;
             }
             // After a server went silent on one client, the other client is
@@ -1083,7 +1105,7 @@ impl Worker {
             // Space attempts inside one encounter too: a burst of identities is
             // as suspicious as a burst of requests.
             if index > 0 {
-                std::thread::sleep(Duration::from_millis(250));
+                self.nap(Duration::from_millis(250));
             }
             // Arrival: a browser that has been on this site before does not jump
             // straight to an inner page from nowhere. One priming request to the
@@ -1340,6 +1362,7 @@ impl Worker {
                 response
             };
             last_body = response.body.clone();
+            last_final_url = response.url.clone();
             if options.capture_body {
                 last_headers = response.headers.clone();
                 last_raw = response.raw.clone();
@@ -1393,13 +1416,14 @@ impl Worker {
                 if verdict.class != Class::Content {
                     self.state.record_wall(
                         &host,
+                        Some(identity.name),
                         class_name,
                         verdict.wall.as_ref().map(|wall| wall.vendor.as_str()),
                         &verdict.evidence,
                     );
                 }
                 let upcoming = order.iter().find(|name| *name != identity.name).cloned();
-                if let Some(state) = self.state.origins.get_mut(&host) {
+                if let Some(state) = self.state.origins.get_mut(&host).map(Arc::make_mut) {
                     state.next = upcoming;
                 }
             }
@@ -1441,8 +1465,7 @@ impl Worker {
 
             if verdict.class == Class::Content {
                 if self.persist {
-                    self.state.record_vendor_success(&host, identity.name);
-                    if let Some(origin) = self.state.origins.get_mut(&host) {
+                    if let Some(origin) = self.state.origins.get_mut(&host).map(Arc::make_mut) {
                         origin.route = None;
                     }
                     self.save_state();
@@ -1460,38 +1483,24 @@ impl Worker {
                     revalidated: revalidated.take(),
                 });
                 return Outcome {
-                    url: url.to_string(),
-                    cache: None,
-                    host,
-                    final_url: response.url.clone(),
-                    class: verdict.class,
-                    identity: Some(identity.name.to_string()),
-                    status: response.status,
-                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
-                    ms_first: first_ms,
-                    attempts,
                     title: content.title,
                     text_chars: content.text_chars,
                     wall: verdict.wall,
                     evidence: verdict.evidence,
-                    failures: Vec::new(),
-                    spent_state,
-                    transport: "document".to_string(),
-                    items: 0,
-                    sample: Vec::new(),
-                    sample_urls: Vec::new(),
-                    body_text: String::new(),
-                    body: options.capture_body.then(|| response.body.clone()),
-                    headers: if options.capture_body {
-                        response.headers.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    bytes: if options.capture_body {
-                        response.raw.clone()
-                    } else {
-                        None
-                    },
+                    ..answer(
+                        url,
+                        host,
+                        &response,
+                        verdict.class,
+                        identity.name,
+                        Ended {
+                            started,
+                            first_ms,
+                            attempts,
+                            spent_state,
+                            capture: options.capture_body,
+                        },
+                    )
                 };
             }
 
@@ -1500,29 +1509,42 @@ impl Worker {
             // browser without JavaScript does.
             if verdict.class != Class::Content {
                 if let Some(handoff) = akamai_bm_verify(&response.body) {
-                    if !handoff_taken && handoff_steps < 2 {
+                    // The page's own wait and one request after it must fit the
+                    // encounter's budget; the target is the page's own address,
+                    // on its own host, and is asked of the caller's hop guard like
+                    // any navigation.
+                    let wait = Duration::from_secs(handoff.delay_secs);
+                    let target = url::Url::parse(&response.url)
+                        .and_then(|base| base.join(&handoff.target))
+                        .ok()
+                        .filter(|next| {
+                            matches!(next.scheme(), "http" | "https")
+                                && next.host_str().map(str::to_ascii_lowercase)
+                                    == url::Url::parse(&response.url).ok().and_then(|base| {
+                                        base.host_str().map(str::to_ascii_lowercase)
+                                    })
+                        })
+                        .map(|next| next.to_string())
+                        .filter(|next| {
+                            options.policy.hop.as_ref().is_none_or(|guard| {
+                                guard(&response.url, next) == crate::http::Hop::Follow
+                            })
+                        });
+                    let remaining = options.deadline.saturating_sub(started.elapsed());
+                    let fits = remaining > wait + Duration::from_millis(1200);
+                    if let (false, Some(target), true) = (handoff_taken, target, fits) {
                         handoff_taken = true;
-                        handoff_steps += 1;
-                        let wait = std::time::Duration::from_secs(handoff.delay_secs);
-                        std::thread::sleep(wait);
-                        let target = if handoff.target.starts_with("http") {
-                            handoff.target.clone()
-                        } else {
-                            format!("{}://{}{}", parsed.scheme(), host, handoff.target)
-                        };
+                        // The answer's own cookies (`ak_bmsc`) ride the hand-off,
+                        // as they would in a browser, persisted or not.
+                        self.state
+                            .store_cookies(&host, identity.name, cookies.clone());
+                        self.nap(wait);
+                        let timeout = options.deadline.saturating_sub(started.elapsed());
                         // One request to the handoff URL, same identity, same jar.
                         let cookie = self.state.cookie_header_for(&target, identity.name);
-                        let handed = {
-                            let wire = self.wire(identity).ok();
-                            match wire {
-                                Some(wire) => wire.get(
-                                    &target,
-                                    cookie.as_deref(),
-                                    identity,
-                                    std::time::Duration::from_secs(8),
-                                ),
-                                None => Err("no wire".to_string()),
-                            }
+                        let handed = match self.wire(identity) {
+                            Ok(wire) => wire.get(&target, cookie.as_deref(), identity, timeout),
+                            Err(error) => Err(error),
                         };
                         if let Ok(next) = handed {
                             let content = verify_response(
@@ -1562,42 +1584,26 @@ impl Worker {
                                         true,
                                         next.elapsed_ms,
                                     );
-                                    self.state.record_vendor_success(&host, identity.name);
                                     self.save_state();
                                 }
                                 return Outcome {
-                                    url: url.to_string(),
-                                    cache: None,
-                                    host,
-                                    final_url: next.url.clone(),
-                                    class: Class::Content,
-                                    identity: Some(identity.name.to_string()),
-                                    status: next.status,
-                                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
-                                    ms_first: first_ms,
-                                    attempts,
                                     title: content.title,
                                     text_chars: content.text_chars,
-                                    wall: None,
                                     evidence: vec!["akamai bm-verify".into()],
-                                    failures: Vec::new(),
-                                    spent_state: cookie.is_some(),
-                                    transport: "document".to_string(),
-                                    items: 0,
-                                    sample: Vec::new(),
-                                    sample_urls: Vec::new(),
-                                    body_text: String::new(),
-                                    body: options.capture_body.then(|| next.body.clone()),
-                                    headers: if options.capture_body {
-                                        next.headers.clone()
-                                    } else {
-                                        Vec::new()
-                                    },
-                                    bytes: if options.capture_body {
-                                        next.raw.clone()
-                                    } else {
-                                        None
-                                    },
+                                    ..answer(
+                                        url,
+                                        host,
+                                        &next,
+                                        Class::Content,
+                                        identity.name,
+                                        Ended {
+                                            started,
+                                            first_ms,
+                                            attempts,
+                                            spent_state: cookie.is_some(),
+                                            capture: options.capture_body,
+                                        },
+                                    )
                                 };
                             }
                         }
@@ -1733,42 +1739,26 @@ impl Worker {
                                                 true,
                                                 second.elapsed_ms,
                                             );
-                                            self.state.record_vendor_success(&host, chrome.name);
                                             self.save_state();
                                         }
                                         return Outcome {
-                                            url: url.to_string(),
-                                            cache: None,
-                                            host,
-                                            final_url: second.url.clone(),
-                                            class: Class::Content,
-                                            identity: Some(chrome.name.to_string()),
-                                            status: second.status,
-                                            ms_total: started.elapsed().as_secs_f64() * 1000.0,
-                                            ms_first: first_ms,
-                                            attempts,
                                             title: content.title,
                                             text_chars: content.text_chars,
-                                            wall: None,
                                             evidence: vec!["identity: chrome-local".to_string()],
-                                            failures: Vec::new(),
-                                            spent_state: false,
-                                            transport: "document".to_string(),
-                                            items: 0,
-                                            sample: Vec::new(),
-                                            sample_urls: Vec::new(),
-                                            body_text: String::new(),
-                                            body: options.capture_body.then(|| second.body.clone()),
-                                            headers: if options.capture_body {
-                                                second.headers.clone()
-                                            } else {
-                                                Vec::new()
-                                            },
-                                            bytes: if options.capture_body {
-                                                second.raw.clone()
-                                            } else {
-                                                None
-                                            },
+                                            ..answer(
+                                                url,
+                                                host,
+                                                &second,
+                                                Class::Content,
+                                                chrome.name,
+                                                Ended {
+                                                    started,
+                                                    first_ms,
+                                                    attempts,
+                                                    spent_state: false,
+                                                    capture: options.capture_body,
+                                                },
+                                            )
                                         };
                                     }
                                     engine_identity = chrome;
@@ -1881,22 +1871,10 @@ impl Worker {
                                 let retry_cookie = self
                                     .state
                                     .cookie_header_for(&retry_url, engine_identity.name);
-                                // The engine spends its own credential on its own
-                                // client; that response is the retry. Only when it
-                                // produced none do we ask again ourselves.
+                                // The credential is spent through the fetcher's own
+                                // client, as the identity that minted it.
                                 let retry: Option<Result<crate::http::Response, String>> =
-                                    if mint.page_status != 0 && !mint.page_body.is_empty() {
-                                        Some(Ok(crate::http::Response {
-                                            status: mint.page_status,
-                                            version: String::new(),
-                                            headers: Vec::new(),
-                                            body: mint.page_body.clone(),
-                                            url: mint.page_url.clone(),
-                                            elapsed_ms: mint.ms,
-                                            cookies: Vec::new(),
-                                            raw: None,
-                                        }))
-                                    } else if budget.as_millis() >= 800 {
+                                    if budget.as_millis() >= 800 {
                                         match self.wire(engine_identity) {
                                             Ok(wire) => Some(wire.get(
                                                 &retry_url,
@@ -2003,14 +1981,9 @@ impl Worker {
                                                 true,
                                                 retry.elapsed_ms,
                                             );
-                                            self.state
-                                                .record_vendor_success(&host, engine_identity.name);
                                             self.save_state();
                                         }
                                         return Outcome {
-                                            url: url.to_string(),
-                                            cache: None,
-                                            host,
                                             // The document the challenge stood in
                                             // front of, or where the page then
                                             // navigated. A challenge hand-off is a
@@ -2024,37 +1997,26 @@ impl Worker {
                                             } else {
                                                 retry.url.clone()
                                             },
-                                            class: Class::Content,
-                                            identity: Some(engine_identity.name.to_string()),
-                                            status: retry.status,
-                                            ms_total: started.elapsed().as_secs_f64() * 1000.0,
-                                            ms_first: first_ms,
-                                            attempts,
                                             title: content.title,
                                             text_chars: content.text_chars,
-                                            wall: None,
                                             evidence: vec![format!(
                                                 "engine: minted in {} ms",
                                                 mint.ms.round()
                                             )],
-                                            failures: Vec::new(),
-                                            spent_state: true,
-                                            transport: "document".to_string(),
-                                            items: 0,
-                                            sample: Vec::new(),
-                                            sample_urls: Vec::new(),
-                                            body_text: String::new(),
-                                            body: options.capture_body.then(|| retry.body.clone()),
-                                            headers: if options.capture_body {
-                                                retry.headers.clone()
-                                            } else {
-                                                Vec::new()
-                                            },
-                                            bytes: if options.capture_body {
-                                                retry.raw.clone()
-                                            } else {
-                                                None
-                                            },
+                                            ..answer(
+                                                url,
+                                                host,
+                                                &retry,
+                                                Class::Content,
+                                                engine_identity.name,
+                                                Ended {
+                                                    started,
+                                                    first_ms,
+                                                    attempts,
+                                                    spent_state: true,
+                                                    capture: options.capture_body,
+                                                },
+                                            )
                                         };
                                     }
                                     failure_reason = Some(format!(
@@ -2128,13 +2090,13 @@ impl Worker {
             // itself: the client is not what the site is reacting to, and the
             // next will be shown it too. Text, not bytes: a per-request nonce in
             // a script or an attribute does not make the answer different.
-            let answer = (
+            let shown = (
                 verdict.class,
                 response.status,
                 cache::text_hash(response.body.as_bytes()),
             );
-            let identity_blind = verdict.wall.is_none() && last_answer == Some(answer);
-            last_answer = Some(answer);
+            let identity_blind = verdict.wall.is_none() && last_answer == Some(shown);
+            last_answer = Some(shown);
             if interaction_final
                 || told_to_wait
                 || identity_blind
@@ -2147,38 +2109,25 @@ impl Worker {
                     self.save_state();
                 }
                 return Outcome {
-                    url: url.to_string(),
-                    cache: None,
-                    host,
-                    final_url: response.url.clone(),
-                    class: verdict.class,
-                    identity: Some(identity.name.to_string()),
-                    status: response.status,
-                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
-                    ms_first: first_ms,
-                    attempts,
                     title: content.title,
                     text_chars: content.text_chars,
                     wall: verdict.wall,
                     evidence: verdict.evidence,
                     failures: content.failures,
-                    spent_state,
-                    transport: "document".to_string(),
-                    items: 0,
-                    sample: Vec::new(),
-                    sample_urls: Vec::new(),
-                    body_text: String::new(),
-                    body: options.capture_body.then(|| response.body.clone()),
-                    headers: if options.capture_body {
-                        response.headers.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    bytes: if options.capture_body {
-                        response.raw.clone()
-                    } else {
-                        None
-                    },
+                    ..answer(
+                        url,
+                        host,
+                        &response,
+                        verdict.class,
+                        identity.name,
+                        Ended {
+                            started,
+                            first_ms,
+                            attempts,
+                            spent_state,
+                            capture: options.capture_body,
+                        },
+                    )
                 };
             }
         }
@@ -2199,7 +2148,12 @@ impl Worker {
             url: url.to_string(),
             cache: None,
             host,
-            final_url: last.as_ref().map(|_| url.to_string()).unwrap_or_default(),
+            // Where the last answer came from (a redirect may have moved it).
+            final_url: if last_final_url.is_empty() {
+                url.to_string()
+            } else {
+                last_final_url
+            },
             class: last
                 .as_ref()
                 .map(|attempt| attempt.class)
@@ -2350,11 +2304,29 @@ fn ended(
     ended: Ended,
 ) -> Outcome {
     Outcome {
+        evidence: vec![evidence.to_string()],
+        ..answer(url, host, response, Class::HttpError, identity, ended)
+    }
+}
+
+/// The outcome of an encounter that ends on `response`, as `identity` received
+/// it: its address, status and timing, and its body when the caller asked for
+/// it. What the answer was judged to be (title, wall, evidence) is the caller's
+/// to add.
+fn answer(
+    url: &str,
+    host: String,
+    response: &crate::http::Response,
+    class: Class,
+    identity: &str,
+    ended: Ended,
+) -> Outcome {
+    Outcome {
         url: url.to_string(),
         cache: None,
         host,
         final_url: response.url.clone(),
-        class: Class::HttpError,
+        class,
         identity: Some(identity.to_string()),
         status: response.status,
         ms_total: ended.started.elapsed().as_secs_f64() * 1000.0,
@@ -2363,7 +2335,7 @@ fn ended(
         title: String::new(),
         text_chars: 0,
         wall: None,
-        evidence: vec![evidence.to_string()],
+        evidence: Vec::new(),
         failures: Vec::new(),
         spent_state: ended.spent_state,
         transport: "document".to_string(),
@@ -2398,15 +2370,37 @@ fn stored(cookie: &crate::http::SetCookie) -> StoredCookie {
     }
 }
 
-/// How long an interface asked us to wait, in ms.
+/// The longest wait an origin's own hint is taken at: past it, the hint is
+/// garbled or a ban, and either way a cooldown that outlives the session is
+/// not pacing.
+const RETRY_HINT_MAX_MS: i64 = 3600 * 1000;
+
+/// How long an interface asked us to wait, in ms. `Retry-After` is seconds or
+/// an HTTP date (RFC 9110 §10.2.3); `X-RateLimit-Reset` is seconds to wait on
+/// some APIs (Reddit) and the epoch second of the reset on others (GitHub), so
+/// a value that can only be a timestamp is read as one.
 fn retry_hint(headers: &[(String, String)]) -> Option<i64> {
+    retry_hint_at(headers, crate::state::now_unix())
+}
+
+fn retry_hint_at(headers: &[(String, String)], now: i64) -> Option<i64> {
     for (name, value) in headers {
         let name = name.to_ascii_lowercase();
-        if name == "x-ratelimit-reset" || name == "retry-after" {
-            if let Ok(seconds) = value.trim().parse::<f64>() {
-                return Some((seconds * 1000.0) as i64);
-            }
+        if name != "x-ratelimit-reset" && name != "retry-after" {
+            continue;
         }
+        let value = value.trim();
+        let ms = match value.parse::<f64>() {
+            Ok(seconds) if !seconds.is_finite() || seconds < 0.0 => continue,
+            // Past a year from the epoch it is a timestamp, not a duration.
+            Ok(seconds) if seconds > 365.0 * 86_400.0 => (seconds as i64 - now) * 1000,
+            Ok(seconds) => (seconds * 1000.0) as i64,
+            Err(_) => match crate::cache::http_date(value) {
+                Some(at) => (at - now) * 1000,
+                None => continue,
+            },
+        };
+        return Some(ms.clamp(0, RETRY_HINT_MAX_MS));
     }
     None
 }
@@ -2464,6 +2458,37 @@ mod transport_tests {
         ] {
             assert_eq!(transport_scope(client), TransportScope::Client, "{client}");
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_hint_tests {
+    use super::retry_hint_at;
+
+    fn hint(name: &str, value: &str) -> Option<i64> {
+        retry_hint_at(&[(name.to_string(), value.to_string())], 1_800_000_000)
+    }
+
+    #[test]
+    fn a_wait_is_read_in_every_shape_origins_send_it() {
+        assert_eq!(hint("Retry-After", "120"), Some(120_000));
+        assert_eq!(hint("x-ratelimit-reset", "7.5"), Some(7_500));
+        // GitHub: the epoch second of the reset, 90 s from now.
+        assert_eq!(hint("X-RateLimit-Reset", "1800000090"), Some(90_000));
+        // RFC 9110 HTTP date, 30 s from now; one already past is no wait.
+        assert_eq!(
+            hint("Retry-After", "Fri, 15 Jan 2027 08:00:30 GMT"),
+            Some(30_000)
+        );
+        assert_eq!(
+            hint("Retry-After", "Thu, 01 Jan 2026 00:00:00 GMT"),
+            Some(0)
+        );
+        // Garbled or hostile values are capped or ignored, never a lockout.
+        assert_eq!(hint("Retry-After", "86400"), Some(3_600_000));
+        assert_eq!(hint("Retry-After", "soon"), None);
+        assert_eq!(hint("Retry-After", "-5"), None);
+        assert_eq!(hint("Retry-After", "NaN"), None);
     }
 }
 

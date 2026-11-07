@@ -385,25 +385,56 @@ fn builder_options(identity: &Identity) -> wreq::tls::TlsOptions {
         .unwrap_or_default()
 }
 
+/// Extra trust roots, PEM, a caller adds before the first request: an owner's
+/// own configured CA bundle (the product's `[tls] cert_file`/`cert_dir`).
+static EXTRA_ROOTS: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+/// Trust the PEM certificates in `pem` too, on top of the bundled and OS
+/// roots. Takes effect for clients built after the first call that builds the
+/// store, so it belongs before the first request.
+pub fn add_trust_pem(pem: Vec<u8>) {
+    EXTRA_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(pem);
+}
+
 /// The roots a server's chain is verified against: the bundled Mozilla set,
 /// which is the same everywhere, plus what the OS itself trusts (Windows' ROOT
 /// store, the macOS keychain, the Linux bundle, `SSL_CERT_FILE`/`SSL_CERT_DIR`),
 /// as Chrome trusts the OS store: an enterprise's inspection root or a private
-/// CA installed the OS's way is trusted here too. Read once per process. `None`
-/// (the store could not be built) leaves BoringSSL's default paths.
+/// CA installed the OS's way is trusted here too, and so is what the owner added
+/// with [`add_trust_pem`]. Read once per process. A bundle that does not parse
+/// is left out, never the whole store; `None` (the store could not be built)
+/// leaves BoringSSL's default paths.
 fn trust_roots() -> Option<wreq::tls::trust::CertStore> {
     static ROOTS: std::sync::LazyLock<Option<wreq::tls::trust::CertStore>> =
         std::sync::LazyLock::new(|| {
             let native = rustls_native_certs::load_native_certs().certs;
-            wreq::tls::trust::CertStore::builder()
-                .add_der_certs(
-                    webpki_root_certs::TLS_SERVER_ROOT_CERTS
-                        .iter()
-                        .map(|cert| cert.as_ref()),
-                )
-                .add_der_certs(native.iter().map(|cert| cert.as_ref()))
-                .build()
-                .ok()
+            let base = || {
+                wreq::tls::trust::CertStore::builder()
+                    .add_der_certs(
+                        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                            .iter()
+                            .map(|cert| cert.as_ref()),
+                    )
+                    .add_der_certs(native.iter().map(|cert| cert.as_ref()))
+            };
+            let extra = EXTRA_ROOTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mut builder = base();
+            for pem in &extra {
+                // Each bundle alone first: one that does not parse is dropped
+                // and named, and the rest of the store stands.
+                if base().add_stack_pem_certs(pem).build().is_ok() {
+                    builder = builder.add_stack_pem_certs(pem);
+                } else {
+                    eprintln!("[trust] an added CA bundle is not PEM certificates; left out");
+                }
+            }
+            builder.build().ok().or_else(|| base().build().ok())
         });
     ROOTS.clone()
 }

@@ -453,9 +453,6 @@ pub struct Mint {
     pub surfaces: Vec<String>,
     pub logs: Vec<String>,
     pub redirect: Option<String>,
-    pub page_status: u16,
-    pub page_url: String,
-    pub page_body: String,
     pub ms: f64,
     /// What the run cost, so the envelope's headroom is measured, not assumed.
     pub cost: Cost,
@@ -658,15 +655,6 @@ pub fn mint_within_via(
     let mut mint = Mint {
         ms: value["ms"].as_f64().unwrap_or(0.0),
         redirect: value["redirect"].as_str().map(str::to_string),
-        page_status: value["page"]["status"].as_u64().unwrap_or(0) as u16,
-        page_url: value["page"]["url"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        page_body: value["page"]["body"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
         cost,
         ..Default::default()
     };

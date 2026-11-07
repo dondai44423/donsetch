@@ -26,29 +26,38 @@ pub fn akamai_bm_verify(body: &str) -> Option<VerifyRedirect> {
     if !body.contains("bm-verify") {
         return None;
     }
+    // The whole `<meta>` tag: its attributes come in any order and any quoting.
     let lower = body.to_ascii_lowercase();
-    let at = lower.find("http-equiv=\"refresh\"")?;
-    let rest = &body[at..];
-    let end = rest
+    let refresh = [
+        "http-equiv=\"refresh\"",
+        "http-equiv='refresh'",
+        "http-equiv=refresh",
+    ]
+    .iter()
+    .filter_map(|needle| lower.find(needle))
+    .min()?;
+    let start = lower[..refresh].rfind('<').unwrap_or(0);
+    let end = lower[refresh..]
         .find('>')
-        .map(|offset| at + offset)
-        .unwrap_or(body.len());
-    let tag = &body[at..end];
-    let delay = tag
-        .split("content=")
-        .nth(1)?
+        .map_or(body.len(), |offset| refresh + offset);
+    let tag = &body[start..end];
+    let lower_tag = tag.to_ascii_lowercase();
+    let delay = tag[lower_tag.find("content=")? + "content=".len()..]
         .trim_start_matches(['"', '\''])
         .split(|character: char| !character.is_ascii_digit())
         .next()?
         .parse::<u64>()
         .unwrap_or(5);
-    let url_at = tag.find("URL=")?;
+    // `URL=` is case-insensitive (HTML's refresh syntax), and the target is
+    // attribute text: entities such as `&amp;` are the page's, not the URL's.
+    let url_at = lower_tag.find("url=")?;
     let mut target = tag[url_at + 4..]
         .trim_start_matches(['"', '\''])
         .to_string();
     if let Some(quote) = target.find(['"', '\'']) {
         target.truncate(quote);
     }
+    let target = target.trim().replace("&amp;", "&");
     if !target.contains("bm-verify") {
         return None;
     }
@@ -76,6 +85,21 @@ mod tests {
         assert!(akamai_bm_verify(body).is_none());
         let body = r#"<meta http-equiv="refresh" content="3; URL='/other'">"#;
         assert!(akamai_bm_verify(body).is_none());
+    }
+
+    #[test]
+    fn the_refresh_is_read_as_html_writes_it() {
+        let body = r#"<META HTTP-EQUIV="Refresh" CONTENT="2;url=/p?bm-verify=T&amp;a=1">"#;
+        let found = akamai_bm_verify(body).expect("challenge");
+        assert_eq!(found.target, "/p?bm-verify=T&a=1");
+        assert_eq!(found.delay_secs, 2);
+        // Attributes in the other order.
+        let body = r#"<meta content="3; URL='/?bm-verify=Z'" http-equiv="refresh">"#;
+        let found = akamai_bm_verify(body).expect("challenge");
+        assert_eq!(
+            (found.target.as_str(), found.delay_secs),
+            ("/?bm-verify=Z", 3)
+        );
     }
 
     #[test]

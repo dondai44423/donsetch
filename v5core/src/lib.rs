@@ -41,7 +41,8 @@ pub use classify::{Class, Wall};
 pub use contract::Contract;
 pub use fetch::{Attempt, Outcome};
 pub use http::{
-    default_hop, Cancel, Hop, HopGuard, Kind, Policy, CANCELLED, DOCUMENT_BODY_MAX, REDIRECTS_MAX,
+    add_trust_pem, default_hop, Cancel, Hop, HopGuard, Kind, Policy, CANCELLED, DOCUMENT_BODY_MAX,
+    REDIRECTS_MAX,
 };
 
 use std::sync::Mutex;
@@ -157,13 +158,21 @@ pub struct Reply {
     pub elapsed_ms: f64,
 }
 
+/// The state file as this session last read or wrote it, and which version of
+/// the file that was.
+#[derive(Default)]
+struct Disk {
+    base: state::State,
+    stamp: Option<state::FileStamp>,
+}
+
 /// A fetching session: learned state and the page cache shared by every call,
 /// workers pooled.
 pub struct Session {
     state: Mutex<state::State>,
     /// The state file as last read or written: what a save merges from, so two
     /// processes on one file keep each other's learning.
-    base: Mutex<state::State>,
+    disk: Mutex<Disk>,
     idle: Mutex<Vec<fetch::Worker>>,
     cache: std::sync::Arc<cache::PageCache>,
     /// The state file, when the session persists.
@@ -197,8 +206,12 @@ impl Session {
             Some(dir) => cache::PageCache::on_disk(dir.join("pages")),
             None => cache::PageCache::in_memory(),
         };
+        let stamp = path.as_deref().and_then(state::FileStamp::of);
         Self {
-            base: Mutex::new(state.clone()),
+            disk: Mutex::new(Disk {
+                base: state.clone(),
+                stamp,
+            }),
             state: Mutex::new(state),
             idle: Mutex::new(Vec::new()),
             cache: std::sync::Arc::new(cache),
@@ -256,13 +269,7 @@ impl Session {
         let outcome = worker.fetch(&request.url, &options);
         let after = worker.swap_state(state::State::default());
         if request.learn {
-            let mut shared = lock(&self.state);
-            shared.absorb(&before, &after);
-            if let Some(path) = &self.path {
-                let mut base = lock(&self.base);
-                *base = shared.save_merged_at(&base, path);
-                *shared = base.clone();
-            }
+            self.learn(&before, &after);
         }
         lock(&self.idle).push(worker);
         outcome
@@ -286,16 +293,35 @@ impl Session {
         let reply = worker.once(once);
         let after = worker.swap_state(state::State::default());
         if once.cookies {
-            let mut shared = lock(&self.state);
-            shared.absorb(&before, &after);
-            if let Some(path) = &self.path {
-                let mut base = lock(&self.base);
-                *base = shared.save_merged_at(&base, path);
-                *shared = base.clone();
-            }
+            self.learn(&before, &after);
         }
         lock(&self.idle).push(worker);
         reply
+    }
+
+    /// Fold what one call learned (`before` → `after`) into the shared state,
+    /// and write it when the session persists. Saves are taken in turn (the
+    /// disk lock, always before the state's), but the file is written outside
+    /// the shared state's lock, so other calls start while one saves; what the
+    /// merge brings back (another process's learning, pruning) is folded in
+    /// after, over whatever they learned meanwhile.
+    fn learn(&self, before: &state::State, after: &state::State) {
+        let Some(path) = &self.path else {
+            lock(&self.state).absorb(before, after);
+            return;
+        };
+        let mut disk = lock(&self.disk);
+        let snapshot = {
+            let mut shared = lock(&self.state);
+            shared.absorb(before, after);
+            shared.clone()
+        };
+        let (merged, stamp) = snapshot.save_merged_known(&disk.base, path, disk.stamp);
+        lock(&self.state).absorb(&snapshot, &merged);
+        *disk = Disk {
+            base: merged,
+            stamp,
+        };
     }
 
     /// The names of the cookies `identity` holds for `host` (unexpired). A

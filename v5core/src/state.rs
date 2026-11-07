@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Score {
@@ -148,12 +149,19 @@ pub const VENDOR_SEED: &[(&str, &[&str])] = &[
     ("akamai", &["chrome-android"]),
 ];
 
+/// Per-host entries are shared, not copied: a state is cloned for every fetch
+/// (a worker's snapshot, the save), and at the origin cap a deep copy cost more
+/// than the request. A clone copies pointers; a write copies the one entry it
+/// changes ([`Arc::make_mut`]); a fold skips entries that are still the same
+/// allocation.
+pub type Shared<T> = Arc<T>;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
     pub version: u32,
-    pub origins: BTreeMap<String, OriginState>,
+    pub origins: BTreeMap<String, Shared<OriginState>>,
     /// host -> identity -> cookies
-    pub cookies: BTreeMap<String, BTreeMap<String, Vec<StoredCookie>>>,
+    pub cookies: BTreeMap<String, Shared<BTreeMap<String, Vec<StoredCookie>>>>,
     /// host -> last call to that interface (data paths only).
     #[serde(default)]
     pub interface_calls: BTreeMap<String, i64>,
@@ -166,10 +174,10 @@ pub struct State {
     pub vendor_priors: BTreeMap<String, BTreeMap<String, u32>>,
     /// host -> identity -> the engine credential currently held.
     #[serde(default)]
-    pub credentials: BTreeMap<String, BTreeMap<String, Credential>>,
+    pub credentials: BTreeMap<String, Shared<BTreeMap<String, Credential>>>,
     /// host -> minting history and measured credential lifetime.
     #[serde(default)]
-    pub mints: BTreeMap<String, MintLedger>,
+    pub mints: BTreeMap<String, Shared<MintLedger>>,
 }
 
 impl State {
@@ -196,20 +204,20 @@ impl State {
     /// meanwhile; vendor priors add its increments. Two learners on one host race
     /// as two processes on one state file do: the later write wins.
     pub fn absorb(&mut self, before: &State, after: &State) {
-        fold(&mut self.origins, &before.origins, &after.origins);
-        fold(&mut self.cookies, &before.cookies, &after.cookies);
+        fold_shared(&mut self.origins, &before.origins, &after.origins);
+        fold_shared(&mut self.cookies, &before.cookies, &after.cookies);
         fold(
             &mut self.interface_calls,
             &before.interface_calls,
             &after.interface_calls,
         );
         fold(&mut self.cooldowns, &before.cooldowns, &after.cooldowns);
-        fold(
+        fold_shared(
             &mut self.credentials,
             &before.credentials,
             &after.credentials,
         );
-        fold(&mut self.mints, &before.mints, &after.mints);
+        fold_shared(&mut self.mints, &before.mints, &after.mints);
         for (vendor, counts) in &after.vendor_priors {
             for (identity, count) in counts {
                 let was = before
@@ -228,6 +236,17 @@ impl State {
                 }
             }
         }
+    }
+
+    /// This host's entry, created when missing, writable (copied first when
+    /// another state still shares it).
+    pub fn origin_mut(&mut self, host: &str) -> &mut OriginState {
+        Arc::make_mut(self.origins.entry(host.to_string()).or_default())
+    }
+
+    /// This host's entry, writable, when it exists.
+    pub fn origin_get_mut(&mut self, host: &str) -> Option<&mut OriginState> {
+        self.origins.get_mut(host).map(Arc::make_mut)
     }
 
     /// Identities that have passed `vendor`, best first: what this state has
@@ -267,7 +286,24 @@ impl State {
         if let Some(chosen) = stored.and_then(|state| state.chosen.clone()) {
             ordered.push(chosen);
         }
-        if let Some(vendor) = stored.and_then(|state| state.wall_vendor.clone()) {
+        // A host met for the first time starts from its site: what a sibling
+        // host of the same site (`www.` and `m.` of one domain, one CDN edge for
+        // all its subdomains) last let through. Ordering only: cookies and
+        // credentials stay bound to the host that earned them.
+        let sibling = if stored.is_none_or(|state| state.scores.is_empty()) {
+            self.sibling(host)
+        } else {
+            None
+        };
+        if let Some(chosen) = sibling.and_then(|state| state.chosen.clone()) {
+            if !ordered.contains(&chosen) {
+                ordered.push(chosen);
+            }
+        }
+        let vendor = stored
+            .and_then(|state| state.wall_vendor.clone())
+            .or_else(|| sibling.and_then(|state| state.wall_vendor.clone()));
+        if let Some(vendor) = vendor {
             for name in self.vendor_order(&vendor) {
                 if !ordered.contains(&name) {
                     ordered.push(name);
@@ -328,6 +364,22 @@ impl State {
         ordered
     }
 
+    /// The most recently used other host of `host`'s site that has learned
+    /// something: a winner or a named wall.
+    fn sibling(&self, host: &str) -> Option<&OriginState> {
+        let site = site_of(host);
+        let suffix = format!(".{site}");
+        self.origins
+            .iter()
+            .filter(|(other, state)| {
+                other.as_str() != host
+                    && (other.as_str() == site || other.ends_with(&suffix))
+                    && (state.chosen.is_some() || state.wall_vendor.is_some())
+            })
+            .max_by_key(|(_, state)| state.last_ms.max(state.updated_unix * 1000))
+            .map(|(_, state)| &**state)
+    }
+
     // ----- engine credentials: lifetime, renewal, and the cost of minting -------
 
     /// May the engine mint for this host now? `Err` names why not, so the outcome
@@ -380,20 +432,17 @@ impl State {
             .map(|at| at - now)
             .filter(|ttl| *ttl > 0)
             .min();
-        self.credentials
-            .entry(host.to_string())
-            .or_default()
-            .insert(
-                identity.to_string(),
-                Credential {
-                    vendor: vendor.to_string(),
-                    minted_unix: now,
-                    names: cookies.iter().map(|cookie| cookie.name.clone()).collect(),
-                    declared_ttl,
-                    uses: 0,
-                },
-            );
-        let ledger = self.mints.entry(host.to_string()).or_default();
+        Arc::make_mut(self.credentials.entry(host.to_string()).or_default()).insert(
+            identity.to_string(),
+            Credential {
+                vendor: vendor.to_string(),
+                minted_unix: now,
+                names: cookies.iter().map(|cookie| cookie.name.clone()).collect(),
+                declared_ttl,
+                uses: 0,
+            },
+        );
+        let ledger = Arc::make_mut(self.mints.entry(host.to_string()).or_default());
         ledger.recent.retain(|at| now - at < MINT_WINDOW_SECS);
         ledger.recent.push(now);
     }
@@ -401,7 +450,7 @@ impl State {
     /// The origin accepted a minted credential's request after a mint: the host's
     /// failure streak ends.
     pub fn mint_succeeded(&mut self, host: &str) {
-        if let Some(ledger) = self.mints.get_mut(host) {
+        if let Some(ledger) = self.mints.get_mut(host).map(Arc::make_mut) {
             ledger.failures = 0;
             ledger.blocked_until = 0;
             ledger.last_error = None;
@@ -412,7 +461,7 @@ impl State {
     /// credential, if any, is dropped and the next mint waits.
     pub fn mint_failed(&mut self, host: &str, identity: &str, reason: &str, now: i64) {
         self.drop_credential(host, identity);
-        let ledger = self.mints.entry(host.to_string()).or_default();
+        let ledger = Arc::make_mut(self.mints.entry(host.to_string()).or_default());
         ledger.failures = ledger.failures.saturating_add(1);
         let doubling = 1i64 << (ledger.failures - 1).min(10);
         ledger.blocked_until = now + (BACKOFF_BASE_SECS * doubling).min(BACKOFF_MAX_SECS);
@@ -439,11 +488,13 @@ impl State {
         let removed = self
             .credentials
             .get_mut(host)
+            .map(Arc::make_mut)
             .and_then(|per_identity| per_identity.remove(identity));
         if let Some(credential) = removed {
             if let Some(cookies) = self
                 .cookies
                 .get_mut(host)
+                .map(Arc::make_mut)
                 .and_then(|per_identity| per_identity.get_mut(identity))
             {
                 cookies.retain(|cookie| !credential.names.contains(&cookie.name));
@@ -485,11 +536,12 @@ impl State {
             if let Some(credential) = self
                 .credentials
                 .get_mut(host)
+                .map(Arc::make_mut)
                 .and_then(|per_identity| per_identity.get_mut(identity))
             {
                 credential.uses += 1;
             }
-            let ledger = self.mints.entry(host.to_string()).or_default();
+            let ledger = Arc::make_mut(self.mints.entry(host.to_string()).or_default());
             ledger.accepted_age = ledger.accepted_age.max(age);
             return;
         }
@@ -499,7 +551,7 @@ impl State {
             .and_then(|per_identity| per_identity.get(identity))
             .is_some_and(|credential| credential.uses > 0);
         if had_worked {
-            let ledger = self.mints.entry(host.to_string()).or_default();
+            let ledger = Arc::make_mut(self.mints.entry(host.to_string()).or_default());
             ledger.refused_age = Some(ledger.refused_age.map_or(age, |known| known.min(age)));
         }
         self.drop_credential(host, identity);
@@ -515,10 +567,10 @@ impl State {
             .map(|state| state.last_ms)
             .unwrap_or(0);
         let wait = (last + minimum_ms - now).max(0);
-        if let Some(state) = self.origins.get_mut(host) {
+        if let Some(state) = self.origins.get_mut(host).map(Arc::make_mut) {
             state.last_ms = now + wait;
         } else {
-            self.origins.entry(host.to_string()).or_default().last_ms = now + wait;
+            Arc::make_mut(self.origins.entry(host.to_string()).or_default()).last_ms = now + wait;
         }
         if wait > 0 {
             std::thread::sleep(std::time::Duration::from_millis(wait as u64));
@@ -544,7 +596,7 @@ impl State {
     }
 
     pub fn mark_seen(&mut self, host: &str) {
-        self.origins.entry(host.to_string()).or_default().visited += 1;
+        Arc::make_mut(self.origins.entry(host.to_string()).or_default()).visited += 1;
     }
 
     pub fn mark_call(&mut self, host: &str) {
@@ -563,26 +615,8 @@ impl State {
         self.cooldowns.insert(host.to_string(), until);
     }
 
-    /// Learn which identity works behind a vendor. Recorded on success only: a
-    /// prior is a positive signal, never an assumption.
-    pub fn record_vendor_success(&mut self, host: &str, identity: &str) {
-        let Some(vendor) = self
-            .origins
-            .get(host)
-            .and_then(|state| state.wall_vendor.clone())
-        else {
-            return;
-        };
-        *self
-            .vendor_priors
-            .entry(vendor)
-            .or_default()
-            .entry(identity.to_string())
-            .or_insert(0) += 1;
-    }
-
     pub fn record(&mut self, host: &str, identity: &str, class: &str, ok: bool, ms: f64) {
-        let origin = self.origins.entry(host.to_string()).or_default();
+        let origin = Arc::make_mut(self.origins.entry(host.to_string()).or_default());
         let score = origin.scores.entry(identity.to_string()).or_default();
         // Recent outcomes outweigh old ones: past SCORE_WINDOW attempts every
         // count halves, so a site that changed its mind is believed within weeks
@@ -596,8 +630,18 @@ impl State {
             score.ok += 1;
             origin.chosen = Some(identity.to_string());
             origin.wall_class = None;
-            origin.wall_vendor = None;
             origin.evidence.clear();
+            // The wall this origin last showed is what this identity got past:
+            // that is the cross-origin prior a cold origin behind the same vendor
+            // starts from. Recorded on success only, never assumed.
+            if let Some(vendor) = origin.wall_vendor.take() {
+                *self
+                    .vendor_priors
+                    .entry(vendor)
+                    .or_default()
+                    .entry(identity.to_string())
+                    .or_insert(0) += 1;
+            }
         } else {
             score.fail += 1;
         }
@@ -607,16 +651,34 @@ impl State {
         origin.updated_unix = now_unix();
     }
 
+    /// The wall `identity` (when known) was shown on `host`.
     pub fn record_wall(
         &mut self,
         host: &str,
+        identity: Option<&str>,
         class: &str,
         vendor: Option<&str>,
         evidence: &[String],
     ) {
-        let origin = self.origins.entry(host.to_string()).or_default();
+        let origin = Arc::make_mut(self.origins.entry(host.to_string()).or_default());
         origin.wall_class = Some(class.to_string());
         origin.wall_vendor = vendor.map(str::to_string);
+        // A vendor that walls an identity it used to let through is believed:
+        // each refusal takes a quarter of that identity's credit with the vendor,
+        // so a few fresh refusals outweigh an old run of passes.
+        if let (Some(vendor), Some(identity)) = (vendor, identity) {
+            if let Some(counts) = self.vendor_priors.get_mut(vendor) {
+                if let Some(count) = counts.get_mut(identity) {
+                    *count -= (*count).div_ceil(4);
+                    if *count == 0 {
+                        counts.remove(identity);
+                    }
+                }
+                if counts.is_empty() {
+                    self.vendor_priors.remove(vendor);
+                }
+            }
+        }
         origin.evidence = evidence.to_vec();
         origin.updated_unix = now_unix();
     }
@@ -625,10 +687,7 @@ impl State {
         if cookies.is_empty() {
             return;
         }
-        let per_identity = self
-            .cookies
-            .entry(host.to_string())
-            .or_default()
+        let per_identity = Arc::make_mut(self.cookies.entry(host.to_string()).or_default())
             .entry(identity.to_string())
             .or_default();
         for cookie in cookies {
@@ -683,6 +742,36 @@ impl State {
     }
 }
 
+/// The site a host belongs to, for ordering priors only: its last two labels,
+/// or three under a two-letter country code whose second level is a short
+/// generic one (`bbc.co.uk`, `abc.net.au`). An IP address is its own site.
+fn site_of(host: &str) -> &str {
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return host;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let keep = match labels.as_slice() {
+        [.., second, tld]
+            if tld.len() == 2
+                && matches!(
+                    *second,
+                    "co" | "com" | "net" | "org" | "ac" | "gov" | "edu" | "ne" | "or" | "go"
+                ) =>
+        {
+            3
+        }
+        _ => 2,
+    };
+    if labels.len() <= keep {
+        return host;
+    }
+    let skip: usize = labels[..labels.len() - keep]
+        .iter()
+        .map(|label| label.len() + 1)
+        .sum();
+    &host[skip..]
+}
+
 /// RFC 6265 §5.1.4: a cookie path covers the request path when they are equal,
 /// or the cookie path is a prefix ending at a `/` boundary. A cookie with no
 /// stored path is the site's own default and covers every path here.
@@ -728,6 +817,17 @@ impl State {
         let now = now_unix();
         let now_ms = now_ms();
         for per_identity in self.cookies.values_mut() {
+            // Only a jar holding an expired cookie is copied to be pruned.
+            let stale = per_identity.values().any(|cookies| {
+                cookies.is_empty()
+                    || cookies
+                        .iter()
+                        .any(|cookie| cookie.expires_unix.is_some_and(|at| at <= now))
+            });
+            if !stale {
+                continue;
+            }
+            let per_identity = Arc::make_mut(per_identity);
             for cookies in per_identity.values_mut() {
                 cookies.retain(|cookie| cookie.expires_unix.map(|at| at > now).unwrap_or(true));
             }
@@ -768,22 +868,72 @@ impl State {
 
     /// [`State::save_merged`] into `path`.
     pub fn save_merged_at(&self, base: &State, path: &std::path::Path) -> State {
-        let _lock = FileLock::take(path);
-        let mut merged = State::load_from(path);
-        merged.absorb(base, self);
-        merged.prune();
-        merged.write(path);
-        merged
+        self.save_merged_known(base, path, None).0
     }
 
-    fn write(&self, path: &std::path::Path) {
+    /// [`State::save_merged_at`] for a writer that knows which version of the
+    /// file `base` is: when the file is still that version (no other process
+    /// wrote since), it is not read and parsed again, and the merge is this
+    /// state itself. Returns the merged state and the version just written
+    /// (`None` when the write failed, so the next save reads the file).
+    pub fn save_merged_known(
+        &self,
+        base: &State,
+        path: &std::path::Path,
+        known: Option<FileStamp>,
+    ) -> (State, Option<FileStamp>) {
+        let _lock = FileLock::take(path);
+        let mut merged = match known {
+            // Folding our changes onto the base they were made from is exactly
+            // this state.
+            Some(known) if FileStamp::of(path) == Some(known) => self.clone(),
+            _ => {
+                let mut merged = State::load_from(path);
+                merged.absorb(base, self);
+                merged
+            }
+        };
+        merged.prune();
+        let written = merged.write(path);
+        let stamp = if written { FileStamp::of(path) } else { None };
+        (merged, stamp)
+    }
+
+    fn write(&self, path: &std::path::Path) -> bool {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let Ok(raw) = serde_json::to_vec(self) else {
-            return;
+            return false;
         };
-        write_replacing(path, &raw);
+        write_replacing(path, &raw)
+    }
+}
+
+/// One version of the state file. Every writer renames a freshly written file
+/// over it ([`write_replacing`]), so a new version is a new file: its creation
+/// time differs (and its inode, on Unix), whatever the clock's resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    inode: u64,
+}
+
+impl FileStamp {
+    pub fn of(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            created: meta.created().ok(),
+            inode,
+        })
     }
 }
 
@@ -869,6 +1019,28 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
             let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// [`fold`] over shared entries: one still the same allocation is unchanged
+/// without being compared.
+fn fold_shared<V: PartialEq>(
+    ours: &mut BTreeMap<String, Shared<V>>,
+    before: &BTreeMap<String, Shared<V>>,
+    after: &BTreeMap<String, Shared<V>>,
+) {
+    for (key, value) in after {
+        let unchanged = before
+            .get(key)
+            .is_some_and(|was| Arc::ptr_eq(was, value) || **was == **value);
+        if !unchanged {
+            ours.insert(key.clone(), Arc::clone(value));
+        }
+    }
+    for key in before.keys() {
+        if !after.contains_key(key) {
+            ours.remove(key);
         }
     }
 }
@@ -976,7 +1148,12 @@ mod tests {
         for n in 0..ORIGINS_MAX + 10 {
             let host = format!("h{n}.test");
             state.record(&host, "chrome", "content", true, 1.0);
-            state.origins.get_mut(&host).unwrap().last_ms = n as i64;
+            state
+                .origins
+                .get_mut(&host)
+                .map(Arc::make_mut)
+                .unwrap()
+                .last_ms = n as i64;
         }
         state.store_cookies(
             "h0.test",
@@ -1028,9 +1205,242 @@ mod tests {
     }
 
     #[test]
+    fn passing_a_named_wall_teaches_the_vendor_prior() {
+        // The encounter records the wall, then the identity that got past it:
+        // the prior must survive the success clearing the origin's wall.
+        let mut state = State::default();
+        state.record_wall(
+            "a.test",
+            Some("plain"),
+            "wall_program",
+            Some("cloudflare"),
+            &[],
+        );
+        state.record("a.test", "plain", "wall_program", false, 300.0);
+        state.record("a.test", "okhttp", "content", true, 600.0);
+        assert_eq!(state.vendor_priors["cloudflare"]["okhttp"], 1);
+        assert_eq!(state.origins["a.test"].wall_vendor, None);
+        // No wall seen, nothing credited.
+        state.record("b.test", "chrome", "content", true, 300.0);
+        assert_eq!(state.vendor_priors.len(), 1);
+        // A cold origin behind the same vendor now starts with what passed it.
+        state.record_wall("c.test", None, "wall_program", Some("cloudflare"), &[]);
+        assert_eq!(
+            state.order("c.test", &["plain", "chrome", "okhttp"])[0],
+            "okhttp"
+        );
+        // The vendor changes its mind: refusals wear the credit down to nothing.
+        for _ in 0..4 {
+            *state
+                .vendor_priors
+                .get_mut("cloudflare")
+                .unwrap()
+                .get_mut("okhttp")
+                .unwrap() += 1;
+        }
+        state.record_wall(
+            "c.test",
+            Some("okhttp"),
+            "wall_program",
+            Some("cloudflare"),
+            &[],
+        );
+        assert_eq!(state.vendor_priors["cloudflare"]["okhttp"], 3);
+        for _ in 0..3 {
+            state.record_wall(
+                "c.test",
+                Some("okhttp"),
+                "wall_program",
+                Some("cloudflare"),
+                &[],
+            );
+        }
+        assert!(!state.vendor_priors.contains_key("cloudflare"));
+    }
+
+    /// A state at the origin cap, shaped like a real one: scores for a few
+    /// identities, a wall on some, cookies on most.
+    pub(crate) fn full_state() -> State {
+        let mut state = State::default();
+        for n in 0..ORIGINS_MAX {
+            let host = format!("www.site{n}.test");
+            for identity in ["plain", "chrome", "chrome-local"] {
+                state.record(&host, identity, "content", n % 3 != 0, 420.0);
+            }
+            if n % 5 == 0 {
+                state.record_wall(
+                    &host,
+                    Some("plain"),
+                    "wall_program",
+                    Some("cloudflare"),
+                    &["cf-mitigated".into()],
+                );
+            }
+            state
+                .origins
+                .get_mut(&host)
+                .map(Arc::make_mut)
+                .unwrap()
+                .last_ms = now_ms() - n as i64;
+            state.store_cookies(
+                &host,
+                "chrome",
+                (0..4)
+                    .map(|c| StoredCookie {
+                        name: format!("cookie{c}"),
+                        value: "v".repeat(48),
+                        domain: Some(host.clone()),
+                        path: Some("/".into()),
+                        expires_unix: Some(now_unix() + 86_400),
+                        secure: true,
+                        http_only: c % 2 == 0,
+                    })
+                    .collect(),
+            );
+        }
+        state
+    }
+
+    #[test]
+    #[ignore = "a measurement, not a check: cargo test --release -- --ignored save_cost --nocapture"]
+    fn save_cost_at_the_origin_cap() {
+        let dir = std::env::temp_dir().join(format!("v5-save-cost-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("state.json");
+        let base = full_state();
+        let base = base.save_merged_at(&State::default(), &path);
+        let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let mut ours = base.clone();
+        let rounds = 20;
+        let started = std::time::Instant::now();
+        let mut current = base;
+        let mut stamp = FileStamp::of(&path);
+        for round in 0..rounds {
+            let before = ours.clone();
+            let mut after = before.clone();
+            after.record(
+                "www.site7.test",
+                "chrome",
+                "content",
+                true,
+                300.0 + round as f64,
+            );
+            ours.absorb(&before, &after);
+            (current, stamp) = ours.save_merged_known(&current, &path, stamp);
+            ours = current.clone();
+        }
+        let time = |label: &str, job: &mut dyn FnMut()| {
+            let at = std::time::Instant::now();
+            for _ in 0..5 {
+                job();
+            }
+            eprintln!("  {label}: {:.1} ms", at.elapsed().as_secs_f64() * 200.0);
+        };
+        let probe = current.clone();
+        time("clone", &mut || drop(probe.clone()));
+        let mut folded = probe.clone();
+        time("absorb", &mut || folded.absorb(&probe, &probe));
+        let mut pruned = probe.clone();
+        time("prune", &mut || pruned.prune());
+        time("serialize", &mut || drop(serde_json::to_vec(&probe)));
+        let raw = serde_json::to_vec(&probe).unwrap();
+        time("write", &mut || {
+            let _ = write_replacing(&path, &raw);
+        });
+        time("parse", &mut || drop(State::load_from(&path)));
+        time("stamp", &mut || {
+            let _ = FileStamp::of(&path);
+        });
+        eprintln!(
+            "state file {} KB, {:.1} ms per learning fetch (clone, absorb, merge, write)",
+            bytes / 1024,
+            started.elapsed().as_secs_f64() * 1000.0 / rounds as f64
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writer_that_knows_the_file_still_merges_another_processes_write() {
+        let dir = std::env::temp_dir().join(format!("v5-known-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("state.json");
+        let _ = std::fs::remove_file(&path);
+        // Process A writes, and knows the version it wrote.
+        let mut a = State::default();
+        a.record("a.test", "chrome", "content", true, 100.0);
+        let (base_a, stamp_a) = a.save_merged_known(&State::default(), &path, None);
+        assert!(stamp_a.is_some());
+        // Process B writes in between.
+        let mut b = State::load_from(&path);
+        let base_b = b.clone();
+        b.record("b.test", "okhttp", "content", true, 100.0);
+        b.save_merged_at(&base_b, &path);
+        // A saves again on its stale stamp: B's learning survives.
+        let mut a2 = base_a.clone();
+        a2.record("c.test", "plain", "content", true, 100.0);
+        let (merged, _) = a2.save_merged_known(&base_a, &path, stamp_a);
+        for host in ["a.test", "b.test", "c.test"] {
+            assert!(merged.origins.contains_key(host), "{host}");
+        }
+        assert_eq!(State::load_from(&path).origins.len(), 3);
+        // Unchanged since A's last write: the merge is A's state, and it is on disk.
+        let (merged, stamp) =
+            merged.save_merged_known(&State::default(), &path, FileStamp::of(&path));
+        assert_eq!(merged.origins.len(), 3);
+        assert_eq!(stamp, FileStamp::of(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_host_starts_from_what_its_site_learned() {
+        assert_eq!(site_of("www.example.com"), "example.com");
+        assert_eq!(site_of("example.com"), "example.com");
+        assert_eq!(site_of("news.bbc.co.uk"), "bbc.co.uk");
+        assert_eq!(site_of("a.b.github.io"), "github.io");
+        assert_eq!(site_of("10.0.0.1"), "10.0.0.1");
+        assert_eq!(site_of("localhost"), "localhost");
+        let mut state = State::default();
+        state.record_wall(
+            "www.shop.test",
+            Some("plain"),
+            "wall_program",
+            Some("cloudflare"),
+            &[],
+        );
+        state.record("www.shop.test", "plain", "wall_program", false, 300.0);
+        state.record("www.shop.test", "okhttp", "content", true, 600.0);
+        // Elsewhere, chrome has passed most often: the global prior.
+        for host in ["a.test", "b.test"] {
+            state.record(host, "chrome", "content", true, 300.0);
+        }
+        let prior = ["plain", "chrome", "okhttp"];
+        assert_eq!(state.order("m.shop.test", &prior)[0], "okhttp");
+        // Another site learns nothing from it: the global prior leads there.
+        assert_eq!(state.order("www.other.test", &prior)[0], "chrome");
+        // A host's own history outranks its site's.
+        state.record("m.shop.test", "chrome", "content", true, 300.0);
+        assert_eq!(state.order("m.shop.test", &prior)[0], "chrome");
+        // Cookies never cross.
+        state.store_cookies(
+            "www.shop.test",
+            "okhttp",
+            vec![StoredCookie {
+                name: "s".into(),
+                value: "1".into(),
+                domain: None,
+                path: None,
+                expires_unix: None,
+                secure: false,
+                http_only: false,
+            }],
+        );
+        assert!(state.cookie_header("m.shop.test", "okhttp").is_none());
+    }
+
+    #[test]
     fn a_vendor_prior_lifts_the_identity_that_worked_there() {
         let mut state = State::default();
-        state.record_wall("b.test", "wall_program", Some("cloudflare"), &[]);
+        state.record_wall("b.test", None, "wall_program", Some("cloudflare"), &[]);
         *state
             .vendor_priors
             .entry("cloudflare".to_string())

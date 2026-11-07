@@ -1813,7 +1813,6 @@
     // The page the caller already fetched is the one to run: asking again inside
     // the same window adds a challenge attempt and can escalate the vendor.
     const html = page.html;
-    let spent = { status: 0, url: "", body: "" };
 
     note("log", "env Worker=" + (typeof globalThis.Worker) + " Blob=" + (typeof globalThis.Blob) + " fetch=" + (typeof globalThis.fetch) + " coURL=" + (typeof URL.createObjectURL) + " cib=" + (typeof globalThis.crypto) + "/" + (typeof (globalThis.crypto && globalThis.crypto.subtle && globalThis.crypto.subtle.importKey)));
     const beforeGlobals = new Set(Object.getOwnPropertyNames(globalThis));
@@ -1906,7 +1905,6 @@
       cookies,
       surfaces: [...M.surfaces],
       redirect: M.redirect || null,
-      page: spent,
       logs: M.logs.slice(0, DEBUG ? 5000 : 200),
       ms: ops.op_now() - M.started,
     }));

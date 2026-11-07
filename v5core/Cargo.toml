@@ -15,7 +15,7 @@ wreq-util = "=3.0.0-rc.14"
 tokio = { version = "1", features = ["rt", "time", "net", "sync", "macros"] }
 # Already in the tree through wreq: reads the engine's response bodies in chunks.
 futures-util = { version = "0.3", default-features = false }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # The challenge engine: V8 in-process, so the site's own program runs here and
 # never in a browser.
