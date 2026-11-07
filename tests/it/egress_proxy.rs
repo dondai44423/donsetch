@@ -539,10 +539,6 @@ async fn stealth_v3_invalid_ambient_proxy_keeps_explicit_bypass_and_lane_control
 }
 
 #[tokio::test]
-#[cfg_attr(
-    windows,
-    ignore = "the selected proxy lane is not credited on Windows: the next pick returns the same lane after it answered 429. Real defect to root-cause on hardware; see status.md."
-)]
 async fn stealth_v3_selected_route_keeps_lane_health_for_the_next_call() {
     use donsetch::egress::proxy::Proxy;
     use donsetch::search::egress::EgressPool;

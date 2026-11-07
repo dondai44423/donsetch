@@ -305,6 +305,28 @@ jobs:
           cargo test --release --locked --lib 2>&1 | tail -4 || echo "v5core lib tests exit=$?"
         timeout-minutes: 30
 
+      # Not a gate (the beta ships no arm64 asset): it turns "segfaults before
+      # main" into a symbolized fault on real hardware, so the collision can be
+      # attacked from evidence instead of a sentence in status.md. Remove this
+      # step and turn the lane back into a test lane once the binary starts.
+      - name: aarch64 fault evidence (advisory)
+        if: matrix.name == 'linux-aarch64'
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          set +e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb >/dev/null 2>&1
+          cargo build --profile fast --bin donsetch --target ${{ matrix.target }}
+          BIN=./target/${{ matrix.target }}/fast/donsetch
+          echo "--- file";    file "$BIN"
+          echo "--- loader";  readelf -l "$BIN" | grep -A1 INTERP
+          echo "--- direct"
+          "$BIN" --version; echo "exit=$?"
+          echo "--- gdb"
+          gdb -batch -ex 'set pagination off' -ex run -ex 'bt 40' \
+              -ex 'info sharedlibrary' --args "$BIN" --version 2>&1 | tail -100
+
       # A test list is not proof the binary runs: a fault that only shows at
       # exec (the aarch64 lane hit exactly that) surfaced as nextest's
       # "creating test list failed" instead of the crash itself. This starts

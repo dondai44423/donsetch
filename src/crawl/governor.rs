@@ -693,10 +693,6 @@ mod tests {
         assert!(pool.rtt_ms("direct").is_some());
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "wall/lane accounting on Windows keeps the direct lane where Linux penalizes it (a 403 and an auth-wall 201 both reach the governor unpenalized). Real defect to root-cause on hardware; see status.md. The fetch still returns content."
-    )]
     #[tokio::test]
     async fn stealth_v3_success_status_403_still_penalizes_crawl_lane() {
         let (governor, pool, unused_proxy) = owned_status_crawl(403, false).await;
@@ -714,10 +710,6 @@ mod tests {
         assert!(pool.rtt_ms("direct").is_some());
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "wall/lane accounting on Windows keeps the direct lane where Linux penalizes it (a 403 and an auth-wall 201 both reach the governor unpenalized). Real defect to root-cause on hardware; see status.md. The fetch still returns content."
-    )]
     #[tokio::test]
     async fn stealth_v3_success_status_201_auth_wall_still_penalizes_crawl_content() {
         let (governor, pool, _) = owned_status_crawl(201, true).await;
