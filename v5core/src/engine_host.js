@@ -1613,7 +1613,7 @@
       const due = env.timers.filter((t) => !t.cancelled && t.at <= ops.op_now());
       for (const t of due) {
         if (t.repeat) t.at = ops.op_now() + t.every; else t.cancelled = true;
-        try { t.fn.apply(null, t.args); } catch (e) { note("log", "timer: " + (e && e.message)); }
+        try { t.fn.apply(null, t.args); } catch (e) { note("log", "timer: " + (e && (e.stack || e.message))); }
         settle();
       }
     }
