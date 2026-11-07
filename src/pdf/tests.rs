@@ -290,6 +290,157 @@ fn a_short_document_keeps_its_first_page_footer() {
     }
 }
 
+/// A `furniture_page`-sized page holding `lines` as (text, y0) pairs, each
+/// 10 pt tall: y0 <= 70 is in the top band, y0 >= 736 in the bottom band.
+fn band_page(index: usize, lines: &[(&str, f32)]) -> crate::pdf::layout::PageLines {
+    let mut page = furniture_page(index);
+    let template = page.lines[0].clone();
+    page.lines = lines
+        .iter()
+        .zip(0u32..)
+        .map(|(&(text, y0), order)| crate::pdf::layout::Line {
+            text: text.to_string(),
+            y0,
+            y1: y0 + 10.0,
+            glyphs: text.chars().count(),
+            order,
+            ..template.clone()
+        })
+        .collect();
+    page
+}
+
+fn has_line(page: &crate::pdf::layout::PageLines, text: &str) -> bool {
+    page.lines.iter().any(|l| l.text == text)
+}
+
+#[test]
+fn a_phrase_in_both_bands_of_one_page_counts_once() {
+    // The IRS W-9 layout: page 1 has the title "Form W-9" in its head and
+    // the form number in its foot; pages 2-6 share one running head, which
+    // pass 1 removes; page 2's foot holds a body sentence naming the form.
+    // "form w-#" is then in the head of one sampled page and in the foot of
+    // two: no band reaches the cutoff of three pages.
+    let sentence = "See Pub. 515 for more information on providing a Form W-9 or a certification";
+    let heads: Vec<String> = (0..6)
+        .map(|i| format!("Form W-9 (Rev. 3-2024) Page {}", i + 1))
+        .collect();
+    let mut pages: Vec<_> = (0..6)
+        .map(|index| {
+            let mut lines = vec![("Body text unique to this page", 300.0)];
+            match index {
+                0 => lines.extend([
+                    ("Form W-9", 30.0),
+                    ("Cat. No. 10231X Form W-9 (Rev. 3-2024)", 760.0),
+                ]),
+                _ => lines.push((heads[index].as_str(), 30.0)),
+            }
+            if index == 1 {
+                lines.push((sentence, 750.0));
+            }
+            band_page(index, &lines)
+        })
+        .collect();
+    crate::pdf::reading::suppress_furniture(&mut pages);
+    assert!(
+        has_line(&pages[0], "Form W-9"),
+        "the page-1 title was counted twice and suppressed: {:?}",
+        pages[0].lines
+    );
+    assert!(
+        has_line(&pages[1], sentence),
+        "the body sentence was suppressed as furniture: {:?}",
+        pages[1].lines
+    );
+    for p in &pages[1..] {
+        assert!(
+            !has_line(p, &heads[p.index]),
+            "page {} kept its running head",
+            p.index
+        );
+    }
+}
+
+#[test]
+fn a_band_sentence_sharing_one_family_bigram_survives() {
+    // A running head that varies per page (roman numerals defeat pass 1)
+    // is a bigram family; a body sentence that continues into the head
+    // band of page 3 shares one of its bigrams, "form w-#", and nothing
+    // else.
+    let numerals = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii"];
+    let heads: Vec<String> = numerals
+        .iter()
+        .map(|n| format!("Instructions for Form W-9 · {n}"))
+        .collect();
+    let sentence = "Persons who must file Form W-9 with the requester should read";
+    let mut pages: Vec<_> = (0..8)
+        .map(|index| {
+            let mut lines = vec![
+                (heads[index].as_str(), 30.0),
+                ("Body text unique to this page", 300.0),
+            ];
+            if index == 2 {
+                lines.push((sentence, 50.0));
+            }
+            band_page(index, &lines)
+        })
+        .collect();
+    crate::pdf::reading::suppress_furniture(&mut pages);
+    assert!(
+        has_line(&pages[2], sentence),
+        "a sentence sharing one bigram with the running head was suppressed: {:?}",
+        pages[2].lines
+    );
+    for p in &pages {
+        assert!(
+            !has_line(p, &heads[p.index]),
+            "page {} kept its running head",
+            p.index
+        );
+    }
+}
+
+#[test]
+fn a_footer_family_varying_per_page_is_still_suppressed() {
+    // The PDF 32000 footer: the page label alternates sides and runs from
+    // roman to arabic, so no exact key recurs and only the bigram family
+    // can remove it, on the sampled pages and past them.
+    let labels = ["i", "ii", "iii", "iv", "v", "vi", "81", "420"];
+    let feet: Vec<String> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let notice = "© Adobe Systems Incorporated 2008 – All rights reserved";
+            if i % 2 == 0 {
+                format!("{notice} {n}")
+            } else {
+                format!("{n} {notice}")
+            }
+        })
+        .collect();
+    let mut pages: Vec<_> = (0..8)
+        .map(|index| {
+            band_page(
+                index,
+                &[
+                    ("Body text unique to this page", 300.0),
+                    (feet[index].as_str(), 760.0),
+                ],
+            )
+        })
+        .collect();
+    crate::pdf::reading::suppress_furniture(&mut pages);
+    for p in &pages {
+        let texts: Vec<&str> = p.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["Body text unique to this page"],
+            "page {} kept its footer",
+            p.index
+        );
+    }
+}
+
 // ---------- form (w9.pdf) ----------
 
 #[test]
@@ -323,6 +474,33 @@ fn w9_form_content() {
         parsed.blocks.len() > 10,
         "w9 produced suspiciously few blocks ({})",
         parsed.blocks.len()
+    );
+}
+
+#[test]
+fn w9_body_lines_in_the_page_bands_are_not_furniture() {
+    let Some(bytes) = read("w9.pdf") else {
+        return;
+    };
+    let parsed = crate::pdf::parse(&bytes).expect("parse");
+    let text = all_block_text(&parsed.blocks);
+    // Each of these lines sits in a top or bottom page band and shares one
+    // or two common bigrams ("form w-#", "of the", "a disregarded",
+    // "a foreign", "as a") with other band lines of the form; none of them
+    // repeats.
+    let missing: Vec<&str> = [
+        "See Pub. 515 for more information on providing a Form W-9",
+        "Department of the Treasury",
+        "Caution: A disregarded U.S. entity",
+        "member of the same expanded affiliated",
+        "group as a corporation described in Regulations section",
+    ]
+    .into_iter()
+    .filter(|line| !text.contains(line))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "w9 body lines suppressed as furniture: {missing:?}"
     );
 }
 
