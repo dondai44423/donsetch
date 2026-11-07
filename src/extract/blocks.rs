@@ -318,6 +318,7 @@ fn walk<'a>(
                 );
             }
         }
+        "table" if is_link_farm_table(el, base, opts) => {}
         "table" => {
             // Prose tables (forum threads, HN comment trees, layout
             // tables) must NOT go through the pipe-table renderer :
@@ -689,6 +690,26 @@ fn def_list_items(dl: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) 
     items
 }
 
+/// A navigation table: a Wikipedia series sidebar or navbox, a link
+/// directory laid out as a table. It is a list of links to other pages, not
+/// content of this one, and at several thousand characters it would be the
+/// first thing every read of the article returns. Only a table that both
+/// says so in its class and is almost all links is dropped, whatever its size.
+fn is_link_farm_table(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> bool {
+    let class = el.value().attr("class").unwrap_or("");
+    let nav_class = class.split_whitespace().any(|c| {
+        matches!(
+            c,
+            "sidebar" | "navbox" | "vertical-navbox" | "navbar" | "navbox-inner"
+        )
+    });
+    if !nav_class || class.split_whitespace().any(|c| c == "infobox") {
+        return false;
+    }
+    let (_, link_density) = inline::markdown(el, base, opts);
+    link_density >= 0.7
+}
+
 /// Layout/prose table detection. Forums (HN, phpBB), old CMSes,
 /// and email-style pages lay CONTENT out in tables; rendering those
 /// as pipe tables flattens their paragraph structure. A table is
@@ -780,6 +801,8 @@ fn table_block(
 ) -> Option<Block> {
     let mut headers = Vec::new();
     let mut rows = Vec::new();
+    // Set when any filled cell holds text that is not a link.
+    let mut prose_cell = false;
     // Output pagination is the budget. Cutting source rows or cells here
     // makes later focus/probe/offset reads unable to recover the evidence.
     for tr in own_rows(el) {
@@ -791,7 +814,9 @@ fn table_block(
         let cells: Vec<(bool, String)> = own_cells(tr)
             .map(|c| {
                 let is_th = c.value().name() == "th";
-                let t = inline::markdown(c, base, opts).0.replace('|', "\\|"); // unescaped pipes break md tables
+                let (md, link_density) = inline::markdown(c, base, opts);
+                prose_cell |= !md.trim().is_empty() && link_density < 0.9;
+                let t = md.replace('|', "\\|"); // unescaped pipes break md tables
                 (is_th, t)
             })
             .collect();
@@ -818,11 +843,13 @@ fn table_block(
     if headers.is_empty() && !rows.is_empty() {
         headers = rows.remove(0);
     }
-    // Tab-nav junk: tiny tables that are just links.
+    // Tab-nav junk: tiny tables that are only links. A small table with a
+    // cell of plain text is a figure ("Maximum | EUR 15M or 3%"), and
+    // dropping it leaves a section that reads as complete without it.
     let total_text: usize = headers.iter().map(|h| h.len()).sum::<usize>()
         + rows.iter().flatten().map(|c| c.len()).sum::<usize>();
     let cells = headers.len() + rows.iter().map(|r| r.len()).sum::<usize>();
-    if cells <= 3 && total_text < 60 {
+    if cells <= 3 && total_text < 60 && !prose_cell {
         return None;
     }
     Some(Block::Table {

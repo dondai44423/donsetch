@@ -222,11 +222,35 @@ fn is_furniture(el: ElementRef) -> bool {
         "style" | "script" | "sup" => {
             el.value().name() != "sup" || el.value().classes().any(|c| c == "reference")
         }
-        "span" | "div" => el.value().classes().any(|c| c == "mw-editsection"),
+        // Navigation boxes and the series sidebar are lists of links to other
+        // articles, thousands of characters of them: they would be the first
+        // and the last thing every read of the article returns.
+        "span" | "div" => el.value().classes().any(|c| {
+            matches!(
+                c,
+                "mw-editsection"
+                    | "navbox"
+                    | "navbox-styles"
+                    | "vertical-navbox"
+                    | "sidebar"
+                    | "authority-control"
+                    | "catlinks"
+                    | "printfooter"
+                    | "sistersitebox"
+            )
+        }),
         "table" => el.value().classes().any(|c| {
             matches!(
                 c,
-                "infobox" | "navbox" | "vertical-navbox" | "metadata" | "ambox" | "sistersitebox"
+                "infobox"
+                    | "navbox"
+                    | "vertical-navbox"
+                    | "metadata"
+                    | "ambox"
+                    | "sistersitebox"
+                    | "sidebar"
+                    | "navbar"
+                    | "authority-control"
             )
         }),
         _ => false,
@@ -357,6 +381,30 @@ mod tests {
         <p>Rust began as a personal project in 2006.</p>
       </div>
     </div></body></html>"#;
+
+    #[test]
+    fn series_sidebars_and_navboxes_are_not_article_content() {
+        let html = r#"<html><body><div id="content"><h1 class="firstHeading">Treaty</h1>
+      <div class="mw-content-ltr mw-parser-output">
+        <table class="infobox"><tr><th scope="row">Signed</th><td>1 May 2020</td></tr><tr><th scope="row">Location</th><td>Geneva</td></tr><tr><th scope="row">Parties</th><td>Twelve states</td></tr><tr><th scope="row">Language</th><td>French</td></tr></table>
+        <table class="sidebar nomobile"><tr><td><a href="/wiki/Alpha">Alpha topic</a> <a href="/wiki/Beta">Beta topic</a></td></tr></table>
+        <p>The treaty was signed in 2020 and ratified by every party within a year.</p>
+        <h2>Terms</h2>
+        <table class="wikitable"><tr><th>Item</th><th>Limit</th></tr><tr><td>Fines</td><td>EUR 15M or 3%</td></tr></table>
+        <div class="navbox"><table class="nowraplinks"><tr><td><a href="/wiki/Gamma">Gamma topic</a></td></tr></table></div>
+        <div class="navbox authority-control"><a href="/wiki/VIAF">VIAF</a></div>
+      </div></div></body></html>"#;
+        let ex = extract(html, "https://en.wikipedia.org/wiki/Treaty", &opts()).unwrap();
+        assert!(
+            ex.markdown.contains("ratified by every party"),
+            "{}",
+            ex.markdown
+        );
+        assert!(ex.markdown.contains("EUR 15M or 3%"), "{}", ex.markdown);
+        for gone in ["Alpha topic", "Gamma topic", "VIAF"] {
+            assert!(!ex.markdown.contains(gone), "{gone}: {}", ex.markdown);
+        }
+    }
 
     #[test]
     fn infobox_becomes_fields() {

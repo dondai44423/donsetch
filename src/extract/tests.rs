@@ -1722,6 +1722,62 @@ fn table_without_th_promotes_first_row() {
     assert!(!r.markdown.contains("|  |  |"));
 }
 
+// A table of one row is a figure ("Maximum | EUR 15M or 3%"), not
+// navigation: table_block dropped every table of three cells or fewer
+// and under 60 chars, so a section read as complete while its one
+// number was missing. Only a tiny table made of links is tab-nav.
+#[test]
+fn a_small_table_of_figures_is_kept_and_a_tiny_link_table_is_not() {
+    let prose = "The ceiling for this tier is stated in the table that follows, and small enterprises pay the lower of the two amounts rather than the higher one.";
+    let html = format!(
+        r#"<html><body><article><h1>Fines</h1>
+<h2>Tier two</h2><p>{prose}</p>
+<table><tr><th>Maximum</th><td>EUR 15M or 3%</td></tr></table>
+<p>SMEs pay the lower amount.</p>
+<h2>Tier one</h2><p>{prose}</p>
+<table><tr><td>Max</td><td>EUR 35M</td><td>7%</td></tr></table>
+<h2>Tabs</h2><p>{prose}</p>
+<table><tr><td><a href="/a">Overview</a></td><td><a href="/b">Pricing</a></td></tr></table>
+</article></body></html>"#
+    );
+    let r = extract_html(&html);
+    assert!(r.markdown.contains("EUR 15M or 3%"), "{}", r.markdown);
+    assert!(r.markdown.contains("EUR 35M"), "{}", r.markdown);
+    assert!(!r.markdown.contains("Overview"), "{}", r.markdown);
+
+    // And the section view carries the figure with its prose.
+    let view = view::View {
+        section: Some("Tier two".into()),
+        max_chars: 16_000,
+        ..view::View::default()
+    };
+    let section = view::render(&r.markdown, &view, None);
+    assert!(section.text.contains("EUR 15M or 3%"), "{}", section.text);
+    assert!(section.text.contains("lower amount"), "{}", section.text);
+}
+
+// A series sidebar is a table of links to other articles. It is not
+// content of the page, and at thousands of characters it led every read of
+// the article; a data table with the same class is still data.
+#[test]
+fn a_link_directory_table_is_dropped_but_a_data_table_is_not() {
+    let prose = "The treaty was signed after long negotiation between the parties, and it entered into force a year later once every signatory had ratified it in turn.";
+    let links: String = (0..40)
+        .map(|i| format!(r#"<tr><td><a href="/wiki/Topic_{i}">Topic number {i}</a></td></tr>"#))
+        .collect();
+    let html = format!(
+        r#"<html><body><article><h1>Treaty</h1><p>{prose}</p>
+<table class="sidebar nomobile">{links}</table>
+<h2>Terms</h2><p>{prose}</p>
+<table class="sidebar"><tr><th>Item</th><th>Limit</th></tr><tr><td>Fines</td><td>EUR 15M or 3%</td></tr></table>
+</article></body></html>"#
+    );
+    let r = extract_html(&html);
+    assert!(!r.markdown.contains("Topic number 7"), "{}", r.markdown);
+    assert!(r.markdown.contains("EUR 15M or 3%"), "{}", r.markdown);
+    assert!(r.markdown.contains("long negotiation"), "{}", r.markdown);
+}
+
 // ════════════════════════════════════════════════════════════
 // 24b. TABLE ROW HEADERS (<th scope="row">) ARE KEPT
 // ════════════════════════════════════════════════════════════
