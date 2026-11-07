@@ -556,22 +556,25 @@ and origins, like every other knob. The rule table itself is not listed; use
   not in the denied section or its count. Skipped pages appear only in the
   crawl's debug data for the client (`_meta`), not in its text or `[meta]`;
   the crawl is then reported not `complete`.
-- **The browser reports some refusals as browser errors.** `policy.denied`
-  appears only when the URL the browser was sent to is itself denied, or the
-  page lands on a denied URL. A redirect the browser follows into a denied
-  host is blocked, and surfaces as a browser navigation error. A navigation
-  the page starts
-  on its own after loading (a script or meta refresh) is blocked the same way
-  and surfaces as a failed page. A subresource from a denied host (an image, a
-  script) is dropped silently from any page the browser renders.
+- **The browser drops a denied subresource silently.** `web_screenshot`
+  refuses the capture with `policy.denied` when the URL it was sent to is
+  denied, when a redirect the browser follows leads into a denied host, and
+  when the page navigates there on its own (a script or meta refresh) before
+  the capture is taken. A subresource from a denied host (an image, a script,
+  a `fetch()`) is blocked without a report: that request fails inside the
+  page and the capture goes ahead without it.
 - **The browser check sees only the page's own HTTP requests.** It intercepts
   the requests Chrome pauses for the page through the DevTools `Fetch`
-  domain. A WebSocket and a preconnect hint are not checked, so a page on an
-  allowed host can still make the browser open a connection to a denied host;
-  a DNS prefetch hint only looks up the host's name. Requests made inside a
-  cross-site iframe or by a worker the page starts are probably not checked
-  either. This list is read from the code and from how Chrome's DevTools
-  protocol works, not from a test with a real browser.
+  domain: the page's navigation and redirects, its subresources and
+  `fetch()` calls, and those of a dedicated worker it starts. A WebSocket and
+  a preconnect hint are not checked, so a page on an allowed host can still
+  make the browser open a connection to a denied host; a DNS prefetch hint
+  only looks up the host's name. Requests made inside a cross-site iframe, or
+  by a shared or service worker the page starts, are not checked either.
+  With headless Chromium 156, a WebSocket, a cross-site iframe's image and
+  `fetch()`, and a shared and a service worker's `fetch()` all reached a
+  denied host; the preconnect and DNS prefetch cases are read from how
+  Chrome's DevTools protocol works, not tested.
 - **Changing rules does not rewrite a resumable crawl.** After you remove or
   narrow a rule, a resumed crawl neither fetches the URLs the earlier run
   denied nor stops listing them: they stay in the crawl's seen set and in its
