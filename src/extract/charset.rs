@@ -41,6 +41,50 @@ pub fn decode(body: &[u8], content_type: &str) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
+/// Decode a body that is not HTML (plain text, JSON, XML, a feed) by
+/// what it declares, without guessing: a BOM, else the Content-Type
+/// charset, else the `encoding` of a leading `<?xml ...?>` declaration,
+/// else UTF-8. A Content-Type charset that names the replacement
+/// encoding (iso-2022-kr, hz-gb-2312 and the other labels encoding_rs
+/// maps to it) is ignored. Malformed bytes become U+FFFD.
+pub fn decode_declared(body: &[u8], content_type: &str) -> String {
+    // No meta prescan and no statistical guess: the prescan takes the
+    // label after any "charset" word in the first 4 KB, so a UTF-8 text
+    // that mentions one would decode as that charset. `Encoding::decode`
+    // sniffs a BOM ahead of the label it is called on, which puts the BOM
+    // first (RFC 7303 §3.2 for XML: the BOM, then the charset parameter).
+    // The replacement decoder turns any non-empty input into one U+FFFD,
+    // so following such a header would drop the whole body.
+    let enc = from_content_type(content_type)
+        .filter(|enc| *enc != encoding_rs::REPLACEMENT)
+        .or_else(|| xml_declared(body))
+        .unwrap_or(encoding_rs::UTF_8);
+    enc.decode(body).0.into_owned()
+}
+
+/// The encoding an XML declaration at the start of `body` names
+/// (leading ASCII whitespace allowed). A UTF-16 or replacement label
+/// yields UTF-8.
+fn xml_declared(body: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let head = &body[..body.len().min(1024)];
+    let decl = head.trim_ascii_start().strip_prefix(b"<?xml")?;
+    let decl = &decl[..decl.windows(2).position(|w| w == b"?>")?];
+    let at = decl.windows(8).position(|w| w == b"encoding")?;
+    let value = decl[at + 8..]
+        .trim_ascii_start()
+        .strip_prefix(b"=")?
+        .trim_ascii_start();
+    let (&quote, value) = value.split_first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let label = &value[..value.iter().position(|&b| b == quote)?];
+    // A declaration read as ASCII bytes is not in UTF-16, whatever it
+    // names, and the replacement encoding would turn the whole body into
+    // one U+FFFD: both decode as UTF-8.
+    encoding_rs::Encoding::for_label(label).map(encoding_rs::Encoding::output_encoding)
+}
+
 /// Extract charset from a Content-Type header value.
 ///
 /// Handles: case-insensitive "charset", quoted values, spaces
@@ -627,6 +671,52 @@ mod tests {
         };
         let decoded = decode(&html, "text/html");
         assert!(decoded.contains("日本語"), "decoded: {decoded}");
+    }
+
+    // ── Declared charsets only (text, feeds) ──
+
+    #[test]
+    fn declared_bom_then_header_then_xml_declaration_then_utf8() {
+        let ru = "Привет";
+        let (cp1251, _, _) = encoding_rs::WINDOWS_1251.encode(ru);
+        let with_decl = |label: &str| {
+            let mut xml = format!("<?xml version='1.0' encoding='{label}'?><p>").into_bytes();
+            xml.extend_from_slice(&cp1251);
+            xml
+        };
+        let xml = with_decl("windows-1251");
+        assert!(decode_declared(&xml, "application/xml").contains(ru));
+        let xml = with_decl("utf-8");
+        assert!(decode_declared(&xml, "text/xml; charset=windows-1251").contains(ru));
+        let bom = [b"\xEF\xBB\xBF".as_slice(), ru.as_bytes()].concat();
+        assert_eq!(
+            decode_declared(&bom, "text/plain; charset=windows-1251"),
+            ru
+        );
+        let text = "Größe, charset=iso-8859-1";
+        assert_eq!(decode_declared(text.as_bytes(), "text/plain"), text);
+    }
+
+    #[test]
+    fn a_declared_utf16_or_replacement_label_in_ascii_bytes_decodes_as_utf8() {
+        for label in ["UTF-16", "iso-2022-kr"] {
+            let xml = format!("<?xml version=\"1.0\" encoding=\"{label}\"?><t>Größe</t>");
+            assert!(
+                decode_declared(xml.as_bytes(), "").contains("Größe"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_replacement_header_charset_is_ignored() {
+        for label in ["iso-2022-kr", "hz-gb-2312"] {
+            let ct = format!("text/plain; charset={label}");
+            assert_eq!(decode_declared(b"hello", &ct), "hello", "{label}");
+        }
+        let (xml, _, _) = encoding_rs::WINDOWS_1251
+            .encode("<?xml version=\"1.0\" encoding=\"windows-1251\"?><t>Привет</t>");
+        assert!(decode_declared(&xml, "text/xml; charset=iso-2022-kr").contains("Привет"));
     }
 
     // ── Ghost (browser-provided) text: pinned UTF-8 (#35) ──
