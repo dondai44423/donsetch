@@ -1201,8 +1201,6 @@ fn spacing_preserves_digits_and_real_word_gaps() {
 
 /// Serialize `objects` (bodies of objects 1..=n) into a PDF with a
 /// correct xref table. Object 1 is the catalog.
-#[cfg(feature = "ocr")]
-
 fn audit_pdf(objects: &[String]) -> Vec<u8> {
     let mut out = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -1226,8 +1224,6 @@ fn audit_pdf(objects: &[String]) -> Vec<u8> {
     );
     out
 }
-
-#[cfg(feature = "ocr")]
 
 fn audit_stream(content: &str) -> String {
     format!(
