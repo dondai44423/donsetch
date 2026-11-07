@@ -323,6 +323,12 @@ pub(crate) fn parse_with(bytes: &[u8], max_pages: usize) -> Result<ParsedPdf, Pd
                     let Some(bmp) = &pixels else {
                         continue;
                     };
+                    // `pi` is a document page index, but `pages` holds only
+                    // the pages that loaded: after a page PDFium could not
+                    // load, a page's position is no longer its index.
+                    let Some(at) = pages.iter().position(|p| p.index == *pi) else {
+                        continue;
+                    };
                     let t0 = std::time::Instant::now();
                     let hint = decided_hint.unwrap_or(script_hint);
                     match ocr::ocr_page(bmp, hint) {
@@ -345,15 +351,15 @@ pub(crate) fn parse_with(bytes: &[u8], max_pages: usize) -> Result<ParsedPdf, Pd
                             ocr_conf_sum += conf;
                             ocr_conf_pages += 1;
                             ocr_page_conf.insert(*pi, conf);
-                            let (pw, ph) = (pages[*pi].width, pages[*pi].height);
+                            let (pw, ph) = (pages[at].width, pages[at].height);
                             let pc = ocr::lines_to_chars(&olines, *pi, pw, ph);
                             let mut pl = layout::assemble(pc);
-                            pl.fusion = pages[*pi].fusion.clone();
+                            pl.fusion = pages[at].fusion.clone();
                             if let Some(f) = pl.fusion.as_mut() {
                                 f.garbage_ratio = 1.0;
                             }
-                            pl.images = pages[*pi].images;
-                            pages[*pi] = pl;
+                            pl.images = pages[at].images;
+                            pages[at] = pl;
                             ocr_pages += 1;
                         }
                         Ok((_olines, _kind)) => {
