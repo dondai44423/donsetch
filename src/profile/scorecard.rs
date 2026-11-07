@@ -11,10 +11,10 @@
 //!   user agent) via a public echo endpoint and diffs every layer
 //!   against the committed baseline fixture. Any layer that moved
 //!   without a deliberate profile change = alarm.
-//! - When a local Chrome is available, the same endpoint is ALSO
-//!   captured through the ghost (a real browser): local fetch vs real
-//!   Chrome parity is the strongest stealth statement available,
-//!   computed live with no fixture maintenance.
+//! - `--stealth --parity` captures the same endpoint through the
+//!   local browser (a real Chrome) instead of reading the fixture:
+//!   local fetch vs real Chrome parity is the strongest stealth
+//!   statement available, computed live with no fixture maintenance.
 //! - CI runs the fixture diff weekly; a drift reds the pipeline
 //!   before the ecosystem's JA4 databases even notice.
 //!
@@ -36,10 +36,10 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FingerprintSnapshot {
     /// Free-text provenance: what produced this snapshot
-    /// ("local fetcher, profile chrome-151, linux", or the ghost
-    /// chrome version). For human review of the fixture.
+    /// ("local fetcher, profile chrome-151, linux", or "local browser
+    /// (real Chrome)"). For human review of the fixture.
     /// Defaulted: raw echo endpoints do not carry it; capture()
-    /// stamps it. Ghost-parsed snapshots carry it too.
+    /// stamps it. Browser captures carry it too.
     #[serde(default)]
     pub source: String,
     /// Defaulted like source
@@ -71,8 +71,9 @@ pub async fn capture(fetcher: &Fetcher) -> Result<FingerprintSnapshot, String> {
         .await
         .map_err(|e| format!("echo endpoint fetch failed: {e}"))?;
     // Operator debug: when DONSETCH_DEBUG_ECHO=1 the RAW echo lands
-    // in /tmp/ for offline diffing against the evergreen ghost
-    // capture (/tmp/ghost-echo-blob.json). Off by default.
+    // in /tmp/ for offline diffing against the evergreen browser
+    // capture (`--parity` leaves /tmp/browser-echo-blob.json when its
+    // echo does not parse). Off by default.
     if crate::config::cfg().debug.echo_scorecard {
         let _ = std::fs::write("/tmp/fetch-echo-raw.json", &out.body);
     }

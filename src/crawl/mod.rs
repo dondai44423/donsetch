@@ -1151,11 +1151,7 @@ impl Crawler {
             // seed (map and full have to agree on what exists).
             //
             // Raw HTML cannot see JS-built navigation (mdBook sidebars,
-            // SPA menus). A thin inventory gets one bounded rendered
-            // read of the seed through the caller's renderer, and its
-            // links merge through the same filter. Render failure or
-            // absence keeps the static map: the browser is an
-            // enhancement here, never a dependency.
+            // SPA menus): links a script builds are not in this harvest.
             let mut candidates: Vec<Url> = Vec::new();
             if map.is_empty() {
                 let buffered_seed = buffered
@@ -1222,8 +1218,8 @@ impl Crawler {
                 }
                 map.push(normalized);
             }
-            // Judged after the seed-link harvest and the render: a seed
-            // the browser rescued leaves a map, so it is not a failure.
+            // Judged after the seed-link harvest: a seed whose links
+            // filled the map is not a failure.
             // When the preflight fetched nothing (boxed host, deadline)
             // there is no outcome to report and today's row stays.
             let stop = if Instant::now() >= deadline_at {

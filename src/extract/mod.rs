@@ -84,7 +84,7 @@ pub struct Extracted {
     /// Rough token estimate (chars / 4) of the returned markdown.
     pub tokens_est: usize,
     /// True when the page was large but almost no content
-    /// extracted : a JS shell. Tier 2's job.
+    /// extracted : a JS shell.
     pub thin: bool,
     /// Best-guess content kind from block composition.
     /// Conservative: only non-Page when confident.
@@ -531,7 +531,7 @@ pub fn extract(
     let lang_info = language::detect(&doc);
 
     // A large page that yields almost nothing is a JS
-    // shell (Medium, SPAs) : flag it for tier 2 routing.
+    // shell (Medium, SPAs) : flag it.
     let thin_flag = raw_len > 50_000;
 
     // Skeleton/SPA loading detection. Only use aria-busy :
@@ -849,7 +849,7 @@ fn downstream(
     // small section on a 400KB page used to escalate to ghost and
     // return the full page instead of the section).
     // Shell detection measures source yield, never the deliberately narrowed
-    // focus projection. Otherwise a successful focus triggers browser recovery.
+    // focus projection. Otherwise a successful focus would read as a shell.
     let source_len = identity.len();
     let density = if raw_len > 0 {
         source_len as f64 / raw_len as f64

@@ -22,10 +22,9 @@ const PROXY_TIMEOUT: Duration = Duration::from_secs(12);
 /// One outer ceiling for the whole dial+handshake (S3): the per-step
 /// `PROXY_TIMEOUT`s used to stack (a SOCKS5 handshake is up to nine
 /// steps, ~108s worst case on a line that accepts TCP then stalls
-/// mid-handshake; ~36s on CONNECT), and every fetch attempt, browser
-/// relay request included, re-paid it before the lane finally
-/// benched. 30s covers a healthy handshake (a few RTTs) with room
-/// for a slow dial.
+/// mid-handshake; ~36s on CONNECT), and every fetch attempt
+/// re-paid it before the lane finally benched. 30s covers a healthy
+/// handshake (a few RTTs) with room for a slow dial.
 const PROXY_CONNECT_BUDGET: Duration = Duration::from_secs(30);
 
 /// True when `host` matches a NO_PROXY entry. Comma-separated
@@ -386,9 +385,8 @@ impl Proxy {
     /// credentials : each request must send this header itself.
     pub fn proxy_authorization(&self) -> Option<String> {
         // A password alone counts: some providers hand out a token
-        // with an empty user name, and the ghost tier already treats
-        // user-or-pass as "authenticated" (ghost/mod.rs). Dropping
-        // the credential silently surfaced as a bare 407 instead.
+        // with an empty user name. Dropping the credential silently
+        // surfaced as a bare 407 instead.
         if self.user.is_empty() && self.pass.is_empty() {
             return None;
         }
@@ -406,8 +404,7 @@ impl Proxy {
         target_host: &str,
         target_port: u16,
     ) -> Result<(), FetchError> {
-        // A bare IPv6 literal ("2001:db8::1", as the Chrome relay
-        // hands over from its ATYP 0x04 read) must bracket for the
+        // A bare IPv6 literal ("2001:db8::1") must bracket for the
         // request line and the Host header (RFC 3986): unbracketed it
         // is ambiguous between host and port. Already-bracketed
         // literals and hostnames pass through unchanged.
@@ -553,8 +550,7 @@ impl Proxy {
         // the proxy resolves DNS : no local DNS leak, stealth-
         // preserving. An IP LITERAL goes as its native address type
         // (RFC 1928 §5) instead: a literal shipped as a "domain" is a
-        // name no resolver can answer ("[::1]" least of all, and the
-        // Chrome relay hands over bare IPv6 from ATYP 0x04), so
+        // name no resolver can answer ("[::1]" least of all), so
         // literal targets used to die with "host unreachable".
         let bare = target_host
             .strip_prefix('[')
@@ -1607,8 +1603,7 @@ u:p@also_valid:8080
         );
     }
 
-    // A bare IPv6 literal (the shape the Chrome relay forwards from
-    // its ATYP 0x04 read) must bracket on the CONNECT line and the
+    // A bare IPv6 literal must bracket on the CONNECT line and the
     // Host header; already-bracketed input must not double-bracket.
     #[tokio::test]
     async fn http_connect_brackets_bare_ipv6_targets() {

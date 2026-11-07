@@ -385,7 +385,7 @@ Same-domain, best-first. Two phases: sitemap discovery (cheap URL inventory), th
 - **Crawl-shape**: frontier pops get a seeded reader-like jitter so repeated crawls never replay one identical, score-eager order into server logs. Ordering only, payloads untouched. Kill switch: `DONSETCH_NO_CRAWL_SHAPE=1`.
 - **Resume tokens**: a stopped crawl resumes in one call, valid 30 minutes, survives restarts.
 - **Near-duplicate detection**: title plus first 200 chars, hashed.
-- **Budgets**: `per_page_max` and `max_total_chars` honor positive character limits down to 1, including concurrent workers. `deadline_s` accepts 1-600 seconds and bounds discovery, page reads, browser handoffs and extraction. A sliced page carries `next_offset`; use `web_fetch` with that offset to continue it.
+- **Budgets**: `per_page_max` and `max_total_chars` honor positive character limits down to 1, including concurrent workers. `deadline_s` accepts 1-600 seconds and bounds discovery, page reads and extraction. A sliced page carries `next_offset`; use `web_fetch` with that offset to continue it.
 - **Inventory**: `map_limit` controls returned URLs (default 120, up to 50,000). `inventory.complete=false` discloses output caps, unavailable sitemaps and discovery safety bounds (100,000 URLs, 32 sitemap reads). A map derived from seed-page links cannot establish site-wide completeness. Narrow `focus`/`include_paths` for large sites.
 - **Change tracking**: `since_last=true` rechecks sources, then suppresses unchanged pages using per-URL fingerprints from earlier fetches or crawls. Pagination does not prevent recording a full-source fingerprint; partial output never becomes full baseline text.
 - **Focus receipts**: page state records whether passages were omitted and the block counts. Dataset JSON Lines use `dataset_version:2`, adding the per-row focus receipt.
@@ -731,7 +731,7 @@ docker build -t donsetch-mcp .
 docker compose up -d                 # loopback-only by default
 ```
 
-Multi-stage build, non-root user, optional Chrome, resource limits in the compose file. An opt-in `http` profile serves the HTTP transport with a healthcheck, and `docker compose stop` gives in-flight browser work a 45s grace period.
+Multi-stage build, non-root user, optional Chrome, resource limits in the compose file. An opt-in `http` profile serves the HTTP transport with a healthcheck, and `docker compose stop` gives its in-flight requests a 45s grace period to drain.
 
 ## 🧭 Pick the right tool
 

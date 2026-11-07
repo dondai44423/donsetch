@@ -199,8 +199,8 @@ function startServer(): Promise<void> {
       }
     });
 
-    // The daemon writes diagnostics to stderr (Xvfb warnings,
-    // fallback notices, ghost telemetry). Pi's TUI surfaces stderr
+    // The daemon writes diagnostics to stderr (config warnings,
+    // rerank and OCR notices). Pi's TUI surfaces stderr
     // as user-facing output: raw forwarding used to pop non-fatal
     // warnings up (issue #95). Gate it:
     // - DONSETCH_DEBUG / DEBUG set: forward everything (dev mode)
@@ -449,14 +449,12 @@ function getSearchProvider(sc: any, dbg: any): string {
 }
 
 /**
- * Extract the fetch source label from model state with a
- * client-only diagnostics fallback. Compact MCP contracts keep
- * transport telemetry in _meta["com.donsetch/fetch-debug"], so the
- * tier can live there; older servers still expose it on
- * structuredContent.
- * Returns "cache" when tier is "1(warm)" (warm cookies, not a
- * fresh fetch), "ghost" when tier starts with "2" (browser
- * escalation), or "" for a normal tier-1 fetch.
+ * Extract the fetch source label from the `tier` field that servers
+ * before 5.0 report, in _meta["com.donsetch/fetch-debug"] or on
+ * structuredContent. Returns "cache" when tier is "1(warm)" (warm
+ * cookies, not a fresh fetch), "ghost" when tier starts with "2"
+ * (their browser tier), or "" otherwise. A 5.x server sends no
+ * tier and has no browser tier, so the result is always "".
  */
 function getFetchSource(sc: any, dbg: any): string {
   const tier = String(

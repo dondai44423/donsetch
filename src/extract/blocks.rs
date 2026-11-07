@@ -533,7 +533,7 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
                     // sentinel the inline renderer uses so the collapse
                     // turns it into a newline. This is the shared
                     // conversion site for every DOM-to-markdown path
-                    // (tier 1, tier-2 ghost, adapters, fallback).
+                    // (the page read, adapters, fallback).
                     buf.push('\u{0}');
                     continue;
                 }

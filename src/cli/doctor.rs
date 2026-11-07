@@ -929,9 +929,8 @@ async fn check_chrome() -> CheckResult {
     match result {
         Ok(Ok(browser)) => {
             // Full dotted build, not just the major: probing the
-            // exact binary we resolved (backed identical for
-            // chromium and cloak) costs one spawn and is the only
-            // number that matters for debugging detection issues.
+            // exact binary we resolved costs one spawn and is the
+            // only number that matters for debugging detection issues.
             // A padded "151.0.0.0" was honest but vague.
             let version =
                 crate::profile::probe_version_string_at_path(&browser.path.to_string_lossy())
@@ -2347,7 +2346,7 @@ fn apply_fixes(collected: &mut [(String, String, String, String)]) {
 /// layers match the baseline, 1 drift or capture failure
 /// (--stealth-record writes the fixture and exits 0 on success).
 /// --parity (v4 phase 1.1) instead diffs the live local fetch
-/// against the REAL local browser (ghost): the evergreen check,
+/// against the REAL local browser: the evergreen check,
 /// no fixture involved. It cannot go stale; it fails when the
 /// profile and the floor diverge.
 async fn stealth_scorecard(record: bool, json: bool, parity: bool) -> i32 {

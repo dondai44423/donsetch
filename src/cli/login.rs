@@ -197,8 +197,9 @@ async fn interactive(site: Option<&str>, fresh: bool, probe: bool) -> Result<(),
         );
     }
 
-    // Dedicated profile: never the automation ghost-profile, so a
-    // login session can never interleave with automated page work.
+    // Dedicated profile: never the throwaway profile a screenshot
+    // launches with, so a login session can never interleave with
+    // automated page work.
     let base = crate::paths::cache_dir();
     let profile_dir = base.join("auth-profile");
     let lock_path = base.join("auth-profile.lock");

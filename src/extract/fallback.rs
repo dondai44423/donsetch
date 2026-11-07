@@ -70,7 +70,7 @@ pub fn text_fallback(
     // thin=true when < 800 chars: a JS shell with 300 chars of
     // visible text (script filenames, noscript messages, meta
     // descriptions) is NOT real content. The MCP layer must
-    // escalate to ghost. Only pages with >= 800 chars of real
+    // not serve it as content. Only pages with >= 800 chars of real
     // visible text are non-thin : those are genuinely complex
     // DOMs where block extraction failed but text is real.
     let lang_info = crate::extract::language::detect(&doc);

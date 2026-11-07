@@ -166,7 +166,7 @@ fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 ///
 /// Returns the parsed Url on success, or a FetchError that the
 /// caller should surface directly. This is the single sync gate
-/// used by both fetch and browser tiers.
+/// for fetch, crawl and web_screenshot.
 pub fn validate_url_basic(url_str: &str) -> Result<url::Url, crate::error::FetchError> {
     validate_url_basic_with_policy(url_str, private_egress_allowed(), crate::rules::rules())
 }
@@ -817,7 +817,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_url_safe_fail_closed_on_dns_error() {
         // Non-existent hostname must fail closed, not silently allow.
-        // This proves we do not swallow DNS errors for browser tier.
+        // This proves we do not swallow DNS errors for web_screenshot.
         let res = ensure_url_safe("https://this-host-does-not-exist-12345.invalid/").await;
         assert!(res.is_err(), "non-resolvable host must fail closed, got Ok");
         let err = res.unwrap_err();

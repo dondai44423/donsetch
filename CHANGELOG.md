@@ -163,6 +163,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The browser fetch tier. `web_fetch` loses `tier`, `actions` and `shot`
   (use `web_screenshot`), each refused with a note; the browser stays only
   for `donsetch login` and `web_screenshot`.
+- The browser backends, the browser search lane and rule tier pins. Login
+  and screenshots drive the installed Chromium-family browser
+  (`browser.chromium_path`, or the one discovery finds); CloakBrowser and its
+  download are gone, search no longer falls back to a browser-rendered
+  Google page, and a rule no longer pins a fetch tier.
+  **Breaking:** a `donsetch.toml` that still sets one of these keys fails to
+  load, and every command except `help`, `version` and
+  `config show --legacy` exits 1 naming it:
+  `[browser]` `backend`, `no_sandbox`, `cloak_auto_download`, `cloak_path`,
+  `cloak_version`, `cloak_cache_dir`, `pool_slots` and `xvfb_display`;
+  `[search]` `ghost_lane`; `tier` and `tier_enforce` in a
+  `[rules.url."<pattern>"]` rule. Delete those lines. The environment
+  variables that set them are ignored.
 
 ### Fixed
 

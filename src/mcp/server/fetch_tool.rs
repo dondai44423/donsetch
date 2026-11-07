@@ -924,7 +924,7 @@ async fn fetch_single_inner(
     let adapter_host = adapter_used.is_some();
 
     // Centralized SSRF guard (sync part): scheme, credentials, localhost/private literals.
-    // DNS-resolved private addresses are checked at transport/browser layers.
+    // DNS-resolved private addresses are checked at the transport layer.
     if let Err(e) = crate::fetch::guards::validate_url_basic(&url) {
         // A rule on the rewrite target: the SSRF advice below would
         // replace the operator's message.
@@ -975,12 +975,7 @@ async fn fetch_single_inner(
     // already follow.
     let is_json_url = is_json_url_like(&url);
 
-    // === Decision: how to route this fetch? ===
-    // The self-improving loop: the domain profile decides
-    // cold / warm / skip-to-solve / recheck-cold.
-    // Adapter endpoints (reddit .json, package registry APIs) are
-    // plain-GET structured targets : they never need a rendered
-    // fetch. Force Cold even if a stale profile says SkipToSolve.
+    // === Domain state before the fetch ===
     // Remember the real origin scheme (v4 phase 0.2: the prober
     // probes the origin, not a guessed https upgrade).
     {

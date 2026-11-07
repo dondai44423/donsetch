@@ -345,8 +345,8 @@ pub struct OcrLine {
 
 /// Kind selection: explicit hint wins; "auto" runs the confidence
 /// escalation cascade (En → Zh → Deva) on this page and picks the
-/// recognizer with the best mean confidence. The cascade mirrors
-/// DonShadow→DonGhost: cheap answer first, escalate on signal.
+/// recognizer with the best mean confidence: cheap answer first,
+/// escalate on signal.
 /// Returns (lines, winning kind as string) when cascade used.
 #[cfg(feature = "ocr")]
 pub fn ocr_page(
