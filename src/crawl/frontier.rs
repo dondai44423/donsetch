@@ -126,12 +126,43 @@ pub fn locale_split(path: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// Locale-canonical key for cross-locale dedup. Two URLs with
-/// different locale prefixes but the same remainder are
-/// translations of the same page.
-pub fn locale_canonical(path: &str) -> String {
-    let (_, rest) = locale_split(path);
-    rest.to_lowercase()
+/// Locale-canonical key for cross-locale dedup in a crawl from `seed`:
+/// the [`normalize`]d URL in its same-site form, with a known locale
+/// prefix (see [`locale_split`]) cut from its path. The same-site form
+/// drops one leading `www.` from the host, and then applies
+/// [`canonical_scheme`] against the seed with its `www.` dropped too.
+/// URLs that differ only in the locale prefix or in those twin forms
+/// share a key. Any other difference in scheme, host, port, the rest of
+/// the path (case kept) or the normalized query keeps two URLs apart.
+pub fn locale_canonical(url: &Url, seed: &Url) -> String {
+    // The twins folded here are the ones the crawl already treats as
+    // one site: `host_matches` ignores a leading `www.` when it scopes
+    // a crawl, and `canonical_scheme` names the https form of a
+    // same-host plain-http link under an https seed. Pairs the crawl
+    // cannot tell are one page (another host's schemes, a non-default
+    // port, both schemes under an http seed, path case) stay distinct:
+    // a missed merge costs one extra fetch, a wrong merge loses a page.
+    let u = canonical_scheme(&without_www(&normalized_url(url)), &without_www(seed));
+    let (_, rest) = locale_split(u.path());
+    format!(
+        "{}{rest}{}",
+        &u[..url::Position::BeforePath],
+        &u[url::Position::AfterPath..]
+    )
+}
+
+/// `url` with one leading `www.` cut from its host; a host that is
+/// nothing but `www.` is left as it is.
+fn without_www(url: &Url) -> Url {
+    let mut u = url.clone();
+    if let Some(bare) = url
+        .host_str()
+        .and_then(|h| h.strip_prefix("www."))
+        .filter(|h| !h.is_empty())
+    {
+        let _ = u.set_host(Some(bare));
+    }
+    u
 }
 
 /// Normalize a URL for frontier dedup.
@@ -144,6 +175,11 @@ pub fn locale_canonical(path: &str) -> String {
 /// - trailing-slash collapse on non-root dirs is deliberately
 ///   NOT done (site-dependent meaning); dedup happens on hit.
 pub fn normalize(url: &Url) -> String {
+    normalized_url(url).to_string()
+}
+
+/// [`normalize`] before serialization.
+fn normalized_url(url: &Url) -> Url {
     let mut u = url.clone();
     u.set_fragment(None);
     let host = u.host_str().unwrap_or("").to_lowercase();
@@ -177,7 +213,7 @@ pub fn normalize(url: &Url) -> String {
     if u.path().is_empty() {
         u.set_path("/");
     }
-    u.to_string()
+    u
 }
 
 /// Resolve a possibly-relative link against the page URL.
@@ -909,21 +945,96 @@ mod tests {
         assert_eq!(locale_split("/"), (None, "/"));
     }
 
+    fn lkey(s: &str) -> String {
+        lkey_from(s, "https://ex.com/")
+    }
+
+    fn lkey_from(s: &str, seed: &str) -> String {
+        locale_canonical(&Url::parse(s).unwrap(), &Url::parse(seed).unwrap())
+    }
+
     #[test]
     fn locale_canonical_strips_locale_prefix() {
-        assert_eq!(locale_canonical("/en-US/docs/Web/JS"), "/docs/web/js");
-        assert_eq!(locale_canonical("/de/docs/Web/JS"), "/docs/web/js");
-        assert_eq!(locale_canonical("/docs/Web/JS"), "/docs/web/js");
-        assert_eq!(locale_canonical("/api/v1"), "/api/v1");
+        assert_eq!(
+            lkey("https://ex.com/en-US/docs/Web/JS"),
+            "https://ex.com/docs/Web/JS"
+        );
+        assert_eq!(
+            lkey("https://ex.com/de/docs/Web/JS"),
+            "https://ex.com/docs/Web/JS"
+        );
+        assert_eq!(
+            lkey("https://ex.com/docs/Web/JS"),
+            "https://ex.com/docs/Web/JS"
+        );
+        assert_eq!(lkey("https://ex.com/api/v1"), "https://ex.com/api/v1");
     }
 
     #[test]
     fn locale_canonical_makes_translations_dedup() {
-        let en = locale_canonical("/en-US/docs/Web/JavaScript/Array/map");
-        let de = locale_canonical("/de/docs/Web/JavaScript/Array/map");
-        let fr = locale_canonical("/fr/docs/Web/JavaScript/Array/map");
+        let en = lkey("https://ex.com/en-US/docs/Web/JavaScript/Array/map");
+        let de = lkey("https://ex.com/de/docs/Web/JavaScript/Array/map");
+        let fr = lkey("https://ex.com/fr/docs/Web/JavaScript/Array/map");
         assert_eq!(en, de);
         assert_eq!(en, fr);
+        // The query and tracking params go through `normalize`.
+        assert_eq!(
+            lkey("https://ex.com/en/x?b=2&a=1&utm_source=feed"),
+            lkey("https://ex.com/de/x?a=1&b=2#top")
+        );
+    }
+
+    // Only a locale prefix or a same-site twin form may merge two URLs.
+    // A different query, host, port or path case is a different page,
+    // with or without a locale prefix, and so are both schemes of a
+    // host the seed gives no https evidence for.
+    #[test]
+    fn locale_canonical_keeps_distinct_pages_apart() {
+        for (a, b) in [
+            ("https://ex.com/topic?id=1", "https://ex.com/topic?id=2"),
+            ("https://ex.com/list", "https://ex.com/list?page=2"),
+            ("https://a.example/", "https://b.example/"),
+            ("https://ex.com/about", "https://ex.com:8443/about"),
+            ("http://ex.com:8080/about", "https://ex.com:8080/about"),
+            ("http://other.example/about", "https://other.example/about"),
+            ("https://ex.com/about", "https://sub.ex.com/about"),
+            ("https://ex.com/about", "https://www2.ex.com/about"),
+            ("https://ex.com/Wiki/Apple", "https://ex.com/wiki/apple"),
+            ("https://ex.com/de/x?id=1", "https://ex.com/en/x?id=2"),
+            ("https://a.example/de/x", "https://b.example/en/x"),
+        ] {
+            assert_ne!(lkey(a), lkey(b), "{a} vs {b}");
+        }
+        // An http seed is no evidence that the site serves https.
+        assert_ne!(
+            lkey_from("http://ex.com/about", "http://ex.com/"),
+            lkey_from("https://ex.com/about", "http://ex.com/")
+        );
+    }
+
+    // Same-site twins share a key: a leading `www.` on either the URL
+    // or the seed, and a same-host plain-http URL on the default port
+    // under an https seed. The locale cut applies on top.
+    #[test]
+    fn locale_canonical_merges_same_site_twins() {
+        for seed in ["https://ex.com/", "https://www.ex.com/docs/"] {
+            let key = lkey_from("https://ex.com/a?id=1", seed);
+            assert_eq!(key, "https://ex.com/a?id=1", "seed {seed}");
+            for twin in [
+                "https://www.ex.com/a?id=1",
+                "http://ex.com/a?id=1",
+                "http://www.ex.com:80/a?id=1",
+                "https://WWW.EX.COM/de/a?id=1",
+            ] {
+                assert_eq!(lkey_from(twin, seed), key, "{twin} under seed {seed}");
+            }
+        }
+        // The www fold does not depend on the seed: another host's www
+        // twin folds the same way.
+        assert_eq!(
+            lkey("https://www.other.example/a"),
+            lkey("https://other.example/a")
+        );
     }
 
     #[test]
