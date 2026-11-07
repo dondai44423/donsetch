@@ -23,11 +23,16 @@ async fn fetch_with_budget(
 ) -> Value {
     let started = std::time::Instant::now();
     let witness = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The encounter plans inside the caller's deadline (`fetch::v5`); without
+    // one it keeps its own budget.
+    let until = started + deadline.unwrap_or(std::time::Duration::from_secs(86_400));
     let mut result = FETCH_TRACE
         .scope(
             witness.clone(),
             run_with_budget(
-                Box::pin(fetch_single(daemon, args, url)),
+                Box::pin(
+                    crate::fetch::v5::CALLER_DEADLINE.scope(until, fetch_single(daemon, args, url)),
+                ),
                 deadline,
                 ctx,
                 || {
@@ -1171,11 +1176,7 @@ async fn fetch_single_inner(
     // path : the adapter is an optimization, never a dependency.
     if let Some(o) = &out {
         match o.verdict {
-            Verdict::ContentOk => {
-                // Page-load realism (v4 phase 1.3): background
-                // subresource burst for stealth-relevant hosts.
-                crate::fetch::shadow::maybe_shadow(&daemon.fetcher, &daemon.state, &o.url, o).await;
-            }
+            Verdict::ContentOk => {}
             // A refusal on an ADAPTER endpoint (a challenge
             // included) is a failed adapter hop, never the end:
             // retry the caller's URL through the generic pipeline

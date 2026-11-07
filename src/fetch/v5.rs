@@ -28,6 +28,24 @@ use crate::profile::RequestClass;
 /// site's own interface included. Callers wrap their own deadlines around it.
 const DOCUMENT_DEADLINE: Duration = Duration::from_secs(20);
 
+tokio::task_local! {
+    /// The instant the caller stops waiting (an agent's `deadline_ms`), so the
+    /// encounter plans inside it: it starts no attempt that cannot finish and
+    /// ends on the best answer it has, instead of being cut off mid-search.
+    pub static CALLER_DEADLINE: Instant;
+}
+
+/// What is left for one document under the caller's deadline, keeping a slice
+/// for the reading that follows the fetch (extraction, PDF parsing).
+fn document_budget() -> Duration {
+    let Ok(until) = CALLER_DEADLINE.try_with(|until| *until) else {
+        return DOCUMENT_DEADLINE;
+    };
+    let left = until.saturating_duration_since(Instant::now());
+    left.saturating_sub((left / 5).min(Duration::from_millis(600)))
+        .min(DOCUMENT_DEADLINE)
+}
+
 /// A one-shot read's ceiling; callers wrap tighter deadlines around it. A file
 /// (the update tarball) is the longest thing read this way.
 const ONCE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -85,6 +103,7 @@ impl V5Fetcher {
     /// page cache on disk under the product's cache root (`v5/`), so
     /// `DONSETCH_CACHE_DIR` and `[paths] cache_dir` move them with everything else.
     pub fn new(persist: bool) -> Self {
+        add_configured_roots();
         let session = if persist {
             v5core::Session::at(state_path())
         } else {
@@ -103,7 +122,7 @@ impl V5Fetcher {
         request.proxy = document.proxy.as_ref().map(Proxy::wire_url);
         request.learn = document.learn;
         request.cache = document.learn && !document.skip_cache;
-        request.deadline = DOCUMENT_DEADLINE;
+        request.deadline = document_budget();
         let cancel = v5core::Cancel::new();
         request.policy = v5core::Policy {
             hop: Some(hop_guard(Arc::clone(&refusal), document.gate)),
@@ -226,6 +245,52 @@ impl V5Fetcher {
         names.dedup();
         names
     }
+}
+
+/// The owner's `[tls] cert_file` and `cert_dir` (PEM bundles; a directory's
+/// `.pem`, `.crt` and `.cer` files), trusted on top of the bundled and OS roots.
+/// Once per process, before the first client is built.
+fn add_configured_roots() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let tls = &crate::config::cfg().tls;
+        for pem in configured_roots(&tls.cert_file, &tls.cert_dir) {
+            v5core::add_trust_pem(pem);
+        }
+    });
+}
+
+fn configured_roots(file: &str, dir: &str) -> Vec<Vec<u8>> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if !file.is_empty() {
+        paths.push(file.into());
+    }
+    if !dir.is_empty()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let mut found: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        matches!(ext.to_ascii_lowercase().as_str(), "pem" | "crt" | "cer")
+                    })
+            })
+            .collect();
+        found.sort();
+        paths.extend(found);
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                crate::diag!("[tls] cannot read {}: {error}", path.display());
+                None
+            }
+        })
+        .collect()
 }
 
 /// Where v5 keeps its state file (its page cache is `pages/` beside it).
@@ -652,6 +717,50 @@ mod tests {
             into_outcome(denied, RequestRoute::direct(), &refusal),
             Err(FetchError::Ssrf(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn the_callers_deadline_bounds_the_encounter() {
+        assert_eq!(document_budget(), DOCUMENT_DEADLINE);
+        let soon = Instant::now() + Duration::from_secs(5);
+        let budget = CALLER_DEADLINE
+            .scope(soon, async { document_budget() })
+            .await;
+        // Five seconds left, less the 600 ms kept for reading what comes back.
+        assert!(
+            budget <= Duration::from_millis(4400) && budget > Duration::from_millis(4300),
+            "{budget:?}"
+        );
+        let later = Instant::now() + Duration::from_secs(120);
+        let budget = CALLER_DEADLINE
+            .scope(later, async { document_budget() })
+            .await;
+        assert_eq!(budget, DOCUMENT_DEADLINE);
+        let past = Instant::now();
+        let budget = CALLER_DEADLINE
+            .scope(past, async { document_budget() })
+            .await;
+        assert_eq!(budget, Duration::ZERO);
+    }
+
+    #[test]
+    fn configured_roots_read_the_file_and_the_directorys_certificates() {
+        let dir = std::env::temp_dir().join(format!("donsetch-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("corp.pem");
+        std::fs::write(&file, b"FILE").unwrap();
+        let bundle = dir.join("bundle");
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::write(bundle.join("b.crt"), b"B").unwrap();
+        std::fs::write(bundle.join("a.PEM"), b"A").unwrap();
+        std::fs::write(bundle.join("notes.txt"), b"no").unwrap();
+        let roots = configured_roots(file.to_str().unwrap(), bundle.to_str().unwrap());
+        assert_eq!(roots, vec![b"FILE".to_vec(), b"A".to_vec(), b"B".to_vec()]);
+        assert!(configured_roots("", "").is_empty());
+        // A missing file is named and skipped, never fatal.
+        assert!(configured_roots("/nonexistent/ca.pem", "").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

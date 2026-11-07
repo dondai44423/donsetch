@@ -284,10 +284,6 @@ pub struct GhostState {
     /// observable, never magic.
     #[serde(default)]
     pub probes_total: u64,
-    /// Lifetime shadow-fetched subresource count (v4 phase 1.3):
-    /// page-load realism at work, surfaced in donsetch status.
-    #[serde(default)]
-    pub shadowed_assets_total: u64,
     /// Lifetime count of fetches served from the search->fetch
     /// prewarm cache (v4 phase 2.1 warm handoff), surfaced in
     /// donsetch status. Counter, not inventory: the RAM cache is
@@ -1423,15 +1419,6 @@ impl GhostState {
             .collect()
     }
 
-    /// A shadow burst fetched N subresources (v4 phase 1.3).
-    pub fn note_shadow(&mut self, assets: usize) {
-        if !route_memory_enabled() || route_memory_readonly() {
-            return;
-        }
-        self.shadowed_assets_total = self.shadowed_assets_total.saturating_add(assets as u64);
-        self.save();
-    }
-
     /// v4 phase 2.1 visibility: count a fetch served from the
     /// search prewarm cache. DONSETCH_NO_PREWARM stops entries
     /// being parked in the first place, so this only grows while
@@ -1717,8 +1704,6 @@ impl GhostState {
                     .and_then(|bytes| serde_json::from_slice::<GhostState>(&bytes).ok());
                 if let Some(disk) = &disk {
                     self.probes_total = self.probes_total.max(disk.probes_total);
-                    self.shadowed_assets_total =
-                        self.shadowed_assets_total.max(disk.shadowed_assets_total);
                     self.prewarmed_served_total =
                         self.prewarmed_served_total.max(disk.prewarmed_served_total);
                     self.merge_vault_from_disk(disk);

@@ -555,8 +555,8 @@ Each identity is fingerprinted and diffed against the browser it claims to be. T
 | Cookies per site and identity | A jar per (host, identity), with expiry. Cookies never cross hosts or identities, and a clearance is never spent by a different client class: a fingerprint mismatch burns the request and looks like a wall. |
 | Conditional revalidation | A repeat read sends `If-None-Match` / `If-Modified-Since` in Chrome's order. A 304 is what a returning browser gets. |
 | Pacing | At least 900 ms between reads of one site and 250 ms between attempts. A burst is a signature even when every request is perfect. |
-| Page-load realism | After an HTML read on a site that has walled before, a bounded background burst of the page's own subresources with the page as referer, as a browser loads them (`[fetch] shadow_fetch`). |
-| The OS's trust store | The bundled Mozilla roots plus the OS store and `SSL_CERT_FILE` / `SSL_CERT_DIR`, as Chrome trusts the OS: an enterprise inspection root installed the OS's way works. The ClientHello does not change. |
+| One client per read | A page is read as one identity with its own jar: no background requests in another client's name, which would contradict the one that read the page. |
+| The OS's trust store | The bundled Mozilla roots plus the OS store and `SSL_CERT_FILE` / `SSL_CERT_DIR`, as Chrome trusts the OS: an enterprise inspection root installed the OS's way works, and so does a bundle named in `[tls] cert_file` / `cert_dir`. The ClientHello does not change. |
 
 ## ⚡ Challenges, in one process
 
@@ -619,7 +619,6 @@ Sections: `transport`, `mcp`, `paths`, `state`, `proxy`, `tls`, `persona`, `cli`
 
 ```toml
 [fetch]
-shadow_fetch = "never"  # or "auto" / "always": the page-load burst
 pdf_max_mb = 100
 dns_cache_ttl_secs = 30 # seconds a resolved name is reused in-process, 0 disables
 
