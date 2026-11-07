@@ -6,6 +6,7 @@
 
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const tls = require('tls');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -159,15 +160,30 @@ function requestDirect(target) {
   });
 }
 
+// Basic credentials from the proxy URL's user:pass@ part, or null when
+// it has none. The URL parser keeps them percent-encoded.
+function proxyAuthorization(proxy) {
+  if (!proxy.username && !proxy.password) return null;
+  const decode = (part) => {
+    try { return decodeURIComponent(part); } catch (_) { return part; }
+  };
+  const pair = `${decode(proxy.username)}:${decode(proxy.password)}`;
+  return `Basic ${Buffer.from(pair).toString('base64')}`;
+}
+
 function requestThroughProxy(target, proxy) {
   return new Promise((resolve, reject) => {
+    const authority = `${target.hostname}:${target.port || 443}`;
+    const connectHeaders = { Host: authority };
+    const authorization = proxyAuthorization(proxy);
+    if (authorization) connectHeaders['Proxy-Authorization'] = authorization;
     const connectTransport = proxy.protocol === 'https:' ? https : http;
     const proxyReq = connectTransport.request({
       hostname: proxy.hostname,
       port: proxy.port || (proxy.protocol === 'https:' ? 443 : 80),
       method: 'CONNECT',
-      path: `${target.hostname}:${target.port || 443}`,
-      headers: { Host: `${target.hostname}:${target.port || 443}` },
+      path: authority,
+      headers: connectHeaders,
     });
     proxyReq.once('connect', (response, socket) => {
       if (response.statusCode !== 200) {
@@ -184,10 +200,17 @@ function requestThroughProxy(target, proxy) {
           Accept: 'application/octet-stream',
           'User-Agent': 'donsetch-npm-installer',
         },
-        agent: false,
+        // No `agent` key: Node uses createConnection only when no agent
+        // is in use, and `agent: false` means a fresh default Agent,
+        // which dials the host directly and leaves the tunnel unused.
+        // Without an agent the request also closes its connection, and
+        // with it the tunnel, once the response ends.
+        // The certificate is verified (tls.connect's default) against
+        // the release host; SNI takes host names only (RFC 6066 3).
         createConnection: () => tls.connect({
           socket,
-          servername: target.hostname,
+          host: target.hostname,
+          servername: net.isIP(target.hostname) ? undefined : target.hostname,
         }),
       }, resolve);
       req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error('request timeout')));

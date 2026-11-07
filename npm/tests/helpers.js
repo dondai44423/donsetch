@@ -107,15 +107,18 @@ function assetName() {
   return names[`${process.platform}-${process.arch}`] || null;
 }
 
-function makeTlsFixture(root) {
+// A self-signed certificate valid for `host` only: 127.0.0.1 by
+// default, or a DNS name for a mirror reached by name.
+function makeTlsFixture(root, { host = '127.0.0.1' } = {}) {
   const keyPath = join(root, 'key.pem');
   const certPath = join(root, 'cert.pem');
+  const san = /^[0-9.]+$/.test(host) ? `IP:${host}` : `DNS:${host}`;
   execFileSync(
     'openssl',
     [
       'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
       '-keyout', keyPath, '-out', certPath, '-days', '2', '-nodes',
-      '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
+      '-subj', `/CN=${host}`, '-addext', `subjectAltName=${san}`,
     ],
     { stdio: 'ignore' }
   );
@@ -139,12 +142,16 @@ function sha256File(p) {
 
 // A local release mirror speaking HTTPS (the installer refuses
 // non-HTTPS download URLs, so the fixture must be the real thing).
+// `hits` holds the request paths, `sni` the TLS server name each
+// request arrived with (null without SNI), and `peers` the source port
+// of every TCP connection the mirror accepted.
 function startReleaseServer(tls, { tag, asset, tarballPath, sha }) {
-  const state = { hits: [] };
+  const state = { hits: [], sni: [], peers: [] };
   const server = https.createServer(
     { key: readFileSync(tls.keyPath), cert: readFileSync(tls.certPath) },
     (req, res) => {
       state.hits.push(req.url);
+      state.sni.push(req.socket.servername || null);
       if (req.url === `/${tag}/${asset}`) {
         res.writeHead(200);
         res.end(readFileSync(tarballPath));
@@ -157,6 +164,7 @@ function startReleaseServer(tls, { tag, asset, tarballPath, sha }) {
       }
     }
   );
+  server.on('connection', (socket) => state.peers.push(socket.remotePort));
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       state.port = server.address().port;
