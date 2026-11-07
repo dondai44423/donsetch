@@ -174,11 +174,13 @@ pub(super) async fn engine_task_with_budget(
     let (mut hits, instant) = engines::parse_with_instant(&engine, &html);
     let scoped = super::query::compile(&query).site;
     if let Some(site) = &scoped {
+        let (site, path) = super::query::site_scope(site);
         let site = site.trim_start_matches("www.");
         hits.retain(|hit| {
             url::Url::parse(&hit.url).ok().is_some_and(|u| {
                 u.host_str()
                     .is_some_and(|host| host == site || host.ends_with(&format!(".{site}")))
+                    && super::query::site_path_matches(&u, path)
             })
         });
     }
@@ -437,5 +439,143 @@ mod tests {
         assert_eq!(egress, "direct");
         assert!(!was_engine);
         assert!(instant.is_none());
+    }
+
+    /// Serves `body` for one HTTPS request to `host` through a CONNECT
+    /// proxy on loopback, with a certificate the fetcher trusts through
+    /// SSL_CERT_FILE. Installs the config and sets SSL_CERT_FILE, both
+    /// process-wide: callers depend on nextest's process per test.
+    async fn owned_serp(
+        host: &str,
+        body: String,
+    ) -> (crate::egress::proxy::Proxy, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.fetch.allow_private_egress = true;
+        config.proxy.from_environment = false;
+        crate::config::install(config).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
+        let bundle = crate::paths::cache_dir().join("owned-serp-ca.pem");
+        std::fs::write(&bundle, cert.cert.pem()).unwrap();
+        unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls_pki_types::CertificateDer::from(
+                    cert.cert.der().to_vec(),
+                )],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
+                    cert.signing_key.serialize_der(),
+                )),
+            )
+            .unwrap();
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(tls.read_u8().await.unwrap());
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tls.write_all(response.as_bytes()).await.unwrap();
+            let _ = tls.shutdown().await;
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (proxy, server)
+    }
+
+    fn bing_serp(hits: &[(&str, &str)]) -> String {
+        let items: String = hits
+            .iter()
+            .map(|(url, title)| {
+                format!(
+                    "<li class=\"b_algo\"><h2><a href=\"{url}\">{title}</a></h2>\
+                     <div class=\"b_caption\"><p>{title}: a page about the subject of the query, with details.</p></div></li>"
+                )
+            })
+            .collect();
+        format!(
+            "<!DOCTYPE html><html><head><title>owned query - Search</title></head><body>\
+             <ol id=\"b_results\">{items}</ol></body></html>"
+        )
+    }
+
+    /// Runs the real Bing HTTP lane for `query` against an owned SERP.
+    async fn run_bing(query: &str, body: String) -> (String, EngineResult) {
+        let (proxy, server) = owned_serp("www.bing.com", body).await;
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let pool = EgressPool::new(vec![proxy.clone()]);
+        let google = engines::google_wml::ProfileSelector::from_env();
+        let context = EngineContext {
+            fetcher: &fetcher,
+            pool: &pool,
+            google: &google,
+        };
+        let out = engine_task_with_budget(
+            "bing".into(),
+            query.into(),
+            proxy.id(),
+            Some(proxy),
+            context,
+            std::time::Duration::from_secs(6),
+            None,
+        )
+        .await;
+        let request = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("the owned SERP was requested")
+            .unwrap();
+        assert!(request.starts_with("GET /search?q="), "{request}");
+        out
+    }
+
+    #[tokio::test]
+    async fn http_lane_keeps_hits_for_a_path_scoped_site_operator() {
+        let body = bing_serp(&[
+            ("https://github.com/tokio-rs/tokio", "tokio-rs/tokio"),
+            ("https://github.com/tokio-rs/axum", "tokio-rs/axum"),
+            ("https://github.com/tokio-rs/mio", "tokio-rs/mio"),
+        ]);
+        let (_, result) = run_bing("runtime site:github.com/tokio-rs", body).await;
+        match result {
+            Ok((hits, ..)) => assert_eq!(hits.len(), 3),
+            Err((status, ..)) => panic!(
+                "Bing returned 3 github.com/tokio-rs hits; the lane reported {status:?} with none kept"
+            ),
+        }
+    }
+
+    /// Negative: a path scope still drops on-host hits outside the path
+    /// and off-host hits under the same path.
+    #[tokio::test]
+    async fn http_lane_drops_hits_outside_a_path_scoped_site_operator() {
+        let body = bing_serp(&[
+            ("https://github.com/rust-lang/rust", "rust-lang/rust"),
+            ("https://github.com/tokio-rs/tokio", "tokio-rs/tokio"),
+            ("https://gitlab.com/tokio-rs/tokio", "tokio-rs/tokio mirror"),
+        ]);
+        let (_, result) = run_bing("runtime site:github.com/tokio-rs", body).await;
+        let (hits, ..) = result.expect("the one on-path hit is kept");
+        let kept: Vec<&str> = hits.iter().map(|hit| hit.url.as_str()).collect();
+        assert_eq!(kept, vec!["https://github.com/tokio-rs/tokio"]);
     }
 }
