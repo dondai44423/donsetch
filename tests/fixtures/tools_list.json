@@ -69,7 +69,7 @@
                 ]
               }
             ],
-            "description": "Keep links. true: [text](L-handle), and a handle passed as url follows it. \"urls\": [text](real URL), to cite or check where a link goes (~2x tokens). Off: link text only (~30% fewer tokens)."
+            "description": "Keep links. true or \"urls\": [text](real URL), to cite, check or follow a link. \"handles\": [text](L-handle), about half the tokens; a handle passed as url follows it. Off: link text only (~30% fewer tokens)."
           },
           "since_last": {
             "type": "boolean",

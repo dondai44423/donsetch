@@ -649,7 +649,7 @@ pub(super) enum LinkMode {
 
 pub(super) fn link_mode(args: &Value) -> LinkMode {
     match args.get("links") {
-        Some(Value::Bool(true)) => LinkMode::Handles,
+        Some(Value::Bool(true)) => LinkMode::Urls,
         Some(Value::String(mode)) if mode == "urls" => LinkMode::Urls,
         Some(Value::String(mode)) if mode == "handles" => LinkMode::Handles,
         _ => LinkMode::Off,
@@ -2959,7 +2959,7 @@ mod link_mode_tests {
     fn links_are_off_handles_or_urls() {
         assert_eq!(link_mode(&json!({})), LinkMode::Off);
         assert_eq!(link_mode(&json!({"links": false})), LinkMode::Off);
-        assert_eq!(link_mode(&json!({"links": true})), LinkMode::Handles);
+        assert_eq!(link_mode(&json!({"links": true})), LinkMode::Urls);
         assert_eq!(link_mode(&json!({"links": "handles"})), LinkMode::Handles);
         assert_eq!(link_mode(&json!({"links": "urls"})), LinkMode::Urls);
         assert_eq!(link_mode(&json!({"links": "nonsense"})), LinkMode::Off);
