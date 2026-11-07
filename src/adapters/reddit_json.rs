@@ -83,6 +83,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
         (ContentKind::Article, 1)
     };
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title: title_of(&v, url),

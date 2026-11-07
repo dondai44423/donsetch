@@ -259,6 +259,7 @@ fn finish(
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max_chars);
     let tokens_est = slice.len() / 4;
     Some(Extracted {
+        page: None,
         markdown: slice,
         title,
         byline: None,

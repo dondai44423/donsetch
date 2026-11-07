@@ -40,6 +40,7 @@ pub fn extract(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extracte
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     let deps_n = card.deps.len();
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(format!("{} {}", card.name, card.version)),

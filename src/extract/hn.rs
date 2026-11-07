@@ -116,6 +116,7 @@ fn extract_permalink(doc: &Html, url: &str, opts: &ExtractOptions) -> Option<Ext
     let tokens_est = slice.len() / 4;
     let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
+        page: None,
         markdown: slice,
         title: Some(title),
         byline: (!author.is_empty()).then(|| author.clone()),
@@ -357,6 +358,7 @@ fn extract_thread(
     let tokens_est = slice.len() / 4;
     let lang_info = crate::extract::language::detect(doc);
     Some(Extracted {
+        page: None,
         markdown: slice,
         title: Some(title),
         byline: (!author.is_empty()).then(|| author.clone()),

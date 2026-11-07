@@ -1400,8 +1400,16 @@ async fn fetch_single_inner(
     // local fetch served that as a successful result). Short,
     // sentence-free, identifier-dominated text = a shell, not
     // content: fail instead of serving garbage.
-    let shell_text =
-        status_2xx && !is_pdf_content && final_ex.as_ref().map(is_framework_shell).unwrap_or(false);
+    // The document's own substance verdict (`detect::substance`), read from
+    // its structure at extraction: authoritative for an HTML read. The text
+    // heuristics below stand in only where no verdict exists, and a
+    // verdict of content overrides them (a short real page is content).
+    let page_verdict = final_ex.as_ref().and_then(|e| e.page);
+    let page_content = page_verdict.is_some_and(|v| v.is_content());
+    let shell_text = status_2xx
+        && !is_pdf_content
+        && !page_content
+        && final_ex.as_ref().map(is_framework_shell).unwrap_or(false);
     // #282: "the extraction is non-empty" is not a success test. A
     // challenge interstitial or a chrome-only shell must fail
     // honestly, not serve.
@@ -1414,6 +1422,7 @@ async fn fetch_single_inner(
             .unwrap_or(false);
     let chrome_text = status_2xx
         && !is_pdf_content
+        && page_verdict.is_none()
         && final_ex
             .as_ref()
             .map(|e| crate::extract::quality::chrome_only(&e.markdown))
@@ -1427,6 +1436,7 @@ async fn fetch_single_inner(
     // throttle/block shell (bloomberg's 502-byte ok:true body), never ok.
     let micro_shell = sink_eligible
         && status_2xx
+        && !page_content
         && out
             .as_ref()
             .map(|o| {
@@ -1437,15 +1447,28 @@ async fn fetch_single_inner(
             })
             .unwrap_or(false);
     let wall_like = sink_eligible && (challenge || challenge_text);
-    // A body the fetch layer verified as content is served as extracted, short
-    // or not: its own contract already ruled out a shell.
+    // A document whose structure says it is not content (an app frame, a
+    // sign-in page, a loading placeholder, a notice) is not served, whatever
+    // the fetch layer's contract counted: that contract counts visible
+    // characters, and a navigation frame has plenty.
+    let page_shell = sink_eligible && status_2xx && page_verdict.is_some() && still_thin;
+    // Without a verdict, a body the fetch layer verified as content is served
+    // as extracted: its contract already ruled out an empty shell.
     let shell_like = sink_eligible
         && !wall_like
-        && !(verified
-            && final_ex
-                .as_ref()
-                .is_some_and(|e| !e.markdown.trim().is_empty()))
-        && (shell_text || chrome_text || micro_shell || (still_thin && !is_small_404));
+        && (page_shell
+            || (!(verified
+                && final_ex
+                    .as_ref()
+                    .is_some_and(|e| !e.markdown.trim().is_empty()))
+                && (shell_text || chrome_text || micro_shell || (still_thin && !is_small_404))));
+    // An anonymous read the site redirected to its sign-in endpoint: the
+    // final page is a login form, never the requested content.
+    let login_redirected = sink_eligible
+        && status_2xx
+        && out
+            .as_ref()
+            .is_some_and(|o| crate::detect::substance::login_redirect(&url, &o.url));
     if wall_like {
         let v = extraction_wall.unwrap_or(Verdict::Challenge(Vendor::Generic));
         // The optional unlocker: a paid opt-in reached after a local
@@ -1474,14 +1497,37 @@ async fn fetch_single_inner(
             })),
         );
     }
-    if shell_like {
-        // Wave W / D4: a thin shell whose visible content is auth CTAs is an
-        // authentication gate, not a hydration failure — the honest answer a
-        // browser would give (measured: x.com's logged-out shell).
-        if out
-            .as_ref()
-            .map(|o| crate::detect::walls::auth_shell(&o.body))
-            .unwrap_or(false)
+    if shell_like || login_redirected {
+        // A document with no content that tells script-less clients where
+        // to go (`<noscript><meta http-equiv=refresh>`, duckduckgo's HTML
+        // site) is followed once, on the same site: it is the site's own
+        // answer for a client like this one.
+        if !login_redirected
+            && args.get("_noscript_hop").is_none()
+            && let Some(o) = out.as_ref()
+            && let Some(target) = noscript_hop(&o.body, &o.url)
+        {
+            trace.step("local", "noscript-redirect", &target, 0);
+            let prior = match trace.value() {
+                Value::Array(a) => a,
+                _ => Vec::new(),
+            };
+            let mut args2 = args.clone();
+            args2["_noscript_hop"] = json!(true);
+            let mut res = Box::pin(fetch_single_inner(daemon, &args2, &target, call)).await;
+            fold_trace_into_result(&mut res, prior);
+            return res;
+        }
+        // A thin shell whose visible content is sign-in prompts, or a read
+        // redirected to a sign-in endpoint, is an authentication gate, not a
+        // hydration failure: the honest answer a browser would give.
+        if login_redirected
+            || page_verdict == Some(crate::detect::substance::Verdict::AuthGate)
+            || (page_verdict.is_none()
+                && out
+                    .as_ref()
+                    .map(|o| crate::detect::walls::auth_shell(&o.body))
+                    .unwrap_or(false))
         {
             return tool_error_structured(
                 format!(
@@ -1497,16 +1543,15 @@ async fn fetch_single_inner(
                 })),
             );
         }
+        let (msg, kind, action) = shell_failure(&url, page_verdict, out.as_ref());
         return tool_error_structured(
-            format!(
-                "no readable content at {url} : the page renders client-side and did not hydrate"
-            ),
-            "transient",
+            msg,
+            kind,
             Some(json!({
                 "url": url,
                 "status": final_status,
                 "verdict": "Incomplete",
-                "next_action": "retry later, or choose another source for this page",
+                "next_action": action,
                 "escalation": trace.value(),
             })),
         );
@@ -1529,7 +1574,13 @@ async fn fetch_single_inner(
     // content, whatever produced it. The failure is "walled" so the
     // optional unlocker can engage instead of the agent trusting
     // navigation boilerplate.
-    if let Some((msg, kind, action)) = content_fail(&ex.markdown, &url, final_status, verified) {
+    if let Some((msg, kind, action)) = content_fail(
+        &ex.markdown,
+        &url,
+        final_status,
+        verified,
+        ex.page.is_some(),
+    ) {
         return tool_error_structured(
             msg,
             kind,
@@ -1803,7 +1854,7 @@ pub(super) async fn try_bypass(
     let failure = if ex.blocks_total == 0 || ex.markdown.trim().is_empty() {
         Some("unlocker returned no extracted content".to_string())
     } else {
-        content_fail(&ex.markdown, url, outcome.status, false).map(|(msg, _, _)| msg)
+        content_fail(&ex.markdown, url, outcome.status, false, false).map(|(msg, _, _)| msg)
     };
     if let Some(msg) = failure {
         crate::fetch::bypass::invalidate_cached(&cache_dir, url, cfg.render);
@@ -1838,6 +1889,96 @@ pub(super) async fn try_bypass(
         apply_link_handles(daemon, &mut res).await;
     }
     Some(res)
+}
+
+/// The same-site page a contentless document sends script-less clients
+/// to: its `<noscript>` refresh, or, for a document with no text at all,
+/// its declared English alternate (where its script would send a
+/// browser). None when it leads nowhere new.
+fn noscript_hop(body: &[u8], page_url: &str) -> Option<String> {
+    let page = crate::detect::substance::assess_html(body, page_url);
+    if page.verdict.is_content() {
+        return None;
+    }
+    let target = page.noscript_redirect.or(page.language_hop)?;
+    let (from, to) = (
+        url::Url::parse(page_url).ok()?,
+        url::Url::parse(&target).ok()?,
+    );
+    let site = |u: &url::Url| {
+        u.host_str()
+            .map(|h| psl::domain_str(h).unwrap_or(h).to_ascii_lowercase())
+    };
+    (matches!(to.scheme(), "http" | "https")
+        && site(&from).is_some()
+        && site(&from) == site(&to)
+        && !same_fetch_url(&target, page_url))
+    .then_some(target)
+}
+
+/// The honest failure for a document that carries no content: what it is,
+/// quoted where it says so itself, and what to do instead. Not "retry": the
+/// same document comes back.
+fn shell_failure(
+    url: &str,
+    verdict: Option<crate::detect::substance::Verdict>,
+    out: Option<&crate::fetch::client::FetchOutcome>,
+) -> (String, &'static str, &'static str) {
+    use crate::detect::substance::Verdict as V;
+    const ELSEWHERE: &str = "the content renders in a browser after scripts run: look for the same content in a server-rendered page, a feed or an API of this site, or another source (web_search)";
+    let notice = match verdict {
+        Some(V::Notice | V::Loading | V::Shell) => {
+            out.and_then(|o| crate::detect::substance::assess_html(&o.body, &o.url).notice)
+        }
+        _ => None,
+    };
+    match (verdict, notice) {
+        (Some(V::Notice), Some(text)) => {
+            let transient = {
+                let l = text.to_lowercase();
+                l.contains("try again") || l.contains("temporar")
+            };
+            (
+                format!(
+                    "no readable content at {url} : the page shows a notice instead of its content: \"{text}\""
+                ),
+                if transient { "transient" } else { "permanent" },
+                if transient {
+                    "the site reports a temporary failure: retry later, or choose another source"
+                } else {
+                    "the notice is the site's answer for this client: choose another source for this content (web_search)"
+                },
+            )
+        }
+        (Some(V::Loading), _) => (
+            format!(
+                "no readable content at {url} : the page is a loading placeholder; its content is fetched by scripts in a browser"
+            ),
+            "permanent",
+            ELSEWHERE,
+        ),
+        (Some(V::Empty), _) => (
+            format!(
+                "no readable content at {url} : the document has no visible text; the page is built by scripts in a browser"
+            ),
+            "permanent",
+            ELSEWHERE,
+        ),
+        (Some(_), _) => (
+            format!(
+                "no readable content at {url} : the page is a client-side app frame (navigation, labels, legal lines) without its content"
+            ),
+            "permanent",
+            ELSEWHERE,
+        ),
+        (None, _) => (
+            format!(
+                "no readable content at {url} : the page renders client-side and did not hydrate"
+            ),
+            "transient",
+            "retry later, or choose another source for this page",
+        ),
+    }
 }
 
 /// Short, sentence-free, identifier-dominated extraction = a
@@ -1898,6 +2039,7 @@ fn content_fail(
     url: &str,
     status: u16,
     verified: bool,
+    has_verdict: bool,
 ) -> Option<(String, &'static str, &'static str)> {
     if let Some(wall) = crate::detect::walls::text_wall(markdown)
         && !(verified && matches!(wall, Verdict::Challenge(_) | Verdict::Blocked))
@@ -1917,7 +2059,12 @@ fn content_fail(
             "retry later : the challenge may clear; a configured unlocker can try this class",
         ));
     }
-    if (200..300).contains(&status) && crate::extract::quality::chrome_only(markdown) {
+    // A document verdict already judged the frame; the markdown test is
+    // for reads without one.
+    if !has_verdict
+        && (200..300).contains(&status)
+        && crate::extract::quality::chrome_only(markdown)
+    {
         return Some((
             format!(
                 "blocked at {url} : the page rendered only navigation and login chrome (an empty shell or a login wall), no content"
@@ -2928,6 +3075,7 @@ mod fetch_output_contract_tests {
 
     pub(super) fn extracted(markdown: &str) -> Extracted {
         Extracted {
+            page: None,
             markdown: markdown.into(),
             title: Some("Example".into()),
             byline: Some("A. Author".into()),

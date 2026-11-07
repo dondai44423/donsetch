@@ -1418,6 +1418,7 @@ fn short_pdf_is_not_classified_as_an_html_shell() {
         &ExtractOptions::default(),
         16_000,
         None,
+        None,
     )
     .unwrap();
 
@@ -1563,7 +1564,7 @@ fn signal_thin_js_shell() {
     );
     let r = extract_html(&html);
     assert!(r.thin);
-    assert!(r.markdown.contains("likely JS-rendered"));
+    assert!(r.markdown.contains("built by scripts"));
 }
 
 #[test]

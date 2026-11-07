@@ -75,6 +75,7 @@ pub fn text_fallback(
     // DOMs where block extraction failed but text is real.
     let lang_info = crate::extract::language::detect(&doc);
     Some(Extracted {
+        page: None,
         markdown: slice,
         title: meta.title.clone(),
         byline: meta.byline.clone(),

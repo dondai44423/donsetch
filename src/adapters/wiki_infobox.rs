@@ -94,6 +94,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let (slice, next) = crate::extract::paginate_public(&full, opts.offset, max);
     let lang_info = crate::extract::language::detect(&doc);
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title: doc

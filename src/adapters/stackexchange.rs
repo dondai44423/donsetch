@@ -103,6 +103,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let max = opts.max_chars.unwrap_or(16_000).max(200);
     let (slice, next) = crate::extract::paginate_public(&md, opts.offset, max);
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title: Some(title),

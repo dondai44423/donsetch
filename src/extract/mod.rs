@@ -83,9 +83,15 @@ pub struct Extracted {
     pub focus_omitted: bool,
     /// Rough token estimate (chars / 4) of the returned markdown.
     pub tokens_est: usize,
-    /// True when the page was large but almost no content
-    /// extracted : a JS shell.
+    /// True when the read is not the page's content: an app shell, a
+    /// sign-in gate, a loading placeholder or a notice standing in for
+    /// it. For an HTML document this is the substance verdict in `page`,
+    /// never a size: a short page with real content is not thin.
     pub thin: bool,
+    /// The substance verdict for the HTML document this read came from
+    /// (`detect::substance`). None when the text did not come from the
+    /// document's DOM: a PDF, a feed, an adapter or embedded data.
+    pub page: Option<crate::detect::substance::Verdict>,
     /// Best-guess content kind from block composition.
     /// Conservative: only non-Page when confident.
     pub content_kind: ContentKind,
@@ -414,6 +420,7 @@ pub fn extract(
         let (slice, next) = paginate(&text, opts.offset, max_chars);
 
         return Ok(Extracted {
+            page: None,
             tokens_est: slice.len() / 4,
             total_chars: text.len(),
             markdown: slice,
@@ -456,6 +463,7 @@ pub fn extract(
                     url,
                     opts,
                     max_chars,
+                    None,
                     None,
                 );
             }
@@ -517,6 +525,9 @@ pub fn extract(
     }
 
     let doc = Html::parse_document(&html_text);
+    // What the document carries, read once from its structure: the thin
+    // verdict for every read of it below.
+    let page = crate::detect::substance::assess(&doc, url);
     let base = metadata::base_url(&doc, url);
     let mut meta = metadata::metadata(&doc);
     if url::Url::parse(url)
@@ -550,6 +561,19 @@ pub fn extract(
     for root in &roots {
         blocks::segment(*root, &base, opts, &mut all_blocks);
     }
+    // A site that answers script-less clients in <noscript> ("NO", "NOPE.")
+    // has said its content there; when that is the only substance, it is
+    // the page.
+    let noscript_only = page.substance > 0 && page.substance == page.noscript_text.len();
+    if noscript_only {
+        for text in &page.noscript_text {
+            all_blocks.push(blocks::Block::Para {
+                md: text.clone(),
+                link_density: 0.0,
+                path: Vec::new(),
+            });
+        }
+    }
 
     let neutral_identity = if opts.include_links {
         let neutral = ExtractOptions::default();
@@ -580,6 +604,7 @@ pub fn extract(
         opts,
         max_chars,
         neutral_identity,
+        Some(page.verdict),
     )?;
 
     // JSON-in-script rescue: SPAs (Next.js/React/YouTube) embed
@@ -623,6 +648,9 @@ pub fn extract(
         if fb.images.is_empty() {
             fb.images = extracted.images.clone();
         }
+        // The fallback reads the same document: its verdict holds.
+        fb.thin = !page.verdict.is_content();
+        fb.page = Some(page.verdict);
         return Ok(fb);
     }
     Ok(extracted)
@@ -645,6 +673,7 @@ fn body_starts_with_html(body: &[u8]) -> bool {
 fn empty_pdf(url: &str, reason: &str) -> Extracted {
     let md = format!("{url}\n\n*[pdf: {reason}]*\n");
     Extracted {
+        page: None,
         tokens_est: md.len() / 4,
         total_chars: md.len(),
         markdown: md,
@@ -694,6 +723,7 @@ fn downstream(
     opts: &ExtractOptions,
     max_chars: usize,
     neutral_identity: Option<String>,
+    page: Option<crate::detect::substance::Verdict>,
 ) -> Result<Extracted, ExtractError> {
     let identity = neutral_identity.unwrap_or_else(|| {
         render::render(
@@ -861,14 +891,41 @@ fn downstream(
     // from a complete binary document, so HTML shell heuristics must never
     // label a short PDF as a JS-rendered page.
     let is_pdf = pdf_pages.is_some();
+    // An HTML document carries its substance verdict: thin is what the
+    // document says, never its size (a three-word page with a date and a
+    // count is content; a 3 KB navigation frame is not). Text without a
+    // document (embedded data) keeps the yield rule.
     let thin = !is_pdf
-        && ((source_len < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
-            || (thin_flag && has_skeletons && source_len < 4000)
-            || is_shell);
+        && match page {
+            Some(verdict) => !verdict.is_content(),
+            None => {
+                (source_len < 800 && (thin_flag || raw_len > 5_000 || blocks_total == 0))
+                    || (thin_flag && has_skeletons && source_len < 4000)
+                    || is_shell
+            }
+        };
     if thin {
-        full = format!(
-            "*[note: large page rendered almost no content : likely JS-rendered (SPA). Content below may be a shell.]*\n\n{full}"
-        );
+        let note = match page {
+            Some(crate::detect::substance::Verdict::AuthGate) => {
+                "the page is a sign-in page; the text below is its prompts, not the content"
+            }
+            Some(crate::detect::substance::Verdict::Loading) => {
+                "the page shows a loading placeholder; its content renders in a browser"
+            }
+            Some(crate::detect::substance::Verdict::Notice) => {
+                "the page shows a notice in place of its content"
+            }
+            Some(crate::detect::substance::Verdict::Empty) => {
+                "the document has no visible text; the page is built by scripts in a browser"
+            }
+            Some(_) => {
+                "the page is a client-rendered frame (navigation, labels, legal lines); its content renders in a browser"
+            }
+            None => {
+                "large page rendered almost no content : likely JS-rendered (SPA). Content below may be a shell."
+            }
+        };
+        full = format!("*[note: {note}]*\n\n{full}");
     }
     let (slice, next) = paginate(&full, opts.offset, max_chars);
     let tokens_est = slice.len() / 4;
@@ -877,6 +934,7 @@ fn downstream(
     let quality = quality_score(meta, &kept, blocks_total, raw_len, &lang_info);
 
     Ok(Extracted {
+        page,
         markdown: slice,
         title: meta.title.clone(),
         byline: meta.byline.clone(),

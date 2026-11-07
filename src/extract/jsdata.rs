@@ -330,12 +330,14 @@ fn finish(
             opts,
             opts.max_chars.unwrap_or(16_000).max(200),
             None,
+            None,
         )
         .ok();
     }
     let total = md.len();
     let (slice, next) = paginate(&md, opts);
     Some(Extracted {
+        page: None,
         tokens_est: slice.len() / 4,
         markdown: slice,
         title,
