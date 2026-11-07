@@ -3836,3 +3836,53 @@ async fn same_site_twins_are_fetched_once() {
         .unwrap();
     assert_eq!(r.map, ["https://ex.com/a", "https://ex.com/b"]);
 }
+
+
+// A gate rides each worker request into the fetch layer, which can hold
+// the request after the crawl has returned.
+#[tokio::test]
+async fn a_redirect_gate_keeps_the_scope_and_none_of_the_callbacks() {
+    use tokio::sync::mpsc::error::TryRecvError;
+    let (fetch, _) = MockSite::new()
+        .page(
+            "https://ex.com/robots.txt",
+            200,
+            "User-agent: *\nDisallow: /docs/blocked\n",
+        )
+        .fetcher();
+    let (sink, mut beats) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let options = CrawlOptions {
+        same_host: true,
+        respect_robots: true,
+        include_paths: vec!["/docs/*".into()],
+        exclude_paths: vec!["/docs/private/*".into()],
+        progress: Some(Arc::new(move |done, _queued| {
+            let _ = sink.send(done);
+        })),
+        ..opts()
+    };
+    let gate = super::build_redirect_gate(
+        &fetch,
+        &Arc::new(super::sitemap::RobotsCache::new()),
+        &gov(),
+        "ex.com",
+        &options,
+    )
+    .expect("a crawl gate");
+    drop(options);
+    assert_eq!(
+        beats.try_recv(),
+        Err(TryRecvError::Disconnected),
+        "the gate keeps the crawl's progress sink alive"
+    );
+    // The gate still rules on every part of the scope it was built from.
+    let allows = |url: &str| gate(url.parse().unwrap());
+    assert!(allows("https://ex.com/docs/a").await);
+    assert!(!allows("https://other.com/docs/a").await, "same host");
+    assert!(!allows("https://ex.com/blog/a").await, "include_paths");
+    assert!(
+        !allows("https://ex.com/docs/private/a").await,
+        "exclude_paths"
+    );
+    assert!(!allows("https://ex.com/docs/blocked").await, "robots");
+}

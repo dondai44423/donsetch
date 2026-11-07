@@ -423,6 +423,106 @@ mod tests {
         );
     }
 
+    // Installs the process config: depends on nextest's process-per-test.
+    #[tokio::test]
+    async fn a_finished_crawl_holds_no_sender_of_its_progress_sink() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::mpsc::error::TryRecvError;
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") && head.len() < 16384 {
+                        match socket.read_u8().await {
+                            Ok(byte) => head.push(byte),
+                            Err(_) => return,
+                        }
+                    }
+                    // The seed is read before any worker starts, without
+                    // the crawl's redirect gate; `/next` is a worker's
+                    // fetch and carries it.
+                    let page = if head.starts_with(b"GET / ") {
+                        Some((
+                            "Field notes",
+                            "A sentence a reader came to this page for. ",
+                            "<ul><li><a href=\"/next\">The next field notes page</a></li></ul>",
+                        ))
+                    } else if head.starts_with(b"GET /next ") {
+                        Some((
+                            "More field notes",
+                            "Another observation recorded on the second page. ",
+                            "",
+                        ))
+                    } else {
+                        None
+                    };
+                    let reply = if let Some((title, sentence, links)) = page {
+                        let body = format!(
+                            "<html><head><title>{title}</title></head><body><article>\
+                             <h1>{title}</h1><p>{}</p>{links}</article></body></html>",
+                            sentence.repeat(40)
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let fetcher =
+            Arc::new(Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap());
+        let (crawler, _) = build(fetcher, Arc::new(EgressPool::new(Vec::new())));
+        // The MCP server answers a call that asked for progress once every
+        // sender of the call's progress channel is gone; this sink is that
+        // channel.
+        let (sink, mut beats) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let result = crawler
+            .crawl(
+                &url,
+                super::super::CrawlOptions {
+                    mode: super::super::CrawlMode::Content,
+                    respect_robots: false,
+                    max_pages: 2,
+                    max_depth: 1,
+                    deadline: std::time::Duration::from_secs(10),
+                    progress: Some(Arc::new(move |done, _queued| {
+                        let _ = sink.send(done);
+                    })),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.pages.len(), 2, "{:?}", result.skipped);
+        let mut done = Vec::new();
+        let end = loop {
+            match beats.try_recv() {
+                Ok(beat) => done.push(beat),
+                Err(end) => break end,
+            }
+        };
+        // The sink was live while the crawl ran: every page's beat arrived.
+        assert_eq!(done, vec![1, 2]);
+        assert_eq!(
+            end,
+            TryRecvError::Disconnected,
+            "the crawl returned, yet something still holds its progress sink"
+        );
+    }
+
     #[test]
     fn crawl_leaves_the_pool_with_the_opt_out() {
         let proxies = vec![

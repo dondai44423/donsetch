@@ -117,6 +117,87 @@ fn a_hop_guard_is_asked_before_every_hop_and_can_stop_or_refuse_it() {
 }
 
 #[test]
+fn a_finished_request_leaves_none_of_its_policy_with_the_session() {
+    let server = Server::start(|request| match request.path.as_str() {
+        "/a" => Reply::Redirect("/b".into()),
+        _ => Reply::ok(page("End")),
+    });
+    // A guard that owns `held` and counts the hops it is asked about: what a
+    // caller's guard captures stands for the caller's per-request state.
+    let guard = |held: &Arc<()>, asked: &Arc<AtomicUsize>, verdict: Hop| -> crate::HopGuard {
+        let held = Arc::clone(held);
+        let asked = Arc::clone(asked);
+        Arc::new(move |_: &str, _: &str| {
+            let _ = &held;
+            asked.fetch_add(1, Ordering::SeqCst);
+            verdict.clone()
+        })
+    };
+    let session = Session::new(false);
+
+    let held = Arc::new(());
+    let asked = Arc::new(AtomicUsize::new(0));
+    let fetched = {
+        let request = Request {
+            policy: Policy {
+                hop: Some(guard(&held, &asked, Hop::Follow)),
+                ..Policy::default()
+            },
+            cache: false,
+            ..request(server.url("/a"))
+        };
+        session.fetch(&request)
+    };
+    assert_eq!(fetched.class, Class::Content, "{:?}", fetched.failures);
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "the guard ruled its fetch");
+    assert_eq!(
+        Arc::strong_count(&held),
+        1,
+        "the fetch is over, yet the session still holds its hop guard"
+    );
+
+    let held = Arc::new(());
+    let asked = Arc::new(AtomicUsize::new(0));
+    let reply = session
+        .once(&Once {
+            policy: Policy {
+                hop: Some(guard(&held, &asked, Hop::Follow)),
+                ..Policy::default()
+            },
+            ..Once::new(server.url("/a"))
+        })
+        .expect("once");
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the guard ruled its request"
+    );
+    assert_eq!(
+        Arc::strong_count(&held),
+        1,
+        "the request is over, yet the session still holds its hop guard"
+    );
+
+    // The worker and wire those requests used still follow the next
+    // request's own rules: this guard stops at /b, and /b is never dialed.
+    let held = Arc::new(());
+    let asked = Arc::new(AtomicUsize::new(0));
+    let before = server.hit_count();
+    let stopped = session.fetch(&Request {
+        policy: Policy {
+            hop: Some(guard(&held, &asked, Hop::Stop)),
+            ..Policy::default()
+        },
+        cache: false,
+        ..request(server.url("/a"))
+    });
+    assert_eq!(stopped.status, 302);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert_eq!(server.hits()[before..].to_vec(), vec!["/a"]);
+}
+
+#[test]
 fn without_follow_the_redirect_comes_back_and_no_hop_is_dialed() {
     let server = Server::start(|request| match request.path.as_str() {
         "/a" => full(302, &[("Location", "/b"), ("Set-Cookie", "hop=1")], ""),
