@@ -261,6 +261,29 @@ pub async fn ensure_url_safe(url_str: &str) -> Result<url::Url, crate::error::Fe
     Ok(url)
 }
 
+/// The URL guard for a read that leaves through `proxy`.
+///
+/// With no proxy this is `ensure_url_safe`. Through a proxy the target's
+/// name is handed to the proxy, which resolves it on its side, so the name
+/// is not looked up on this machine and no answer is judged here; every
+/// check `validate_url_basic` makes still applies (scheme, credentials,
+/// local rules, localhost names and literal private addresses).
+pub async fn ensure_url_safe_via(
+    url_str: &str,
+    proxy: Option<&crate::egress::proxy::Proxy>,
+) -> Result<url::Url, crate::error::FetchError> {
+    use crate::egress::proxy::ProxyScheme;
+    match proxy.map(|proxy| proxy.scheme) {
+        // Both schemes are sent the name: an HTTP proxy in its CONNECT or
+        // absolute-form request line, a SOCKS5 lane because v5 dials it as
+        // socks5h (`Proxy::wire_url`). A local answer is not the address the
+        // proxy reaches. A scheme resolved on this machine needs the lookup
+        // and belongs with `None`.
+        Some(ProxyScheme::Http | ProxyScheme::Socks5) => validate_url_basic(url_str),
+        None => ensure_url_safe(url_str).await,
+    }
+}
+
 /// Validate a redirect target URL string relative to a base URL.
 /// Used per redirect hop. A non-http(s) scheme is
 /// `FetchError::NonHttpRedirect` carrying the scheme; everything else
@@ -880,6 +903,486 @@ mod tests {
             let rules = crate::rules::RuleSet::empty();
             assert!(validate_url_basic_with_policy(target, true, &rules).is_ok());
             assert!(validate_url_basic_with_policy(target, false, &rules).is_err());
+        }
+    }
+}
+
+// ── Reads through a proxy ──────────────────────────────────────────────
+//
+// These install the process config, which can happen once per process, some
+// give a name an answer in the process-wide resolver cache, and the fetch-pool
+// tests keep lane health in the process's test cache root: they depend on
+// nextest's one process per test.
+#[cfg(test)]
+mod proxied_read_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    use crate::egress::proxy::Proxy;
+    use crate::error::FetchError;
+    use crate::fetch::client::Fetcher;
+    use crate::profile::BrowserProfile;
+    use crate::search::egress::EgressPool;
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A name no resolver answers: a read of it that returns a page was not
+    /// resolved on this machine.
+    const NAME: &str = "no-such-host-for-donsetch.invalid";
+
+    /// A name the resolver cache answers with a loopback address.
+    const PRIVATE_NAME: &str = "private-answer.donsetch.test";
+
+    /// A name the resolver cache answers with a public address.
+    const PUBLIC_NAME: &str = "public-answer.donsetch.test";
+
+    fn install(allow_private_egress: bool) {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = allow_private_egress;
+        crate::config::install(config).unwrap();
+        crate::egress::dns::remember(PRIVATE_NAME, 80, &["127.0.0.1:80".parse().unwrap()]);
+    }
+
+    /// Names the guard's resolver (`egress::dns::resolve`) has been asked for,
+    /// answered from its cache or not.
+    fn lookups() -> u64 {
+        let (hits, misses) = crate::egress::dns::stats();
+        hits + misses
+    }
+
+    async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            if bytes.len() > 16384 {
+                return None;
+            }
+            bytes.push(stream.read_u8().await.ok()?);
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn page_reply() -> Vec<u8> {
+        let page = format!(
+            "<!doctype html><html><head><title>Through the proxy</title></head><body><article><h1>Through the proxy</h1><p>{}</p></article></body></html>",
+            "The request reached the page it asked for, and this paragraph is that page's content. ".repeat(4)
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+            page.len()
+        )
+        .into_bytes()
+    }
+
+    /// An HTTP proxy on 127.0.0.1 that logs each request line and answers
+    /// every request itself.
+    async fn http_proxy() -> (u16, Log, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log: Log = Arc::default();
+        let seen = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let head = read_head(&mut stream).await?;
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    seen.lock().unwrap().push(line);
+                    stream.write_all(&page_reply()).await.ok()?;
+                    stream.shutdown().await.ok()
+                });
+            }
+        });
+        (port, log, task)
+    }
+
+    /// A SOCKS5 proxy on 127.0.0.1 that grants every CONNECT without
+    /// authentication, logs the destination it is asked for ("name
+    /// host:port" or "address ip:port") and answers the tunnelled request
+    /// itself.
+    async fn socks5_proxy() -> (u16, Log, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log: Log = Arc::default();
+        let seen = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 2];
+                    stream.read_exact(&mut greeting).await.ok()?;
+                    let mut methods = vec![0u8; usize::from(greeting[1])];
+                    stream.read_exact(&mut methods).await.ok()?;
+                    stream.write_all(&[0x05, 0x00]).await.ok()?;
+                    let mut request = [0u8; 4];
+                    stream.read_exact(&mut request).await.ok()?;
+                    let destination = match request[3] {
+                        0x03 => {
+                            let mut name = vec![0u8; usize::from(stream.read_u8().await.ok()?)];
+                            stream.read_exact(&mut name).await.ok()?;
+                            format!("name {}", String::from_utf8_lossy(&name))
+                        }
+                        0x01 => {
+                            let mut ip = [0u8; 4];
+                            stream.read_exact(&mut ip).await.ok()?;
+                            format!("address {}", std::net::Ipv4Addr::from(ip))
+                        }
+                        _ => {
+                            let mut ip = [0u8; 16];
+                            stream.read_exact(&mut ip).await.ok()?;
+                            format!("address [{}]", std::net::Ipv6Addr::from(ip))
+                        }
+                    };
+                    let port = stream.read_u16().await.ok()?;
+                    seen.lock().unwrap().push(format!("{destination}:{port}"));
+                    stream
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])
+                        .await
+                        .ok()?;
+                    read_head(&mut stream).await?;
+                    stream.write_all(&page_reply()).await.ok()?;
+                    stream.shutdown().await.ok()
+                });
+            }
+        });
+        (port, log, task)
+    }
+
+    /// A document read and a one-shot read of `url` through `proxy` (or
+    /// direct): each one's status, or its error.
+    async fn both_paths(proxy: Option<&Proxy>, url: &str) -> [Result<u16, FetchError>; 2] {
+        let fetcher = Fetcher::new(BrowserProfile::host_default()).unwrap();
+        let document = fetcher.fetch_via(url, proxy).await;
+        let once = fetcher.fetch_once_via(url, &[], proxy, false, None).await;
+        [document, once].map(|result| result.map(|out| out.status))
+    }
+
+    /// With private egress not allowed, a read through a SOCKS5 lane (dialed
+    /// as socks5h) or an HTTP proxy hands the proxy the target's name and the
+    /// URL guard does not look that name up on this machine: a document read
+    /// and a one-shot read of a name no resolver answers return the proxy's
+    /// page, and the guard's resolver is asked nothing.
+    #[tokio::test]
+    async fn a_read_through_a_proxy_leaves_the_target_name_to_the_proxy() {
+        install(false);
+        let (socks_port, socks, socks_task) = socks5_proxy().await;
+        let (http_port, http, http_task) = http_proxy().await;
+        let url = format!("http://{NAME}/page");
+        let named = [
+            (
+                format!("socks5://127.0.0.1:{socks_port}"),
+                &socks,
+                format!("name {NAME}:80"),
+            ),
+            (
+                format!("http://127.0.0.1:{http_port}"),
+                &http,
+                format!("GET {url} "),
+            ),
+        ];
+        for (proxy, log, sent) in named {
+            let proxy = Proxy::parse(&proxy).unwrap();
+            let before = lookups();
+            let results = both_paths(Some(&proxy), &url).await;
+            let asked = lookups() - before;
+            let seen = std::mem::take(&mut *log.lock().unwrap());
+            assert!(
+                results.iter().all(|result| matches!(result, Ok(200)))
+                    && asked == 0
+                    && !seen.is_empty()
+                    && seen.iter().all(|line| line.starts_with(&sent)),
+                "{}: {results:?}; the guard looked the name up {asked} time(s); the proxy saw {seen:?}",
+                proxy.wire_url()
+            );
+        }
+        socks_task.abort();
+        http_task.abort();
+    }
+
+    /// Negative: with private egress not allowed, a read with no proxy still
+    /// looks the name up and refuses a private answer, and a read through a
+    /// proxy is still refused a private literal or a localhost name before
+    /// anything is sent.
+    #[tokio::test]
+    async fn the_guard_still_judges_a_direct_name_and_a_private_literal_through_a_proxy() {
+        install(false);
+        let before = lookups();
+        let results = both_paths(None, &format!("http://{PRIVATE_NAME}/page")).await;
+        let asked = lookups() - before;
+        let refusal = format!("{PRIVATE_NAME} resolves to private/loopback address 127.0.0.1");
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(FetchError::Ssrf(m)) if m.contains(&refusal)))
+                && asked == 2,
+            "direct: {results:?}; the guard looked the name up {asked} time(s)"
+        );
+        let (port, socks, task) = socks5_proxy().await;
+        let proxy = Proxy::parse(&format!("socks5://127.0.0.1:{port}")).unwrap();
+        for url in [
+            "http://10.0.0.1/page".to_string(),
+            format!("http://127.0.0.1:{port}/page"),
+            "http://[::1]/page".to_string(),
+            "http://localhost/page".to_string(),
+        ] {
+            let results = both_paths(Some(&proxy), &url).await;
+            assert!(
+                results
+                    .iter()
+                    .all(|result| matches!(result, Err(FetchError::Ssrf(_)))),
+                "{url}: {results:?}"
+            );
+        }
+        task.abort();
+        assert!(socks.lock().unwrap().is_empty(), "{:?}", socks.lock());
+    }
+
+    /// Negative: with private egress allowed, as before, the guard looks no
+    /// name up, direct or through a proxy, and lets a private literal
+    /// through to the proxy.
+    #[tokio::test]
+    async fn with_private_egress_allowed_the_guard_looks_no_name_up_as_before() {
+        install(true);
+        let before = lookups();
+        let direct = super::ensure_url_safe(&format!("http://{PRIVATE_NAME}/page")).await;
+        let (port, socks, task) = socks5_proxy().await;
+        let proxy = Proxy::parse(&format!("socks5://127.0.0.1:{port}")).unwrap();
+        let named = both_paths(Some(&proxy), &format!("http://{NAME}/page")).await;
+        let literal = both_paths(Some(&proxy), "http://10.0.0.1/page").await;
+        let asked = lookups() - before;
+        task.abort();
+        let seen = socks.lock().unwrap().clone();
+        assert!(
+            direct.is_ok()
+                && named
+                    .iter()
+                    .chain(&literal)
+                    .all(|result| matches!(result, Ok(200)))
+                && asked == 0
+                && seen.contains(&format!("name {NAME}:80"))
+                && seen.iter().any(|line| line.ends_with(" 10.0.0.1:80")),
+            "direct: {direct:?}; through the proxy: {named:?} {literal:?}; the guard looked a name up {asked} time(s); the proxy saw {seen:?}"
+        );
+    }
+
+    /// The process config for fetch-pool reads: `proxy.fetch_rotate` on,
+    /// private egress not allowed.
+    fn install_rotation() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.proxy.fetch_rotate = true;
+        config.fetch.allow_private_egress = false;
+        crate::config::install(config).unwrap();
+    }
+
+    /// How a fixture proxy refuses every request.
+    #[derive(Clone, Copy, Debug)]
+    enum Refusal {
+        /// SOCKS5: the no-auth greeting is accepted and every CONNECT gets
+        /// this reply code.
+        Socks5(u8),
+        /// HTTP: every request gets this status line.
+        Http(&'static str),
+        /// HTTP: every request is read and the connection closed unanswered.
+        HttpHangUp,
+    }
+
+    /// A proxy on 127.0.0.1 that refuses every request as `refusal` says and
+    /// counts the connections it accepts.
+    async fn refusing_proxy(
+        refusal: Refusal,
+    ) -> (Proxy, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    match refusal {
+                        Refusal::Socks5(reply) => {
+                            let mut greeting = [0u8; 2];
+                            stream.read_exact(&mut greeting).await.ok()?;
+                            let mut methods = vec![0u8; usize::from(greeting[1])];
+                            stream.read_exact(&mut methods).await.ok()?;
+                            stream.write_all(&[0x05, 0x00]).await.ok()?;
+                            let mut request = [0u8; 4];
+                            stream.read_exact(&mut request).await.ok()?;
+                            let address = match request[3] {
+                                0x03 => usize::from(stream.read_u8().await.ok()?),
+                                0x01 => 4,
+                                _ => 16,
+                            };
+                            let mut rest = vec![0u8; address + 2];
+                            stream.read_exact(&mut rest).await.ok()?;
+                            stream
+                                .write_all(&[0x05, reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                                .await
+                                .ok()?;
+                        }
+                        Refusal::Http(status) => {
+                            read_head(&mut stream).await?;
+                            let reply = format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            stream.write_all(reply.as_bytes()).await.ok()?;
+                        }
+                        Refusal::HttpHangUp => {
+                            read_head(&mut stream).await?;
+                        }
+                    }
+                    stream.shutdown().await.ok()
+                });
+            }
+        });
+        let scheme = match refusal {
+            Refusal::Socks5(_) => "socks5",
+            Refusal::Http(_) | Refusal::HttpHangUp => "http",
+        };
+        let proxy = Proxy::parse(&format!("{scheme}://127.0.0.1:{port}")).unwrap();
+        (proxy, accepted, task)
+    }
+
+    /// A fetch pool of one lane through `proxy`, and a fetcher drawing on it.
+    fn pool_of(proxy: &Proxy) -> (Arc<EgressPool>, Fetcher) {
+        let pool = Arc::new(EgressPool::new(vec![proxy.clone()]));
+        let fetcher = Fetcher::new(BrowserProfile::host_default())
+            .unwrap()
+            .with_egress(Arc::clone(&pool));
+        (pool, fetcher)
+    }
+
+    /// The error a one-shot read of `url` through `proxy` fails with.
+    async fn one_shot_error(proxy: &Proxy, url: &str) -> FetchError {
+        let fetcher = Fetcher::new(BrowserProfile::host_default()).unwrap();
+        match fetcher
+            .fetch_once_via(url, &[], Some(proxy), false, None)
+            .await
+        {
+            Ok(out) => panic!("{}: {url} returned {}", proxy.wire_url(), out.status),
+            Err(error) => error,
+        }
+    }
+
+    fn marked(error: &FetchError) -> bool {
+        matches!(error, FetchError::Io(error) if crate::fetch::v5::proxy_refused_the_target(error))
+    }
+
+    /// With fetch rotation on and private egress not allowed, a pool lane
+    /// whose proxy answers that it cannot reach the target (a SOCKS5 reply
+    /// 0x03 to 0x06, a CONNECT status other than 200 and 407) is not benched:
+    /// each document read of a name no resolver answers goes to the proxy, the
+    /// guard's resolver is asked nothing, and the pool still picks the lane,
+    /// not the direct egress.
+    #[tokio::test]
+    async fn a_target_the_proxy_cannot_reach_does_not_bench_its_lane() {
+        install_rotation();
+        let before = lookups();
+        for refusal in [Refusal::Socks5(0x04), Refusal::Http("502 Bad Gateway")] {
+            let (proxy, accepted, task) = refusing_proxy(refusal).await;
+            let (pool, fetcher) = pool_of(&proxy);
+            let mut reads = Vec::new();
+            for n in 1..=2 {
+                let url = format!("https://dead-{n}-for-donsetch.invalid/");
+                let connections = accepted.load(Ordering::SeqCst);
+                let result = fetcher.fetch_persona(&url).await.map(|out| out.status);
+                reads.push((result, accepted.load(Ordering::SeqCst) - connections));
+            }
+            task.abort();
+            let id = proxy.id();
+            let picked = pool.pick_fetch("example.org", true).map(|lane| lane.id);
+            assert!(
+                reads
+                    .iter()
+                    .all(|(result, connections)| *connections > 0
+                        && result.as_ref().is_err_and(marked))
+                    && !pool.is_dead(&id)
+                    && picked.as_deref() == Some(id.as_str()),
+                "{refusal:?}: (result, proxy connections) per read {reads:?}; benched: {}; the pool picks {picked:?}",
+                pool.is_dead(&id)
+            );
+        }
+        // Each refusal as the transport reports it, noted on a lane as the
+        // fetch path notes a failed read.
+        for refusal in [
+            Refusal::Socks5(0x03),
+            Refusal::Socks5(0x04),
+            Refusal::Socks5(0x05),
+            Refusal::Socks5(0x06),
+            Refusal::Http("502 Bad Gateway"),
+            Refusal::Http("503 Service Unavailable"),
+        ] {
+            let (proxy, _, task) = refusing_proxy(refusal).await;
+            let error = one_shot_error(&proxy, "https://dead-for-donsetch.invalid/").await;
+            task.abort();
+            let id = proxy.id();
+            let pool = EgressPool::new(vec![proxy]);
+            for _ in 0..3 {
+                crate::fetch::client::note_lane_outcome(
+                    &pool,
+                    "dead-for-donsetch.invalid",
+                    &id,
+                    &error,
+                );
+            }
+            let picked = pool.pick_fetch("example.org", true).map(|lane| lane.id);
+            assert!(
+                marked(&error) && !pool.is_dead(&id) && picked.as_deref() == Some(id.as_str()),
+                "{refusal:?}: {error:?}; benched: {}; the pool picks {picked:?}",
+                pool.is_dead(&id)
+            );
+        }
+        let asked = lookups() - before;
+        assert_eq!(
+            asked, 0,
+            "the guard looked a target name up {asked} time(s)"
+        );
+    }
+
+    /// Negative: a pool lane that cannot be used is still benched and the
+    /// pool leaves it for the direct egress: a proxy port that refuses the
+    /// connection, a SOCKS5 proxy that answers with a general server failure
+    /// (0x01) and an HTTP proxy that closes the connection unanswered.
+    #[tokio::test]
+    async fn a_lane_that_cannot_be_used_is_still_benched() {
+        install_rotation();
+        // A public answer in the cache, so a guard that looks the name up lets
+        // the read through to the lane.
+        crate::egress::dns::remember(PUBLIC_NAME, 443, &["93.184.216.34:443".parse().unwrap()]);
+        let url = format!("https://{PUBLIC_NAME}/");
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            Proxy::parse(&format!("socks5://127.0.0.1:{port}")).unwrap()
+        };
+        let (pool, fetcher) = pool_of(&refused);
+        let result = fetcher.fetch_persona(&url).await.map(|out| out.status);
+        let picked = pool.pick_fetch("example.org", true).map(|lane| lane.id);
+        assert!(
+            result.as_ref().is_err_and(|error| !marked(error))
+                && pool.is_dead(&refused.id())
+                && picked.as_deref() == Some("direct"),
+            "{}: {result:?}; the pool picks {picked:?}",
+            refused.wire_url()
+        );
+        for refusal in [Refusal::Socks5(0x01), Refusal::HttpHangUp] {
+            let (proxy, _, task) = refusing_proxy(refusal).await;
+            let error = one_shot_error(&proxy, &url).await;
+            task.abort();
+            let id = proxy.id();
+            let pool = EgressPool::new(vec![proxy]);
+            crate::fetch::client::note_lane_outcome(&pool, PUBLIC_NAME, &id, &error);
+            let picked = pool.pick_fetch("example.org", true).map(|lane| lane.id);
+            assert!(
+                matches!(error, FetchError::Io(_))
+                    && !marked(&error)
+                    && pool.is_dead(&id)
+                    && picked.as_deref() == Some("direct"),
+                "{refusal:?}: {error:?}; the pool picks {picked:?}"
+            );
         }
     }
 }
