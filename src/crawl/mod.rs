@@ -383,7 +383,7 @@ pub enum StopReason {
     DepthLimit,
     Deadline,
     /// Client cancelled (MCP notifications/cancelled) : workers
-    /// stopped gracefully, resume token persisted.
+    /// stopped gracefully; no resume token is issued.
     Cancelled,
     /// Host boxed us out (all lanes walled) : resume later.
     ThrottledOut,
@@ -1473,8 +1473,8 @@ impl Crawler {
                         }
                         break 'work;
                     }
-                    // v3: client cancellation : graceful stop; the
-                    // resume checkpoint keeps everything gathered.
+                    // v3: client cancellation : graceful stop. A Cancelled
+                    // crawl issues no resume token (see the resume block below).
                     if let Some(rx) = &opts_worker.cancel
                         && (*rx.borrow() || rx.has_changed().unwrap_or(false))
                     {
@@ -2629,18 +2629,19 @@ impl Crawler {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Resume token when stopped with work still queued:
-        // budget stops, a client cancellation, or the host's
-        // penalty box. The MCP surface promises both Cancelled
-        // ("resume with the token above") and ThrottledOut ("wait
-        // and resume") partial progress, so both must persist the
-        // frontier; only a drained frontier (FrontierEmpty) and a
-        // completed crawl have nothing to resume.
+        // Resume token when stopped with work still queued: budget
+        // stops or the host's penalty box. The MCP surface promises
+        // ThrottledOut ("wait and resume") partial progress, so it
+        // must persist the frontier; only a drained frontier
+        // (FrontierEmpty) and a completed crawl have nothing to
+        // resume. A Cancelled crawl gets none: its result is the
+        // token's only carrier, and the MCP server sends no response
+        // to a cancelled request, so the token would sit in the store
+        // unread until it expired.
         let resume = match stop {
             StopReason::MaxPages
             | StopReason::CharBudget
             | StopReason::Deadline
-            | StopReason::Cancelled
             | StopReason::ThrottledOut => {
                 if !queued_entries.is_empty() {
                     let id = {
