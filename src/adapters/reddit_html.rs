@@ -44,7 +44,7 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
         render_about(&doc).map(|(md, title, n)| (md, title, ContentKind::Article, n, None))
     } else {
         // Listings, and any other page carrying posts (search
-        // results, a ghost-rendered profile feed). Profile pages
+        // results, a user's profile feed). Profile pages
         // as served locally carry their pinned/recent items and
         // stream the rest; the card keys on the user, not the
         // feed item's "u_<name>" prefixed label.

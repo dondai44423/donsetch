@@ -200,11 +200,10 @@ async fn health_handler() -> impl IntoResponse {
 /// independently optional, so nothing stopped a user from enabling
 /// permissive CORS (any origin) while leaving auth off. With that
 /// combination, any webpage open in the same local browser could
-/// POST arbitrary MCP tool calls (fetch/crawl/search, including the
-/// `actions` browser-automation surface) to this server with no
-/// authentication. Fail closed instead of just warning: a startup
-/// error is impossible to miss, unlike an crate::diag! in a background
-/// daemon's log.
+/// POST arbitrary MCP tool calls (fetch, search, crawl, screenshot) to
+/// this server with no authentication. Fail closed instead of just
+/// warning: a startup error is impossible to miss, unlike an
+/// crate::diag! in a background daemon's log.
 fn validate_http_config(cors_enabled: bool, auth_enabled: bool) -> Result<(), String> {
     if cors_enabled && !auth_enabled {
         return Err(

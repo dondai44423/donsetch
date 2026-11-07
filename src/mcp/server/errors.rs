@@ -516,7 +516,7 @@ fn moved_page_query(raw: &str) -> Option<String> {
 /// result whose envelope carries `ok:false`; nothing raises. Lives on
 /// structuredContent so it survives the TextOnly `[meta]` fold. The
 /// one predicate every consumer branches on (MCP wire, batch
-/// renderers, shot receipts, CLI exit codes).
+/// renderers, CLI exit codes).
 pub(crate) fn is_failure(result: &Value) -> bool {
     result
         .pointer("/structuredContent/ok")

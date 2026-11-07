@@ -518,9 +518,9 @@ const INTERSTITIAL_MARKERS: &[&str] = &[
 /// chars) that loads a challenge script and has no form. Returns the
 /// vendor when the page is an interstitial.
 ///
-/// This is the layer that keeps the ghost oracle honest: a rendered
-/// "Just a moment..." page must never satisfy the content-quality
-/// oracle, no matter how many visible chars its boilerplate carries.
+/// This is the layer that keeps extraction honest: a "Just a
+/// moment..." page must never satisfy the content-quality oracle,
+/// no matter how many visible chars its boilerplate carries.
 pub fn detect_interstitial(body: &[u8]) -> Option<Vendor> {
     let scan = &body[..body.len().min(96 * 1024)];
     let text = String::from_utf8_lossy(scan).to_lowercase();
@@ -927,7 +927,7 @@ fn classify_wall(
             return Verdict::Challenge(Vendor::Cloudflare);
         }
         // No challenge markers : WAF block (403) or
-        // origin error (503). Ghost solve won't help.
+        // origin error (503). There is nothing to solve.
         return Verdict::Blocked;
     }
     // DataDome: the x-datadome header is present on ALL responses
@@ -1085,9 +1085,10 @@ fn classify_wall(
     }
     // Instagram's logged-out shell: a sign-up gate. The profile
     // content is behind login BY DESIGN, so the verdict is Login,
-    // never Challenge (there is nothing to solve). Escalating to
-    // the ghost just renders the same wall and fails with "no
-    // real content was extractable" (live case: /cristiano/).
+    // never Challenge (there is nothing to solve). A browser
+    // renders the same wall: the old browser tier failed on it
+    // with "no real content was extractable" (live case:
+    // /cristiano/).
     if text.len() < 12_000
         && (text.contains("log in to see photos and videos from friends")
             || text.contains("sign up to see photos and videos"))

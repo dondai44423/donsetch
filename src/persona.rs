@@ -12,8 +12,10 @@
 //! Phase 0 scope: the store, the coherence checker, the mint/
 //! quarantine lifecycle, and binding of the active global profile
 //! as "persona v1" per domain. Phase 1 diverges header sets per
-//! persona; phase 3 binds ghost entropy (canvas/WebGL/audio) and
-//! proxy exits to the same records.
+//! persona; phase 3 binds proxy exits to the same records. The
+//! viewport and the canvas/WebGL/audio entropy seed are minted and
+//! coherence-checked, but no fetch drives a browser that would use
+//! them.
 //!
 //! Personas are route memory: the DONSETCH_NO_ROUTE_MEMORY and
 //! DONSETCH_ROUTE_MEMORY_READONLY switches cover them too.
@@ -22,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 /// The active wire identity a persona must agree with. Sourced from
 /// the profile the fetcher actually sends (which itself probes the
-/// installed browser, so ghost and tier 1 claim the same build).
+/// installed browser, so the local fetch claims the installed build).
 #[derive(Clone, Debug)]
 pub struct PersonaCaps {
     pub chrome_major: u32,
@@ -68,9 +70,11 @@ pub struct Persona {
     pub tz: String,
     /// BCP-47-ish locale ("en-US").
     pub locale: String,
-    /// Viewport for ghost tabs (phase 3).
+    /// Viewport pin. Only the coherence check reads it: no fetch
+    /// drives a browser.
     pub viewport: (u32, u32),
-    /// Entropy seed for canvas/WebGL/audio (phase 3). Never 0.
+    /// Entropy seed for canvas/WebGL/audio. Never 0. Only the
+    /// coherence check reads it: no fetch drives a browser.
     pub entropy_seed: u64,
     /// Bound proxy exit id (phase 1+); a persona never crosses exits.
     pub proxy_id: Option<String>,
