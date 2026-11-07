@@ -4,7 +4,7 @@
 //! budget or re-learns a walled engine from zero.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::EngineReport;
 use super::Intent;
@@ -18,11 +18,11 @@ use super::rank::Merged;
 /// hiding whether the answer was fresh consensus or stale cache).
 pub(crate) type CacheMap = HashMap<String, (Instant, Vec<Merged>, usize, Vec<EngineReport>)>;
 
-/// On-disk cache entry: (key, age_secs, results, merge total,
-/// engine reports). Owned form for load, borrowed form for save.
+/// On-disk cache entry: (key, written-at Unix seconds, results,
+/// merge total, engine reports). Owned form for load, borrowed form
+/// for save.
 type DiskEntry = (String, u64, Vec<Merged>, usize, Vec<EngineReport>);
 type DiskEntryRef<'a> = (String, u64, Vec<Merged>, usize, &'a [EngineReport]);
-type DiskEntryLegacy = (String, u64, Vec<Merged>, usize);
 
 /// Disk cache path (ghost-state pattern).
 fn cache_path() -> Option<std::path::PathBuf> {
@@ -36,19 +36,19 @@ fn dirs_cache() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// On disk: (key, age_secs, results, total, reports) : age lets us
-/// re-base Instant across process restarts. Reports were added for
-/// #164; entries written before that carry a 4-tuple and load with
-/// an empty report list rather than being discarded.
+/// On disk: (key, written_unix, results, total, reports). The
+/// wall-clock write time lets a later process age each entry by the
+/// time that really passed, including time no process was running.
 pub(crate) fn save_cache_disk(cache: &CacheMap) {
     let Some(path) = cache_path() else { return };
     let now = Instant::now();
+    let now_wall = SystemTime::now();
     let entries: Vec<DiskEntryRef> = cache
         .iter()
         .map(|(k, (at, r, t, rep))| {
             (
                 k.clone(),
-                now.saturating_duration_since(*at).as_secs(),
+                written_unix(now_wall, now.saturating_duration_since(*at)),
                 r.clone(),
                 *t,
                 rep.as_slice(),
@@ -69,19 +69,17 @@ pub(crate) fn load_cache_disk() -> CacheMap {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return map;
     };
-    // Current 5-tuple format first; fall back to the pre-#164
-    // 4-tuple format so an existing cache survives an upgrade.
-    let entries: Vec<DiskEntry> = match serde_json::from_str(&raw) {
-        Ok(e) => e,
-        Err(_) => match serde_json::from_str::<Vec<DiskEntryLegacy>>(&raw) {
-            Ok(old) => old
-                .into_iter()
-                .map(|(k, age, results, total)| (k, age, results, total, Vec::new()))
-                .collect(),
-            Err(_) => return map,
-        },
+    // Files from older writers hold each entry's age at save time in
+    // the second field, with no record of when that was, so the
+    // downtime since is unknown. Read as a write time, such an age is
+    // decades in the past and the entry drops below as expired; a
+    // pre-#164 4-tuple file does not parse at all. Either way such
+    // an entry costs a re-fetch instead of being served stale.
+    let Ok(entries) = serde_json::from_str::<Vec<DiskEntry>>(&raw) else {
+        return map;
     };
-    for (key, age, results, total, reports) in entries {
+    let now_wall = now_unix();
+    for (key, written, results, total, reports) in entries {
         // TTL is intent + recency keyed (the query text
         // is the key's first segment). Keys carry a stable u8
         // intent code; pre-code entries carry the Debug string and
@@ -99,16 +97,16 @@ pub(crate) fn load_cache_disk() -> CacheMap {
             }
         };
         let ttl = cache_ttl(intent, qpart);
-        if Duration::from_secs(age) < ttl {
-            map.insert(
-                key,
-                (
-                    Instant::now() - Duration::from_secs(age),
-                    results,
-                    total,
-                    reports,
-                ),
-            );
+        // A write time ahead of the clock (the clock was set back)
+        // gives no usable age: drop rather than serve as fresh.
+        // checked_sub, not `-`: std documents that Instant - Duration
+        // may panic when the result cannot be represented, and the age
+        // now includes downtime.
+        if let Some(age) = now_wall.checked_sub(written).map(Duration::from_secs)
+            && age < ttl
+            && let Some(at) = Instant::now().checked_sub(age)
+        {
+            map.insert(key, (at, results, total, reports));
         }
     }
     map
@@ -155,6 +153,8 @@ struct HealthDisk {
     /// Per-intent trust: `engine|intent_code` -> EWMA.
     #[serde(default)]
     trust_intent: HashMap<String, f64>,
+    /// Failure streaks: engine -> (consecutive fails, Unix seconds of
+    /// the last failure).
     #[serde(default)]
     failures: HashMap<String, (u32, u64)>,
 }
@@ -201,11 +201,19 @@ pub(crate) fn load_health_disk() -> HealthSnapshot {
     for (k, t) in h.trust_intent {
         trust_intent.insert(k, t.clamp(0.2, 2.0));
     }
-    for (e, (n, age)) in h.failures {
+    let now_wall = now_unix();
+    for (e, (n, last)) in h.failures {
         // Only a streak that WOULD still quarantine matters:
         // everything older expired while the process was down.
-        if n >= 3 && Duration::from_secs(age) < super::QUARANTINE_TTL {
-            failures.insert(e, (n, Instant::now() - Duration::from_secs(age.min(599))));
+        // Same rules as load_cache_disk: a write time ahead of the
+        // clock, or an older writer's age-at-save value (decades in
+        // the past when read as a time), never re-quarantines.
+        if n >= 3
+            && let Some(age) = now_wall.checked_sub(last).map(Duration::from_secs)
+            && age < super::QUARANTINE_TTL
+            && let Some(at) = Instant::now().checked_sub(age)
+        {
+            failures.insert(e, (n, at));
         }
     }
     (trust, trust_intent, failures)
@@ -218,6 +226,7 @@ pub(crate) fn save_health_disk(
 ) {
     let Some(path) = health_path() else { return };
     let now = Instant::now();
+    let now_wall = SystemTime::now();
     let disk = HealthDisk {
         version: HEALTH_DISK_VERSION,
         trust: trust.clone(),
@@ -227,7 +236,10 @@ pub(crate) fn save_health_disk(
             .map(|(e, (n, at))| {
                 (
                     e.clone(),
-                    (*n, now.saturating_duration_since(*at).as_secs()),
+                    (
+                        *n,
+                        written_unix(now_wall, now.saturating_duration_since(*at)),
+                    ),
                 )
             })
             .collect(),
@@ -298,6 +310,16 @@ const QUALITY_WEIGHT: f64 = 0.08;
 
 fn quality_path() -> Option<std::path::PathBuf> {
     Some(crate::paths::cache_dir().join("search-quality.json"))
+}
+
+/// Unix seconds, rounded down, of the moment `age` before `now_wall`.
+/// Rounds the exact moment once, so an entry saved, loaded and saved
+/// again keeps the same stored time instead of creeping forward.
+fn written_unix(now_wall: SystemTime, age: Duration) -> u64 {
+    now_wall
+        .checked_sub(age)
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
 }
 
 fn now_unix() -> u64 {
@@ -831,6 +853,209 @@ mod tests {
         assert!(map.contains_key("probe|a.example"));
         assert!(!map.contains_key("probe|b.example"));
         assert!(!map.contains_key("page|a.example"), "class stays scoped");
+    }
+
+    // ── persisted cache and quarantine age ──
+    // These reach their files through crate::paths::cache_dir(), the
+    // per-process test root, so they rely on nextest's
+    // process-per-test runner for isolation.
+
+    /// Move the write times that `times` picks out of the JSON file at
+    /// `path` back by `secs`, as if no process had run for that long
+    /// since the save. Panics unless each field holds a Unix write time
+    /// at least `secs` after the epoch.
+    fn backdate(
+        path: &std::path::Path,
+        secs: u64,
+        times: fn(&mut serde_json::Value) -> Vec<&mut serde_json::Value>,
+    ) {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for t in times(&mut doc) {
+            // Only a write time can be moved back. A field holding the
+            // age at save time is 0 for a fresh entry; subtracting from
+            // it would leave 0 and simulate no downtime at all.
+            let written = t.as_u64().unwrap();
+            assert!(
+                written > secs,
+                "stored field {written} is not a Unix write time, so it cannot be moved {secs} s back"
+            );
+            *t = (written - secs).into();
+        }
+        std::fs::write(path, doc.to_string()).unwrap();
+    }
+
+    fn cache_times(doc: &mut serde_json::Value) -> Vec<&mut serde_json::Value> {
+        doc.as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .map(|e| &mut e[1])
+            .collect()
+    }
+
+    fn failure_times(doc: &mut serde_json::Value) -> Vec<&mut serde_json::Value> {
+        doc["failures"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .map(|f| &mut f[1])
+            .collect()
+    }
+
+    fn save_fresh_cache(keys: &[&str]) {
+        let mut map = CacheMap::new();
+        for k in keys {
+            map.insert(
+                k.to_string(),
+                (
+                    Instant::now(),
+                    vec![merged("https://tokio.rs/", 1.0)],
+                    12,
+                    Vec::new(),
+                ),
+            );
+        }
+        save_cache_disk(&map);
+    }
+
+    /// A fresh cache entry and a live 3-strike streak, saved and then
+    /// loaded two seconds of real time later, both load with an age of
+    /// at least those two seconds. Reaches the files only through save
+    /// and load, so it holds for any on-disk format.
+    #[test]
+    fn persisted_ages_count_real_time_between_save_and_load() {
+        let web = format!("tokio runtime overview|{}", Intent::Web.code());
+        save_fresh_cache(&[&web]);
+        let trust = HashMap::new();
+        let mut failures = HashMap::new();
+        failures.insert("google".to_string(), (3, Instant::now()));
+        save_health_disk(&trust, &trust, &failures);
+        // The gap between two one-shot CLI runs, or a daemon restart:
+        // the loader must count it toward both ages.
+        let gap = Duration::from_secs(2);
+        std::thread::sleep(gap);
+        let cache_age = load_cache_disk().get(&web).map(|(at, ..)| at.elapsed());
+        let (_, _, f) = load_health_disk();
+        let streak_age = f.get("google").map(|(_, at)| at.elapsed());
+        assert!(
+            cache_age.is_some_and(|a| a >= gap) && streak_age.is_some_and(|a| a >= gap),
+            "{gap:?} passed between save and load, but the reloaded ages are: \
+             cache entry {cache_age:?}, quarantine streak {streak_age:?}"
+        );
+    }
+
+    /// Run after run, each loading the files, working briefly and saving
+    /// them again: the stored ages keep the time that passed. Each save
+    /// stores whole seconds, so the age loaded at the end may trail real
+    /// time by under one second, never by more.
+    #[test]
+    fn persisted_ages_survive_repeated_load_and_save() {
+        let start = Instant::now();
+        let web = format!("tokio runtime overview|{}", Intent::Web.code());
+        save_fresh_cache(&[&web]);
+        let trust = HashMap::new();
+        let mut failures = HashMap::new();
+        failures.insert("google".to_string(), (3, Instant::now()));
+        save_health_disk(&trust, &trust, &failures);
+        for _ in 0..5 {
+            let cache = load_cache_disk();
+            let (_, _, failures) = load_health_disk();
+            std::thread::sleep(Duration::from_millis(600));
+            save_cache_disk(&cache);
+            save_health_disk(&trust, &trust, &failures);
+        }
+        let cache_at = load_cache_disk().get(&web).map(|(at, ..)| *at);
+        let (_, _, f) = load_health_disk();
+        let streak_at = f.get("google").map(|(_, at)| *at);
+        let real = start.elapsed();
+        let cache_age = cache_at.map(|at| at.elapsed());
+        let streak_age = streak_at.map(|at| at.elapsed());
+        let lost_a_second =
+            |age: Option<Duration>| age.is_none_or(|a| a + Duration::from_secs(1) <= real);
+        assert!(
+            !lost_a_second(cache_age) && !lost_a_second(streak_age),
+            "{real:?} passed over five load/save runs, but the reloaded ages are: \
+             cache entry {cache_age:?}, quarantine streak {streak_age:?}"
+        );
+    }
+
+    #[test]
+    fn persisted_cache_entry_ages_while_no_process_runs() {
+        let web = format!("tokio runtime overview|{}", Intent::Web.code());
+        save_fresh_cache(&[&web]);
+        // Fresh at save, then three days with the daemon stopped:
+        // far past the 30-minute Web TTL.
+        backdate(&cache_path().unwrap(), 3 * 86_400, cache_times);
+        let loaded = load_cache_disk();
+        assert!(
+            loaded.is_empty(),
+            "an entry written 3 days ago loaded as fresh: {:?}",
+            loaded.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn persisted_cache_keeps_entries_still_inside_their_ttl() {
+        let web = format!("tokio runtime overview|{}", Intent::Web.code());
+        let recency = format!("tokio release latest|{}", Intent::Web.code());
+        save_fresh_cache(&[&web, &recency]);
+        // Six minutes stopped: past the 5-minute recency TTL, inside
+        // the 30-minute Web TTL.
+        backdate(&cache_path().unwrap(), 360, cache_times);
+        let loaded = load_cache_disk();
+        let (at, results, _, _) = loaded
+            .get(&web)
+            .expect("a Web entry 6 minutes old must still load");
+        assert_eq!(results[0].url, "https://tokio.rs/");
+        let age = at.elapsed();
+        assert!(
+            age >= Duration::from_secs(360) && age < Duration::from_secs(1800),
+            "the downtime must count toward the age, got {age:?}"
+        );
+        assert!(
+            !loaded.contains_key(&recency),
+            "a recency entry 6 minutes old outlived its 5-minute TTL"
+        );
+    }
+
+    #[test]
+    fn persisted_cache_drops_entries_written_after_now() {
+        let web = format!("tokio runtime overview|{}", Intent::Web.code());
+        save_fresh_cache(&[&web]);
+        // The clock was set back an hour after the save.
+        let path = cache_path().unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let w = doc[0][1].as_u64().unwrap();
+        doc[0][1] = (w + 3_600).into();
+        std::fs::write(&path, doc.to_string()).unwrap();
+        assert!(load_cache_disk().is_empty());
+    }
+
+    #[test]
+    fn persisted_quarantine_ages_while_no_process_runs() {
+        let trust = HashMap::new();
+        let mut failures = HashMap::new();
+        failures.insert("google".to_string(), (3, Instant::now()));
+        let path = health_path().unwrap();
+
+        // Eleven minutes stopped: the 10-minute quarantine is over.
+        save_health_disk(&trust, &trust, &failures);
+        backdate(&path, 11 * 60, failure_times);
+        let (_, _, f) = load_health_disk();
+        assert!(f.is_empty(), "an expired quarantine came back: {f:?}");
+
+        // Two minutes stopped: still benched, and the downtime counts.
+        save_health_disk(&trust, &trust, &failures);
+        backdate(&path, 120, failure_times);
+        let (_, _, f) = load_health_disk();
+        let (n, at) = f.get("google").expect("a live quarantine must load");
+        assert_eq!(*n, 3);
+        let age = at.elapsed();
+        assert!(
+            age >= Duration::from_secs(120) && age < Duration::from_secs(600),
+            "the downtime must count toward the streak age, got {age:?}"
+        );
     }
 
     #[test]

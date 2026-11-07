@@ -2427,6 +2427,54 @@ mod tests {
         }
     }
 
+    /// A restarted searcher must count the time no process ran: an
+    /// entry fresh at save and three days old on disk is not served.
+    /// Reaches search-cache.json through the per-process test cache
+    /// root, so it relies on nextest's process per test.
+    #[tokio::test]
+    async fn persisted_cache_entry_counts_time_spent_stopped() {
+        let query = "tokio runtime overview";
+        let key = format!("{}|{}", norm_query(query), Intent::Web.code());
+        let mut map = persist::CacheMap::new();
+        map.insert(
+            key.clone(),
+            (
+                Instant::now(),
+                vec![merged("https://tokio.rs/")],
+                12,
+                Vec::new(),
+            ),
+        );
+        persist::save_cache_disk(&map);
+        let path = crate::paths::cache_dir().join("search-cache.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // The daemon was stopped for three days after that save: move
+        // the entry's stored time back by three days. The file mtime is
+        // not read by the loader, so backdating it would simulate nothing.
+        // Only a Unix write time can be moved back: an age-at-save
+        // field is 0 here and would stay 0.
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let stored = doc[0][1].as_u64().unwrap();
+        assert!(
+            stored > 3 * 86_400,
+            "stored field {stored} is not a Unix write time, so it cannot be moved 3 days back; on disk: {}",
+            &raw[..raw.len().min(160)]
+        );
+        doc[0][1] = (stored - 3 * 86_400).into();
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let s = Searcher::new(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            EgressPool::new(Vec::new()),
+        );
+        // Checked on the searcher's own cache: a search() call would
+        // send the query to live engines.
+        assert!(
+            !s.cache.lock().unwrap().contains_key(&key),
+            "an entry saved 3 days ago (Web TTL 30 min) was loaded as fresh; on disk: {}",
+            &raw[..raw.len().min(160)]
+        );
+    }
+
     #[test]
     fn cache_ttl_is_intent_and_recency_aware() {
         assert!(cache_ttl(Intent::News, "anything") < cache_ttl(Intent::Web, "anything"));
