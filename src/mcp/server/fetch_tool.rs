@@ -1777,19 +1777,34 @@ pub(super) async fn try_bypass(
         );
         return None;
     }
-    let ex =
-        match extract::extract_off_worker(&outcome.body, &outcome.content_type, url, opts).await {
-            Ok(e) => e,
-            Err(e) => {
-                trace.step(
-                    "bypass",
-                    "extract",
-                    &format!("{e}"),
-                    t0.elapsed().as_millis(),
-                );
-                return None;
-            }
-        };
+    // The unlocker hands the page over inside a JSON string, so the body
+    // is UTF-8 whatever charset the target's Content-Type names: extract
+    // gets the target's MIME type with charset=utf-8. An empty MIME type
+    // becomes text/html, the type parse_response gives a target that sent
+    // no Content-Type; extract routes it as it routes an empty type.
+    let mime = match outcome
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+    {
+        "" => "text/html",
+        mime => mime,
+    };
+    let unlocked_ct = format!("{mime}; charset=utf-8");
+    let ex = match extract::extract_off_worker(&outcome.body, &unlocked_ct, url, opts).await {
+        Ok(e) => e,
+        Err(e) => {
+            trace.step(
+                "bypass",
+                "extract",
+                &format!("{e}"),
+                t0.elapsed().as_millis(),
+            );
+            return None;
+        }
+    };
     let failure = if ex.blocks_total == 0 || ex.markdown.trim().is_empty() {
         Some("unlocker returned no extracted content".to_string())
     } else {
@@ -2580,6 +2595,95 @@ mod bypass_content_tests {
                 );
             }
         }
+    }
+
+    // The unlocker's answer carries the page inside a JSON string, so its
+    // bytes are UTF-8 whatever charset the target's Content-Type names.
+    // Nextest isolates the process-wide key store and daemon state.
+    #[tokio::test]
+    async fn an_unlocked_page_reads_as_utf8_whatever_charset_the_target_names() {
+        let cache = crate::paths::cache_dir();
+        ByokConfig {
+            default: "local".into(),
+            providers: vec![ProviderConfig {
+                name: "unlocker".into(),
+                keys: vec![KeyEntry {
+                    key: "fixture-token::fixture-zone".into(),
+                    state: KeyState::Active,
+                    ts: 0,
+                }],
+            }],
+        }
+        .save();
+        let daemon = Arc::new(Daemon::new().await.unwrap());
+        let ru = "Привет, мир! Это обычная страница из разблокировщика, в ней достаточно \
+                  текста, чтобы извлечение не сочло её пустой оболочкой. Съешь же ещё этих \
+                  мягких французских булок да выпей чаю. Вторая фраза тоже на русском языке.";
+        let text = format!("{ru}\n{ru}\n");
+        let article = format!("<article><h1>Заголовок страницы</h1><p>{ru}</p></article>");
+        let html =
+            format!("<html><head><title>Страница</title></head><body>{article}</body></html>");
+        let feed = format!(
+            "<?xml version=\"1.0\" encoding=\"windows-1251\"?><rss version=\"2.0\"><channel>\
+             <title>Новости</title><link>https://news.example/</link><item>\
+             <title>Первая новость дня</title><link>https://news.example/1</link>\
+             <description>{ru}</description></item></channel></rss>"
+        );
+        // The last two are negatives: a UTF-8 label, and an empty type, which
+        // must still take the HTML route (a body without <html> is not shown
+        // as raw markup).
+        let doc = format!("<body>{article}</body>");
+        let mut wrong = Vec::new();
+        for (name, ct, body) in [
+            ("text-1251", "text/plain; charset=windows-1251", &text),
+            (
+                "feed-1251",
+                "application/rss+xml; charset=windows-1251",
+                &feed,
+            ),
+            ("html-1251", "text/html; charset=windows-1251", &html),
+            ("text-utf8", "text/plain; charset=utf-8", &text),
+            ("doc-no-type", "", &doc),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
+            let answer =
+                json!({"status_code":200,"headers":{"content-type":ct},"body":body}).to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            let cfg = crate::fetch::bypass::BypassConfig {
+                endpoint,
+                ..Default::default()
+            };
+            let url = format!("https://fixture.example/{name}");
+            // Primes the solve cache; try_bypass reads the page from it.
+            crate::fetch::bypass::unlock("fixture-token::fixture-zone", &url, &cfg, &cache)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            let mut trace = Trace::default();
+            match try_bypass(&daemon, &url, &ExtractOptions::default(), &mut trace).await {
+                None => wrong.push(format!("{name}: refused: {}", trace.value())),
+                Some(result) => {
+                    let shown = result["content"][0]["text"].as_str().unwrap_or_default();
+                    if !shown.contains("Привет, мир!") || shown.contains("<article>") {
+                        wrong.push(format!(
+                            "{name} ({ct}): {} {shown}",
+                            result["structuredContent"]
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
 

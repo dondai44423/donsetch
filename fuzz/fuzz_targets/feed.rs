@@ -15,6 +15,6 @@ fuzz_target!(|data: &[u8]| {
     };
     if donsetch::extract::feed::is_feed(ct, data) {
         let opts = donsetch::extract::ExtractOptions::default();
-        let _ = donsetch::extract::feed::extract(data, "https://fuzz.example.com/feed", &opts);
+        let _ = donsetch::extract::feed::extract(data, ct, "https://fuzz.example.com/feed", &opts);
     }
 });
