@@ -41,8 +41,8 @@ pub use classify::{Class, Wall};
 pub use contract::Contract;
 pub use fetch::{Attempt, Outcome};
 pub use http::{
-    add_trust_pem, default_hop, Cancel, Hop, HopGuard, Kind, Policy, CANCELLED, DOCUMENT_BODY_MAX,
-    REDIRECTS_MAX,
+    add_trust_pem, default_hop, environment_proxies, proxy_url, Cancel, Hop, HopGuard, Kind, Policy,
+    CANCELLED, DOCUMENT_BODY_MAX, REDIRECTS_MAX,
 };
 
 use std::sync::Mutex;
@@ -56,7 +56,9 @@ pub struct Request {
     /// choose from what this origin and its vendor have accepted before.
     pub identity: Option<String>,
     /// Egress proxy URL (`http://user:pass@host:port`, `socks5://...`); the
-    /// challenge engine leaves through it too. `None` is a direct connection.
+    /// challenge engine leaves through it too. `None` takes the proxy the
+    /// environment names ([`environment_proxies`]), and is a direct connection
+    /// when there is none.
     pub proxy: Option<String>,
     /// Spend and earn learned state (scores, cookies, credentials). Off is a
     /// cold probe: nothing is read from or written to the session's state.

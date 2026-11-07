@@ -1,8 +1,8 @@
 //! The library seam: one `Session` shared by threads and async callers.
 
 use crate::testkit::{Reply, Server};
-use crate::{Class, Request, Session};
-use std::sync::Arc;
+use crate::{Class, Once, Request, Session};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn page(title: &str) -> String {
@@ -149,6 +149,360 @@ fn a_proxy_carries_the_whole_request() {
         proxy.hits()
     );
     assert_eq!(via.title, "Through the proxy");
+}
+
+/// A SOCKS5 proxy on 127.0.0.1 that logs the `user:pass` each connection
+/// authenticates with (RFC 1929; empty when none is offered), grants the
+/// CONNECT and answers the tunnelled request itself.
+fn socks5_proxy() -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    fn field(stream: &mut TcpStream) -> std::io::Result<String> {
+        let mut len = [0u8; 1];
+        stream.read_exact(&mut len)?;
+        let mut bytes = vec![0u8; usize::from(len[0])];
+        stream.read_exact(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    fn serve(mut stream: TcpStream, log: &Mutex<Vec<String>>) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut greeting = [0u8; 2];
+        stream.read_exact(&mut greeting)?;
+        let mut methods = vec![0u8; usize::from(greeting[1])];
+        stream.read_exact(&mut methods)?;
+        let credentials = if methods.contains(&0x02) {
+            stream.write_all(&[0x05, 0x02])?;
+            let mut version = [0u8; 1];
+            stream.read_exact(&mut version)?;
+            let user = field(&mut stream)?;
+            let pass = field(&mut stream)?;
+            stream.write_all(&[0x01, 0x00])?;
+            format!("{user}:{pass}")
+        } else {
+            stream.write_all(&[0x05, 0x00])?;
+            String::new()
+        };
+        log.lock().unwrap().push(credentials);
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request)?;
+        let address = match request[3] {
+            0x01 => 4,
+            0x04 => 16,
+            _ => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len)?;
+                usize::from(len[0])
+            }
+        };
+        let mut rest = vec![0u8; address + 2];
+        stream.read_exact(&mut rest)?;
+        stream.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80])?;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte)?;
+            head.push(byte[0]);
+        }
+        let body = page("Through the proxy");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let log: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = Arc::clone(&log);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || serve(stream, &seen));
+        }
+    });
+    (addr, log)
+}
+
+fn once_via(proxy: String, url: String) -> Once {
+    Once {
+        proxy: Some(proxy),
+        timeout: Duration::from_secs(5),
+        ..Once::new(url)
+    }
+}
+
+#[test]
+fn a_proxy_url_the_transport_cannot_read_fails_the_request_and_dials_nothing() {
+    // A '/', '?' or '#' in the password ends the URL's address early. The
+    // origin answers anyone who reaches it.
+    let origin = Server::start(|_| Reply::ok(page("Direct from the origin")));
+    let (proxy, proxied) = socks5_proxy();
+    for scheme in ["socks5h", "http"] {
+        for userinfo in ["alice:pa/ss", "alice:pa#ss", "alice:pa?ss", "alice:/x"] {
+            let url = format!("{scheme}://{userinfo}@{proxy}");
+            let session = Session::new(false);
+            let once = session.once(&once_via(url.clone(), origin.url("/page")));
+            let fetched = session.fetch(&Request {
+                proxy: Some(url.clone()),
+                ..request(origin.url("/page"))
+            });
+            let report = format!(
+                "{url}: one-shot {:?}; document {:?} {} {:?}; the origin took {} direct request(s)",
+                once.as_ref().map(|reply| reply.status),
+                fetched.class,
+                fetched.status,
+                fetched.failures,
+                origin.hit_count()
+            );
+            let named = format!("proxy: cannot read proxy URL \"{scheme}://***@{proxy}\": ");
+            assert!(
+                once.as_ref().is_err_and(|error| error.starts_with(&named)),
+                "{report}"
+            );
+            assert!(
+                fetched.class == Class::Network
+                    && fetched
+                        .failures
+                        .last()
+                        .is_some_and(|error| error.starts_with(&named)),
+                "{report}"
+            );
+            let mut errors = once.as_ref().err().into_iter().chain(&fetched.failures);
+            assert!(
+                errors.all(|error| !error.contains("alice")),
+                "the credentials are echoed: {report}"
+            );
+        }
+    }
+    assert_eq!(origin.hit_count(), 0, "{:?}", origin.hits());
+    assert!(proxied.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_proxy_scheme_in_capitals_names_the_same_proxy() {
+    let origin = Server::start(|_| Reply::ok(page("Direct from the origin")));
+    let (proxy, proxied) = socks5_proxy();
+    let reply = Session::new(false).once(&once_via(
+        format!("SOCKS5H://alice:s3cret@{proxy}"),
+        origin.url("/page"),
+    ));
+    let body = reply
+        .as_ref()
+        .map(|reply| String::from_utf8_lossy(&reply.bytes).into_owned());
+    assert!(
+        body.as_ref()
+            .is_ok_and(|body| body.contains("Through the proxy")),
+        "{body:?}; the origin took {} direct request(s)",
+        origin.hit_count()
+    );
+    assert_eq!(*proxied.lock().unwrap(), ["alice:s3cret"]);
+    assert_eq!(origin.hit_count(), 0);
+}
+
+// Negative: the proxy URLs the transport reads carry the request as before,
+// a percent-encoded '/' in the password included.
+#[test]
+fn a_readable_proxy_url_still_carries_the_request() {
+    let origin = Server::start(|_| Reply::ok(page("Direct from the origin")));
+    let (socks, proxied) = socks5_proxy();
+    let http = Server::start(|request| {
+        // "alice:s3cret" in base64.
+        if request.header("proxy-authorization") == Some("Basic YWxpY2U6czNjcmV0") {
+            Reply::ok(page("Through the proxy"))
+        } else {
+            Reply::Full {
+                status: 407,
+                headers: vec![("proxy-authenticate".into(), "Basic".into())],
+                body: Vec::new(),
+            }
+        }
+    });
+    let target = origin.url("/page");
+    for (url, credentials) in [
+        (
+            format!("socks5h://alice:s3cret@{socks}"),
+            Some("alice:s3cret"),
+        ),
+        (
+            format!("socks5h://alice:pa%2Fss@{socks}"),
+            Some("alice:pa/ss"),
+        ),
+        (format!("socks5://{socks}"), Some("")),
+        (format!("http://alice:s3cret@{}", http.addr), None),
+    ] {
+        let session = Session::new(false);
+        let once = session.once(&once_via(url.clone(), target.clone()));
+        let fetched = session.fetch(&Request {
+            proxy: Some(url.clone()),
+            ..request(target.clone())
+        });
+        let seen = std::mem::take(&mut *proxied.lock().unwrap());
+        assert!(
+            once.as_ref().is_ok_and(|reply| reply.status == 200)
+                && fetched.title == "Through the proxy",
+            "{url}: one-shot {:?}; document {:?} {:?}",
+            once.as_ref().map(|reply| reply.status),
+            fetched.class,
+            fetched.failures
+        );
+        if let Some(credentials) = credentials {
+            assert!(
+                !seen.is_empty() && seen.iter().all(|seen| seen == credentials),
+                "{url}: {seen:?}"
+            );
+        }
+    }
+    let hops = http.hits();
+    assert!(
+        !hops.is_empty() && hops.iter().all(|hop| hop.starts_with(&target)),
+        "{hops:?}"
+    );
+    assert_eq!(origin.hit_count(), 0, "{:?}", origin.hits());
+}
+
+#[test]
+fn a_refused_proxy_url_is_named_with_its_credentials_masked() {
+    for (raw, named) in [
+        (
+            "socks5h://alice:pa/ss@127.0.0.1:1080",
+            "socks5h://***@127.0.0.1:1080",
+        ),
+        // Without a scheme the user name would read as one.
+        ("alice:s3cret@127.0.0.1:1080", "***@127.0.0.1:1080"),
+        ("ftp://alice:s3cret@127.0.0.1:21", "ftp://***@127.0.0.1:21"),
+        (
+            "http://alice:s3cret@127.0.0.1:3128/path",
+            "http://***@127.0.0.1:3128/path",
+        ),
+    ] {
+        let error = crate::proxy_url(raw).expect_err(raw);
+        assert!(
+            error.starts_with(&format!("cannot read proxy URL {named:?}: ")),
+            "{error}"
+        );
+        assert!(
+            !error.contains("alice") && !error.contains("s3cret") && !error.contains("pa/ss"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        crate::proxy_url("SOCKS5H://alice:s3cret@127.0.0.1:1080").as_deref(),
+        Ok("socks5h://alice:s3cret@127.0.0.1:1080")
+    );
+}
+
+/// The environment as `vars` sets it, checked as a client built without a
+/// proxy reads it. No process state: the lookup is handed in.
+fn environment(vars: &[(&str, std::ffi::OsString)]) -> Result<(), String> {
+    crate::http::environment_proxies_in(|name| {
+        vars.iter()
+            .find(|(set, _)| *set == name)
+            .map(|(_, value)| value.clone())
+    })
+}
+
+#[test]
+fn an_environment_proxy_the_transport_cannot_read_is_named_by_its_variable() {
+    let set = |vars: &[(&'static str, &str)]| -> Vec<(&'static str, std::ffi::OsString)> {
+        vars.iter()
+            .map(|(name, value)| (*name, (*value).into()))
+            .collect()
+    };
+    for (vars, named) in [
+        (
+            set(&[("HTTP_PROXY", "socks5://alice:pa/ss@127.0.0.1:1080")]),
+            "HTTP_PROXY: cannot read proxy URL \"socks5://***@127.0.0.1:1080\": ",
+        ),
+        (
+            set(&[("https_proxy", "http://alice:pa#ss@127.0.0.1:3128")]),
+            "https_proxy: cannot read proxy URL \"http://***@127.0.0.1:3128\": ",
+        ),
+        // Without "://" the transport reads an http proxy.
+        (
+            set(&[("ALL_PROXY", "alice:pa/ss@127.0.0.1:3128")]),
+            "ALL_PROXY: cannot read proxy URL \"http://***@127.0.0.1:3128\": ",
+        ),
+        // URLs the url crate reads and the transport does not.
+        (
+            set(&[("HTTP_PROXY", "SOCKS5://alice:s3cret@127.0.0.1:1080")]),
+            "HTTP_PROXY: cannot read proxy URL \"SOCKS5://***@127.0.0.1:1080\": ",
+        ),
+        (
+            set(&[("HTTP_PROXY", "socks5://127.0.0.1:1080 ")]),
+            "HTTP_PROXY: cannot read proxy URL \"socks5://127.0.0.1:1080 \": ",
+        ),
+        (
+            set(&[("HTTP_PROXY", "socks5://127.0.0.1:")]),
+            "HTTP_PROXY: cannot read proxy URL \"socks5://127.0.0.1:\": ",
+        ),
+        // An empty value in capitals hides the lowercase name; a blank one is
+        // no proxy, and the next variable is still read.
+        (
+            set(&[
+                ("HTTP_PROXY", ""),
+                ("http_proxy", "socks5://alice:pa/ss@127.0.0.1:1080"),
+                ("HTTPS_PROXY", "  "),
+                ("https_proxy", "socks5://alice:pa?ss@127.0.0.1:1080"),
+                ("ALL_PROXY", "socks5://alice:pa#ss@127.0.0.1:1080"),
+            ]),
+            "ALL_PROXY: cannot read proxy URL \"socks5://***@127.0.0.1:1080\": ",
+        ),
+    ] {
+        let error = environment(&vars).expect_err(named);
+        assert!(error.starts_with(named), "{vars:?}: {error}");
+        assert!(
+            ["alice", "s3cret", "pa/ss", "pa#ss", "pa?ss"]
+                .iter()
+                .all(|secret| !error.contains(secret)),
+            "{error}"
+        );
+    }
+    // A value that is not Unicode is passed over, for the lowercase name.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let vars = [
+            ("HTTP_PROXY", std::ffi::OsString::from_vec(vec![0xff, b':'])),
+            ("http_proxy", "socks5://alice:pa/ss@127.0.0.1:1080".into()),
+        ];
+        let error = environment(&vars).expect_err("http_proxy");
+        assert!(error.starts_with("http_proxy: "), "{error}");
+    }
+}
+
+// Negative: the environment proxies the transport reads, an empty or blank
+// value and anything under CGI pass.
+#[test]
+fn a_readable_environment_proxy_passes_the_check() {
+    let set = |vars: &[(&'static str, &str)]| -> Vec<(&'static str, std::ffi::OsString)> {
+        vars.iter()
+            .map(|(name, value)| (*name, (*value).into()))
+            .collect()
+    };
+    for vars in [
+        set(&[]),
+        set(&[
+            ("HTTP_PROXY", "socks5://alice:s3cret@127.0.0.1:1080"),
+            ("HTTPS_PROXY", "http://alice:pa%2Fss@proxy.example:3128/"),
+            ("ALL_PROXY", "127.0.0.1:3128"),
+        ]),
+        set(&[
+            ("http_proxy", "socks5h://127.0.0.1"),
+            ("https_proxy", "HTTPS://Proxy.Example"),
+            ("all_proxy", "alice:s3cret@[::1]:3128"),
+        ]),
+        set(&[
+            ("HTTP_PROXY", ""),
+            ("http_proxy", "socks5://alice:pa/ss@127.0.0.1:1080"),
+            ("HTTPS_PROXY", " "),
+        ]),
+        set(&[
+            ("REQUEST_METHOD", "GET"),
+            ("HTTP_PROXY", "socks5://alice:pa/ss@127.0.0.1:1080"),
+        ]),
+    ] {
+        assert_eq!(environment(&vars), Ok(()), "{vars:?}");
+    }
 }
 
 #[test]
