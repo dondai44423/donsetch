@@ -111,6 +111,13 @@ jobs:
       - name: Copy LICENSE into npm package
         run: cp LICENSE npm/LICENSE
 
+      # Proves the credential on every run, including a manual one for a
+      # version already published (which skips the publish itself).
+      - name: Check npm auth
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
       - name: Publish (skip if already on the registry)
         working-directory: npm
         env:
