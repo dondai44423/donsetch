@@ -391,118 +391,67 @@ fn a_refused_proxy_url_is_named_with_its_credentials_masked() {
     );
 }
 
-/// The environment as `vars` sets it, checked as a client built without a
-/// proxy reads it. No process state: the lookup is handed in.
-fn environment(vars: &[(&str, std::ffi::OsString)]) -> Result<(), String> {
-    crate::http::environment_proxies_in(|name| {
-        vars.iter()
-            .find(|(set, _)| *set == name)
-            .map(|(_, value)| value.clone())
-    })
-}
-
+/// A request handed no proxy is a direct connection, whatever the
+/// environment names: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are not
+/// read. The variables are set only in a child process of this test binary,
+/// which runs this test alone; this process sets none, so the test does not
+/// depend on the runner.
 #[test]
-fn an_environment_proxy_the_transport_cannot_read_is_named_by_its_variable() {
-    let set = |vars: &[(&'static str, &str)]| -> Vec<(&'static str, std::ffi::OsString)> {
-        vars.iter()
-            .map(|(name, value)| (*name, (*value).into()))
-            .collect()
-    };
-    for (vars, named) in [
-        (
-            set(&[("HTTP_PROXY", "socks5://alice:pa/ss@127.0.0.1:1080")]),
-            "HTTP_PROXY: cannot read proxy URL \"socks5://***@127.0.0.1:1080\": ",
-        ),
-        (
-            set(&[("https_proxy", "http://alice:pa#ss@127.0.0.1:3128")]),
-            "https_proxy: cannot read proxy URL \"http://***@127.0.0.1:3128\": ",
-        ),
-        // Without "://" the transport reads an http proxy.
-        (
-            set(&[("ALL_PROXY", "alice:pa/ss@127.0.0.1:3128")]),
-            "ALL_PROXY: cannot read proxy URL \"http://***@127.0.0.1:3128\": ",
-        ),
-        // URLs the url crate reads and the transport does not.
-        (
-            set(&[("HTTP_PROXY", "SOCKS5://alice:s3cret@127.0.0.1:1080")]),
-            "HTTP_PROXY: cannot read proxy URL \"SOCKS5://***@127.0.0.1:1080\": ",
-        ),
-        (
-            set(&[("HTTP_PROXY", "socks5://127.0.0.1:1080 ")]),
-            "HTTP_PROXY: cannot read proxy URL \"socks5://127.0.0.1:1080 \": ",
-        ),
-        (
-            set(&[("HTTP_PROXY", "socks5://127.0.0.1:")]),
-            "HTTP_PROXY: cannot read proxy URL \"socks5://127.0.0.1:\": ",
-        ),
-        // An empty value in capitals hides the lowercase name; a blank one is
-        // no proxy, and the next variable is still read.
-        (
-            set(&[
-                ("HTTP_PROXY", ""),
-                ("http_proxy", "socks5://alice:pa/ss@127.0.0.1:1080"),
-                ("HTTPS_PROXY", "  "),
-                ("https_proxy", "socks5://alice:pa?ss@127.0.0.1:1080"),
-                ("ALL_PROXY", "socks5://alice:pa#ss@127.0.0.1:1080"),
-            ]),
-            "ALL_PROXY: cannot read proxy URL \"socks5://***@127.0.0.1:1080\": ",
-        ),
-    ] {
-        let error = environment(&vars).expect_err(named);
-        assert!(error.starts_with(named), "{vars:?}: {error}");
+fn a_request_handed_no_proxy_is_direct_whatever_the_environment_names() {
+    const TARGET: &str = "V5CORE_TEST_DIRECT_TARGET";
+    if let Some(target) = std::env::var_os(TARGET) {
+        // The child: a one-shot and a document read, no proxy handed over.
+        let target = target.into_string().expect("target");
+        let session = Session::new(false);
+        let once = session.once(&Once {
+            timeout: Duration::from_secs(5),
+            ..Once::new(target.clone())
+        });
+        let fetched = session.fetch(&request(target));
+        let body = once
+            .as_ref()
+            .map(|reply| String::from_utf8_lossy(&reply.bytes).into_owned());
         assert!(
-            ["alice", "s3cret", "pa/ss", "pa#ss", "pa?ss"]
-                .iter()
-                .all(|secret| !error.contains(secret)),
-            "{error}"
+            body.as_ref()
+                .is_ok_and(|body| body.contains("Direct from the origin"))
+                && fetched.title == "Direct from the origin",
+            "one-shot {body:?}; document {:?} {:?} {:?}",
+            fetched.class,
+            fetched.title,
+            fetched.failures
         );
+        return;
     }
-    // A value that is not Unicode is passed over, for the lowercase name.
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        let vars = [
-            ("HTTP_PROXY", std::ffi::OsString::from_vec(vec![0xff, b':'])),
-            ("http_proxy", "socks5://alice:pa/ss@127.0.0.1:1080".into()),
-        ];
-        let error = environment(&vars).expect_err("http_proxy");
-        assert!(error.starts_with("http_proxy: "), "{error}");
-    }
-}
-
-// Negative: the environment proxies the transport reads, an empty or blank
-// value and anything under CGI pass.
-#[test]
-fn a_readable_environment_proxy_passes_the_check() {
-    let set = |vars: &[(&'static str, &str)]| -> Vec<(&'static str, std::ffi::OsString)> {
-        vars.iter()
-            .map(|(name, value)| (*name, (*value).into()))
-            .collect()
-    };
-    for vars in [
-        set(&[]),
-        set(&[
-            ("HTTP_PROXY", "socks5://alice:s3cret@127.0.0.1:1080"),
-            ("HTTPS_PROXY", "http://alice:pa%2Fss@proxy.example:3128/"),
-            ("ALL_PROXY", "127.0.0.1:3128"),
-        ]),
-        set(&[
-            ("http_proxy", "socks5h://127.0.0.1"),
-            ("https_proxy", "HTTPS://Proxy.Example"),
-            ("all_proxy", "alice:s3cret@[::1]:3128"),
-        ]),
-        set(&[
-            ("HTTP_PROXY", ""),
-            ("http_proxy", "socks5://alice:pa/ss@127.0.0.1:1080"),
-            ("HTTPS_PROXY", " "),
-        ]),
-        set(&[
-            ("REQUEST_METHOD", "GET"),
-            ("HTTP_PROXY", "socks5://alice:pa/ss@127.0.0.1:1080"),
-        ]),
+    let origin = Server::start(|_| Reply::ok(page("Direct from the origin")));
+    // As an HTTP proxy it answers an absolute-form request for any origin.
+    let proxy = Server::start(|_| Reply::ok(page("Through the proxy")));
+    let name = "session_tests::a_request_handed_no_proxy_is_direct_whatever_the_environment_names";
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(TARGET, origin.url("/page"));
+    for variable in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
     ] {
-        assert_eq!(environment(&vars), Ok(()), "{vars:?}");
+        child.env(variable, proxy.url(""));
     }
+    for variable in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+        child.env_remove(variable);
+    }
+    let output = child.output().expect("run the child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(proxy.hit_count(), 0, "{:?}", proxy.hits());
+    assert!(origin.hit_count() >= 2, "{:?}", origin.hits());
 }
 
 #[test]

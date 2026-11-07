@@ -165,6 +165,14 @@ impl Searcher {
                     Ok(Err(crate::error::FetchError::Denied { .. })) => {
                         (i, None, Some(String::new()), QualityObs::Neutral)
                     }
+                    // A proxy the route needs could not be used (an
+                    // unreadable proxy URL, or a hop the route proxies
+                    // from a read that left direct): a routing fact, not
+                    // a page fact, so the hit keeps its score and no
+                    // quality is recorded, as for a deny.
+                    Ok(Err(crate::error::FetchError::ProxyConfig(_))) => {
+                        (i, None, Some(String::new()), QualityObs::Neutral)
+                    }
                     // Refused / DNS-dead / nothing recovered = dead.
                     Ok(Err(_)) => (i, None, None, QualityObs::Dead),
                     Ok(Ok(mut o)) => {
@@ -543,6 +551,134 @@ mod tests {
                 .take(&url)
                 .is_none(),
             "a 404 never parks a body"
+        );
+    }
+
+    /// A hit whose page redirects to a host the configured route sends
+    /// through a proxy, from a read that left direct, is refused with
+    /// ProxyConfig. That is a routing fact: the hit keeps its score and no
+    /// host quality is recorded. Sets process-wide proxy variables, so it
+    /// relies on nextest's process per test.
+    #[tokio::test]
+    async fn a_redirect_the_route_refuses_is_neither_dead_nor_recorded() {
+        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+        // Nothing listens here: a direct dial of the hop is refused.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let read_head = |sock: &std::net::TcpStream| -> String {
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(4)));
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            first.trim_end().to_string()
+        };
+        // The proxy answers every request with a page and logs its request line.
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let through = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let through = std::sync::Arc::clone(&through);
+            std::thread::spawn(move || {
+                for sock in proxy.incoming() {
+                    let Ok(mut sock) = sock else { break };
+                    let head = read_head(&sock);
+                    through.lock().unwrap().push(head);
+                    let body = "<html><head><title>Through the proxy: the real page title of this search result</title><meta name=\"description\" content=\"A description long enough to be taken as the snippet of this search result, from the proxy.\"></head><body><p>Readable text of the page.</p></body></html>";
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+        // The hit's page: a redirect to localhost, which NO_PROXY does not name.
+        let page = TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_port = page.local_addr().unwrap().port();
+        let page_heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        {
+            let page_heads = std::sync::Arc::clone(&page_heads);
+            std::thread::spawn(move || {
+                for sock in page.incoming() {
+                    let Ok(mut sock) = sock else { break };
+                    let head = read_head(&sock);
+                    page_heads.lock().unwrap().push(head);
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{dead}/page\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+        unsafe {
+            for name in [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "http_proxy",
+                "no_proxy",
+                "REQUEST_METHOD",
+            ] {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"));
+            std::env::set_var("NO_PROXY", "127.0.0.1");
+        }
+        let searcher = searcher();
+        let url = format!("http://127.0.0.1:{page_port}/start");
+        let mut hits = vec![merged(&url, "search title long enough to be replaced")];
+        let before = hits[0].score;
+        searcher.enrich_results(&mut hits).await;
+        std::thread::sleep(Duration::from_millis(200));
+        let quality = searcher
+            .quality
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&crate::search::persist::quality_host_key("127.0.0.1"))
+            .copied();
+        let parked = searcher
+            .prewarms()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(&url)
+            .is_some();
+        assert!(
+            (hits[0].score - before).abs() < f64::EPSILON,
+            "a routing refusal must not demote the hit: {} -> {}",
+            before,
+            hits[0].score
+        );
+        assert!(
+            quality.is_none(),
+            "a routing refusal must not record host quality"
+        );
+        assert!(!parked, "nothing was read, so nothing is parked");
+        assert!(
+            through.lock().unwrap().is_empty(),
+            "the refused hop must not reach the proxy: {:?}",
+            through.lock().unwrap()
+        );
+        assert_eq!(
+            page_heads.lock().unwrap().len(),
+            1,
+            "the hit's own page was read once"
         );
     }
 
