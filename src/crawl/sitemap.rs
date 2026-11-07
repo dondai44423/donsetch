@@ -16,9 +16,14 @@ use std::sync::Arc;
 #[derive(Default, Debug, Clone)]
 pub struct Robots {
     pub sitemaps: Vec<String>,
-    /// `Disallow:` prefixes for agent `*`. Longest-match wins.
+    /// `Disallow:` rules of the groups that name `*` or donsetch (in a
+    /// file with no user-agent line, every non-empty `Disallow:` line),
+    /// with every octet outside ASCII percent-encoded and the hex
+    /// digits of every `%xx` escape in upper case (RFC 9309 §2.2.2).
+    /// Longest-match wins.
     pub disallow: Vec<String>,
-    /// `Allow:` prefixes (override Disallow on longest match).
+    /// `Allow:` rules of the same groups, in the same form (override
+    /// Disallow on longest match).
     pub allow: Vec<String>,
     /// Site-declared request delay seconds, if any: finite,
     /// non-negative, at most [`MAX_CRAWL_DELAY_SECS`].
@@ -47,9 +52,24 @@ impl Robots {
         }
     }
 
+    /// The rules of every group that names `*` or donsetch, and the
+    /// file's `Sitemap:` lines. A file with no user-agent line has its
+    /// `Disallow:` lines read as one `*` group. A leading UTF-8
+    /// byte-order mark is skipped.
     pub fn parse(body: &str, base_origin: &str) -> Self {
+        // Left in place, a BOM glues onto the first key and hides the
+        // first user-agent line. Google's open-source parser skips it
+        // too (robots.cc, RobotsTxtParser::Parse).
+        let body = body.strip_prefix('\u{feff}').unwrap_or(body);
         let mut r = Robots::default();
+        // RFC 9309 §2.1: a group is one or more user-agent lines
+        // followed by rules, and a user-agent line after a rule starts
+        // the next group. The user-agent lines before the first rule
+        // all name one group, so membership accumulates over them.
+        // Crawl-delay and Sitemap are not rules and end nothing
+        // (§2.2.4: other records must not terminate a group).
         let mut in_star_group = false;
+        let mut group_has_rules = false;
         let mut seen_any_group = false;
         for raw in body.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -63,17 +83,25 @@ impl Robots {
             let v = v.trim();
             match k.as_str() {
                 "user-agent" => {
-                    // A new group starts. Track only `*` groups
-                    // (and exact us if we had a UA string; we act
-                    // as a generic crawler).
-                    in_star_group = v == "*" || v.to_lowercase().contains("donsetch");
+                    if group_has_rules {
+                        in_star_group = false;
+                        group_has_rules = false;
+                    }
+                    // Track only `*` groups (and exact us if we had a
+                    // UA string; we act as a generic crawler).
+                    in_star_group |= v == "*" || v.to_lowercase().contains("donsetch");
                     seen_any_group = true;
                 }
-                "disallow" if in_star_group && !v.is_empty() => {
-                    r.disallow.push(v.to_string());
-                }
-                "allow" if in_star_group && !v.is_empty() => {
-                    r.allow.push(v.to_string());
+                "disallow" | "allow" => {
+                    group_has_rules = true;
+                    if in_star_group && !v.is_empty() {
+                        let rules = if k == "allow" {
+                            &mut r.allow
+                        } else {
+                            &mut r.disallow
+                        };
+                        rules.push(canonical_octets(v).into_owned());
+                    }
                 }
                 "crawl-delay" if in_star_group => {
                     r.crawl_delay = v
@@ -105,7 +133,7 @@ impl Robots {
                     continue;
                 };
                 if k.trim().eq_ignore_ascii_case("disallow") && !v.trim().is_empty() {
-                    r.disallow.push(v.trim().to_string());
+                    r.disallow.push(canonical_octets(v.trim()).into_owned());
                 }
             }
         }
@@ -123,8 +151,12 @@ impl Robots {
     }
 
     /// Longest-match rule evaluation over a path, or a path with its
-    /// `?query`. Allow beats Disallow at equal length (RFC 9309).
+    /// `?query`. Allow beats Disallow at equal length (RFC 9309). The
+    /// path is compared in the form the rules are stored in: octets
+    /// outside ASCII percent-encoded, `%xx` hex digits in upper case.
     pub fn allowed(&self, path: &str) -> bool {
+        let path = canonical_octets(path);
+        let path = path.as_ref();
         let mut best_dis = 0usize;
         let mut best_allow = 0usize;
         for d in &self.disallow {
@@ -139,6 +171,47 @@ impl Robots {
         }
         best_allow >= best_dis
     }
+}
+
+/// `s` in the form robots.txt rules and URL paths are compared in
+/// (RFC 9309 §2.2.2): every octet outside ASCII percent-encoded, and
+/// the hex digits of every `%xx` escape in upper case. `*`, `$` and a
+/// `%` that starts no escape are left as they are. Borrowed when `s`
+/// is already in that form.
+fn canonical_octets(s: &str) -> std::borrow::Cow<'_, str> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let b = s.as_bytes();
+    let escape_at = |i: usize| {
+        b[i] == b'%'
+            && b.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+            && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+    };
+    let changes = (0..b.len()).any(|i| {
+        !b[i].is_ascii()
+            || (escape_at(i) && (b[i + 1].is_ascii_lowercase() || b[i + 2].is_ascii_lowercase()))
+    });
+    if !changes {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() * 3);
+    let mut i = 0;
+    while i < b.len() {
+        if escape_at(i) {
+            out.push('%');
+            out.push(char::from(b[i + 1].to_ascii_uppercase()));
+            out.push(char::from(b[i + 2].to_ascii_uppercase()));
+            i += 3;
+        } else if b[i].is_ascii() {
+            out.push(char::from(b[i]));
+            i += 1;
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(b[i] >> 4)]));
+            out.push(char::from(HEX[usize::from(b[i] & 0xf)]));
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// RFC 9309 §2.2.3 rule matching: the rule is a path prefix, `*`
@@ -806,6 +879,163 @@ mod tests {
         let r = Robots::parse(body, "ex.com");
         assert!(r.allowed("/a/b/c"));
         assert!(!r.allowed("/a/x"));
+    }
+
+    // RFC 9309 §2.1: a group is "one or more user-agent lines that are
+    // followed by one or more rules", so the `*` line stays in force
+    // through the user-agent lines that follow it. §2.2.4: an extension
+    // record such as Sitemap "MUST NOT terminate a group".
+    #[test]
+    fn robots_star_keeps_its_rules_in_a_multi_agent_group() {
+        let mut wrong = Vec::new();
+        for body in [
+            "User-agent: *\nUser-agent: ExampleBot\nDisallow: /private/\n",
+            "User-agent: *\nSitemap: https://ex.com/s.xml\nUser-agent: ExampleBot\nDisallow: /private/\n",
+            "User-agent: Googlebot\nDisallow: /g\n\nUser-agent: *\nUser-agent: ExampleBot\nUser-agent: OtherBot\nDisallow: /private/\n",
+        ] {
+            let r = Robots::parse(body, "https://ex.com");
+            if r.allowed("/private/x") || !r.allowed("/public") {
+                wrong.push(format!("{body:?}: disallow={:?}", r.disallow));
+            }
+        }
+        let delayed = Robots::parse(
+            "User-agent: *\nUser-agent: ExampleBot\nCrawl-delay: 3\nDisallow: /p\n",
+            "https://ex.com",
+        );
+        if delayed.crawl_delay != Some(3.0) {
+            wrong.push(format!("Crawl-delay: {:?}", delayed.crawl_delay));
+        }
+        // §2.2's ABNF lets empty lines sit between a group's user-agent
+        // lines, and only a rule ends them: a `*` line followed by
+        // nothing but a Crawl-delay is in the next agent's group.
+        let joined = Robots::parse(
+            "User-agent: *\nCrawl-delay: 10\n\nUser-agent: BadBot\nDisallow: /\n",
+            "https://ex.com",
+        );
+        if joined.allowed("/any") || joined.crawl_delay != Some(10.0) {
+            wrong.push(format!(
+                "joined group: disallow={:?} crawl_delay={:?}",
+                joined.disallow, joined.crawl_delay
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // A UTF-8 byte-order mark before the first line must not hide that
+    // line. The bytes go through robots_for_origin, the decode
+    // fetch_robots applies to the response body.
+    #[test]
+    fn robots_leading_bom_is_skipped() {
+        let origin = "https://ex.com";
+        let url = |p: &str| url::Url::parse(&format!("{origin}{p}")).unwrap();
+        let mut wrong = Vec::new();
+        let multi = robots_for_origin(
+            200,
+            b"\xEF\xBB\xBFUser-agent: *\nDisallow: /private\n\nUser-agent: ExampleBot\nDisallow: /x\n",
+            origin,
+        );
+        if multi.allows_url(&url("/private/a")) || !multi.allows_url(&url("/x")) {
+            wrong.push(format!("two groups: disallow={:?}", multi.disallow));
+        }
+        // A file whose only group names another agent is not a file
+        // without groups: its rules stay out.
+        let other = robots_for_origin(
+            200,
+            b"\xEF\xBB\xBFUser-agent: ExampleBot\nDisallow: /x\n",
+            origin,
+        );
+        if !other.allows_url(&url("/x")) {
+            wrong.push(format!("ExampleBot only: disallow={:?}", other.disallow));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    // RFC 9309 §2.2.2: "Octets in the URI and robots.txt paths outside
+    // the range of the ASCII coded character set ... MUST be
+    // percent-encoded as defined by [RFC3986] prior to comparison."
+    // url::Url hands the crawl an encoded path, so a rule written in raw
+    // UTF-8 has to be compared in the same form.
+    #[test]
+    fn robots_non_ascii_rules_match_the_encoded_path() {
+        let r = Robots::parse(
+            "User-agent: *\nDisallow: /wiki/特別:\nDisallow: /café/\nAllow: /café/menu\nDisallow: /*é$\nDisallow: /lower/%e7%89%b9\n",
+            "https://ex.com",
+        );
+        let allows = |u: &str| r.allows_url(&url::Url::parse(u).unwrap());
+        let mut wrong = Vec::new();
+        for (u, want) in [
+            ("https://ex.com/wiki/特別:Search", false),
+            // %xx hex digits are case-insensitive (RFC 3986 §2.1).
+            ("https://ex.com/wiki/%e7%89%b9%e5%88%a5:Search", false),
+            ("https://ex.com/lower/特", false),
+            ("https://ex.com/lower/%E7%89%B9x", false),
+            ("https://ex.com/café/drinks", false),
+            // The longer rule wins, measured in encoded octets.
+            ("https://ex.com/café/menu", true),
+            // `*` and `$` around an encoded octet.
+            ("https://ex.com/x/café", false),
+            ("https://ex.com/x/café/more", true),
+            ("https://ex.com/cafe/drinks", true),
+            ("https://ex.com/cafè/drinks", true),
+            ("https://ex.com/wiki/特:Search", true),
+        ] {
+            if allows(u) != want {
+                wrong.push(format!("{u}: allowed={}", !want));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?} disallow={:?}", r.disallow);
+        // §2.2.2: an equivalent Allow and Disallow resolve to Allow,
+        // whichever of them was written in raw UTF-8.
+        let tie = Robots::parse(
+            "User-agent: *\nDisallow: /caf%C3%A9/\nAllow: /café/\n",
+            "https://ex.com",
+        );
+        assert!(tie.allowed("/caf%C3%A9/x"));
+        let hex = Robots::parse("User-agent: *\nDisallow: /b%2f\n", "https://ex.com");
+        assert!(!hex.allowed("/b%2Fx"));
+    }
+
+    // Shapes the parser already read correctly, and rules it must keep
+    // ignoring: groups that name only other agents, a user-agent line
+    // after a rule (a new group), a `%` that starts no escape.
+    #[test]
+    fn robots_other_agents_and_already_read_shapes_are_unchanged() {
+        let ignored = Robots::parse(
+            "User-agent: ExampleBot\nUser-agent: OtherBot\nDisallow: /theirs\n\nUser-agent: *\nDisallow: /admin\nUser-agent: ExampleBot\nDisallow: /also-theirs\nAllow: /admin/open\nCrawl-delay: 9\n",
+            "https://ex.com",
+        );
+        assert!(ignored.allowed("/theirs"));
+        assert!(ignored.allowed("/also-theirs"));
+        assert!(!ignored.allowed("/admin/x"));
+        assert!(!ignored.allowed("/admin/open"), "ExampleBot's Allow");
+        assert_eq!(ignored.crawl_delay, None, "ExampleBot's Crawl-delay");
+        let own = Robots::parse(
+            "User-agent: ExampleBot\nDisallow: /theirs\n\nUser-agent: OtherBot\nUser-agent: DonSeTch\nDisallow: /own\n",
+            "https://ex.com",
+        );
+        assert!(!own.allowed("/own"), "a group naming donsetch applies");
+        assert!(own.allowed("/theirs"));
+        let star_last = Robots::parse(
+            "User-agent: ExampleBot\nUser-agent: *\nDisallow: /private\n",
+            "https://ex.com",
+        );
+        assert!(!star_last.allowed("/private/x"));
+        let single_bom = Robots::parse(
+            "\u{feff}User-agent: *\nDisallow: /private\n",
+            "https://ex.com",
+        );
+        assert!(!single_bom.allowed("/private/x"));
+        let encoded = Robots::parse(
+            "User-agent: *\nDisallow: /wiki/%E7%89%B9%E5%88%A5:\n",
+            "https://ex.com",
+        );
+        assert!(!encoded.allows_url(&url::Url::parse("https://ex.com/wiki/特別:Search").unwrap()));
+        let percent = Robots::parse("User-agent: *\nDisallow: /a%zz\n", "https://ex.com");
+        assert!(!percent.allowed("/a%zz/x"));
+        assert!(
+            percent.allowed("/a%ZZ/x"),
+            "not an escape: compared as written"
+        );
     }
 
     /// A PageFetcher over a fixed url → (status, body) table that
