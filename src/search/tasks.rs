@@ -128,10 +128,7 @@ pub(super) async fn engine_task_with_budget(
     .await
     {
         Err(_) => return (label, Err(("timeout".into(), egress_id, true))),
-        Ok(Err(e)) => {
-            let status = engine_fetch_status(&e);
-            return (label, Err((status.into(), egress_id, true)));
-        }
+        Ok(Err(e)) => return (label, Err((engine_fetch_status(&e), egress_id, true))),
         Ok(Ok(o)) => o,
     };
     let ms = started.elapsed().as_millis() as u64;
@@ -245,28 +242,38 @@ fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (Stri
 const RULE_DENIED_STATUS: &str = "invalid-config: excluded by the operator's local DonSeTch rules";
 
 /// The engine-report status for a failed vertical fetch: a rule refusal
-/// gets [`RULE_DENIED_STATUS`], anything else its error text.
+/// gets [`RULE_DENIED_STATUS`], a proxy configuration error its error text
+/// behind `invalid-config: `, anything else its error text.
 fn vertical_failure_status(e: &FetchError) -> String {
     match e {
         FetchError::Denied { .. } => RULE_DENIED_STATUS.into(),
+        // The lane's proxy URL cannot be used: the operator's
+        // configuration, not the vertical failing (see engine_fetch_status).
+        FetchError::ProxyConfig(_) => format!("invalid-config: {e}"),
         _ => format!("{e}"),
     }
 }
 
-/// The engine-report status for a failed SERP fetch.
-fn engine_fetch_status(e: &FetchError) -> &'static str {
+/// The engine-report status for a failed SERP fetch. A rule refusal and a
+/// proxy configuration error are in the `invalid-config:` family.
+fn engine_fetch_status(e: &FetchError) -> String {
     match e {
-        FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout",
-        FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail",
-        FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy",
+        FetchError::Timeout | FetchError::DnsTimeout(_) => "timeout".into(),
+        FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail".into(),
+        FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy".into(),
         // A local rule refused the engine's host. That is the
         // operator's configuration, not the engine misbehaving, so it
         // takes the "invalid-config:" status family, which
         // search/mod.rs already keeps out of quarantine, trust erosion
         // and vertical retries; "net" would persist a bad score for an
         // engine that outlives the rule.
-        FetchError::Denied { .. } => RULE_DENIED_STATUS,
-        _ => "net",
+        FetchError::Denied { .. } => RULE_DENIED_STATUS.into(),
+        // A proxy URL v5 cannot read fails the request before anything
+        // is sent: the operator's configuration again, never the engine.
+        // Same status family as an environment proxy that does not parse
+        // (above); the text names the proxy with its credentials masked.
+        FetchError::ProxyConfig(_) => format!("invalid-config: {e}"),
+        _ => "net".into(),
     }
 }
 
@@ -285,8 +292,35 @@ mod tests {
         };
         let status = engine_fetch_status(&denied);
         assert!(status.starts_with("invalid-config:"), "{status}");
-        assert!(!super::super::is_engine_fault(status));
-        assert!(!super::super::retry_engine_failure(status));
+        assert!(!super::super::is_engine_fault(&status));
+        assert!(!super::super::retry_engine_failure(&status));
+    }
+
+    /// A proxy URL v5 cannot read fails the fetch with `ProxyConfig`. On an
+    /// engine or a vertical lane that is the operator's configuration: no
+    /// quarantine, trust erosion, lane report or retry, and the status keeps
+    /// the masked proxy and the reason.
+    #[test]
+    fn a_proxy_url_that_cannot_be_read_is_not_an_engine_fault() {
+        let reason = "cannot read proxy URL \"socks5h://***@127.0.0.1:1080\": invalid port number";
+        let error = FetchError::ProxyConfig(reason.into());
+        let check = |lane: &str, status: &str| {
+            assert!(
+                status.starts_with("invalid-config:") && status.contains(reason),
+                "{lane}: {status}"
+            );
+            assert!(!super::super::is_engine_fault(status), "{lane}: {status}");
+            assert!(
+                !super::super::retry_engine_failure(status),
+                "{lane}: {status}"
+            );
+        };
+        check("engine", &engine_fetch_status(&error));
+        check("vertical", &vertical_failure_status(&error));
+        // Negative: a network failure is still the engine's fault.
+        let status = engine_fetch_status(&FetchError::Http("connection reset".into()));
+        assert_eq!(status, "net");
+        assert!(super::super::is_engine_fault(&status));
     }
 
     #[test]

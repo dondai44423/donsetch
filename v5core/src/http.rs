@@ -408,9 +408,160 @@ fn trust_roots() -> Option<wreq::tls::trust::CertStore> {
     ROOTS.clone()
 }
 
+/// The proxy schemes the transport dials.
+const PROXY_SCHEMES: &[&str] = &["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
+
+/// `raw` read as a proxy URL and written back out as the URL a client is
+/// handed for it (scheme in lowercase, user name and password
+/// percent-encoded), so the endpoint dialed is the endpoint read. Readable
+/// means `scheme://[user[:password]@]host[:port][/]` with a proxy scheme
+/// (`http`, `https`, `socks4`, `socks4a`, `socks5`, `socks5h`, in any case).
+/// Anything else is a one-line error that names the proxy with its user name
+/// and password masked.
+pub fn proxy_url(raw: &str) -> Result<String, String> {
+    let refuse = |why: &str| {
+        // A '/', '?' or '#' inside the credentials ends the address early,
+        // and the reason a parser gives for that ("invalid port number")
+        // does not point at the credentials.
+        let hint = if userinfo(raw).is_some_and(|span| raw[span].contains(['/', '?', '#'])) {
+            "; a '/', '?' or '#' in the user name or password must be percent-encoded"
+        } else {
+            ""
+        };
+        format!("cannot read proxy URL {:?}: {why}{hint}", masked(raw))
+    };
+    let url = url::Url::parse(raw).map_err(|error| refuse(&error.to_string()))?;
+    if !PROXY_SCHEMES.contains(&url.scheme()) {
+        // The scheme is not echoed: in "user:pass@host:port" it is the user name.
+        return Err(refuse(&format!(
+            "not a proxy scheme ({})",
+            PROXY_SCHEMES.join(", ")
+        )));
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(refuse("no host"));
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(refuse("a path, query or fragment after host:port"));
+    }
+    Ok(url.into())
+}
+
+/// Where a user name and password sit in `raw`, however the rest of the URL
+/// breaks: from after a leading `scheme://` to the last `@`.
+fn userinfo(raw: &str) -> Option<std::ops::Range<usize>> {
+    let at = raw.rfind('@')?;
+    let start = raw[..at]
+        .find("://")
+        .filter(|&end| {
+            let scheme = &raw[..end];
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        })
+        .map_or(0, |end| end + 3);
+    Some(start..at)
+}
+
+/// `raw` with its user name and password replaced by `***`.
+fn masked(raw: &str) -> String {
+    match userinfo(raw) {
+        Some(span) => format!("{}***{}", &raw[..span.start], &raw[span.end..]),
+        None => raw.to_string(),
+    }
+}
+
+/// The variables a client built without a proxy takes one from, each name
+/// in capitals before the same name in lowercase.
+const ENVIRONMENT_PROXIES: [[&str; 2]; 3] = [
+    ["HTTP_PROXY", "http_proxy"],
+    ["HTTPS_PROXY", "https_proxy"],
+    ["ALL_PROXY", "all_proxy"],
+];
+
+/// Checks the proxies a client built without one takes from the environment:
+/// from `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, each the first of the
+/// name in capitals and in lowercase that is set and holds Unicode, and none
+/// at all while `REQUEST_METHOD` is set. A value without `://` is an
+/// `http://` proxy; an empty or blank one is none. A value the transport
+/// cannot read, or that
+/// [`proxy_url`] cannot, is an error that names its variable and the proxy
+/// with its user name and password masked.
+pub fn environment_proxies() -> Result<(), String> {
+    environment_proxies_in(|name| std::env::var_os(name))
+}
+
+pub(crate) fn environment_proxies_in(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(), String> {
+    // The transport reads these itself (vendor/wreq/src/proxy/matcher.rs:
+    // Builder::from_env, get_first_env, Builder::build), and for a value it
+    // cannot read it keeps no proxy and returns no error, so the request
+    // would leave direct. wreq exposes none of that reading, so its rules are
+    // repeated here: nothing under CGI; per pair, the first name that holds
+    // Unicode, even an empty value.
+    if var("REQUEST_METHOD").is_some() {
+        return Ok(());
+    }
+    for names in ENVIRONMENT_PROXIES {
+        let Some((name, value)) = names
+            .into_iter()
+            .find_map(|name| Some((name, var(name)?.into_string().ok()?)))
+        else {
+            continue;
+        };
+        // A blank value is no proxy to the transport either.
+        if value.trim().is_empty() {
+            continue;
+        }
+        let url = if value.contains("://") {
+            value.clone()
+        } else {
+            format!("http://{value}")
+        };
+        proxy_url(&url).map_err(|error| format!("{name}: {error}"))?;
+        transport_reads(&value)
+            .map_err(|why| format!("{name}: cannot read proxy URL {:?}: {why}", masked(&value)))?;
+    }
+    Ok(())
+}
+
+/// Whether the transport takes `value`, read from the environment, as a
+/// proxy, and why not.
+fn transport_reads(value: &str) -> Result<(), String> {
+    // vendor/wreq/src/proxy/matcher.rs, parse_env_uri: an `http::Uri`; `http`
+    // and `https` in any case (http::Uri reads them so), the SOCKS schemes as
+    // spelled, none as `http`; a SOCKS proxy without a port gets ":1080".
+    let uri = value
+        .parse::<wreq::Uri>()
+        .map_err(|error| format!("the transport cannot parse it ({error})"))?;
+    let socks = match uri.scheme_str() {
+        None | Some("http" | "https") => false,
+        Some("socks4" | "socks4a" | "socks5" | "socks5h") => true,
+        Some(_) => {
+            return Err(
+                "the transport reads socks4, socks4a, socks5 and socks5h only in lowercase".into(),
+            );
+        }
+    };
+    let Some(authority) = uri.authority() else {
+        return Err("no host".into());
+    };
+    if socks
+        && authority.port().is_none()
+        && format!("{authority}:1080").parse::<wreq::Uri>().is_err()
+    {
+        return Err("the transport cannot add the SOCKS port 1080 to it".into());
+    }
+    Ok(())
+}
+
 impl Wire {
     /// A client that presents `identity` coherently, through an egress proxy (`http://`, `https://`,
-    /// `socks5://` URL, credentials in the userinfo), or direct when `None`.
+    /// `socks5://` URL, credentials in the userinfo). With `None` it takes the proxy the
+    /// environment names ([`environment_proxies`]), and is direct when there is none; an
+    /// environment proxy that cannot be read is an error.
     pub fn via(identity: &Identity, proxy: Option<&str>) -> Result<Self, String> {
         Self::build(identity, None, proxy)
     }
@@ -460,8 +611,20 @@ impl Wire {
         if let Some(proxy) = proxy {
             // Through a proxy the name is resolved on the proxy's side: the
             // guard still refuses literal private addresses before any socket.
-            let proxy = wreq::Proxy::all(proxy).map_err(|error| format!("proxy: {error}"))?;
+            // wreq accepts a proxy URL its matcher cannot read, keeps no proxy
+            // for it and dials the target direct, so it is only ever handed
+            // the URL `proxy_url` read. Its own error is stripped of the URL,
+            // which carries the credentials.
+            let url = proxy_url(proxy).map_err(|error| format!("proxy: {error}"))?;
+            let proxy =
+                wreq::Proxy::all(url).map_err(|error| format!("proxy: {}", error.without_uri()))?;
             builder = builder.proxy(proxy);
+        } else {
+            // With no proxy handed over, wreq's builder reads one from the
+            // environment itself (auto_sys_proxy, on unless proxy() or
+            // no_proxy() is called) and would dial direct in place of a value
+            // it cannot read.
+            environment_proxies().map_err(|error| format!("proxy: {error}"))?;
         }
         if let Some(mut emulation) = identity.emulation() {
             if identity.name.starts_with("chrome") {
