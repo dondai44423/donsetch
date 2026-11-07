@@ -1659,14 +1659,23 @@ impl Crawler {
                     // Workers aren't lane-pinned: whoever's
                     // least-blocked for this host takes it.
                     let Some(lane) = governor.best_lane(host).cloned() else {
-                        if governor.wait_for(host, "*", seq) > Duration::ZERO {
-                            // Whole host boxed : if the frontier
-                            // holds only this host, we're done.
-                            if queue
+                        // best_lane found the host boxed. The item was
+                        // not fetched, so it goes back on the queue
+                        // first, where a stop's resume snapshot keeps
+                        // it.
+                        let alone = {
+                            let mut q = queue
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .is_empty()
-                            {
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let alone = q.is_empty();
+                            q.requeue(item.clone());
+                            alone
+                        };
+                        if governor.wait_for(host, "*", seq) > Duration::ZERO {
+                            // Whole host boxed : if nothing else was
+                            // queued, the frontier holds only this
+                            // host and we're done.
+                            if alone {
                                 let mut s = stop_flag
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1675,24 +1684,15 @@ impl Crawler {
                                 }
                                 break 'work;
                             }
-                            // Requeue and yield.
-                            queue
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .requeue(frontier::Frontier {
-                                    url: item.url.clone(),
-                                    score: item.score,
-                                    depth: item.depth,
-                                    retries: item.retries,
-                                    parent: item.parent.clone(),
-                                });
+                            // Yield before popping again.
                             tokio::time::sleep(
                                 Duration::from_millis(400)
                                     .min(deadline_at.saturating_duration_since(Instant::now())),
                             )
                             .await;
-                            continue 'work;
                         }
+                        // Pop again: after the yield, or at once when
+                        // the box lifted after best_lane looked.
                         continue 'work;
                     };
                     seq += 1;

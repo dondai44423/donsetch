@@ -1291,6 +1291,119 @@ async fn crawl_throttle_recovers_and_continues() {
     let _ = MockSite::new().hit_count();
 }
 
+// A 429 boxes the host. When the next pop finds the box still up and
+// nothing else queued, the crawl stops ThrottledOut. The URL that pop
+// took was never fetched: it stays queued under a resume token, and a
+// resume once the host answers again fetches it. The 429'd URL is a
+// permanent skip, and the resume does not request it again.
+// Uses the resume store under the per-process test cache root, so it
+// depends on nextest's process-per-test.
+#[tokio::test]
+async fn a_throttled_out_crawl_resumes_the_url_it_never_fetched() {
+    let root = linking_page("root", &["/a", "/b"]);
+    let site = || {
+        MockSite::new()
+            .page("https://ex.com/", 200, &root)
+            .page("https://ex.com/a", 200, &html("A", "alpha"))
+            .page("https://ex.com/b", 200, &html("B", "beta"))
+    };
+    let (fetch, _) = site()
+        .throttle_n("https://ex.com/a", 1)
+        .throttle_n("https://ex.com/b", 1)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.shape = false;
+    o.max_pages = 10;
+    let r1 = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o.clone(), None)
+        .await
+        .unwrap();
+    let state = format!(
+        "stop={:?} resume={:?} pages={:?} skipped={:?} queued={:?}",
+        r1.stop,
+        r1.resume,
+        r1.pages.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+        r1.skipped,
+        r1.queued
+    );
+    // The first link popped got the 429; the second was popped while
+    // the host was boxed.
+    assert_eq!(r1.stop, StopReason::ThrottledOut, "{state}");
+    assert_eq!(r1.skipped.len(), 1, "{state}");
+    let throttled = r1.skipped[0].0.clone();
+    let untried = if throttled == "https://ex.com/a" {
+        "https://ex.com/b"
+    } else {
+        "https://ex.com/a"
+    };
+    assert_eq!(r1.queued, [untried], "{state}");
+    let token = r1.resume.expect(&state);
+
+    // A fresh crawl stack, as a new process gets: the box one 429 sets
+    // is under a second, and the governor's disk state keeps whole
+    // seconds.
+    let (fetch, hits) = site().fetcher();
+    let r2 = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, Some(&token))
+        .await
+        .unwrap();
+    assert!(
+        r2.pages.iter().any(|p| p.url == untried),
+        "resume stop={:?} pages={:?} skipped={:?}",
+        r2.stop,
+        r2.pages.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+        r2.skipped
+    );
+    assert_eq!(r2.stop, StopReason::FrontierEmpty);
+    assert_eq!(
+        hits_matching(&hits, &throttled),
+        0,
+        "the 429'd URL was requested again: {:?}",
+        hits.lock().unwrap()
+    );
+}
+
+// Negative for the test above: a crawl that meets no 429 reads every
+// link and ends FrontierEmpty with nothing queued and no token, and a
+// 404 is a permanent skip, requested once.
+#[tokio::test]
+async fn an_unthrottled_crawl_with_a_404_ends_without_a_resume_token() {
+    let (fetch, hits) = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &linking_page("root", &["/a", "/b", "/gone"]),
+        )
+        .page("https://ex.com/a", 200, &html("A", "alpha"))
+        .page("https://ex.com/b", 200, &html("B", "beta"))
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.shape = false;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let mut pages: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    pages.sort_unstable();
+    let state = format!(
+        "stop={:?} resume={:?} pages={pages:?} skipped={:?} queued={:?}",
+        r.stop, r.resume, r.skipped, r.queued
+    );
+    assert_eq!(
+        pages,
+        ["https://ex.com/", "https://ex.com/a", "https://ex.com/b"],
+        "{state}"
+    );
+    assert_eq!(r.stop, StopReason::FrontierEmpty, "{state}");
+    assert!(r.queued.is_empty() && r.resume.is_none(), "{state}");
+    assert_eq!(r.skipped.len(), 1, "{state}");
+    assert_eq!(r.skipped[0].0, "https://ex.com/gone", "{state}");
+    assert_eq!(hits_matching(&hits, "/gone"), 1, "{state}");
+}
+
 #[tokio::test]
 async fn crawl_char_budget_caps_total() {
     let big = html("Big", &"word ".repeat(5000));
