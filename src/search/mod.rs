@@ -129,23 +129,72 @@ fn current_year() -> i64 {
     era * 400 + yoe + 1
 }
 
-/// Normalize a query for cache keys: casing, punctuation
-/// and stopwords don't change intent, so they don't get
-/// to spend egress budget twice.
+/// Normalize a query for cache and single-flight keys. Casing,
+/// punctuation and stopwords collapse. These stay distinct: `+` and
+/// `#` as word characters (`c++`, `c#`), a `-` that starts a token (an
+/// exclusion, of a word or of a quoted phrase), a `"…"` phrase with
+/// its stopwords, an uppercase `OR`, and the `site:`, `filetype:` and
+/// `intitle:` operators as [`query::compile`] reads them, appended in
+/// that order after the terms.
 fn norm_query(q: &str) -> String {
     const STOP: &[&str] = &[
         "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "at", "to", "for", "and",
         "or", "what", "which", "how", "do", "does", "i", "you", "it",
     ];
-    // '+' is kept (as the intent tokenizer does): stripping it made
-    // "rust vs c++ performance" and "rust vs c performance" share
-    // one cache key, serving the first query's results to the
-    // second as cached.
-    q.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '+')
-        .filter(|w| !w.is_empty() && !STOP.contains(w))
-        .collect::<Vec<_>>()
-        .join(" ")
+    fn words(s: &str) -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+    let compiled = query::compile(q);
+    let mut key: Vec<String> = Vec::new();
+    // Odd segments are inside double quotes; an unterminated quote
+    // runs to the end of the query.
+    let segments: Vec<&str> = compiled.text.split('"').collect();
+    let mut exclude_phrase = false;
+    for (i, segment) in segments.iter().enumerate() {
+        if i % 2 == 1 {
+            let phrase = words(segment);
+            if !phrase.is_empty() {
+                let sign = if exclude_phrase { "-" } else { "" };
+                key.push(format!("{sign}\"{}\"", phrase.join(" ")));
+            }
+            continue;
+        }
+        // `-"…"`: a lone `-` right before the opening quote.
+        exclude_phrase = i + 1 < segments.len()
+            && segment
+                .strip_suffix('-')
+                .is_some_and(|head| head.is_empty() || head.ends_with(char::is_whitespace));
+        for token in segment.split_whitespace() {
+            if token == "OR" {
+                key.push(token.to_string());
+            } else if let Some(excluded) = token.strip_prefix('-') {
+                let excluded = words(excluded);
+                if !excluded.is_empty() {
+                    key.push(format!("-{}", excluded.join("-")));
+                }
+            } else {
+                key.extend(
+                    words(token)
+                        .into_iter()
+                        .filter(|w| !STOP.contains(&w.as_str())),
+                );
+            }
+        }
+    }
+    if let Some(site) = compiled.site {
+        key.push(format!("site:{site}"));
+    }
+    if let Some(filetype) = compiled.filetype {
+        key.push(format!("filetype:{filetype}"));
+    }
+    if let Some(title) = compiled.intitle {
+        key.push(format!("intitle:\"{}\"", title.to_lowercase()));
+    }
+    key.join(" ")
 }
 
 /// Cache key for BYOK provider results (issue #195). The `byok|`
@@ -1856,6 +1905,102 @@ mod tests {
         assert!(s.byok_cache_get("shared query", Intent::News, 5).is_none());
     }
 
+    const JAGUAR_REVIEW: &str = "https://cars.example/jaguar-f-type-review";
+
+    /// Bench every engine and vertical the queries would fan out to,
+    /// so a search the cache does not answer fails at once with
+    /// "all engines failed" instead of reaching the network.
+    fn bench_every_source(s: &Searcher, queries: &[&str]) {
+        let mut failures = s.failures.lock().unwrap();
+        let engines = intent::engines_for(Intent::Web).iter().copied();
+        for e in engines.map(engine_health_key) {
+            failures.insert(e.to_string(), (3, Instant::now()));
+        }
+        for q in queries {
+            for v in intent::verticals_for(Intent::Web, q) {
+                failures.insert(v.to_string(), (3, Instant::now()));
+            }
+        }
+    }
+
+    /// Store a local-path entry the way `search_inner` keys it.
+    fn seed_local_cache(s: &Searcher, query: &str, url: &str) {
+        let key = format!("{}|{}", norm_query(query), Intent::Web.code());
+        s.cache
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), vec![merged(url)], 12, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_query_is_not_served_the_included_results() {
+        let s = test_searcher();
+        bench_every_source(&s, &["jaguar car", "jaguar -car"]);
+        seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
+        // Negative: a repeat of the cached query is still a hit.
+        let repeat = s
+            .search("jaguar car", 5, Some(Intent::Web))
+            .await
+            .expect("a repeat query is served from the cache");
+        assert!(repeat.cached);
+        assert_eq!(repeat.results[0].url, JAGUAR_REVIEW);
+        let excluded = s.search("jaguar -car", 5, Some(Intent::Web)).await;
+        assert!(
+            matches!(&excluded, Err(e) if e.to_string().contains("all engines failed")),
+            "\"jaguar -car\" must miss the \"jaguar car\" entry, got {:?}",
+            excluded.map(|out| (out.cached, out.results))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_query_does_not_join_the_included_flight() {
+        let s = test_searcher();
+        bench_every_source(&s, &["jaguar car", "jaguar -car"]);
+        // A "jaguar car" leader is in flight. A follower polls for its
+        // cache write for up to 12 s before running on its own.
+        let leader = format!("{}|{}", norm_query("jaguar car"), Intent::Web.code());
+        s.inflight.lock().unwrap().insert(leader);
+        // Negative: an identical query joins the flight and is served
+        // what the leader publishes.
+        let (joined, ()) = tokio::join!(s.search("jaguar car", 5, Some(Intent::Web)), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
+        });
+        let joined = joined.expect("a follower is served the leader's results");
+        assert!(joined.cached);
+        assert_eq!(joined.results[0].url, JAGUAR_REVIEW);
+        // Drop the published entry: only the flight can hold the next
+        // query back now.
+        s.cache.lock().unwrap().clear();
+        let excluded = tokio::time::timeout(
+            Duration::from_secs(3),
+            s.search("jaguar -car", 5, Some(Intent::Web)),
+        )
+        .await;
+        assert!(
+            matches!(&excluded, Ok(Err(_))),
+            "\"jaguar -car\" waited on the \"jaguar car\" flight: {excluded:?}"
+        );
+    }
+
+    #[test]
+    fn a_byok_exclusion_query_misses_the_included_entry() {
+        let s = test_searcher();
+        s.byok_cache_put("jaguar car", &byok_outcome("serper", &[JAGUAR_REVIEW]));
+        // Negative: a repeat of the cached query is still a hit.
+        let repeat = s
+            .byok_cache_get("jaguar car", Intent::Web, 5)
+            .expect("a repeat query is served from the cache");
+        assert!(repeat.cached);
+        assert_eq!(repeat.results[0].url, JAGUAR_REVIEW);
+        let excluded = s.byok_cache_get("jaguar -car", Intent::Web, 5);
+        assert!(
+            excluded.is_none(),
+            "\"jaguar -car\" was served the provider's \"jaguar car\" answer: {:?}",
+            excluded.map(|out| out.results)
+        );
+    }
+
     #[test]
     fn regression_unavailable_google_does_not_stop_other_assignments() {
         let proxy = crate::egress::proxy::Proxy::parse("http://127.0.0.1:12345").unwrap();
@@ -2248,6 +2393,33 @@ mod tests {
             norm_query("rust async runtime comparison")
         );
         assert_ne!(norm_query("kafka vs nats"), norm_query("kafka"));
+        // A plain query's key is its lowercased words minus stopwords.
+        assert_eq!(
+            norm_query("Rust Async: the Runtime, comparison!"),
+            "rust async runtime comparison"
+        );
+        // Punctuation that is not an operator still collapses.
+        for (a, b) in [
+            ("x-ray machine", "x ray machine"),
+            ("jaguar - car", "jaguar car"),
+            ("rust or go", "rust go"),
+            ("rust site:github.com", "rust site:GitHub.com/"),
+        ] {
+            assert_eq!(norm_query(a), norm_query(b), "{a:?} vs {b:?}");
+        }
+        // An operator keeps each pair apart.
+        for (a, b) in [
+            ("jaguar car", "jaguar -car"),
+            ("rust async", "\"rust async\""),
+            ("c tutorial", "c# tutorial"),
+            ("rust go", "rust OR go"),
+            ("jaguar \"the car\"", "jaguar -\"the car\""),
+            ("rust site github com", "rust site:github.com"),
+            ("rust filetype pdf", "rust filetype:pdf"),
+            ("intitle rust", "intitle:rust"),
+        ] {
+            assert_ne!(norm_query(a), norm_query(b), "{a:?} vs {b:?}");
+        }
     }
 
     #[test]
