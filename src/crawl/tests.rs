@@ -3025,3 +3025,339 @@ async fn reliability_map_limit_can_expand_without_false_completeness() {
     assert!(r.inventory.complete);
     assert_eq!(r.stop, StopReason::FrontierEmpty);
 }
+
+// ── Locale dedup key ───────────────────────────────────────────
+// The translated-variant dedup merges URLs that differ only in a locale
+// prefix, and same-site twins (a `www.` host, plain http on an https
+// seed's host). The query, the host, the port and the path's case keep
+// pages apart.
+
+fn site_with(pages: &[(&str, String)]) -> MockSite {
+    let mut site = MockSite::new();
+    for (url, body) in pages {
+        site = site.page(url, 200, body);
+    }
+    site
+}
+
+// Query-addressed pages on one path are distinct pages: forum topics,
+// `?page=N` pagination, `index.php?title=` wikis. A path-only key
+// filtered every one after the first as a "translated variant".
+#[tokio::test]
+async fn query_variants_of_one_path_are_all_crawled() {
+    let seed = linking_page("forum", &["/topic?id=1", "/topic?id=2", "/topic?id=3"]);
+    let mut pages = vec![("https://ex.com/", seed)];
+    let bodies: Vec<(String, String)> = (1..=3)
+        .map(|i| {
+            (
+                format!("https://ex.com/topic?id={i}"),
+                html(&format!("Topic {i}"), &format!("distinct topic number {i}")),
+            )
+        })
+        .collect();
+    for (u, b) in &bodies {
+        pages.push((u.as_str(), b.clone()));
+    }
+    let (fetch, hits) = site_with(&pages).fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(
+        hits_matching(&hits, "/topic?id="),
+        3,
+        "every topic must be fetched; pages={got:?} stop={:?} filtered_out={} skipped={:?} queued={:?}",
+        r.stop,
+        r.filtered_out,
+        r.skipped,
+        r.queued
+    );
+}
+
+// `<link rel="next">` pagination by query string is followed. Page 2
+// has the seed's own path, which a path-only key dropped at harvest.
+#[tokio::test]
+async fn query_pagination_is_followed() {
+    let p1 = "<html><head><title>list p1</title><link rel=\"next\" href=\"/news/list?page=2\"/></head><body><article><p>first page of the list with enough words for the extractor threshold pass</p></article></body></html>";
+    let p2 = "<html><head><title>list p2</title><link rel=\"next\" href=\"/news/list?page=3\"/></head><body><article><p>second page of the list with different words for the extractor threshold</p></article></body></html>";
+    let p3 = "<html><head><title>list p3</title></head><body><article><p>third page of the list with yet other words for the extractor threshold pass</p></article></body></html>";
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/news/list", 200, p1)
+        .page("https://ex.com/news/list?page=2", 200, p2)
+        .page("https://ex.com/news/list?page=3", 200, p3)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/news/list", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "page=2") == 1 && hits_matching(&hits, "page=3") == 1,
+        "rel=next pages must be fetched; pages={got:?} stop={:?} filtered_out={}",
+        r.stop,
+        r.filtered_out
+    );
+}
+
+// Map mode keeps every query-addressed sitemap entry. A path-only key
+// collapsed them to the first.
+#[tokio::test]
+async fn map_keeps_query_addressed_sitemap_entries() {
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/product?id=1</loc></url>\
+        <url><loc>https://ex.com/product?id=2</loc></url>\
+        <url><loc>https://ex.com/product?id=3</loc></url>\
+        </urlset>";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.map.len(),
+        3,
+        "three distinct sitemap URLs, map={:?} inventory.complete={}",
+        r.map,
+        r.inventory.complete
+    );
+}
+
+// With same_host=false, each linked host's "/" is its own page. A
+// path-only key treated every other host's "/" as a "translated variant"
+// of the seed's.
+#[tokio::test]
+async fn any_host_crawl_fetches_each_hosts_root() {
+    let seed = linking_page("hub", &["https://other.example/", "https://third.example/"]);
+    let (fetch, hits) = MockSite::new()
+        .page("https://ex.com/", 200, &seed)
+        .page(
+            "https://other.example/",
+            200,
+            &html("Other", "other site home"),
+        )
+        .page(
+            "https://third.example/",
+            200,
+            &html("Third", "third site home"),
+        )
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.same_host = false;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "https://other.example/") >= 1
+            && hits_matching(&hits, "https://third.example/") >= 1,
+        "linked hosts' home pages must be fetched; pages={got:?} filtered_out={} hits={:?}",
+        r.filtered_out,
+        hits.lock().unwrap()
+    );
+}
+
+// Full mode seeds the frontier from the sitemap through the same key,
+// so query-addressed sitemap entries are all fetched.
+#[tokio::test]
+async fn full_mode_seeds_every_query_addressed_sitemap_entry() {
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/product?id=1</loc></url>\
+        <url><loc>https://ex.com/product?id=2</loc></url>\
+        <url><loc>https://ex.com/product?id=3</loc></url>\
+        </urlset>";
+    let mut site = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &html("Shop", "shop home without links"),
+        )
+        .page("https://ex.com/sitemap.xml", 200, sitemap);
+    for i in 1..=3 {
+        site = site.page(
+            &format!("https://ex.com/product?id={i}"),
+            200,
+            &html(&format!("Product {i}"), &format!("product number {i}")),
+        );
+    }
+    let (fetch, hits) = site.fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Full;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(
+        hits_matching(&hits, "/product?id="),
+        3,
+        "pages={got:?} stop={:?} hits={:?}",
+        r.stop,
+        hits.lock().unwrap()
+    );
+}
+
+// Map mode without a sitemap falls back to the seed page's links, through
+// the same key, so query-addressed links are all mapped.
+#[tokio::test]
+async fn map_seed_links_keep_query_addressed_pages() {
+    let (fetch, _) = MockSite::new()
+        .page(
+            "https://ex.com/",
+            200,
+            &linking_page("hub", &["/p?id=1", "/p?id=2", "/p?id=3"]),
+        )
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.map.iter().filter(|u| u.contains("/p?id=")).count(),
+        3,
+        "map={:?}",
+        r.map
+    );
+}
+
+// Both sides of the locale key in one test. URLs that differ only in a
+// locale prefix are still one page, fetched once and mapped once: the
+// negative case, which fails if the key stops cutting the prefix. The
+// query keeps translated pages with different ids apart: /de/item?id=2
+// fails on a path-only key.
+#[tokio::test]
+async fn translated_variants_still_collapse_to_one_page() {
+    let variants = [
+        "/en/guide",
+        "/de/guide",
+        "/fr/guide",
+        "/en/item?id=1",
+        "/de/item?id=1",
+        "/de/item?id=2",
+    ];
+    let hub = linking_page("hub", &variants);
+    let mut site = MockSite::new().page("https://ex.com/", 200, &hub);
+    for (i, path) in variants.iter().enumerate() {
+        site = site.page(
+            &format!("https://ex.com{path}"),
+            200,
+            &html(
+                &format!("Variant {i}"),
+                &format!("distinct body number {i}"),
+            ),
+        );
+    }
+    let (fetch, hits) = site.fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "/guide") == 1
+            && hits_matching(&hits, "/item?id=1") == 1
+            && hits_matching(&hits, "/item?id=2") == 1,
+        "one fetch per translated page; pages={got:?} hits={:?}",
+        hits.lock().unwrap()
+    );
+    assert_eq!(r.filtered_out, 3, "pages={got:?}");
+
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/en/guide</loc></url>\
+        <url><loc>https://ex.com/de/guide</loc></url>\
+        <url><loc>https://ex.com/en/item?id=1</loc></url>\
+        <url><loc>https://ex.com/de/item?id=1</loc></url>\
+        <url><loc>https://ex.com/en/item?id=2</loc></url>\
+        </urlset>";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.map.len(), 3, "map={:?}", r.map);
+    assert!(
+        r.map.iter().any(|u| u.ends_with("/item?id=2")),
+        "map={:?}",
+        r.map
+    );
+}
+
+// Negative case for the URL key: same-site twins of one page, a
+// `www.` host and plain http on the seed's host under an https seed, are
+// still one page, fetched once and mapped once, as under a path-only
+// key. Path case is not a twin (see `frontier::locale_canonical`).
+#[tokio::test]
+async fn same_site_twins_are_fetched_once() {
+    let twins = [
+        "/a",
+        "https://www.ex.com/a",
+        "http://ex.com/a",
+        "http://www.ex.com/a",
+    ];
+    let mut links = twins.to_vec();
+    links.push("/b");
+    let same = html("Page A", "the one page a");
+    let mut site = MockSite::new()
+        .page("https://ex.com/", 200, &linking_page("hub", &links))
+        .page("https://ex.com/b", 200, &html("Page B", "page b"));
+    for twin in ["https://ex.com/a", twins[1], twins[2], twins[3]] {
+        site = site.page(twin, 200, &same);
+    }
+    let (fetch, hits) = site.fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Content;
+    o.max_pages = 10;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    let got: Vec<&str> = r.pages.iter().map(|p| p.url.as_str()).collect();
+    assert!(
+        hits_matching(&hits, "ex.com/a") == 1 && hits_matching(&hits, "ex.com/b") == 1,
+        "one fetch per page; pages={got:?} skipped={:?} hits={:?}",
+        r.skipped,
+        hits.lock().unwrap()
+    );
+    assert_eq!(got.len(), 3, "seed, one twin of /a, /b: pages={got:?}");
+    assert!(!r.pages.iter().any(|p| p.duplicate), "pages={got:?}");
+
+    let sitemap = "<urlset>\
+        <url><loc>https://ex.com/a</loc></url>\
+        <url><loc>https://www.ex.com/a</loc></url>\
+        <url><loc>http://ex.com/a</loc></url>\
+        <url><loc>https://ex.com/b</loc></url>\
+        </urlset>";
+    let (fetch, _) = MockSite::new()
+        .page("https://ex.com/sitemap.xml", 200, sitemap)
+        .fetcher();
+    let mut o = opts();
+    o.mode = CrawlMode::Map;
+    let r = Crawler::new(fetch, gov())
+        .crawl("https://ex.com/", o, None)
+        .await
+        .unwrap();
+    assert_eq!(r.map, ["https://ex.com/a", "https://ex.com/b"]);
+}

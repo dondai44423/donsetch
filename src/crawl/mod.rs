@@ -1026,8 +1026,8 @@ impl Crawler {
                     // denied section (the queue loop below records it),
                     // not as merely "not fetched". Map mode fetches none
                     // of its URLs, so it lists them all unmarked. Before
-                    // the locale dedup, which keys on the path alone: a
-                    // denied entry must not take an allowed twin's slot.
+                    // the locale dedup: a denied entry must not take an
+                    // allowed twin's slot.
                     if opts.mode == CrawlMode::Full && rule_denial(rules, &u).is_some() {
                         continue;
                     }
@@ -1040,7 +1040,7 @@ impl Crawler {
                         continue;
                     }
                     // Dedup translated variants in the map.
-                    let lcanon = frontier::locale_canonical(u.path());
+                    let lcanon = frontier::locale_canonical(&u, &seed_url);
                     if !map_locales.insert(lcanon) {
                         continue;
                     }
@@ -1130,7 +1130,7 @@ impl Crawler {
             let mut seen_locales: std::collections::HashSet<String> = map
                 .iter()
                 .filter_map(|url| Url::parse(url).ok())
-                .map(|u| frontier::locale_canonical(u.path()))
+                .map(|u| frontier::locale_canonical(&u, &seed_url))
                 .collect();
             for u in &candidates {
                 if !host_ok(u) {
@@ -1151,7 +1151,7 @@ impl Crawler {
                 // an https seed names the canonical fetchable URL;
                 // mixed twins collapse in the seen-set below.
                 let u = frontier::canonical_scheme(u, &seed_url);
-                let lcanon = frontier::locale_canonical(u.path());
+                let lcanon = frontier::locale_canonical(&u, &seed_url);
                 if !seen_locales.insert(lcanon) {
                     continue;
                 }
@@ -1250,7 +1250,7 @@ impl Crawler {
         if resume_token.is_none() {
             let _ = gate.push(&mut queue, seed_url.clone(), 10.0, 0, None);
             // Sitemap entries seed frontier at depth 1.
-            // Dedup by locale-canonical path: don't queue
+            // Dedup by locale-canonical key: don't queue
             // multiple language variants of the same page
             // (de/, es/, fr/ copies waste crawl budget).
             let mut seeded_locales: std::collections::HashSet<String> =
@@ -1294,7 +1294,7 @@ impl Crawler {
                 {
                     continue;
                 }
-                let lcanon = frontier::locale_canonical(u.path());
+                let lcanon = frontier::locale_canonical(&u, &seed_url);
                 if !seeded_locales.insert(lcanon) {
                     continue; // Another variant already queued
                 }
@@ -1337,7 +1337,7 @@ impl Crawler {
         let skipped: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let filtered_out = Arc::new(AtomicUsize::new(0));
         let dup_sigs: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-        // Locale-canonical paths of fetched pages : prevents
+        // Locale-canonical keys of fetched pages : prevents
         // crawling translated variants (de/, es/, fr/ copies).
         let locale_seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let chars_total = Arc::new(AtomicUsize::new(total_chars));
@@ -1379,6 +1379,7 @@ impl Crawler {
             let governor = Arc::clone(&self.governor);
             let opts_worker = opts.clone();
             let seed_host2 = seed_host.clone();
+            let seed_url_w = seed_url.clone();
             let seed_norm_w = seed_norm.clone();
             let requested_norm_w = requested_norm.clone();
             let other_dequeued = Arc::clone(&other_dequeued);
@@ -1577,12 +1578,12 @@ impl Crawler {
                     }
                     // Locale dedup: skip translated variants of
                     // already-fetched pages. The first variant
-                    // fetched claims the canonical path; all other
+                    // fetched claims the canonical key; all other
                     // language versions (de/, es/, fr/, zh-CN/...)
                     // are blocked. The seed is exempt : it's the
                     // entry point and always fetched.
                     if !is_seed {
-                        let lcanon = frontier::locale_canonical(parsed.path());
+                        let lcanon = frontier::locale_canonical(&parsed, &seed_url_w);
                         if locale_seen
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1904,11 +1905,11 @@ impl Crawler {
 
                     let mut md = r.markdown;
 
-                    // Claim the locale-canonical path: translated
+                    // Claim the locale-canonical key: translated
                     // variants of this page (de/, es/, fr/, ...) are
                     // now blocked from the crawl budget.
                     {
-                        let lcanon = frontier::locale_canonical(parsed.path());
+                        let lcanon = frontier::locale_canonical(&parsed, &seed_url_w);
                         locale_seen
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2052,7 +2053,7 @@ impl Crawler {
                                 locale_seen
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .remove(&frontier::locale_canonical(parsed.path()));
+                                    .remove(&frontier::locale_canonical(&parsed, &seed_url_w));
                                 if !duplicate {
                                     dup_sigs
                                         .lock()
@@ -2219,7 +2220,7 @@ impl Crawler {
                                         );
                                         continue;
                                     }
-                                    let lcanon = frontier::locale_canonical(nu.path());
+                                    let lcanon = frontier::locale_canonical(&nu, &seed_url_w);
                                     if ls.contains(&lcanon) {
                                         continue;
                                     }
@@ -2305,7 +2306,7 @@ impl Crawler {
                                         {
                                             continue;
                                         }
-                                        let lcanon = frontier::locale_canonical(u.path());
+                                        let lcanon = frontier::locale_canonical(&u, &seed_url_w);
                                         if ls.contains(&lcanon) {
                                             continue;
                                         }
@@ -2382,7 +2383,7 @@ impl Crawler {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
                                     }
-                                    let lcanon = frontier::locale_canonical(cu.path());
+                                    let lcanon = frontier::locale_canonical(&cu, &seed_url_w);
                                     if ls.contains(&lcanon) {
                                         filtered_out.fetch_add(1, Ordering::Relaxed);
                                         return None;
