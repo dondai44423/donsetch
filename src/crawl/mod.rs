@@ -376,6 +376,10 @@ pub enum StopReason {
     FrontierEmpty,
     MaxPages,
     CharBudget,
+    /// Frontier exhausted, but links in scope were left unfollowed
+    /// because of `max_depth` (`CrawlResult::depth_cut` lists them).
+    /// Issues no resume token: the cut links were never queued, so a
+    /// crawl with a larger `max_depth` is what reaches them.
     DepthLimit,
     Deadline,
     /// Client cancelled (MCP notifications/cancelled) : workers
@@ -405,8 +409,13 @@ pub struct CrawlResult {
     pub inventory: InventoryStatus,
     pub seed: String,
     pub pages: Vec<CrawlPage>,
-    /// URLs discovered but not fetched (budget/depth/scope).
+    /// URLs discovered but not fetched (budget/scope).
     pub queued: Vec<String>,
+    /// In-scope URLs the crawl did not follow because of `max_depth`,
+    /// sorted, in frontier-key form: links on pages at the limit that
+    /// no shallower page led to, and queued entries deeper than the
+    /// limit. Carried across resumes.
+    pub depth_cut: Vec<String>,
     /// URLs skipped by robots/scope rules.
     pub filtered_out: usize,
     /// URLs fetched but skipped (wall/dup/error), with reason.
@@ -535,6 +544,53 @@ struct ResumeState {
     /// Denials the earlier runs recorded; absent in older tokens.
     #[serde(default)]
     denied: DeniedLog,
+    /// The earlier runs' depth cut (`CrawlResult::depth_cut`); absent
+    /// in older tokens.
+    #[serde(default)]
+    depth_cut: Vec<String>,
+}
+
+/// The links a crawl leaves unfollowed because of `max_depth`, by
+/// frontier key (`frontier::normalize`), while the crawl runs.
+#[derive(Default)]
+struct DepthCutLog {
+    /// Queued entries deeper than the limit, dropped when popped:
+    /// never fetched, and already in the frontier's seen set.
+    dropped: HashSet<String>,
+    /// Links on pages at the limit that the frontier had not seen
+    /// when they were noted.
+    links: HashSet<String>,
+}
+
+impl DepthCutLog {
+    /// Take back a resume token's depth cut: a key the restored seen
+    /// set holds was a dropped entry, any other was a link.
+    fn restore(&mut self, keys: Vec<String>, seen: impl Fn(&str) -> bool) {
+        for key in keys {
+            if seen(&key) {
+                self.dropped.insert(key);
+            } else {
+                self.links.insert(key);
+            }
+        }
+    }
+
+    /// The cut, sorted: every dropped entry, and each link `seen` does
+    /// not hold.
+    fn settle(&self, seen: impl Fn(&str) -> bool) -> Vec<String> {
+        // A link noted at the limit can still be reached later through
+        // a shallower page; the frontier's seen set then holds it and
+        // it was not cut.
+        let mut keys: Vec<String> = self
+            .dropped
+            .iter()
+            .chain(self.links.iter().filter(|key| !seen(key)))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
 }
 
 /// Disk-backed resume store: tokens survive process restarts, so
@@ -1203,6 +1259,7 @@ impl Crawler {
                 seed: seed.to_string(),
                 pages: Vec::new(),
                 queued: Vec::new(),
+                depth_cut: Vec::new(),
                 filtered_out: 0,
                 skipped,
                 stop,
@@ -1238,8 +1295,10 @@ impl Crawler {
         let fetched_pages = 0usize;
         let total_chars = 0usize;
         let seed_norm = frontier::normalize(&seed_url);
+        let mut depth_cut_log = DepthCutLog::default();
         if let Some(state) = resumed_state {
             queue.restore_seen(state.seen);
+            depth_cut_log.restore(state.depth_cut, |key| queue.is_seen(key));
             for (u, s, d, r, p) in state.queue {
                 queue.push_to_heap(u, s, d, r, p);
             }
@@ -1315,6 +1374,7 @@ impl Crawler {
                 seed: seed.to_string(),
                 pages: Vec::new(),
                 queued: Vec::new(),
+                depth_cut: Vec::new(),
                 filtered_out: 0,
                 skipped: vec![(seed.to_string(), "empty frontier (all filtered)".into())],
                 stop: StopReason::FrontierEmpty,
@@ -1348,6 +1408,7 @@ impl Crawler {
         // against the quality budget.
         let total_fetched = Arc::new(AtomicUsize::new(0));
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let depth_cut = Arc::new(Mutex::new(depth_cut_log));
         let stop_flag: Arc<Mutex<Option<StopReason>>> = Arc::new(Mutex::new(None));
         let focus = Arc::new(opts.focus.clone());
         // Failed-seed evidence, judged once the queue is empty: whether
@@ -1372,6 +1433,7 @@ impl Crawler {
             let total_fetched = Arc::clone(&total_fetched);
             let in_flight = Arc::clone(&in_flight);
             let stop_flag = Arc::clone(&stop_flag);
+            let depth_cut = Arc::clone(&depth_cut);
             let focus = Arc::clone(&focus);
             let focus_idf = focus_idf.clone();
             let fetch = fetch.clone();
@@ -1526,16 +1588,15 @@ impl Crawler {
                         // Skip the item and keep going: the old shape
                         // aborted the whole crawl on the first
                         // too-deep pop, discarding the shallower
-                        // frontier behind it (and DepthLimit never
-                        // persisted a resume token, so the work was
-                        // simply lost). Honest skip instead.
-                        skipped
+                        // frontier behind it. The URL joins the depth
+                        // cut (one count for the whole crawl, not a
+                        // skip row each), which a drained frontier
+                        // reports as DepthLimit.
+                        depth_cut
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((
-                                item.url.clone(),
-                                format!("depth {} > max {max_depth}", item.depth),
-                            ));
+                            .dropped
+                            .insert(item.url.clone());
                         continue 'work;
                     }
                     let host = parsed.host_str().unwrap_or("");
@@ -2135,7 +2196,9 @@ impl Crawler {
                     }
 
                     // ── Harvest outlinks into the frontier ──
-                    if item.depth < max_depth {
+                    // Every page here is within max_depth: deeper pops
+                    // were dropped above.
+                    {
                         let html = String::from_utf8_lossy(&page.body);
                         // <base href> handling: resolve relative
                         // links against the base URL when present.
@@ -2162,6 +2225,70 @@ impl Crawler {
                                     .unwrap_or(false)
                             })
                         });
+
+                        // A page at max_depth is not harvested. The
+                        // links the harvest below would have queued
+                        // (`<a href>` and pagination, past the same
+                        // host, scope, robots, locale, focus and rule
+                        // filters, and new to the frontier) are noted
+                        // as the depth cut instead, so a drained
+                        // frontier reports DepthLimit. Feed entries are
+                        // not noted: the feed is not fetched here.
+                        if item.depth >= max_depth {
+                            let next_hrefs = extract_link_rel(&html, "next");
+                            let candidates = links
+                                .iter()
+                                .map(|(child, anchor)| (child.as_str(), anchor.as_str()))
+                                .chain(next_hrefs.iter().map(|nh| (nh.as_str(), "")));
+                            let ls = locale_seen
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let q = queue
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut cut = depth_cut
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            for (child, anchor) in candidates {
+                                let Some(cu) = frontier::resolve(&base, child) else {
+                                    continue;
+                                };
+                                if opts_worker.same_host
+                                    && !cu.host_str().is_some_and(|h| host_matches(h, &seed_host2))
+                                {
+                                    continue;
+                                }
+                                if !scope_allowed(
+                                    cu.path(),
+                                    &opts_worker.include_paths,
+                                    &opts_worker.exclude_paths,
+                                ) {
+                                    continue;
+                                }
+                                if opts_worker.respect_robots && !robots_cache.peek_allows(&cu) {
+                                    continue;
+                                }
+                                if ls.contains(&frontier::locale_canonical(cu.path())) {
+                                    continue;
+                                }
+                                // The harvest's focus gate: soft only on
+                                // the seed when none of its links match.
+                                if let Some(fq) = focus.as_ref()
+                                    && !score::focus_match(anchor, cu.path(), fq)
+                                    && (any_focus_match || item.depth > 0)
+                                {
+                                    continue;
+                                }
+                                if rule_denial(gate.rules, &cu).is_some() {
+                                    continue;
+                                }
+                                let key = frontier::normalize(&cu);
+                                if !q.is_seen(&key) {
+                                    cut.links.insert(key);
+                                }
+                            }
+                            continue 'work;
+                        }
 
                         // Pagination: <link rel="next"> continues a
                         // linear chain : push at the SAME depth so
@@ -2466,6 +2593,15 @@ impl Crawler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .dropped();
+        let depth_cut_v = {
+            let q = sh_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            depth_cut
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .settle(|key| q.is_seen(key))
+        };
 
         let skipped_v = std::mem::take(
             &mut *skipped
@@ -2529,6 +2665,7 @@ impl Crawler {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .clone(),
+                        depth_cut: depth_cut_v.clone(),
                     };
                     resume_store_issue(&id, &state);
                     Some(id)
@@ -2556,6 +2693,16 @@ impl Crawler {
         } else {
             None
         };
+        // A drained frontier did not read the whole reachable scope when
+        // max_depth cut links off. A failed seed keeps its own report.
+        let stop = if stop == StopReason::FrontierEmpty
+            && seed_failure.is_none()
+            && !depth_cut_v.is_empty()
+        {
+            StopReason::DepthLimit
+        } else {
+            stop
+        };
 
         Ok(CrawlResult {
             inventory,
@@ -2566,6 +2713,7 @@ impl Crawler {
                 .into_iter()
                 .map(|(u, _, _, _, _)| u)
                 .collect(),
+            depth_cut: depth_cut_v,
             filtered_out: filtered,
             skipped: skipped_v,
             stop,
@@ -2944,11 +3092,45 @@ mod resume_store_mode_tests {
             )],
             seen: vec!["https://intranet.example/secret-plan".into()],
             denied: Default::default(),
+            depth_cut: Vec::new(),
         };
         assert!(write_token_file(&dir, "c0001", &state));
         let p = dir.join("c0001.json");
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "resume token is {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod depth_cut_log_tests {
+    use super::DepthCutLog;
+    use std::collections::HashSet;
+
+    // A link noted at the limit that the crawl reached later through a
+    // shallower page is no cut; an entry dropped at pop always is. A
+    // resume token's cut splits back by the restored seen set.
+    #[test]
+    fn the_depth_cut_settles_against_the_final_seen_set() {
+        let mut log = DepthCutLog::default();
+        log.links.insert("https://ex.com/reached-later".into());
+        log.links.insert("https://ex.com/cut".into());
+        log.dropped.insert("https://ex.com/deep".into());
+        let seen =
+            |key: &str| key == "https://ex.com/reached-later" || key == "https://ex.com/deep";
+        let cut = log.settle(seen);
+        assert_eq!(cut, ["https://ex.com/cut", "https://ex.com/deep"]);
+
+        let mut back = DepthCutLog::default();
+        back.restore(cut, seen);
+        assert_eq!(
+            back.dropped,
+            HashSet::from(["https://ex.com/deep".to_string()])
+        );
+        assert_eq!(
+            back.links,
+            HashSet::from(["https://ex.com/cut".to_string()])
+        );
+        assert!(DepthCutLog::default().settle(|_| false).is_empty());
     }
 }

@@ -458,6 +458,13 @@ fn queued_preview(queued: &[String]) -> Value {
     json!(queued.iter().take(QUEUED_PREVIEW).collect::<Vec<_>>())
 }
 
+/// Depth-cut URLs shown in the debug block, beside their count.
+const DEPTH_CUT_SAMPLE: usize = 10;
+
+fn depth_cut_sample(cut: &[String]) -> Value {
+    json!(cut.iter().take(DEPTH_CUT_SAMPLE).collect::<Vec<_>>())
+}
+
 pub(super) fn render_crawl_result(
     result: &crate::crawl::CrawlResult,
     requested_mode: CrawlMode,
@@ -582,6 +589,8 @@ pub(super) fn render_crawl_result(
         "map": result.map,
         "queued": queued_preview(&result.queued),
         "queued_total": result.queued.len(),
+        "depth_cut": result.depth_cut.len(),
+        "depth_cut_sample": depth_cut_sample(&result.depth_cut),
         "filtered_out": result.filtered_out,
         "skipped": result.skipped.iter().map(|(u, w)| json!({"url": u, "reason": w})).collect::<Vec<_>>(),
         "pages": result.pages.iter().map(|p| json!({
@@ -703,6 +712,8 @@ pub(super) fn render_crawl_dataset(
         "rows": rows.len(),
         "queued": queued_preview(&result.queued),
         "queued_total": result.queued.len(),
+        "depth_cut": result.depth_cut.len(),
+        "depth_cut_sample": depth_cut_sample(&result.depth_cut),
         "filtered_out": result.filtered_out,
         "skipped": result
             .skipped
@@ -984,6 +995,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: None,
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         };
         let rendered = render_crawl_result(&result, CrawlMode::Map, false);
@@ -1035,6 +1047,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: Some("opaque-resume".into()),
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         };
         let output = render_crawl_result(&result, CrawlMode::Full, false);
@@ -1079,6 +1092,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: Some("tok".into()),
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         };
         for dataset in [false, true] {
@@ -1091,6 +1105,47 @@ mod crawl_output_contract_tests {
             );
             assert_eq!(debug["queued_total"], json!(5_000), "dataset={dataset}");
             assert_eq!(debug["queued"][0], "https://example.com/p/0");
+        }
+    }
+
+    // A depth-cut crawl renders as incomplete with the depth-limit next
+    // action and no resume token, and its debug block carries the count
+    // and a bounded sample. Negative: a drained crawl with no cut stays
+    // complete and reports a zero count.
+    #[test]
+    fn a_depth_limit_stop_is_incomplete_and_counts_its_cut() {
+        let mut result = dataset_fixture();
+        result.skipped.clear();
+        for dataset in [false, true] {
+            let out = render_crawl_result(&result, CrawlMode::Content, dataset);
+            assert_eq!(
+                out["structuredContent"]["complete"], true,
+                "dataset={dataset}"
+            );
+            let debug = &out["_meta"]["com.donsetch/crawl-debug"];
+            assert_eq!(debug["depth_cut"], 0, "dataset={dataset}");
+            assert_eq!(debug["depth_cut_sample"], json!([]), "dataset={dataset}");
+        }
+        result.stop = StopReason::DepthLimit;
+        result.depth_cut = (0..25)
+            .map(|i| format!("https://example.com/docs/deep/{i:02}"))
+            .collect();
+        for dataset in [false, true] {
+            let out = render_crawl_result(&result, CrawlMode::Content, dataset);
+            let state = &out["structuredContent"];
+            assert_eq!(state["complete"], false, "dataset={dataset}");
+            assert_eq!(state["stop"], "DepthLimit", "dataset={dataset}");
+            assert!(state.get("resume").is_none(), "dataset={dataset}");
+            assert_eq!(
+                state["next_action"],
+                "crawl hit the depth limit. Increase max_depth to discover more pages.",
+                "dataset={dataset}"
+            );
+            let debug = &out["_meta"]["com.donsetch/crawl-debug"];
+            assert_eq!(debug["depth_cut"], 25, "dataset={dataset}");
+            let sample = debug["depth_cut_sample"].as_array().unwrap();
+            assert_eq!(sample.len(), super::DEPTH_CUT_SAMPLE, "dataset={dataset}");
+            assert_eq!(sample[0], "https://example.com/docs/deep/00");
         }
     }
 
@@ -1145,6 +1200,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: None,
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         }
     }
@@ -1239,6 +1295,7 @@ mod crawl_output_contract_tests {
             crawl_delay: None,
             resume: None,
             denied: Default::default(),
+            depth_cut: vec![],
             seed_failure: None,
         }
     }
