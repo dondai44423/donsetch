@@ -7,11 +7,10 @@
 
 use crate::DISPLAY_NAME;
 use crate::cli;
+use crate::cli::update::{self, Offer};
 use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
 use std::time::Duration;
-
-const REPO: &str = "dondai44423/donsetch";
 
 pub async fn run(args: &[String]) {
     crate::cli::args::Spec::new("version", "donsetch version", &[]).reject(&args[2..]);
@@ -54,17 +53,17 @@ pub async fn run(args: &[String]) {
     // ── Update check (atom feed : no API, no rate limits) ─────
     //
     // Fetches the GitHub releases.atom feed (a regular web page,
-    // not the API : no 60-req/hour limit). Parses the first
-    // <entry><title> for the latest tag. Compares semver.
+    // not the API : no 60-req/hour limit). The verdict comes from
+    // update::check_feed, the one `donsetch update` acts on.
 
     let skip_update_check =
         std::env::var_os("DONSETCH_NO_UPDATE_CHECK").is_some() || std::env::var_os("CI").is_some();
-    let latest = if skip_update_check {
+    let feed = if skip_update_check {
         None
     } else {
         let fetcher = Fetcher::new(BrowserProfile::host_default());
         match fetcher {
-            Ok(f) => tokio::time::timeout(Duration::from_secs(3), fetch_latest_version(&f))
+            Ok(f) => tokio::time::timeout(Duration::from_secs(3), update::fetch_feed(&f))
                 .await
                 .ok()
                 .and_then(Result::ok),
@@ -79,82 +78,72 @@ pub async fn run(args: &[String]) {
         return;
     }
 
-    match &latest {
-        Some(latest) => {
-            let cur = semver::Version::parse(current).ok();
-            let lat = semver::Version::parse(latest).ok();
-            match (cur, lat) {
-                (Some(c), Some(l)) if c == l => {
-                    println!("  {} up to date ({current})", cli::icon_pass());
-                }
-                (Some(c), Some(l)) if c > l => {
-                    println!(
-                        "  {} ahead of latest ({current} > {latest})",
-                        cli::icon_warn(),
-                    );
-                }
-                _ => {
-                    println!(
-                        "  {} update available: {current} → {latest}",
-                        cli::icon_warn(),
-                    );
-                    println!("    Run `donsetch update` to upgrade.");
-                }
-            }
-        }
-        None => {
-            println!(
-                "  {} could not check for updates (offline?)",
-                cli::icon_warn()
-            );
-        }
+    println!("{}", update_report(current, feed.as_deref()));
+}
+
+/// The update lines `version` prints for an install at `current`,
+/// from a releases.atom `feed` body (None: no answer). They announce
+/// an update only when `donsetch update` would install it.
+fn update_report(current: &str, feed: Option<&str>) -> String {
+    match feed.map(|body| update::check_feed(body, current)) {
+        Some(Ok((_, Offer::UpToDate))) => format!("  {} up to date ({current})", cli::icon_pass()),
+        Some(Ok((latest, Offer::Prerelease))) => format!(
+            "  {} up to date ({current}); latest published is a prerelease ({latest})",
+            cli::icon_pass()
+        ),
+        Some(Ok((latest, Offer::Ahead))) => format!(
+            "  {} ahead of latest ({current} > {latest})",
+            cli::icon_warn()
+        ),
+        Some(Ok((latest, Offer::Newer))) => format!(
+            "  {} update available: {current} → {latest}\n    Run `donsetch update` to upgrade.",
+            cli::icon_warn()
+        ),
+        Some(Err(_)) | None => format!(
+            "  {} could not check for updates (offline?)",
+            cli::icon_warn()
+        ),
     }
 }
 
-/// Fetch the releases.atom feed and parse the latest release tag.
-/// Same logic as `cli::update::fetch_latest_version` : duplicated
-/// here to keep `version` independent of `update` (no cross-module
-/// dependency for a one-off atom parse).
-///
-/// Uses the `<id>` tag (not `<title>`) because release titles can
-/// contain extra text (e.g. "v1.0.0 : Stable Release") that breaks
-/// semver parsing. The `<id>` tag always ends with `/v<version>`.
-async fn fetch_latest_version(fetcher: &Fetcher) -> Result<String, String> {
-    let url = format!("https://github.com/{REPO}/releases.atom");
-    let out = fetcher.fetch(&url).await.map_err(|e| e.to_string())?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::update::tests::feed;
 
-    if out.status != 200 {
-        return Err(format!("HTTP {} from releases feed", out.status));
+    // `update` keeps a stable install on the newest stable release
+    // when a prerelease tops the feed, so `version` must not announce
+    // the prerelease as an update.
+    #[test]
+    fn a_stable_install_is_not_told_to_update_to_a_prerelease() {
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0", "v4.10.5"]);
+        let report = update_report("5.0.0", Some(body.as_str()));
+        assert!(report.contains("up to date (5.0.0)"), "{report}");
+        assert!(!report.contains("update available"), "{report}");
+        let body = feed(&["v5.1.0-beta.1", "v5.0.1", "v5.0.0"]);
+        let report = update_report("5.0.0", Some(body.as_str()));
+        assert!(
+            report.contains("update available: 5.0.0 → 5.0.1"),
+            "{report}"
+        );
+        let body = feed(&["v5.1.0-beta.2", "v5.1.0-beta.1"]);
+        let report = update_report("5.0.0", Some(body.as_str()));
+        assert!(!report.contains("update available"), "{report}");
     }
 
-    let body = String::from_utf8_lossy(&out.body);
-
-    let entry_pos = body
-        .find("<entry>")
-        .ok_or_else(|| "no releases found in feed".to_string())?;
-
-    // The <id> tag always ends with /v<version> : clean, no extra text.
-    let id_tag = body[entry_pos..]
-        .find("<id>")
-        .ok_or_else(|| "could not parse feed: no <id> in first entry".to_string())?
-        + entry_pos;
-
-    let content_start = body[id_tag..]
-        .find('>')
-        .ok_or_else(|| "could not parse feed: malformed <id>".to_string())?
-        + id_tag
-        + 1;
-
-    let content_end = body[content_start..]
-        .find("</id>")
-        .ok_or_else(|| "could not parse feed: no </id>".to_string())?
-        + content_start;
-
-    // <id> looks like: tag:github.com,2008:Repository/123/v1.0.0
-    // Extract everything after the last '/'.
-    let id_content = body[content_start..content_end].trim();
-    let tag = id_content.rsplit('/').next().unwrap_or(id_content);
-
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    Ok(version.to_string())
+    #[test]
+    fn a_newer_release_the_install_follows_is_announced() {
+        let body = feed(&["v5.0.1", "v5.0.0"]);
+        let report = update_report("5.0.0", Some(body.as_str()));
+        assert!(
+            report.contains("update available: 5.0.0 → 5.0.1"),
+            "{report}"
+        );
+        let body = feed(&["v5.1.0-beta.1", "v5.0.0"]);
+        let report = update_report("5.0.0-beta.1", Some(body.as_str()));
+        assert!(
+            report.contains("update available: 5.0.0-beta.1 → 5.1.0-beta.1"),
+            "{report}"
+        );
+    }
 }
