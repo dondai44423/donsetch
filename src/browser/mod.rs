@@ -718,11 +718,51 @@ pub struct HeadlessSession {
     child: tokio::process::Child,
     cdp: cdp::Cdp,
     profile: PathBuf,
+    guard: Option<cdp::RequestGuard>,
 }
 
 impl HeadlessSession {
     pub fn cdp(&self) -> &cdp::Cdp {
         &self.cdp
+    }
+
+    /// From now until the session closes, each request the `Fetch`
+    /// domain pauses on the page's own target (the navigation, each
+    /// redirect hop, subresources, `fetch()`) leaves the browser only if
+    /// `ensure_url_safe` accepts its URL; a refused one fails with
+    /// `BlockedByClient`. See [`cdp::Cdp::spawn_request_guard`]. A
+    /// dedicated worker's requests are paused too. What `Fetch` does not
+    /// pause here passes unchecked: WebSockets, preconnects and DNS
+    /// prefetches, and the requests made inside a cross-site iframe or by
+    /// a shared or service worker.
+    pub async fn guard_requests(&mut self) -> Result<(), String> {
+        let main_frame = self
+            .cdp
+            .call(None, "Page.getFrameTree", json!({}))
+            .await
+            .map_err(|e| e.to_string())?
+            .pointer("/frameTree/frame/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "the page reported no main frame".to_string())?;
+        self.guard = Some(self.cdp.spawn_request_guard(main_frame));
+        self.cdp
+            .call(
+                None,
+                "Fetch.enable",
+                json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The check's error for the first main-frame document request the
+    /// guard refused since [`Self::guard_requests`], taken once.
+    pub fn take_refusal(&self) -> Option<FetchError> {
+        self.guard
+            .as_ref()
+            .and_then(cdp::RequestGuard::take_refusal)
     }
 
     /// Navigate and wait until the main document is complete, bounded.
@@ -749,6 +789,12 @@ impl HeadlessSession {
                 .unwrap_or(false);
             if ready {
                 return Ok(());
+            }
+            if self.cdp.is_dead() {
+                return Err(format!(
+                    "cdp link closed while the page loaded ({})",
+                    self.cdp.failure().unwrap_or("unavailable")
+                ));
             }
             if started.elapsed() >= LOAD_DEADLINE {
                 return Err(format!(
@@ -863,6 +909,7 @@ pub async fn launch_headless(binary: &Path) -> Result<HeadlessSession, String> {
         child,
         cdp,
         profile,
+        guard: None,
     })
 }
 
@@ -912,14 +959,26 @@ fn temporary_profile_dir() -> PathBuf {
 
 /// One-shot capture: navigate, settle `wait_ms`, return (png, final
 /// url). Used by the `web_screenshot` tool.
+///
+/// The page's requests pass the request guard
+/// ([`HeadlessSession::guard_requests`], which names what it does not
+/// see). A refused subresource fails inside the page and the capture
+/// goes on without it. A refused main-frame document request (a
+/// redirect hop, or a navigation the page starts before the capture is
+/// taken) refuses the capture with the check's own error,
+/// `FetchError::Denied` for a rule. Any other failure is
+/// `FetchError::Browser`.
 pub async fn capture_page_png(
     url: &str,
     full_page: bool,
     wait_ms: u64,
-) -> Result<(Vec<u8>, String), String> {
-    let resolved = resolve_browser_without_download()?;
-    let session = launch_headless(&resolved.path).await?;
-    let result = async {
+) -> Result<(Vec<u8>, String), FetchError> {
+    let resolved = resolve_browser_without_download().map_err(FetchError::browser)?;
+    let mut session = launch_headless(&resolved.path)
+        .await
+        .map_err(FetchError::browser)?;
+    let result: Result<(Vec<u8>, String), String> = async {
+        session.guard_requests().await?;
         session.navigate(url).await?;
         if wait_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
@@ -945,8 +1004,14 @@ pub async fn capture_page_png(
         Ok((png, final_url))
     }
     .await;
+    // Chrome answers a refused document with its own error page, which
+    // loads and captures like any other: the refusal is the result.
+    let refusal = session.take_refusal();
     session.close().await;
-    result
+    match refusal {
+        Some(refusal) => Err(refusal),
+        None => result.map_err(FetchError::browser),
+    }
 }
 
 #[cfg(test)]
@@ -1249,5 +1314,65 @@ mod screenshot_data_tests {
         assert!(decode_screenshot_data("Zm9v!!!!").is_err());
         assert!(decode_screenshot_data("Zm9vYg").is_err(), "missing padding");
         assert!(decode_screenshot_data("Zm9v\nYmFy").is_err(), "line break");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod session_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::{Duration, Instant};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // When the DevTools link ends while the page loads (the request
+    // guard ended it, the socket closed), the page can no longer report
+    // itself complete: navigate says so at once instead of waiting out
+    // LOAD_DEADLINE and blaming the page.
+    #[tokio::test]
+    async fn navigate_returns_as_soon_as_the_link_ends() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Page.navigate is accepted and the page is still loading;
+            // then the link ends.
+            for result in [
+                json!({ "frameId": "main" }),
+                json!({ "result": { "type": "boolean", "value": false } }),
+            ] {
+                let Some(Ok(Message::Text(call))) = ws.next().await else {
+                    return;
+                };
+                let call: Value = serde_json::from_str(&call).unwrap();
+                let reply = json!({ "id": call["id"], "result": result });
+                ws.send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let cdp = cdp::Cdp::connect(&format!("ws://{addr}")).await.unwrap();
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let session = HeadlessSession {
+            child,
+            cdp,
+            profile: PathBuf::new(),
+            guard: None,
+        };
+        let started = Instant::now();
+        let error = session.navigate("http://127.0.0.1/").await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "navigate outlived the link by {:?}: {error}",
+            started.elapsed()
+        );
+        assert!(
+            error.starts_with("cdp link closed while the page loaded ("),
+            "{error}"
+        );
     }
 }

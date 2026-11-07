@@ -94,8 +94,9 @@ flowchart TD
   Adding the key back reopens that.
 - **Every routing site calls `policy_error_value`** before the error turns
   into text: `fetch_input`, the rewritten-URL guard, the transport `Err` arm
-  (above its adapter branch), `fetch_with_actions`, `web_screenshot`'s four
-  sites,
+  (above its adapter branch), `fetch_with_actions`, `web_screenshot`'s three
+  sites (the URL's two checks and the browser request guard's refusal of the
+  page's own document),
   and the crawl's seed guard. A missed site degrades rather than lies:
   `error_code` has a first arm on the fixed text that yields
   `policy.denied.unspecified`.
@@ -184,8 +185,6 @@ so in a comment. The crawl tests use `Crawler::with_rules` to stay pure.
 
 ## Known gaps, accepted for v1
 
-- A redirect the browser follows into a denied host is stopped by the CDP
-  guard but surfaces as a browser navigation error, not `policy.denied`.
 - The paid unlocker can return a denied host's page after a redirect on its
   side; the request never leaves from the operator's IP.
 - A rule refusing a phase-1 robots or sitemap fetch is silent: discovery
@@ -217,15 +216,14 @@ Each is additive: no v1 key or output changes meaning when it arrives.
   intermediate redirect hops. Needs a delivery contract the agent reads.
 - **Rules on document requests only, in the browser.** Today the CDP guard
   blocks every request to a denied host that the page session's `Fetch`
-  domain pauses, images and scripts on allowed pages included. It sees no
-  WebSocket, DNS prefetch or preconnect, and probably no request from a
-  cross-site iframe or a worker (`Fetch.enable` runs on the page session
-  only, with no auto-attach; not verified with a real browser). `Fetch.requestPaused` carries `resourceType`, so the rule
+  domain pauses, images and scripts on allowed pages included, and a
+  dedicated worker's requests. It sees no WebSocket, DNS prefetch or
+  preconnect, and no request from a cross-site iframe or a shared or
+  service worker (`Fetch.enable` runs on the page session only, with no
+  auto-attach; the iframe, worker and WebSocket cases measured with
+  Chromium 156). `Fetch.requestPaused` carries `resourceType`, so the rule
   half of the guard could skip subresources while the SSRF half keeps
   applying to everything. Revisit if a deny breaks pages nobody named.
-- **Typed browser denials.** Store the `Denied` the CDP guard saw for a
-  document request in a per-tab slot that navigation returns, so a
-  browser-followed redirect reports the rule.
 - **A second config file layer** (project-level). The map shape already
   merges per key. Then the duplicate-key error should name each key's layer
   (`Loaded::origin_of_path` exists for it).
