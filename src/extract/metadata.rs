@@ -16,12 +16,38 @@ pub struct Meta {
     pub canonical: Option<String>,
 }
 
-pub fn base_url(doc: &Html) -> Option<String> {
-    let sel = scraper::Selector::parse("base[href]").ok()?;
-    doc.select(&sel)
-        .next()
-        .and_then(|b| b.value().attr("href"))
-        .map(|s| s.to_string())
+/// The URL relative links and images on the page resolve against: the
+/// first `<base href>` resolved against `page_url` by
+/// [`resolve_base_href`]. When `page_url` does not parse, only a base
+/// that is itself an absolute http(s) URL is used. Otherwise, and when
+/// the page has no such element or the base is rejected, `page_url` as
+/// given.
+pub fn base_url(doc: &Html, page_url: &str) -> String {
+    let sel = scraper::Selector::parse("base[href]").ok();
+    let href = sel
+        .as_ref()
+        .and_then(|sel| doc.select(sel).next())
+        .and_then(|b| b.value().attr("href"));
+    let base = href.and_then(|href| match url::Url::parse(page_url) {
+        Ok(page) => resolve_base_href(&page, href),
+        // Nothing to resolve a relative base against, but an absolute
+        // one needs no document URL and still carries the links.
+        Err(_) => url::Url::parse(href).ok().filter(is_web_base),
+    });
+    base.map_or_else(|| page_url.to_string(), String::from)
+}
+
+/// A `<base href>` value resolved against the document URL `page`
+/// (HTML §4.2.3), so `/`, `/docs/` and `../` bases work as they do in a
+/// browser and an absolute base replaces the page URL. `None` when the
+/// value does not parse or resolves to a scheme other than http(s),
+/// such as `javascript:`, `data:` or `file:`.
+pub fn resolve_base_href(page: &url::Url, href: &str) -> Option<url::Url> {
+    page.join(href).ok().filter(is_web_base)
+}
+
+fn is_web_base(base: &url::Url) -> bool {
+    matches!(base.scheme(), "http" | "https")
 }
 
 pub fn metadata(doc: &Html) -> Meta {

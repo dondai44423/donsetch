@@ -560,6 +560,200 @@ fn metadata_description_in_frontmatter() {
     assert!(r.markdown.contains("> A short summary."));
 }
 
+// ── <base href> ───────────────────────────────────────────
+
+const BASE_PAD: &str = "<p>This paragraph is ordinary article prose that exists only so the scorer sees a real article body with enough text, punctuation, and paragraphs to win.</p><p>A second distinct paragraph of filler prose, again present only so that the article container clearly wins the main-content scoring pass.</p>";
+
+// An article at https://example.com/a/b.html, links on, whose <head>
+// carries `head`: a path-relative, a root-relative and an absolute
+// link, and one content image with a relative src.
+fn extract_with_base(head: &str) -> Extracted {
+    extract_with_base_at(head, "https://example.com/a/b.html")
+}
+
+// The same article, extracted as if fetched from `page_url`.
+fn extract_with_base_at(head: &str, page_url: &str) -> Extracted {
+    let html = format!(
+        "<!doctype html><html><head>{head}<title>Base</title></head><body><article><h1>Base</h1>{BASE_PAD}<p>Read the <a href=\"docs/install\">installation guide</a>, the <a href=\"/abs/path\">reference</a> and the <a href=\"https://other.example.net/faq\">FAQ</a>.</p><img src=\"images/diagram.png\" alt=\"System diagram\" width=\"600\" height=\"400\"></article></body></html>"
+    );
+    extract(
+        html.as_bytes(),
+        "text/html",
+        page_url,
+        &ExtractOptions {
+            include_links: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn has_image(ex: &Extracted, src: &str) -> bool {
+    ex.images.iter().any(|(_, s)| s == src)
+}
+
+// A relative <base href> ("/" is Angular's default) resolves against
+// the document URL (HTML §4.2.3). Taken raw it is not a parsable base,
+// so every relative link and image was discarded.
+#[test]
+fn relative_base_href_resolves_against_the_page() {
+    let html = format!(
+        "<!doctype html><html><head><base href=\"/\"><title>Base</title></head><body><article><h1>Base</h1>{BASE_PAD}<p>Read the <a href=\"docs/install\">installation guide</a> first.</p><img src=\"images/diagram.png\" alt=\"System diagram\" width=\"600\" height=\"400\"></article></body></html>"
+    );
+    let ex = extract(
+        html.as_bytes(),
+        "text/html",
+        "https://example.com/a/b.html",
+        &ExtractOptions {
+            include_links: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        ex.markdown
+            .contains("[installation guide](https://example.com/docs/install)"),
+        "{}",
+        ex.markdown
+    );
+    assert!(
+        ex.images
+            .iter()
+            .any(|(_, src)| src == "https://example.com/images/diagram.png"),
+        "images: {:?}",
+        ex.images
+    );
+}
+
+// A base under a path: relative links and images resolve under it, a
+// root-relative link resolves to the host root, an absolute link is
+// untouched.
+#[test]
+fn a_base_href_under_a_path_resolves_every_relative_form() {
+    let ex = extract_with_base("<base href=\"/guide/\">");
+    let md = &ex.markdown;
+    for link in [
+        "[installation guide](https://example.com/guide/docs/install)",
+        "[reference](https://example.com/abs/path)",
+        "[FAQ](https://other.example.net/faq)",
+    ] {
+        assert!(md.contains(link), "missing {link}:\n{md}");
+    }
+    assert!(
+        has_image(&ex, "https://example.com/guide/images/diagram.png"),
+        "images: {:?}",
+        ex.images
+    );
+}
+
+// A javascript: or data: base falls back to the page URL, as HTML's
+// "set the frozen base URL" step does (§4.2.3): the links resolve as
+// if the element were absent.
+#[test]
+fn a_non_http_base_href_falls_back_to_the_page() {
+    for base in ["javascript:void(0)", "data:text/html,x"] {
+        let ex = extract_with_base(&format!("<base href=\"{base}\">"));
+        let md = &ex.markdown;
+        for link in [
+            "[installation guide](https://example.com/a/docs/install)",
+            "[reference](https://example.com/abs/path)",
+        ] {
+            assert!(md.contains(link), "base {base}: missing {link}:\n{md}");
+        }
+        assert!(
+            has_image(&ex, "https://example.com/a/images/diagram.png"),
+            "base {base}: images: {:?}",
+            ex.images
+        );
+    }
+}
+
+// A file: base would resolve every relative link (a browser adopts
+// it), but only an http(s) base is adopted: it is dropped and the page
+// URL is the base.
+#[test]
+fn a_file_base_href_is_never_adopted() {
+    let ex = extract_with_base("<base href=\"file:///srv/site/\">");
+    let md = &ex.markdown;
+    assert!(!md.contains("](file:"), "{md}");
+    assert!(
+        md.contains("[installation guide](https://example.com/a/docs/install)"),
+        "{md}"
+    );
+    assert!(
+        has_image(&ex, "https://example.com/a/images/diagram.png"),
+        "images: {:?}",
+        ex.images
+    );
+}
+
+// A page URL that does not parse leaves nothing to resolve a relative
+// base against, but an absolute http(s) base still carries the links;
+// a file: one still does not.
+#[test]
+fn an_absolute_base_href_works_without_a_parsable_page_url() {
+    let ex = extract_with_base_at("<base href=\"https://cdn.example.org/root/\">", "not a url");
+    let md = &ex.markdown;
+    for link in [
+        "[installation guide](https://cdn.example.org/root/docs/install)",
+        "[reference](https://cdn.example.org/abs/path)",
+    ] {
+        assert!(md.contains(link), "missing {link}:\n{md}");
+    }
+    assert!(
+        has_image(&ex, "https://cdn.example.org/root/images/diagram.png"),
+        "images: {:?}",
+        ex.images
+    );
+
+    let ex = extract_with_base_at("<base href=\"file:///srv/site/\">", "not a url");
+    assert!(!ex.markdown.contains("](file:"), "{}", ex.markdown);
+    assert!(
+        ex.images.iter().all(|(_, s)| !s.starts_with("file:")),
+        "images: {:?}",
+        ex.images
+    );
+}
+
+// Negative: an absolute base still replaces the page URL.
+#[test]
+fn an_absolute_base_href_still_wins() {
+    let ex = extract_with_base("<base href=\"https://cdn.example.org/root/\">");
+    let md = &ex.markdown;
+    for link in [
+        "[installation guide](https://cdn.example.org/root/docs/install)",
+        "[reference](https://cdn.example.org/abs/path)",
+        "[FAQ](https://other.example.net/faq)",
+    ] {
+        assert!(md.contains(link), "missing {link}:\n{md}");
+    }
+    assert!(!md.contains("](https://example.com/"), "{md}");
+    assert!(
+        has_image(&ex, "https://cdn.example.org/root/images/diagram.png"),
+        "images: {:?}",
+        ex.images
+    );
+}
+
+// Negative: without a base, links resolve against the page itself.
+#[test]
+fn a_page_without_base_href_resolves_against_itself() {
+    let ex = extract_with_base("");
+    let md = &ex.markdown;
+    for link in [
+        "[installation guide](https://example.com/a/docs/install)",
+        "[reference](https://example.com/abs/path)",
+        "[FAQ](https://other.example.net/faq)",
+    ] {
+        assert!(md.contains(link), "missing {link}:\n{md}");
+    }
+    assert!(
+        has_image(&ex, "https://example.com/a/images/diagram.png"),
+        "images: {:?}",
+        ex.images
+    );
+}
+
 // ════════════════════════════════════════════════════════════
 // 5. BLOCK TYPES
 // ════════════════════════════════════════════════════════════

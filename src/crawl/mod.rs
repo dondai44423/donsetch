@@ -1116,8 +1116,7 @@ impl Crawler {
                     // <base href> resolves against the document
                     // URL first, the page loop's rule.
                     let base = extract_base_href(&html)
-                        .and_then(|bh| page_url_parsed.join(&bh).ok())
-                        .filter(|b| matches!(b.scheme(), "http" | "https"))
+                        .and_then(|bh| extract::metadata::resolve_base_href(&page_url_parsed, &bh))
                         .unwrap_or(page_url_parsed);
                     for (href, _anchor) in self_harvest_static(&html, &base) {
                         if let Some(u) = frontier::resolve(&base, &href) {
@@ -2147,8 +2146,9 @@ impl Crawler {
                         let page_url_parsed =
                             Url::parse(&page.url).unwrap_or_else(|_| parsed.clone());
                         let base = extract_base_href(&html)
-                            .and_then(|bh| page_url_parsed.join(&bh).ok())
-                            .filter(|b| matches!(b.scheme(), "http" | "https"))
+                            .and_then(|bh| {
+                                extract::metadata::resolve_base_href(&page_url_parsed, &bh)
+                            })
                             .unwrap_or(page_url_parsed);
 
                         // Harvest <a href> links early so we can check
