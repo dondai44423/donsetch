@@ -444,7 +444,15 @@ fn walk<'a>(
         // layer drops them unless include_media. On-demand image
         // OCR (v3) needs the image list even when media lines are
         // not part of the output.
-        "figure" | "img" => {
+        "img" => {
+            media_block(el, base, headings, out);
+        }
+        // A figure takes the media path only when images and a
+        // caption are all it holds. One that wraps a table, a code
+        // listing or a quote (WordPress figure.wp-block-table and
+        // wp-block-pullquote, Jekyll figure.highlight > pre) falls
+        // through to the container walk, which emits every child.
+        "figure" if !figure_has_content(el) => {
             media_block(el, base, headings, out);
         }
         "hr" => {}
@@ -910,6 +918,29 @@ fn media_block(el: ElementRef<'_>, base: &str, headings: &[(u8, String)], out: &
             });
         }
     }
+}
+
+/// True when a `<figure>` holds readable text outside its
+/// `<figcaption>` elements. Subtrees the walk skips as junk
+/// (script, svg, hidden, ...) do not count.
+fn figure_has_content(fig: ElementRef<'_>) -> bool {
+    let mut stack: Vec<_> = fig.children().collect();
+    while let Some(node) = stack.pop() {
+        match node.value() {
+            Node::Text(t) if !t.text.trim().is_empty() => return true,
+            Node::Element(_) => {
+                let Some(c) = ElementRef::wrap(node) else {
+                    continue;
+                };
+                if c.value().name() == "figcaption" || crate::extract::junk::skip(c) {
+                    continue;
+                }
+                stack.extend(node.children());
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 #[allow(dead_code)]
