@@ -632,6 +632,28 @@ fn absent_words(query: &str, docs: &[Vec<String>], lang: &LanguageInfo) -> Vec<S
     absent
 }
 
+/// The query without its quantities, and each quantity as written with how
+/// many times every passage states its value (`super::amount`).
+fn query_amounts(query: &str, all: &[Passage]) -> (String, Vec<(String, Vec<usize>)>) {
+    let mut words = query.to_string();
+    let mut found = Vec::new();
+    for amount in super::amount::amounts(query) {
+        let Ok(re) = regex::RegexBuilder::new(&amount.pattern)
+            .case_insensitive(true)
+            .build()
+        else {
+            continue;
+        };
+        let hits = all.iter().map(|p| re.find_iter(&p.text).count()).collect();
+        found.push((query[amount.start..amount.end].trim().to_string(), hits));
+        words.replace_range(
+            amount.start..amount.end,
+            &" ".repeat(amount.end - amount.start),
+        );
+    }
+    (words, found)
+}
+
 fn quoted_list(words: &[String]) -> String {
     words
         .iter()
@@ -799,7 +821,7 @@ fn render_focus(
     // passage sits under are left out, or the page's subject would match
     // everywhere and decide nothing.
     let subject = subject_headings(doc, &all);
-    let docs: Vec<Vec<String>> = all
+    let mut docs: Vec<Vec<String>> = all
         .iter()
         .map(|p| {
             let mut tokens = focus::passage_tokens(&p.text, lang);
@@ -813,7 +835,19 @@ fn render_focus(
             tokens
         })
         .collect();
-    let query_tokens = focus::passage_tokens(query, lang);
+    // A quantity in the query ("15M", "3%") is matched by value, in whatever
+    // spelling the page uses ("EUR 15 000 000", "3 %"): it becomes a term of
+    // its own that each passage stating it carries, and its characters leave
+    // the word query, where "15m" would match nothing and be called absent.
+    let (word_query, amounts) = query_amounts(query, &all);
+    let mut query_tokens = focus::passage_tokens(&word_query, lang);
+    for (k, (_, hits)) in amounts.iter().enumerate() {
+        let term = format!("\u{1}amount{k}");
+        for (tokens, &n) in docs.iter_mut().zip(hits) {
+            tokens.extend(std::iter::repeat_n(term.clone(), n));
+        }
+        query_tokens.push(term);
+    }
     let mut scores = focus::bm25_rank(&docs, query_tokens.clone());
     // Synonyms add to the passages they find; they never remove a direct hit.
     let alts = synonyms_of(query);
@@ -836,7 +870,13 @@ fn render_focus(
             }
         }
     }
-    let absent = absent_words(query, &docs, lang);
+    let mut absent = absent_words(&word_query, &docs, lang);
+    absent.extend(
+        amounts
+            .into_iter()
+            .filter(|(_, hits)| hits.iter().all(|&n| n == 0))
+            .map(|(phrase, _)| phrase),
+    );
     let best = scores.iter().copied().fold(0.0f64, f64::max);
     let absent_note = if absent.is_empty() {
         String::new()
@@ -1639,6 +1679,41 @@ Intro text about widgets and how they work.\n\n\
         );
         assert!(r.text.contains("§s3 · Install › Windows"), "{}", r.text);
         assert!(r.text.contains("use the MSI"));
+    }
+
+    // The figure the agent read ("15M", "3%") is on the page as the statute
+    // spells it; focus finds it by value and never calls it absent.
+    #[test]
+    fn focus_finds_a_figure_in_the_spelling_the_page_uses() {
+        let md = "# Penalties\n\n## Scope\n\nThis article covers the rules on penalties and their reach.\n\n\
+                  ## Prohibited practices\n\nNon-compliance shall be subject to administrative fines of up to EUR 35 000 000 or 7 % of turnover.\n\n\
+                  ## Other obligations\n\nNon-compliance shall be subject to administrative fines of up to EUR 15 000 000 or 3 % of turnover.\n\n\
+                  ## Information\n\nIncorrect information is subject to fines of up to EUR 7 500 000 or 1 % of turnover.\n";
+        let focused = |q: &str| {
+            render(
+                md,
+                &View {
+                    focus: Some(q.into()),
+                    ..view()
+                },
+                None,
+            )
+        };
+        for q in ["15M", "15M or 3%", "fines 15M"] {
+            let r = focused(q);
+            assert!(r.text.contains("EUR 15 000 000"), "{q}: {}", r.text);
+            assert!(!r.text.contains("not on the page"), "{q}: {}", r.text);
+            let first = r.text.find("EUR 15 000 000").unwrap();
+            for other in ["EUR 35 000 000", "EUR 7 500 000"] {
+                assert!(
+                    r.text.find(other).is_none_or(|o| o > first),
+                    "{q}: {}",
+                    r.text
+                );
+            }
+        }
+        let r = focused("20M");
+        assert!(r.text.contains("not on the page: \"20M\""), "{}", r.text);
     }
 
     #[test]

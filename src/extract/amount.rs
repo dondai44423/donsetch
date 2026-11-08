@@ -10,8 +10,10 @@
 //!
 //! False positives are bounded by construction: the currency, when the phrase
 //! names one, must stand next to the number on the page; a single-letter
-//! magnitude (`15m`) counts only beside a currency, where it cannot be metres;
-//! and a number never matches the head of a longer one (`€15` is not `€15,000`).
+//! magnitude beside a currency reads in either case (`€15m`), but alone only
+//! as the capital that is never a unit (`15M`, `2B`, and `k` for thousands),
+//! so `15m` stays metres and `3T` stays tesla; and a number never matches the
+//! head of a longer one (`€15` is not `€15,000`).
 
 use std::sync::LazyLock;
 
@@ -76,19 +78,34 @@ fn currency_of(token: &str) -> Option<&'static Currency> {
     Some(&CURRENCIES[index])
 }
 
-/// Magnitudes: their multiplier, the words for them, and the one-letter forms
-/// that count only beside a currency.
-const MAGNITUDES: &[(f64, &[&str], &str)] = &[
-    (1e3, &["thousand", "thousands"], "k"),
-    (1e6, &["million", "millions", "mln", "mn", "mio"], "m"),
-    (1e9, &["billion", "billions", "bln", "bn", "mrd", "md"], "b"),
-    (1e12, &["trillion", "trillions", "tn"], "t"),
+/// Magnitudes: their multiplier, the words for them, the one-letter form that
+/// counts in either case beside a currency, and the exact letters that count
+/// without one (none that is also a unit: `m` metres, `b` bits, `T` tesla).
+const MAGNITUDES: &[(f64, &[&str], &str, &[&str])] = &[
+    (1e3, &["thousand", "thousands"], "k", &["k", "K"]),
+    (
+        1e6,
+        &["million", "millions", "mln", "mn", "mio"],
+        "m",
+        &["M"],
+    ),
+    (
+        1e9,
+        &["billion", "billions", "bln", "bn", "mrd", "md"],
+        "b",
+        &["B"],
+    ),
+    (1e12, &["trillion", "trillions", "tn"], "t", &[]),
 ];
 
 fn magnitude_of(token: &str, with_currency: bool) -> Option<f64> {
-    let token = token.trim().to_lowercase();
-    MAGNITUDES.iter().find_map(|(times, words, letter)| {
-        (words.contains(&token.as_str()) || (with_currency && token == *letter)).then_some(*times)
+    let raw = token.trim();
+    let token = raw.to_lowercase();
+    MAGNITUDES.iter().find_map(|(times, words, letter, bare)| {
+        (words.contains(&token.as_str())
+            || (with_currency && token == *letter)
+            || bare.contains(&raw))
+        .then_some(*times)
     })
 }
 
@@ -179,7 +196,7 @@ fn value_pattern(value: f64, with_currency: bool, percent: bool) -> String {
         forms.push(number_pattern(value));
     }
     if !percent {
-        for (times, words, letter) in MAGNITUDES {
+        for (times, words, letter, bare) in MAGNITUDES {
             let x = value / times;
             let thousandths = x * 1000.0;
             if x < 0.1 || (thousandths - thousandths.round()).abs() > 1e-6 * thousandths.max(1.0) {
@@ -188,6 +205,9 @@ fn value_pattern(value: f64, with_currency: bool, percent: bool) -> String {
             let mut names: Vec<String> = words.iter().map(|word| word.to_string()).collect();
             if with_currency {
                 names.push(letter.to_string());
+            } else if !bare.is_empty() {
+                // The match is case-insensitive; a bare letter is not.
+                names.push(format!("(?-i:{})", bare.join("|")));
             }
             forms.push(format!(
                 r"{}\s*(?:{})\b",
@@ -219,8 +239,8 @@ pub(super) fn amounts(phrase: &str) -> Vec<Found> {
         let magnitude = caps
             .name("mag")
             .map(|m| magnitude_of(m.as_str(), currency.is_some()));
-        // A one-letter magnitude with no currency is a unit (`15m`), not a
-        // quantity: the phrase is matched as written.
+        // A one-letter magnitude that is also a unit, with no currency to
+        // say otherwise (`15m`, `3T`), is matched as written.
         if magnitude == Some(None) {
             continue;
         }
@@ -310,6 +330,29 @@ mod tests {
         }
     }
 
+    // An agent writes the figure it read without a currency: "15M" against a
+    // statute that spells "EUR 15 000 000".
+    #[test]
+    fn a_capital_magnitude_needs_no_currency() {
+        for page in [
+            "fines of up to EUR 15 000 000 or 3 %",
+            "15 million",
+            "a 15M round",
+            "15,000,000 users",
+        ] {
+            assert!(matches("15M", page), "15M vs {page:?}");
+        }
+        for page in ["15m long", "150 million", "1.5 million", "15MB", "15,000"] {
+            assert!(!matches("15M", page), "15M must not match {page:?}");
+        }
+        assert!(matches("7.5M", "EUR 7 500 000"));
+        assert!(matches("2B", "2 billion parameters"));
+        assert!(matches("15k", "15,000 stars"));
+        assert!(matches("15K", "15k stars"));
+        assert!(matches("15 million", "raised 15M"));
+        assert!(!matches("15 million", "15m tall"));
+    }
+
     #[test]
     fn decimals_and_magnitudes_agree() {
         assert!(matches("$1.5bn", "revenue of US$1,500 million"));
@@ -337,6 +380,8 @@ mod tests {
             "version 2.3",
             "in 2024",
             "15m tall",
+            "3T scanner",
+            "a 5b counter",
             "chapter 12",
         ] {
             assert!(amounts(term).is_empty(), "{term}");
