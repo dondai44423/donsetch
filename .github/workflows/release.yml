@@ -132,7 +132,7 @@ jobs:
           # Only the Windows target needs libclang; the Linux and macOS legs
           # already have a toolchain. The release-download path 504s, so this
           # goes through the same API-asset fallback the build script uses.
-          name=clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz
+          name=clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.10.tar.xz
           url=https://github.com/llvm/llvm-project/releases/download/llvmorg-11.0.1/$name
           curl -fsSL --retry 3 -o /tmp/llvm.tar.xz "$url" || {
             asset=$(gh api repos/llvm/llvm-project/releases/tags/llvmorg-11.0.1 \
