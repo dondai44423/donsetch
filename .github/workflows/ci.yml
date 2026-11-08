@@ -1,25 +1,37 @@
-# DonSeTch CI — build + test on Linux, macOS, Windows.
+# DonSeTch CI.
 #
-# Test runs use cargo-nextest with the `ci` cargo profile (release
-# opts, no fat LTO), so full test links take seconds, not minutes.
-# Build output is cached per platform (see .github/workflows/CACHING.md),
-# so steady-state Windows runs are minutes, not 20.
+# Four lean jobs, then one nightly. The shape follows what each platform
+# actually proves, not a five-way matrix that recompiled the same code five
+# times:
 #
-# Two payload gates beyond compilation, because compile success has
-# shipped dead binaries before (v3.3.0 ONNX feature leak):
-#   1. The onnx_payload_probe unit test runs inside the features-on
-#      suites on every lane that builds them (linux-x64 and both
-#      macOS lanes, all dynamic load), and fails if the ONNX
-#      environment cannot initialize.
-#   2. Windows compile-checks the full release feature set
-#      (ocr,rerank,http) without linking: MSVC's 305MB static ONNX
-#      link stays a release-time cost. The complete Windows payload
-#      proof (doctor probe + size gate) lives in release.yml.
+#   build-test (linux-x86_64)  the SEMANTIC gate: workspace clippy, the whole
+#                              default suite (pdf, extract, crawl, mcp, state),
+#                              the test-budget guard, the shipped binary
+#                              starting, --stealth --parity. Nothing else needs
+#                              to run the suite; a test in it is not
+#                              platform-specific or it would be named here.
+#   build-test (macos-arm64)   PLATFORM gate: clippy for the macOS cfg surface,
+#                              the process/restart, path, profile and PDF tests,
+#                              the binary starting, release-feature compile.
+#   build-test (windows-x86_64) PLATFORM gate: compile the whole crate (the
+#                              real converter is clippy --all-targets), the
+#                              Windows core suite on master, release-feature
+#                              compile.
+#   check                      cheap gates, no build: rustfmt, the static test
+#                              budget, cargo-deny.
 #
-# The heavy dependencies need platform-specific setup:
-#   boring-sys (BoringSSL): CMake + C/C++ compiler + Go + bindgen (libclang)
-#   PDFium (static):         curl + tar (build.rs downloads at build time)
-#   oar-ocr (ONNX Runtime):  download-binaries feature fetches at build time
+# The fetch core is a workspace member: it compiles in PARALLEL with the
+# product, shares one lockfile and one target cache, and its clippy runs in the
+# same step as the product's. It has no CI job of its own any more.
+#
+# Nightly (schedule) is the only place that pays for: all five fuzz targets,
+# the heavy test set (soak, corpus PDFs, timing ceilings) and the aarch64
+# Linux lane. Everything expensive is scheduled, nothing per-push is.
+#
+# Branch protection requires these contexts on master:
+#   build-test (linux-x86_64) · build-test (macos-arm64) · build-test (windows-x86_64)
+# The names are deliberately unchanged; `check` is not required (it is a
+# lint/format gate, not a build verdict) but still fails the run.
 
 name: CI
 
@@ -28,25 +40,14 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
-  # Nightly gets what a per-push run cannot afford: the heavy set (soak,
-  # corpus, landmarks, live probes) on every platform, and all five fuzz
-  # targets instead of the one smoke target. 06:00 UTC.
   schedule:
     - cron: '0 6 * * *'
   workflow_dispatch:
 
 # One live run per pull request: a new push evicts that PR's own
-# still-running checks instead of queueing behind them. On a
-# pull_request event github.ref is refs/pull/<n>/merge, so the group
-# key carries the PR number and runs never cancel across PRs.
-#
-# Pushes to master keep the group key refs/heads/master and opt out of
-# cancellation: branch protection reads per-commit results, so a
-# cancelled master run would leave a gap rather than a verdict.
+# still-running checks. Pushes are keyed per SHA (branch protection reads
+# per-commit results).
 concurrency:
-  # Pushes and manual checks are keyed per SHA: the release gate needs
-  # the exact commit's verdict, and an obsolete candidate must not block
-  # verification of its replacement. PR updates still cancel their own run.
   group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -54,19 +55,38 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
+  # ── Cheap gates: no toolchain build, seconds each. ─────────────────
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test budget (fixtures and ceilings, no build)
+        run: python3 scripts/test_budget.py --static
+      - name: cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --all-features check --hide-inclusion-graph
+
+  # ── A Linux build every tag proves, so no five-way release rebuild. ──
   build-test:
-    # Context MUST stay "build-test (<platform>)": master's branch
-    # protection requires exactly these check names
-    # (build-test (linux-x86_64) / (macos-arm64) / (windows-x86_64)).
-    # GitHub generates this format for matrix jobs without an explicit
-    # name; setting it explicitly keeps the required-checks contract
-    # stable no matter how the matrix evolves.
     name: build-test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    # A lane can pin a linker: aarch64 needs lld for a binary this size.
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
+      # Only lanes that run the suite write the machine-readable log.
+      SUITE: ${{ matrix.suite }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,189 +94,74 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            # Full feature set here: ocr+rerank (ONNX dlopen probe)
-            # and http (axum/tower-http) are only CI-exercised on Linux.
             features: --features ocr,rerank,http
-            release-check: false
-            # The semantic gate: the default suite; the heavy set is
-            # nightly (nextest's default-filter keeps it out of this step).
-            tests: full
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            # OCR/rerank/http stay off here (the aarch64 ONNX runtime
-            # deadlocks in its loader), as in the linux-arm64 release asset.
-            features: ''
-            extra-args: ''
-            release-check: false
-            # The smoke set runs the product binary's own tests on real
-            # arm64 hardware: PDF (PDFium is the C++ static that used to
-            # crash this lane), profile detection, extraction. The binary
-            # itself is started by "The shipped binary starts (aarch64)".
-            tests: smoke
+            suite: full
             rustflags: ''
           - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            # ONNX dlopens Microsoft's signed 1.23.2 dylib from
-            # beside the binary since #316; the smoke set runs the
-            # payload probe, which proves it loads (the exact check
-            # that would have caught v3.3.0's darwin-arm64
-            # regression).
             features: --features ocr,rerank
-            extra-args: ''
-            release-check: false
-            # Platform-specific value only: process spawn + restart
-            # policy, paths, profile detection, extraction. The suite
-            # itself is Linux's job (see the Test steps below).
-            tests: smoke
-          - name: macos-x86_64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            # ONNX dlopens here too since #316 (Microsoft's signed
-            # 1.23.2 dylib), so the smoke set runs the same payload
-            # probe as arm64.
-            features: --features ocr,rerank
-            extra-args: ''
-            release-check: false
-            # The slowest runner in the matrix, and the only one that used
-            # to run no binaries at all: its full-suite run died at this
-            # step's 30 minute timeout mid-compile, so the lane was left as
-            # a compile-check. It runs the SMOKE set now, not the full
-            # suite: the platform-exclusive surface is thin and macos-arm64
-            # already covers it (process spawn + restart policy, paths,
-            # profile detection, extraction), so what this adds is that the
-            # Intel arch stops being test-free, and macOS-exclusive code
-            # gets a second architecture's worth of exercise.
-            #
-            # Affordable now because the integration tests are one binary
-            # instead of ten (the ten MSVC/macOS links were the cost that
-            # made this lane's suite unaffordable), which is why it is
-            # being tried again rather than left as it was.
-            tests: smoke
+            suite: platform
+            rustflags: ''
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            # Core tests: linking 305MB of static ONNX on MSVC is a
-            # release-time cost anymore (see release.yml payload gate).
             features: ''
-            extra-args: ''
-            release-check: true
-            tests: none
+            suite: platform
+            rustflags: ''
+          # Nightly only: the aarch64 Linux asset, built and started on the
+          # hardware it ships to (PDFium's CREL relocations and the loader
+          # behaviour that once crashed call_init are arm64 concerns).
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: ''
+            suite: none
+            rustflags: ''
 
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98
+      - uses: dtolnay/rust-toolchain@1.98
         with:
-          targets: ${{ matrix.target }}
-          # Minimal profile: clippy/rustfmt exist only where named.
-          # Clippy also runs on Windows — ghost/proc.rs is entirely
-          # #[cfg(windows)], so a Linux-only lint pass never sees it.
-          components: ${{ (matrix.os == 'ubuntu-latest' && 'clippy, rustfmt') || (matrix.os == 'windows-latest' && 'clippy') || '' }}
-
-      - name: Install Go
-        uses: actions/setup-go@v7
+          components: clippy
+      - uses: actions/setup-go@v7
+        if: runner.os != 'Windows'
         with:
           go-version: '>=1.22.0'
-
-      - name: Install NASM (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        timeout-minutes: 5
+      - name: Install nasm (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-
-      - name: Install NASM (macOS)
-        if: startsWith(matrix.os, 'macos')
+      - name: Install nasm (macOS)
+        if: runner.os == 'macOS'
         run: brew install nasm
-
-      - name: Install NASM (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Install nasm (Windows)
+        if: runner.os == 'Windows'
         run: choco install nasm -y
         shell: cmd
 
-      - name: Install LLVM (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: KyleMayes/install-llvm-action@v2
+      # ~/.cargo (index + .crate archives) only. The compiled tree lives in
+      # the cache below, which this action must not manage: its seven-day
+      # cleanup would delete artifacts the build still uses (CACHING.md).
+      - name: Cache ~/.cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          version: "11.0"
-          directory: ${{ runner.temp }}/llvm
+          cache-targets: false
+          save-if: ${{ github.event_name != 'pull_request' }}
 
-      - name: Set LIBCLANG_PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          $clang = (Get-Command clang).Source
-          $libclangPath = Split-Path $clang
-          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Add NASM to PATH (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: powershell
-        run: |
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
-
-      # Caching is explained in .github/workflows/CACHING.md. Two caches:
-      # ~/.cargo via rust-cache, target/ via actions/cache with a sweep
-      # before saving. DEP_HASH ignores donsetch's own version, so a
-      # release commit keeps the cache warm.
       - name: Compute version-insensitive dep hash
         shell: bash
         run: echo "DEP_HASH=$(python3 scripts/dep-hash.py)" >> "$GITHUB_ENV"
 
-      # Build-shape part of the key. Windows is keyed `full` on every
-      # event, so its check-only PRs restore master's test-built tree.
-      # Safe only because PRs never save (CACHING.md, "Pull requests
-      # never save").
-      - name: Compute cache kind
-        shell: bash
-        run: |
-          KIND='${{ matrix.tests }}'
-          if [ '${{ matrix.name }}' = 'windows-x86_64' ]; then
-            KIND=full
-          fi
-          echo "CACHE_KIND=$KIND" >> "$GITHUB_ENV"
-
-      # Key: tgt-<target>-<kind>-<rustc>-v1-<DEP_HASH>-<WF_HASH>. A miss
-      # falls back to the newest older entry. WF_HASH (this file) makes
-      # any change to how a lane builds re-save. Bump v1 for a cold
-      # reset. CACHING.md, "The target/ key".
+      # One tree for the whole workspace (product + core). The key is the
+      # target, the dependency hash and a hash of THIS workflow; a change to
+      # the build recipe falls back to the previous entry and reuses what
+      # cargo can.
       - name: Compute target/ cache key
         shell: bash
         run: |
-          RUSTC=$(rustc -vV | sed -n 's/^commit-hash: //p' | cut -c1-9)
-          WF_HASH=$(python3 -c "import hashlib; print(hashlib.sha256(open('.github/workflows/ci.yml', 'rb').read().replace(b'\r\n', b'\n')).hexdigest()[:8])")
-          PREFIX="tgt-${{ matrix.target }}-${CACHE_KIND}-${RUSTC}-v1-"
-          {
-            echo "TARGET_CACHE_PREFIX=$PREFIX"
-            echo "TARGET_CACHE_DEPS_PREFIX=${PREFIX}${DEP_HASH}-"
-            echo "TARGET_CACHE_KEY=${PREFIX}${DEP_HASH}-${WF_HASH}"
-          } >> "$GITHUB_ENV"
+          wf=$(sha256sum .github/workflows/ci.yml | cut -c1-8)
+          echo "TARGET_CACHE_KEY=tgt-${{ matrix.target }}-${{ env.DEP_HASH }}-${wf}" >> "$GITHUB_ENV"
 
-      # ~/.cargo only (CACHING.md, "Two caches per lane"). MUST run
-      # before the target/ restore: on a partial match it cleans
-      # target/ even with cache-targets false. SHA-pinned: v2 moves.
-      - name: Cache ~/.cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.target }}
-          cache-targets: "false"
-          cache-on-failure: "true"
-          # Pull requests never save, as for target/.
-          save-if: ${{ github.event_name != 'pull_request' }}
-
-      # Windows runners ship with last-access updates off, which would
-      # make the sweep delete the whole tree. Fail rather than risk it.
-      - name: Enable NTFS last-access updates (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          fsutil.exe behavior set disablelastaccess 0
-          fsutil.exe behavior query disablelastaccess | tee lastaccess.txt
-          grep -q 'Updates ENABLED' lastaccess.txt
-
-      # Most specific first: the same key (finds a red run's -partial-
-      # entry), the same deps under an older workflow, any older state.
       - name: Restore target/
         id: target-cache
         uses: actions/cache/restore@v6
@@ -264,164 +169,67 @@ jobs:
           path: target
           key: ${{ env.TARGET_CACHE_KEY }}
           restore-keys: |
-            ${{ env.TARGET_CACHE_KEY }}
-            ${{ env.TARGET_CACHE_DEPS_PREFIX }}
-            ${{ env.TARGET_CACHE_PREFIX }}
-
-      # Marks the start of the build for the sweep (CACHING.md, "Keeping
-      # the cache bounded"). Nothing may read target/ between the
-      # restore and here, not even `du`.
-      - name: Prepare target/ for the sweep
-        if: steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
-        shell: bash
-        run: python3 scripts/ci-sweep.py prepare
+            tgt-${{ matrix.target }}-${{ env.DEP_HASH }}-
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      # Full suite on the lanes with a native, warm toolchain. This step
-      # is also the COLD BUILD (a PR branch starts with an empty
-      # rust-cache, per-branch keys), so the timeout has to clear the
-      # slowest cold build; a hung TEST is caught by nextest's own
-      # per-test slow-timeout, not by this number.
-      - name: core alone on this architecture
-        if: matrix.name == 'linux-aarch64'
-        run: |
-          cd core
-          cargo test --release --locked --no-run
-          cargo test --release --locked --lib
-        timeout-minutes: 30
+      # The semantic gate. One clippy pass covers the product AND the core
+      # (workspace-wide), every target, tests included.
+      - name: Clippy (workspace, all targets)
+        if: matrix.suite == 'full' || matrix.suite == 'platform'
+        run: cargo clippy --profile ci ${{ matrix.features }} --all-targets -- -Dwarnings
 
-      # The gate the aarch64 lane lacked while its binary crashed in call_init:
-      # a fault that only shows at exec otherwise surfaces as nextest's
-      # "creating test list failed". Cause (2026-11-07): PDFium's archives carry
-      # CREL relocation sections, the runner's apt lld 18 skips them silently,
-      # and libc++'s iostream init keeps a null .init_array slot. build.rs links
-      # with the toolchain's rust-lld now; this step proves it on this hardware
-      # and, if it ever regresses, prints the evidence instead of a bare 139.
-      - name: The shipped binary starts (aarch64)
-        if: matrix.name == 'linux-aarch64'
-        timeout-minutes: 40
+      - name: The binary starts
+        if: matrix.suite != 'none'
+        shell: bash
         run: |
-          cargo build --profile ci ${{ matrix.features }} --target ${{ matrix.target }} --bin donsetch
-          BIN=./target/${{ matrix.target }}/ci/donsetch
-          readelf -p .comment "$BIN" | grep -i linker || true
-          if ! "$BIN" --version; then
-            echo "exit=$?"
-            echo '--- .init_array (a zero slot with no relocation is a null constructor)'
-            readelf -x .init_array "$BIN" | tail -8
-            readelf -rW "$BIN" | grep -c R_AARCH64_RELATIVE || true
-            sudo apt-get install -y -qq gdb >/dev/null 2>&1
-            gdb -batch -ex 'set pagination off' -ex run -ex 'bt 20' --args "$BIN" --version 2>&1 | tail -30
-            exit 1
-          fi
+          cargo build --profile ci ${{ matrix.features }} --bin donsetch
+          ./target/ci/donsetch --version
 
-      # A test list is not proof the binary runs: a fault that only shows at
-      # exec (the aarch64 lane hit exactly that) surfaced as nextest's
-      # "creating test list failed" instead of the crash itself. This starts
-      # the product binary the release will actually ship, on the host it
-      # will run on. One build: the fast profile is a local shape, not a
-      # release shape.
-      - name: The shipped binary starts
-        if: matrix.tests == 'full'
-        run: |
-          uname -a; getconf PAGESIZE
-          cargo build --profile ci ${{ matrix.features }} --target ${{ matrix.target }} --bin donsetch
-          ./target/${{ matrix.target }}/ci/donsetch --version
-        timeout-minutes: 40
-
-      - name: Test (nextest, full)
-        if: matrix.tests == 'full'
+      # The full suite: everything in the default filter. Emits the
+      # machine-readable log the budget guard reads.
+      - name: Test (full suite)
+        if: matrix.suite == 'full'
         env:
           NEXTEST_EXPERIMENTAL_LIBTEST_JSON: '1'
-        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }} --message-format libtest-json-plus > nextest.json
-        timeout-minutes: 60
-
-      # The suite is a tool, not a landfill: this fails when it grows or
-      # slows past tests/budget.json without a deliberate raise.
-      - name: Test budget
-        if: matrix.tests == 'full'
-        run: python3 scripts/test_budget.py --json nextest.json
-
-      # Everywhere else the risk is platform COMPILATION (cfg paths,
-      # linkage, process semantics), and the expensive part of a test run
-      # there is the link, not the test count. So: clippy --all-targets
-      # compiles every target on those lanes, and this smoke set runs the
-      # tests whose value is genuinely platform-specific.
-      # The heavy set (soak/corpus/landmarks/live) runs in the nightly
-      # `heavy` job and in every platform's full matrix there.
-      # This step includes a cold native compile/link, just like the full
-      # lane. Per-test hangs remain bounded by nextest's 30-second timeout.
-      - name: Test (nextest, smoke)
-        if: matrix.tests == 'smoke'
-        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} -E 'test(mcp::supervisor) | test(profile::) | test(extract::) | test(pdf::) | test(ghost::) | test(onnx::)'
-        timeout-minutes: 60
-
-      # The cross-platform check for the lanes that run no suite: compile
-      # every target (tests included, no LINK). This is what keeps those
-      # lanes meaningful, and on macos-x86_64 it is the only per-push
-      # compilation of darwin-x86_64, which is a release target.
-      - name: Compile-check all targets (no test link)
-        if: matrix.tests == 'none' && matrix.name != 'windows-x86_64'
-        run: cargo check --profile ci --all-targets ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --workspace --message-format libtest-json-plus > nextest.json
         timeout-minutes: 30
 
-      # Windows is the only place a Windows-shaped test can fail, and this
-      # lane has been compile-only since 6bb584e, so a test whose fixture
-      # happens not to exist on Windows could not turn anything red
-      # (2026-09-19: a new doctor test used a path-form command and failed
-      # only under a local Windows run; #261). PR cycles stay cheap here:
-      # master pushes, tags and the nightly run the suite, and since the
-      # release gate reads the CI conclusion for the tag's SHA, a Windows
-      # test failure blocks the mint instead of surfacing after it.
-      - name: Test (nextest, Windows core suite, non-PR)
-        if: matrix.name == 'windows-x86_64' && github.event_name != 'pull_request'
-        run: cargo nextest run --profile ci --cargo-profile ci --target ${{ matrix.target }} ${{ matrix.extra-args }}
-        timeout-minutes: 60
+      - name: Test budget
+        if: matrix.suite == 'full'
+        run: python3 scripts/test_budget.py --json nextest.json
 
-      # Windows: compile-check the release feature set without the
-      # 305MB MSVC static link. Catches feature-gating typos and
-      # ort-sys build-script breakage at merge time; the real link
-      # and the payload gates run at release time.
-      - name: Compile-gate release features (Windows)
-        if: matrix.release-check
-        run: cargo check --profile ci --features ocr,rerank,http --target ${{ matrix.target }}
-        timeout-minutes: 15
-
-      # Two platforms, because ~32 cfg sites are Windows-exclusive
-      # (all of ghost/proc.rs) and Linux clippy never compiles them.
-      # macOS adds only one exclusive site — its other paths are
-      # `unix` (shared with Linux) or `not(linux_like)` (shared with
-      # Windows), so both are already covered here.
-      #
-      # --all-targets pulls in #[cfg(test)] modules and tests/*.rs,
-      # which the default lib+bins pass leaves unlinted.
-      # --profile ci reuses the test artifact graph (no recompile).
-      - name: Clippy
-        if: matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest'
-        run: cargo clippy --profile ci ${{ matrix.features }} --all-targets -- -Dwarnings
-        timeout-minutes: 15
-
-      - name: Format check
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo fmt --all -- --check
-
-      # ── Save target/. Keep these the LAST steps: the sweep deletes
-      # whatever the earlier steps did not read. Pull requests never
-      # save (CACHING.md, "Pull requests never save").
-
-      # Green run: keep only what this run used, drop donsetch's own
-      # units (every commit rebuilds them), save under the exact key.
-      - name: Sweep target/
-        id: sweep
-        if: success() && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+      # Platform-specific value only: process spawn and restart policy,
+      # paths, profile detection, PDF (the C++ static that once crashed an
+      # arm64 lane), extraction, MCP supervisor. A test here is one whose
+      # behaviour differs on this OS; the rest is linux's job above.
+      - name: Test (platform suite)
+        if: matrix.suite == 'platform'
         shell: bash
-        run: |
-          python3 scripts/ci-sweep.py sweep
-          cargo clean -p donsetch --profile ci --target ${{ matrix.target }}
-          cargo clean -p donsetch --profile ci
+        env:
+          # The Windows lane runs the core suite only on master: a Redmond
+          # path quirk would otherwise block every PR.
+          EXTRA: ${{ (matrix.name == 'windows-x86_64' && github.event_name == 'pull_request') && '-E test(none)' || '' }}
+        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} -E 'test(mcp::supervisor) | test(profile::) | test(pdf::) | test(extract::) | test(onnx::) | test(ghost::)' ${{ env.EXTRA }}
+        timeout-minutes: 30
+
+      # The release feature set must COMPILE on Windows; linking 300 MB of
+      # MSVC ONNX is a tag-time cost (release.yml), not a per-push one.
+      - name: Compile the release feature set (Windows)
+        if: matrix.name == 'windows-x86_64'
+        run: cargo check --profile ci --features ocr,rerank,http
+        timeout-minutes: 15
+
+      # The scorecard echo, rendered by the installed browser and diffed
+      # against the local fetch: the one check that proves the identity
+      # stack against a real Chrome on this platform.
+      - name: Stealth parity
+        if: matrix.name == 'linux-x86_64' && github.event_name != 'pull_request'
+        run: ./target/ci/donsetch doctor --stealth --parity --json | head -40
+        timeout-minutes: 10
 
       - name: Save target/
         if: success() && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
@@ -430,282 +238,63 @@ jobs:
           path: target
           key: ${{ env.TARGET_CACHE_KEY }}
 
-      # Red run, timeouts included: save UNSWEPT under a -partial- key so
-      # the next run resumes (CACHING.md, "When a run fails"). First stop
-      # leftover compilers, which keep writing after a step times out;
-      # TERM before KILL so make and cc can delete half-written output.
-      - name: Stop leftover build processes (red run)
-        if: failure() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && steps.sweep.outcome == 'skipped' && github.event_name != 'pull_request'
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = Windows ]; then
-            names="cargo.exe cargo-nextest.exe rustc.exe build-script-build.exe cl.exe link.exe lld-link.exe cmake.exe"
-            for p in $names; do taskkill //T //IM "$p" >/dev/null 2>&1 || true; done
-            sleep 10
-            for p in $names; do taskkill //F //T //IM "$p" >/dev/null 2>&1 || true; done
-          else
-            names='cargo|cargo-nextest|rustc|build-script-build|cc|c\+\+|cc1|cc1plus|as|ld|ld\.lld|clang|cmake|make'
-            pkill -TERM -x "$names" || true
-            sleep 10
-            pkill -KILL -x "$names" || true
-          fi
-          sleep 2
-
-      - name: Save partial target/ (red run, unswept)
-        if: failure() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && steps.sweep.outcome == 'skipped' && github.event_name != 'pull_request'
-        uses: actions/cache/save@v6
-        with:
-          path: target
-          key: ${{ env.TARGET_CACHE_KEY }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
-
-  # ── Supply chain: licenses + RustSec advisories + sources ──
-  supply-chain:
-    name: cargo-deny
+  # ── Nightly only ───────────────────────────────────────────────────
+  # The tests that are real but too expensive for a push: soak, corpus
+  # PDFs, landmark runs, timing ceilings. They are excluded from the
+  # default suite by .config/nextest.toml; this lifts that filter.
+  heavy:
+    name: heavy
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
-      - name: Check advisories + licenses + bans + sources
-        run: cargo deny --all-features check --hide-inclusion-graph
-
-  # ── core, the fetch engine, is its own crate with its own lockfile:
-  # the product suite only reaches it through the product's API, so its
-  # own offline suite (loopback servers, no network) runs here. The
-  # network tests are #[ignore]d and stay a local, egress-gated run.
-  core:
-    name: core
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98
-        with:
-          components: clippy
-      - name: Install Go
-        uses: actions/setup-go@v7
+      - uses: dtolnay/rust-toolchain@1.98
+      - uses: actions/setup-go@v7
         with:
           go-version: '>=1.22.0'
-      - name: Install NASM
-        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-      - name: Cache ~/.cargo and core/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: core
-          save-if: ${{ github.event_name != 'pull_request' }}
-      # The cache keeps v8's build-script fingerprint but not the archive it
-      # downloaded into target/release/gn_out, so a v8 rebuild fails to link
-      # ("could not find native static library rusty_v8"). Without the
-      # archive, the build script runs again and fetches it.
-      - name: Re-fetch the V8 archive the cache dropped
-        working-directory: core
-        run: |
-          if [ ! -s target/release/gn_out/obj/librusty_v8.a ]; then
-            rm -rf target/release/.fingerprint/v8-* target/release/build/v8-*
-          fi
-      - name: Test
-        working-directory: core
-        run: cargo test --release --locked
-      - name: Clippy
-        working-directory: core
-        run: cargo clippy --release --all-targets --locked -- -Dwarnings
-
-  # ── The npm wrapper's installer logic: resolution order, unwritable
-  # installs (#361), atomic landing, wrapper passthrough. npm is the
-  # primary install path, so any push touching the package keeps these
-  # green. No rust toolchain needed: plain node, seconds.
-  npm-installer:
-    name: npm-installer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-      - name: Run the npm installer suite
-        working-directory: npm
-        run: node --test --test-timeout=90000 tests/*.test.js
-
-  # ── Heavy: the tests too slow for a per-push run (soak holds the
-  # process for minutes, corpus/landmark runs parse whole fixture trees,
-  # the live ones need the network) plus all five fuzz targets. Nightly
-  # and on dispatch. PRs and master pushes run the same suite minus the
-  # heavy set, on every platform.
-  heavy:
-    name: heavy (${{ matrix.name }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-    steps:
-      - uses: actions/checkout@v7
-      # Same pin as build-test and rust-toolchain.toml: `@stable` let
-      # this job drift to whatever stable is on the nightly date.
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98
-        with:
-          targets: ${{ matrix.target }}
-      - name: Compute version-insensitive dep hash
-        shell: bash
-        run: echo "DEP_HASH=$(python3 scripts/dep-hash.py)" >> "$GITHUB_ENV"
-
-      # The ci-profile heavy tree has its own build shape and cache.
-      - name: Compute cache kind
-        shell: bash
-        run: echo "CACHE_KIND=heavy" >> "$GITHUB_ENV"
-
-      - name: Compute target/ cache key
-        shell: bash
-        run: |
-          RUSTC=$(rustc -vV | sed -n 's/^commit-hash: //p' | cut -c1-9)
-          WF_HASH=$(python3 -c "import hashlib; print(hashlib.sha256(open('.github/workflows/ci.yml', 'rb').read().replace(b'\r\n', b'\n')).hexdigest()[:8])")
-          PREFIX="tgt-${{ matrix.target }}-${CACHE_KIND}-${RUSTC}-v1-"
-          {
-            echo "TARGET_CACHE_PREFIX=$PREFIX"
-            echo "TARGET_CACHE_DEPS_PREFIX=${PREFIX}${DEP_HASH}-"
-            echo "TARGET_CACHE_KEY=${PREFIX}${DEP_HASH}-${WF_HASH}"
-          } >> "$GITHUB_ENV"
-
-      # ~/.cargo only (CACHING.md, "Two caches per lane"). MUST run
-      # before the target/ restore: on a partial match it cleans
-      # target/ even with cache-targets false. SHA-pinned: v2 moves.
-      - name: Cache ~/.cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.target }}
-          cache-targets: "false"
-          cache-on-failure: "true"
-          # Pull requests never save, as for target/.
-          save-if: ${{ github.event_name != 'pull_request' }}
-
-      - name: Restore target/
-        id: target-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: target
-          key: ${{ env.TARGET_CACHE_KEY }}
-          restore-keys: |
-            ${{ env.TARGET_CACHE_KEY }}
-            ${{ env.TARGET_CACHE_DEPS_PREFIX }}
-            ${{ env.TARGET_CACHE_PREFIX }}
-
-      # Marks the start of the build for the sweep (CACHING.md, "Keeping
-      # the cache bounded"). Nothing may read target/ between the
-      # restore and here, not even `du`.
-      - name: Prepare target/ for the sweep
-        if: steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
-        shell: bash
-        run: python3 scripts/ci-sweep.py prepare
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+          cache-targets: false
+      - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - name: Heavy suite (soak, corpus, landmarks, live)
-        run: cargo nextest run --profile ci --cargo-profile ci --target ${{ matrix.target }} --ignore-default-filter -E 'test(soak) | test(corpus) | test(landmark) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling)' --no-fail-fast
-        timeout-minutes: 90
+      - name: Heavy set
+        run: cargo nextest run --profile ci --cargo-profile ci --features ocr,rerank,http --workspace --ignore-default-filter -E 'test(soak) | test(corpus) | test(landmark) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling)' --no-fail-fast
+        timeout-minutes: 45
 
-      - name: Sweep target/
-        id: sweep
-        if: success() && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
-        shell: bash
-        run: |
-          python3 scripts/ci-sweep.py sweep
-          cargo clean -p donsetch --profile ci --target ${{ matrix.target }}
-          cargo clean -p donsetch --profile ci
-
-      - name: Save target/
-        if: success() && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
-        uses: actions/cache/save@v6
-        with:
-          path: target
-          key: ${{ env.TARGET_CACHE_KEY }}
-
-      # Red run, timeouts included: save UNSWEPT under a -partial- key so
-      # the next run resumes (CACHING.md, "When a run fails"). First stop
-      # leftover compilers, which keep writing after a step times out;
-      # TERM before KILL so make and cc can delete half-written output.
-      - name: Stop leftover build processes (red run)
-        if: failure() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && steps.sweep.outcome == 'skipped' && github.event_name != 'pull_request'
-        shell: bash
-        run: |
-          if [ "$RUNNER_OS" = Windows ]; then
-            names="cargo.exe cargo-nextest.exe rustc.exe build-script-build.exe cl.exe link.exe lld-link.exe cmake.exe"
-            for p in $names; do taskkill //T //IM "$p" >/dev/null 2>&1 || true; done
-            sleep 10
-            for p in $names; do taskkill //F //T //IM "$p" >/dev/null 2>&1 || true; done
-          else
-            names='cargo|cargo-nextest|rustc|build-script-build|cc|c\+\+|cc1|cc1plus|as|ld|ld\.lld|clang|cmake|make'
-            pkill -TERM -x "$names" || true
-            sleep 10
-            pkill -KILL -x "$names" || true
-          fi
-          sleep 2
-
-      - name: Save partial target/ (red run, unswept)
-        if: failure() && steps.target-cache.outcome == 'success' && steps.target-cache.outputs.cache-hit != 'true' && steps.sweep.outcome == 'skipped' && github.event_name != 'pull_request'
-        uses: actions/cache/save@v6
-        with:
-          path: target
-          key: ${{ env.TARGET_CACHE_KEY }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
-
-  # ── Fuzz smoke: short bursts keep the corpus warm and catch shallow
-  # panics before users do. Daemon aborts are the worst failure mode for
-  # an MCP server. One target on pull requests (the wall-clock cost of
-  # five was the same as one but the runner bill was not), all five on
-  # master pushes and nightly.
+  # All five fuzz targets, nightly. A push runs one (PRs) or none: a
+  # fuzz target is a long-running search, not a per-commit verdict.
   fuzz:
     name: fuzz (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Dynamic, NOT a job-level `if` on matrix.target: the job-level
-        # condition is evaluated before the matrix expands, so referring
-        # to matrix there is not reliable. One target on pull requests, the
-        # two highest-change targets on master pushes, all five nightly.
-        target: ${{ fromJSON(github.event_name == 'pull_request' && '["extract"]' || (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["extract","charset","paginate","sitemap","feed"]' || '["extract","feed"]') }}
+        target: [extract, charset, paginate, sitemap, feed]
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-          # -Zbuild-std needs rust-src. We fuzz the GNU target —
-          # boring-sys (BoringSSL C++) has no musl cross toolchain
-          # here and doesn't need one.
           targets: x86_64-unknown-linux-gnu
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: Install Go
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: '>=1.22.0'
-      - name: Install build deps (boring-sys)
-        run: |
+      - run: |
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y --no-install-recommends cmake nasm libclang-dev
-      - name: Fuzz (90s smoke)
+      - name: Fuzz (90s)
         working-directory: fuzz
         run: |
           mkdir -p corpus/${{ matrix.target }} artifacts/${{ matrix.target }}
           cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -s none -- -max_total_time=90 -artifact_prefix=artifacts/${{ matrix.target }}/
-      - name: Upload crash artifacts
+      - uses: actions/upload-artifact@v7
         if: failure()
-        uses: actions/upload-artifact@v7
         with:
-          name: crash-${{ matrix.target }}
-          path: fuzz/artifacts/
-          if-no-files-found: ignore
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/

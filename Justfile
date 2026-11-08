@@ -89,7 +89,7 @@ clean-bloat:
 # Instant size report: what each shell of the build tree costs, and how
 # much of the incremental caches is already reclaimable.
 space:
-	@du -shx target core/target fuzz/target 2>/dev/null || true
+	@du -shx target fuzz/target 2>/dev/null || true
 	@du -shx target/*/ 2>/dev/null | sort -rh | head -8
 	@sh scripts/guard.sh --report
 

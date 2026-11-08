@@ -812,7 +812,7 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
     // extracted under a new hash: start from nothing and re-fetch.
     let _ = fs::remove_file(&tarball);
     eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
-    if !download_release_asset(&tarball, &info.url) {
+    if !download_release_asset(&tarball, info.url) {
         panic!("ONNX: download failed for {}", info.url);
     }
 

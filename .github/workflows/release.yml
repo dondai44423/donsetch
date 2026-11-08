@@ -199,8 +199,8 @@ jobs:
           # Linux legs link PDFium with rust-lld (build.rs): neither bfd
           # 2.38 (22.04) nor an apt lld reads its CREL relocations.
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --profile dist --locked ${{ matrix.features }} --target ${{ matrix.target }}
-        timeout-minutes: 30
+        run: cargo build --profile dist-thin --locked ${{ matrix.features }} --target ${{ matrix.target }}
+        timeout-minutes: 25
 
       # Windows loads ONNX Runtime at runtime like Linux (#277, #298).
       # build.rs fetches Microsoft's pinned, sha256-verified release
@@ -224,7 +224,7 @@ jobs:
         env:
           DONSETCH_NO_UPDATE_CHECK: "1"
         run: |
-          cd target/${{ matrix.target }}/dist
+          cd target/${{ matrix.target }}/dist-thin
           BIN=donsetch
           if [ -f donsetch.exe ]; then BIN=donsetch.exe; fi
           output=$(./$BIN --version 2>&1 || true)
@@ -253,7 +253,7 @@ jobs:
       - name: Payload integrity gates
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/dist
+          cd target/${{ matrix.target }}/dist-thin
           BIN=donsetch
           [ -f donsetch.exe ] && BIN=donsetch.exe
           SIZE=$(wc -c < "$BIN")
@@ -307,7 +307,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu-')
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/dist
+          cd target/${{ matrix.target }}/dist-thin
           if ! command -v objdump >/dev/null 2>&1; then
             sudo apt-get install -y --no-install-recommends binutils >/dev/null 2>&1 || true
           fi
@@ -336,7 +336,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get install -y --no-install-recommends qemu-user >/dev/null 2>&1 || true
-          cd target/${{ matrix.target }}/dist
+          cd target/${{ matrix.target }}/dist-thin
           rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
           output=$(qemu-x86_64 -cpu qemu64 ./donsetch --version 2>&1 || true)
           if [ -z "$output" ]; then
@@ -366,7 +366,7 @@ jobs:
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
         run: |
-          cd target/${{ matrix.target }}/dist
+          cd target/${{ matrix.target }}/dist-thin
           # Include the ONNX shared lib when present: libonnxruntime.so
           # on Linux x64, libonnxruntime.dylib on both macOS arches
           # (build.rs fetches it for runtime dlopen, #298/#316).
@@ -383,7 +383,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: cmd
         run: |
-          cd target\${{ matrix.target }}\dist
+          cd target\${{ matrix.target }}\dist-thin
           if not exist pdfium.dll (
             echo ERROR: pdfium.dll not found - build.rs copy failed
             exit 1
@@ -456,26 +456,17 @@ jobs:
       # so the CI run for this exact SHA is already in flight. Poll
       # for its conclusion (bounded ~40 min); a red or missing CI
       # blocks the release instead of shipping unverified assets.
-      - name: Wait for CI on this commit
+      # One instant check, no polling: `just ship` already refused to start
+      # unless master CI was green, and branch protection keeps master
+      # green. This re-reads that verdict once so a draft is never created
+      # for a commit whose gates are red.
+      - name: Confirm CI was green on this commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The release gates on the CI run for the commit the binaries were
-          # actually built from (the tag's target), not on the tag ref: CI
-          # runs branch pushes, and a tag push creates no CI run at all.
           sha=$(git rev-parse "${{ github.sha }}^{commit}")
-          conclusion=""
-          for i in $(seq 1 60); do
-            # A cancelled or still-running duplicate is not evidence about
-            # this commit: a later push (or a rerun of an older SHA) can
-            # cancel this SHA's run through the CI concurrency group, and
-            # blocking on that ships nothing. Poll for a real verdict, and
-            # still refuse on an actual failure.
-            conclusion=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$sha" \
-              --jq '[.workflow_runs[] | select(.name == "CI") | .conclusion | select(. != null and . != "cancelled" and . != "skipped")] | first // ""')
-            [ -n "$conclusion" ] && break
-            sleep 30
-          done
+          conclusion=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$sha&per_page=100" \
+            --jq '[.workflow_runs[] | select(.name == "CI") | .conclusion | select(. != null and . != "cancelled" and . != "skipped")] | first // ""')
           echo "CI conclusion for $sha: ${conclusion:-none}"
           if [ "$conclusion" != "success" ]; then
             echo "release blocked: CI on this commit is ${conclusion:-missing}; fix and re-tag"

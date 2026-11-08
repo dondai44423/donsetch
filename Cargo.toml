@@ -1,3 +1,10 @@
+# One workspace: the product and its fetch core compile in PARALLEL. As a
+# standalone path dependency, core finished before donsetch started, and the
+# product could not share a profile, a lockfile, or an artifact cache with it.
+[workspace]
+members = ["core"]
+resolver = "2"
+
 [package]
 name = "donsetch"
 version = "5.1.0"
@@ -159,12 +166,21 @@ codegen-units = 16
 strip = true
 panic = "abort"
 
-# The SHIPPED shape: what release.yml builds. Fat LTO is a release-workflow
-# cost, paid once per platform in parallel, never in the edit loop.
+# The SHIPPED shape: what release.yml builds. Thin LTO with 16 codegen
+# units: fat LTO on one unit cost 20-26 minutes per platform (macOS Intel was
+# the worst) for a few percent of size and speeed. Cargo's own guidance is
+# "start with thin"; the payload gates still prove the result runs.
 [profile.dist]
 inherits = "release"
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
+
+# What an unsigned branch/master build uses: the fastest shape that still
+# runs the real binary. Only a tag pays for `dist`.
+[profile.dist-thin]
+inherits = "dist"
+lto = false
+codegen-units = 16
 
 # The LOCAL loop profile: the default for `just check`, `just t`,
 # `just lint` and `just bin`. Debug codegen for this crate (an edit

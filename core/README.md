@@ -5,13 +5,17 @@ carried state, the site's own interface in front of its walled document, and an
 in-process V8 engine that runs a challenge page's own scripts when a wall demands
 it. One Rust binary, no browser, no layout, no rasteriser.
 
-The crate is the repo-root `core/`. Run every command below from there.
+The crate is the repo-root `core/`, a member of the repo workspace: build and
+test it from the repo root with `-p donsetch-core` (`cargo test -p
+donsetch-core`), so it shares the lockfile and the target cache with the
+product. The commands below run the crate's own binary.
 `hard-corpus.json`, `fixtures/` and `runs/` are private working material
 (git-ignored); this README is tracked.
 
 ```sh
 # build (vendored wreq/btls; V8 arrives as a prebuilt static library via deno_core)
-cargo build --release
+# from the repo root; the artifacts land in the shared ./target
+cargo build -p donsetch-core --release
 
 # one fetch: portfolio selection, pacing, state spent and earned
 V5_PERSONA=~/Projects/donsetch-evidence/research/persona/chrome-local.json \

@@ -34,13 +34,3 @@ url = "2"
 # HTML parsing only: contracts are verified against the served document.
 # This is a parser, not a browser: no scripts, no layout, no rendering.
 scraper = "0.27"
-
-[patch.crates-io]
-wreq = { path = "vendor/wreq" }
-btls-sys = { path = "vendor/btls-sys" }
-
-[profile.release]
-opt-level = 2
-lto = "thin"
-codegen-units = 1
-strip = "symbols"

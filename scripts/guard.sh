@@ -38,9 +38,10 @@
 #
 # Ceiling 55000M. The floor under it is the warm artifact set measured after
 # the 2026-11-08 profile split: fast ~22G (deps at opt-level 1), ci ~7G,
-# core/target ~7.6G, sccache <=10G (its own cap), a 3-day incremental window
-# ~8G. ~45G is what a healthy tree costs; 55G leaves room for one `dist`
-# release-verification tree (~10G). A crossing means rot, not the ladder.
+# sccache <=10G (its own cap), a 3-day incremental window ~8G. One workspace
+# means one target dir (the core builds into it since core/ joined the
+# workspace). ~45G is what a healthy tree costs; 55G leaves room for one
+# `dist` release-verification tree (~10G). A crossing means rot, not the ladder.
 #
 # Callers:
 #   scripts/budget.sh (every build/test/fuzz)       --prune-stale
@@ -67,7 +68,7 @@ esac
 # counts toward the ceiling so its cache cannot hide outside it. Review
 # worktrees under target/wt* are already inside `target`.
 target_dirs() {
-    for t in target core/target fuzz/target; do
+    for t in target fuzz/target; do
         if [ -d "$t" ]; then
             printf '%s\n' "$t"
         fi
