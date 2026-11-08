@@ -496,6 +496,58 @@ fn a_page_about_browsers_is_content() {
     assert_eq!(verdict(imperative), Verdict::Content);
 }
 
+// federalregister.gov and openreview.net served to a flagged client
+// (2026-11-08): a headline that is the check, over the explanation of it.
+#[test]
+fn a_bot_check_or_access_refusal_is_a_notice() {
+    let federal = r#"<body><header><a href="/my/sign_in">Sign in</a><a href="/my/sign_up">Sign up</a><a href="/my/clippings">My Clipboard</a></header><main><h1>Request Access</h1>
+        <p>Due to aggressive automated scraping of FederalRegister.gov and eCFR.gov, programmatic access to these sites is limited to access to our extensive developer APIs.</p>
+        <p>Your request has been flagged as potentially automated. If you are human user receiving this message, please complete the CAPTCHA (bot test) below and click "Request Access".</p>
+        <form><button>Request Access</button></form></main><footer><p>An official website of the United States government</p></footer></body>"#;
+    let openreview = r#"<body><nav><a href="/">OpenReview.net</a></nav><main><h1>Verifying your browser</h1>
+        <h2>Complete the check below to continue to OpenReview</h2><p>Please complete the verification above.</p>
+        <p>Have an OpenReview account? <a href="/login">Sign in</a> to skip this check.</p></main></body>"#;
+    for (page, quote) in [
+        (federal, "Request Access"),
+        (openreview, "Verifying your browser"),
+    ] {
+        let read = assess(&Html::parse_document(page), "https://example.test/");
+        assert_eq!(read.verdict, Verdict::Notice, "{page}");
+        assert_eq!(read.notice.as_deref(), Some(quote));
+    }
+    for headline in [
+        "Just a moment...",
+        "Checking your browser before accessing example.com",
+        "Access to this page has been denied",
+        "Are you a robot?",
+        "Sorry, you have been blocked",
+    ] {
+        let page = format!(
+            "<body><h1>{headline}</h1><p>This process is automatic and your browser will redirect to the requested content shortly.</p></body>"
+        );
+        // A notice, or (for "Just a moment...") a loading placeholder.
+        let read = verdict(&page);
+        assert!(
+            matches!(read, Verdict::Notice | Verdict::Loading),
+            "{headline}: {read:?}"
+        );
+    }
+}
+
+#[test]
+fn an_article_about_bot_checks_is_content() {
+    for article in [
+        r#"<body><main><h1>Access denied: what a 403 error means</h1>
+        <p>A 403 response says the server understood the request and refuses to authorize it, usually for lack of permission.</p></main></body>"#,
+        r#"<body><main><h1>Security check-in tips for busy airports</h1>
+        <p>Arrive two hours early, keep liquids in a clear bag and take laptops out before the scanner.</p></main></body>"#,
+        r#"<body><main><h1>Verifying your browser's extensions before a release</h1>
+        <p>Load the unpacked build, open the extensions page and confirm that the permissions match the manifest.</p></main></body>"#,
+    ] {
+        assert_eq!(verdict(article), Verdict::Content, "{article}");
+    }
+}
+
 // heineken.com served to a reader without the age cookie (2026-11-08): the
 // headline asks the birth date over a country list and a province picker.
 #[test]

@@ -663,6 +663,19 @@ static AGE_GATE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("age gate pattern")
 });
 
+/// A headline that is a bot check or an access refusal standing in for the
+/// page: the whole headline is the check ("Verifying your browser", "Just a
+/// moment...", "Request Access", "Access denied", "Are you a robot?"),
+/// optionally followed by where it applies ("before accessing example.com").
+/// A headline that goes on ("Access denied: what a 403 means") heads an
+/// article.
+static CHECK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^\W*((please\s+)?(wait\s+while\s+we\s+)?(verifying|checking|verify|check)\s+(that\s+)?(your|the)\s+(browser|connection|device|request|access)|(verifying|verify|confirm)\s+(that\s+)?you\s+are\s+(a\s+)?human|are\s+you\s+a\s+(robot|human|bot)|just\s+a\s+moment|one\s+more\s+step|request(ing)?\s+access|you\s+need\s+(access|permission)|access\s+(denied|blocked|restricted|to\s+this\s+page\s+has\s+been\s+(denied|blocked))|(sorry,?\s+)?you\s+have\s+been\s+blocked|(security|bot|human|browser)\s+(check|verification|test))(\s+(before|to|for|on)\b.{0,80})?\W*$",
+    )
+    .expect("check pattern")
+});
+
 static LOADING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)^(loading|please wait|one moment|just a moment|connecting|initiali[sz]ing|starting|fetching|preparing|finding|searching|redirecting|processing|waiting|checking)\b",
@@ -1483,8 +1496,9 @@ pub fn assess(doc: &Html, url: &str) -> Page {
 
     let mut kinds = Vec::with_capacity(w.units.len());
     let mut auth_level: Option<u8> = None;
-    // A page whose headline refuses the reader's browser, or asks the
-    // reader's age before letting them in, is that notice: what stands
+    // A page whose headline refuses the reader's browser, checks it for a
+    // bot, refuses access, or asks the reader's age before letting them in,
+    // is that notice: what stands
     // under the headline (an apology, a help link, a list of browsers to
     // install, the drink-responsibly line) is the notice too. Any later
     // heading ends it, so an article under such a headline keeps its
@@ -1495,6 +1509,10 @@ pub fn assess(doc: &Html, url: &str) -> Page {
     let mut headline: Option<(usize, String)> = None;
     let mut headline_units: Vec<usize> = Vec::new();
     let mut past_headline = false;
+    // Whether text other than headings has followed the headline: until it
+    // does, a heading is the headline's subtitle ("Verifying your browser"
+    // over "Complete the check below"), not a section of its own.
+    let mut body_seen = false;
     let mut refusal_headline: Option<String> = None;
     let mut rows: Vec<(usize, usize)> = Vec::new();
     for u in &w.units {
@@ -1504,13 +1522,14 @@ pub fn assess(doc: &Html, url: &str) -> Page {
                     text.push(' ');
                     text.push_str(u.text.trim());
                 }
+                Some(_) if !body_seen => {}
                 Some(_) => past_headline = true,
                 None => headline = Some((u.ctx.heading_id, u.text.trim().to_string())),
             }
             refusal = !past_headline
-                && headline
-                    .as_ref()
-                    .is_some_and(|(_, t)| REFUSAL.is_match(t) || AGE_GATE.is_match(t));
+                && headline.as_ref().is_some_and(|(_, t)| {
+                    REFUSAL.is_match(t) || AGE_GATE.is_match(t) || CHECK.is_match(t)
+                });
             if !past_headline {
                 headline_units.push(kinds.len());
             }
@@ -1527,6 +1546,8 @@ pub fn assess(doc: &Html, url: &str) -> Page {
                     }
                 }
             }
+        } else if u.ctx.heading == 0 && !u.ctx.frame && headline.is_some() {
+            body_seen = true;
         }
         if u.ctx.heading > 0 {
             if auth_level.is_some_and(|l| u.ctx.heading <= l) {
@@ -1630,6 +1651,11 @@ pub fn assess(doc: &Html, url: &str) -> Page {
 
     let verdict = if w.units.is_empty() && noscript_text.is_empty() {
         Verdict::Empty
+    } else if refusal_headline.is_some() && substance == 0 {
+        // The headline says what the page is (a bot check, an access or
+        // browser refusal, an age gate), whatever sign-in links its frame
+        // carries.
+        Verdict::Notice
     } else if (authform || auth >= 3) && auth >= 2 && core <= 1 && listing == 0 {
         Verdict::AuthGate
     } else if substance > 0 {
