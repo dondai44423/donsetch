@@ -334,7 +334,7 @@ must_contain: MATCH 2/2
 
 **Extraction (DonSift)**: HTML bytes in, agent-native markdown out. Typed blocks with heading breadcrumbs; link farms, wiki junk and duplicates dropped; links off unless asked for. Pages are classified `Article` / `Listing` / `Forum` / `Docs` / `Table` / `Page` with a 0-1 quality score.
 
-- **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Overflow, Wikipedia and docs sites are restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable. Every view applies to them.
+- **Domain adapters**: Reddit, npm/PyPI/crates.io/Go/RubyGems, GitHub, Stack Exchange, Wikipedia and docs sites are restructured from each site's own keyless surfaces. Labeled `via=adapter:…`, kill-switchable. Every view applies to them.
 - **Page memory**: every read is fingerprinted, so a re-read reports `changed` with section-level diffs, and `since_last` collapses a re-check to one line (~30 tokens).
 - **API/JSON endpoints**: `.json` URLs and JSON responses come back as structured data.
 - **Batches**: pass up to 12 URLs; they are read in parallel with the same view, and successful siblings stay available beside individual error rows.
@@ -345,7 +345,7 @@ must_contain: MATCH 2/2
 
 **Time and freshness (observed).** Median read 0.5-0.6 s on defended corpora; an AWS WAF first contact 2-5 s, then cookie-carried; guards are instant. Dead URLs return the live failure directly; a readable URL path may supply a `suggested_query` for locating a moved copy. `changed` and `since_last` compare stored history: they are not a live revalidation.
 
-Stack Overflow question reads use the public question API with answers and comments; an empty, failed or incompatible API response falls back to the website, and service-declared backoff is honored. Fetch keeps its direct-IP default even with a configured proxy pool; search and crawl keep their pool routing.
+Stack Exchange question reads (Stack Overflow and every network site) use the public question API with answers and comments; an empty, failed or incompatible API response falls back to the website, and service-declared backoff is honored. Fetch keeps its direct-IP default even with a configured proxy pool; search and crawl keep their pool routing.
 
 `web_screenshot` returns the inline PNG and a private local `path` containing the same bytes; remote clients should use the inline image because the path belongs to the server host.
 
@@ -359,7 +359,7 @@ Stack Overflow question reads use the public question API with answers and comme
 | AWS WAF, all three shapes | IMDb, Booking, Trustpilot | ✅ the challenge program runs in-process, cold 2-5 s, then cookie-carried |
 | Akamai Bot Manager | Amazon | ✅ native `bm-verify` hand-off, ~1.5 s first contact |
 | Cloudflare managed challenge | Glassdoor, Indeed, npm, Medium, Product Hunt | ✅ content through the identity Cloudflare lets through; the challenge program itself runs but does not pass yet |
-| App shells and walled documents | Reddit, Stack Overflow, crates.io, 4chan, Twitch, NYT, WSJ | ✅ the site's own feed or API (`transport: data`) |
+| App shells and walled fronts and listings | Reddit, Stack Exchange, crates.io, 4chan, Twitch, NYT, WSJ | ✅ the site's own feed or API (`transport: data`); an article, question or thread is read as its own page |
 | PerimeterX press-and-hold | Bloomberg, Zillow | ⚠️ passes intermittently by identity, otherwise declared |
 | DataDome captcha | Etsy, Yelp | ⛔ declared: it asks a human |
 | Interactive captchas | hCaptcha / reCAPTCHA / Turnstile | ⛔ declared without a key (with an unlocker key: ✅) |

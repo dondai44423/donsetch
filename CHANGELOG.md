@@ -39,6 +39,12 @@ the fixes and the hardening found since.
   (tesla) are matched as written. Focus ranks the passage that states the
   figure first and names a figure absent only when the page never states it.
 
+- **Every Stack Exchange site reads through the public API.** Questions on
+  Super User, Server Fault, Ask Ubuntu, MathOverflow, the `*.stackexchange.com`
+  sites, the meta sites and the localized Stack Overflows come back with their
+  answers and comments, as Stack Overflow's already did, instead of meeting
+  the Cloudflare wall in front of the page.
+
 ### Fixed
 
 - **Links.** `--links=handles` on the command line sent `true` and returned
@@ -86,6 +92,11 @@ the fixes and the hardening found since.
 - **Slow transfers.** A body still arriving is bounded by the caller's deadline,
   not the per-request ceiling, and a transfer cut by the deadline says how far
   it got and that a larger `deadline_ms` (up to 600000) lets it finish.
+- **A site's interface answers only the page asked for.** A missing or walled
+  New York Times or WSJ article, a Stack Exchange question and a 4chan thread
+  were answered with the front page's feed or listing; they are now read as
+  their own document, and a wall or a 404 there is reported as such. Fronts,
+  sections, question listings and board pages still use the feed.
 - **Walls.** A wall heading no longer overrides a substantive page.
 - **Proxy.** v5 reads no proxy environment of its own; a proxy URL the engine
   cannot read fails the request instead of going direct; credentials with
