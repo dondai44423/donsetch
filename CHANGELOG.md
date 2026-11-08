@@ -5,11 +5,11 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [5.1.0] - 2026-11-08
 
-The repository is one structure at the current version: the product is `src/`,
-the fetch core is `core/` (crate `donsetch-core`), and the private design set is
-`design/`. v4-era material has left the checkout. No version bump yet.
+The repository is one structure: the product is `src/`, the fetch core is
+`core/` (crate `donsetch-core`), and the private design set is `design/`.
+v4-era material has left the checkout.
 
 ### Changed
 
@@ -18,6 +18,10 @@ the fetch core is `core/` (crate `donsetch-core`), and the private design set is
   `design/brief.md` and `design/mechanism.md`. CI, `Justfile`, `guard.sh` and every
   document follow. Frozen v4 evidence (Persona Engine, doncore, proof, the v4
   design notes) moved out of the repository to `~/Projects/donsetch-evidence/`.
+- **A faster development and release loop.** The `fast`/`ci`/`dist` profile split,
+  a default suite of ~2,000 tests with a budget guard, and `just ship <version>`
+  (CI gate through npm) are the workflow from here on. Contributor detail is in
+  `CONTRIBUTING.md`.
 - **A major update asks first.** `donsetch update` now prints what a major version
   changes and refuses to install one without confirmation; an unattended run needs
   `--yes`. The text names the v5 fetch-engine change when the jump is 4.x → 5.x.
