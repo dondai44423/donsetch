@@ -206,14 +206,11 @@ jobs:
       # paths, profile detection, PDF (the C++ static that once crashed an
       # arm64 lane), extraction, MCP supervisor. A test here is one whose
       # behaviour differs on this OS; the rest is linux's job above.
+      # The Windows lane runs this only on master: a Redmond path quirk
+      # would otherwise block every PR. macOS runs it on every event.
       - name: Test (platform suite)
-        if: matrix.suite == 'platform'
-        shell: bash
-        env:
-          # The Windows lane runs the core suite only on master: a Redmond
-          # path quirk would otherwise block every PR.
-          EXTRA: ${{ (matrix.name == 'windows-x86_64' && github.event_name == 'pull_request') && '-E test(none)' || '' }}
-        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} -E 'test(mcp::supervisor) | test(profile::) | test(pdf::) | test(extract::) | test(onnx::) | test(ghost::)' ${{ env.EXTRA }}
+        if: matrix.suite == 'platform' && (matrix.name != 'windows-x86_64' || github.event_name != 'pull_request')
+        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} -E 'test(mcp::supervisor) | test(profile::) | test(pdf::) | test(extract::) | test(onnx::) | test(ghost::)'
         timeout-minutes: 30
 
       # The release feature set must COMPILE on Windows; linking 300 MB of

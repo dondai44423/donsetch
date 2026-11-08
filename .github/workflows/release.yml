@@ -465,8 +465,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha=$(git rev-parse "${{ github.sha }}^{commit}")
-          conclusion=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$sha&per_page=100" \
-            --jq '[.workflow_runs[] | select(.name == "CI") | .conclusion | select(. != null and . != "cancelled" and . != "skipped")] | first // ""')
+          conclusion=""
+          # Bounded: the tag points at a commit whose CI started seconds ago.
+          # Ten minutes is enough for the lean matrix; anything longer is a
+          # red or missing gate, not patience.
+          for _ in $(seq 1 30); do
+            conclusion=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$sha&per_page=100" \
+              --jq '[.workflow_runs[] | select(.name == "CI") | .conclusion | select(. != null and . != "cancelled" and . != "skipped")] | first // ""')
+            [ -n "$conclusion" ] && break
+            sleep 20
+          done
           echo "CI conclusion for $sha: ${conclusion:-none}"
           if [ "$conclusion" != "success" ]; then
             echo "release blocked: CI on this commit is ${conclusion:-missing}; fix and re-tag"
