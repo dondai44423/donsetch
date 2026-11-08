@@ -1107,7 +1107,17 @@ fn machine_token(t: &str) -> bool {
         .filter(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
         .count();
     let hex = t.len() >= 16 && t.bytes().all(|b| b.is_ascii_hexdigit());
-    humps >= 3 || hex || t.contains(['/', '_', ':', '[', '"', '\\'])
+    // A long lowerCamelCase name ("cinematicContainerRenderer") or a long
+    // all-lowercase kebab key ("engagement-panel-comments-section"). Short
+    // brand spellings ("iPadOS", "eBay") and hyphenated words
+    // ("state-of-the-art") stay words.
+    let lower_camel =
+        humps >= 2 && t.len() >= 12 && t.starts_with(|c: char| c.is_ascii_lowercase());
+    let kebab = t.len() >= 20
+        && t.matches('-').count() >= 3
+        && t.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    humps >= 3 || lower_camel || kebab || hex || t.contains(['/', '_', ':', '[', '"', '\\'])
 }
 
 /// `key=value[_]key=value` attribute fragments (viewports, meta
@@ -1567,6 +1577,20 @@ mod tests {
         assert!(!super::machine_token("PlayStation"));
         assert!(!super::machine_token("McDonald's"));
         assert!(super::machine_token("RSTWebWorkerEntrypointBundle"));
+        // YouTube's renderer and panel names.
+        assert!(super::machine_token("cinematicContainerRenderer"));
+        assert!(super::machine_token("expandableMetadataRenderer"));
+        assert!(super::machine_token("engagement-panel-comments-section"));
+        for word in [
+            "iPadOS",
+            "eBay",
+            "iPhone",
+            "state-of-the-art",
+            "JavaScript",
+            "mother-in-law",
+        ] {
+            assert!(!super::machine_token(word), "{word}");
+        }
     }
 
     /// Fuzzer find (CI, 2026-08-22): a global-assignment match at
