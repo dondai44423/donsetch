@@ -97,7 +97,7 @@ prints the version it really is.
   status-code health model read as 95% healthy.
 - **The `weak` flag is gone, and so is the `degraded: N/M` line.** One census
   line replaces both: `sources: bing 10 · ddg 10 · brave 19 · mojeek — 403`.
-  `structuredContent` carries `sources: [{id, items, status}]`; the `weak` and
+  The result's `[meta]` part carries `sources: [{id, items, status}]`; the `weak` and
   `failed_engines` fields are removed.
 - **A source that stops answering stops holding a slot.** A source at the trust
   floor benches for ten minutes, then is probed once; a failure re-benches it
