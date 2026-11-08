@@ -126,7 +126,7 @@
               "news",
               "entity"
             ],
-            "description": "auto (default) detects from the query. Keyless mode adds keyless verticals: code: + GitHub, HN, StackExchange, MDN; paper: + Scholar, arXiv; news: + Google News, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join)."
+            "description": "auto (default) detects from the query. Keyless mode adds keyless verticals: code: + GitHub, HN, StackExchange, MDN, crates.io/npm by ecosystem word; paper: + OpenAlex, arXiv, Europe PMC (biomedical); news: + Google News, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join)."
           }
         },
         "required": [

@@ -753,6 +753,149 @@
     "raspberrypi\\.com/products/raspberry-pi-5",
     "raspberrypi\\.com/documentation/[^ ]*raspberry-pi-5"
    ]
+  },
+  {
+   "id": "p6",
+   "shape": "paper",
+   "set": "gold",
+   "query": "swin transformer hierarchical vision transformer using shifted windows",
+   "gold": [
+    "arxiv\\.org/abs/2103\\.14030"
+   ]
+  },
+  {
+   "id": "p7",
+   "shape": "paper",
+   "set": "gold",
+   "query": "learning transferable visual models from natural language supervision",
+   "gold": [
+    "arxiv\\.org/abs/2103\\.00020"
+   ]
+  },
+  {
+   "id": "k1",
+   "shape": "code",
+   "set": "gold",
+   "query": "rust anyhow error handling crate",
+   "gold": [
+    "crates\\.io/crates/anyhow",
+    "docs\\.rs/anyhow",
+    "github\\.com/dtolnay/anyhow"
+   ]
+  },
+  {
+   "id": "k2",
+   "shape": "code",
+   "set": "gold",
+   "query": "npm react-router package",
+   "gold": [
+    "npmjs\\.com/package/react-router",
+    "reactrouter\\.com"
+   ]
+  },
+  {
+   "id": "h-p6",
+   "shape": "paper",
+   "set": "held",
+   "query": "mrna vaccine bnt162b2 safety and efficacy",
+   "gold": [
+    "nejm\\.org/doi/[^ ]*NEJMoa2034577",
+    "pubmed\\.ncbi\\.nlm\\.nih\\.gov/33301246",
+    "pmc\\.ncbi\\.nlm\\.nih\\.gov/articles/PMC7745181"
+   ]
+  },
+  {
+   "id": "h-p7",
+   "shape": "paper",
+   "set": "held",
+   "query": "highly accurate protein structure prediction with alphafold",
+   "gold": [
+    "nature\\.com/articles/s41586-021-03819-2",
+    "pubmed\\.ncbi\\.nlm\\.nih\\.gov/34265844",
+    "pmc\\.ncbi\\.nlm\\.nih\\.gov/articles/PMC8371605"
+   ]
+  },
+  {
+   "id": "h-p8",
+   "shape": "paper",
+   "set": "held",
+   "query": "proximal policy optimization algorithms",
+   "gold": [
+    "arxiv\\.org/abs/1707\\.06347"
+   ]
+  },
+  {
+   "id": "h-p9",
+   "shape": "paper",
+   "set": "held",
+   "query": "llama open and efficient foundation language models",
+   "gold": [
+    "arxiv\\.org/abs/2302\\.13971"
+   ]
+  },
+  {
+   "id": "h-p10",
+   "shape": "paper",
+   "set": "held",
+   "query": "the lottery ticket hypothesis finding sparse trainable neural networks",
+   "gold": [
+    "arxiv\\.org/abs/1803\\.03635"
+   ]
+  },
+  {
+   "id": "h-k1",
+   "shape": "code",
+   "set": "held",
+   "query": "rust serde json crate",
+   "gold": [
+    "crates\\.io/crates/serde_json",
+    "docs\\.rs/serde_json",
+    "github\\.com/serde-rs/json"
+   ]
+  },
+  {
+   "id": "h-k2",
+   "shape": "code",
+   "set": "held",
+   "query": "npm lodash package",
+   "gold": [
+    "npmjs\\.com/package/lodash",
+    "lodash\\.com",
+    "github\\.com/lodash/lodash"
+   ]
+  },
+  {
+   "id": "h-k3",
+   "shape": "code",
+   "set": "held",
+   "query": "rust clap command line argument parser crate",
+   "gold": [
+    "crates\\.io/crates/clap",
+    "docs\\.rs/clap",
+    "github\\.com/clap-rs/clap"
+   ]
+  },
+  {
+   "id": "h-k4",
+   "shape": "code",
+   "set": "held",
+   "query": "npm zod schema validation",
+   "gold": [
+    "npmjs\\.com/package/zod",
+    "zod\\.dev",
+    "github\\.com/colinhacks/zod"
+   ]
+  },
+  {
+   "id": "h-k5",
+   "shape": "code",
+   "set": "held",
+   "query": "rust reqwest http client",
+   "gold": [
+    "docs\\.rs/reqwest",
+    "crates\\.io/crates/reqwest",
+    "github\\.com/seanmonstar/reqwest"
+   ]
   }
  ]
 }

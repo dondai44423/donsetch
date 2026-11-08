@@ -257,9 +257,25 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             if hnish(&q, &toks) {
                 v.push("hn");
             }
+            // A package registry answers "does a package named X exist and
+            // which one is it" better than any page about it.
+            if registry_words(&toks, CRATE_WORDS) {
+                v.push("crates");
+            }
+            if registry_words(&toks, NPM_WORDS) {
+                v.push("npm");
+            }
             v
         }
-        Intent::Paper => vec!["scholar", "arxiv"],
+        Intent::Paper => {
+            let lower = query.to_lowercase();
+            let toks = tokens(&lower);
+            let mut v = vec!["openalex", "arxiv"];
+            if biomedical(&toks) {
+                v.push("europepmc");
+            }
+            v
+        }
         Intent::News => vec!["news", "hn"],
         Intent::Entity => vec!["wikipedia"],
         // Wiki safety net only on CONCEPTUAL web queries :
@@ -278,6 +294,71 @@ pub fn trim_verticals_for_stress(verticals: Vec<&'static str>, stress: f64) -> V
         return verticals;
     }
     verticals.into_iter().filter(|v| *v != "hn").collect()
+}
+
+const CRATE_WORDS: &[&str] = &["rust", "crate", "crates", "cargo"];
+const NPM_WORDS: &[&str] = &[
+    "npm",
+    "node",
+    "nodejs",
+    "javascript",
+    "typescript",
+    "js",
+    "yarn",
+    "pnpm",
+    "package",
+];
+
+/// A registry is asked only when the query names its ecosystem: "rust" for
+/// crates, "npm" or "node" for npm. The word "package" alone names no
+/// ecosystem, so a Python or Go package question spends no request.
+fn registry_words(toks: &[&str], words: &[&str]) -> bool {
+    toks.iter().any(|t| *t != "package" && words.contains(t))
+}
+
+/// Europe PMC holds the life-science literature; asking it about transformers
+/// would only spend a request. Fires on vocabulary that names that literature.
+fn biomedical(toks: &[&str]) -> bool {
+    const BIO: &[&str] = &[
+        "pubmed",
+        "clinical",
+        "trial",
+        "trials",
+        "patients",
+        "patient",
+        "disease",
+        "cancer",
+        "tumor",
+        "protein",
+        "proteins",
+        "gene",
+        "genes",
+        "genome",
+        "genomic",
+        "covid",
+        "sars",
+        "vaccine",
+        "mrna",
+        "crispr",
+        "therapy",
+        "cell",
+        "cells",
+        "drug",
+        "syndrome",
+        "randomized",
+        "randomised",
+        "biology",
+        "medical",
+        "medicine",
+        "neuron",
+        "neurons",
+        "virus",
+        "bacteria",
+        "antibody",
+        "diabetes",
+        "mice",
+    ];
+    toks.iter().any(|t| BIO.contains(t))
 }
 
 /// StackExchange: question language, error strings, or how-to +
@@ -459,6 +540,22 @@ mod tests {
         // substring across a word boundary ("show tools" is not
         // "how to").
         assert_ne!(detect("show tools for woodworking"), Intent::Code);
+    }
+
+    #[test]
+    fn registries_and_the_medical_index_fire_only_on_their_own_vocabulary() {
+        let v = |i, q| verticals_for(i, q);
+        assert!(v(Intent::Code, "rust tokio crate").contains(&"crates"));
+        assert!(!v(Intent::Code, "python requests package").contains(&"crates"));
+        assert!(!v(Intent::Code, "python requests package").contains(&"npm"));
+        assert!(v(Intent::Code, "npm express middleware").contains(&"npm"));
+        assert!(v(Intent::Code, "node fetch timeout").contains(&"npm"));
+        assert_eq!(
+            v(Intent::Paper, "attention is all you need"),
+            ["openalex", "arxiv"]
+        );
+        assert!(v(Intent::Paper, "crispr cas9 therapy trial").contains(&"europepmc"));
+        assert!(!v(Intent::Paper, "scaling laws language models").contains(&"europepmc"));
     }
 
     #[test]

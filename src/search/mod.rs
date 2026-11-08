@@ -95,6 +95,7 @@ fn answered(outcomes: &[(String, EngineResult)]) -> (usize, usize) {
 fn worth_second_ask(status: &str) -> bool {
     !matches!(status, "no-results" | "pacing-timeout" | "late")
         && !status.starts_with("invalid-config")
+        && !status.starts_with("rate-limited")
 }
 
 tokio::task_local! {
@@ -275,6 +276,7 @@ fn is_engine_fault(status: &str) -> bool {
         && status != "no-results"
         && status != "invalid-config"
         && !status.starts_with("invalid-config:")
+        && !status.starts_with("rate-limited")
         && status != "pacing-timeout"
         && status != "budget-skipped"
 }
@@ -705,6 +707,18 @@ impl Searcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         matches!(f.get(engine), Some(&(n, at)) if n >= 3 && at.elapsed() < QUARANTINE_TTL)
+    }
+
+    /// Bench a source that asked for time. Same clock and same persistence as
+    /// the chronic-failure bench, but it touches neither trust nor egress
+    /// health: a throttle is the source working as published.
+    fn rest(&self, engine: &str) {
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(engine.to_string(), (3, Instant::now()));
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn record_outcome(&self, engine: &str, ok: bool) {
@@ -1234,6 +1248,10 @@ impl Searcher {
                     // or distrust the engine over them.
                     if is_engine_fault(&status) {
                         self.record_outcome(base, false);
+                    } else if status.starts_with("rate-limited") {
+                        // The source published a limit: it is rested, not
+                        // distrusted, and probed again when the rest lapses.
+                        self.rest(base);
                     }
                     if was_engine {
                         if status.starts_with("dead") {
@@ -2016,6 +2034,36 @@ mod tests {
         );
     }
 
+    // Depends on nextest's process-per-test isolation: test_searcher sets the
+    // process-wide DONSETCH_CACHE_DIR.
+    #[test]
+    fn a_throttled_source_is_rested_without_losing_trust() {
+        let s = test_searcher();
+        let trust_before = s
+            .trust
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("stackexchange")
+            .copied();
+        assert!(!s.quarantined("stackexchange"));
+        s.rest("stackexchange");
+        assert!(
+            s.quarantined("stackexchange"),
+            "a throttled source sits out"
+        );
+        assert!(!s.quarantined("github"), "only the throttled source");
+        let trust_after = s
+            .trust
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("stackexchange")
+            .copied();
+        assert_eq!(
+            trust_before, trust_after,
+            "a published limit is not distrust"
+        );
+    }
+
     fn test_searcher() -> Searcher {
         // Hermetic: point disk cache/health at a throwaway dir so the
         // real user cache is neither read nor polluted, then clear the
@@ -2450,6 +2498,8 @@ mod tests {
         assert!(!is_engine_fault("auth-fail"));
         assert!(!is_engine_fault("no-results"));
         assert!(!is_engine_fault("invalid-config"));
+        assert!(!is_engine_fault("rate-limited:900"));
+        assert!(!worth_second_ask("rate-limited:900"));
         assert!(is_engine_fault("blocked:403"));
         assert!(is_engine_fault("blocked:captcha"));
         assert!(is_engine_fault("empty-parse"));

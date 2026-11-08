@@ -310,7 +310,7 @@ pub(super) async fn vertical_task(
         Err(_) => (vertical, Err(("timeout".into(), "direct".into(), false))),
         Ok(Err(e)) => (
             vertical,
-            Err((vertical_failure_status(&e), "direct".into(), false)),
+            Err((vertical_error_status(&e), "direct".into(), false)),
         ),
         Ok(Ok(hits)) => vertical_success(vertical, hits, started.elapsed().as_millis() as u64),
     }
@@ -349,6 +349,15 @@ fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (Stri
 /// The engine-report status for a SERP or vertical request a local rule
 /// refused; in the `invalid-config:` family, so not an engine fault.
 const RULE_DENIED_STATUS: &str = "invalid-config: excluded by the operator's local DonSeTch rules";
+
+/// The status for a vertical that asked for time: `rate-limited:<seconds>`.
+/// Not a failure of the source (see `is_engine_fault`); the searcher rests it.
+fn vertical_error_status(e: &verticals::VerticalError) -> String {
+    match e {
+        verticals::VerticalError::Throttled(rest) => format!("rate-limited:{}", rest.as_secs()),
+        verticals::VerticalError::Fetch(f) => vertical_failure_status(f),
+    }
+}
 
 /// The engine-report status for a failed vertical fetch: a rule refusal
 /// gets [`RULE_DENIED_STATUS`], a proxy configuration error its error text

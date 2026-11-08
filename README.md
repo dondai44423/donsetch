@@ -412,7 +412,7 @@ Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
 
 No API key, no account. Six keyless engines across four independent index families, plus eight official verticals, run in parallel on your machine, then merge, dedupe and rank.
 
-- **Backends**: Bing family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek, Google, plus keyless verticals (GitHub, Wikipedia, HN, Semantic Scholar, arXiv, StackExchange, MDN, Google News).
+- **Backends**: Bing family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek, Google, plus keyless verticals (GitHub, Wikipedia, HN, OpenAlex, arXiv, Europe PMC, crates.io, npm, StackExchange, MDN, Google News).
 - **Native Google, browser-free**: HTTP through the legacy mobile endpoint on the existing Rust transport, with seven experimentally verified Nokia profiles (`6230-03.15` by default). A profile that succeeds stays preferred per egress, CAPTCHA advances the cursor circularly, rate limits do not. Retry, pacing and quarantine use the same policy as every other engine. Availability depends on Google and your network; see [configuration and limits](docs/google-wml.md).
 - **Semantic reranking**: a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, 23MB) reads query + title + snippet through full attention, blended 60/40 with RRF + BM25 + consensus. A post-enrichment top-up re-scores close calls using the destination page's real title and description instead of SERP fragments.
 - **Consensus**: a URL several independent indexes return gets a boost. Every result carries `score`, `consensus` (independent index families) and `engines`, and the compact surface shows `· N sources`.

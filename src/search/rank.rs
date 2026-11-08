@@ -25,7 +25,18 @@ const VERTICAL_WEIGHT: f64 = 0.6;
 pub(crate) fn is_vertical(engine: &str) -> bool {
     matches!(
         engine,
-        "github" | "hn" | "wikipedia" | "scholar" | "news" | "arxiv" | "stackexchange" | "mdn"
+        "github"
+            | "hn"
+            | "wikipedia"
+            | "scholar"
+            | "news"
+            | "arxiv"
+            | "stackexchange"
+            | "mdn"
+            | "openalex"
+            | "europepmc"
+            | "crates"
+            | "npm"
     )
 }
 
@@ -57,8 +68,19 @@ pub fn norm_key(raw: &str) -> String {
         .unwrap_or("")
         .trim_start_matches("www.")
         .to_lowercase();
-    let path = u
-        .path()
+    // An arXiv paper is one document at /abs, /pdf and /html alike.
+    let arxiv_id = (host == "arxiv.org")
+        .then(|| {
+            let p = u.path();
+            ["/abs/", "/pdf/", "/html/"]
+                .iter()
+                .find_map(|pre| p.strip_prefix(pre))
+                .map(|id| id.trim_end_matches(".pdf").trim_end_matches('/'))
+        })
+        .flatten()
+        .map(|id| format!("/abs/{id}"));
+    let path = arxiv_id.unwrap_or_else(|| u.path().to_string());
+    let path = path
         .trim_end_matches('/')
         .trim_end_matches("/index.html")
         .trim_end_matches("/index.htm")
@@ -667,6 +689,15 @@ mod tests {
         let a = norm_key("https://www.docs.rs/ratatui/index.html");
         let b = norm_key("http://docs.rs/ratatui/");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn norm_key_makes_one_arxiv_paper_of_its_abs_pdf_and_html_forms() {
+        let abs = norm_key("https://arxiv.org/abs/1706.03762");
+        assert_eq!(abs, norm_key("https://arxiv.org/pdf/1706.03762.pdf"));
+        assert_eq!(abs, norm_key("http://www.arxiv.org/html/1706.03762"));
+        assert_ne!(abs, norm_key("https://arxiv.org/abs/1706.03763"));
+        assert_ne!(abs, norm_key("https://example.org/pdf/1706.03762.pdf"));
     }
 
     #[test]
