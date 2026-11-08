@@ -116,6 +116,10 @@
             "type": "integer",
             "description": "Hard time budget in ms (500-600000) for the whole call; per-backend timeouts stay below it. On expiry: an honest deadline error."
           },
+          "read": {
+            "type": "integer",
+            "description": "Read the top N results (max 3, default 0) within the call's deadline: their snippets become the page's own passage for the query (`page:`), and a follow-up web_fetch of them is served warm. Use when snippets are not enough to choose."
+          },
           "intent": {
             "type": "string",
             "enum": [

@@ -266,6 +266,77 @@ or add an API-key provider (`donsetch keys add`)*\n",
     md
 }
 
+/// A title without the site name the row already shows as its host:
+/// "Attention Is All You Need - Wikipedia" on en.wikipedia.org is the title and
+/// the host said twice. Only a trailing, separator-set part that is contained in
+/// the host's own name is dropped, and never down to nothing.
+fn display_title(title: &str, host: &str) -> String {
+    const SEPARATORS: &[&str] = &[" - ", " | ", " · ", " – ", " — ", " :: "];
+    let key = |s: &str| {
+        s.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let host_key = key(host);
+    let cut = SEPARATORS
+        .iter()
+        .filter_map(|sep| title.rfind(sep).map(|at| (at, sep.len())))
+        .max_by_key(|(at, _)| *at);
+    if let Some((at, len)) = cut {
+        let (head, tail) = (title[..at].trim_end(), title[at + len..].trim());
+        let tail_key = key(tail);
+        if head.chars().count() >= 3 && tail_key.len() >= 4 && host_key.contains(&tail_key) {
+            return head.to_string();
+        }
+    }
+    title.to_string()
+}
+
+/// One result on the compact surface: a line naming it (handle, title, host,
+/// kind, route hint, and how many independent indexes returned it when more than
+/// one did) and the snippet under it. A single index is the unremarkable case and
+/// says nothing.
+pub(super) fn compact_row(
+    number: usize,
+    reference: &str,
+    result: &super::rank::Merged,
+    hint: Option<&str>,
+) -> String {
+    let host = rank::host_of(&result.url);
+    let mut row = format!(
+        "{number}. {reference} · {} : {host}",
+        display_title(&result.title, &host)
+    );
+    let kind = rank::source_type(&result.url);
+    if kind != "web" {
+        row.push_str(&format!(" · {kind}"));
+    }
+    if let Some(hint) = hint {
+        row.push(' ');
+        row.push_str(hint);
+    }
+    let indexes = rank::family_count(result);
+    if indexes > 1 {
+        row.push_str(&format!(" · {indexes} indexes"));
+    }
+    row.push('\n');
+    if !result.snippet.is_empty() {
+        let limit = if result.from_page {
+            super::evidence::PASSAGE_CHARS
+        } else {
+            SNIPPET_CHARS
+        };
+        row.push_str("   ");
+        if result.from_page {
+            row.push_str("page: ");
+        }
+        row.push_str(&clip_snippet(&result.snippet, limit));
+        row.push('\n');
+    }
+    row
+}
+
 /// Compact MCP evidence surface. Rank already communicates the ordering
 /// decision, while per-engine scores and timings remain available as client
 /// diagnostics. Keep only evidence and state that can alter the next action.
@@ -300,35 +371,8 @@ pub fn render_compact_markdown(
             .and_then(|items| items.get(index))
             .map(String::as_str)
             .unwrap_or(&result.url);
-        let host = rank::host_of(&result.url);
-        markdown.push_str(&format!(
-            "{}. {reference} · {} : {host}",
-            index + 1,
-            result.title
-        ));
-        let kind = rank::source_type(&result.url);
-        if kind != "web" {
-            markdown.push_str(&format!(" · {kind}"));
-        }
-        // Report how many search-index families returned this URL,
-        // using the same count as ranking. This is retrieval agreement,
-        // not independent corroboration of the page's claims.
-        let families = rank::family_count(result);
-        if let Some(hint) = hints.get(index).and_then(|hint| hint.as_deref()) {
-            markdown.push(' ');
-            markdown.push_str(hint);
-        }
-        markdown.push_str(&format!(
-            " · {} index {}",
-            families,
-            if families == 1 { "family" } else { "families" }
-        ));
-        markdown.push('\n');
-        if !result.snippet.is_empty() {
-            markdown.push_str("   ");
-            markdown.push_str(&clip_snippet(&result.snippet, SNIPPET_CHARS));
-            markdown.push('\n');
-        }
+        let hint = hints.get(index).and_then(|hint| hint.as_deref());
+        markdown.push_str(&compact_row(index + 1, reference, result, hint));
     }
 
     if out.results.is_empty() {
@@ -408,4 +452,80 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
             report
         }).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::rank::Merged;
+
+    fn result(title: &str, url: &str, snippet: &str) -> Merged {
+        Merged {
+            title: title.into(),
+            url: url.into(),
+            snippet: snippet.into(),
+            sources: Vec::new(),
+            score: 1.0,
+            published: None,
+            families: 1,
+            from_page: false,
+        }
+    }
+
+    #[test]
+    fn a_site_name_the_host_already_says_is_dropped_from_the_title() {
+        let t = |title, host| display_title(title, host);
+        assert_eq!(
+            t("Attention Is All You Need - Wikipedia", "en.wikipedia.org"),
+            "Attention Is All You Need"
+        );
+        assert_eq!(
+            t(
+                "Rust async runtime | GeeksforGeeks",
+                "www.geeksforgeeks.org"
+            ),
+            "Rust async runtime"
+        );
+        // Not the host's name, so it is information: kept.
+        assert_eq!(
+            t(
+                "Array.prototype.reduce() - JavaScript | MDN",
+                "developer.mozilla.org"
+            ),
+            "Array.prototype.reduce() - JavaScript | MDN"
+        );
+        // Never down to nothing, and a short tail is not a name.
+        assert_eq!(t("A - Wikipedia", "en.wikipedia.org"), "A - Wikipedia");
+        assert_eq!(t("Go - Go", "go.dev"), "Go - Go");
+    }
+
+    #[test]
+    fn a_row_names_agreement_only_when_there_is_some() {
+        let mut r = result(
+            "Tokio guide",
+            "https://tokio.rs/guide",
+            "Learn the runtime.",
+        );
+        let one = compact_row(1, "S1", &r, None);
+        assert_eq!(
+            one,
+            "1. S1 · Tokio guide : tokio.rs\n   Learn the runtime.\n"
+        );
+        r.families = 3;
+        assert!(
+            compact_row(1, "S1", &r, Some("· ⚠ needs browser"))
+                .starts_with("1. S1 · Tokio guide : tokio.rs · ⚠ needs browser · 3 indexes\n")
+        );
+    }
+
+    #[test]
+    fn a_page_passage_is_labelled_and_may_run_longer_than_a_teaser() {
+        let long = "word ".repeat(60);
+        let mut r = result("T", "https://example.com/a", long.trim());
+        let teaser = compact_row(1, "S1", &r, None);
+        r.from_page = true;
+        let page = compact_row(1, "S1", &r, None);
+        assert!(page.contains("   page: word"), "{page}");
+        assert!(page.len() > teaser.len(), "a passage has the longer limit");
+    }
 }

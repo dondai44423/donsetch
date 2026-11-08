@@ -268,8 +268,11 @@ struct SavedHit {
 /// input, in seconds, with no network noise. Only queries still in the selected
 /// set are scored, so tuning on `gold` never reads a `held` row.
 fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
-    use super::{intent, rank};
+    use super::{evidence, intent, rank, render};
     let trust = std::collections::HashMap::new();
+    // What the shown snippets cost and say, before (the longest source snippet,
+    // clipped) and after (the evidence pick), over the top seven results.
+    let mut shown = SnippetTally::default();
     let mut all = Tally::default();
     let mut by_shape: std::collections::BTreeMap<String, Tally> = Default::default();
     for path in &opts.replay {
@@ -333,6 +336,18 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
                 &families,
                 12,
             );
+            for m in merged.iter().take(7) {
+                let key = rank::norm_key(&m.url);
+                let longest = per_engine
+                    .iter()
+                    .flat_map(|(_, hits)| hits.iter())
+                    .filter(|h| rank::norm_key(&h.url) == key)
+                    .map(|h| h.snippet.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .max_by_key(|s| s.len())
+                    .unwrap_or_default();
+                let old = render::clip_snippet(&longest, evidence::EVIDENCE_CHARS);
+                shown.add(&q.query, &old, &m.snippet);
+            }
             let urls: Vec<String> = merged
                 .iter()
                 .take(opts.max_results)
@@ -365,7 +380,47 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
         crate::diag!("{}", t.line(shape));
     }
     crate::diag!("{}", all.line("ALL"));
+    crate::diag!("{}", shown.line());
     0
+}
+
+/// Snippet cost and fit, old against new, over the same results.
+#[derive(Default)]
+struct SnippetTally {
+    n: usize,
+    old_chars: usize,
+    new_chars: usize,
+    old_cover: f64,
+    new_cover: f64,
+    old_clean_end: usize,
+    new_clean_end: usize,
+}
+
+impl SnippetTally {
+    fn add(&mut self, query: &str, old: &str, new: &str) {
+        let clean = |s: &str| s.ends_with(['.', '!', '?']);
+        self.n += 1;
+        self.old_chars += old.chars().count();
+        self.new_chars += new.chars().count();
+        self.old_cover += super::evidence::coverage(query, old);
+        self.new_cover += super::evidence::coverage(query, new);
+        self.old_clean_end += usize::from(clean(old));
+        self.new_clean_end += usize::from(clean(new));
+    }
+
+    fn line(&self) -> String {
+        let n = self.n.max(1) as f64;
+        format!(
+            "snippets n={}  chars {:.0} -> {:.0}  covers query {:.2} -> {:.2}  ends at a sentence {:.2} -> {:.2}",
+            self.n,
+            self.old_chars as f64 / n,
+            self.new_chars as f64 / n,
+            self.old_cover / n,
+            self.new_cover / n,
+            self.old_clean_end as f64 / n,
+            self.new_clean_end as f64 / n,
+        )
+    }
 }
 
 pub async fn run(args: &[String]) -> i32 {

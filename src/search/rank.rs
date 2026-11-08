@@ -55,6 +55,10 @@ pub struct Merged {
     /// ranked (`families.rs`). Cached results keep the count they were given.
     #[serde(default)]
     pub families: usize,
+    /// The snippet is a passage read from the page itself (`read`), not a
+    /// source's teaser.
+    #[serde(default)]
+    pub from_page: bool,
 }
 
 /// Normalize a URL for consensus matching: scheme-less,
@@ -239,6 +243,9 @@ fn merge_inner(
     // random order, so any two results with an equal score came out in an
     // arbitrary order: the same candidates, ranked differently on each run.
     let mut order: Vec<String> = Vec::new();
+    // Every source's snippet for a URL: the one shown is picked from these once
+    // the order is settled (`evidence::pick`), so ranking never reads a cut text.
+    let mut snippets: HashMap<String, Vec<String>> = HashMap::new();
     let mut family_best: HashMap<(String, String), f64> = HashMap::new();
     let conceptual = super::intent::is_conceptual(query);
     // Sources are read in a fixed order (trust, then name), not the order they
@@ -287,6 +294,12 @@ fn merge_inner(
                 .take(MAX_SNIPPET_CHARS)
                 .collect();
             let key = norm_key(&hit.url);
+            if !hit_snippet.is_empty() {
+                let seen = snippets.entry(key.clone()).or_default();
+                if !seen.contains(&hit_snippet) {
+                    seen.push(hit_snippet.clone());
+                }
+            }
             let contribution = tw / (RRF_K + hit.rank as f64 + 1.0);
             let best = family_best
                 .entry((key.clone(), family.clone()))
@@ -303,6 +316,7 @@ fn merge_inner(
                 score: 0.0,
                 published: None,
                 families: 0,
+                from_page: false,
             });
             // Keep the longest snippet (most informative), skipping redirect
             // stubs. Both sides are already bounded (MAX_SNIPPET_CHARS), so no
@@ -429,6 +443,11 @@ fn merge_inner(
         diverse.extend(overflow.into_iter().take(max_results - diverse.len()));
     }
     diverse.truncate(max_results);
+    for r in &mut diverse {
+        if let Some(candidates) = snippets.get(&norm_key(&r.url)) {
+            r.snippet = super::evidence::pick(query, candidates, super::evidence::EVIDENCE_CHARS);
+        }
+    }
     diverse
 }
 

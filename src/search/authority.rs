@@ -444,6 +444,7 @@ mod tests {
             score,
             published,
             families: 1,
+            from_page: false,
         }
     }
 

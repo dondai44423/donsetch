@@ -410,24 +410,22 @@ Continue a stopped crawl using `resume` alone; a new crawl requires `url`.
 
 ## 🔎 Keyless search
 
-No API key, no account. Six keyless engines across four independent index families, plus eight official verticals, run in parallel on your machine, then merge, dedupe and rank.
+No API key, no account. Keyless engines and first-party interfaces run in parallel on your machine inside one time budget, then merge, dedupe and rank. A source's answer is classified before it can rank: a page that is off the query, a bot wall or an empty result earns nothing.
 
 - **Backends**: Bing family (Bing, DuckDuckGo, Yahoo), Brave, Mojeek, Google, plus keyless verticals (GitHub, Wikipedia, HN, OpenAlex, arXiv, Europe PMC, crates.io, npm, StackExchange, MDN, Google News).
 - **Native Google, browser-free**: HTTP through the legacy mobile endpoint on the existing Rust transport, with seven experimentally verified Nokia profiles (`6230-03.15` by default). A profile that succeeds stays preferred per egress, CAPTCHA advances the cursor circularly, rate limits do not. Retry, pacing and quarantine use the same policy as every other engine. Availability depends on Google and your network; see [configuration and limits](docs/google-wml.md).
-- **Semantic reranking**: a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, 23MB) reads query + title + snippet through full attention, blended 60/40 with RRF + BM25 + consensus. A post-enrichment top-up re-scores close calls using the destination page's real title and description instead of SERP fragments.
-- **Consensus**: a URL several independent indexes return gets a boost. Every result carries `score`, `consensus` (independent index families) and `engines`, and the compact surface shows `· N sources`.
-- **Learned engine health**: per-engine trust EWMAs and chronic-failure quarantine survive restarts, so dead engines get benched instead of burning fan-out slots on every query.
+- **Semantic reranking** (opt-in, `search.rerank`): a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, 23MB) re-scores close calls from query, title and snippet. It is off by default: in paired runs it moved no ranking metric and cost seconds of CPU per search.
+- **Consensus**: a URL several independent indexes return gets a boost. Independence is measured, not assumed: sources whose top results overlap are counted as one index, and the graph is learned and persisted, so a source that changes supplier is re-measured. The compact surface shows `· N indexes` when more than one index returned a result.
+- **Learned engine health**: per-engine trust and chronic-failure quarantine survive restarts, so dead engines get benched instead of burning fan-out slots on every query. A source that publishes a rate limit (Stack Exchange's daily quota, any `429`) is rested until it lapses, not marked as failing.
 - **Entity coverage**: anchor entities (B-tree, version numbers, years) are checked against results. Wrong entity, 0.3x.
-- **Honest reporting**: `weak=true` means low consensus, per-engine status is always visible, and there is no fake "no results".
-- **Warm handoff**: search pre-fetches the top results, so the next MCP fetch serves from cache in ~3ms.
+- **Honest reporting**: a census line names every source that answered and what each other source said (`403`, `late`, `off-query`, `rate-limited:N`), so an empty or thin result says why.
+- **Evidence, not teasers**: each result's snippet is the sentence, across all sources that returned it, that best covers your query, cut at a sentence boundary. `read: N` (max 3) fetches the top N pages inside the same deadline and shows the passage of each page that answers the query, marked `page:`; those pages are then warm for the follow-up fetch.
 - **Query compiler**: `site:`, `filetype:` and `intitle:` are sent only to engines that honor them, and SERP instant answers are extracted with their source URLs.
 
 Keyless quality, 110 questions across 11 niches with no keys: **95.5%** answer-in-snippet against Tavily's published 93.3% (LLM-graded). Reproduce with `python3 bench/search_quality.py --verbose`; methodology and per-niche numbers live in the script. Search-quality caching for the bench lives in `~/.cache/donsetch/bench-search/`, delete it when comparing binaries.
 
 Search reports `requested_results`, `returned_results`, and `underfilled`
-when engines cannot supply the requested count. `weak` considers lexical
-query coverage as well as engine agreement; it is a retrieval warning, not a
-fact-check. `source_type` identifies video, community, paper, reference,
+when engines cannot supply the requested count. `source_type` identifies video, community, paper, reference,
 publisher, official, institutional, and general web sources from known hosts.
 It does not certify a page's claims or assign trust to lookalike domains.
 

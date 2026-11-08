@@ -636,6 +636,7 @@ mod tests {
             score,
             published: None,
             families: 0,
+            from_page: false,
         }
     }
 

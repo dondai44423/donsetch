@@ -298,6 +298,99 @@ impl Searcher {
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
 
+    /// `read: k`: fetch the top `k` results in parallel inside the call's
+    /// budget and replace each teaser with the passage of the page that answers
+    /// the query (`evidence::passage`). A page that cannot be read (a wall, a
+    /// timeout, a non-document, nothing that speaks to the query) keeps its
+    /// teaser: reading never demotes, reorders or removes a result. Bodies are
+    /// parked for the follow-up `web_fetch` unless prewarm is switched off.
+    pub async fn read_results(&self, results: &mut [Merged], query: &str, k: usize) {
+        /// More than this is the agent fetching pages through search.
+        const READ_MAX: usize = 3;
+        const READ_TIMEOUT: Duration = Duration::from_secs(4);
+        /// Share of the query's topic words a passage must hold to be shown.
+        const READ_MIN_COVER: f64 = 0.4;
+        let n = results.len().min(k.min(READ_MAX));
+        if n == 0 {
+            return;
+        }
+        let park = crate::config::cfg().fetch.prewarm;
+        let budget = super::stage_budget(READ_TIMEOUT, Duration::from_millis(100));
+        let fetcher = &self.fetcher;
+        let sink = self.prewarms.clone();
+        let mut set: futures_util::stream::FuturesUnordered<_> = results
+            .iter()
+            .take(n)
+            .enumerate()
+            .map(|(i, r)| {
+                let url = r.url.clone();
+                let sink = sink.clone();
+                let query = query.to_string();
+                async move {
+                    let route = crate::egress::request_route::RequestRoute::configured();
+                    let proxy = route.proxy_for(&url).ok()?;
+                    let mut o = fetcher
+                        .fetch_once_via(&url, &[], proxy.as_ref(), true, None)
+                        .await
+                        .ok()?;
+                    o.route = route;
+                    if o.status >= 400 || !matches!(o.verdict, Verdict::ContentOk) {
+                        return None;
+                    }
+                    let ct = o
+                        .headers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    // Documents only: a PDF or a binary is the fetch tool's job.
+                    if !(ct.is_empty() || ct.contains("html") || ct.starts_with("text/")) {
+                        return None;
+                    }
+                    let body = o.body.clone();
+                    let page_url = url.clone();
+                    let q = query.clone();
+                    let passage = tokio::task::spawn_blocking(move || {
+                        let opts = crate::extract::ExtractOptions {
+                            focus: Some(q.clone()),
+                            max_chars: Some(2_000),
+                            ..Default::default()
+                        };
+                        let ex = crate::extract::extract(&body, &ct, &page_url, &opts).ok()?;
+                        super::evidence::passage(&q, &ex.markdown, super::evidence::PASSAGE_CHARS)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if park {
+                        sink.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .put(&url, o);
+                    }
+                    passage.map(|p| (i, p))
+                }
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + budget;
+        while let Ok(Some(done)) =
+            tokio::time::timeout_at(deadline, futures_util::StreamExt::next(&mut set)).await
+        {
+            if let Some((i, passage)) = done
+                && let Some(r) = results.get_mut(i)
+            {
+                // A passage replaces the teaser only when it speaks to the query
+                // at least as well as the teaser does, and to a real share of it:
+                // the first paragraph that mentions one word is not an answer.
+                let after = super::evidence::coverage(query, &passage);
+                if after >= READ_MIN_COVER && after >= super::evidence::coverage(query, &r.snippet)
+                {
+                    r.snippet = passage;
+                    r.from_page = true;
+                }
+            }
+        }
+    }
+
     /// detached warm-handoff for the BYOK takeover
     /// path. Provider results already carry real titles/snippets, so
     /// the search reply does not wait for the prefetch pass: it fires
@@ -427,6 +520,13 @@ mod tests {
         )
     }
 
+    /// A result whose teaser is "serp", served by the rig on `port`.
+    fn teased(port: u16) -> Vec<Merged> {
+        let mut m = merged(&format!("http://127.0.0.1:{port}/p"), "t");
+        m.snippet = "serp".into();
+        vec![m]
+    }
+
     fn merged(url: &str, title: &str) -> Merged {
         Merged {
             title: title.to_string(),
@@ -436,6 +536,7 @@ mod tests {
             score: 1.0,
             published: None,
             families: 0,
+            from_page: false,
         }
     }
 
@@ -528,6 +629,71 @@ mod tests {
             "a killed prewarm cannot leave an entry behind"
         );
         unsafe { std::env::remove_var("DONSETCH_NO_PREWARM") };
+    }
+
+    /// `read` replaces the teaser with the page's own passage, marks it, parks the
+    /// body for the follow-up fetch, and leaves score and order alone.
+    #[tokio::test]
+    async fn read_replaces_the_teaser_with_the_pages_passage() {
+        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+        let (port, rx) = serve(RigMode::Reach);
+        let searcher = searcher();
+        let mut hits = vec![merged(&format!("http://127.0.0.1:{port}/page"), "serp")];
+        searcher
+            .read_results(&mut hits, "wire merge curiosity", 1)
+            .await;
+        rx.recv_timeout(Duration::from_secs(4))
+            .expect("the page was fetched");
+        assert!(hits[0].from_page, "the snippet is marked as the page's");
+        assert!(
+            hits[0].snippet.contains("wire merge of curiosity"),
+            "{}",
+            hits[0].snippet
+        );
+        assert_eq!(hits[0].score, 1.0, "reading never moves a result");
+        assert!(
+            searcher
+                .prewarms()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(&hits[0].url)
+                .is_some(),
+            "the body is parked for the follow-up fetch"
+        );
+    }
+
+    /// A page that does not speak to the query, a wall, a dead link and `k` = 0
+    /// all leave the teaser exactly as the search returned it.
+    #[tokio::test]
+    async fn read_leaves_the_teaser_when_there_is_nothing_to_quote() {
+        unsafe { std::env::set_var("DONSETCH_ALLOW_PRIVATE_EGRESS", "1") };
+        let searcher = searcher();
+        let (port, _rx) = serve(RigMode::Reach);
+        let mut off = teased(port);
+        searcher
+            .read_results(&mut off, "kubernetes ingress controller", 1)
+            .await;
+        assert_eq!((off[0].snippet.as_str(), off[0].from_page), ("serp", false));
+
+        for mode in [RigMode::Wall, RigMode::Dead] {
+            let (port, _rx) = serve(mode);
+            let mut hits = teased(port);
+            searcher
+                .read_results(&mut hits, "wire merge curiosity", 1)
+                .await;
+            assert_eq!((hits[0].snippet.as_str(), hits[0].score), ("serp", 1.0));
+            assert!(!hits[0].from_page);
+        }
+
+        let (port, rx) = serve(RigMode::Reach);
+        let mut none = teased(port);
+        searcher
+            .read_results(&mut none, "wire merge curiosity", 0)
+            .await;
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "read 0 makes no request"
+        );
     }
 
     /// Dead links (404) are honestly demoted 50%, and nothing gets

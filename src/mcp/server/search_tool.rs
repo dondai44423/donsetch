@@ -21,6 +21,7 @@ pub(super) async fn search_tool(
         Err(message) => return tool_error(message),
     };
     let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(7) as usize;
+    let read = args.get("read").and_then(Value::as_u64).unwrap_or(0) as usize;
     let intent = match args.get("intent").and_then(Value::as_str) {
         Some("web") => Some(Intent::Web),
         Some("code") => Some(Intent::Code),
@@ -35,7 +36,7 @@ pub(super) async fn search_tool(
             if queries.len() == 1 {
                 let query = &queries[0];
                 run_with_budget(
-                    search_inner(daemon, query, max, intent),
+                    search_inner(daemon, query, max, intent, read),
                     deadline,
                     ctx.as_mut(),
                     || search_deadline_error(query),
@@ -44,7 +45,7 @@ pub(super) async fn search_tool(
             } else {
                 let deadline_queries = queries.clone();
                 run_with_budget(
-                    search_batch_inner(daemon, &queries, max, intent),
+                    search_batch_inner(daemon, &queries, max, intent, read),
                     deadline,
                     ctx.as_mut(),
                     move || search_batch_deadline_error(&deadline_queries),
@@ -113,8 +114,9 @@ pub(super) async fn search_inner(
     query: &str,
     max: usize,
     intent: Option<Intent>,
+    read: usize,
 ) -> Value {
-    match search_outcome(daemon, query, max, intent).await {
+    match search_read(daemon, query, max, intent, read).await {
         Ok(out) => render_search_outcome(daemon, &out, max).await,
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
@@ -224,11 +226,12 @@ pub(super) async fn search_batch_inner(
     queries: &[String],
     max: usize,
     intent: Option<Intent>,
+    read: usize,
 ) -> Value {
     let started = std::time::Instant::now();
     let futures = queries
         .iter()
-        .map(|query| search_outcome(daemon, query, max, intent));
+        .map(|query| search_read(daemon, query, max, intent, read));
     let outcomes = futures_util::future::join_all(futures).await;
     let ok = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
     if ok == 0 {
@@ -337,6 +340,26 @@ pub(super) async fn search_batch_inner(
             "searches": diagnostics,
         }},
     })
+}
+
+/// The search pipeline, then `read`: the top `read` results' pages are fetched
+/// inside the same deadline and their passages replace the teasers. Applies to a
+/// provider's results as much as to the local fan-out.
+async fn search_read(
+    daemon: &Arc<Daemon>,
+    query: &str,
+    max: usize,
+    intent: Option<Intent>,
+    read: usize,
+) -> Result<crate::search::SearchOutcome, SearchFailure> {
+    let mut out = search_outcome(daemon, query, max, intent).await?;
+    if read > 0 {
+        daemon
+            .searcher
+            .read_results(&mut out.results, query, read)
+            .await;
+    }
+    Ok(out)
 }
 
 /// The search pipeline without presentation. Keeping acquisition separate lets
@@ -555,6 +578,7 @@ mod search_output_contract_tests {
                 score: 0.9,
                 published: None,
                 families: 0,
+                from_page: false,
             }],
             intent: Intent::Web,
             report: Vec::new(),
@@ -670,6 +694,7 @@ mod search_output_contract_tests {
                 score: 0.9,
                 published: None,
                 families: 0,
+                from_page: false,
             }],
             intent: Intent::Web,
             report: Vec::new(),

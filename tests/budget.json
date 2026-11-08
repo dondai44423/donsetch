@@ -1,11 +1,11 @@
 {
   "_comment": "A deliberate ceiling, not a target. Growth is a decision: raise a number here in the same commit that adds the coverage, and say why. After a clean full run `just ratchet` tightens every ceiling back to what the suite really uses, so room to grow never builds up unnoticed. max_single_test_s is CI-runner headroom (the desktop's slowest test is ~10 s); a test that needs more belongs in the heavy lane (.config/nextest.toml default-filter).",
-  "max_total": 2268,
+  "max_total": 2280,
   "max_single_test_s": 30,
   "max_sum_s": 540,
   "suites": {
     "donsetch-core::donsetch_core": 226,
-    "donsetch::donsetch": 1962,
+    "donsetch::donsetch": 1974,
     "donsetch::it": 107
   },
   "allow_slow": [],

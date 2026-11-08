@@ -317,6 +317,17 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         ),
     },
     ParamSpec {
+        name: "read",
+        flag: "read",
+        kind: ParamKind::Usize,
+        cli: CliKind::Flag,
+        required: false,
+        help: "Read the top N results (max 3, default 0) inside the same deadline: each snippet becomes the passage of that page which answers the query, marked `page:`, and the page is warm for a follow-up fetch. A page that cannot be read keeps its snippet.",
+        mcp_help: Some(
+            "Read the top N results (max 3, default 0) within the call's deadline: their snippets become the page's own passage for the query (`page:`), and a follow-up web_fetch of them is served warm. Use when snippets are not enough to choose.",
+        ),
+    },
+    ParamSpec {
         name: "intent",
         flag: "intent",
         kind: ParamKind::Enum(&["auto", "web", "code", "paper", "news", "entity"]),

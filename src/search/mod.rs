@@ -9,6 +9,7 @@ pub mod byok;
 pub mod coverage;
 pub mod egress;
 pub mod engines;
+pub mod evidence;
 pub mod families;
 pub mod instant;
 pub mod intent;
@@ -102,7 +103,7 @@ tokio::task_local! {
     pub(crate) static SEARCH_DEADLINE: Option<tokio::time::Instant>;
 }
 
-fn stage_budget(cap: Duration, reserve: Duration) -> Duration {
+pub(crate) fn stage_budget(cap: Duration, reserve: Duration) -> Duration {
     SEARCH_DEADLINE
         .try_with(|deadline| {
             deadline.map_or(cap, |deadline| {
@@ -2098,6 +2099,7 @@ mod tests {
                 score: 1.0 - i as f64 * 0.1,
                 published: None,
                 families: 0,
+                from_page: false,
             })
             .collect::<Vec<_>>();
         let report = vec![EngineReport {
@@ -2622,7 +2624,7 @@ mod tests {
         // bing, ddg and yahoo are one opinion; google and brave stand alone.
         assert_eq!(rank::family_count(&measured[0]), 3);
         let markdown = render_compact_markdown(&outcome(vec![measured[0].clone()]), "", None, &[]);
-        assert!(markdown.contains("3 index families"), "{markdown}");
+        assert!(markdown.contains(" · 3 indexes"), "{markdown}");
     }
 
     #[test]
@@ -3086,10 +3088,8 @@ mod tests {
             &[Some("· ⚠ needs browser".into())],
         );
         assert!(
-            markdown.contains(
-                "1. S1 · Tokio runtime guide : tokio.rs · ⚠ needs browser · 1 index family"
-            ),
-            "index-family count follows the route hint: {markdown}"
+            markdown.contains("1. S1 · Tokio runtime guide : tokio.rs · ⚠ needs browser"),
+            "the route hint follows the host: {markdown}"
         );
         assert!(markdown.contains("A focused explanation"));
         // The census names who answered and who did not; there is no
@@ -3143,6 +3143,7 @@ mod tests {
             score: 1.0,
             published: None,
             families: 0,
+            from_page: false,
         }
     }
 
