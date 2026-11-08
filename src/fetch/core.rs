@@ -58,6 +58,11 @@ fn document_budget() -> Duration {
 
 /// A one-shot read's ceiling; callers wrap tighter deadlines around it. A file
 /// (the update tarball) is the longest thing read this way.
+/// How long an AWS pricing page waits for its price files, and the largest one
+/// it reads: a page that cannot have them in this time is served as it came.
+const PRICE_FILES_BUDGET: Duration = Duration::from_secs(8);
+const PRICE_FILE_MAX: usize = 16 * 1024 * 1024;
+
 const ONCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The identity a one-shot read presents: a real client profile from the
@@ -154,8 +159,58 @@ impl CoreFetcher {
         let session = Arc::clone(&self.session);
         let outcome = blocking(cancel, move || session.fetch(&request)).await;
         let mut out = into_outcome(outcome, document.route, &refusal)?;
+        self.fill_price_tables(&mut out, document.proxy.as_ref())
+            .await;
         out.elapsed = started.elapsed();
         Ok(out)
+    }
+
+    /// An AWS pricing page's tables are templates its own script fills from a
+    /// public price file; read the file the page names and put the filled
+    /// tables in the page (see [`crate::fetch::pricing`]). A page that is not
+    /// one, or a file that does not answer in time, leaves the body as served.
+    async fn fill_price_tables(&self, out: &mut FetchOutcome, proxy: Option<&Proxy>) {
+        if out.status != 200 || !out.body.windows(20).any(|w| w == b"data-pricing-markup=") {
+            return;
+        }
+        let Ok(html) = std::str::from_utf8(&out.body) else {
+            return;
+        };
+        let Some(plan) = crate::fetch::pricing::plan(html, &out.url) else {
+            return;
+        };
+        let referer = out.url.clone();
+        let reads = plan.files.iter().map(|(name, url)| {
+            let origin = [("origin".to_string(), plan.origin.clone())];
+            let referer = referer.as_str();
+            async move {
+                let reply = self
+                    .once(OneShot {
+                        url,
+                        conditional: &origin,
+                        proxy,
+                        use_jar: false,
+                        referer: Some(referer),
+                        class: RequestClass::Fetch,
+                        user_agent: None,
+                    })
+                    .await
+                    .ok()
+                    .filter(|r| r.status == 200 && r.body.len() <= PRICE_FILE_MAX)?;
+                let json = serde_json::from_slice(&reply.body).ok()?;
+                Some((name.clone(), json))
+            }
+        });
+        let Ok(files) =
+            tokio::time::timeout(PRICE_FILES_BUDGET, futures_util::future::join_all(reads)).await
+        else {
+            return;
+        };
+        let data: std::collections::HashMap<String, serde_json::Value> =
+            files.into_iter().flatten().collect();
+        if let Some(filled) = crate::fetch::pricing::apply(html, &out.url, &data) {
+            out.body = filled.into_bytes();
+        }
     }
 
     /// One request exactly as described: no identity search, no page cache, no
@@ -194,7 +249,12 @@ impl CoreFetcher {
             headers.push(("accept".into(), accept));
             headers.push((
                 "sec-fetch-mode".into(),
-                if dest == "font" { "cors" } else { "no-cors" }.into(),
+                if shot.class.is_cors() {
+                    "cors"
+                } else {
+                    "no-cors"
+                }
+                .into(),
             ));
             headers.push(("sec-fetch-dest".into(), dest));
             donsetch_core::Kind::Subresource

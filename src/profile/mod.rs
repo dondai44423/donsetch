@@ -230,7 +230,10 @@ impl BrowserProfile {
             ("user-agent".into(), self.user_agent.clone()),
             ("accept".into(), accept),
             ("sec-fetch-site".into(), "same-origin".into()),
-            ("sec-fetch-mode".into(), "no-cors".into()),
+            (
+                "sec-fetch-mode".into(),
+                if class.is_cors() { "cors" } else { "no-cors" }.into(),
+            ),
             ("sec-fetch-dest".into(), dest),
             ("accept-encoding".into(), "gzip, deflate, br, zstd".into()),
             (
@@ -262,9 +265,17 @@ pub enum RequestClass {
     Image,
     /// favicon.ico (image class, dest image).
     Favicon,
+    /// A `fetch()`/XHR the page's own script makes: cors mode, dest `empty`.
+    Fetch,
 }
 
 impl RequestClass {
+    /// Whether the browser sends this class in `cors` mode (fonts and script
+    /// `fetch()` calls) rather than `no-cors`.
+    pub(crate) fn is_cors(self) -> bool {
+        matches!(self, RequestClass::Font | RequestClass::Fetch)
+    }
+
     /// The per-class Accept value and sec-fetch-dest, matching what
     /// Chrome sends for the same subresource type.
     pub(crate) fn accept_and_dest(self) -> (String, String) {
@@ -277,6 +288,7 @@ impl RequestClass {
             RequestClass::Style => ("text/css,*/*;q=0.1".to_string(), "style".to_string()),
             RequestClass::Script => ("*/*".to_string(), "script".to_string()),
             RequestClass::Font => ("*/*".to_string(), "font".to_string()),
+            RequestClass::Fetch => ("*/*".to_string(), "empty".to_string()),
             RequestClass::Image | RequestClass::Favicon => (
                 "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8".to_string(),
                 "image".to_string(),
@@ -928,6 +940,18 @@ mod class_tests {
     }
 
     #[test]
+    fn a_pages_own_fetch_call_is_cors_with_an_empty_destination() {
+        let p = profile();
+        let h = p.h1_headers_for_class("example.com", "/a", RequestClass::Fetch);
+        let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("sec-fetch-dest"), Some("empty"));
+        assert_eq!(get("sec-fetch-mode"), Some("cors"));
+        assert_eq!(get("accept"), Some("*/*"));
+        assert!(RequestClass::Fetch.is_cors() && RequestClass::Font.is_cors());
+        assert!(!RequestClass::Script.is_cors() && !RequestClass::Navigation.is_cors());
+    }
+
+    #[test]
     fn subresource_classes_carry_their_own_sets() {
         let p = profile();
         for (class, dest, accept_prefix) in [
@@ -941,7 +965,13 @@ mod class_tests {
             let names: Vec<&str> = h.iter().map(|(n, _)| n.as_str()).collect();
             let get = |k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
             assert_eq!(get("sec-fetch-dest"), Some(dest), "{class:?}");
-            assert_eq!(get("sec-fetch-mode"), Some("no-cors"), "{class:?}");
+            // Chrome loads a font in cors mode and the rest in no-cors.
+            let mode = if class == RequestClass::Font {
+                "cors"
+            } else {
+                "no-cors"
+            };
+            assert_eq!(get("sec-fetch-mode"), Some(mode), "{class:?}");
             assert!(
                 get("accept").unwrap().starts_with(accept_prefix),
                 "{class:?} accept {:?}",
