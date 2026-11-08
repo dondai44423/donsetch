@@ -304,14 +304,13 @@ fn render_thread_modern(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
         "{owner}/{repo}#{number} · {state} · u/{author} · opened {date}\n\n"
     ));
     if let Some(body) = doc.select(&body_sel).next() {
-        let body_md = crate::extract::inline::markdown(
+        let body_md = crate::extract::element_markdown(
             body,
             &format!("https://github.com/{owner}/{repo}"),
             &gh_inline_opts(),
-        )
-        .0;
+        );
         if !body_md.trim().is_empty() {
-            md.push_str(body_md.trim());
+            md.push_str(demote_headings(&body_md, 1).trim());
             md.push_str("\n\n");
         }
     }
@@ -324,12 +323,27 @@ fn render_thread_modern(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
 }
 
 fn render_thread_legacy(doc: &Html, owner: &str, repo: &str, number: &str) -> Option<String> {
-    let title_sel = Selector::parse("bdi.js-issue-title").ok()?;
+    // The 2026 pull request page keeps the server-rendered timeline but moves
+    // the title into a page-header `h1` and the state into a StateLabel.
+    let title_sel = Selector::parse("bdi.js-issue-title, h1 span.markdown-title").ok()?;
     let title = doc
         .select(&title_sel)
-        .next()
         .map(text_of)
-        .filter(|t| !t.is_empty())?;
+        .find(|t| !t.is_empty())?;
+    let label_sel = Selector::parse("[data-component='StateLabel'][data-status]").ok()?;
+    let labelled = doc
+        .select(&label_sel)
+        .next()
+        .and_then(|l| l.value().attr("data-status"))
+        .map(|st| {
+            if st.contains("erged") {
+                "merged"
+            } else if st.contains("losed") {
+                "closed"
+            } else {
+                "open"
+            }
+        });
     let state_open = doc
         .select(&Selector::parse("svg.octicon-issue-opened, svg.octicon-git-pull-request").ok()?)
         .next()
@@ -347,12 +361,11 @@ fn render_thread_legacy(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
     let time_sel = Selector::parse("relative-time").ok()?;
     let opened = doc
         .select(&time_sel)
-        .next()
-        .and_then(|t| t.value().attr("datetime"))
+        .find_map(|t| t.value().attr("datetime"))
         .map(|d| d.chars().take(10).collect::<String>())
         .unwrap_or_default();
 
-    let state = if state_open { "open" } else { "closed" };
+    let state = labelled.unwrap_or(if state_open { "open" } else { "closed" });
     let mut md = format!("# {title}\n");
     md.push_str(&format!(
         "{owner}/{repo}#{number} · {state} · u/{author} · opened {opened}\n\n"
@@ -375,25 +388,110 @@ fn render_thread_legacy(doc: &Html, owner: &str, repo: &str, number: &str) -> Op
         let Some(body) = item.select(&inner_sel).next() else {
             continue;
         };
-        let body_md = crate::extract::inline::markdown(
+        let body_md = crate::extract::element_markdown(
             body,
             &format!("https://github.com/{owner}/{repo}"),
             &gh_inline_opts(),
-        )
-        .0;
+        );
         if body_md.trim().is_empty() {
             continue;
         }
         count += 1;
         let role = if count == 1 { " (opener)" } else { "" };
         md.push_str(&format!("**u/{who}**{role}\n\n"));
-        md.push_str(body_md.trim());
+        md.push_str(demote_headings(&body_md, 1).trim());
         md.push_str("\n\n---\n\n");
     }
     if count == 0 {
         return None; // JS-only render (rare) → generic
     }
     Some(md.trim_end_matches("---\n\n").trim_end().to_string())
+}
+
+/// A fence line's marker (its run of backticks or tildes), if it is one.
+fn fence_marker(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let c = t.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let run = t.len() - t.trim_start_matches(c).len();
+    (run >= 3).then(|| &t[..run])
+}
+
+/// Markdown whose headings sit `by` levels lower (at most `######`), so a
+/// body's own headings nest under the heading this page puts above it.
+/// Lines inside code fences are left alone.
+fn demote_headings(md: &str, by: usize) -> String {
+    let mut out = String::with_capacity(md.len() + 16);
+    let mut fence: Option<String> = None;
+    for line in md.split_inclusive('\n') {
+        if let Some(marker) = fence_marker(line) {
+            match &fence {
+                Some(open) if marker.starts_with(open.as_str()) => fence = None,
+                None => fence = Some(marker.to_string()),
+                Some(_) => {}
+            }
+        } else if fence.is_none() {
+            let level = line.bytes().take_while(|&b| b == b'#').count();
+            if (1..=6).contains(&level) && line[level..].starts_with(' ') {
+                out.push_str(&"#".repeat((level + by).min(6)));
+                out.push_str(&line[level..]);
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// At most about `max` bytes of `md`, ended at a block boundary outside any
+/// code fence; a single block longer than that is cut and its fence closed.
+fn clip_blocks(md: &str, max: usize) -> String {
+    let md = md.trim();
+    if md.len() <= max {
+        return md.to_string();
+    }
+    let mut fence: Option<String> = None;
+    let mut cut = None;
+    let mut at = 0;
+    for line in md.split_inclusive('\n') {
+        if at + line.len() > max {
+            break;
+        }
+        if let Some(marker) = fence_marker(line) {
+            match &fence {
+                Some(open) if marker.starts_with(open.as_str()) => fence = None,
+                None => fence = Some(marker.to_string()),
+                Some(_) => {}
+            }
+        }
+        at += line.len();
+        if fence.is_none() && line.trim().is_empty() {
+            cut = Some(at);
+        }
+    }
+    let mut out = match cut {
+        // A heading whose section was cut away is dropped with it.
+        Some(end) => {
+            let mut kept = md[..end].trim_end();
+            while let Some((rest, last)) = kept.rsplit_once('\n')
+                && last.starts_with('#')
+                && last.trim_start_matches('#').starts_with(' ')
+            {
+                kept = rest.trim_end();
+            }
+            kept.to_string()
+        }
+        None => {
+            let end = crate::extract::blocks::floor_boundary(md, max);
+            let mut head = md[..end].to_string();
+            if let Some(open) = fence {
+                head.push('\n');
+                head.push_str(&open);
+            }
+            head
+        }
+    };
+    out.push_str("\n\n…");
+    out
 }
 
 // ── Releases ──────────────────────────────────────────────────
@@ -433,9 +531,9 @@ fn render_releases(doc: &Html) -> Option<String> {
         md.push_str(&format!("## {tag} : {date}\n\n"));
         if let Some(notes) = rel.select(&notes_sel).next() {
             let notes_md =
-                crate::extract::inline::markdown(notes, "https://github.com", &gh_inline_opts()).0;
-            let trimmed: String = notes_md.chars().take(2_000).collect();
-            md.push_str(trimmed.trim());
+                crate::extract::element_markdown(notes, "https://github.com", &gh_inline_opts());
+            // Under the release's own `##`, the notes' headings sit below it.
+            md.push_str(&clip_blocks(&demote_headings(&notes_md, 2), 2_000));
             md.push_str("\n\n");
         }
     }
@@ -675,6 +773,101 @@ mod tests {
         assert!(ex.markdown.contains("o/r#42"));
         assert!(ex.markdown.contains("(opener)"));
         assert!(ex.markdown.contains("panic"));
+    }
+
+    // The 2026 pull request page, as served: the title in the page header's
+    // h1, the state in a StateLabel, the timeline still server-rendered.
+    #[test]
+    fn a_pull_request_page_renders_as_a_thread() {
+        let page = |status: &str| {
+            format!(
+                r#"<html><body>
+          <h1 class="lh-condensed prc-Heading-Heading-MtWFE" data-component="Heading"><span class="f1 text-normal markdown-title" data-component="Text">time: use <code>array::from_fn</code></span><span class="sr-only"> - #7000</span></h1>
+          <span class="prc-StateLabel-StateLabel-Iawzp" data-component="StateLabel" data-status="{status}">Merged</span>
+          <div class="timeline-comment">
+            <a class="author">Dav1dde</a> <span class="Label">Contributor</span> <button>Copy link</button>
+            <div class="edit-comment-hide"><div class="comment-body markdown-body js-comment-body">
+              <h2 dir="auto">Motivation</h2><p dir="auto">The block can use <code>std::array::from_fn</code>.</p>
+            </div></div>
+          </div>
+        </body></html>"#
+            )
+        };
+        let url = "https://github.com/tokio-rs/tokio/pull/7000";
+        let ex = extract(&page("pullMerged"), url, &opts()).expect("adapter renders the PR");
+        assert!(ex.markdown.starts_with("# time: use"), "{}", ex.markdown);
+        assert!(
+            ex.markdown.contains("tokio-rs/tokio#7000 · merged"),
+            "{}",
+            ex.markdown
+        );
+        assert!(
+            ex.markdown.contains("**u/Dav1dde** (opener)"),
+            "{}",
+            ex.markdown
+        );
+        assert!(
+            ex.markdown.contains("std::array::from_fn"),
+            "{}",
+            ex.markdown
+        );
+        assert!(!ex.markdown.contains("Copy link"), "{}", ex.markdown);
+        for (status, word) in [("pullOpened", "open"), ("pullClosed", "closed")] {
+            let ex = extract(&page(status), url, &opts()).unwrap();
+            assert!(
+                ex.markdown.contains(&format!("#7000 · {word} ·")),
+                "{status}: {}",
+                ex.markdown
+            );
+        }
+    }
+
+    // An issue body is a document: its paragraphs, lists and code blocks stay
+    // apart, and its headings nest under the thread's title.
+    #[test]
+    fn an_issue_body_keeps_its_blocks() {
+        let html = r#"<html><body>
+          <bdi class="js-issue-title">Spawn in Drop panics</bdi>
+          <div class="timeline-comment">
+            <a class="author">jg</a>
+            <div class="comment-body markdown-body">
+              <h1>Version</h1><p>Reproducible on 0.3.1.</p>
+              <h2>Description</h2><p>Calling spawn in Drop panics:</p>
+              <div class="highlight"><pre># not a heading
+fn drop(&amp;mut self) { tokio::spawn(async {}); }</pre></div>
+              <ul><li>first</li><li>second</li></ul>
+            </div>
+          </div>
+        </body></html>"#;
+        let ex = extract(html, "https://github.com/o/r/issues/3043", &opts()).unwrap();
+        let md = &ex.markdown;
+        assert!(md.contains("\n## Version\n"), "{md}");
+        assert!(md.contains("\n### Description\n"), "{md}");
+        assert!(md.contains("Reproducible on 0.3.1.\n"), "{md}");
+        assert!(md.contains("```\n# not a heading\nfn drop"), "{md}");
+        assert!(md.contains("- first\n- second"), "{md}");
+    }
+
+    #[test]
+    fn headings_demote_outside_code_only() {
+        let md = "# A\n\n```sh\n# comment\n```\n\n###### Deep\n#hashtag\n";
+        assert_eq!(
+            demote_headings(md, 2),
+            "### A\n\n```sh\n# comment\n```\n\n###### Deep\n#hashtag\n"
+        );
+    }
+
+    #[test]
+    fn clipped_notes_end_between_blocks_and_close_their_fence() {
+        let md = format!("Intro.\n\n```\n{}```\n\nTail.", "let x = 1;\n".repeat(40));
+        let clipped = clip_blocks(&md, 200);
+        assert_eq!(clipped, "Intro.\n\n…");
+        let md = format!("Intro.\n\n### Changed\n\n{}", "- item\n".repeat(60));
+        assert_eq!(clip_blocks(&md, 40), "Intro.\n\n…");
+        let one_block = format!("```\n{}```", "let x = 1;\n".repeat(40));
+        let clipped = clip_blocks(&one_block, 100);
+        assert!(clipped.ends_with("\n```\n\n…"), "{clipped}");
+        assert_eq!(clip_blocks("short", 100), "short");
     }
 
     #[test]

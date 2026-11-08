@@ -1090,6 +1090,33 @@ fn soft_cut(tail: &str) -> usize {
     tail[..limit].rfind(' ').unwrap_or(limit)
 }
 
+/// One element's content as markdown blocks (headings, paragraphs, lists,
+/// code, tables, quotes), with no page frontmatter: for an adapter that lays
+/// out a post or comment body inside its own page. Falls back to the
+/// element's inline rendering when the block walk finds nothing.
+pub(crate) fn element_markdown(
+    root: scraper::ElementRef<'_>,
+    base: &str,
+    opts: &ExtractOptions,
+) -> String {
+    let mut found = Vec::new();
+    blocks::segment(root, base, opts, &mut found);
+    let meta = metadata::Meta {
+        title: None,
+        byline: None,
+        published: None,
+        site: None,
+        description: None,
+        canonical: None,
+    };
+    let md = render::render(&meta, "", &found.iter().collect::<Vec<_>>(), opts);
+    let md = md.trim();
+    if md.is_empty() {
+        return inline::markdown(root, base, opts).0.trim().to_string();
+    }
+    md.to_string()
+}
+
 /// Shared pagination for dedicated extractors (reddit, hn).
 pub fn paginate_public(text: &str, offset: usize, max_chars: usize) -> (String, Option<usize>) {
     paginate(text, offset, max_chars)
