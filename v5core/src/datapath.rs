@@ -393,16 +393,37 @@ fn resolve_stackexchange(url: &Url) -> Option<Request> {
     if host.starts_with("api.") {
         return None;
     }
-    // The call below answers "what is being asked here": the site's front
-    // and its question listing. A question is answered by its own document.
+    // The call below answers "what is being asked here": the site's front,
+    // its question listing and a tag's listing. A question is answered by
+    // its own document.
     let segments: Vec<&str> = url
         .path()
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
-    if !matches!(segments.as_slice(), [] | ["questions"]) {
-        return None;
-    }
+    let tagged = match segments.as_slice() {
+        [] | ["questions"] => None,
+        ["questions", "tagged", tags] => {
+            // `rust+async` and `rust%20async` both mean two tags; the API
+            // takes them `;`-separated. A literal `+` separates before
+            // decoding, so `c%2B%2B` stays the tag `c++`.
+            let tags: Vec<String> = tags
+                .split('+')
+                .flat_map(|part| {
+                    percent_decode(part)
+                        .split(' ')
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|tag| !tag.is_empty())
+                .collect();
+            if tags.is_empty() {
+                return None;
+            }
+            Some(tags.join(";"))
+        }
+        _ => return None,
+    };
     // The API's `site` parameter is the network host without the TLD.
     let site = host.strip_prefix("www.").unwrap_or(host);
     let site = site.split('.').next().unwrap_or("stackoverflow");
@@ -411,9 +432,18 @@ fn resolve_stackexchange(url: &Url) -> Option<Request> {
     } else {
         site
     };
-    let target = format!(
-        "https://api.stackexchange.com/2.3/questions?site={site}&pagesize=30&order=desc&sort=activity&filter=default"
-    );
+    let mut target = Url::parse("https://api.stackexchange.com/2.3/questions").ok()?;
+    target
+        .query_pairs_mut()
+        .append_pair("site", site)
+        .append_pair("pagesize", "30")
+        .append_pair("order", "desc")
+        .append_pair("sort", "activity");
+    if let Some(tags) = tagged {
+        target.query_pairs_mut().append_pair("tagged", &tags);
+    }
+    target.query_pairs_mut().append_pair("filter", "default");
+    let target = target.to_string();
     Some(Request {
         method: "GET",
         url: target,
@@ -735,6 +765,27 @@ fn strip_html(value: &str) -> String {
     out
 }
 
+/// A URL path segment with its `%XX` escapes decoded (lossily, as UTF-8).
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |at: usize| bytes.get(at).and_then(|b| (*b as char).to_digit(16));
+        match (bytes[i], hex(i + 1), hex(i + 2)) {
+            (b'%', Some(hi), Some(lo)) => {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            (byte, _, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn unescape(value: &str) -> String {
     value
         .replace("&amp;", "&")
@@ -807,6 +858,14 @@ mod tests {
         assert!(feed("https://stackoverflow.com/").is_some());
         assert!(feed("https://stackoverflow.com/questions").is_some());
         assert!(feed("https://stackoverflow.com/questions/11227809/why-is-it-faster").is_none());
+        // A tag's listing asks the API for that tag's questions.
+        let tagged = feed("https://stackoverflow.com/questions/tagged/c%2b%2b+async").unwrap();
+        assert!(tagged.contains("tagged=c%2B%2B%3Basync"), "{tagged}");
+        assert!(tagged.contains("site=stackoverflow"), "{tagged}");
+        assert!(feed("https://stackoverflow.com/questions/tagged/").is_none());
+        assert!(!feed("https://stackoverflow.com/questions")
+            .unwrap()
+            .contains("tagged"));
         assert!(feed("https://superuser.com/questions/42/title").is_none());
 
         assert_eq!(
