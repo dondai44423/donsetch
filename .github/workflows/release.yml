@@ -122,14 +122,23 @@ jobs:
       # target is Windows, so the cross build needs no Windows MSI. This
       # also keeps clang away from the Windows runners' LLVM installer,
       # which its own download path 504s on.
-      - name: Install LLVM 11 (cross builds)
-        if: matrix.os != 'windows-latest'
+      - name: Install LLVM 11 (Windows cross build)
+        if: matrix.os == 'ubuntu-22.04'
         run: |
           # nasm: BoringSSL's Windows assembly objects, one apt install here
           # instead of a choco package on a runner whose downloads flake.
           sudo apt-get update -o Acquire::Retries=5
           sudo apt-get install -y --no-install-recommends nasm xz-utils
-          curl -fsSL --retry 5 -o /tmp/llvm.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-11.0.1/clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz
+          # Only the Windows target needs libclang; the Linux and macOS legs
+          # already have a toolchain. The release-download path 504s, so this
+          # goes through the same API-asset fallback the build script uses.
+          name=clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz
+          url=https://github.com/llvm/llvm-project/releases/download/llvmorg-11.0.1/$name
+          curl -fsSL --retry 3 -o /tmp/llvm.tar.xz "$url" || {
+            asset=$(gh api repos/llvm/llvm-project/releases/tags/llvmorg-11.0.1 \
+              --jq ".assets[]|select(.name==\"$name\")|.url")
+            curl -fsSL --retry 5 -H 'Accept: application/octet-stream' -o /tmp/llvm.tar.xz "$asset"
+          }
           mkdir -p "$RUNNER_TEMP/llvm"
           tar -xJf /tmp/llvm.tar.xz -C "$RUNNER_TEMP/llvm" --strip-components=1
           echo "$RUNNER_TEMP/llvm/bin" >> "$GITHUB_PATH"
