@@ -375,15 +375,25 @@ fn outline(doc: &Doc, within: Option<usize>) -> String {
             size_label(chars)
         );
     }
-    let base = ids
-        .iter()
-        .map(|&i| doc.headings[i].level)
-        .min()
-        .unwrap_or(1);
+    // Indent by nesting, not by level number: a heading two levels below
+    // its parent (an h2 under an h4-sized title, a PDF's guessed sizes)
+    // still reads as its child.
+    let depth = |i: usize| {
+        let mut depth = 0;
+        let mut at = doc.headings[i].parent;
+        while let Some(parent) = at {
+            if within.is_some_and(|root| parent < root) {
+                break;
+            }
+            depth += 1;
+            at = doc.headings[parent].parent;
+        }
+        depth
+    };
     let mut out = String::new();
     for &i in &ids {
         let h = &doc.headings[i];
-        let indent = "  ".repeat((h.level - base) as usize);
+        let indent = "  ".repeat(depth(i));
         out.push_str(&format!(
             "{indent}- [s{}] {} · {}\n",
             i + 1,
@@ -1389,6 +1399,24 @@ Intro text about widgets and how they work.\n\n\
             None,
         );
         assert!(r.text.contains("not on the page: \"zebra\""), "{}", r.text);
+    }
+
+    #[test]
+    fn the_outline_indents_by_nesting_not_by_level() {
+        let doc = Doc::parse(
+            "# Paper\nhttps://example.com/p.pdf\n\n# Attention\n\nIntro.\n\n##### Abstract\n\nText.\n\n## 1 Introduction\n\nText.\n\n### 1.1 Scope\n\nText.\n",
+        );
+        let toc = outline(&doc, None);
+        let lines: Vec<&str> = toc.lines().collect();
+        assert!(lines[0].starts_with("- [s1] Attention"), "{toc}");
+        assert!(lines[1].starts_with("  - [s2] Abstract"), "{toc}");
+        assert!(lines[2].starts_with("  - [s3] 1 Introduction"), "{toc}");
+        assert!(lines[3].starts_with("    - [s4] 1.1 Scope"), "{toc}");
+        // Inside a section, its heading is the root.
+        let inner = outline(&doc, Some(2));
+        let inner: Vec<&str> = inner.lines().collect();
+        assert!(inner[0].starts_with("- [s3] 1 Introduction"), "{inner:?}");
+        assert!(inner[1].starts_with("  - [s4] 1.1 Scope"), "{inner:?}");
     }
 
     #[test]
