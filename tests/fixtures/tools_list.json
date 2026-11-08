@@ -92,7 +92,7 @@
     },
     {
       "name": "web_search",
-      "description": "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. Weak or degraded results are incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
+      "description": "Discover ranked URLs, titles and snippets; fetch a candidate for its full text. A snippet supports only what it states. A sources census names who answered and what every other source said, so an incomplete set reads as incomplete. Fetch handles resolve directly in web_fetch; citation URLs accompany the evidence in the leading [meta] JSON.",
       "inputSchema": {
         "type": "object",
         "properties": {

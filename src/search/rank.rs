@@ -176,6 +176,15 @@ fn collapse_ws(s: &str) -> String {
 /// multi-MiB title from any provider.
 const MAX_TITLE_CHARS: usize = 512;
 
+/// How many candidates the cross-encoder scores. 24 is past the point where a
+/// tie-break can matter: the answer is in the head of the list or it is not.
+const RERANK_DEPTH: usize = 24;
+
+/// No snippet may exceed this, whatever the source. The render cuts to 180 and
+/// the cross-encoder batches every candidate to the longest snippet it is given,
+/// so one unbounded description costs seconds of CPU on every search.
+const MAX_SNIPPET_CHARS: usize = 600;
+
 fn title_of(s: &str) -> String {
     collapse_ws(s).chars().take(MAX_TITLE_CHARS).collect()
 }
@@ -256,7 +265,11 @@ fn merge_inner(
             // length-based, so mixing raw and collapsed strings
             // would pick winners by whitespace count.
             let hit_title = title_of(&hit.title);
-            let hit_snippet = collapse_ws(&hit.snippet);
+            // Bounded once, here, where every source's text enters the merge.
+            let hit_snippet: String = collapse_ws(&hit.snippet)
+                .chars()
+                .take(MAX_SNIPPET_CHARS)
+                .collect();
             let key = norm_key(&hit.url);
             let contribution = tw / (RRF_K + hit.rank as f64 + 1.0);
             let best = family_best
@@ -271,8 +284,9 @@ fn merge_inner(
                 score: 0.0,
                 published: None,
             });
-            // Keep the longest snippet (most informative),
-            // skipping redirect stubs.
+            // Keep the longest snippet (most informative), skipping redirect
+            // stubs. Both sides are already bounded (MAX_SNIPPET_CHARS), so no
+            // source can inflate the cross-encoder's batch.
             if hit_snippet.len() > entry.snippet.len() && !hit_snippet.starts_with("Redirecting") {
                 entry.snippet = hit_snippet.clone();
             }
@@ -356,8 +370,13 @@ fn merge_inner(
     // Cross-encoder semantic reranking: re-score by semantic
     // relevance (query ↔ title+snippet through full attention).
     // Skipped gracefully if model unavailable or feature disabled.
-    if semantic {
-        crate::search::rerank::rerank(query, &mut results);
+    if semantic && crate::config::cfg().search.rerank {
+        // The cross-encoder is a tie-breaker over the strongest candidates, not
+        // a second retrieval: score the head of the lexical blend and leave the
+        // tail alone, so its cost is bounded by a constant, not by the merge.
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let depth = results.len().min(RERANK_DEPTH);
+        crate::search::rerank::rerank(query, &mut results[..depth]);
     }
 
     // Entity coverage penalty: penalize results that miss
@@ -703,6 +722,25 @@ mod tests {
         let trust = std::collections::HashMap::new();
         let out = merge(&[], "anything", Intent::Web, &trust, 10);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_snippet_is_bounded_whatever_the_source_sends() {
+        // A 100 KB feed description used to reach the cross-encoder, which pads
+        // every pair in its batch to the longest one: 40 CPU-seconds for one
+        // search. The merge is the one place every source flows through.
+        let huge = "x".repeat(100_000);
+        let mut a = hit("https://example.com/a", 0);
+        a.snippet = huge.clone();
+        let per = vec![("bing".to_string(), vec![a])];
+        let trust = std::collections::HashMap::new();
+        let out = merge(&per, "example", Intent::Web, &trust, 10);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].snippet.chars().count() <= MAX_SNIPPET_CHARS,
+            "snippet is {} chars",
+            out[0].snippet.chars().count()
+        );
     }
 
     #[test]

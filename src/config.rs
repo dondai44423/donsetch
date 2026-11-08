@@ -157,6 +157,18 @@ section!(SearchSection {
     /// C5: extract byte-derived featured/instant/knowledge answers
     /// from SERP HTML. Kill: DONSETCH_NO_SERP_INSTANT.
     serp_instant: bool = true,
+    /// Cross-encoder re-ranking of the merged candidates (ONNX, in-process).
+    /// OFF by default: on the 40-query bench it moved no metric (hit@1 0.25 vs
+    /// 0.23, hit@5 0.65 vs 0.62, MRR 0.434 vs 0.418 -- all inside noise, twice)
+    /// while costing 7-12 CPU-seconds per search, almost all of it the ONNX
+    /// session's first use in a process. A long-lived daemon would pay that
+    /// once; every tool call would not. Enable to try it on your own queries.
+    rerank: bool = false,
+    /// Fetch the top results to replace SERP snippets with the pages' own
+    /// title and description, and park the bodies for the next fetch.
+    /// OFF by default: it is one page fetch per result (five per search), which
+    /// is an agent's traffic to spend only when it asks. Default off since 5.2.
+    enrich: bool = false,
 });
 
 section!(BrowserSection {

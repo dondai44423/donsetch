@@ -34,7 +34,7 @@ use persist::{
     load_quality_disk, save_cache_disk, save_health_disk_if_dirty, save_outcome_disk_if_dirty,
     save_quality_disk_if_dirty,
 };
-use tasks::{EngineResult, TaskFut, engine_task, vertical_task};
+use tasks::{EngineResult, TaskFut, vertical_task};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -47,8 +47,52 @@ use egress::EgressPool;
 use intent::Intent;
 use rank::Merged;
 
-const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
-const RETRY_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the fan-out may run before the call commits to what has answered.
+/// Sources answer in 0.8–1.4 s on this network, so this is a cap on the tail,
+/// not a target: a lane still running at the mark is reported `late` and
+/// cancelled. A caller's `deadline_ms` shrinks it further.
+const FANOUT_SOFT_MARK: Duration = Duration::from_millis(1200);
+
+/// Never wait past this, however slow the sources are: a search with no answer
+/// after four seconds is answered by `late`, not by a longer wait.
+const FANOUT_HARD_MARK: Duration = Duration::from_millis(4000);
+
+/// The merge is thin below this: fewer than three answering sources, or fewer
+/// items than a ranking can be built from. A thin merge gets one bounded second
+/// ask (measured: it is where most of the recall lives on a bad minute).
+const THIN_LANES: usize = 3;
+const THIN_ITEMS: usize = 15;
+
+/// How long a second ask may take, and only ever inside the hard mark.
+const SECOND_ASK: Duration = Duration::from_millis(1500);
+
+/// A lane's own ceiling: the mark plus a grace for the request already on the
+/// wire. Dropping a lane's future does NOT stop its blocking fetch, and the
+/// process waits for it at exit — measured: a 1.2 s answer with a 4.9 s wall
+/// clock because a cancelled bing lane kept working. Bounding the lane is what
+/// makes the mark real.
+fn lane_budget() -> Duration {
+    stage_budget(
+        FANOUT_HARD_MARK + Duration::from_millis(400),
+        Duration::from_millis(200),
+    )
+}
+
+/// Contributing sources and items in what has landed so far.
+fn answered(outcomes: &[(String, EngineResult)]) -> (usize, usize) {
+    outcomes.iter().fold((0usize, 0usize), |(l, n), (_, r)| match r {
+        Ok(a) if a.class.contributes() => (l + 1, n + a.hits.len()),
+        _ => (l, n),
+    })
+}
+
+/// A status a second ask can plausibly change: the source misbehaved, rather
+/// than the query being dry or the operator's config saying no.
+fn worth_second_ask(status: &str) -> bool {
+    !matches!(status, "no-results" | "pacing-timeout" | "late")
+        && !status.starts_with("invalid-config")
+}
+
 
 tokio::task_local! {
     pub(crate) static SEARCH_DEADLINE: Option<tokio::time::Instant>;
@@ -255,6 +299,17 @@ fn trust_target_for(engine: &str, status: &str, ok: bool) -> f64 {
         return 0.15;
     }
     0.3
+}
+
+/// Is the answer settled before the mark?
+///
+/// Only when independent families already agree on a top-3 URL: then a further
+/// opinion cannot reorder the list. A plain item count is NOT enough — measured:
+/// committing at two fat lanes (30 items between them) cut the contributing
+/// lanes from 4.3 to 1.4 per query and doubled the misses, because consensus is
+/// what the ranking is built on and two engines are one opinion plus one.
+fn enough_answered(outcomes: &[(String, EngineResult)], early: bool) -> bool {
+    early && outcomes.len() >= 2 && early_consensus_enough(outcomes)
 }
 
 /// C4: enough independent families already agree on a top-3 URL
@@ -807,7 +862,7 @@ impl Searcher {
 
         // Fan out: engines each get their own egress
         // (spreading is the anti-rate-limit move).
-        let mut futures: Vec<TaskFut> = Vec::new();
+        let mut futures: Vec<(String, TaskFut)> = Vec::new();
         let mut used_egresses: Vec<String> = Vec::new();
         let mut queries: Vec<String> = vec![query.to_string()];
         if let Some(v) = intent::variant(query) {
@@ -901,7 +956,19 @@ impl Searcher {
         };
         for (engine, q, eg) in assign_egresses(self.pool.as_ref(), assignments, &mut used_egresses)
         {
-            futures.push(Box::pin(engine_task(engine, q, eg.id, eg.proxy, context)));
+            let name = engine_name(&engine).to_string();
+            futures.push((
+                name,
+                Box::pin(tasks::engine_task_with_budget(
+                    engine,
+                    q,
+                    eg.id,
+                    eg.proxy,
+                    context,
+                    lane_budget(),
+                    None,
+                )),
+            ));
         }
         // Verticals: direct, friendly APIs.
         let verticals: Vec<&str> = verticals
@@ -909,130 +976,160 @@ impl Searcher {
             .filter(|v| !self.quarantined(v))
             .collect();
         for v in verticals {
-            futures.push(Box::pin(vertical_task(
-                v.to_string(),
-                query.to_string(),
-                &self.fetcher,
-                None,
-            )));
-        }
-
-        // C4 adaptive early-return: collect completions as they
-        // land; once ≥3 independent families agree on a top-3 URL,
-        // drop the stragglers (their futures are cancelled). Kill:
-        // search.search_early=false / DONSETCH_NO_SEARCH_EARLY.
-        let early = crate::config::cfg().search.search_early;
-        let outcomes: Vec<(String, EngineResult)> = if early {
-            use futures_util::stream::{FuturesUnordered, StreamExt};
-            let mut futs = FuturesUnordered::new();
-            for f in futures {
-                futs.push(f);
-            }
-            let mut acc: Vec<(String, EngineResult)> = Vec::new();
-            while let Some(outcome) = futs.next().await {
-                acc.push(outcome);
-                if early_consensus_enough(&acc) {
-                    break;
-                }
-            }
-            acc
-        } else {
-            futures_util::future::join_all(futures).await
-        };
-
-        // ── Retry wave: failed engines get one more shot
-        // through a fresh egress : but ONLY when the first
-        // wave left the merge thin. A healthy merge never
-        // pays retry latency; a degraded one recovers.
-        let ok_engines = outcomes
-            .iter()
-            .filter(|(_, r)| r.as_ref().is_ok_and(|a| a.class.credits()))
-            .count();
-        let ok_hits: usize = outcomes
-            .iter()
-            .filter_map(|(_, r)| r.as_ref().ok())
-            .filter(|a| a.class.contributes())
-            .map(|a| a.hits.len())
-            .sum();
-        let merge_thin = ok_engines < 3 || ok_hits < 15;
-        let failed: Vec<String> = if merge_thin {
-            outcomes
-                .iter()
-                .filter(|(_, r)| matches!(r, Err((s, _, _)) if retry_engine_failure(s)))
-                .map(|(e, _)| e.split('@').next().unwrap_or(e).to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let mut retry_futures: Vec<TaskFut> = Vec::new();
-        let mut retried = std::collections::HashSet::new();
-        for engine in &failed {
-            if !retried.insert(engine) {
-                continue;
-            }
-            if outcomes
-                .iter()
-                .any(|(label, outcome)| engine_name(label) == engine && outcome.is_ok())
-            {
-                continue;
-            }
-            let is_vertical = matches!(
-                engine.as_str(),
-                "github"
-                    | "hn"
-                    | "wikipedia"
-                    | "scholar"
-                    | "news"
-                    | "arxiv"
-                    | "stackexchange"
-                    | "mdn"
-            );
-            if is_vertical {
-                // Vertical retry rides a proxy egress (their
-                // direct IP is what got rate-limited).
-                let Some(eg) = self.pool.pick("github", &[], false) else {
-                    continue;
-                };
-                let task = Box::pin(vertical_task(
-                    engine.clone(),
+            futures.push((
+                engine_name(v).to_string(),
+                Box::pin(vertical_task(
+                    v.to_string(),
                     query.to_string(),
                     &self.fetcher,
-                    eg.proxy,
-                ));
-                retry_futures.push(Box::pin(bounded_retry(
-                    task,
-                    engine.clone(),
-                    eg.id,
-                    false,
-                    stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
-                )));
-                continue;
-            }
-            // ddg's html endpoint is the fallback when lite fails.
-            let retry_engine = if engine == "ddg" { "ddg_html" } else { engine };
-            let Some(eg) = self.pool.pick(engine, &used_egresses, true) else {
-                continue;
-            };
-            let previous = outcomes.iter().find_map(|(label, result)| {
-                if engine_name(label) == engine
-                    && let Err((status, _, _)) = result
-                {
-                    Some((label.as_str(), status.as_str()))
-                } else {
-                    None
-                }
-            });
-            retry_futures.push(Box::pin(tasks::engine_task_with_budget(
-                retry_engine.to_string(),
-                query.to_string(),
-                eg.id,
-                eg.proxy,
-                context,
-                stage_budget(RETRY_TIMEOUT, Duration::from_secs(2)),
-                previous,
-            )));
+                    None,
+                    lane_budget(),
+                )),
+            ));
         }
-        let retry_outcomes = futures_util::future::join_all(retry_futures).await;
+
+        // ── One budget, raced ──
+        //
+        // The call commits to what has answered by the soft mark and cancels the
+        // rest. A source that misses it is reported `late`: never waited on, never
+        // retried inside the call. Recovery is the state's job on the next call,
+        // through a different lane, so one slow or walled source costs this query
+        // nothing but its own absence.
+        // Two marks, not one. The soft mark commits to an answer that is already
+        // good; the hard mark bounds the wait when the sources are slow. A single
+        // fixed mark measured on this network turned a slow minute into lost
+        // answers (hit@5 0.53 against 0.68), because it cut the sources that
+        // would have answered.
+        let started_at = tokio::time::Instant::now();
+        let soft_deadline = started_at + stage_budget(FANOUT_SOFT_MARK, Duration::from_millis(300));
+        let hard_deadline = started_at + stage_budget(FANOUT_HARD_MARK, Duration::from_millis(200));
+        let mut outstanding: std::collections::HashMap<String, usize> = Default::default();
+        for (name, _) in &futures {
+            *outstanding.entry(name.clone()).or_insert(0) += 1;
+        }
+        use futures_util::StreamExt as _;
+        let mut futs: futures_util::stream::FuturesUnordered<_> = futures
+            .into_iter()
+            .map(|(name, fut)| {
+                Box::pin(async move { (name, fut.await) }) as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = (String, (String, EngineResult))> + Send>,
+                >
+            })
+            .collect();
+        let early = crate::config::cfg().search.search_early;
+        let mut outcomes: Vec<(String, EngineResult)> = Vec::new();
+        loop {
+            if enough_answered(&outcomes, early) {
+                break;
+            }
+            // The soft mark only ends the wait when the answer is already
+            // settled (independent families agree). A count of items is not
+            // agreement: measured, stopping at two fat lanes cut contributing
+            // sources from 3.5 to 1.8 per query and cost ranking quality, because
+            // the third source was 200 ms behind, not absent.
+            let now = tokio::time::Instant::now();
+            if now >= hard_deadline {
+                break;
+            }
+            // Until the soft mark, then until the hard one: past the soft mark
+            // the wait continues, it does not collapse to zero.
+            let until = if now < soft_deadline {
+                soft_deadline
+            } else {
+                hard_deadline
+            };
+            match tokio::time::timeout_at(until, futs.next()).await {
+                Ok(Some((name, (label, result)))) => {
+                    if let Some(n) = outstanding.get_mut(&name) {
+                        *n = n.saturating_sub(1);
+                    }
+                    outcomes.push((label, result));
+                }
+                // Every lane answered.
+                Ok(None) => break,
+                // The mark passed with lanes still running: they are late.
+                Err(_) => break,
+            }
+        }
+        // ── One bounded second ask ──
+        //
+        // A thin merge gets one more attempt from the sources that misbehaved,
+        // through a different lane, inside the hard mark. Never a third ask, and
+        // never when the first wave already answered well: recovery is still the
+        // state's job across calls, this only rescues a query where two thirds
+        // of the sources were walled at once.
+        let (lanes, items) = answered(&outcomes);
+        if (lanes < THIN_LANES || items < THIN_ITEMS)
+            && tokio::time::Instant::now() < hard_deadline
+        {
+            let mut asked: std::collections::HashSet<String> = Default::default();
+            let mut retry: Vec<(String, TaskFut)> = Vec::new();
+            for (label, result) in &outcomes {
+                let Err((status, _, engine_lane)) = result else {
+                    continue;
+                };
+                if !*engine_lane || !worth_second_ask(status) {
+                    continue;
+                }
+                let engine = engine_name(label).to_string();
+                if !asked.insert(engine.clone()) {
+                    continue;
+                }
+                if outcomes
+                    .iter()
+                    .any(|(l, r)| engine_name(l) == engine && r.is_ok())
+                {
+                    continue;
+                }
+                let Some(eg) = self.pool.pick(&engine, &used_egresses, true) else {
+                    continue;
+                };
+                let budget = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+                retry.push((
+                    engine.clone(),
+                    Box::pin(tasks::engine_task_with_budget(
+                        engine,
+                        query.to_string(),
+                        eg.id,
+                        eg.proxy,
+                        context,
+                        budget.min(SECOND_ASK),
+                        None,
+                    )),
+                ));
+            }
+            if !retry.is_empty() {
+                let secs: futures_util::stream::FuturesUnordered<_> = retry
+                    .into_iter()
+                    .map(|(name, fut)| {
+                        Box::pin(async move { (name, fut.await) }) as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = (String, (String, EngineResult)),
+                                    > + Send,
+                            >,
+                        >
+                    })
+                    .collect();
+                let left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if let Ok(done) = tokio::time::timeout(left, futures_util::future::join_all(secs)).await
+                {
+                    for (name, outcome) in done {
+                        if let Some(n) = outstanding.get_mut(&name) {
+                            *n = n.saturating_sub(1);
+                        }
+                        outcomes.push(outcome);
+                    }
+                }
+            }
+        }
+
+        let mut late: Vec<String> = outstanding
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, _)| name)
+            .collect();
+        late.sort();
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
@@ -1043,7 +1140,7 @@ impl Searcher {
         // C5: best instant answer across lanes (first non-empty wins
         // by engine trust order, which outcomes already respect).
         let mut instant: Option<instant::InstantAnswer> = None;
-        let all: Vec<(String, EngineResult)> = outcomes.into_iter().chain(retry_outcomes).collect();
+        let all: Vec<(String, EngineResult)> = outcomes;
         for (label, outcome) in all {
             let profile = label.split_once('@').map(|(_, p)| p.to_string());
             let engine = engine_name(&label).to_string();
@@ -1127,6 +1224,19 @@ impl Searcher {
                     self.bump_trust_status(base, intent, false, "off-query-alone");
                 }
             }
+        }
+
+        // A source that did not answer inside the budget is named as late, not
+        // as absent: the difference is whether rephrasing could help.
+        for name in late {
+            report.push(EngineReport {
+                engine: name,
+                profile: None,
+                status: "late".into(),
+                hits: 0,
+                ms: 0,
+                egress: "-".into(),
+            });
         }
 
         if per_engine.is_empty() {
@@ -1215,12 +1325,18 @@ impl Searcher {
         // pages. Richer than SERP snippets, filters dead links.
         // The genius feature: results carry the page's own title
         // and description, not the SERP's truncated version.
+        // Enrichment is one page fetch per result: opt-in (`search.enrich`),
+        // never a default. It used to run on every search -- five pages, ~700 ms,
+        // and a traffic amplifier for sites the agent had not chosen yet. The
+        // `read: k` view (M5) is what asks for it, per call.
         let enrich_t = std::time::Instant::now();
-        let _ = tokio::time::timeout(
-            stage_budget(Duration::from_secs(4), Duration::from_millis(500)),
-            self.enrich_results(&mut results),
-        )
-        .await;
+        if crate::config::cfg().search.enrich && !results.is_empty() {
+            let _ = tokio::time::timeout(
+                stage_budget(Duration::from_secs(4), Duration::from_millis(500)),
+                self.enrich_results(&mut results),
+            )
+            .await;
+        }
         let enrich_ms = enrich_t.elapsed().as_millis();
 
         // ── site:/intitle:/filetype: post-merge enforcement:
@@ -1239,7 +1355,8 @@ impl Searcher {
         // DONSEEK_NO_TOPUP is the A/B kill switch for benching.
         #[cfg(feature = "rerank")]
         let topup_ms: u128 = {
-            if crate::config::cfg().search.rerank_topup
+            if crate::config::cfg().search.rerank
+                && crate::config::cfg().search.rerank_topup
                 && !stage_budget(Duration::from_secs(1), Duration::from_millis(500)).is_zero()
             {
                 let t = std::time::Instant::now();
@@ -1265,7 +1382,8 @@ impl Searcher {
         // Poisoning guard: a merge built while engines
         // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
-        let cacheable = ranking_finished && ok_engines >= 2 && total >= 8;
+        let content_lanes = report.iter().filter(|r| r.status == "ok").count();
+        let cacheable = ranking_finished && content_lanes >= 2 && total >= 8;
         if cacheable {
             let snapshot = {
                 let mut cache = self
@@ -1470,29 +1588,13 @@ fn engine_health_key(engine: &str) -> &str {
     egress::health_key(engine)
 }
 
-fn retry_engine_failure(status: &str) -> bool {
-    !matches!(status, "no-results" | "pacing-timeout" | "invalid-config")
-        && !status.starts_with("invalid-config:")
-}
 
-/// Vertical retries retain explicit timeout outcomes; engine tasks own their
-/// deadline internally so diagnostics include the identity actually attempted.
-async fn bounded_retry(
-    task: TaskFut<'_>,
-    engine: String,
-    egress: String,
-    was_engine: bool,
-    budget: Duration,
-) -> (String, EngineResult) {
-    tokio::time::timeout(budget, task)
-        .await
-        .unwrap_or_else(|_| (engine, Err(("retry-timeout".into(), egress, was_engine))))
-}
-
-/// Input hygiene for the search surface. Empty queries waste a
-/// fan-out (and cached-homepage SERPs would poison the merge);
-/// oversized queries break every endpoint's URL budget. Returns
-/// the human-readable problem, None = valid.
+/// Governor: fan-out width under stress. Healthy pool →
+/// all engines; stressed → shrink appetite (you can't be
+/// rate-limited if you never exceed the rate); starved →
+/// top engine + verticals. Consensus survives at width 2
+/// by construction (two independent index families).
+/// Reject a query no endpoint would answer, before any egress is spent.
 pub(crate) fn validate_query(query: &str) -> Option<String> {
     let t = query.trim();
     if t.is_empty() {
@@ -1507,11 +1609,6 @@ pub(crate) fn validate_query(query: &str) -> Option<String> {
     None
 }
 
-/// Governor: fan-out width under stress. Healthy pool →
-/// all engines; stressed → shrink appetite (you can't be
-/// rate-limited if you never exceed the rate); starved →
-/// top engine + verticals. Consensus survives at width 2
-/// by construction (two independent index families).
 fn width_for_stress(stress: f64, available: usize) -> usize {
     if stress < 0.15 {
         available
@@ -2141,7 +2238,80 @@ mod tests {
     }
 
     #[test]
-    fn all_engines_share_retry_eligibility() {
+    fn a_slow_minute_is_not_answered_with_nothing() {
+        // Two lanes with real items is the fast path; a single lane, however
+        // fat, is not, and neither is a pile of failures. This is what keeps the
+        // soft mark from cutting the sources that would have answered.
+        let lane = |hits: usize| {
+            let one = |i: usize| crate::search::engines::Hit {
+                title: format!("result {i}"),
+                url: format!("https://example.com/{i}"),
+                snippet: String::new(),
+                rank: i,
+                published: None,
+            };
+            (
+                "brave".to_string(),
+                Ok(crate::search::tasks::LaneAnswer {
+                    hits: (0..hits).map(one).collect(),
+                    items: hits,
+                    ms: 1,
+                    egress: "direct".into(),
+                    engine_lane: true,
+                    instant: None,
+                    class: crate::search::engines::AnswerClass::Content,
+                }),
+            )
+        };
+        let dead = |name: &str| {
+            (
+                name.to_string(),
+                Err(("blocked:429".to_string(), "direct".to_string(), true)),
+            )
+        };
+        // What counts toward the commit: contributing lanes and their items.
+        assert_eq!(answered(&[lane(10), lane(3)]), (2, 13));
+        assert_eq!(answered(&[lane(40)]), (1, 40));
+        // Failures and off-query answers contribute nothing.
+        assert_eq!(answered(&[dead("bing"), dead("ddg"), lane(2)]), (1, 2));
+        // A thin merge earns one second ask; a fat one does not.
+        assert!(answered(&[lane(4), lane(3)]).1 < THIN_ITEMS);
+        assert!(answered(&[lane(10), lane(3)]).0 < THIN_LANES);
+    }
+
+    #[test]
+    fn the_answer_is_settled_by_two_real_lanes_not_by_waiting() {
+        let lane = |hits: usize| {
+            let one = |i: usize| crate::search::engines::Hit {
+                title: format!("result {i}"),
+                url: format!("https://example.com/{i}"),
+                snippet: String::new(),
+                rank: i,
+                published: None,
+            };
+            (
+                "brave".to_string(),
+                Ok(crate::search::tasks::LaneAnswer {
+                    hits: (0..hits).map(one).collect(),
+                    items: hits,
+                    ms: 1,
+                    egress: "direct".into(),
+                    engine_lane: true,
+                    instant: None,
+                    class: crate::search::engines::AnswerClass::Content,
+                }),
+            )
+        };
+        // Two lanes with no shared URL between them: no agreement, keep waiting.
+        assert!(!enough_answered(&[lane(20), lane(20)], true));
+        // A plain item count is not agreement either.
+        assert!(!enough_answered(&[lane(40)], true));
+        // Early consensus stays off when the config turns it off.
+        assert!(!enough_answered(&[lane(2)], false));
+    }
+
+    #[test]
+    fn a_failed_source_is_a_fault_only_when_it_misbehaved() {
         for status in [
             "blocked:captcha",
             "blocked:429",
@@ -2150,56 +2320,22 @@ mod tests {
             "empty-parse",
             "net",
             "timeout",
-            "dead-proxy",
-            "auth-fail",
+            "off-query",
         ] {
-            assert!(retry_engine_failure(status));
-            if !matches!(status, "dead-proxy" | "auth-fail") {
-                assert!(is_engine_fault(status));
-            }
+            assert!(is_engine_fault(status), "{status} is the source's fault");
         }
+        // Infra and config problems, and a query that legitimately found
+        // nothing, never erode the source's record.
         for status in [
             "invalid-config",
             "invalid-config: proxy: unsupported scheme",
             "no-results",
             "pacing-timeout",
+            "dead-proxy",
+            "auth-fail",
         ] {
-            assert!(!retry_engine_failure(status));
-            assert!(!is_engine_fault(status));
+            assert!(!is_engine_fault(status), "{status} is not the source's fault");
         }
-    }
-
-    #[tokio::test]
-    async fn slow_retry_does_not_discard_completed_peer() {
-        let fast: TaskFut = Box::pin(async {
-            (
-                "google".into(),
-                Err(("blocked:captcha".into(), "direct".into(), true)),
-            )
-        });
-        let slow: TaskFut = Box::pin(std::future::pending());
-        let outcomes = futures_util::future::join_all(vec![
-            bounded_retry(
-                fast,
-                "google".into(),
-                "direct".into(),
-                true,
-                Duration::from_millis(20),
-            ),
-            bounded_retry(
-                slow,
-                "bing".into(),
-                "direct".into(),
-                true,
-                Duration::from_millis(10),
-            ),
-        ])
-        .await;
-        assert_eq!(outcomes.len(), 2);
-        assert!(matches!(&outcomes[1].1, Err((s, _, _)) if s == "retry-timeout"));
-        assert_eq!(outcomes[0].0, "google");
-        // A second CAPTCHA is reported, not recursively scheduled.
-        assert!(matches!(&outcomes[0].1, Err((s, _, _)) if s == "blocked:captcha"));
     }
 
     #[test]

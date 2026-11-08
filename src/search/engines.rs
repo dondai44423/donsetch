@@ -803,13 +803,20 @@ pub fn parse_rss(body: &str) -> Vec<Hit> {
         out.push(Hit {
             title: strip_markup(&title),
             url,
-            snippet: strip_markup(&snippet),
+            // A feed description can be the whole article. Capping here is not
+            // cosmetic: merge keeps the LONGEST snippet, and the cross-encoder
+            // pads every pair in a batch to the longest one -- one 10 KB
+            // description turned a 40 ms rerank into 40 CPU-seconds.
+            snippet: strip_markup(&snippet).chars().take(MAX_RSS_SNIPPET).collect(),
             rank: out.len(),
             published,
         });
     }
     out
 }
+
+/// A feed summary long enough to carry a claim, short enough to batch.
+const MAX_RSS_SNIPPET: usize = 400;
 
 fn rss_items(body: &str) -> Vec<&str> {
     let mut items = Vec::new();

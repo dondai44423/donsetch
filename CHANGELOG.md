@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Search answers in about a second, not five.** The fan-out runs under one
+  budget: a soft mark that ends the wait once independent sources already agree,
+  and a hard mark that always ends it. A source still running at the mark is
+  reported `late` and cancelled, never waited on. Measured against the previous
+  build on the same 40 queries: p50 3.4 s → 1.2 s, p95 9.0 s → 2.7 s, with the
+  answer page in the top three unchanged.
+- **The unbounded retry wave is gone.** A thin merge (fewer than three sources or
+  fifteen items) gets exactly one second ask, through a different lane, inside the
+  same budget. Recovery across calls is the learned state's job.
+- **Two per-search costs are opt-in.** Result enrichment fetched five pages on
+  every search; it is now `search.enrich`, off by default. The cross-encoder moved
+  no metric on two paired 40-query runs while costing 7–12 CPU-seconds per search,
+  so it is `search.rerank`, off by default.
+- **No source can inflate a snippet.** Feed descriptions arrive as whole articles;
+  the merge now bounds every snippet, because the cross-encoder's batch is padded
+  to its longest pair — one 10 KB description turned a 40 ms re-rank into 40
+  CPU-seconds.
+
 - **Search reports what answered, and refuses what did not.** Every source's
   answer is classified before it can influence ranking: `content`, `thin`,
   `off-query` (a 200 carrying a result list that never mentions the query — a

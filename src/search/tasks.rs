@@ -5,7 +5,6 @@
 
 use std::time::Instant;
 
-use super::ENGINE_TIMEOUT;
 use super::egress::EgressPool;
 use super::engines;
 use super::verticals;
@@ -46,25 +45,6 @@ pub(super) struct EngineContext<'a> {
     pub fetcher: &'a Fetcher,
     pub pool: &'a EgressPool,
     pub google: &'a engines::google_wml::ProfileSelector,
-}
-
-pub(super) async fn engine_task(
-    engine: String,
-    query: String,
-    egress_id: String,
-    proxy: Option<crate::egress::proxy::Proxy>,
-    context: EngineContext<'_>,
-) -> (String, EngineResult) {
-    engine_task_with_budget(
-        engine,
-        query,
-        egress_id,
-        proxy,
-        context,
-        ENGINE_TIMEOUT,
-        None,
-    )
-    .await
 }
 
 /// One admission and HTTP attempt under a single deadline, including pacing.
@@ -291,15 +271,20 @@ async fn bing_rss_fallback(
     Some((hits, class))
 }
 
+/// One vertical's answer, bounded by `budget` rather than the engine ceiling:
+/// a lane must not outlive the call that cancelled it (a cancelled blocking
+/// fetch keeps the process alive, which showed up as a 4.9 s wall clock on a
+/// 1.2 s answer).
 pub(super) async fn vertical_task(
     vertical: String,
     query: String,
     fetcher: &Fetcher,
     proxy: Option<crate::egress::proxy::Proxy>,
+    budget: std::time::Duration,
 ) -> (String, EngineResult) {
     let started = Instant::now();
     match tokio::time::timeout(
-        ENGINE_TIMEOUT,
+        budget,
         verticals::run(fetcher, &vertical, &query, proxy.as_ref()),
     )
     .await
@@ -401,7 +386,6 @@ mod tests {
         let status = engine_fetch_status(&denied);
         assert!(status.starts_with("invalid-config:"), "{status}");
         assert!(!super::super::is_engine_fault(&status));
-        assert!(!super::super::retry_engine_failure(&status));
     }
 
     /// A proxy URL v5 cannot read fails the fetch with `ProxyConfig`. On an
@@ -418,10 +402,6 @@ mod tests {
                 "{lane}: {status}"
             );
             assert!(!super::super::is_engine_fault(status), "{lane}: {status}");
-            assert!(
-                !super::super::retry_engine_failure(status),
-                "{lane}: {status}"
-            );
         };
         check("engine", &engine_fetch_status(&error));
         check("vertical", &vertical_failure_status(&error));
@@ -457,7 +437,6 @@ mod tests {
         let status = vertical_failure_status(&denied);
         assert_eq!(status, RULE_DENIED_STATUS);
         assert!(!super::super::is_engine_fault(&status));
-        assert!(!super::super::retry_engine_failure(&status));
         // Negative: any other failure keeps its text and stays a fault.
         let status = vertical_failure_status(&FetchError::Http("connection reset".into()));
         assert_eq!(status, "http: connection reset");
@@ -508,12 +487,14 @@ mod tests {
             "PostgreSQL documentation",
             "musei di Roma",
         ] {
-            let (engine, outcome) = engine_task(
+            let (engine, outcome) = engine_task_with_budget(
                 "google".into(),
                 query.into(),
                 "direct".into(),
                 None,
                 context,
+                std::time::Duration::from_secs(8),
+                None,
             )
             .await;
             let answer = outcome.expect("Google HTTP lane must return usable results");
