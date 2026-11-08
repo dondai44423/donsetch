@@ -243,6 +243,21 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
         };
     }
 
+    // The `/_pow/solve` proof of work (NCBI) is a short page whose program
+    // states its work: the page names its own contract.
+    if crate::challenge::pow_work(evidence.body).is_some() {
+        found.push("pow:/_pow/solve".into());
+        return Verdict {
+            class: Class::WallContract,
+            wall: Some(Wall {
+                vendor: "pow-solve".into(),
+                marker: "/_pow/solve".into(),
+                asks: "proof of work",
+            }),
+            evidence: found,
+        };
+    }
+
     if evidence.content_ok {
         return Verdict {
             class: Class::Content,
@@ -517,6 +532,33 @@ mod tests {
             headers: &[],
         })
         .class
+    }
+
+    #[test]
+    fn a_pow_solve_page_is_its_challenge_and_an_article_about_one_is_not() {
+        let page = r#"<script>const challengeId = "MpNBUn2OifdS_VNrp-IRTA";
+const bits = 12;
+async function submitSolve(nonce) { await fetch("/_pow/solve", {method: "POST"}); }</script>
+<p>Cookies must be enabled</p>"#;
+        let verdict = classify(Evidence {
+            status: 203,
+            body: page,
+            content_ok: false,
+            headers: &[],
+        });
+        assert_eq!(verdict.class, Class::WallContract);
+        assert_eq!(verdict.wall.map(|w| w.vendor), Some("pow-solve".into()));
+        // A page that only mentions the path, with no work stated, is read
+        // as what it is.
+        let article =
+            "<article><p>The /_pow/solve endpoint takes a nonce and a challenge id.</p></article>";
+        let verdict = classify(Evidence {
+            status: 200,
+            body: article,
+            content_ok: true,
+            headers: &[],
+        });
+        assert_eq!(verdict.class, Class::Content);
     }
 
     #[test]

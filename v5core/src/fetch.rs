@@ -1094,6 +1094,149 @@ impl Worker {
         })
     }
 
+    /// Answer the `/_pow/solve` proof of work as `identity`
+    /// ([`crate::challenge::pow_work`]): solve the work the page states, post
+    /// the answer as the page's own `fetch`, and ask for the page again with
+    /// the clearance it earned. `None` when a step fails, the deadline cannot
+    /// fit the work, the server refuses the answer, or the page still does
+    /// not pass.
+    #[allow(clippy::too_many_arguments)]
+    fn answer_pow(
+        &mut self,
+        url: &str,
+        host: &str,
+        identity: &'static Identity,
+        options: &Options,
+        (contract, generic): (&Contract, bool),
+        response: &crate::http::Response,
+        (started, first_ms): (Instant, f64),
+        attempts: &mut Vec<Attempt>,
+    ) -> Option<Outcome> {
+        use crate::challenge::{pow_answer, pow_solve, pow_work, POW_SOLVE_PATH};
+        let work = pow_work(&response.body)?;
+        let base = url::Url::parse(&response.url).ok()?;
+        let page_host = base.host_str()?.to_ascii_lowercase();
+        let solve_url = base.join(POW_SOLVE_PATH).ok()?.to_string();
+        let allowed = options
+            .policy
+            .hop
+            .as_ref()
+            .is_none_or(|guard| guard(&response.url, &solve_url) == crate::http::Hop::Follow);
+        if !allowed {
+            return None;
+        }
+        let remaining = || options.deadline.saturating_sub(started.elapsed());
+        self.state.store_cookies(
+            &page_host,
+            identity.name,
+            response.cookies.iter().map(stored).collect(),
+        );
+        // The work must leave time for the answer and the page after it.
+        let solve_by = started + options.deadline.checked_sub(Duration::from_millis(1500))?;
+        let nonce = pow_solve(&work, solve_by)?;
+        let body = pow_answer(&work, nonce, &response.url);
+        let origin = base.origin().ascii_serialization();
+        // The page's `fetch(..., {method: "POST", cache: "no-store",
+        // credentials: "same-origin"})` with a JSON body.
+        let headers = [
+            ("pragma", "no-cache"),
+            ("cache-control", "no-cache"),
+            ("content-type", "application/json"),
+            ("accept", "*/*"),
+            ("origin", origin.as_str()),
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "cors"),
+            ("sec-fetch-dest", "empty"),
+            ("referer", response.url.as_str()),
+        ];
+        let cookie = self.state.cookie_header_for(&solve_url, identity.name);
+        let answered = self
+            .wire(identity)
+            .ok()?
+            .subresource(
+                identity,
+                crate::http::Call {
+                    method: "POST",
+                    url: &solve_url,
+                    cookie: cookie.as_deref(),
+                    timeout: remaining(),
+                    extra: &headers,
+                    body: Some(body.as_bytes()),
+                    cap: Some(64 * 1024),
+                    kind: crate::http::Kind::Subresource,
+                },
+            )
+            .ok()?;
+        self.state.store_cookies(
+            &page_host,
+            identity.name,
+            answered.cookies.iter().map(stored).collect(),
+        );
+        let accepted = serde_json::from_str::<serde_json::Value>(&answered.body)
+            .is_ok_and(|reply| reply["success"] == serde_json::Value::Bool(true));
+        if !accepted {
+            return None;
+        }
+        let cookie = self.state.cookie_header_for(&response.url, identity.name);
+        let next = self
+            .wire(identity)
+            .ok()?
+            .get(&response.url, cookie.as_deref(), identity, remaining())
+            .ok()?;
+        let content = verify_response(
+            next.status,
+            &next.headers,
+            &next.body,
+            &next.url,
+            contract,
+            generic,
+        );
+        let verdict = classify(Evidence {
+            status: next.status,
+            body: &next.body,
+            content_ok: content.passed,
+            headers: &next.headers,
+        });
+        attempts.push(Attempt {
+            identity: identity.name.to_string(),
+            transport: "document".to_string(),
+            class: verdict.class,
+            status: next.status,
+            ms: next.elapsed_ms,
+            bytes: next.body.len(),
+            version: next.version.clone(),
+            title: content.title.clone(),
+            note: Some(format!("proof of work answered (nonce {nonce})")),
+        });
+        if verdict.class != Class::Content {
+            return None;
+        }
+        if self.persist {
+            self.state
+                .record(host, identity.name, "content", true, next.elapsed_ms);
+            self.save_state();
+        }
+        Some(Outcome {
+            title: content.title,
+            text_chars: content.text_chars,
+            evidence: vec!["pow-solve proof of work".into()],
+            ..answer(
+                url,
+                host.to_string(),
+                &next,
+                Class::Content,
+                identity.name,
+                Ended {
+                    started,
+                    first_ms,
+                    attempts: std::mem::take(attempts),
+                    spent_state: true,
+                    capture: options.capture_body,
+                },
+            )
+        })
+    }
+
     fn encounter(&mut self, url: &str, options: &Options) -> Outcome {
         let started = Instant::now();
         self.proxy = options.proxy.clone();
@@ -1177,6 +1320,7 @@ impl Worker {
         let mut last_raw: Option<Vec<u8>> = None;
         let mut handoff_taken = false;
         let mut siteground_taken = false;
+        let mut pow_taken = false;
         if options.pace_ms > 0 {
             self.state.pace(&host, options.pace_ms);
         }
@@ -1782,6 +1926,30 @@ impl Worker {
             {
                 siteground_taken = true;
                 if let Some(outcome) = self.answer_siteground(
+                    url,
+                    &host,
+                    identity,
+                    options,
+                    (&contract, generic),
+                    &response,
+                    (started, first_ms),
+                    &mut attempts,
+                ) {
+                    return outcome;
+                }
+            }
+
+            // The `/_pow/solve` proof of work: the page states its work, the
+            // answer is one post from the page, and the clearance it earns
+            // lets the same URL serve the page. Once per encounter.
+            if !pow_taken
+                && verdict
+                    .wall
+                    .as_ref()
+                    .is_some_and(|wall| wall.vendor == "pow-solve")
+            {
+                pow_taken = true;
+                if let Some(outcome) = self.answer_pow(
                     url,
                     &host,
                     identity,

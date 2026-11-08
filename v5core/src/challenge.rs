@@ -245,6 +245,153 @@ pub fn siteground_answer_path(work: &SgWork, sol: &str, ms: u128, hashes: u64) -
     format!("{}{joiner}sol={sol}&s={ms}:{hashes}", work.submit)
 }
 
+/// The `/_pow/solve` proof of work (NCBI serves it, with HTTP 203, in front
+/// of PubMed). The page carries `challengeId` and `bits`; its program counts a
+/// decimal nonce up from 0 until SHA-256 over `<challengeId>:<nonce>` starts
+/// with `bits` zero bits, then POSTs `{challenge_id, nonce, redirect_url}` as
+/// JSON to `/_pow/solve` from the page. The server answers `{"success": true}`
+/// with a clearance cookie, and the page reloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PowWork {
+    pub challenge_id: String,
+    pub bits: u32,
+}
+
+/// The most work a `/_pow/solve` answer may cost: 2^22 hashes on average.
+/// Pages ask 12 bits; a larger ask than this is not answered.
+pub const POW_MAX_BITS: u32 = 22;
+
+/// Where the page's program sends its answer.
+pub const POW_SOLVE_PATH: &str = "/_pow/solve";
+
+/// The work a `/_pow/solve` page asks for.
+pub fn pow_work(body: &str) -> Option<PowWork> {
+    if !body.contains("fetch(\"/_pow/solve\"") {
+        return None;
+    }
+    let after = |marker: &str| Some(&body[body.find(marker)? + marker.len()..]);
+    let id = after("const challengeId = \"")?;
+    let challenge_id = &id[..id.find('"')?];
+    let bits: u32 = after("const bits = ")?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    let id_ok = !challenge_id.is_empty()
+        && challenge_id.len() <= 128
+        && challenge_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    (id_ok && (1..=POW_MAX_BITS).contains(&bits)).then(|| PowWork {
+        challenge_id: challenge_id.to_string(),
+        bits,
+    })
+}
+
+/// Does this digest start with `bits` zero bits?
+fn pow_meets(digest: &[u8; 32], bits: u32) -> bool {
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]).leading_zeros() >= bits
+}
+
+/// The page's nonce for `work`: the first one, counting from 0 as the page
+/// does, or `None` when the deadline passes first.
+pub fn pow_solve(work: &PowWork, deadline: std::time::Instant) -> Option<u64> {
+    if !(1..=POW_MAX_BITS).contains(&work.bits) {
+        return None;
+    }
+    let mut message = format!("{}:", work.challenge_id);
+    let prefix = message.len();
+    for nonce in 0u64.. {
+        if nonce.is_multiple_of(4096) && std::time::Instant::now() >= deadline {
+            return None;
+        }
+        message.truncate(prefix);
+        message.push_str(&nonce.to_string());
+        if pow_meets(&btls::sha::sha256(message.as_bytes()), work.bits) {
+            return Some(nonce);
+        }
+    }
+    None
+}
+
+/// The JSON the page's program posts with its answer.
+pub fn pow_answer(work: &PowWork, nonce: u64, page_url: &str) -> String {
+    serde_json::json!({
+        "challenge_id": work.challenge_id,
+        "nonce": nonce.to_string(),
+        "redirect_url": page_url,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod pow_tests {
+    use super::*;
+
+    // The page's own constants and the call that names the contract, as
+    // pubmed.ncbi.nlm.nih.gov served them (2026-11-08).
+    const PAGE: &str = r#"<script>
+const challengeId = "MpNBUn2OifdS_VNrp-IRTA";
+const challengeDomain = "pubmed.ncbi.nlm.nih.gov";
+const bits = 12;
+const maxMs = 40000;
+async function submitSolve(nonce) {
+  const response = await fetch("/_pow/solve", {method: "POST"});
+}
+</script>"#;
+
+    #[test]
+    fn the_page_states_its_work() {
+        assert_eq!(
+            pow_work(PAGE),
+            Some(PowWork {
+                challenge_id: "MpNBUn2OifdS_VNrp-IRTA".into(),
+                bits: 12
+            })
+        );
+        // Too much work, an id that is not a token, or no solve call.
+        assert!(pow_work(&PAGE.replace("bits = 12", "bits = 30")).is_none());
+        assert!(pow_work(&PAGE.replace("bits = 12", "bits = 0")).is_none());
+        assert!(pow_work(&PAGE.replace("MpNBUn2OifdS_VNrp-IRTA", "a b")).is_none());
+        assert!(pow_work(&PAGE.replace("/_pow/solve", "/other")).is_none());
+        assert!(pow_work("<p>an article about const bits = 12</p>").is_none());
+    }
+
+    #[test]
+    fn the_nonce_is_the_pages_first_answer() {
+        let work = pow_work(PAGE).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let nonce = pow_solve(&work, deadline).unwrap();
+        let digest = btls::sha::sha256(format!("{}:{nonce}", work.challenge_id).as_bytes());
+        assert!(pow_meets(&digest, 12));
+        // No smaller nonce answers: the page counts up from 0.
+        assert!((0..nonce).all(|n| {
+            let digest = btls::sha::sha256(format!("{}:{n}", work.challenge_id).as_bytes());
+            !pow_meets(&digest, 12)
+        }));
+        let answer: serde_json::Value = serde_json::from_str(&pow_answer(
+            &work,
+            nonce,
+            "https://pubmed.ncbi.nlm.nih.gov/1/",
+        ))
+        .unwrap();
+        assert_eq!(answer["challenge_id"], "MpNBUn2OifdS_VNrp-IRTA");
+        assert_eq!(answer["nonce"], nonce.to_string());
+        assert_eq!(answer["redirect_url"], "https://pubmed.ncbi.nlm.nih.gov/1/");
+        // A deadline already passed answers nothing.
+        assert!(pow_solve(&work, std::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn leading_zero_bits_count_across_bytes() {
+        let mut digest = [0xffu8; 32];
+        digest[0] = 0;
+        digest[1] = 0x0f;
+        assert!(pow_meets(&digest, 12));
+        assert!(!pow_meets(&digest, 13));
+    }
+}
+
 #[cfg(test)]
 mod siteground_tests {
     use super::*;
