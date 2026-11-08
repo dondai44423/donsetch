@@ -649,10 +649,8 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
             break;
         };
         let tag_end = tag_start + tag_end_rel;
-        if quoted
-            .iter()
-            .any(|needle| html[tag_start..tag_end].contains(needle))
-        {
+        let tag = &html[tag_start..tag_end];
+        if quoted.iter().any(|needle| tag.contains(needle)) && !tag_id(tag).is_some_and(chrome_id) {
             let body_start = tag_end + 1;
             let rest = &html[body_start..];
             if let Some(cs) = rest.find("</script>") {
@@ -665,6 +663,105 @@ fn find_typed_bodies<'a>(html: &'a str, ty: &str) -> Vec<&'a str> {
         from = tag_end + 1;
     }
     out
+}
+
+/// The `id` attribute of an opening tag's text, if it has one.
+fn tag_id(tag: &str) -> Option<&str> {
+    let lower = tag.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("id") {
+        let at = from + rel;
+        from = at + 2;
+        // `id` as a whole attribute name, not the tail of `data-id`.
+        if !lower[..at].ends_with(|c: char| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let rest = tag[at + 2..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &rest[1..];
+        return body.find(quote).map(|end| &body[..end]);
+    }
+    None
+}
+
+/// The words an identifier is made of: split at punctuation and at
+/// camelCase humps (`AnalyticsConfigurationJSON` → analytics,
+/// configuration, json), lowercased.
+fn id_words(id: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for part in id.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let chars: Vec<char> = part.chars().collect();
+        let mut word = String::new();
+        for (i, &c) in chars.iter().enumerate() {
+            let hump = c.is_ascii_uppercase()
+                && i > 0
+                && (chars[i - 1].is_ascii_lowercase()
+                    || chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase())
+                        && chars[i - 1].is_ascii_uppercase());
+            if hump && !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            word.push(c.to_ascii_lowercase());
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// Words that name what a page's chrome stores as JSON: its navigation,
+/// header and footer, banners and sign-up prompts, configuration and
+/// feature flags, analytics, translations, and bundler bookkeeping.
+const CHROME_WORDS: &[&str] = &[
+    "nav",
+    "navigation",
+    "navbar",
+    "menu",
+    "megamenu",
+    "header",
+    "footer",
+    "banner",
+    "modal",
+    "popup",
+    "newsletter",
+    "signup",
+    "onetap",
+    "consent",
+    "cookie",
+    "cookies",
+    "config",
+    "configuration",
+    "settings",
+    "flags",
+    "env",
+    "analytics",
+    "tracking",
+    "tracker",
+    "rum",
+    "chunks",
+    "preloads",
+    "i18n",
+    "l10n",
+    "translations",
+    "weglot",
+    "alternates",
+];
+
+/// Whether a JSON script's `id` says it holds page chrome rather than the
+/// page: `_indeed_gnav_config`, `__PFS_TOPNAV_DATA__`, `aws-rum-config`,
+/// `StickyBannerTop`. Matched by whole word (and `…nav` compounds), so
+/// `__NEXT_DATA__`, `initial-props` or a `Home` component are never
+/// taken for chrome. A false hit drops one blob from the rescue; the
+/// document's own reading is untouched.
+fn chrome_id(id: &str) -> bool {
+    id_words(id)
+        .iter()
+        .any(|w| CHROME_WORDS.contains(&w.as_str()) || (w.len() > 3 && w.ends_with("nav")))
 }
 
 /// Extract a balanced JS object/array starting at `s`. Handles
@@ -1154,6 +1251,75 @@ fn paginate(full: &str, opts: &ExtractOptions) -> (String, Option<usize>) {
 
 #[cfg(test)]
 mod tests {
+    // Ids seen on live pages: what chrome names its JSON, and what pages
+    // name their content.
+    #[test]
+    fn a_json_script_named_for_page_chrome_is_not_content() {
+        for chrome in [
+            "_indeed_gnav_config",
+            "_indeed_gnav_footer_config",
+            "__PFS_TOPNAV_DATA__",
+            "__PFS_PRODUCTNAV_DATA__",
+            "raspberry-semrush-navigation-data",
+            "js-react-on-rails-component-Nav-react-component-1a2b",
+            "js-react-on-rails-component-Footer-react-component-9f",
+            "js-react-on-rails-component-StickyBannerTop-react-component-3",
+            "js-react-on-rails-component-MarketingModal-react-component-7",
+            "NewsletterSignup__json",
+            "client-env",
+            "wp-emoji-settings",
+            "AnalyticsConfigurationJSON",
+            "aws-rum-config",
+            "page-kit-flags-embed",
+            "__LOADABLE_REQUIRED_CHUNKS__",
+            "weglot-data",
+            "locale-alternates",
+        ] {
+            assert!(super::chrome_id(chrome), "{chrome}");
+        }
+        for content in [
+            "__NEXT_DATA__",
+            "__NUXT_DATA__",
+            "initial-props",
+            "redux-store-state",
+            "serialized-server-data",
+            "crate-metadata",
+            "ng-state",
+            "fin-trending-tickers",
+            "js-react-on-rails-component-Home-react-component-1a",
+            "ProductJson-product-template",
+            "canvas-data",
+        ] {
+            assert!(!super::chrome_id(content), "{content}");
+        }
+    }
+
+    #[test]
+    fn the_rescue_reads_no_chrome_json() {
+        // The same prose is content under a page's data id and chrome under
+        // a navigation config's.
+        let payload = serde_json::json!({"children": [
+            {"title": "Are you still interested in this job opportunity?"},
+            {"text": "Thanks for the opportunity, but I am no longer interested at this time. I will reach back out if things change. ".repeat(6)}
+        ]});
+        let page = |id: &str| {
+            format!(
+                r#"<title>Job Search</title><script id="{id}" type="application/json">{payload}</script>"#
+            )
+        };
+        let url = "https://example.com/";
+        assert!(super::extract(&page("_indeed_gnav_config"), url, &Default::default()).is_none());
+        assert!(super::extract(&page("__NEXT_DATA__"), url, &Default::default()).is_some());
+        assert_eq!(
+            super::tag_id(r#"<script data-id="x" id='page-data' type="application/json""#),
+            Some("page-data")
+        );
+        assert_eq!(
+            super::tag_id(r#"<script data-id="x" type="application/json""#),
+            None
+        );
+    }
+
     #[test]
     fn report_audit_js_rescue_excludes_bootstrap_configuration_without_losing_prose() {
         let payload = serde_json::json!({"require": [

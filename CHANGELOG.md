@@ -68,6 +68,12 @@ the fixes and the hardening found since.
   text stays bold; bare numeric and letter superscripts are kept; a relative
   `<base href>` is resolved against the page; text and feeds decode by the
   charset they declare.
+- **Page chrome is not read as the page.** When a page's visible text is thin,
+  the rescue that reads its embedded app data took any JSON script: a job
+  site's homepage came back as its navigation bar's prompt strings. A JSON
+  script whose id names chrome (navigation, header, footer, banners, sign-up
+  prompts, configuration, flags, analytics, translations, bundler chunks) is
+  left out, so the page's own text is read instead.
 - **`since_last`** compares pages by their words, so a read with links and one
   without are the same page.
 - **Slow transfers.** A body still arriving is bounded by the caller's deadline,
