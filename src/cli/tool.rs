@@ -601,6 +601,10 @@ pub fn print_top_help() {
         "  {:10} Print tool schemas as JSON (same as MCP tools/list)",
         "tools"
     );
+    println!(
+        "  {:10} Where every search source stands (--sources); run the canary battery (--doctor)",
+        "search"
+    );
     println!();
     println!("MANAGEMENT:");
     println!("  {:10} Start MCP server (JSON-RPC on stdio)", "mcp");

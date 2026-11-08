@@ -7,6 +7,7 @@
 pub mod bench;
 pub mod byok;
 pub mod coverage;
+pub mod doctor;
 pub mod egress;
 pub mod engines;
 pub mod evidence;
@@ -305,6 +306,50 @@ fn trust_target_for(engine: &str, status: &str, ok: bool) -> f64 {
         return 0.15;
     }
     0.3
+}
+
+/// What a source currently means for the next search.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SourceState {
+    /// Answering and trusted.
+    Verified,
+    /// Answering badly or recently failing: still asked, and still judged on
+    /// every answer.
+    Suspect,
+    /// Sitting out, and asked again once this long has passed.
+    Benched(Duration),
+}
+
+/// One source's standing, as `search --sources` shows it.
+#[derive(Debug, Clone)]
+pub struct SourceHealth {
+    pub name: String,
+    pub trust: f64,
+    pub strikes: u32,
+    pub state: SourceState,
+    pub family: String,
+}
+
+/// Trust below this, or any recent failure, makes a source suspect.
+const VERIFIED_TRUST: f64 = 0.8;
+
+/// The standing of a source given its trust and its failure streak (strikes and
+/// time since the last one). A source is benched while a streak of three is
+/// inside its window; the window lapsing makes it suspect, and it is asked once:
+/// a success restores it, a failure benches it again. Nothing in that needs a
+/// restart or a person.
+pub(crate) fn source_state(trust: f64, failure: Option<(u32, Duration)>) -> SourceState {
+    if let Some((strikes, since)) = failure
+        && strikes >= 3
+        && since < QUARANTINE_TTL
+    {
+        return SourceState::Benched(QUARANTINE_TTL - since);
+    }
+    if trust < VERIFIED_TRUST || failure.is_some() {
+        SourceState::Suspect
+    } else {
+        SourceState::Verified
+    }
 }
 
 /// Is the answer settled before the mark?
@@ -750,6 +795,67 @@ impl Searcher {
         }
         self.health_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drop every cached answer, in memory. Repeats inside the cache TTL are
+    /// otherwise served from it; a health check must ask the sources.
+    pub fn forget_cached(&self) {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Ask a first-party interface directly, outside the search path: the oracle
+    /// a canary is judged against. Bounded, and a failure is just a failure.
+    pub async fn first_party(&self, vertical: &str, query: &str) -> Vec<engines::Hit> {
+        const ORACLE_BUDGET: Duration = Duration::from_secs(8);
+        tokio::time::timeout(
+            ORACLE_BUDGET,
+            verticals::run(&self.fetcher, vertical, query, None),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+    }
+
+    /// Every source this process knows about and what it currently means for the
+    /// next search: verified, suspect, or benched until a time. Read-only; it
+    /// derives from the same trust and failure state the roster uses.
+    pub fn health_report(&self) -> Vec<SourceHealth> {
+        let trust = self
+            .trust
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let families = self
+            .families
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut names: Vec<&String> = trust.keys().chain(failures.keys()).collect();
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .map(|name| {
+                let t = trust.get(name).copied().unwrap_or(1.0);
+                let f = failures.get(name).map(|(n, at)| (*n, at.elapsed()));
+                SourceHealth {
+                    name: name.clone(),
+                    trust: t,
+                    strikes: f.map_or(0, |(n, _)| n),
+                    state: source_state(t, f),
+                    family: families.family_of(name),
+                }
+            })
+            .collect()
     }
 
     /// Should this source sit out this search?
@@ -2032,6 +2138,62 @@ mod tests {
         assert!(
             proxies.iter().all(|p| !pool.is_dead(&p.id())),
             "a budget-cut partial batch must publish nothing"
+        );
+    }
+
+    /// A source that serves bot-pages beside answering peers leaves the roster
+    /// within three searches, and returns by itself, with no person and no
+    /// restart, once its window lapses and it answers again.
+    // Depends on nextest's process-per-test isolation (DONSETCH_CACHE_DIR).
+    #[test]
+    fn a_decayed_source_is_benched_within_five_calls_and_returns_unattended() {
+        let s = test_searcher();
+        let mut calls = 0;
+        while !s.quarantined("bing") && !s.resting("bing") {
+            // What one search does when a source answers off-query beside peers.
+            s.record_outcome("bing", false);
+            s.bump_trust_status("bing", Intent::Web, false, "off-query");
+            calls += 1;
+            assert!(calls <= 5, "still in the roster after {calls} calls");
+        }
+        assert_eq!(calls, 3, "three strikes bench it");
+        let state = |s: &Searcher| {
+            s.health_report()
+                .into_iter()
+                .find(|h| h.name == "bing")
+                .map(|h| h.state)
+        };
+        assert!(matches!(state(&s), Some(SourceState::Benched(_))));
+
+        // The window lapses (no clock to wind, so age the streak): it is asked again.
+        let aged = Instant::now()
+            .checked_sub(QUARANTINE_TTL + Duration::from_secs(1))
+            .expect("monotonic clock is past the window");
+        s.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("bing".into(), (3, aged));
+        assert!(!s.quarantined("bing") && !s.resting("bing"));
+        assert_eq!(state(&s), Some(SourceState::Suspect));
+
+        // It answers; trust climbs back and the streak clears.
+        for _ in 0..4 {
+            s.record_outcome("bing", true);
+            s.bump_trust("bing", Intent::Web, true);
+        }
+        assert_eq!(state(&s), Some(SourceState::Verified));
+    }
+
+    #[test]
+    fn a_source_state_follows_trust_and_the_failure_streak() {
+        let long = Duration::from_secs(3600);
+        assert_eq!(source_state(1.0, None), SourceState::Verified);
+        assert_eq!(source_state(0.7, None), SourceState::Suspect);
+        assert_eq!(source_state(1.1, Some((1, long))), SourceState::Suspect);
+        assert_eq!(source_state(1.1, Some((3, long))), SourceState::Suspect);
+        assert_eq!(
+            source_state(0.3, Some((3, Duration::from_secs(60)))),
+            SourceState::Benched(QUARANTINE_TTL - Duration::from_secs(60))
         );
     }
 

@@ -249,6 +249,11 @@ async fn run() {
 
     match cmd {
         // ── Agent tools (spec-driven, shared core, clap-parsed) ──
+        // `search --sources` / `search --doctor`: source health, not a search.
+        "search" if donsetch::search::doctor::wants(&args[2..]) => {
+            let code = donsetch::search::doctor::run(&args[2..]).await;
+            std::process::exit(code);
+        }
         "fetch" | "search" | "crawl" | "screenshot" => {
             let code = cli::tool::run(cmd, &args[2..]).await;
             std::process::exit(code as i32);

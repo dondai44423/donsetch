@@ -362,6 +362,17 @@ fn parse_mojeek(doc: &Html) -> Vec<Hit> {
 /// Yahoo embeds tracking parameters (/RK=, /RS=, /RV=) inside
 /// the URL-encoded RU= value, so they survive urlencoding_decode
 /// as path suffixes on the real URL. We strip them.
+/// A sponsored result's click-through: Yahoo serves Bing's ads in its list, and
+/// the link is Bing's `/aclick` redirect, not a page. It is not an answer to
+/// anything the user asked, so it is dropped where the redirect is decoded.
+fn is_ad_click(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| {
+        u.host_str()
+            .is_some_and(|h| h == "bing.com" || h.ends_with(".bing.com"))
+            && u.path().starts_with("/aclick")
+    })
+}
+
 fn decode_yahoo(href: &str) -> String {
     // Yahoo's redirect host is `r.search.yahoo.com` on some layouts and
     // `rd.search.yahoo.com` on others; `contains("r.search.yahoo.com")` matched
@@ -383,7 +394,11 @@ fn decode_yahoo(href: &str) -> String {
         if let Ok(decoded) = urlencoding_decode(raw)
             && decoded.starts_with("http")
         {
-            return strip_yahoo_tracking(&decoded);
+            return if is_ad_click(&decoded) {
+                String::new()
+            } else {
+                strip_yahoo_tracking(&decoded)
+            };
         }
     }
     // Try _url= parameter.
@@ -392,7 +407,11 @@ fn decode_yahoo(href: &str) -> String {
         if let Ok(decoded) = urlencoding_decode(raw)
             && decoded.starts_with("http")
         {
-            return strip_yahoo_tracking(&decoded);
+            return if is_ad_click(&decoded) {
+                String::new()
+            } else {
+                strip_yahoo_tracking(&decoded)
+            };
         }
     }
     // Can't decode : return empty so the parser's `starts_with("http")`
@@ -994,6 +1013,16 @@ mod tests {
         let decoded =
             decode_yahoo("https://r.search.yahoo.com/;_ylt=Awr;RU=https://example.com/page;RV=abc");
         assert_eq!(decoded, "https://example.com/page");
+    }
+
+    #[test]
+    fn a_sponsored_click_through_is_not_a_result() {
+        let ad = "https://r.search.yahoo.com/;_ylt=A;RU=https%3a%2f%2fwww.bing.com%2faclick%3fld%3De8wiz8%26u%3daHR0cHM;RK=2";
+        assert_eq!(decode_yahoo(ad), "");
+        // A real page on a Bing-owned host that is not an ad redirect stays.
+        let page =
+            "https://r.search.yahoo.com/;RU=https%3a%2f%2fwww.bing.com%2fsearch%3fq%3drust;RK=2";
+        assert!(decode_yahoo(page).starts_with("https://www.bing.com/search"));
     }
 
     #[test]
