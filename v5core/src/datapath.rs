@@ -75,7 +75,7 @@ pub static PATHS: &[DataPath] = &[
         id: "news-feed",
         hosts: &["nytimes.com", "wsj.com"],
         resolve: resolve_news_feed,
-        parse: parse_rss_items,
+        parse: parse_news_feed,
         min_items: 5,
         min_interval_ms: 0,
         preferred: false,
@@ -332,6 +332,47 @@ fn parse_rss_items(body: &str, _source: &str) -> Vec<Item> {
         });
     }
     items
+}
+
+/// A front's feed, when it is alive: a feed whose newest dated story is more
+/// than [`STALE_FEED_DAYS`] old has been abandoned, and its stories are not the
+/// front's (WSJ's RSS stopped in January 2025). A stale feed answers nothing,
+/// so the front is read as its own document.
+fn parse_news_feed(body: &str, source: &str) -> Vec<Item> {
+    let items = parse_rss_items(body, source);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    if stale_feed(&items, now) {
+        return Vec::new();
+    }
+    items
+}
+
+/// The age past which a front's newest story says the feed was abandoned.
+const STALE_FEED_DAYS: i64 = 30;
+
+/// Whether the newest dated item is older than [`STALE_FEED_DAYS`] at `now`
+/// (Unix seconds). A feed with no dates is not judged by them.
+fn stale_feed(items: &[Item], now: i64) -> bool {
+    items
+        .iter()
+        .filter_map(|item| rss_day(&item.detail))
+        .max()
+        .is_some_and(|newest| now - newest > STALE_FEED_DAYS * 86_400)
+}
+
+/// An RSS `pubDate` (`Mon, 27 Jan 2025 14:23:00 -0500`) as the Unix second
+/// its day began; the time and zone do not matter at a month's scale.
+fn rss_day(value: &str) -> Option<i64> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let date = match parts.as_slice() {
+        [weekday, day, month, year, ..] if weekday.ends_with(',') => (day, month, year),
+        [day, month, year, ..] => (day, month, year),
+        _ => return None,
+    };
+    let (day, month, year) = date;
+    crate::cache::http_date(&format!("Thu, {day:0>2} {month} {year} 00:00:00 GMT"))
 }
 
 /// News fronts publish a feed of the stories the front page leads with. The
@@ -834,6 +875,34 @@ mod tests {
 
     // An interface answers the question its URL asks. A feed of other
     // stories is no answer to an article, nor a question list to a question.
+    // WSJ's world feed, still served in November 2026, last moved in
+    // January 2025: its stories are not the front's.
+    #[test]
+    fn an_abandoned_feed_answers_nothing() {
+        let item = |date: &str| Item {
+            title: "A story".into(),
+            detail: date.into(),
+            url: None,
+        };
+        let now = crate::cache::http_date("Sun, 08 Nov 2026 10:00:00 GMT").unwrap();
+        let wsj = [
+            item("Mon, 27 Jan 2025 14:23:00 -0500"),
+            item("Sun, 26 Jan 2025 09:00:00 -0500"),
+        ];
+        assert!(stale_feed(&wsj, now));
+        let live = [
+            item("Mon, 27 Jan 2025 14:23:00 -0500"),
+            item("Sat, 07 Nov 2026 22:10:00 +0000"),
+        ];
+        assert!(!stale_feed(&live, now));
+        // No dates, or dates in another shape: not judged by them.
+        assert!(!stale_feed(&[item(""), item("yesterday")], now));
+        assert_eq!(
+            rss_day("7 Nov 2026 22:10:00 GMT"),
+            rss_day("Sat, 07 Nov 2026 01:00:00 +0900")
+        );
+    }
+
     #[test]
     fn interfaces_answer_fronts_and_listings_and_leave_items_to_their_page() {
         let feed = |u: &str| plan(u).map(|(_, request)| request.url);
