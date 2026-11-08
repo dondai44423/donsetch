@@ -5,6 +5,95 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0] - 2026-11-08
+
+The stable release of v5: one fetch path (`v5core`: carried identity and state,
+the site's own interfaces, and a V8 engine for challenge programs only, with no
+browser in the path). The betas below describe that change; this release adds
+the fixes and the hardening found since.
+
+### Changed
+
+- **`links: true` keeps the real link addresses.** `[text](https://...)`, to
+  cite a source, check where a link goes or follow it. Short handles are still
+  there as `links: "handles"` (`--links=handles`), about half the tokens of the
+  address; a handle passed as `url` follows it. Off stays the default: link
+  text only. Callers that relied on `true` giving handles should send
+  `"handles"`.
+- **Content is judged by the document's substance, not its size.** A page is
+  content when its main region holds prose, a listing, a table or code; an
+  empty app shell, a sign-in gate, a loading screen or a notice is called what
+  it is, whatever its length. A thin JavaScript shell is no longer reported as
+  content, and a short real page (a card grid, a page-wide header holding the
+  article) is no longer called a shell. Text recovered from a page's app state is judged
+  the same way.
+
+### Added
+
+- **SiteGround's proof-of-work challenge is answered natively.** The page's
+  own work is solved in process and the origin accepts the answer; no browser.
+- **`focus` and `must_contain` find a figure in the page's spelling.** "15M"
+  finds "EUR 15 000 000", "7.5M" finds "EUR 7 500 000", "2B" finds "2 billion"
+  and "15k" finds "15,000". A capital magnitude that is never a unit (K, M, B,
+  and k) counts without a currency; `15m` (metres), `5b` (bits) and `3T`
+  (tesla) are matched as written. Focus ranks the passage that states the
+  figure first and names a figure absent only when the page never states it.
+
+### Fixed
+
+- **Links.** `--links=handles` on the command line sent `true` and returned
+  addresses; it returns handles now. A Wikipedia article carried link markup
+  with links off; it is text only now (GitHub, Stack Exchange and reddit
+  threads keep their links, where a link is often the content). Card grids
+  link their headlines, and an empty anchor renders nothing instead of
+  `[](url)`.
+- **Sections and tables.** Tables inside tab panels and inside indenting
+  blockquotes are kept, cells stay under their headers across `rowspan` and
+  `colspan`, and tables, code and quotes wrapped in `<figure>` are kept. The
+  outline indents headings by nesting, not by level number, and a linked
+  heading is listed by its words.
+- **Paging.** With no paragraph break near the cut, a page ended mid-row or
+  inside a link address; it now ends on a line or a word outside any link, and
+  the next page resumes exactly there.
+- **Focus.** A query word on the page in another form (an inflection the
+  stemmer does not know, `-ies` plurals) is no longer called absent.
+- **Reading.** A hover definition or glossary popup is not read into its
+  sentence; a badge is not glued to the word after it; bold that leaked into
+  text stays bold; bare numeric and letter superscripts are kept; a relative
+  `<base href>` is resolved against the page; text and feeds decode by the
+  charset they declare.
+- **`since_last`** compares pages by their words, so a read with links and one
+  without are the same page.
+- **Slow transfers.** A body still arriving is bounded by the caller's deadline,
+  not the per-request ceiling, and a transfer cut by the deadline says how far
+  it got and that a larger `deadline_ms` (up to 600000) lets it finish.
+- **Walls.** A wall heading no longer overrides a substantive page.
+- **Proxy.** v5 reads no proxy environment of its own; a proxy URL the engine
+  cannot read fails the request instead of going direct; credentials with
+  reserved characters are encoded; a proxied read leaves the target's name to
+  the proxy.
+- **Search.** Persisted cache entries and quarantines age by wall clock;
+  exclusions, phrases, `#` and `OR` stay apart in the cache key; `site:` honours
+  a path or scheme.
+- **Crawl.** Sitemaps that start with a BOM are read and an empty one is not
+  complete; `robots.txt` `*` rules apply in multi-agent groups; a crawl cut by
+  `max_depth` stops `DepthLimit`; a `ThrottledOut` stop keeps the URL it popped
+  for resume; locale dedup keys on the URL; a crawl that asks for progress is
+  answered when it ends, and a cancelled one sends no more progress and stores
+  no resume token.
+- **PDF.** Pages are rendered for OCR one at a time and only when OCR can run;
+  the OCR'd page is found by its index; the outline walk stops at a bookmark
+  cycle; furniture removal keeps titles and body lines; notes are kept when an
+  untitled document yields no blocks.
+- **Screenshot and browser.** `web_screenshot` guards the page's redirects and
+  subresources again, and a browser that dies at start is reported at once with
+  its stderr.
+- **Runtime.** ONNX loads the runtime's libstdc++ and a bad load fails at once
+  instead of waiting 15 s; the HTTP MCP server stops with a `GET /mcp` stream
+  open; npm downloads ride the `HTTPS_PROXY` tunnel with its credentials;
+  `donsetch version` and `status` give the same update verdict `update` acts
+  on.
+
 ## [5.0.0-beta.3] - 2026-11-07
 
 ### Fixed
