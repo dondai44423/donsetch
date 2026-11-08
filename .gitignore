@@ -50,3 +50,4 @@ bench/regression-results.json
 /core/runs/
 /core/hard-corpus.json
 /core/fixtures/
+__pycache__/
