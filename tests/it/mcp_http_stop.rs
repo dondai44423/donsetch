@@ -31,7 +31,21 @@ struct Server {
 impl Server {
     /// The real binary on a free loopback port, hermetic (no config
     /// file, a private cache) and allowed to fetch loopback pages.
+    ///
+    /// The port is free when picked but released before the child binds
+    /// it, and parallel tests pick ports too: a child that loses its port
+    /// exits at startup, and the next attempt picks another.
     fn start(tag: &str) -> Self {
+        for _ in 0..5 {
+            if let Some(server) = Self::try_start(tag) {
+                return server;
+            }
+        }
+        panic!("the server lost its port five times");
+    }
+
+    /// `None` when the child could not bind the port it was given.
+    fn try_start(tag: &str) -> Option<Self> {
         let port = TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
             .expect("a free port")
@@ -70,6 +84,18 @@ impl Server {
             seen: Vec::new(),
             dir,
         };
+        // Only this child's own line proves the port is its: a health
+        // answer alone may come from another test's server.
+        let listening = format!("listening on http://127.0.0.1:{port}");
+        if !server.wait_log(&listening, Duration::from_secs(60)) {
+            let log = server.log();
+            if server.exited_within(Duration::from_secs(5)).is_some()
+                && log.to_ascii_lowercase().contains("in use")
+            {
+                return None;
+            }
+            panic!("the server did not come up: {log}");
+        }
         let up = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
@@ -79,7 +105,7 @@ impl Server {
                 let mut answer = String::new();
                 let _ = s.read_to_string(&mut answer);
                 if answer.starts_with("HTTP/1.1 200") {
-                    return server;
+                    return Some(server);
                 }
             }
             if let Ok(Some(status)) = server.child.try_wait() {
