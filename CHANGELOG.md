@@ -32,6 +32,11 @@ the fixes and the hardening found since.
 
 - **SiteGround's proof-of-work challenge is answered natively.** The page's
   own work is solved in process and the origin accepts the answer; no browser.
+- **NCBI's proof of work is answered natively.** PubMed (and NCBI's other
+  hosts) answer a new client with an HTTP 203 page whose program hashes for a
+  nonce and posts it to `/_pow/solve`; v5 states the same work in code, posts
+  the answer as the page's own request, and reads the article with the
+  clearance it earns. PubMed articles were reported as an empty app frame.
 - **`focus` and `must_contain` find a figure in the page's spelling.** "15M"
   finds "EUR 15 000 000", "7.5M" finds "EUR 7 500 000", "2B" finds "2 billion"
   and "15k" finds "15,000". A capital magnitude that is never a unit (K, M, B,
@@ -89,6 +94,10 @@ the fixes and the hardening found since.
   notice: a headline that is only the ask ("Please tell us: When were you
   born?", "Are you of legal drinking age?") makes heineken.com a notice
   quoting it, while "Are you over 50? Here's what to know" heads an article.
+  A headline that is a bot check or an access refusal ("Verifying your
+  browser" on OpenReview, "Request Access" on the Federal Register, "Just a
+  moment...") is not content either, and a heading straight under such a
+  headline is its subtitle, not a section.
   A page whose only text is a Korean statutory business footer is not content
   either.
 - **Missing pages.** A page with no `h1` that leads with a "404" or "Page not
@@ -114,7 +123,9 @@ the fixes and the hardening found since.
   their own document, and a wall or a 404 there is reported as such. Fronts,
   sections, question listings and board pages still use the feed, and a Stack
   Exchange tag page (`/questions/tagged/c%2B%2B+async`) lists that tag's
-  questions instead of the site's newest.
+  questions instead of the site's newest. A front's feed whose newest story is
+  over 30 days old has been abandoned (WSJ's stopped in January 2025) and
+  answers nothing, so the front is read as its own document.
 - **Walls.** A wall heading no longer overrides a substantive page.
 - **Proxy.** v5 reads no proxy environment of its own; a proxy URL the engine
   cannot read fails the request instead of going direct; credentials with
