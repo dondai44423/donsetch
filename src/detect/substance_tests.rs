@@ -455,3 +455,61 @@ fn recovered_state_is_judged_by_its_substance() {
     assert!(!assess_lines(["is_latency_sensitive_broadcast", "FDSTooltipDef"]).is_content());
     assert_eq!(assess_lines(Vec::<&str>::new()), Verdict::Empty);
 }
+
+// Slack and Microsoft Teams (2026-11-08) answer a browser they will not
+// serve with a page that says so; the apology and the list of browsers to
+// install under that headline are the notice, not content.
+#[test]
+fn a_page_refusing_the_readers_browser_is_a_notice() {
+    let slack = format!(
+        r#"<body><nav><a href="/product">Product</a><a href="/pricing">Pricing</a><a href="/signin">Sign in</a></nav>
+        <h1>Please change browsers to use Slack</h1>
+        <p>We are no longer supporting this browser, so you’ll need to switch to one of our supported browsers to keep using Slack. We know this can be a pain, and we’re sorry for asking you to do it.</p>
+        <p>For questions or support, go to the Slack Help Center.</p><a href="/help">Learn More</a>{FOOTER}</body>"#
+    );
+    assert_eq!(verdict(&slack), Verdict::Notice);
+    let teams = r#"<body><h1>Hmm. Your browser version isn't supported. Quickest solution? Download the desktop app.</h1>
+        <a href="/download">Download Microsoft Teams</a><p>Here are the supported browser versions.</p>
+        <p>Edge</p><span>(latest three versions)</span><a href="/edge">Install for free</a>
+        <p>Chrome</p><span>(latest three versions)</span><a href="/chrome">Install for free</a>
+        <p>Safari</p><span>(latest two versions)</span><a href="/safari">Install for free</a></body>"#;
+    assert_eq!(verdict(teams), Verdict::Notice);
+}
+
+#[test]
+fn a_page_about_browsers_is_content() {
+    // A help page that lists the supported browsers names them; it refuses
+    // nobody.
+    let docs = r#"<body><main><h1>Supported browsers</h1>
+        <p>Slack supports the latest versions of Chrome, Firefox, Safari and Edge on desktop computers.</p>
+        <ul><li>Chrome 140 or later</li><li>Firefox 135 or later</li><li>Safari 18 or later</li></ul></main></body>"#;
+    assert_eq!(verdict(docs), Verdict::Content);
+    // An article whose headline names the refusal keeps its sections.
+    let article = r#"<body><main><h1>How to fix "your browser is not supported" errors</h1>
+        <p>Some sites check the browser version before they load.</p>
+        <h2>Update the browser</h2><p>Open the settings menu and choose About to install the latest version, then restart.</p>
+        <h2>Clear the cache</h2><p>A stale cached copy of the site can keep showing the old warning after an update.</p></main></body>"#;
+    assert_eq!(verdict(article), Verdict::Content);
+    let imperative = r#"<body><main><h1>Update your browser to keep your account safe</h1>
+        <p>Browsers patch security holes in every release, and an old one leaves those holes open.</p>
+        <h2>Why updates matter</h2><p>Attackers scan for outdated browsers because the flaws are already public.</p></main></body>"#;
+    assert_eq!(verdict(imperative), Verdict::Content);
+}
+
+// claude.ai/new served to a reader with no session (2026-11-08): the only
+// text is the statutory Korean business footer, outside any footer element.
+#[test]
+fn a_korean_business_footer_alone_is_not_content() {
+    let shell = r#"<body><div id="root"></div><div class="legal">
+        <div>Anthropic PBC | 사업자등록번호 86-1969045</div>
+        <div>Anthropic PBC | 사업자등록번호 86-1969045 (미국 델라웨어) | 다리오 아모데이</div>
+        <div>통신판매업 신고: 2025-공정-0020호 | 사업자정보확인 | 호스팅제공자: AWS Cloud Services | 이용약관</div>
+        <div>주소: 500 Howard Street, San Francisco, California U.S. | 대표전화: 1-415-505-5563 | support@anthropic.com</div>
+        </div></body>"#;
+    assert_ne!(verdict(shell), Verdict::Content);
+    let page = shell.replace(
+        r#"<div id="root"></div>"#,
+        "<main><h1>서비스 안내</h1><p>이 서비스는 연구와 글쓰기를 돕는 인공지능 도우미입니다. 질문을 입력하면 답변을 받을 수 있습니다.</p></main>",
+    );
+    assert_eq!(verdict(&page), Verdict::Content);
+}

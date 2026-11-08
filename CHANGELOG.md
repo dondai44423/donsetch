@@ -68,6 +68,13 @@ the fixes and the hardening found since.
   text stays bold; bare numeric and letter superscripts are kept; a relative
   `<base href>` is resolved against the page; text and feeds decode by the
   charset they declare.
+- **A page refusing the browser is a notice.** Slack's "Please change browsers"
+  and Teams' "Your browser version isn't supported" were reported as content
+  because the apology and the list of browsers under the headline read as
+  prose. A headline that refuses the reader's browser now makes what stands
+  under it the notice; a page about supported browsers, or an article with
+  sections under such a headline, stays content. A page whose only text is a
+  Korean statutory business footer is not content either.
 - **Page chrome is not read as the page.** When a page's visible text is thin,
   the rescue that reads its embedded app data took any JSON script: a job
   site's homepage came back as its navigation bar's prompt strings. A JSON

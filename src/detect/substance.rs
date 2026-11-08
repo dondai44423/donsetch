@@ -121,6 +121,14 @@ const LEGAL: &[&str] = &[
     "公网安备",
     "版权所有",
     "利用規約",
+    // A Korean site's statutory business footer: registration number,
+    // mail-order filing, terms, privacy policy, main phone line.
+    "사업자등록번호",
+    "통신판매업",
+    "사업자정보",
+    "이용약관",
+    "개인정보처리방침",
+    "대표전화",
 ];
 
 /// Sign-in prompts and fields, in the languages most pages use.
@@ -630,6 +638,17 @@ static NOTICE: LazyLock<Regex> = LazyLock::new(|| {
         r"(?i)\btry again\b|\b(resource|page|file) not found\b|something went wrong|an error (has )?occurred|error occurred|isn.t available|is not available|could not be (found|loaded)|couldn.t (be )?(found|load)|no longer available|\boops\b|checking your browser|verify you are (a )?human|verifying you are (a )?human|are you a robot|unusual traffic|access denied|press (&|and) hold|complete the security check|attention required|one more step|this process is automatic|redirect to your requested content",
     )
     .expect("notice pattern")
+});
+
+/// A headline that refuses the reader's browser: it addresses that browser
+/// ("your browser isn't supported", "we no longer support this browser") or
+/// tells the reader to change it ("Please change browsers to use Slack").
+/// A page about which browsers are supported names them; it does not say so.
+static REFUSAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(your|this) browser(\s+version)?\s+(is\s+)?(not|no longer|isn.t)\s+(\w+\s+)?(supported|compatible)\b|\bno longer support(s|ing|ed)?\s+(this|your)\s+browser|^\W*(please\s+)?(change|switch|update|upgrade)\s+(your\s+)?browsers?\b|^\W*unsupported\s+browser\b",
+    )
+    .expect("refusal pattern")
 });
 
 static LOADING: LazyLock<Regex> = LazyLock::new(|| {
@@ -1448,8 +1467,18 @@ pub fn assess(doc: &Html, url: &str) -> Page {
 
     let mut kinds = Vec::with_capacity(w.units.len());
     let mut auth_level: Option<u8> = None;
+    // A page whose headline refuses the reader's browser is that notice:
+    // what stands under the headline (an apology, a help link, a list of
+    // browsers to install) is the notice too. Any later heading ends it, so
+    // an article under such a headline keeps its sections as content.
+    let mut refusal = false;
+    let mut headline_seen = false;
     let mut rows: Vec<(usize, usize)> = Vec::new();
     for u in &w.units {
+        if u.ctx.heading > 0 && !u.ctx.frame {
+            refusal = !headline_seen && REFUSAL.is_match(u.text.trim());
+            headline_seen = true;
+        }
         if u.ctx.heading > 0 {
             if auth_level.is_some_and(|l| u.ctx.heading <= l) {
                 auth_level = None;
@@ -1461,7 +1490,10 @@ pub fn assess(doc: &Html, url: &str) -> Page {
                 auth_level = Some(u.ctx.heading);
             }
         }
-        let kind = classify(u, auth_level.is_some(), &echoes);
+        let mut kind = classify(u, auth_level.is_some(), &echoes);
+        if refusal && matches!(kind, Kind::Sentence | Kind::Data | Kind::Entity) {
+            kind = Kind::Notice;
+        }
         if u.ctx.row != 0
             && !matches!(
                 kind,
