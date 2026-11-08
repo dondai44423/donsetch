@@ -269,10 +269,13 @@ fn a_cjk_paragraph_is_content() {
 
 #[test]
 fn deep_nesting_does_not_overflow() {
+    // 2,000 is already four times html5ever's own 512-depth cap: the parser
+    // clamps there, so the walk sees the same tree that 50,000 bought for 45
+    // seconds. Keep it pathological, keep it under a second.
     let html = format!(
         "<body>{}<p>Deep content sits here in a full sentence.</p>{}</body>",
-        "<div>".repeat(50_000),
-        "</div>".repeat(50_000)
+        "<div>".repeat(2_000),
+        "</div>".repeat(2_000)
     );
     // html5ever caps nesting on its own; the walk must not recurse either way.
     let _ = verdict(&html);

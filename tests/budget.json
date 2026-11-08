@@ -1,0 +1,17 @@
+{
+  "_comment": "A deliberate ceiling, not a target. Raise it in the same commit that adds real coverage; the guard exists so growth is a decision, not a drift.",
+  "max_total": 2100,
+  "max_single_test_s": 20,
+  "max_sum_s": 600,
+  "suites": {
+    "donsetch::donsetch": 2000,
+    "donsetch::it": 150,
+    "donsetch::bin/donsetch": 20
+  },
+  "allow_slow": [],
+  "fixtures_mb": {
+    "tests/fixtures": 4,
+    "tests/pdf-corpus": 50,
+    "core/fixtures": 8
+  }
+}

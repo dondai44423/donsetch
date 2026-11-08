@@ -110,6 +110,12 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
 - **For a code change, a test that fails without the fix**, built from the
   real capture where one exists, and at least one negative case that shows
   the fix does not fire where it must not.
+- **A test has a cost budget.** The default suite is capped by
+  `.config/nextest.toml`'s default-filter and `tests/budget.json` (count,
+  per-suite count, single-test time, total CPU, fixture size). Keep a new test
+  under ~2 s; a corpus or clock test belongs in the heavy set (`just heavy`),
+  not in the per-push gate. CI fails on growth without a deliberate raise of
+  the budget in the same change.
 - **Tests isolate their own state instead of relying on the runner.** A
   per-test temp dir isolates nothing when it reaches the code through
   `DONSETCH_CACHE_DIR`: the variable is process-wide, so under libtest
@@ -152,6 +158,8 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
   descriptions and schemas and the CLI subcommands. Every connected client
   and every CLI user sees what it holds: treat edits there as user-facing.
 - The version is bumped by the maintainer at release time. Do not touch it
-  in a PR.
+  in a PR. A release is `just ship <version>`: it gates on master CI, bumps,
+  tags, watches the five-platform build, publishes the draft and watches npm.
+  Do not hand-run those steps.
 - Commit messages follow Conventional Commits. Do not append tool or
   session trailers.

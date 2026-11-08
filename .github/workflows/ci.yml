@@ -78,7 +78,8 @@ jobs:
             # and http (axum/tower-http) are only CI-exercised on Linux.
             features: --features ocr,rerank,http
             release-check: false
-            # The semantic gate: the whole suite (heavy set included).
+            # The semantic gate: the default suite; the heavy set is
+            # nightly (nextest's default-filter keeps it out of this step).
             tests: full
           - name: linux-aarch64
             os: ubuntu-24.04-arm
@@ -321,25 +322,28 @@ jobs:
       # exec (the aarch64 lane hit exactly that) surfaced as nextest's
       # "creating test list failed" instead of the crash itself. This starts
       # the product binary the release will actually ship, on the host it
-      # will run on.
+      # will run on. One build: the fast profile is a local shape, not a
+      # release shape.
       - name: The shipped binary starts
         if: matrix.tests == 'full'
         run: |
           uname -a; getconf PAGESIZE
           cargo build --profile ci ${{ matrix.features }} --target ${{ matrix.target }} --bin donsetch
-          echo '--- ci profile (LTO)'
-          ./target/${{ matrix.target }}/ci/donsetch --version || echo "ci profile exit=$?"
-          cargo build --profile fast ${{ matrix.features }} --target ${{ matrix.target }} --bin donsetch
-          echo '--- fast profile (no LTO)'
-          ./target/${{ matrix.target }}/fast/donsetch --version || echo "fast profile exit=$?"
-          echo '--- ci profile again, as the gate'
           ./target/${{ matrix.target }}/ci/donsetch --version
         timeout-minutes: 40
 
       - name: Test (nextest, full)
         if: matrix.tests == 'full'
-        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }}
+        env:
+          NEXTEST_EXPERIMENTAL_LIBTEST_JSON: '1'
+        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --target ${{ matrix.target }} ${{ matrix.extra-args }} --message-format libtest-json-plus > nextest.json
         timeout-minutes: 60
+
+      # The suite is a tool, not a landfill: this fails when it grows or
+      # slows past tests/budget.json without a deliberate raise.
+      - name: Test budget
+        if: matrix.tests == 'full'
+        run: python3 scripts/test_budget.py --json nextest.json
 
       # Everywhere else the risk is platform COMPILATION (cfg paths,
       # linkage, process semantics), and the expensive part of a test run
@@ -360,7 +364,7 @@ jobs:
       # lanes meaningful, and on macos-x86_64 it is the only per-push
       # compilation of darwin-x86_64, which is a release target.
       - name: Compile-check all targets (no test link)
-        if: matrix.tests == 'none'
+        if: matrix.tests == 'none' && matrix.name != 'windows-x86_64'
         run: cargo check --profile ci --all-targets ${{ matrix.features }} --target ${{ matrix.target }}
         timeout-minutes: 30
 
@@ -608,7 +612,7 @@ jobs:
         with:
           tool: nextest
       - name: Heavy suite (soak, corpus, landmarks, live)
-        run: cargo nextest run --profile ci --cargo-profile ci --target ${{ matrix.target }} -E 'test(soak) | test(corpus) | test(landmark)' --no-fail-fast
+        run: cargo nextest run --profile ci --cargo-profile ci --target ${{ matrix.target }} --ignore-default-filter -E 'test(soak) | test(corpus) | test(landmark) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling)' --no-fail-fast
         timeout-minutes: 90
 
       - name: Sweep target/
@@ -668,9 +672,9 @@ jobs:
       matrix:
         # Dynamic, NOT a job-level `if` on matrix.target: the job-level
         # condition is evaluated before the matrix expands, so referring
-        # to matrix there is not reliable. One target on pull requests,
-        # all five on master pushes and nightly.
-        target: ${{ fromJSON(github.event_name == 'pull_request' && '["extract"]' || '["extract","charset","paginate","sitemap","feed"]') }}
+        # to matrix there is not reliable. One target on pull requests, the
+        # two highest-change targets on master pushes, all five nightly.
+        target: ${{ fromJSON(github.event_name == 'pull_request' && '["extract"]' || (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["extract","charset","paginate","sitemap","feed"]' || '["extract","feed"]') }}
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust nightly

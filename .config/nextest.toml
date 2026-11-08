@@ -13,6 +13,12 @@
 
 [profile.default]
 fail-fast = true
+# The per-edit suite stays under a minute: these tests are real but parse a
+# 501-page PDF, scan a large corpus PDF, or spend 20 seconds proving a timing
+# ceiling. They run in the `heavy` lane (`just heavy`, nightly CI) with
+# --ignore-default-filter. A new test that needs more than ~10 s belongs here,
+# not in the default gate.
+default-filter = 'not (test(soak::soak_rss_stays_bounded) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling))' 
 # A hung test must fail locally too, not wedge the terminal forever.
 # Slightly longer than ci: local runs often share the box with a build.
 slow-timeout = { period = "60s", terminate-after = 1 }
@@ -31,3 +37,4 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter = 'test(pdf::tests::progit_book)'
 slow-timeout = { period = "120s", terminate-after = 1 }
+

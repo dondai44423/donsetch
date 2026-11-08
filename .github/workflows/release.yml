@@ -30,6 +30,11 @@ on:
   # Manual run: build + all gates, no publishing. Used to verify
   # baseline/glibc changes without minting a tag.
   workflow_dispatch:
+  # Weekly warm: the build job saves the release-profile cache on the
+  # default branch, and a tag run can restore default-branch caches. This
+  # is what keeps a tag from paying a cold five-platform build every time.
+  schedule:
+    - cron: '17 4 * * 1'
 
 env:
   CARGO_INCREMENTAL: 0
@@ -152,7 +157,7 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: release-${{ matrix.target }}-dep-${{ env.DEP_HASH }}-rel2
+          key: release-${{ matrix.target }}-dep-${{ env.DEP_HASH }}-rel3
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
           save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -167,7 +172,7 @@ jobs:
           # Linux legs link PDFium with rust-lld (build.rs): neither bfd
           # 2.38 (22.04) nor an apt lld reads its CREL relocations.
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked ${{ matrix.features }} --target ${{ matrix.target }}
         timeout-minutes: 30
 
       # Windows loads ONNX Runtime at runtime like Linux (#277, #298).
@@ -192,7 +197,7 @@ jobs:
         env:
           DONSETCH_NO_UPDATE_CHECK: "1"
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           BIN=donsetch
           if [ -f donsetch.exe ]; then BIN=donsetch.exe; fi
           output=$(./$BIN --version 2>&1 || true)
@@ -221,7 +226,7 @@ jobs:
       - name: Payload integrity gates
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           BIN=donsetch
           [ -f donsetch.exe ] && BIN=donsetch.exe
           SIZE=$(wc -c < "$BIN")
@@ -275,7 +280,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu-')
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           if ! command -v objdump >/dev/null 2>&1; then
             sudo apt-get install -y --no-install-recommends binutils >/dev/null 2>&1 || true
           fi
@@ -304,7 +309,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get install -y --no-install-recommends qemu-user >/dev/null 2>&1 || true
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           rm -f ~/.cache/donsetch/avx.json 2>/dev/null || true
           output=$(qemu-x86_64 -cpu qemu64 ./donsetch --version 2>&1 || true)
           if [ -z "$output" ]; then
@@ -334,7 +339,7 @@ jobs:
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
         run: |
-          cd target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/dist
           # Include the ONNX shared lib when present: libonnxruntime.so
           # on Linux x64, libonnxruntime.dylib on both macOS arches
           # (build.rs fetches it for runtime dlopen, #298/#316).

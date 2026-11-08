@@ -122,7 +122,7 @@ pub async fn run(args: &[String]) {
     // update retires v4's browser tier, its login vault and its tier
     // model. Warn before the download touches the install, and never
     // install one unattended without --yes.
-    if is_major_jump(current, &latest) && !confirm_major_update(current, &latest, &args) {
+    if is_major_jump(current, &latest) && !confirm_major_update(current, &latest, args) {
         println!("  Update cancelled.");
         std::process::exit(1);
     }

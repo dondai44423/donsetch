@@ -1,58 +1,64 @@
 # DonSeTch dev loop.
 #
-# THE LADDER (each rung is a different question, and they cost
-# different amounts; climb only as far as the question needs):
+# THE LADDER (each rung is a different question; climb only as far as the
+# question needs):
 #
-#   1. just check      types + cfg on the full feature set   (~seconds, warm)
-#   2. just t <expr>   the touched scope, fast profile        (~seconds-min)
-#   3. CI              the full matrix, the only full gate    (async)
+#   1. just check       types + cfg, full feature set        ~1 s warm
+#   2. just t <expr>    the touched scope                    ~6 s warm
+#   3. just test        the whole default suite              ~35 s warm
+#   4. CI               the cross-platform matrix, async     ~8-10 min
 #
-# `just all` is the pre-push net: fmt + check + lockgate + lint. It does
-# NOT run the suite: CI already does, in parallel, on 5 platforms, and
-# paying for a local full run just serializes what is already running.
+# `just all` is the pre-push net: guard + fmt + check + lockgate + lint +
+# the static test budget. It does NOT run the suite: CI already does, in
+# parallel, on every platform.
 #
-# LOCAL vs CI PROFILE (the reason the loop is fast): every local recipe
-# runs the `fast` profile (debug codegen for this crate, deps at
-# opt-level 1, no debuginfo). A source edit then rebuilds in seconds
-# instead of the 8-12 minutes an opt-level-3 whole-crate recompile cost
-# under the RAM-bounded job cap. The `ci` profile (release opts,
-# panic=abort, the shape the binary ships) stays for CI, for
-# `just tci`/`just bin-ci` when release-profile behavior is the
-# question, and for the heavy suite.
+# PROFILES. `fast` is the edit loop: this crate at opt-level 0, deps at
+# opt-level 1, no debuginfo, codegen-units 16. `ci` is the CI/test shape:
+# release opts, panic=abort, no LTO; the heavy suite runs there because it
+# measures time and memory. `dist` is the SHIPPED shape (fat LTO, one codegen
+# unit) and only release.yml builds it. Plain `release` is thin LTO for local
+# use, so nobody waits ten minutes for a binary that only runs gates.
+#
+# The 2026-11 workflow pass cut the two costs that made this feel like 2010:
+# deps at codegen-units 256 made one crate fan out into every core and one
+# relink cost 6.5 minutes (now 25 s at 16 units), and the memory model in
+# budget.sh dropped to one job on a busy desktop (now three to eight). The
+# suite's heavy tail (a 501-page PDF, a large scanned PDF) moved to the
+# heavy lane via nextest's default-filter; the default gate is 2,018 tests in
+# ~35 s, and `tests/budget.json` keeps it there.
 #
 #   just check        compile-check, full feature set, fast profile
 #   just t <expr>     scoped tests, fast profile (`just t crawl::frontier`)
-#   just test         the whole suite, fast profile, minus the heavy set
-#   just heavy        the heavy set (soak / corpus / landmarks) on ci
+#   just th <expr>    scoped heavy test, default-filter lifted
+#   just test         the default suite, fast profile
+#   just heavy        the heavy set (soak / corpus / PDF corpus / timing)
+#   just budget       the suite as the guard sees it, then the ceilings
 #   just tci <expr>   scoped tests on the ci profile (release parity)
 #   just lint         clippy -Dwarnings, full feature set
-#   just all          pre-push net: guard + fmt-check + check + lockgate + lint
+#   just all          pre-push net: guard + fmt + check + lockgate + lint + budget-static
 #   just bin          target/fast/donsetch (fast live smokes)
 #   just bin-ci       target/ci/donsetch  (release parity + the gates)
 #   just smoke        bin + doctor + fetch + search
+#   just ship <ver>   CI gate, bump, tag, build, publish, npm — one command
 #   just loop-report  measure this ladder on this box, right now
 #   just fuzz extract 30s fuzz burst on one target
 #   just clean-bloat  reclaim all that regrows (incremental, worktrees)
 #
 # A hung test is caught by nextest's own per-test slow-timeout; a long
-# COLD build is caught by the CI step timeout, which has to clear the
-# slowest cold build on the slowest runner (see .github/workflows/ci.yml).
+# COLD build is caught by the CI step timeout.
 #
-# CPU + MEMORY citizenship: this box is the operator's desktop (16
-# threads, 7.6 GB RAM, a live session next to every compile). Every
-# cargo/build/fuzz command below runs through scripts/budget.sh, which
-# pins the whole process TREE to a quarter of the cores with taskset,
-# exports the job caps into nested build systems (cmake, make, nasm), and
-# bounds the job count by what RAM is available right now. A `-j` flag
-# caps neither: rustc spawns its own codegen threads, boring-sys spawns
-# its own make -j$(nproc), and a memory-shaped box swaps instead of
-# stalling.
-#   BG_JOBS=<n>     job count (default: min of the core quarter and the
-#                   RAM budget, one job per ~1.2 GB after reserving 1.5 GB)
-#   BG_CORES=<set>  taskset core set (default: the first quarter)
-# With sccache installed (rust-sccache), budget.sh wires RUSTC_WRAPPER
-# and the C/C++ compilers through it, so recompiles across profiles and
-# branches are cache hits instead of work.
+# CPU + MEMORY citizenship: this box is the operator's desktop (16 threads,
+# 7.6 GB RAM, a live session next to every compile). Every cargo/build/fuzz
+# command below runs through scripts/budget.sh, which pins the whole process
+# TREE to half the cores with taskset, exports the job caps into nested build
+# systems (cmake, make, nasm), and bounds the job count by MemAvailable right
+# now: ~700 MB per rustc at codegen-units 16, after reserving 1 GB.
+#   BG_JOBS=<n>     job count (default: min of half the cores and the RAM
+#                   budget; 3-4 with a browser open, 8 on an idle box)
+#   BG_CORES=<set>  taskset core set (default: the first half)
+# With sccache installed (rust-sccache), budget.sh wires RUSTC_WRAPPER and the
+# C/C++ compilers through it, so recompiles across profiles and branches are
+# cache hits instead of work.
 # Absolute, so a recipe that cd's first (fuzz) can still use it.
 budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
 feat := "--features ocr,rerank,http"
@@ -84,7 +90,7 @@ space:
 
 # Pre-push net. Deliberately NOT the suite: CI is the full gate and runs
 # it on 5 platforms in parallel; a local full run only serializes it.
-all: guard fmt-check check lockgate lint
+all: guard fmt-check check lockgate lint budget-static
 
 # Pre-tag gate: `all` + the payload gates mirrored against the ci-profile
 # binary. Fat LTO is not built locally: the release workflow's own gates
@@ -109,8 +115,8 @@ ci-gates: bin-ci
 
 # The tag-time gates (linux-x64 mirror of release.yml).
 gates:
-    {{budget}} cargo build --release {{feat}}
-    @sh scripts/gates.sh linux-x64 target/release
+    {{budget}} cargo build --profile dist {{feat}}
+    @sh scripts/gates.sh linux-x64 target/dist
 
 fmt:
     cargo fmt --all
@@ -165,16 +171,36 @@ win-check-core: _win-check-prereqs
 # landmark runs parse whole fixture trees, the live ones need the
 # network. They are worth running, they are just not worth running on
 # every edit; CI runs them in the heavy lane.
-heavy_expr := "test(soak) | test(corpus) | test(landmark)"
+# The heavy set: real but expensive, so it never runs per edit. The PDF
+# corpus tests and the timing-ceiling test are excluded by nextest's
+# default-filter too; this expression is the explicit heavy lane.
+heavy_expr := "test(soak) | test(corpus) | test(landmark) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling)"
 
-# The whole suite minus the heavy set, fast profile. CI runs the rest of
-# the matrix; this is for the times a local full run is genuinely wanted.
+# The default suite, fast profile. The heavy set is excluded by nextest's
+# default-filter; `just heavy` is the explicit lane for it.
 test:
-    {{budget}} cargo nextest run --cargo-profile fast {{feat}} -E 'not ({{heavy_expr}})' --workspace
+    {{budget}} cargo nextest run --cargo-profile fast {{feat}} --workspace
 
-# Scoped run: `just t crawl::frontier` runs only what matches.
+# Scoped run: `just t crawl::frontier` runs only what matches. The heavy
+# default-filter still applies; `just th` is the escape for a heavy test.
 t expression:
     {{budget}} cargo nextest run --cargo-profile fast {{feat}} -E 'test({{expression}})'
+
+# Scoped heavy run: `just th pdf::tests::progit_book` (one test, on purpose).
+th expression:
+    {{budget}} cargo nextest run --cargo-profile fast {{feat}} --ignore-default-filter -E 'test({{expression}})'
+
+# The suite as the budget guard sees it: machine-readable run, then the
+# ceilings in tests/budget.json. CI runs the same check on its full lane.
+budget:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 {{budget}} cargo nextest run --cargo-profile fast {{feat}} --workspace --message-format libtest-json-plus > /var/tmp/donsetch-nextest.json
+    python3 scripts/test_budget.py --json /var/tmp/donsetch-nextest.json
+
+# Fixtures and the budget file only: seconds, no build. Runs in `just all`.
+budget-static:
+    python3 scripts/test_budget.py --static
 
 # Explicit native qualification: only the requested ignored test scope, using
 # fresh owned browser profiles. Never part of an ordinary local test run.
@@ -194,7 +220,7 @@ npm-test:
 
 # The heavy set on the ci profile: soak, corpus, landmarks, live probes.
 heavy:
-    {{budget}} cargo nextest run --cargo-profile ci {{feat}} -E '{{heavy_expr}}' --no-fail-fast
+    {{budget}} cargo nextest run --cargo-profile ci {{feat}} --ignore-default-filter -E '{{heavy_expr}}' --no-fail-fast
 
 # The binary for live smokes (fast profile: seconds, real behavior).
 bin:
@@ -240,11 +266,7 @@ smoke: bin
 fuzz target:
     cd fuzz && {{budget}} cargo fuzz run {{target}} -s none -- -max_total_time=30
 
-# Release everything in one command. The CHANGELOG [version] section
-# must already exist; the recipe bumps both manifests + the lock,
-# validates, commits, pushes, and tags. The tag triggers CI + the
-# Release build in parallel; publish the draft when the watcher
-# reports green (gh run watch does it; nothing waits serially).
+# Ship a version end to end (CI gate, bump, tag, build, publish, npm).
 ship version:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -255,6 +277,12 @@ ship version:
     grep -q "^## \[{{version}}\] - " CHANGELOG.md || {
         echo "ship: CHANGELOG.md has no [{{version}}] section yet"; exit 1
     }
+    # The house rule is CI green on master first; enforce it here instead of
+    # remembering it. A running/queued CI is a "wait", not a pass.
+    ci=$(gh run list --workflow CI --branch master --limit 1 --json conclusion --jq '.[0].conclusion // "none"')
+    if [ "$ci" != "success" ]; then
+        echo "ship: master CI is '$ci' — wait for green (just watch <run-id>)"; exit 1
+    fi
     sed -i 's/^version = ".*"/version = "{{version}}"/' Cargo.toml
     sed -i 's/^  "version": ".*",/  "version": "{{version}}",/' npm/package.json
     cargo update -p donsetch --precise {{version}} >/dev/null
@@ -268,23 +296,47 @@ ship version:
     if ! git diff --cached --quiet; then
         git commit -q -m "chore(release): {{version}}"
     fi
-    git push -q origin master
-    git branch --show-current | grep -qx master || git push -q origin "HEAD:master"
+    git push -q origin HEAD
     git tag "v{{version}}"
     git push -q origin "v{{version}}"
     # Match the run by its branch (the tag), not by "newest": the run for
-    # this tag may not exist yet at this instant, and `.[0]` then answered
-    # with the PREVIOUS release's run id (v4.2.1 printed v4.2.0's).
+    # this tag may not exist yet at this instant.
     run=""
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
+    for _ in $(seq 1 20); do
         run=$(gh run list --workflow=Release --limit 10 --json databaseId,headBranch \
             --jq "[.[]|select(.headBranch==\"v{{version}}\")][0].databaseId // empty")
         [ -n "$run" ] && break
         sleep 3
     done
-    echo "ship: v{{version}} pushed. Release build run ${run:-unknown} is underway."
-    echo "      watcher: just watch ${run:-<run-id>}"
-    echo "      publish when green: gh release edit v{{version}} --draft=false"
+    if [ -z "$run" ]; then
+        echo "ship: tag pushed, but no Release run appeared"; exit 1
+    fi
+    echo "ship: Release run $run — five platform builds in parallel"
+    gh run watch "$run" --exit-status --interval 20
+    echo "ship: publishing the draft release; npm publishes on 'released'"
+    published=0
+    for _ in $(seq 1 10); do
+        if gh release edit "v{{version}}" --draft=false >/dev/null 2>&1; then
+            published=1; break
+        fi
+        sleep 3
+    done
+    if [ "$published" != 1 ]; then
+        echo "ship: release built, but the draft could not be published"; exit 1
+    fi
+    # npm publish is triggered by the release event; the newest run is ours.
+    npm_run=""
+    for _ in $(seq 1 20); do
+        npm_run=$(gh run list --workflow "npm publish" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+        [ -n "$npm_run" ] && break
+        sleep 3
+    done
+    if [ -n "$npm_run" ]; then
+        gh run watch "$npm_run" --exit-status --interval 10
+    else
+        echo "ship: released, but no npm publish run appeared (run it: gh workflow run 'npm publish' -f tag=v{{version}})"
+    fi
+    gh release view "v{{version}}" --json url --jq '"ship: published " + .url'
 
 # Follow one GitHub Actions run to completion in the foreground.
 # This replaces every sleep loop and polling loop: one command, it

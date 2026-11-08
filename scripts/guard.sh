@@ -127,7 +127,7 @@ fi
 echo "guard: build tree ${sm}M (ceiling ${cap}M): reclaiming"
 
 prune_stale
-rm -rf target/debug target/release fuzz/target target/x86_64-pc-windows-gnu
+rm -rf target/debug target/release target/dist fuzz/target target/x86_64-pc-windows-gnu
 
 git worktree prune
 for wt in $(git worktree list --porcelain | awk -v p="$PWD/target/wt" '/^worktree / && index($2, p) == 1 { print $2 }'); do

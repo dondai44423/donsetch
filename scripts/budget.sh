@@ -47,7 +47,11 @@ if [ -f "$root/scripts/guard.sh" ]; then
 fi
 
 nproc_now=$(nproc 2>/dev/null || echo 4)
-core_jobs=$(( (nproc_now + 3) / 4 ))
+# Half the threads, not a quarter: profile.codegen-units caps each rustc's own
+# LLVM fan-out (16 instead of 256), so one process no longer claims the whole
+# box. `nice`/`ionice` still put the live session first.
+core_jobs=$(( (nproc_now + 1) / 2 ))
+[ "$core_jobs" -lt 1 ] && core_jobs=1
 
 # MemAvailable is the kernel's own estimate of what we can take without
 # pushing the session into swap; read it rather than trusting total RAM.
@@ -56,8 +60,11 @@ case "$avail_mb" in
     ''|*[!0-9]*) avail_mb=0 ;;
 esac
 mem_jobs=0
-if [ "$avail_mb" -gt 1500 ]; then
-    mem_jobs=$(( (avail_mb - 1500) / 1200 ))
+# ~700 MB per rustc with codegen-units=16 and opt-level 1 deps (measured on
+# this tree). The old 1.2 GB estimate was sized for 256-unit codegen, where
+# one crate could fan out into every core and several GB; that shape is gone.
+if [ "$avail_mb" -gt 1000 ]; then
+    mem_jobs=$(( (avail_mb - 1000) / 700 ))
 fi
 [ "$mem_jobs" -lt 1 ] && mem_jobs=1
 

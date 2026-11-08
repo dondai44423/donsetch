@@ -113,18 +113,24 @@ fn announce_upgrade_once(cmd: &str, args: &[String]) {
     if !has_v4_state(&bytes) {
         return;
     }
-    eprintln!();
-    eprintln!("  DonSeTch v5 is a different fetch engine, not a v4 patch.");
-    eprintln!("    - The fetch path embeds V8 and carries identity and state; no browser runs it.");
-    eprintln!("    - `donsetch login` and the session vault are gone. A login wall is reported,");
-    eprintln!(
+    // diag!, not eprintln!: a closed stderr must not abort the process
+    // (src/diag.rs, and the crate denies print_stderr).
+    donsetch::diag!();
+    donsetch::diag!("  DonSeTch v5 is a different fetch engine, not a v4 patch.");
+    donsetch::diag!(
+        "    - The fetch path embeds V8 and carries identity and state; no browser runs it."
+    );
+    donsetch::diag!(
+        "    - `donsetch login` and the session vault are gone. A login wall is reported,"
+    );
+    donsetch::diag!(
         "      never crossed; authenticated browsing belongs to a browser driver (bladebro)."
     );
-    eprintln!("    - v4 state is left in place and ignored by the new engine.");
-    eprintln!(
+    donsetch::diag!("    - v4 state is left in place and ignored by the new engine.");
+    donsetch::diag!(
         "  Run `donsetch doctor` to see what this install uses, `donsetch help` for commands."
     );
-    eprintln!();
+    donsetch::diag!();
     let _ = std::fs::create_dir_all(&cache);
     let _ = std::fs::write(&stamp, env!("CARGO_PKG_VERSION"));
 }
@@ -139,23 +145,6 @@ fn has_v4_state(bytes: &[u8]) -> bool {
         || text.contains("\"tier1_cookies\"")
 }
 
-#[cfg(test)]
-mod upgrade_notice_tests {
-    use super::has_v4_state;
-
-    #[test]
-    fn v4_state_is_recognised_by_its_vault_fields() {
-        assert!(has_v4_state(br#"{"vault_epoch":3,"profiles":{}}"#));
-        assert!(has_v4_state(
-            br#"{"profiles":{"x":{"session_cookies":[]}}}"#
-        ));
-        assert!(has_v4_state(br#"{"tier1_cookies":[]}"#));
-        assert!(!has_v4_state(
-            br#"{"version":5,"profiles":{},"personas":{}}"#
-        ));
-        assert!(!has_v4_state(b""));
-    }
-}
 /// Every top-level command, for the suggestion on a typo.
 const KNOWN_COMMANDS: &[&str] = &[
     "fetch",
@@ -517,3 +506,21 @@ fn get_arg_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 // ── Dev commands ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod upgrade_notice_tests {
+    use super::has_v4_state;
+
+    #[test]
+    fn v4_state_is_recognised_by_its_vault_fields() {
+        assert!(has_v4_state(br#"{"vault_epoch":3,"profiles":{}}"#));
+        assert!(has_v4_state(
+            br#"{"profiles":{"x":{"session_cookies":[]}}}"#
+        ));
+        assert!(has_v4_state(br#"{"tier1_cookies":[]}"#));
+        assert!(!has_v4_state(
+            br#"{"version":5,"profiles":{},"personas":{}}"#
+        ));
+        assert!(!has_v4_state(b""));
+    }
+}

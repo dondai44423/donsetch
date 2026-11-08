@@ -146,12 +146,25 @@ print_stderr = "deny"
 # reaches `fast`, `ci` or the shipped `release` profile.
 [profile.dev]
 debug = "line-tables-only"
+# 256 codegen units is the historical default; it multiplies LLVM work and
+# peak memory per rustc without making the debug binary faster to run.
+codegen-units = 16
 
+# The LOCAL release shape: thin LTO and parallel codegen. A shipped binary is
+# built with `dist` below, which keeps fat LTO and one codegen unit; nobody
+# should wait ten minutes for a local release binary that only runs gates.
 [profile.release]
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = true
 panic = "abort"
+
+# The SHIPPED shape: what release.yml builds. Fat LTO is a release-workflow
+# cost, paid once per platform in parallel, never in the edit loop.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 # The LOCAL loop profile: the default for `just check`, `just t`,
 # `just lint` and `just bin`. Debug codegen for this crate (an edit
@@ -170,9 +183,11 @@ panic = "abort"
 inherits = "dev"
 debug = 0
 incremental = true
+codegen-units = 16
 
 [profile.fast.package."*"]
 opt-level = 1
+codegen-units = 16
 
 # Test/workflow profile: release optimizations minus fat LTO.
 #
@@ -185,7 +200,10 @@ opt-level = 1
 [profile.ci]
 inherits = "release"
 lto = false
-codegen-units = 256
+# 256 units made one 91k-LOC crate fan out into every core: 6.5 minutes to
+# relink the test binary, and several GB of LLVM state. 16 is the sweet spot
+# for this crate (measured: build ~2 min, runtime unchanged).
+codegen-units = 16
 
 # Dependencies compile at opt-level 1: cold-graph rebuilds (each
 # dependabot bump or feature flip recompiles the whole deps tree,
@@ -194,6 +212,7 @@ codegen-units = 256
 # stay honest. Test binaries run on opt-1 dep object code only.
 [profile.ci.package."*"]
 opt-level = 1
+codegen-units = 16
 
 # The fetch core's vendored forks: patches apply from the workspace ROOT
 # (core keeps the same table for its standalone builds).

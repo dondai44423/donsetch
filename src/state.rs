@@ -310,12 +310,11 @@ pub(crate) fn disk_session_stamp() -> Option<String> {
     let mut tail = Vec::new();
     file.read_to_end(&mut tail).ok()?;
     let tail = String::from_utf8_lossy(&tail);
-    if let Some(body) = tail.trim_end().strip_suffix('}') {
-        if let Some((_, value)) = body.rsplit_once(",\"session_revision\":")
-            && let Ok(Some(revision)) = serde_json::from_str::<Option<String>>(value)
-        {
-            return Some(format!("session:{revision}"));
-        }
+    if let Some(body) = tail.trim_end().strip_suffix('}')
+        && let Some((_, value)) = body.rsplit_once(",\"session_revision\":")
+        && let Ok(Some(revision)) = serde_json::from_str::<Option<String>>(value)
+    {
+        return Some(format!("session:{revision}"));
     }
     // Noncanonical/legacy files still work; only our canonical hot path is bounded.
     #[derive(Deserialize)]

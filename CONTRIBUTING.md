@@ -7,11 +7,10 @@ Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributi
 ```bash
 git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
-cargo build --release                     # core build (fetch, search, crawl, PDF)
-# For the dev loop use `just bin` (target/fast/donsetch, seconds) and
-# `just bin-ci` when release-profile parity matters: these two lines below
-# compile the release-shaped graph, which is the slowest thing here.
-cargo build --release --features ocr,rerank  # full build (adds OCR + semantic reranking)
+just bin                      # edit-loop binary: target/fast/donsetch (seconds)
+just bin-ci                   # release-shaped binary: target/ci/donsetch (panic=abort)
+cargo build --release         # local release: thin LTO, parallel codegen
+cargo build --profile dist    # the SHIPPED shape (fat LTO); release.yml builds this
 ```
 
 **Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#-install) for platform-specific install commands.
@@ -21,23 +20,34 @@ cargo build --release --features ocr,rerank  # full build (adds OCR + semantic r
 The ladder: climb only as far as the question needs.
 
 ```bash
-just check              # types + cfg on the full feature set   (seconds, warm)
-just t crawl::frontier  # the touched scope, fast profile        (seconds)
-just all                # pre-push net: guard + fmt + check + lockgate + lint
+just check              # types + cfg on the full feature set   ~1 s warm
+just t crawl::frontier  # the touched scope, fast profile       ~6 s warm
+just test               # the default suite                     ~35 s warm
+just all                # pre-push: guard + fmt + check + lockgate + lint + budget-static
 ```
 
-`just check` and `just t` run the **`fast` cargo profile** (debug codegen for
-this crate, deps at opt-level 1, no debuginfo): an edit rebuilds in seconds
-instead of the 8-12 minutes a release-shaped whole-crate recompile costs on a
-machine that is also doing other things. Use `just tci <expr>` or `just bin-ci`
-when the question is release-profile behavior specifically (`panic = "abort"`
-included), and `just heavy` for the tests that measure time and memory (soak,
-corpus, landmarks, live probes).
+`just check` and `just t` run the **`fast` profile** (this crate at opt-level 0,
+deps at opt-level 1, no debuginfo, codegen-units 16). `ci` is the test/gate
+shape (release opts, `panic = "abort"`, no LTO); the heavy suite runs there
+because it measures time and memory. `dist` is what ships (fat LTO, one codegen
+unit) and only the release workflow builds it. A plain `cargo build --release`
+is thin LTO on purpose: a local release binary should not cost ten minutes.
 
-Do **not** make a bare `cargo test` or `cargo build --release` your edit loop:
-those compile another artifact graph, and recompiling it is the slowest thing in
-this repository. CI is the full gate (5 platforms, in parallel); `just all` is
-the only local gate you need before pushing.
+**Tests are budgeted.** The default filter in `.config/nextest.toml` excludes
+the four tests that parse a 501-page PDF, a large scanned PDF, or prove a
+20-second timing ceiling. They still run in `just heavy` and in nightly CI.
+`tests/budget.json` caps the default suite (count, per-suite count, single-test
+time, total CPU, fixture size); CI fails when a change grows past it without a
+deliberate raise. A new test should be cheap and specific: prefer a unit test or
+one integration test for the contract, keep it under ~2 s, and put anything that
+needs a real corpus or a real clock in the heavy set.
+
+Use `just th <name>` to run a heavy test on purpose, `just tci <expr>` for
+release-profile behavior, and `just budget` to see the suite exactly as the
+guard does. Do **not** make a bare `cargo test` or `cargo build --release` your
+edit loop: those compile another artifact graph, and recompiling it is the
+slowest thing in this repository. CI is the full gate (five platforms, in
+parallel); `just all` is the only local gate you need before pushing.
 
 A Windows-shaped failure fails the gate: the Windows lane runs the core suite on
 master pushes, tags and the nightly, while PR cycles keep a compile-only check
@@ -49,7 +59,15 @@ installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
 profiles, feature sets and branches become cache hits, and it wraps the C/C++
 compilers too, which is where BoringSSL's build cost actually lives.
 
-The recipes go through `scripts/budget.sh`, which pins the whole build tree to a quarter of the cores and passes the job cap into nested build systems (cmake, make, nasm). Prefer them on a workstation you are also using: a `-j` flag alone does not bound a Rust build, because rustc spawns its own codegen threads and some `-sys` crates spawn their own `make -j$(nproc)`. `BG_JOBS=<n>` lifts the job cap when the box is otherwise idle.
+The recipes go through `scripts/budget.sh`, which pins the whole build tree to
+half the cores and passes the job cap into nested build systems (cmake, make,
+nasm). It also sizes the job count from `MemAvailable` right now (~700 MB per
+rustc at codegen-units 16, 1 GB reserved): three to four jobs with a browser
+open, eight on an idle box. `BG_JOBS=<n>` overrides it.
+
+Releasing is one command: `just ship <version>` gates on master CI, bumps the
+three manifests, tags, watches the five-platform build, publishes the draft, and
+watches npm. A red build stops before anything is published.
 
 ### Verifying Windows compilation from Linux
 
