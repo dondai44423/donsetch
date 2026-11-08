@@ -3,7 +3,7 @@
 # DonSeTch
 
 **The web, for AI agents.**
-**v5 beta:** a new fetch engine. No browser in the fetch path: a wall is answered by the right client identity, the site's own challenge program run in-process, or the site's own public interface. [What changed](CHANGELOG.md).
+**v5:** a new fetch engine. No browser in the fetch path: a wall is answered by the right client identity, the site's own challenge program run in-process, or the site's own public interface. [What changed](CHANGELOG.md).
 <div align="center">
 <a href="https://trendshift.io/repositories/163922?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-163922" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/163922/daily?language=Rust" alt="dondai44423%2Fdonsetch | Trendshift" width="250" height="55"/></a>
 </div>
@@ -754,7 +754,7 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | Surprise | Why |
 |---|---|
 | First build takes a few minutes | BoringSSL compiles from source and V8 is downloaded and linked, cached after. Go is a build dependency too: BoringSSL's build system is Go-based. |
-| v5 is a beta | The fetch engine is new. Its suite runs on Linux and on Windows (the core suite runs there on every push); the macOS builds compile from the same code and are verified on real machines at release. Report anything that regressed from v4. |
+| v5 is a new engine | Every push runs the full suite on Linux and the core suite on Windows; macOS arm64 and x64 run the smoke set, and linux-arm64 runs the fetch engine's suite and the smoke set. Report anything that regressed from v4. |
 | A login wall is an answer | `web_fetch` carries no session in v5: a signed-in page returns `wall.auth`. |
 | OCR and rerank are not in the default build | ONNX Runtime is heavy and optional: `--features ocr,rerank`. Prebuilts ship them on linux-x64, macOS-arm64, macOS-x64 and Windows-x64. |
 | First OCR/rerank use downloads models | ~24MB reranker, ~37MB OCR, cached forever. |
