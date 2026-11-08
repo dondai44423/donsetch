@@ -69,8 +69,8 @@ feat := "--features ocr,rerank,http"
 # command in the repo prunes stale incremental variants on the way through
 # scripts/budget.sh — that last one is what stops the growth, because a
 # session that builds and never pushes never reaches the other three.
-# Ceiling 45G; the floor under it is the warm artifact set (fast ~15G,
-# ci ~4G, core ~4G, sccache <=10G, a 3-day incremental window ~8G).
+# Ceiling 55G; the floor under it is the warm artifact set (fast ~22G,
+# ci ~7G, core ~7.6G, sccache <=10G, a 3-day incremental window ~8G).
 # How the bloat regrew, and why the previous fixed-profile-list guard went
 # green while doing nothing, is in the script header.
 guard:

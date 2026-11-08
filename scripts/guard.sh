@@ -36,10 +36,11 @@
 # Never touched: fast/ci deps + build (the warm loop ladder), the sccache
 # cache (budget.sh self-caps it at 10G), wave receipts.
 #
-# Ceiling 45000M. The floor under it is the warm artifact set measured after
-# the 2026-10-30 reclaim: fast ~15G, ci ~4G, core/target ~4G, sccache
-# <=10G (its own cap), a 3-day incremental window ~8G. ~41G is what a healthy
-# tree costs, so a crossing means rot rather than the ladder.
+# Ceiling 55000M. The floor under it is the warm artifact set measured after
+# the 2026-11-08 profile split: fast ~22G (deps at opt-level 1), ci ~7G,
+# core/target ~7.6G, sccache <=10G (its own cap), a 3-day incremental window
+# ~8G. ~45G is what a healthy tree costs; 55G leaves room for one `dist`
+# release-verification tree (~10G). A crossing means rot, not the ladder.
 #
 # Callers:
 #   scripts/budget.sh (every build/test/fuzz)       --prune-stale
@@ -50,7 +51,7 @@
 set -eu
 cd "$(git rev-parse --show-toplevel)"
 
-cap=${GUARD_CAP_MB:-45000}
+cap=${GUARD_CAP_MB:-55000}
 keep_days=${GUARD_KEEP_DAYS:-3}
 mode=ceiling
 case "${1:-}" in
