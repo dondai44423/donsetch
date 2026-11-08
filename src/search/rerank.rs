@@ -690,6 +690,7 @@ mod inner {
                 sources: vec![],
                 score: 1.0,
                 published: None,
+                families: 0,
             }];
             rerank("test", &mut results);
             assert!((results[0].score - 1.0).abs() < 1e-6);
@@ -705,6 +706,7 @@ mod inner {
                     sources: vec![],
                     score: 0.5,
                     published: None,
+                    families: 0,
                 },
                 Merged {
                     title: "B".into(),
@@ -713,6 +715,7 @@ mod inner {
                     sources: vec![],
                     score: 0.3,
                     published: None,
+                    families: 0,
                 },
             ];
             rerank("   ", &mut results);
@@ -777,6 +780,7 @@ mod inner {
                 sources: vec![],
                 score,
                 published: None,
+                families: 0,
             }
         }
 

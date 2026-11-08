@@ -47,6 +47,20 @@ pub(super) struct EngineContext<'a> {
     pub google: &'a engines::google_wml::ProfileSelector,
 }
 
+/// The pacing gate a request is admitted through. A `site:`-scoped query is a
+/// different question from the plain one (it is the official-docs recall that
+/// rides beside every search that names a technology), so it has its own slot:
+/// behind the plain query's it could never start inside a one-second budget,
+/// because the direct lane spaces one engine's requests 2.5 s or more apart.
+/// Each stream is still paced against its own previous request.
+fn pace_key(engine: &str, query: &str) -> String {
+    if super::query::compile(query).site.is_some() {
+        format!("{engine}#site")
+    } else {
+        engine.to_string()
+    }
+}
+
 /// One admission and HTTP attempt under a single deadline, including pacing.
 pub(super) async fn engine_task_with_budget(
     engine: String,
@@ -65,7 +79,7 @@ pub(super) async fn engine_task_with_budget(
     let mut label = engine.clone();
     let deadline = tokio::time::Instant::now() + budget;
     let started = Instant::now();
-    if tokio::time::timeout_at(deadline, pool.pace(&engine, &egress_id))
+    if tokio::time::timeout_at(deadline, pool.pace(&pace_key(&engine, &query), &egress_id))
         .await
         .is_err()
     {
@@ -377,6 +391,20 @@ fn engine_fetch_status(e: &FetchError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scoped_query_is_paced_apart_from_the_plain_one() {
+        assert_eq!(pace_key("yahoo", "git rebase squash"), "yahoo");
+        assert_eq!(
+            pace_key("yahoo", "git rebase squash site:git-scm.com"),
+            "yahoo#site"
+        );
+        // Another engine's scoped stream is a different gate again.
+        assert_ne!(
+            pace_key("yahoo", "x site:a.com"),
+            pace_key("bing", "x site:a.com")
+        );
+    }
 
     #[test]
     fn a_rule_denial_is_not_a_network_failure() {

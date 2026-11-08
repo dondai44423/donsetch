@@ -435,6 +435,7 @@ mod tests {
             sources: Vec::new(),
             score: 1.0,
             published: None,
+            families: 0,
         }
     }
 

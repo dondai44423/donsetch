@@ -5,12 +5,17 @@
 use std::collections::HashMap;
 
 use super::engines::Hit;
-use super::intent::{self, Intent};
+use super::families::Families;
+use super::intent::Intent;
 
+/// How fast a result's mass falls with rank. Measured insensitive: k from 5 to
+/// 300 moved hit@1 by less than one query on the 40-query set, so the standard
+/// value stays.
 const RRF_K: f64 = 60.0;
+/// Each independent family beyond the first that returns a URL lifts it by this
+/// fraction. Agreement between different indexes is the one signal here that
+/// text matching cannot fake.
 const CONSENSUS_MULT: f64 = 0.5;
-const BM25_WEIGHT: f64 = 0.3;
-const PRIOR_WEIGHT: f64 = 0.15;
 const MAX_PER_DOMAIN: usize = 2;
 /// Vertical-only hits rank below web-engine consensus:
 /// a GitHub/HN/wiki hit with no engine corroboration is
@@ -35,6 +40,10 @@ pub struct Merged {
     pub score: f64,
     /// News vertical fills this; freshness ranking reads it.
     pub published: Option<String>,
+    /// Independent families that returned this URL, as measured when it was
+    /// ranked (`families.rs`). Cached results keep the count they were given.
+    #[serde(default)]
+    pub families: usize,
 }
 
 /// Normalize a URL for consensus matching: scheme-less,
@@ -103,60 +112,6 @@ pub fn host_of(raw: &str) -> String {
         .to_string()
 }
 
-/// BM25-lite relevance of (title, snippet) against query.
-/// IDF is estimated from the result set itself.
-fn relevance(query: &str, docs: &[(String, String)]) -> Vec<f64> {
-    let terms: Vec<String> = query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() > 2)
-        .map(String::from)
-        .collect();
-    if terms.is_empty() {
-        return vec![0.0; docs.len()];
-    }
-    let n = docs.len() as f64;
-    // document frequency per term
-    let mut df: HashMap<&String, usize> = HashMap::new();
-    let tokenized: Vec<Vec<String>> = docs
-        .iter()
-        .map(|(t, s)| {
-            format!("{t} {s}")
-                .to_lowercase()
-                .split(|c: char| !c.is_alphanumeric())
-                .map(String::from)
-                .collect()
-        })
-        .collect();
-    for toks in &tokenized {
-        for term in &terms {
-            if toks.iter().any(|t| t == term) {
-                *df.entry(term).or_insert(0) += 1;
-            }
-        }
-    }
-    let avg_len = tokenized.iter().map(|t| t.len()).sum::<usize>() as f64 / n.max(1.0);
-    const K1: f64 = 1.2;
-    const B: f64 = 0.75;
-    tokenized
-        .iter()
-        .map(|toks| {
-            let mut score = 0.0;
-            for term in &terms {
-                let tf = toks.iter().filter(|t| *t == term).count() as f64;
-                if tf == 0.0 {
-                    continue;
-                }
-                let dfv = *df.get(term).unwrap_or(&0) as f64;
-                let idf = ((n - dfv + 0.5) / (dfv + 0.5) + 1.0).ln();
-                let len_norm = 1.0 - B + B * (toks.len() as f64 / avg_len.max(1.0));
-                score += idf * (tf * (K1 + 1.0)) / (tf + K1 * len_norm);
-            }
-            score
-        })
-        .collect()
-}
-
 /// Collapse every whitespace run : newlines included : into a
 /// single space. HTML-scraped engines already do this in
 /// `engines::text`, but JSON-sourced hits arrive raw: MDN
@@ -196,9 +151,18 @@ pub fn merge(
     query: &str,
     intent: Intent,
     trust: &HashMap<String, f64>,
+    families: &Families,
     max_results: usize,
 ) -> Vec<Merged> {
-    merge_inner(per_engine, query, intent, trust, max_results, true)
+    merge_inner(
+        per_engine,
+        query,
+        intent,
+        trust,
+        families,
+        max_results,
+        true,
+    )
 }
 
 /// Complete consensus/lexical ranking when the semantic worker exceeds the caller budget.
@@ -208,32 +172,66 @@ pub(crate) fn merge_lexical(
     query: &str,
     intent: Intent,
     trust: &HashMap<String, f64>,
+    families: &Families,
     max_results: usize,
 ) -> Vec<Merged> {
-    merge_inner(per_engine, query, intent, trust, max_results, false)
+    merge_inner(
+        per_engine,
+        query,
+        intent,
+        trust,
+        families,
+        max_results,
+        false,
+    )
 }
 
+/// Fusion over measured independence, nothing else.
+///
+/// A URL's score is the best rank-decayed vote of each independent family that
+/// returned it, lifted a little for every extra family. There is no text
+/// scoring of titles and snippets and no domain table. Measured on a 40-query
+/// gold set with the sources' own results held fixed, BM25 over titles, a domain
+/// prior and an authority multiplier took hit@1 from 0.62 down to 0.17: the
+/// additive terms were ten to twenty times the size of the rank signal and
+/// promoted exactly the pages a search engine had already learned to bury (SEO
+/// restatements of the query). What survives is a bounded coverage penalty for
+/// wrong versions and mangled compound terms, and a freshness lift for dated
+/// news items.
 fn merge_inner(
     per_engine: &[(String, Vec<Hit>)],
     query: &str,
     intent: Intent,
     trust: &HashMap<String, f64>,
+    families: &Families,
     max_results: usize,
     semantic: bool,
 ) -> Vec<Merged> {
-    // Group by normalized URL. RRF mass is counted
-    // PER INDEX FAMILY, not per engine: brave/bing/ddg
-    // share the Bing tail index, so a farm ranked by all
-    // three is ONE opinion : the family dedup already
-    // applied to the consensus bonus now applies to the
-    // mass itself. Otherwise correlated engines let
-    // keyword-stuffed farms out-mass independent sources
-    // (measured in bench round 3: 3×Bing-family farms
-    // beat full-weight Wikipedia on conceptual queries).
+    // Group by normalized URL. RRF mass is counted PER MEASURED FAMILY, not per
+    // engine: sources that return the same results are one opinion, so a farm
+    // ranked by all of them out-masses nobody (bench round 3: three engines on
+    // one index beat full-weight Wikipedia on conceptual queries). Which sources
+    // are one family is learned from their overlap (`families.rs`), never named.
     let mut groups: HashMap<String, Merged> = HashMap::new();
+    // First-seen order of the URL keys. A `HashMap` iterates in a per-process
+    // random order, so any two results with an equal score came out in an
+    // arbitrary order: the same candidates, ranked differently on each run.
+    let mut order: Vec<String> = Vec::new();
     let mut family_best: HashMap<(String, String), f64> = HashMap::new();
     let conceptual = super::intent::is_conceptual(query);
-    for (engine, hits) in per_engine {
+    // Sources are read in a fixed order (trust, then name), not the order they
+    // happened to answer in: a tie then resolves to the same URL on every run.
+    let mut sources: Vec<&(String, Vec<Hit>)> = per_engine.iter().collect();
+    sources.sort_by(|a, b| {
+        let t = |e: &str| {
+            trust
+                .get(super::egress::health_key(e))
+                .copied()
+                .unwrap_or(1.0)
+        };
+        t(&b.0).total_cmp(&t(&a.0)).then_with(|| a.0.cmp(&b.0))
+    });
+    for (engine, hits) in sources {
         // Learned trust is keyed by the engine's HEALTH key: the
         // ddg_html retry lane books its health under "ddg", so a
         // lookup by the lane label silently fell back to default
@@ -255,11 +253,7 @@ fn merge_inner(
         // Verticals are independent sources : each is its
         // OWN family (deduping arxiv against scholar or
         // github against hn would destroy their mass).
-        let family = if is_vertical(engine) {
-            format!("vertical:{engine}")
-        } else {
-            engine_family(engine).to_string()
-        };
+        let family = family_name(families, engine);
         for hit in hits {
             // Normalized once per hit: every comparison below is
             // length-based, so mixing raw and collapsed strings
@@ -276,6 +270,9 @@ fn merge_inner(
                 .entry((key.clone(), family.clone()))
                 .or_insert(0.0);
             *best = best.max(contribution);
+            if !groups.contains_key(&key) {
+                order.push(key.clone());
+            }
             let entry = groups.entry(key).or_insert_with(|| Merged {
                 title: hit_title.clone(),
                 url: hit.url.clone(),
@@ -283,6 +280,7 @@ fn merge_inner(
                 sources: Vec::new(),
                 score: 0.0,
                 published: None,
+                families: 0,
             });
             // Keep the longest snippet (most informative), skipping redirect
             // stubs. Both sides are already bounded (MAX_SNIPPET_CHARS), so no
@@ -310,40 +308,19 @@ fn merge_inner(
         }
     }
 
-    let mut results: Vec<Merged> = groups.into_values().collect();
+    let mut results: Vec<Merged> = order.iter().filter_map(|key| groups.remove(key)).collect();
 
-    // Consensus multiplier: engines are independent-ish
-    // (Brave/Mojeek truly independent; Bing/DDG share an
-    // index : count shared-index sources at half weight).
+    // Consensus multiplier: one step for every independent family beyond the
+    // first that returned the URL.
     for r in &mut results {
-        let engines: Vec<&str> = r.sources.iter().map(|(e, _)| e.as_str()).collect();
-        let mut independent: Vec<&str> = Vec::new();
-        for e in &engines {
-            let fam = engine_family(e);
-            if !independent.iter().any(|x| engine_family(x) == fam) {
-                independent.push(e);
-            }
-        }
-        let consensus = independent.len() as f64;
-        r.score *= 1.0 + CONSENSUS_MULT * (consensus - 1.0).max(0.0);
-    }
-
-    // BM25 relevance bonus.
-    let docs: Vec<(String, String)> = results
-        .iter()
-        .map(|r| (r.title.clone(), r.snippet.clone()))
-        .collect();
-    let rel = relevance(query, &docs);
-    let max_rel = rel.iter().cloned().fold(0.0f64, f64::max).max(1e-9);
-    for (r, rv) in results.iter_mut().zip(rel) {
-        r.score += BM25_WEIGHT * (rv / max_rel);
-    }
-
-    // Domain prior bonus.
-    for r in &mut results {
-        let host = host_of(&r.url);
-        let prior = intent::domain_prior(intent, &host, query);
-        r.score += PRIOR_WEIGHT * prior;
+        let independent = r
+            .sources
+            .iter()
+            .map(|(e, _)| family_name(families, e))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        r.families = independent;
+        r.score *= 1.0 + CONSENSUS_MULT * (independent as f64 - 1.0).max(0.0);
     }
 
     // Vertical-only penalty: a result from ONLY a vertical
@@ -388,13 +365,9 @@ fn merge_inner(
     // how similar the cross-encoder thinks they are.
     crate::search::coverage::penalize(query, &mut results);
 
-    // Authority decisiveness: the post-rerank top-placement
-    // layer. Recall puts the right result IN the list; this
-    // puts it FIRST : query-aware official domains, title
-    // entity coverage, news freshness. Multipliers act on the
-    // final blended score (post min-max normalization), so
-    // they self-limit: near-zero semantic misses stay down.
-    crate::search::authority::apply(query, intent, &mut results);
+    // Dated news items rank fresh ones up and stale ones down; nothing else
+    // about a result's host or title moves it.
+    crate::search::authority::freshen(intent, &mut results);
 
     results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
@@ -437,8 +410,6 @@ fn merge_inner(
     diverse
 }
 
-// Index family: engines sharing an index count once for
-// consensus (a Bing hit + DDG hit = one opinion, not two).
 /// Title key for the syndication dedup: lowercase with collapsed
 /// whitespace, PUNCTUATION PRESERVED. The previous key stripped every
 /// non-alphanumeric char, which collapsed genuinely different titles
@@ -457,28 +428,21 @@ fn syndication_title_key(title: &str) -> String {
         .join(" ")
 }
 
-pub(crate) fn engine_family(engine: &str) -> &str {
-    match engine {
-        "bing" | "ddg" | "ddg_lite" | "ddg_html" | "yahoo" => "bing",
-        "brave" => "brave",
-        "mojeek" => "mojeek",
-        "google" => "google",
-        other => other, // verticals are their own family
+/// The family a source's votes are counted under. First-party interfaces are
+/// each their own: deduping arXiv against Semantic Scholar, or GitHub against
+/// Hacker News, would erase the independence that makes them worth asking.
+pub(crate) fn family_name(families: &Families, engine: &str) -> String {
+    if is_vertical(engine) {
+        format!("vertical:{engine}")
+    } else {
+        families.family_of(super::egress::health_key(engine))
     }
 }
 
-/// Independent index families behind one merged result: the
-/// consensus signal the ranking itself is built on, exposed so
-/// the model surface can carry agreement evidence cheaply.
+/// Independent families behind one merged result: the agreement evidence the
+/// ranking itself uses, exposed so the model surface can carry it cheaply.
 pub(crate) fn family_count(r: &Merged) -> usize {
-    let mut families: Vec<&str> = Vec::new();
-    for (e, _) in &r.sources {
-        let f = engine_family(e);
-        if !families.contains(&f) {
-            families.push(f);
-        }
-    }
-    families.len()
+    r.families.max(1)
 }
 
 /// Host category for fetch routing; it does not verify a page's claims.
@@ -548,7 +512,7 @@ mod tests {
         h.title = "t".repeat(20_000);
         let per = vec![("serper".to_string(), vec![h])];
         let trust = HashMap::new();
-        let out = merge(&per, "q", Intent::Web, &trust, 10);
+        let out = merge(&per, "q", Intent::Web, &trust, &Families::default(), 10);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].title.chars().count(), MAX_TITLE_CHARS);
     }
@@ -563,7 +527,14 @@ mod tests {
             ("github".to_string(), vec![hit("https://b.com/y", 0)]),
         ];
         let trust = std::collections::HashMap::new();
-        let out = merge(&per, "rust async runtime", Intent::Code, &trust, 10);
+        let out = merge(
+            &per,
+            "rust async runtime",
+            Intent::Code,
+            &trust,
+            &Families::default(),
+            10,
+        );
         assert_eq!(out[0].url, "https://a.com/x", "consensus must win");
     }
 
@@ -600,7 +571,14 @@ mod tests {
             ("mojeek".to_string(), vec![csharp]),
         ];
         let trust = std::collections::HashMap::new();
-        let out = merge(&per, "tutorial", Intent::Code, &trust, 10);
+        let out = merge(
+            &per,
+            "tutorial",
+            Intent::Code,
+            &trust,
+            &Families::default(),
+            10,
+        );
         let urls: Vec<&str> = out.iter().map(|m| m.url.as_str()).collect();
         assert!(
             urls.contains(&"https://cppreference.com/cpp")
@@ -636,6 +614,7 @@ mod tests {
             "rust ownership borrow checker",
             Intent::Code,
             &trust,
+            &Families::default(),
             10,
         );
         assert_eq!(
@@ -656,7 +635,14 @@ mod tests {
         hits.push(hit("https://third.com/z", 9));
         let per = vec![("brave".to_string(), hits)];
         let trust = std::collections::HashMap::new();
-        let out = merge(&per, "rust async runtime", Intent::Web, &trust, 10);
+        let out = merge(
+            &per,
+            "rust async runtime",
+            Intent::Web,
+            &trust,
+            &Families::default(),
+            10,
+        );
         // third.com must appear before the 3rd same.com hit.
         let pos_third = out
             .iter()
@@ -720,7 +706,14 @@ mod tests {
     #[test]
     fn empty_merge_is_safe() {
         let trust = std::collections::HashMap::new();
-        let out = merge(&[], "anything", Intent::Web, &trust, 10);
+        let out = merge(
+            &[],
+            "anything",
+            Intent::Web,
+            &trust,
+            &Families::default(),
+            10,
+        );
         assert!(out.is_empty());
     }
 
@@ -734,7 +727,14 @@ mod tests {
         a.snippet = huge.clone();
         let per = vec![("bing".to_string(), vec![a])];
         let trust = std::collections::HashMap::new();
-        let out = merge(&per, "example", Intent::Web, &trust, 10);
+        let out = merge(
+            &per,
+            "example",
+            Intent::Web,
+            &trust,
+            &Families::default(),
+            10,
+        );
         assert_eq!(out.len(), 1);
         assert!(
             out[0].snippet.chars().count() <= MAX_SNIPPET_CHARS,
@@ -754,7 +754,14 @@ mod tests {
         raw.snippet = "Starts the process\nof fetching a resource,\treturning a promise.".into();
         let per = vec![("mdn".to_string(), vec![raw])];
         let trust = std::collections::HashMap::new();
-        let out = merge(&per, "fetch api", Intent::Web, &trust, 10);
+        let out = merge(
+            &per,
+            "fetch api",
+            Intent::Web,
+            &trust,
+            &Families::default(),
+            10,
+        );
         assert_eq!(out[0].title, "fetch() global function");
         assert_eq!(
             out[0].snippet,
@@ -776,7 +783,7 @@ mod tests {
             ("ddg".to_string(), vec![real]),
         ];
         let trust = std::collections::HashMap::new();
-        let out = merge(&per, "x", Intent::Web, &trust, 10);
+        let out = merge(&per, "x", Intent::Web, &trust, &Families::default(), 10);
         assert_eq!(
             out[0].snippet,
             "a genuinely longer and more informative snippet"
@@ -794,7 +801,7 @@ mod tests {
             ("ddg".to_string(), vec![clean]),
         ];
         let trust = std::collections::HashMap::new();
-        let out = merge(&per, "rust", Intent::Web, &trust, 10);
+        let out = merge(&per, "rust", Intent::Web, &trust, &Families::default(), 10);
         assert_eq!(out[0].title, "Rust - Wikipedia");
     }
 }

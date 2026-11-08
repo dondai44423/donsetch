@@ -341,7 +341,7 @@ fn quality_disk_version() -> u32 {
     1
 }
 
-/// Strip `www.` so quality keys match `rank::host_of` + domain_prior.
+/// Strip `www.` so quality keys match `rank::host_of`.
 pub(crate) fn quality_host_key(host: &str) -> String {
     host.trim_start_matches("www.")
         .trim_end_matches('.')
@@ -431,9 +431,8 @@ pub(crate) fn observe_quality(map: &mut QualityMap, host: &str, ok: bool) {
     }
 }
 
-/// B3 rank nudge. Applied with static domain_prior, before the
-/// vertical-only penalty so CE can still rescue semantically-
-/// relevant results. Kill switch: `search.quality_prior=false`.
+/// B3 rank nudge: a small multiplier from how often a host's pages read
+/// cleanly, applied to the merged list. Kill switch: `search.quality_prior=false`.
 pub(crate) fn apply_quality_prior(results: &mut [Merged], quality: &QualityMap) {
     if !crate::config::cfg().search.quality_prior {
         return;
@@ -636,6 +635,7 @@ mod tests {
             sources: vec![("brave".into(), 1)],
             score,
             published: None,
+            families: 0,
         }
     }
 

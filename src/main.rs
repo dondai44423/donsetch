@@ -164,6 +164,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "rollback",
     "version",
     "config",
+    "search-bench",
     "help",
 ];
 
@@ -251,6 +252,12 @@ async fn run() {
         "fetch" | "search" | "crawl" | "screenshot" => {
             let code = cli::tool::run(cmd, &args[2..]).await;
             std::process::exit(code as i32);
+        }
+
+        // ── Developer: the search gold-set bench (live web, paced) ──
+        "search-bench" => {
+            let code = donsetch::search::bench::run(&args[2..]).await;
+            std::process::exit(code);
         }
 
         // ── Discovery ──

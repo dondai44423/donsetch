@@ -1,0 +1,758 @@
+{
+ "version": 1,
+ "about": "Gold set for donsetch search-bench. `gold` rows are the tuning set; `held` rows are validation only and are never tuned against. Gold regexes match a result URL. Add a row for every real miss found.",
+ "queries": [
+  {
+   "id": "c1",
+   "shape": "code",
+   "set": "gold",
+   "query": "rust tokio spawn_blocking",
+   "gold": [
+    "docs\\.rs/tokio/[^ ]*spawn_blocking"
+   ]
+  },
+  {
+   "id": "c2",
+   "shape": "code",
+   "set": "gold",
+   "query": "python dataclass frozen",
+   "gold": [
+    "docs\\.python\\.org/3/library/dataclasses"
+   ]
+  },
+  {
+   "id": "c3",
+   "shape": "code",
+   "set": "gold",
+   "query": "typescript satisfies operator",
+   "gold": [
+    "typescriptlang\\.org/[^ ]*4-9",
+    "typescriptlang\\.org/[^ ]*satisfies"
+   ]
+  },
+  {
+   "id": "c4",
+   "shape": "code",
+   "set": "gold",
+   "query": "go context package cancel",
+   "gold": [
+    "pkg\\.go\\.dev/context",
+    "go\\.dev/pkg/context"
+   ]
+  },
+  {
+   "id": "c5",
+   "shape": "code",
+   "set": "gold",
+   "query": "postgres vacuum full command",
+   "gold": [
+    "postgresql\\.org/docs/[^ ]*sql-vacuum"
+   ]
+  },
+  {
+   "id": "c6",
+   "shape": "code",
+   "set": "gold",
+   "query": "git rebase interactive squash commits",
+   "gold": [
+    "git-scm\\.com/docs/git-rebase"
+   ]
+  },
+  {
+   "id": "c7",
+   "shape": "code",
+   "set": "gold",
+   "query": "sqlite write-ahead logging wal",
+   "gold": [
+    "sqlite\\.org/wal\\.html",
+    "sqlite\\.org/[^ ]*wal"
+   ]
+  },
+  {
+   "id": "c8",
+   "shape": "code",
+   "set": "gold",
+   "query": "react useeffect cleanup function",
+   "gold": [
+    "react\\.dev/reference/react/useEffect"
+   ]
+  },
+  {
+   "id": "e1",
+   "shape": "entity",
+   "set": "gold",
+   "query": "what is quantum entanglement",
+   "gold": [
+    "wikipedia\\.org/wiki/Quantum_entanglement"
+   ]
+  },
+  {
+   "id": "e2",
+   "shape": "entity",
+   "set": "gold",
+   "query": "who was ada lovelace",
+   "gold": [
+    "wikipedia\\.org/wiki/Ada_Lovelace"
+   ]
+  },
+  {
+   "id": "e3",
+   "shape": "entity",
+   "set": "gold",
+   "query": "capital of australia",
+   "gold": [
+    "wikipedia\\.org/wiki/Canberra",
+    "britannica\\.com/[^ ]*Canberra"
+   ]
+  },
+  {
+   "id": "e4",
+   "shape": "entity",
+   "set": "gold",
+   "query": "population of tokyo",
+   "gold": [
+    "wikipedia\\.org/wiki/Tokyo"
+   ]
+  },
+  {
+   "id": "e5",
+   "shape": "entity",
+   "set": "gold",
+   "query": "what is a monad functional programming",
+   "gold": [
+    "wikipedia\\.org/wiki/Monad_\\(functional_programming\\)"
+   ]
+  },
+  {
+   "id": "e6",
+   "shape": "entity",
+   "set": "gold",
+   "query": "epistemology definition",
+   "gold": [
+    "wikipedia\\.org/wiki/Epistemology"
+   ]
+  },
+  {
+   "id": "e7",
+   "shape": "entity",
+   "set": "gold",
+   "query": "who invented the telephone",
+   "gold": [
+    "wikipedia\\.org/wiki/Alexander_Graham_Bell"
+   ]
+  },
+  {
+   "id": "e8",
+   "shape": "entity",
+   "set": "gold",
+   "query": "speed of light in vacuum",
+   "gold": [
+    "wikipedia\\.org/wiki/Speed_of_light"
+   ]
+  },
+  {
+   "id": "p1",
+   "shape": "paper",
+   "set": "gold",
+   "query": "attention is all you need",
+   "gold": [
+    "arxiv\\.org/abs/1706\\.03762"
+   ]
+  },
+  {
+   "id": "p2",
+   "shape": "paper",
+   "set": "gold",
+   "query": "bert pre-training deep bidirectional transformers",
+   "gold": [
+    "arxiv\\.org/abs/1810\\.04805"
+   ]
+  },
+  {
+   "id": "p3",
+   "shape": "paper",
+   "set": "gold",
+   "query": "deep residual learning image recognition resnet",
+   "gold": [
+    "arxiv\\.org/abs/1512\\.03385"
+   ]
+  },
+  {
+   "id": "p4",
+   "shape": "paper",
+   "set": "gold",
+   "query": "scaling laws for neural language models",
+   "gold": [
+    "arxiv\\.org/abs/2001\\.08361"
+   ]
+  },
+  {
+   "id": "p5",
+   "shape": "paper",
+   "set": "gold",
+   "query": "lora low-rank adaptation large language models",
+   "gold": [
+    "arxiv\\.org/abs/2106\\.09685"
+   ]
+  },
+  {
+   "id": "n1",
+   "shape": "news",
+   "set": "gold",
+   "query": "nobel prize in physics 2026 winner",
+   "gold": [
+    "nobelprize\\.org",
+    "indianexpress\\.com/[^ ]*nobel",
+    "aps\\.org/[^ ]*nobel"
+   ]
+  },
+  {
+   "id": "n2",
+   "shape": "news",
+   "set": "gold",
+   "query": "rust 1.90 release announcement",
+   "gold": [
+    "blog\\.rust-lang\\.org/[^ ]*1\\.90",
+    "releases\\.rust-lang\\.org"
+   ]
+  },
+  {
+   "id": "n3",
+   "shape": "news",
+   "set": "gold",
+   "query": "federal reserve interest rate decision november 2026",
+   "gold": [
+    "federalreserve\\.gov/newsevents/pressreleases"
+   ]
+  },
+  {
+   "id": "n4",
+   "shape": "news",
+   "set": "gold",
+   "query": "openai gpt release announcement",
+   "gold": [
+    "openai\\.com/[^ ]*(index|news|gpt)"
+   ]
+  },
+  {
+   "id": "n5",
+   "shape": "news",
+   "set": "gold",
+   "query": "apple q4 2026 earnings results",
+   "gold": [
+    "apple\\.com/[^ ]*earnings",
+    "investor\\.apple\\.com"
+   ]
+  },
+  {
+   "id": "b1",
+   "shape": "web",
+   "set": "gold",
+   "query": "best mechanical keyboard for programming",
+   "gold": [
+    "rtings\\.com/keyboard",
+    "keychron\\.com"
+   ]
+  },
+  {
+   "id": "b2",
+   "shape": "web",
+   "set": "gold",
+   "query": "best noise cancelling headphones review",
+   "gold": [
+    "rtings\\.com/headphones"
+   ]
+  },
+  {
+   "id": "b3",
+   "shape": "web",
+   "set": "gold",
+   "query": "sony wh-1000xm5 specifications",
+   "gold": [
+    "sony\\.com/[^ ]*wh-1000xm5",
+    "sony\\.co\\.uk/[^ ]*wh-1000xm5"
+   ]
+  },
+  {
+   "id": "b4",
+   "shape": "web",
+   "set": "gold",
+   "query": "thinkpad x1 carbon gen 13 specifications",
+   "gold": [
+    "lenovo\\.com/[^ ]*x1-carbon",
+    "psref\\.lenovo\\.com"
+   ]
+  },
+  {
+   "id": "b5",
+   "shape": "web",
+   "set": "gold",
+   "query": "keychron q1 pro review",
+   "gold": [
+    "keychron\\.com",
+    "rtings\\.com/keyboard"
+   ]
+  },
+  {
+   "id": "l1",
+   "shape": "code",
+   "set": "gold",
+   "query": "failed to run custom build command for libz-sys",
+   "gold": [
+    "github\\.com/rust-lang/libz-sys",
+    "stackoverflow\\.com/questions/[^ ]*libz"
+   ]
+  },
+  {
+   "id": "l2",
+   "shape": "code",
+   "set": "gold",
+   "query": "donsetch mcp server",
+   "gold": [
+    "github\\.com/dondai44423/donsetch",
+    "npmjs\\.com/package/donsetch"
+   ]
+  },
+  {
+   "id": "l3",
+   "shape": "web",
+   "set": "gold",
+   "query": "how to replace a bicycle tire",
+   "gold": [
+    "wikihow\\.com/[^ ]*(tire|tyre)",
+    "sheldonbrown\\.com/[^ ]*tire"
+   ]
+  },
+  {
+   "id": "l4",
+   "shape": "code",
+   "set": "gold",
+   "query": "docker compose depends_on condition service_healthy",
+   "gold": [
+    "docs\\.docker\\.com/[^ ]*depends_on",
+    "docs\\.docker\\.com/[^ ]*compose-file"
+   ]
+  },
+  {
+   "id": "l5",
+   "shape": "code",
+   "set": "gold",
+   "query": "nginx proxy_pass trailing slash difference",
+   "gold": [
+    "nginx\\.org/[^ ]*proxy_pass",
+    "stackoverflow\\.com/questions/[^ ]*proxy_pass"
+   ]
+  },
+  {
+   "id": "d1",
+   "shape": "code",
+   "set": "gold",
+   "query": "tokio select macro documentation",
+   "gold": [
+    "docs\\.rs/tokio/[^ ]*macro\\.select"
+   ]
+  },
+  {
+   "id": "d2",
+   "shape": "code",
+   "set": "gold",
+   "query": "pandas read_csv dtype parameter",
+   "gold": [
+    "pandas\\.pydata\\.org/[^ ]*read_csv"
+   ]
+  },
+  {
+   "id": "d3",
+   "shape": "code",
+   "set": "gold",
+   "query": "kubernetes liveness probe configuration",
+   "gold": [
+    "kubernetes\\.io/docs/[^ ]*liveness"
+   ]
+  },
+  {
+   "id": "d4",
+   "shape": "code",
+   "set": "gold",
+   "query": "mdn array reduce",
+   "gold": [
+    "developer\\.mozilla\\.org/[^ ]*Array/reduce"
+   ]
+  },
+  {
+   "id": "h-c1",
+   "shape": "code",
+   "set": "held",
+   "query": "python asyncio gather return_exceptions",
+   "gold": [
+    "docs\\.python\\.org/3/library/asyncio-task"
+   ]
+  },
+  {
+   "id": "h-c2",
+   "shape": "code",
+   "set": "held",
+   "query": "rust serde derive rename field",
+   "gold": [
+    "serde\\.rs/field-attrs",
+    "serde\\.rs/attr-rename"
+   ]
+  },
+  {
+   "id": "h-c3",
+   "shape": "code",
+   "set": "held",
+   "query": "javascript promise allsettled",
+   "gold": [
+    "developer\\.mozilla\\.org/[^ ]*Promise/allSettled"
+   ]
+  },
+  {
+   "id": "h-c4",
+   "shape": "code",
+   "set": "held",
+   "query": "css grid template areas",
+   "gold": [
+    "developer\\.mozilla\\.org/[^ ]*grid-template-areas",
+    "css-tricks\\.com/[^ ]*grid-template-areas"
+   ]
+  },
+  {
+   "id": "h-c5",
+   "shape": "code",
+   "set": "held",
+   "query": "systemd timer unit oncalendar",
+   "gold": [
+    "freedesktop\\.org/software/systemd/man/[^ ]*systemd\\.timer",
+    "man7\\.org/[^ ]*systemd\\.timer"
+   ]
+  },
+  {
+   "id": "h-c6",
+   "shape": "code",
+   "set": "held",
+   "query": "kubernetes horizontal pod autoscaler",
+   "gold": [
+    "kubernetes\\.io/docs/[^ ]*horizontal-pod-autoscal"
+   ]
+  },
+  {
+   "id": "h-c7",
+   "shape": "code",
+   "set": "held",
+   "query": "postgresql jsonb operators",
+   "gold": [
+    "postgresql\\.org/docs/[^ ]*(functions-json|datatype-json)"
+   ]
+  },
+  {
+   "id": "h-c8",
+   "shape": "code",
+   "set": "held",
+   "query": "docker multi-stage builds",
+   "gold": [
+    "docs\\.docker\\.com/[^ ]*multi-stage"
+   ]
+  },
+  {
+   "id": "h-c9",
+   "shape": "code",
+   "set": "held",
+   "query": "numpy broadcasting rules",
+   "gold": [
+    "numpy\\.org/doc/[^ ]*broadcasting"
+   ]
+  },
+  {
+   "id": "h-c10",
+   "shape": "code",
+   "set": "held",
+   "query": "git stash pop vs apply",
+   "gold": [
+    "git-scm\\.com/docs/git-stash",
+    "stackoverflow\\.com/questions/[^ ]*stash"
+   ]
+  },
+  {
+   "id": "h-c11",
+   "shape": "code",
+   "set": "held",
+   "query": "typescript generics constraints",
+   "gold": [
+    "typescriptlang\\.org/docs/handbook/2/generics"
+   ]
+  },
+  {
+   "id": "h-c12",
+   "shape": "code",
+   "set": "held",
+   "query": "go generics type parameters tutorial",
+   "gold": [
+    "go\\.dev/doc/tutorial/generics",
+    "go\\.dev/blog/intro-generics"
+   ]
+  },
+  {
+   "id": "h-c13",
+   "shape": "code",
+   "set": "held",
+   "query": "java streams collectors groupingby",
+   "gold": [
+    "docs\\.oracle\\.com/[^ ]*Collectors",
+    "baeldung\\.com/[^ ]*grouping"
+   ]
+  },
+  {
+   "id": "h-c14",
+   "shape": "code",
+   "set": "held",
+   "query": "redis sorted set zadd",
+   "gold": [
+    "redis\\.io/[^ ]*zadd",
+    "redis\\.io/docs/[^ ]*sorted-sets"
+   ]
+  },
+  {
+   "id": "h-c15",
+   "shape": "code",
+   "set": "held",
+   "query": "sqlalchemy relationship lazy loading",
+   "gold": [
+    "docs\\.sqlalchemy\\.org/[^ ]*relationship_loading"
+   ]
+  },
+  {
+   "id": "h-c16",
+   "shape": "code",
+   "set": "held",
+   "query": "bash parameter expansion default value",
+   "gold": [
+    "gnu\\.org/software/bash/manual",
+    "stackoverflow\\.com/questions/[^ ]*(default|unset)"
+   ]
+  },
+  {
+   "id": "h-e1",
+   "shape": "entity",
+   "set": "held",
+   "query": "who discovered penicillin",
+   "gold": [
+    "wikipedia\\.org/wiki/(Alexander_Fleming|Penicillin)"
+   ]
+  },
+  {
+   "id": "h-e2",
+   "shape": "entity",
+   "set": "held",
+   "query": "what is photosynthesis",
+   "gold": [
+    "wikipedia\\.org/wiki/Photosynthesis"
+   ]
+  },
+  {
+   "id": "h-e3",
+   "shape": "entity",
+   "set": "held",
+   "query": "height of mount everest",
+   "gold": [
+    "wikipedia\\.org/wiki/Mount_Everest"
+   ]
+  },
+  {
+   "id": "h-e4",
+   "shape": "entity",
+   "set": "held",
+   "query": "what is the theory of relativity",
+   "gold": [
+    "wikipedia\\.org/wiki/Theory_of_relativity"
+   ]
+  },
+  {
+   "id": "h-e5",
+   "shape": "entity",
+   "set": "held",
+   "query": "who wrote pride and prejudice",
+   "gold": [
+    "wikipedia\\.org/wiki/(Jane_Austen|Pride_and_Prejudice)"
+   ]
+  },
+  {
+   "id": "h-e6",
+   "shape": "entity",
+   "set": "held",
+   "query": "when did world war 2 end",
+   "gold": [
+    "wikipedia\\.org/wiki/(World_War_II|End_of_World_War_II)"
+   ]
+  },
+  {
+   "id": "h-e7",
+   "shape": "entity",
+   "set": "held",
+   "query": "what is blockchain",
+   "gold": [
+    "wikipedia\\.org/wiki/Blockchain"
+   ]
+  },
+  {
+   "id": "h-e8",
+   "shape": "entity",
+   "set": "held",
+   "query": "boiling point of water",
+   "gold": [
+    "wikipedia\\.org/wiki/(Boiling_point|Water_\\(properties\\))",
+    "britannica\\.com/[^ ]*boiling-point"
+   ]
+  },
+  {
+   "id": "h-p1",
+   "shape": "paper",
+   "set": "held",
+   "query": "generative adversarial networks goodfellow",
+   "gold": [
+    "arxiv\\.org/abs/1406\\.2661"
+   ]
+  },
+  {
+   "id": "h-p2",
+   "shape": "paper",
+   "set": "held",
+   "query": "adam a method for stochastic optimization",
+   "gold": [
+    "arxiv\\.org/abs/1412\\.6980"
+   ]
+  },
+  {
+   "id": "h-p3",
+   "shape": "paper",
+   "set": "held",
+   "query": "language models are few-shot learners",
+   "gold": [
+    "arxiv\\.org/abs/2005\\.14165"
+   ]
+  },
+  {
+   "id": "h-p4",
+   "shape": "paper",
+   "set": "held",
+   "query": "denoising diffusion probabilistic models",
+   "gold": [
+    "arxiv\\.org/abs/2006\\.11239"
+   ]
+  },
+  {
+   "id": "h-p5",
+   "shape": "paper",
+   "set": "held",
+   "query": "chain-of-thought prompting elicits reasoning in large language models",
+   "gold": [
+    "arxiv\\.org/abs/2201\\.11903"
+   ]
+  },
+  {
+   "id": "h-n1",
+   "shape": "news",
+   "set": "held",
+   "query": "python 3.14 release notes",
+   "gold": [
+    "docs\\.python\\.org/3/whatsnew/3\\.14",
+    "python\\.org/downloads/release/python-314"
+   ]
+  },
+  {
+   "id": "h-n2",
+   "shape": "news",
+   "set": "held",
+   "query": "node.js 24 release announcement",
+   "gold": [
+    "nodejs\\.org/[^ ]*(blog/release/v24|v24)"
+   ]
+  },
+  {
+   "id": "h-n3",
+   "shape": "news",
+   "set": "held",
+   "query": "kubernetes 1.34 release",
+   "gold": [
+    "kubernetes\\.io/blog/[^ ]*(1-34|v1-34)"
+   ]
+  },
+  {
+   "id": "h-n4",
+   "shape": "news",
+   "set": "held",
+   "query": "postgresql 18 released",
+   "gold": [
+    "postgresql\\.org/about/news/postgresql-18"
+   ]
+  },
+  {
+   "id": "h-n5",
+   "shape": "news",
+   "set": "held",
+   "query": "typescript 5.9 announcement",
+   "gold": [
+    "devblogs\\.microsoft\\.com/typescript/announcing-typescript-5-9"
+   ]
+  },
+  {
+   "id": "h-b1",
+   "shape": "web",
+   "set": "held",
+   "query": "iphone 17 pro specifications",
+   "gold": [
+    "apple\\.com/[^ ]*iphone-17-pro[^ ]*specs",
+    "support\\.apple\\.com/[^ ]*iphone-17-pro"
+   ]
+  },
+  {
+   "id": "h-b2",
+   "shape": "web",
+   "set": "held",
+   "query": "steam deck oled specifications",
+   "gold": [
+    "steamdeck\\.com/[^ ]*tech",
+    "store\\.steampowered\\.com/steamdeck"
+   ]
+  },
+  {
+   "id": "h-b3",
+   "shape": "web",
+   "set": "held",
+   "query": "how to change a flat tire",
+   "gold": [
+    "wikihow\\.com/Change-a-Flat-Tire",
+    "nhtsa\\.gov/[^ ]*tire"
+   ]
+  },
+  {
+   "id": "h-b4",
+   "shape": "web",
+   "set": "held",
+   "query": "how to tie a windsor knot",
+   "gold": [
+    "wikihow\\.com/[^ ]*Windsor",
+    "wikipedia\\.org/wiki/Windsor_knot"
+   ]
+  },
+  {
+   "id": "h-b5",
+   "shape": "web",
+   "set": "held",
+   "query": "best monitors for programming rtings",
+   "gold": [
+    "rtings\\.com/monitor"
+   ]
+  },
+  {
+   "id": "h-b6",
+   "shape": "web",
+   "set": "held",
+   "query": "raspberry pi 5 specifications",
+   "gold": [
+    "raspberrypi\\.com/products/raspberry-pi-5",
+    "raspberrypi\\.com/documentation/[^ ]*raspberry-pi-5"
+   ]
+  }
+ ]
+}

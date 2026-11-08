@@ -1,39 +1,22 @@
-//! authority.rs : the decisive top-placement layer.
+//! authority.rs: which hosts own the thing a query names, and how fresh a dated
+//! item is.
 //!
-//! History: v1 ranking had excellent top-5 recall (23/25 in the
-//! 50-case benchmark) but weak top-1/top-3 placement (6/25 top-1
-//! vs hound's 13/25). The recall machinery : cross-engine
-//! consensus, family-deduped RRF, BM25, coverage penalties :
-//! reliably puts the RIGHT result IN the list, but nothing made
-//! a decisive #1 choice: the domain prior was a flat +0.15 on
-//! the wrong scale, and the cross-encoder blend (60/40, min-max
-//! normalized) destroys absolute score information by design.
+//! The registry answers one question: for a query that names a technology, which
+//! official sites would carry its documentation? That is used for *retrieval*:
+//! a bounded `site:` recall puts those pages in the candidate pool, where the
+//! engines' own ordering then ranks them. It is deliberately not used for
+//! *ranking*. This module used to multiply the score of any result on an
+//! official host, plus a title-match and a paper-host boost; measured with the
+//! sources' own results held fixed, those multipliers took hit@1 on a 40-query
+//! gold set from 0.62 (no boost) to 0.42, at every strength from 0.2 up, and
+//! never improved it. A host list cannot tell the right page of an official site
+//! from the wrong one; the engine that indexed it can.
 //!
-//! This module is the layer that knows what a human would click
-//! FIRST. It runs AFTER rerank and coverage (so it rides on the
-//! final blended score) and multiplies in three signals:
-//!
-//! 1. **Query-aware official domains.** A "rust ownership" query
-//!    maps to rust-lang.org/docs.rs : the OFFICIAL sources for
-//!    the thing the query names : via a curated registry of
-//!    tech-token → official-domain mappings. Generic
-//!    (non-query-aware) authority tables from `intent::domain_prior`
-//!    get a smaller lift.
-//! 2. **Title decisiveness.** The fraction of query entity terms
-//!    present in the title, plus an exact-phrase bonus. This is
-//!    the classic SERP placement signal; it was diluted through
-//!    the 60/40 blend and is restored here as a placement signal.
-//! 3. **Freshness (News intent).** `published` timestamps (dead
-//!    data in v1) now rank fresh wire results up and stale ones
-//!    down.
-//!
-//! All boosts are MULTIPLICATIVE, which self-limits: a garbage
-//! result scoring near zero stays near zero no matter how
-//! official its domain. Only a result that consensus + semantics
-//! already placed mid-pack can be lifted to the top.
+//! The one ranking signal kept is freshness for dated news items, because a
+//! publication date is data the source provided, not a guess about the page.
 
-use super::intent::{self, Intent};
-use super::rank::{Merged, host_of};
+use super::intent::Intent;
+use super::rank::Merged;
 
 /// Query-aware official sources: (query tokens → official
 /// domains). ALL tokens in an entry must appear in the query.
@@ -224,116 +207,6 @@ const OFFICIAL: &[(&[&str], &[&str])] = &[
     (&["openreview"], &["openreview.net"]),
 ];
 
-/// Meta-words about the SEARCH ITSELF, never about the target
-/// entity : excluded from title-coverage requirements. "docs"
-/// and "news" describe what the agent wants, not what the page
-/// is about; requiring them in titles would punish the best
-/// results (official doc pages often don't say "docs" in the
-/// title).
-const TITLE_STOPWORDS: &[&str] = &[
-    "the",
-    "and",
-    "for",
-    "how",
-    "what",
-    "why",
-    "who",
-    "does",
-    "with",
-    "using",
-    "from",
-    "into",
-    "about",
-    "are",
-    "was",
-    "were",
-    "has",
-    "have",
-    "you",
-    "your",
-    "can",
-    "not",
-    "but",
-    "all",
-    "any",
-    "get",
-    "set",
-    "new",
-    "latest",
-    "news",
-    "update",
-    "updates",
-    "official",
-    "documentation",
-    "docs",
-    "doc",
-    "guide",
-    "tutorial",
-    "explained",
-    "example",
-    "examples",
-    "vs",
-    "versus",
-    "best",
-    "good",
-    "modern",
-    "simple",
-    "complete",
-    "difference",
-    "between",
-    "when",
-];
-
-/// Docs-seeking queries amplify the official boost : when the
-/// agent explicitly asks for documentation, official sources are
-/// near-certain to be the intended #1.
-const DOCS_WORDS: &[&str] = &[
-    "docs",
-    "documentation",
-    "documented",
-    "reference",
-    "api",
-    "specification",
-    "spec",
-    "official",
-    "manual",
-    "man page",
-    "rfc",
-    "changelog",
-    "release notes",
-];
-
-/// Paper-seeking signal: the query wants primary research.
-const PAPER_WORDS: &[&str] = &["paper", "papers", "study", "studies", "research", "arxiv"];
-
-/// Canonical research repositories for paper-seeking queries.
-const PAPER_AUTHORITY: &[&str] = &[
-    "arxiv.org",
-    "openreview.net",
-    "semanticscholar.org",
-    "scholar.google.com",
-    "pubmed.ncbi.nlm.nih.gov",
-    "aclanthology.org",
-    "biorxiv.org",
-    "papers.neurips.cc",
-    "openaccess.thecvf.com",
-];
-
-/// Boost strengths. Calibrated against the 50-case benchmark:
-/// the blended (60% RRF + 40% cross-encoder, min-max normalized)
-/// top score is ~0.6-1.0; a mid-pack result sits at ~0.3-0.5.
-/// OFFICIAL × title coverage can lift 0.35 → ~0.9, enough to
-/// take #1 from a consensus-heavy aggregator without letting a
-/// semantically-irrelevant official page (blended ~0.1) anywhere
-/// near the top.
-const OFFICIAL_MULT: f64 = 1.6;
-const OFFICIAL_CODE_MULT: f64 = 1.8;
-const DOCS_SEEK_MULT: f64 = 1.15;
-const PRIOR_MULT: f64 = 1.2;
-const PAPER_SEEK_MULT: f64 = 1.35;
-const TITLE_W: f64 = 0.35;
-const PHRASE_MULT: f64 = 1.15;
-
 fn query_tokens(query: &str) -> Vec<String> {
     query
         .to_lowercase()
@@ -381,54 +254,6 @@ pub(super) fn official_queries(compiled: &super::query::CompiledQuery) -> Vec<St
         .into_iter()
         .map(|domain| format!("{} site:{domain}", compiled.text))
         .collect()
-}
-
-fn docs_seeking(query: &str) -> bool {
-    let q = query.to_lowercase();
-    DOCS_WORDS.iter().any(|w| q.contains(w))
-}
-
-fn paper_seeking(query: &str) -> bool {
-    let q = query.to_lowercase();
-    PAPER_WORDS.iter().any(|w| q.contains(w))
-}
-
-fn host_matches(host: &str, domain: &str) -> bool {
-    host == domain || host.ends_with(&format!(".{domain}"))
-}
-
-/// Fraction of query ENTITY terms present in the title.
-/// Meta-words (TITLE_STOPWORDS) are excluded from both sides of
-/// the ratio : the signal is entity match, not filler match.
-fn title_terms_ratio(query: &str, title: &str) -> f64 {
-    let q = query.to_lowercase();
-    let terms: Vec<&str> = q
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() > 2 && !TITLE_STOPWORDS.contains(t))
-        .collect();
-    if terms.is_empty() {
-        return 0.0;
-    }
-    let tl = title.to_lowercase();
-    let hits = terms.iter().filter(|t| tl.contains(**t)).count();
-    hits as f64 / terms.len() as f64
-}
-
-/// Exact query phrase (normalized) appears in the title.
-fn phrase_in_title(query: &str, title: &str) -> bool {
-    let norm = |s: &str| {
-        s.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_string()
-    };
-    let q = norm(query);
-    if q.len() < 8 {
-        return false; // short queries: term ratio already covers it
-    }
-    norm(title).contains(&q)
 }
 
 /// Freshness multiplier for News intent from an ISO
@@ -506,76 +331,14 @@ fn civil_from_days(z: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The decisive top-placement layer. Called from
-/// `rank::merge` AFTER rerank + coverage, BEFORE the final
-/// sort : the same slot the coverage penalty proved effective
-/// in (the layer the cross-encoder blend cannot wash out).
-pub fn apply(query: &str, intent: Intent, results: &mut [Merged]) {
-    let official = official_domains(query);
-    let docs_seek = docs_seeking(query);
-    let paper_seek = paper_seeking(query);
-    let query_words: Vec<_> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .map(str::to_lowercase)
-        .collect();
-    let wants_benchmark = intent == Intent::Paper
-        && query_words
-            .iter()
-            .any(|w| matches!(w.as_str(), "benchmark" | "benchmarks"))
-        && !query_words
-            .iter()
-            .any(|w| matches!(w.as_str(), "survey" | "surveys" | "review" | "reviews"));
+/// Lift fresh dated items and sink stale ones, for News intent only. An item with
+/// no date, or one that does not parse, is neutral.
+pub fn freshen(intent: Intent, results: &mut [Merged]) {
+    if intent != Intent::News {
+        return;
+    }
     for r in results.iter_mut() {
-        let host = host_of(&r.url);
-        let mut m = 1.0;
-
-        let official_hit = !official.is_empty() && official.iter().any(|d| host_matches(&host, d));
-        if official_hit {
-            m *= match intent {
-                Intent::Code => OFFICIAL_CODE_MULT,
-                _ => OFFICIAL_MULT,
-            };
-            if docs_seek {
-                m *= DOCS_SEEK_MULT;
-            }
-        } else if intent::domain_prior(intent, &host, query) > 0.0 {
-            m *= PRIOR_MULT;
-        }
-
-        // Paper-seeking queries prefer primary repositories over
-        // blog summaries of papers.
-        if paper_seek && !official_hit && PAPER_AUTHORITY.iter().any(|d| host_matches(&host, d)) {
-            m *= PAPER_SEEK_MULT;
-        }
-
-        // Title decisiveness : the placement signal the 60/40
-        // blend dilutes. Applied to every result: it reorders
-        // results by entity-title match, independent of domain.
-        let ratio = title_terms_ratio(query, &r.title);
-        m *= 1.0 + TITLE_W * ratio;
-        if phrase_in_title(query, &r.title) {
-            m *= PHRASE_MULT;
-        }
-
-        // Freshness only ranks within News intent: old sources
-        // for a "latest news" query are the classic metasearch
-        // failure.
-        if intent == Intent::News {
-            m *= freshness_mult(&r.published);
-        }
-
-        // A survey about benchmarks is useful background, but does not
-        // replace the evaluation the caller asked for. Explicit survey
-        // queries retain their normal ranking; no domain is blacklisted.
-        if wants_benchmark
-            && r.title
-                .split(|c: char| !c.is_alphanumeric())
-                .any(|w| w.eq_ignore_ascii_case("survey") || w.eq_ignore_ascii_case("review"))
-        {
-            m *= 0.65;
-        }
-
-        r.score *= m;
+        r.score *= freshness_mult(&r.published);
     }
 }
 
@@ -672,42 +435,16 @@ mod tests {
         assert!(official_domains("rfc 8949 cbor").contains(&"rfc-editor.org"));
     }
 
-    fn merged(title: &str, url: &str, score: f64) -> Merged {
+    fn merged(title: &str, url: &str, score: f64, published: Option<String>) -> Merged {
         Merged {
             title: title.into(),
             url: url.into(),
             snippet: String::new(),
             sources: vec![("bing".into(), 0)],
             score,
-            published: None,
+            published,
+            families: 1,
         }
-    }
-
-    #[test]
-    fn wave450_benchmark_queries_prefer_evaluations_but_keep_requested_surveys() {
-        let mut rs = vec![
-            merged("RAG benchmarks survey", "https://arxiv.org/abs/one", 0.8),
-            merged(
-                "RAG benchmarks evaluation",
-                "https://arxiv.org/abs/two",
-                0.7,
-            ),
-        ];
-        apply("RAG benchmarks", Intent::Paper, &mut rs);
-        assert!(
-            rs[1].score > rs[0].score,
-            "benchmark evidence must beat a similarly relevant survey"
-        );
-        let mut rs = vec![
-            merged("RAG benchmarks survey", "https://arxiv.org/abs/one", 0.8),
-            merged(
-                "RAG benchmarks evaluation",
-                "https://arxiv.org/abs/two",
-                0.7,
-            ),
-        ];
-        apply("RAG benchmarks survey", Intent::Paper, &mut rs);
-        assert!(rs[0].score > rs[1].score);
     }
 
     #[test]
@@ -715,85 +452,6 @@ mod tests {
         assert!(official_domains("Uplift vs Vari standing desk").contains(&"upliftdesk.com"));
         assert!(official_domains("Uplift vs Vari standing desk").contains(&"vari.com"));
         assert!(official_domains("uplift in economic productivity").is_empty());
-    }
-
-    #[test]
-    fn official_outranks_slightly_higher_aggregator() {
-        // The benchmark failure shape: keyword-farm/aggregator
-        // consensus edge over the official doc page. The
-        // authority layer must flip the placement.
-        let mut rs = vec![
-            merged(
-                "Understanding Ownership in Rust - SomeBlog",
-                "https://someblog.dev/rust-ownership",
-                0.80,
-            ),
-            merged(
-                "Ownership - Rust By Example",
-                "https://doc.rust-lang.org/rust-by-example/scope/ownership.html",
-                0.55,
-            ),
-        ];
-        apply("rust ownership explained", Intent::Web, &mut rs);
-        rs.sort_by(|a, b| b.score.total_cmp(&a.score));
-        assert!(
-            rs[0].url.contains("doc.rust-lang.org"),
-            "official doc must place first: {:?}",
-            rs.iter()
-                .map(|r| (r.url.clone(), r.score))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn no_boost_for_garbage_official_page() {
-        // Self-limiting: an official-domain page the consensus +
-        // semantics scored near zero stays near zero.
-        let mut rs = vec![
-            merged(
-                "Kitchen Sinks 2026 Catalog",
-                "https://someblog.dev/sinks",
-                0.90,
-            ),
-            merged(
-                "Unrelated rust-lang page",
-                "https://rust-lang.org/unrelated",
-                0.05,
-            ),
-        ];
-        apply("rust ownership explained", Intent::Web, &mut rs);
-        rs.sort_by(|a, b| b.score.total_cmp(&a.score));
-        assert!(rs[0].url.contains("someblog.dev"));
-    }
-
-    #[test]
-    fn title_phrase_beats_term_scatter() {
-        let mut rs = vec![
-            merged(
-                "The ultimate guide to everything about transformers",
-                "https://a.com/x",
-                0.80,
-            ),
-            merged(
-                "Attention Is All You Need",
-                "https://arxiv.org/abs/1706.03762",
-                0.62,
-            ),
-        ];
-        apply("attention is all you need", Intent::Paper, &mut rs);
-        rs.sort_by(|a, b| b.score.total_cmp(&a.score));
-        assert!(rs[0].url.contains("arxiv.org"));
-    }
-
-    #[test]
-    fn stopwords_do_not_gut_title_ratio() {
-        // "latest news" excluded from the ratio: a wire story
-        // title containing only the ENTITY terms still scores 1.0.
-        let r = title_terms_ratio(
-            "ukraine war latest news",
-            "Ukraine war: Russia strikes Kyiv power grid",
-        );
-        assert!((r - 1.0).abs() < 0.01, "got {r}"); // ukraine+war present, latest+news stopworded
     }
 
     #[test]
@@ -846,32 +504,34 @@ mod tests {
     }
 
     #[test]
-    fn paper_seeking_boosts_arxiv_over_blog() {
+    fn freshen_moves_only_dated_news_items() {
+        let now = epoch_days_now();
         let mut rs = vec![
             merged(
-                "A blog summary of the transformer paper",
-                "https://blog.dev/transformers",
-                0.85,
+                "old",
+                "https://a.com/old",
+                1.0,
+                Some(civil_from_days(now - 400)),
             ),
             merged(
-                "Attention Is All You Need",
-                "https://arxiv.org/abs/1706.03762",
-                0.50,
+                "fresh",
+                "https://a.com/new",
+                1.0,
+                Some(civil_from_days(now)),
             ),
+            merged("undated", "https://a.com/none", 1.0, None),
         ];
-        apply("attention is all you need paper", Intent::Paper, &mut rs);
-        rs.sort_by(|a, b| b.score.total_cmp(&a.score));
-        assert!(rs[0].url.contains("arxiv.org"));
-    }
-
-    #[test]
-    fn no_registry_match_leaves_scores_scaled_only_by_title() {
-        let mut rs = vec![merged("Some Title", "https://a.com/x", 1.0)];
-        apply("nash equilibrium explained", Intent::Web, &mut rs);
-        // Title contains "nash"? No → ratio 0.5 (nash+equilibrium, title has neither → 0.0)
-        assert!(
-            rs[0].score <= 1.0 + 1e-9,
-            "nothing to boost, score must not grow"
-        );
+        freshen(Intent::News, &mut rs);
+        assert!(rs[1].score > rs[2].score && rs[2].score > rs[0].score);
+        assert_eq!(rs[2].score, 1.0, "no date is neutral");
+        // Any other intent is untouched: a date is a news signal, not a quality one.
+        let mut web = vec![merged(
+            "fresh",
+            "https://a.com/new",
+            1.0,
+            Some(civil_from_days(now)),
+        )];
+        freshen(Intent::Web, &mut web);
+        assert_eq!(web[0].score, 1.0);
     }
 }

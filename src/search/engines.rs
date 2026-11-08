@@ -363,7 +363,17 @@ fn parse_mojeek(doc: &Html) -> Vec<Hit> {
 /// the URL-encoded RU= value, so they survive urlencoding_decode
 /// as path suffixes on the real URL. We strip them.
 fn decode_yahoo(href: &str) -> String {
-    if !href.contains("r.search.yahoo.com") && !href.contains("search.yahoo.com/search") {
+    // Yahoo's redirect host is `r.search.yahoo.com` on some layouts and
+    // `rd.search.yahoo.com` on others; `contains("r.search.yahoo.com")` matched
+    // only the first, so every `rd.` result came back as the redirect itself and
+    // ranked as a page on yahoo.com. Match the suffix of the host instead.
+    let host = href
+        .split_once("://")
+        .map_or(href, |(_, rest)| rest)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("");
+    if !host.ends_with(".search.yahoo.com") && !href.contains("search.yahoo.com/search") {
         return href.to_string();
     }
     // Try RU= parameter (most common). Yahoo uses ; as a
@@ -807,7 +817,10 @@ pub fn parse_rss(body: &str) -> Vec<Hit> {
             // cosmetic: merge keeps the LONGEST snippet, and the cross-encoder
             // pads every pair in a batch to the longest one -- one 10 KB
             // description turned a 40 ms rerank into 40 CPU-seconds.
-            snippet: strip_markup(&snippet).chars().take(MAX_RSS_SNIPPET).collect(),
+            snippet: strip_markup(&snippet)
+                .chars()
+                .take(MAX_RSS_SNIPPET)
+                .collect(),
             rank: out.len(),
             published,
         });

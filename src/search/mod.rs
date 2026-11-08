@@ -4,10 +4,12 @@
 //! direct) → weighted RRF merge → ranked results with
 //! honest engine reporting.
 
+pub mod bench;
 pub mod byok;
 pub mod coverage;
 pub mod egress;
 pub mod engines;
+pub mod families;
 pub mod instant;
 pub mod intent;
 pub mod query;
@@ -80,10 +82,12 @@ fn lane_budget() -> Duration {
 
 /// Contributing sources and items in what has landed so far.
 fn answered(outcomes: &[(String, EngineResult)]) -> (usize, usize) {
-    outcomes.iter().fold((0usize, 0usize), |(l, n), (_, r)| match r {
-        Ok(a) if a.class.contributes() => (l + 1, n + a.hits.len()),
-        _ => (l, n),
-    })
+    outcomes
+        .iter()
+        .fold((0usize, 0usize), |(l, n), (_, r)| match r {
+            Ok(a) if a.class.contributes() => (l + 1, n + a.hits.len()),
+            _ => (l, n),
+        })
 }
 
 /// A status a second ask can plausibly change: the source misbehaved, rather
@@ -92,7 +96,6 @@ fn worth_second_ask(status: &str) -> bool {
     !matches!(status, "no-results" | "pacing-timeout" | "late")
         && !status.starts_with("invalid-config")
 }
-
 
 tokio::task_local! {
     pub(crate) static SEARCH_DEADLINE: Option<tokio::time::Instant>;
@@ -308,26 +311,34 @@ fn trust_target_for(engine: &str, status: &str, ok: bool) -> f64 {
 /// committing at two fat lanes (30 items between them) cut the contributing
 /// lanes from 4.3 to 1.4 per query and doubled the misses, because consensus is
 /// what the ranking is built on and two engines are one opinion plus one.
-fn enough_answered(outcomes: &[(String, EngineResult)], early: bool) -> bool {
-    early && outcomes.len() >= 2 && early_consensus_enough(outcomes)
+fn enough_answered(
+    outcomes: &[(String, EngineResult)],
+    early: bool,
+    families: &families::Families,
+) -> bool {
+    early && outcomes.len() >= 2 && early_consensus_enough(outcomes, families)
 }
 
 /// C4: enough independent families already agree on a top-3 URL
 /// that waiting for the stragglers cannot change the answer.
-fn early_consensus_enough(outcomes: &[(String, EngineResult)]) -> bool {
+fn early_consensus_enough(
+    outcomes: &[(String, EngineResult)],
+    families: &families::Families,
+) -> bool {
     use std::collections::{HashMap, HashSet};
-    let mut url_families: HashMap<String, HashSet<&str>> = HashMap::new();
-    let mut families_ok: HashSet<&str> = HashSet::new();
+    let mut url_families: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut families_ok: HashSet<String> = HashSet::new();
     for (label, result) in outcomes {
         let Ok(answer) = result else {
             continue;
         };
-        let hits = &answer.hits;
-        let fam = rank::engine_family(engine_name(label));
-        families_ok.insert(fam);
-        for h in hits.iter().take(3) {
-            let key = rank::norm_key(&h.url);
-            url_families.entry(key).or_default().insert(fam);
+        let fam = rank::family_name(families, engine_name(label));
+        families_ok.insert(fam.clone());
+        for h in answer.hits.iter().take(3) {
+            url_families
+                .entry(rank::norm_key(&h.url))
+                .or_default()
+                .insert(fam.clone());
         }
     }
     families_ok.len() >= 3 && url_families.values().any(|fams| fams.len() >= 3)
@@ -387,6 +398,13 @@ pub struct Searcher {
     /// Default off (`search.outcome_feedback`); never extra fetches.
     outcome: Mutex<OutcomeMap>,
     outcome_dirty: std::sync::atomic::AtomicBool,
+    /// What each source returned for the most recent local fan-out, before the
+    /// merge. Read by `search-bench` to tell a retrieval miss (the answer never
+    /// arrived) from an ordering miss (it arrived and was ranked low); nothing
+    /// else reads it, and a concurrent caller simply overwrites it.
+    last_raw: Mutex<Vec<(String, Vec<engines::Hit>)>>,
+    /// Which sources return the same results, learned from their overlap.
+    families: Mutex<families::Families>,
 }
 
 #[cfg(feature = "rerank")]
@@ -473,7 +491,18 @@ impl Searcher {
             quality_dirty: std::sync::atomic::AtomicBool::new(false),
             outcome: Mutex::new(load_outcome_disk()),
             outcome_dirty: std::sync::atomic::AtomicBool::new(false),
+            last_raw: Mutex::new(Vec::new()),
+            families: Mutex::new(families::load()),
         }
+    }
+
+    /// The per-source results of the most recent uncached local search, in the
+    /// order the sources answered. Empty when the last call was a cache hit.
+    pub fn last_raw(&self) -> Vec<(String, Vec<engines::Hit>)> {
+        self.last_raw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The shared egress pool (crawl/fetch attach the same Arc).
@@ -812,6 +841,10 @@ impl Searcher {
         forced_intent: Option<Intent>,
         started: Instant,
     ) -> Result<SearchOutcome, FetchError> {
+        self.last_raw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         // Cache stores top-12; asking for more just
         // re-lists the same tail.
         let max_results = max_results.clamp(1, 12);
@@ -928,9 +961,13 @@ impl Searcher {
         // Two scoped recalls join the initial wave, on an engine that honors
         // site:, only while the pool is healthy. Results still need ranking.
         if matches!(intent, Intent::Web | Intent::Code) && self.pool.stress() < 0.15 {
+            // Yahoo is the engine that honors `site:` and answers it with the
+            // scoped pages; measured against bing (ignores it) and the DDG
+            // endpoints (answer nothing). The recall used to go to the others.
             let engine = live
                 .iter()
-                .find(|e| matches!(**e, "bing" | "ddg_html"))
+                .find(|e| **e == "yahoo")
+                .or_else(|| live.iter().find(|e| matches!(**e, "bing" | "ddg_html")))
                 .copied()
                 .or_else(|| live.contains(&"ddg").then_some("ddg_html"));
             if let Some(engine) = engine {
@@ -1011,15 +1048,24 @@ impl Searcher {
         let mut futs: futures_util::stream::FuturesUnordered<_> = futures
             .into_iter()
             .map(|(name, fut)| {
-                Box::pin(async move { (name, fut.await) }) as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = (String, (String, EngineResult))> + Send>,
-                >
+                Box::pin(async move { (name, fut.await) })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = (String, (String, EngineResult))>
+                                + Send,
+                        >,
+                    >
             })
             .collect();
         let early = crate::config::cfg().search.search_early;
+        let known_families = self
+            .families
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut outcomes: Vec<(String, EngineResult)> = Vec::new();
         loop {
-            if enough_answered(&outcomes, early) {
+            if enough_answered(&outcomes, early, &known_families) {
                 break;
             }
             // The soft mark only ends the wait when the answer is already
@@ -1059,8 +1105,7 @@ impl Searcher {
         // state's job across calls, this only rescues a query where two thirds
         // of the sources were walled at once.
         let (lanes, items) = answered(&outcomes);
-        if (lanes < THIN_LANES || items < THIN_ITEMS)
-            && tokio::time::Instant::now() < hard_deadline
+        if (lanes < THIN_LANES || items < THIN_ITEMS) && tokio::time::Instant::now() < hard_deadline
         {
             let mut asked: std::collections::HashSet<String> = Default::default();
             let mut retry: Vec<(String, TaskFut)> = Vec::new();
@@ -1102,17 +1147,19 @@ impl Searcher {
                 let secs: futures_util::stream::FuturesUnordered<_> = retry
                     .into_iter()
                     .map(|(name, fut)| {
-                        Box::pin(async move { (name, fut.await) }) as std::pin::Pin<
-                            Box<
-                                dyn std::future::Future<
-                                        Output = (String, (String, EngineResult)),
-                                    > + Send,
-                            >,
-                        >
+                        Box::pin(async move { (name, fut.await) })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = (String, (String, EngineResult)),
+                                        > + Send,
+                                >,
+                            >
                     })
                     .collect();
                 let left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if let Ok(done) = tokio::time::timeout(left, futures_util::future::join_all(secs)).await
+                if let Ok(done) =
+                    tokio::time::timeout(left, futures_util::future::join_all(secs)).await
                 {
                     for (name, outcome) in done {
                         if let Some(n) = outstanding.get_mut(&name) {
@@ -1278,6 +1325,32 @@ impl Searcher {
             .unwrap_or(1.0);
         trust.insert("google".into(), google_trust);
         let total = rank::merged_total(&per_engine);
+        // What each general source returned teaches the independence graph, and
+        // this query is ranked with what it just learned.
+        let families_now = {
+            let lists: Vec<(String, Vec<String>)> = per_engine
+                .iter()
+                .filter(|(name, _)| !rank::is_vertical(name))
+                .map(|(name, hits)| {
+                    (
+                        egress::health_key(name).to_string(),
+                        hits.iter().map(|h| rank::norm_key(&h.url)).collect(),
+                    )
+                })
+                .collect();
+            let mut guard = self
+                .families
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.observe(&lists) {
+                families::save(&guard);
+            }
+            guard.clone()
+        };
+        *self
+            .last_raw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = per_engine.clone();
         // Always merge 12 results for the cache, then trim to
         // max_results for the response. Without this, a first
         // search with max=2 caches only 2 results, and a later
@@ -1286,10 +1359,14 @@ impl Searcher {
         // inference. Core builds keep the existing inline fast path below.
         #[cfg(feature = "rerank")]
         let (mut results, ranking_finished) = {
-            let fallback = rank::merge_lexical(&per_engine, query, intent, &trust, 12);
+            let fallback =
+                rank::merge_lexical(&per_engine, query, intent, &trust, &families_now, 12);
             let query = query.to_string();
-            match run_blocking_ranking(move || rank::merge(&per_engine, &query, intent, &trust, 12))
-                .await?
+            let families_job = families_now.clone();
+            match run_blocking_ranking(move || {
+                rank::merge(&per_engine, &query, intent, &trust, &families_job, 12)
+            })
+            .await?
             {
                 Some(results) => (results, true),
                 None => (fallback, false),
@@ -1298,7 +1375,7 @@ impl Searcher {
         #[cfg(not(feature = "rerank"))]
         let ranking_finished = true;
         #[cfg(not(feature = "rerank"))]
-        let mut results = rank::merge(&per_engine, query, intent, &trust, 12);
+        let mut results = rank::merge(&per_engine, query, intent, &trust, &families_now, 12);
         // B3: learned host quality nudge. After merge (and its
         // diversity cap) so it only reorders survivors with a
         // small weight; consensus still dominates.
@@ -1587,7 +1664,6 @@ fn engine_health_key(engine: &str) -> &str {
     }
     egress::health_key(engine)
 }
-
 
 /// Governor: fan-out width under stress. Healthy pool →
 /// all engines; stressed → shrink appetite (you can't be
@@ -1973,6 +2049,7 @@ mod tests {
                 sources: vec![(provider.to_string(), i)],
                 score: 1.0 - i as f64 * 0.1,
                 published: None,
+                families: 0,
             })
             .collect::<Vec<_>>();
         let report = vec![EngineReport {
@@ -2303,11 +2380,12 @@ mod tests {
             )
         };
         // Two lanes with no shared URL between them: no agreement, keep waiting.
-        assert!(!enough_answered(&[lane(20), lane(20)], true));
+        let fam = families::Families::default();
+        assert!(!enough_answered(&[lane(20), lane(20)], true, &fam));
         // A plain item count is not agreement either.
-        assert!(!enough_answered(&[lane(40)], true));
+        assert!(!enough_answered(&[lane(40)], true, &fam));
         // Early consensus stays off when the config turns it off.
-        assert!(!enough_answered(&[lane(2)], false));
+        assert!(!enough_answered(&[lane(2)], false, &fam));
     }
 
     #[test]
@@ -2334,7 +2412,10 @@ mod tests {
             "dead-proxy",
             "auth-fail",
         ] {
-            assert!(!is_engine_fault(status), "{status} is not the source's fault");
+            assert!(
+                !is_engine_fault(status),
+                "{status} is not the source's fault"
+            );
         }
     }
 
@@ -2423,43 +2504,74 @@ mod tests {
             ok("brave", &["https://a.com/x", "https://b.com/y"]),
             ok("bing", &["https://a.com/x", "https://b.com/y"]),
         ];
-        assert!(!early_consensus_enough(&two));
+        let fam = families::Families::default();
+        assert!(!early_consensus_enough(&two, &fam));
         // Three families, shared top URL: enough.
         let three = vec![
             ok("brave", &["https://a.com/x", "https://b.com/y"]),
             ok("bing", &["https://a.com/x", "https://c.com/z"]),
             ok("mojeek", &["https://a.com/x", "https://d.com/w"]),
         ];
-        assert!(early_consensus_enough(&three));
+        assert!(early_consensus_enough(&three, &fam));
         // Three families but no shared top-3 URL: not enough.
         let disjoint = vec![
             ok("brave", &["https://a.com/x"]),
             ok("bing", &["https://b.com/y"]),
             ok("mojeek", &["https://c.com/z"]),
         ];
-        assert!(!early_consensus_enough(&disjoint));
+        assert!(!early_consensus_enough(&disjoint, &fam));
     }
 
+    // The family count a result carries is the one measured when it was ranked,
+    // not a table lookup: the same five sources are three opinions once the
+    // graph has seen bing, ddg and yahoo return the same results, and five
+    // before it has.
     #[test]
-    fn family_count_dedups_shared_indexes() {
-        let mut r = Merged {
+    fn family_count_is_the_measured_one() {
+        use crate::search::engines::Hit;
+        let hit = |url: &str, rank: usize| Hit {
             title: "t".into(),
-            url: "https://a.com/".into(),
+            url: url.into(),
             snippet: "s".into(),
-            sources: Vec::new(),
-            score: 0.0,
+            rank,
             published: None,
         };
-        r.sources = vec![
-            ("bing".into(), 0),
-            ("ddg".into(), 3),
-            ("yahoo".into(), 5),
-            ("google".into(), 2),
-            ("brave".into(), 4),
-        ];
-        // 5 engines, 3 families (bing family dedups to one opinion).
-        assert_eq!(rank::family_count(&r), 3);
-        let markdown = render_compact_markdown(&outcome(vec![r]), "", None, &[]);
+        let same: Vec<Hit> = (0..6)
+            .map(|i| hit(&format!("https://x.com/{i}"), i))
+            .collect();
+        let per: Vec<(String, Vec<Hit>)> = ["bing", "ddg", "yahoo", "google", "brave"]
+            .iter()
+            .map(|e| (e.to_string(), same.clone()))
+            .collect();
+        let trust = HashMap::new();
+
+        let unmeasured = rank::merge(
+            &per,
+            "x",
+            Intent::Web,
+            &trust,
+            &families::Families::default(),
+            10,
+        );
+        assert_eq!(rank::family_count(&unmeasured[0]), 5);
+
+        let mut learned = families::Families::default();
+        let lists = |names: &[&str], urls: &[&str]| -> Vec<(String, Vec<String>)> {
+            names
+                .iter()
+                .map(|n| (n.to_string(), urls.iter().map(|u| u.to_string()).collect()))
+                .collect()
+        };
+        for _ in 0..4 {
+            learned.observe(&lists(
+                &["bing", "ddg", "yahoo"],
+                &["a/1", "a/2", "a/3", "a/4", "a/5"],
+            ));
+        }
+        let measured = rank::merge(&per, "x", Intent::Web, &trust, &learned, 10);
+        // bing, ddg and yahoo are one opinion; google and brave stand alone.
+        assert_eq!(rank::family_count(&measured[0]), 3);
+        let markdown = render_compact_markdown(&outcome(vec![measured[0].clone()]), "", None, &[]);
         assert!(markdown.contains("3 index families"), "{markdown}");
     }
 
@@ -2980,6 +3092,7 @@ mod tests {
             sources: vec![("bing".into(), 0)],
             score: 1.0,
             published: None,
+            families: 0,
         }
     }
 

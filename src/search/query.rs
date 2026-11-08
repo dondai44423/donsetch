@@ -265,6 +265,7 @@ mod tests {
             sources: vec![],
             score: 0.0,
             published: None,
+            families: 0,
         }
     }
 
