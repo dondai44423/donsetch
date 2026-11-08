@@ -524,6 +524,81 @@ fn user_chose_a_linker() -> bool {
         .unwrap_or(false)
 }
 
+/// Download one pinned release asset to `dest`, returning whether it landed.
+///
+/// GitHub's `releases/download` transfer path answers 504 under load while the
+/// same asset is healthy through the REST API (measured 2026-11-08: every
+/// platform leg of the v5.1.0 release failed on that 504). So: the plain path
+/// first, then the authenticated API asset URL. Both land in `dest` and every
+/// caller verifies a pinned sha256 afterwards, so the fallback cannot change
+/// what a build ends up using.
+fn download_release_asset(dest: &Path, url: &str) -> bool {
+    let try_curl = |target: &str| {
+        Command::new("curl")
+            .args([
+                "-fSL",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--retry",
+                "3",
+                "-o",
+            ])
+            .arg(dest)
+            .arg(target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or_else(|e| panic!("download: failed to spawn curl ({e}) — install curl"))
+    };
+    if try_curl(url) {
+        return true;
+    }
+    // https://github.com/<owner>/<repo>/releases/download/<tag>/<name>
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let Some(name) = rest.rsplit('/').next() else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let Some(&tag) = parts.get(4) else {
+        return false;
+    };
+    let (Some(owner), Some(repo)) = (parts.first(), parts.get(1)) else {
+        return false;
+    };
+    let api = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{owner}/{repo}/releases/tags/{tag}"),
+            "--jq",
+            &format!(".assets[]|select(.name==\"{name}\")|.url"),
+        ])
+        .output();
+    let Ok(out) = api else { return false };
+    let asset_url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || asset_url.is_empty() {
+        eprintln!("download: no API asset URL for {name} ({url})");
+        return false;
+    }
+    eprintln!("download: retrying {name} through the API asset URL");
+    Command::new("curl")
+        .args([
+            "-fSL",
+            "--retry",
+            "3",
+            "-H",
+            "Accept: application/octet-stream",
+            "-o",
+        ])
+        .arg(dest)
+        .arg(&asset_url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Download the pinned PDFium release into `vendored` when missing.
 ///
 /// Linux/macOS: static archive from kognitos/pdfium-static.
@@ -570,25 +645,8 @@ fn fetch_pdfium(os: &str, arch: &str, vendored: &Path) {
     let _ = fs::create_dir_all(vendored);
 
     eprintln!("donsetch build: fetching pdfium {pair} from {url}");
-    let status = Command::new("curl")
-        .args([
-            "-fSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--retry",
-            "3",
-            "-o",
-        ])
-        .arg(&tgz)
-        .arg(&url)
-        .status()
-        .unwrap_or_else(|e| {
-            panic!("pdfium: failed to spawn curl ({e}) — install curl: apt install curl")
-        });
-    if !status.success() {
-        panic!("pdfium: curl download failed for {url}");
+    if !download_release_asset(&tgz, &url) {
+        panic!("pdfium: download failed for {url}");
     }
 
     let mut f = fs::File::open(&tgz).expect("pdfium: cannot open downloaded tarball");
@@ -745,23 +803,8 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
         OnnxArchive::Zip => "onnx.zip",
     });
     eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
-    let status = Command::new("curl")
-        .args([
-            "-fSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--retry",
-            "3",
-            "-o",
-        ])
-        .arg(&tarball)
-        .arg(info.url)
-        .status()
-        .unwrap_or_else(|e| panic!("ONNX: failed to spawn curl ({e})"));
-    if !status.success() {
-        panic!("ONNX: curl download failed for {}", info.url);
+    if !download_release_asset(&tarball, &info.url) {
+        panic!("ONNX: download failed for {}", info.url);
     }
 
     // 2. Verify SHA-256.
