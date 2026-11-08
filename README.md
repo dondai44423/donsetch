@@ -523,7 +523,7 @@ A site decides before it serves content on two things: **who is asking** (TLS an
 |---|---|
 | `plain` | A plain HTTP client: the cheapest first ask |
 | `chrome-local` | Chrome 156 on Linux, captured from a real browser |
-| `chrome` | Chrome 149 on Linux |
+| `chrome` | Chrome 156 on Linux (wire measured against the reference browser) |
 | `chrome-win` | Chrome on Windows |
 | `chrome-android` | Chrome on Android |
 | `firefox` | Firefox 151 |

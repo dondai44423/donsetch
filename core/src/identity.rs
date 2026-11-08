@@ -127,9 +127,9 @@ impl Identity {
                 .build()
                 .into_emulation()
         })?;
-        // The local identity carries the reference browser's own strings, so a
-        // clearance that browser earned is spendable by this identity.
-        if self.name == "chrome-local" {
+        // The identities that carry the reference browser's own strings: a
+        // clearance that browser earned is spendable by them.
+        if self.reference_strings() {
             if let Some(persona) = persona() {
                 let mut set = |name: &str, value: &str| {
                     if let (Ok(name), Ok(value)) = (
@@ -152,6 +152,28 @@ impl Identity {
             }
         }
         Some(emulation)
+    }
+
+    /// Whether this identity sends the reference browser's own user agent and
+    /// client hints (its captured persona) instead of its profile's.
+    ///
+    /// `chrome-local` always does. The Linux `chrome` identity does when the
+    /// persona is a Linux desktop Chrome: its TLS, HTTP/2 and header order were
+    /// measured identical to the reference browser's (JA4, peetprint, Akamai
+    /// HTTP/2 fingerprint, header order against Chromium 156 on the same host),
+    /// so the only thing the profile had older was the version it printed. The
+    /// Windows and Android identities keep their profile's strings: no reference
+    /// browser of those platforms exists here to measure them against.
+    fn reference_strings(&self) -> bool {
+        match self.name {
+            "chrome-local" => true,
+            "chrome" => persona().is_some_and(|persona| {
+                persona.platform == "Linux"
+                    && !persona.mobile
+                    && persona.user_agent.contains("Chrome/")
+            }),
+            _ => false,
+        }
     }
 
     pub fn headers(&self) -> Vec<(&'static str, &'static str)> {
@@ -347,7 +369,7 @@ pub const PORTFOLIO: &[Identity] = &[
     Identity {
         name: "chrome",
         family: Family::Browser,
-        note: "Chrome 149 / Linux desktop",
+        note: "Chrome 156 / Linux desktop, wire measured against the reference browser",
         profile: Some((Profile::Chrome149, Platform::Linux)),
         extra: &[
             // Measured against the reference browser's own document request:
@@ -439,6 +461,39 @@ mod tests {
         );
         assert!(persona.brands.contains("Chromium"), "{}", persona.brands);
         assert!(persona.webgl.is_some() && persona.screen.is_some());
+    }
+
+    #[test]
+    fn the_linux_chrome_identity_sends_the_reference_browsers_own_strings() {
+        let persona = persona().expect("embedded persona");
+        let header = |name: &str, header: &str| {
+            let emulation = lookup(name).expect(name).emulation().expect("a browser");
+            emulation
+                .headers
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        for name in ["chrome", "chrome-local"] {
+            assert_eq!(
+                header(name, "user-agent").as_deref(),
+                Some(persona.user_agent.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                header(name, "sec-ch-ua").as_deref(),
+                Some(persona.brands.as_str()),
+                "{name}"
+            );
+        }
+        // Other platforms have no reference browser to measure: their
+        // profile's own strings stand, and say their own platform.
+        let windows = header("chrome-win", "user-agent").unwrap_or_default();
+        let android = header("chrome-android", "user-agent").unwrap_or_default();
+        assert!(windows.contains("Windows"), "{windows}");
+        assert!(android.contains("Android"), "{android}");
+        assert_ne!(windows, persona.user_agent);
+        assert_ne!(android, persona.user_agent);
     }
 
     #[test]
