@@ -7,7 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.2] - 2026-11-09
+
+Local search that ranks by agreement and answers from first-party records, price
+tables on AWS pricing pages that are tables again, and a Chrome identity that
+prints the version it really is.
+
+### Added
+
+- **Papers and packages are asked at their own front door.** A query that reads as
+  a paper ("... paper", "arxiv ...") asks OpenAlex and arXiv, plus Europe PMC when
+  it is biomedical; one that reads as a library asks crates.io and npm. Each is
+  read through its published interface, so an answer is a record, not a scraped
+  page, and a result's title has to cover what was asked before it ranks. A
+  source's published rate limit (Stack Exchange's daily quota) rests it for the
+  time it states (`rate-limited:3600` in the census); that is not a fault and does
+  not change its trust. A bare paper title still goes through the general sources,
+  which rank it well.
+- **Results carry the sentence that answers.** Each result's snippet is the
+  best-covering window across every source's snippet, cut at a sentence and never
+  padded; `read: N` (at most 3) replaces it with the best-covering passage of the
+  page itself, fetched for the occasion. Lexical, no model. On the recorded gold
+  traces a snippet now covers 0.69 of the query's words (0.64 before) and ends at a
+  sentence 69% of the time (19% before), in 145 characters instead of 168.
+- **Source health you can read.** `donsetch search --sources` shows each source's
+  standing (verified, suspect, benched until when), trust, independence family and
+  last canary. `donsetch search --doctor` asks eight canary queries whose right
+  answer is a first-party record ("attention is all you need", "rust tokio crate",
+  and six more) and judges every source against them, so a source that decays is
+  benched within three calls and one that recovers returns without anyone
+  noticing. A source is convicted only by a live answer: a cached one proves
+  nothing and is never read as a failure.
+- **AWS pricing pages come out as price tables.** An `aws.amazon.com` pricing page
+  holds templates (`{priceOf!lambda/lambda!Lambda!Duration!Tier2}`), not prices;
+  its own script fills them from a public price file. The fetch now reads that
+  file the way the script does (same token grammar, exact decimal arithmetic, the
+  region the page shows by default) and puts the filled tables in the page.
+  Witnessed on Lambda, S3, SQS, EKS and DynamoDB: S3 Standard reads $0.023,
+  $0.022 and $0.021 per GB, SQS $0.40 per million requests, EKS $0.10 per cluster
+  hour, each as AWS publishes it. A row whose price is not published for the
+  region is dropped, as the page drops it. Tables of one row per instance type
+  (RDS, EC2 instances), other partitions and non-English locales are left as
+  served, and so is any table whose price file did not arrive in time.
+
 ### Changed
+
+- **Ranking is by measured agreement, not by text match.** Results are fused by
+  reciprocal rank per *independent* family of sources (which sources return the
+  same pages is measured, not declared), and the merge is deterministic. The text
+  match, trust prior and authority multiplier that used to reorder the answer are
+  gone. On the 44-row gold set, live and paced: hit@1 0.68, hit@3 0.86,
+  hit@5 0.89, p50 0.99 s, p95 2.30 s (5.1.1 scored hit@1 0.25 and hit@3 0.47 on
+  the 40 rows the set had then; it grew to 44 while this was built, and it is the
+  set the ranking was tuned on). On 50 held-out rows it was not tuned on: hit@1 0.76, hit@3 0.90, hit@5 0.96. The weakest shape is
+  general web questions (hit@1 0.33 on six rows).
+- **The Linux Chrome identity sends Chrome 156, not 149.** Measured against
+  Chromium 156 on the same host, its TLS and HTTP/2 fingerprints, header order and
+  every header value except the headless token are identical to the real
+  browser's; only the version it printed was old, and it now sends the reference
+  browser's own. `chrome-win` and `chrome-android` still print their profile's 149:
+  no reference browser of those platforms was available to measure them against,
+  so they are not relabelled.
 
 - **Search answers in about a second, not five.** The fan-out runs under one
   budget: a soft mark that ends the wait once independent sources already agree,
@@ -47,6 +107,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selectors find fewer than three results, so a restyle costs results instead of
   the source. bing's HTML answer also falls back to its RSS interface (the same
   index, 5 KB, no parser) when the page answer does not credit the source.
+
+### Fixed
+
+- **Tabbed pages kept their tables.** A tab's whole content, tables and headings
+  included, sits in an `<li role="tabpanel">`; read as a list item it flattened
+  into one line of running text. A list of tab panels is now read as the sections
+  it is.
+- **A figure's labels no longer enter a PDF's outline.** A caption or a row of
+  labels set large and bold used to be promoted to a heading. A line now counts as
+  a heading only when its typeface or its size also introduces running text at
+  least twice in the document; a figure's labels introduce only more labels. The
+  price is stated: a real heading set in a face and size used nowhere else, after
+  the first page and followed by a table or a list, reads as a paragraph (no text
+  is lost). Checked on all eight PDFs of the corpus.
 
 ## [5.1.1] - 2026-11-08
 
