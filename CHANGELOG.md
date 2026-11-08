@@ -45,6 +45,12 @@ the fixes and the hardening found since.
   answers and comments, as Stack Overflow's already did, instead of meeting
   the Cloudflare wall in front of the page.
 
+- **YouTube videos read as their card.** A watch, Shorts, live or `youtu.be`
+  URL gives the title, channel, date, length, views, category, chapters and
+  the full description, links included, from the data the page carries for
+  its own player. It came back as player component names and interface
+  strings, with the description dropped for its links.
+
 ### Fixed
 
 - **Links.** `--links=handles` on the command line sent `true` and returned
@@ -79,8 +85,17 @@ the fixes and the hardening found since.
   because the apology and the list of browsers under the headline read as
   prose. A headline that refuses the reader's browser now makes what stands
   under it the notice; a page about supported browsers, or an article with
-  sections under such a headline, stays content. A page whose only text is a
-  Korean statutory business footer is not content either.
+  sections under such a headline, stays content. An age gate is the same
+  notice: a headline that is only the ask ("Please tell us: When were you
+  born?", "Are you of legal drinking age?") makes heineken.com a notice
+  quoting it, while "Are you over 50? Here's what to know" heads an article.
+  A page whose only text is a Korean statutory business footer is not content
+  either.
+- **Missing pages.** A page with no `h1` that leads with a "404" or "Page not
+  found" `h2` is reported as not found (Medium's missing post came back as the
+  app's membership plans), and the embedded-data rescue skips the app's own
+  settings in the page state (`config`, feature flags, experiments,
+  environment, analytics, translations).
 - **Page chrome is not read as the page.** When a page's visible text is thin,
   the rescue that reads its embedded app data took any JSON script: a job
   site's homepage came back as its navigation bar's prompt strings. A JSON
