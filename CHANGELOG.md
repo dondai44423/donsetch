@@ -52,6 +52,12 @@ the fixes and the hardening found since.
   `colspan`, and tables, code and quotes wrapped in `<figure>` are kept. The
   outline indents headings by nesting, not by level number, and a linked
   heading is listed by its words.
+- **GitHub.** Issue, pull request and release bodies keep their paragraphs,
+  lists and code blocks (an issue's reproduction came back as one line), with
+  their headings nested under the thread or release; release notes are clipped
+  between blocks, never inside a code fence. Pull request pages render as
+  threads again, with their state (open, closed, merged), instead of the
+  generic page and its UI chrome.
 - **Paging.** With no paragraph break near the cut, a page ended mid-row or
   inside a link address; it now ends on a line or a word outside any link, and
   the next page resumes exactly there.
