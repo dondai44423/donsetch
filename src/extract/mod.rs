@@ -1049,8 +1049,11 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
     if end < text.len() {
         // Prefer a block boundary within the last quarter of the window.
         let window_start = ceil_char_boundary(text, start + (end - start) * 3 / 4);
-        if let Some(pos) = text[window_start..end].rfind("\n\n") {
-            end = window_start + pos;
+        // A page always advances: a boundary at the very start of a tiny
+        // window would hand back the same offset forever.
+        let cut = window_start + soft_cut(&text[window_start..end]);
+        if cut > start {
+            end = cut;
         }
     }
     let next = if end < text.len() { Some(end) } else { None };
@@ -1065,6 +1068,26 @@ fn paginate(text: &str, offset: usize, max_chars: usize) -> (String, Option<usiz
         }
     }
     (slice, next)
+}
+
+/// Where to end a page inside its last quarter `tail`: a block break, else
+/// a line break (a table row stays whole), else a space that is not inside
+/// a link, else the hard cut. Returns a byte offset into `tail`; the next
+/// page resumes there, so nothing is skipped whichever boundary is chosen.
+fn soft_cut(tail: &str) -> usize {
+    if let Some(pos) = tail.rfind("\n\n").or_else(|| tail.rfind('\n')) {
+        return pos;
+    }
+    // A cut inside `[text](url` leaves a link that goes nowhere: end the
+    // page before the link instead.
+    let mut limit = tail.len();
+    if let Some(open) = tail.rfind("](")
+        && !tail[open..].contains(')')
+        && let Some(label) = tail[..open].rfind('[')
+    {
+        limit = label;
+    }
+    tail[..limit].rfind(' ').unwrap_or(limit)
 }
 
 /// Shared pagination for dedicated extractors (reddit, hn).

@@ -3359,3 +3359,73 @@ fn a_table_indented_by_a_blockquote_stays_a_table() {
     assert!(md.contains("| TEXT | TEXT |"), "{md}");
     assert!(md.contains("> A real quotation stays quoted"), "{md}");
 }
+
+/// Pages of `text` read in order, without their truncation markers.
+fn pages_of(text: &str, max: usize) -> Vec<String> {
+    let mut pages = Vec::new();
+    let mut offset = 0;
+    loop {
+        let (slice, next) = paginate_public(text, offset, max);
+        let body = slice
+            .split("\n\n*[truncated")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        pages.push(body);
+        match next {
+            Some(n) => {
+                assert!(n > offset, "a page must advance: {offset} -> {n}");
+                offset = n;
+            }
+            None => return pages,
+        }
+    }
+}
+
+#[test]
+fn a_long_table_pages_at_row_boundaries() {
+    let mut table = String::from("| Name | Value |\n| --- | --- |\n");
+    for i in 0..200 {
+        table.push_str(&format!(
+            "| row {i} | [value {i}](https://example.test/v/{i}) |\n"
+        ));
+    }
+    let pages = pages_of(&table, 1000);
+    assert!(pages.len() > 3);
+    for page in &pages[..pages.len() - 1] {
+        assert!(
+            page.ends_with('|'),
+            "page ends mid-row: {:?}",
+            &page[page.len().saturating_sub(40)..]
+        );
+    }
+    assert_eq!(
+        pages.concat(),
+        table,
+        "paging must neither lose nor repeat text"
+    );
+}
+
+#[test]
+fn a_page_never_ends_inside_a_link() {
+    let line: String = (0..300)
+        .map(|i| format!("[item {i}](https://example.test/a/very/long/path/{i}) "))
+        .collect();
+    let pages = pages_of(&line, 900);
+    for page in &pages[..pages.len() - 1] {
+        let open = page.rfind("](");
+        assert!(
+            open.is_none_or(|o| page[o..].contains(')')),
+            "page ends inside a link: {:?}",
+            &page[page.len().saturating_sub(60)..]
+        );
+    }
+    assert_eq!(pages.concat(), line);
+}
+
+#[test]
+fn a_tiny_window_still_advances() {
+    let text = "\n\nab\n\ncd\n\nef gh ij [k](https://x.test/) end";
+    let pages = pages_of(text, 2);
+    assert_eq!(pages.concat(), text);
+}
