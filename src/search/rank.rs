@@ -462,47 +462,6 @@ pub(crate) fn family_count(r: &Merged) -> usize {
     families.len()
 }
 
-/// Weak-results honesty: no cross-family consensus on the
-/// TOP result and a shallow merge means the answer is not
-/// trustworthy. `merged_total` is the PRE-truncation count
-/// : a max_results=4 call must not read as shallow when
-/// fifty results merged underneath it.
-pub fn is_weak(results: &[Merged], merged_total: usize, query: &str) -> bool {
-    if results.is_empty() {
-        return true;
-    }
-    let top = &results[0];
-    let families: std::collections::HashSet<&str> =
-        top.sources.iter().map(|(e, _)| engine_family(e)).collect();
-    (families.len() < 2 && merged_total < 8) || relevance_is_weak(results, query)
-}
-
-/// A lexical warning, never a filter: paraphrases and untranslated queries
-/// can share few terms with useful sources, so every result remains available.
-pub fn relevance_is_weak(results: &[Merged], query: &str) -> bool {
-    let compiled = super::query::compile(query);
-    let text = format!(
-        "{} {}",
-        compiled.text,
-        compiled.intitle.as_deref().unwrap_or("")
-    );
-    let lang = crate::extract::language::detect_from_text(&text);
-    let terms: std::collections::HashSet<_> = crate::extract::focus::tokenize(&text, &lang)
-        .into_iter()
-        .collect();
-    if terms.is_empty() {
-        return false;
-    }
-    !results.iter().take(3).any(|result| {
-        let document = format!("{} {}", result.title, result.snippet);
-        let tokens: std::collections::HashSet<_> =
-            crate::extract::focus::tokenize(&document, &lang)
-                .into_iter()
-                .collect();
-        terms.intersection(&tokens).count().saturating_mul(5) >= terms.len().saturating_mul(3)
-    })
-}
-
 /// Host category for fetch routing; it does not verify a page's claims.
 pub fn source_type(raw: &str) -> &'static str {
     let host = host_of(raw);
@@ -526,7 +485,7 @@ pub fn source_type(raw: &str) -> &'static str {
     }
 }
 
-/// Total results before truncation : feed to is_weak.
+/// Total results before truncation : the cache and retry gates read it.
 pub fn merged_total(per_engine: &[(String, Vec<super::engines::Hit>)]) -> usize {
     let mut keys = std::collections::HashSet::new();
     for (_, hits) in per_engine {
@@ -539,36 +498,6 @@ pub fn merged_total(per_engine: &[(String, Vec<super::engines::Hit>)]) -> usize 
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn report_audit_weak_checks_query_relevance_despite_engine_agreement() {
-        let result = Merged {
-            title: "Unicode format for network interchange".into(),
-            url: "https://www.rfc-editor.org/info/rfc5198/".into(),
-            snippet: "An RFC on Unicode normalization.".into(),
-            sources: vec![("bing".into(), 1), ("google".into(), 1)],
-            score: 1.0,
-            published: None,
-        };
-        assert!(is_weak(
-            std::slice::from_ref(&result),
-            50,
-            "zzqqx nonexistent unicorn protocol RFC 99999 qwertyuiop"
-        ));
-        assert!(!is_weak(
-            std::slice::from_ref(&result),
-            50,
-            "site:rfc-editor.org Unicode normalization"
-        ));
-        assert!(is_weak(&[], 50, "site:rfc-editor.org"));
-        assert!(!relevance_is_weak(
-            std::slice::from_ref(&result),
-            "site:rfc-editor.org"
-        ));
-        let mut chinese = result;
-        chinese.title = "机器学习模型与训练".into();
-        assert!(!relevance_is_weak(&[chinese], "机器学习"));
-    }
-
     #[test]
     fn report_audit_source_types_do_not_trust_lookalike_domains() {
         assert_eq!(source_type("https://www.youtube.com/watch?v=abc"), "video");
@@ -774,7 +703,6 @@ mod tests {
         let trust = std::collections::HashMap::new();
         let out = merge(&[], "anything", Intent::Web, &trust, 10);
         assert!(out.is_empty());
-        assert!(is_weak(&out, 0, "anything"));
     }
 
     #[test]

@@ -104,6 +104,60 @@ pub(super) fn clip_snippet(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// One line of retrieval state: every source that answered, with its item count,
+/// and every source that did not, with the reason it gave.
+///
+/// This replaces the "weak results" flag and the "degraded N/M" line together.
+/// A flag told the model how to feel about the list; the census tells it what
+/// happened, which is the only thing that changes the next action. It names
+/// off-query answers too — a 200 carrying ten unrelated items is a fact about
+/// retrieval, not a success.
+pub fn census(report: &[super::EngineReport]) -> String {
+    let states = source_states(report);
+    if states.is_empty() {
+        return "sources: none".into();
+    }
+    let parts: Vec<String> = states
+        .into_iter()
+        .map(|(name, hits, status)| {
+            if matches!(status.as_str(), "ok" | "cached") {
+                format!("{name} {hits}")
+            } else if hits > 0 {
+                format!("{name} {hits} {status}")
+            } else {
+                format!("{name} — {status}")
+            }
+        })
+        .collect();
+    format!("sources: {}", parts.join(" · "))
+}
+
+/// Deduped per-source retrieval state: `(source, items, status)`.
+///
+/// The one source of truth behind the text census and the JSON `sources` field.
+/// A source that answered once and failed on a retry still counts as answered;
+/// `blocked:` is shortened to its code because the name says the rest.
+pub fn source_states(report: &[super::EngineReport]) -> Vec<(String, usize, String)> {
+    use std::collections::BTreeMap;
+    let mut best: BTreeMap<&str, &super::EngineReport> = BTreeMap::new();
+    for entry in report {
+        let slot = best.entry(entry.engine.as_str()).or_insert(entry);
+        if matches!(entry.status.as_str(), "ok" | "thin" | "cached") {
+            *slot = entry;
+        }
+    }
+    best.into_iter()
+        .map(|(name, entry)| {
+            let status = entry
+                .status
+                .strip_prefix("blocked:")
+                .unwrap_or(&entry.status)
+                .to_string();
+            (name.to_string(), entry.hits, status)
+        })
+        .collect()
+}
+
 /// Markdown rendering for the MCP/CLI surface.
 pub fn render_markdown(
     out: &SearchOutcome,
@@ -188,40 +242,24 @@ pub fn render_markdown(
             ));
         }
     }
-    if out.weak {
-        md.push_str("\n*weak results: low cross-engine consensus : treat with care*\n");
-    }
-    // Zero hits is a success-shaped answer with nothing in it :
-    // tell the agent which levers exist instead of leaving it
-    // staring at an empty list.
     if out.results.is_empty() {
         md.push_str(
             "\n*0 results : try a simpler query, a different intent (news/code/paper), \
 or add an API-key provider (`donsetch keys add`)*\n",
         );
     }
-    let source = out.provider.as_deref().unwrap_or("local engine");
+    let source = out.provider.as_deref().unwrap_or("local search");
     md.push_str(&format!(
         "\n*{} results in {}ms via {}*\n",
         out.results.len(),
         out.elapsed.as_millis(),
         source
     ));
-    // v3: degraded engines are named, never silently fewer. A merge
-    // built while engines were down must never pass as full-strength.
-    let (unavailable, total) = out.engine_health();
-    let failed: Vec<String> = unavailable
-        .iter()
-        .map(|r| format!("{}: {}", r.engine, r.status))
-        .collect();
-    if !failed.is_empty() {
-        md.push_str(&format!(
-            "*degraded: {}/{} engines ok ({}) : results may skew*\n",
-            total - failed.len(),
-            total,
-            failed.join(", ")
-        ));
-    }
+    // The census is the honesty layer: which sources answered, with how many
+    // items, and what every source that did not answer actually said. It is not
+    // a "weak results" mood -- it is the retrieval state, which is what changes
+    // the next action (rephrase, wait, or fetch anyway).
+    md.push_str(&format!("*{}*\n", census(&out.report)));
     if handles.is_some() && !out.results.is_empty() {
         md.push_str("*fetch results by their S-handle (raw urls in the result metadata)*\n");
     }
@@ -295,18 +333,8 @@ pub fn render_compact_markdown(
 
     if out.results.is_empty() {
         markdown.push_str("No results. Retry once with a materially different formulation.\n");
-    } else if out.weak {
-        markdown.push_str("Weak results : low query relevance or cross-index agreement.\n");
     }
-
-    let (unavailable, total) = out.engine_health();
-    if !unavailable.is_empty() {
-        markdown.push_str(&format!(
-            "Degraded retrieval : {}/{} backends available.\n",
-            total - unavailable.len(),
-            total
-        ));
-    }
+    markdown.push_str(&format!("{}\n", census(&out.report)));
 
     markdown.trim_end().to_string()
 }
@@ -333,7 +361,6 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
     });
     json!({
         "intent": format!("{:?}", out.intent),
-        "weak": out.weak,
         "cached": out.cached,
         "elapsed_ms": out.elapsed.as_millis() as u64,
         "stage_ms": if out.stage_ms.is_empty() {

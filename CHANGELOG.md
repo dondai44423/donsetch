@@ -5,6 +5,31 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Search reports what answered, and refuses what did not.** Every source's
+  answer is classified before it can influence ranking: `content`, `thin`,
+  `off-query` (a 200 carrying a result list that never mentions the query — a
+  bot-page wearing a success shape), `empty`, or a request-level failure
+  (`403`, `timeout`). Only real answers earn rank mass or health credit.
+  Measured on this network: one general source answered 38 of 40 queries with
+  ten items, and 24 of those answers engaged no query term at all, which a
+  status-code health model read as 95% healthy.
+- **The `weak` flag is gone, and so is the `degraded: N/M` line.** One census
+  line replaces both: `sources: bing 10 · ddg 10 · brave 19 · mojeek — 403`.
+  `structuredContent` carries `sources: [{id, items, status}]`; the `weak` and
+  `failed_engines` fields are removed.
+- **A source that stops answering stops holding a slot.** A source at the trust
+  floor benches for ten minutes, then is probed once; a failure re-benches it
+  and a success returns it to the roster. `google` and `mojeek` were failing on
+  every search here, spending a third of the fan-out on nothing.
+- **Result extraction falls back to the document's shape** when a source's known
+  selectors find fewer than three results, so a restyle costs results instead of
+  the source. bing's HTML answer also falls back to its RSS interface (the same
+  index, 5 KB, no parser) when the page answer does not credit the source.
+
 ## [5.1.1] - 2026-11-08
 
 A release that takes minutes of waiting instead of hours, and an updater that no

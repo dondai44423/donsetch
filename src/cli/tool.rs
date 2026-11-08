@@ -394,23 +394,22 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
                 format!("{:.1}s", ms as f64 / 1000.0),
                 format!("provider {provider}"),
             ];
-            if sc.get("weak").and_then(|v| v.as_bool()).unwrap_or(false) {
-                parts.push("weak consensus".into());
-            }
-            // Surface degraded engine health in plain mode so agents
-            // can tell coverage dropped without parsing --json.
+            // Surface retrieval state in plain mode: the sources that did not
+            // answer, and what they said. `ok` and `thin` answered; an
+            // `off-query` answer is named too, because a 200 full of unrelated
+            // items is a fact about retrieval, not a success.
             if let Some(engines) = pick(&sc, &dbg, "engines").and_then(|e| e.as_array()) {
                 let degraded: Vec<String> = engines
                     .iter()
                     .filter_map(|e| {
                         let status = e.get("status").and_then(|s| s.as_str())?;
                         let name = e.get("engine").and_then(|n| n.as_str())?;
-                        if status == "ok" {
+                        if matches!(status, "ok" | "thin") {
                             return None;
                         }
                         // Shorten status for compactness.
-                        let short = if status.starts_with("blocked:") {
-                            format!("{name} blocked")
+                        let short = if let Some(code) = status.strip_prefix("blocked:") {
+                            format!("{name} {code}")
                         } else {
                             format!("{name} {status}")
                         };
@@ -418,7 +417,7 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
                     })
                     .collect();
                 if !degraded.is_empty() {
-                    parts.push(format!("degraded: {}", degraded.join(", ")));
+                    parts.push(format!("unanswered: {}", degraded.join(", ")));
                 }
             }
             format!("[{cmd}] ok · {}", parts.join(" · "))
@@ -559,7 +558,6 @@ fn render_json_envelope(result: &Value, url: &str) -> Value {
 fn machine_meta(result: &Value, sc: &Value) -> Value {
     const SEARCH_MACHINE_FIELDS: &[&str] = &[
         "intent",
-        "weak",
         "cached",
         "elapsed_ms",
         "provider",
@@ -807,20 +805,20 @@ mod tests {
     #[test]
     fn stats_line_search() {
         let v = json!({
-            "structuredContent": {"results": [{"rank": 1}, {"rank": 2}], "weak": true},
+            "structuredContent": {"results": [{"rank": 1}, {"rank": 2}]},
             "_meta": {
                 "com.donsetch/search-debug": {"elapsed_ms": 2100, "provider": null}
             }
         });
         let s = stats_line("search", &v, 0);
         assert!(s.contains("2 results"));
-        assert!(s.contains("weak consensus"));
+        assert!(!s.contains("weak"));
     }
 
     #[test]
     fn stats_line_search_degraded_engines() {
         let v = json!({
-            "structuredContent": {"results": [{"rank": 1}], "weak": false},
+            "structuredContent": {"results": [{"rank": 1}]},
             "_meta": {
                 "com.donsetch/search-debug": {
                     "elapsed_ms": 5000,
@@ -834,8 +832,8 @@ mod tests {
             }
         });
         let s = stats_line("search", &v, 0);
-        assert!(s.contains("degraded"));
-        assert!(s.contains("mojeek blocked"));
+        assert!(s.contains("unanswered"));
+        assert!(s.contains("mojeek 429"));
         assert!(s.contains("brave timeout"));
         assert!(!s.contains("bing")); // healthy engine not mentioned
     }
@@ -846,14 +844,13 @@ mod tests {
             "results": [{"title": "a"}],
             "elapsed_ms": 2000,
             "provider": null,
-            "weak": false,
             "engines": [
                 {"engine": "bing", "status": "ok", "hits": 5, "ms": 800},
                 {"engine": "ddg", "status": "ok", "hits": 3, "ms": 600}
             ]
         });
         let s = stats_line("search", &sc, 0);
-        assert!(!s.contains("degraded"));
+        assert!(!s.contains("unanswered"));
     }
 
     #[test]

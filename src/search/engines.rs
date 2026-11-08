@@ -136,15 +136,21 @@ pub(crate) fn is_serp_url(url: &str) -> bool {
 }
 
 pub fn parse(engine: &str, html: &str) -> Vec<Hit> {
-    parse_with_instant(engine, html).0
+    parse_with_instant(engine, html, "").0
 }
 
 /// One DOM parse feeds both the organic hit list and the C5
 /// instant layer. html5ever on a multi-MB SERP is the expensive
 /// part; doing it twice per engine was pure waste.
+///
+/// `page_url` is the SERP's own address: the shape fallback needs it to
+/// resolve relative links and to know the page's host. Known selectors are
+/// tried first (precise, cheap); when they yield nothing the document's shape
+/// answers instead, so a restyle costs results, never the source.
 pub fn parse_with_instant(
     engine: &str,
     html: &str,
+    page_url: &str,
 ) -> (Vec<Hit>, Option<super::instant::InstantAnswer>) {
     let doc = Html::parse_document(html);
     let mut hits = match engine {
@@ -165,6 +171,14 @@ pub fn parse_with_instant(
     // search.yahoo.com/search pagination links, undecoded
     // r.search.yahoo.com redirects, bing.com/ck/a stubs).
     hits.retain(|h| !is_serp_url(&h.url));
+    // Selector rot insurance: a parser that finds fewer than three results on a
+    // page that visibly contains a list has met a restyle, not an empty SERP.
+    if hits.len() < 3 && !page_url.is_empty() {
+        let shaped = shape_extract(html, page_url);
+        if shaped.len() > hits.len() {
+            hits = shaped;
+        }
+    }
     let instant = super::instant::parse_instant_doc(engine, &doc);
     if hits.is_empty() && crate::config::cfg().debug.search {
         let dump = std::env::temp_dir().join(format!("donseek_debug_{engine}.html"));
@@ -442,8 +456,471 @@ pub fn serp_url(engine: &str, query: &str) -> Option<String> {
         "ddg_html" => Some(format!("https://html.duckduckgo.com/html/?q={q}")),
         "mojeek" => Some(format!("https://www.mojeek.com/search?q={q}")),
         "yahoo" => Some(format!("https://search.yahoo.com/search?p={q}")),
+        // The same index as `bing`, through the one interface it publishes
+        // as data rather than layout: RSS 2.0, ten items, no pagination and
+        // no `site:` support. Used as bing's fallback, never as a 7th slot.
+        "bing_rss" => Some(format!("https://www.bing.com/search?format=rss&q={q}")),
         _ => None,
     }
+}
+
+// ── Answer contracts: what a source replied, not just that it replied ────────
+
+/// How a source publishes its answer. A structured format costs no DOM parse
+/// and cannot rot with a restyle; HTML is the fallback, never the first choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Html,
+    Rss,
+}
+
+pub fn format(engine: &str) -> Format {
+    match engine {
+        "bing_rss" => Format::Rss,
+        _ => Format::Html,
+    }
+}
+
+/// What came back, as a property of the *answer* rather than of the request.
+///
+/// `OffQuery` is the class this layer exists for: an HTTP 200 carrying a full
+/// result list that has nothing to do with the query. Measured on this network:
+/// bing's RSS answered 38/40 queries with ten items, and 24 of those answers
+/// engaged no query term at all. A status-code health model scores that as 95%
+/// healthy; this one scores it as the failure it is, and keeps the items out of
+/// the merge so one bot-page cannot pollute a query's ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerClass {
+    Content,
+    /// Few items, or a mixed bag: the items are real, the answer is not full.
+    Thin,
+    /// A 200 with a result list that does not engage the query at all.
+    OffQuery,
+    Empty,
+}
+
+impl AnswerClass {
+    /// Status string for the report; stable names, they reach the model.
+    pub fn status(self) -> &'static str {
+        match self {
+            Self::Content => "ok",
+            Self::Thin => "thin",
+            Self::OffQuery => "off-query",
+            Self::Empty => "empty-parse",
+        }
+    }
+
+    /// Whether these items may enter the merge.
+    pub fn contributes(self) -> bool {
+        matches!(self, Self::Content | Self::Thin)
+    }
+
+    /// Whether this answer earns the source trust. A thin answer is real but
+    /// unproven; an off-query one is evidence against the source.
+    pub fn credits(self) -> bool {
+        matches!(self, Self::Content)
+    }
+}
+
+/// Query words that carry no answer signal when matching a result list.
+const ANSWER_STOP: &[&str] = &[
+    "the", "and", "for", "how", "what", "who", "why", "when", "where", "which", "does", "did",
+    "can", "could", "should", "would", "with", "without", "from", "into", "about", "best", "vs",
+    "versus", "you", "your", "are", "was", "were", "this", "that", "these", "those", "there",
+];
+
+/// The words an answer has to show to count as answering `query`.
+pub fn answer_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .filter(|w| !ANSWER_STOP.contains(&w.as_str()))
+        // One-char tokens ("c", "r") match everything; keep two and up, which
+        // is what "go", "js" and "5g" need.
+        .filter(|w| w.chars().count() >= 2 || w.chars().any(|c| c.is_numeric()))
+        .collect()
+}
+
+/// Does `text` engage any of the query's terms? Whole-token match for short
+/// words, prefix match for long ones so "dataclass" finds "dataclasses".
+fn engages(terms: &[String], text: &str) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
+        .filter(|w| !w.is_empty())
+        .collect();
+    terms.iter().any(|t| {
+        words
+            .iter()
+            .any(|w| *w == t.as_str() || (t.chars().count() >= 5 && w.starts_with(t.as_str())))
+    })
+}
+
+/// Fraction of the top ten items that show any engagement with the query.
+pub fn engagement(query: &str, hits: &[Hit]) -> f64 {
+    let terms = answer_terms(query);
+    if hits.is_empty() {
+        return 0.0;
+    }
+    let top = hits.iter().take(10).collect::<Vec<_>>();
+    let engaged = top
+        .iter()
+        .filter(|h| engages(&terms, &format!("{} {} {}", h.title, h.snippet, h.url)))
+        .count();
+    engaged as f64 / top.len() as f64
+}
+
+/// Classify a web source's answer. Verticals do not come through here: an API
+/// that returns items has answered, and its own relevance ranking is the
+/// contract (`vertical_class`).
+pub fn classify(query: &str, hits: &[Hit]) -> AnswerClass {
+    if hits.is_empty() {
+        return AnswerClass::Empty;
+    }
+    let share = engagement(query, hits);
+    // A query with no answer terms (a bare number, a symbol) cannot be judged
+    // by engagement; take the items at their word.
+    if answer_terms(query).is_empty() {
+        return AnswerClass::Content;
+    }
+    match (hits.len(), share) {
+        (3.., s) if s >= 0.5 => AnswerClass::Content,
+        (3.., s) if s < 0.25 => AnswerClass::OffQuery,
+        (_, s) if s >= 0.5 => AnswerClass::Thin,
+        _ => AnswerClass::Thin,
+    }
+}
+
+/// A first-party interface answered with items: its own ranking is the
+/// contract, so the only failure it can commit here is returning nothing.
+pub fn vertical_class(hits: &[Hit]) -> AnswerClass {
+    if hits.is_empty() {
+        AnswerClass::Empty
+    } else {
+        AnswerClass::Content
+    }
+}
+
+// ── Shape extraction: the document's structure, never its class names ────────
+
+/// Blocks containing more anchors than this are a list of *results*, not one.
+const BLOCK_MAX_ANCHORS: usize = 3;
+/// A block longer than this is a page section, not a result.
+const BLOCK_MAX_CHARS: usize = 1600;
+/// The climb stops once the block carries at least this much text.
+const BLOCK_MIN_CHARS: usize = 60;
+const MAX_SHAPED: usize = 20;
+
+/// Extract results from any SERP by shape alone.
+///
+/// A result is a *block*: an element holding one primary outbound link, a
+/// heading, and some text, sitting in a list of siblings that look the same.
+/// Nothing here reads a class name, an id, or a tag order, which is the point:
+/// the commonest way a scraped engine dies is a restyle, and a restyle cannot
+/// change the document's shape without ceasing to be a search results page.
+pub fn shape_extract(html: &str, page_url: &str) -> Vec<Hit> {
+    use scraper::ElementRef;
+    use std::collections::{HashMap, HashSet};
+
+    let Ok(base) = url::Url::parse(page_url) else {
+        return Vec::new();
+    };
+    let page_host = base
+        .host_str()
+        .unwrap_or("")
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let doc = Html::parse_document(html);
+    let anchors = sel("a[href]");
+    let headings = sel("h1, h2, h3, h4, h5, h6");
+    // Text length is read for every ancestor of every anchor; on a 250 KB SERP
+    // that is thousands of subtree walks. One pass per node, remembered.
+    let mut len_cache: HashMap<ego_tree::NodeId, usize> = HashMap::new();
+    let text_len = |el: ElementRef<'_>, cache: &mut HashMap<ego_tree::NodeId, usize>| -> usize {
+        *cache
+            .entry(el.id())
+            .or_insert_with(|| text(el).chars().count())
+    };
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<Hit> = Vec::new();
+    for anchor in doc.select(&anchors) {
+        if out.len() >= MAX_SHAPED {
+            break;
+        }
+        let raw = anchor.value().attr("href").unwrap_or("");
+        let url = resolve_result_url(raw, &base);
+        let Ok(parsed) = url::Url::parse(&url) else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https") || is_serp_url(&url) {
+            continue;
+        }
+        let host = parsed
+            .host_str()
+            .unwrap_or("")
+            .trim_start_matches("www.")
+            .to_ascii_lowercase();
+        if host.is_empty()
+            || host == page_host
+            || host.ends_with(&format!(".{page_host}"))
+            || page_host.ends_with(&format!(".{host}"))
+        {
+            continue;
+        }
+        let anchor_text = text(anchor);
+        // The block: climb while the ancestor still looks like ONE result.
+        let mut node = anchor;
+        let mut block = anchor;
+        for _ in 0..6 {
+            let Some(parent) = node.parent().and_then(ElementRef::wrap) else {
+                break;
+            };
+            if parent.select(&anchors).count() > BLOCK_MAX_ANCHORS
+                || text_len(parent, &mut len_cache) > BLOCK_MAX_CHARS
+            {
+                break;
+            }
+            node = parent;
+            block = parent;
+            if text_len(block, &mut len_cache) >= BLOCK_MIN_CHARS {
+                break;
+            }
+        }
+        // Title: the block's own heading when it has one, else the link text.
+        // Breadcrumbs and URL echoes are rejected the same way ranking does.
+        let heading = block.select(&headings).next().map(text).unwrap_or_default();
+        let title = if heading.chars().count() >= 8 && !heading.contains(" › ") {
+            heading
+        } else {
+            anchor_text.clone()
+        };
+        if title.chars().count() < 8 || is_nav_text(&title) {
+            continue;
+        }
+        let mut snippet = text(block);
+        if let Some(pos) = snippet.find(&title) {
+            snippet = snippet[pos + title.len()..].to_string();
+        }
+        let snippet = scrub_snippet(&snippet);
+        let key = super::rank::norm_key(&url);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(Hit {
+            title,
+            url,
+            snippet,
+            rank: out.len(),
+            published: None,
+        });
+    }
+    out
+}
+
+/// A result link as the source meant it: engine wrappers decoded, relatives
+/// resolved. Every source must report the SAME url or consensus cannot match.
+fn resolve_result_url(raw: &str, base: &url::Url) -> String {
+    if raw.contains("uddg=") {
+        return decode_ddg(raw);
+    }
+    if raw.contains("bing.com/ck/a") {
+        return decode_bing(raw);
+    }
+    if raw.contains("r.search.yahoo.com") || raw.contains("search.yahoo.com/search") {
+        return decode_yahoo(raw);
+    }
+    base.join(raw).map(|u| u.to_string()).unwrap_or_default()
+}
+
+/// Navigation and chrome that live in the same list as results.
+fn is_nav_text(title: &str) -> bool {
+    const NAV: &[&str] = &[
+        "next",
+        "previous",
+        "more results",
+        "load more",
+        "sign in",
+        "log in",
+        "settings",
+        "help",
+        "privacy",
+        "terms",
+        "about",
+        "feedback",
+        "images",
+        "videos",
+        "news",
+        "maps",
+        "shopping",
+    ];
+    let t = title.trim().to_lowercase();
+    NAV.iter()
+        .any(|n| t == *n || t.starts_with(&format!("{n} ")))
+}
+
+/// Snippet text with the URL echoes and breadcrumbs every SERP block repeats.
+fn scrub_snippet(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for token in raw.split_whitespace() {
+        if token.starts_with("http://") || token.starts_with("https://") {
+            continue;
+        }
+        if token == "›" || token.starts_with("›") {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    let out = out.trim_matches(|c: char| c.is_whitespace() || "-–—|:·.,".contains(c));
+    out.chars().take(400).collect()
+}
+
+// ── RSS: the structured interface ────────────────────────────────────────────
+
+/// Parse an RSS 2.0 / Atom answer into hits. Small on purpose: the two formats
+/// we consume carry four fields, and a hand-rolled scanner keeps `quick-xml`
+/// out of the product's dependency set for forty lines of work.
+pub fn parse_rss(body: &str) -> Vec<Hit> {
+    let mut out = Vec::new();
+    for item in rss_items(body) {
+        let title = tag_text(item, &["title"]).unwrap_or_default();
+        let url = tag_text(item, &["link"])
+            .or_else(|| atom_link(item))
+            .unwrap_or_default();
+        let snippet = tag_text(item, &["description", "summary", "content"]).unwrap_or_default();
+        let published = tag_text(item, &["pubDate", "published", "updated"])
+            .and_then(|d| super::verticals::rss_date_to_iso(&d));
+        if !url.starts_with("http") || title.trim().is_empty() {
+            continue;
+        }
+        out.push(Hit {
+            title: strip_markup(&title),
+            url,
+            snippet: strip_markup(&snippet),
+            rank: out.len(),
+            published,
+        });
+    }
+    out
+}
+
+fn rss_items(body: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    for tag in ["item", "entry"] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let mut from = 0;
+        while let Some(start) = body[from..].find(&open) {
+            let start = from + start;
+            let Some(end) = body[start..].find(&close) else {
+                break;
+            };
+            items.push(&body[start..start + end]);
+            from = start + end + close.len();
+        }
+    }
+    items
+}
+
+/// Inner text of the first of `names` present in `item`, CDATA unwrapped and
+/// entities decoded. Attribute values are ignored: neither format puts a
+/// title there.
+fn tag_text(item: &str, names: &[&str]) -> Option<String> {
+    for name in names {
+        let open = format!("<{name}");
+        let Some(pos) = item.find(&open) else {
+            continue;
+        };
+        let after = &item[pos + open.len()..];
+        // `<title>` or `<title lang="en">`; anything else is a different tag
+        // whose name merely starts the same way.
+        let body = match after.find('>') {
+            Some(gt) if !after[..gt].starts_with(|c: char| c.is_alphanumeric()) => &after[gt + 1..],
+            Some(gt) if after[..gt].trim().is_empty() => &after[gt + 1..],
+            Some(gt) if after[..gt].starts_with(' ') || after[..gt].contains('=') => {
+                &after[gt + 1..]
+            }
+            _ => continue,
+        };
+        let close = format!("</{name}>");
+        let Some(end) = body.find(&close) else {
+            continue;
+        };
+        return Some(decode_xml(&body[..end]));
+    }
+    None
+}
+
+/// Atom's `<link href="..."/>` since Atom has no link element body.
+fn atom_link(item: &str) -> Option<String> {
+    let pos = item.find("<link")?;
+    let after = &item[pos..];
+    let gt = after.find('>')?;
+    let tag = &after[..gt];
+    let href = tag.split("href=\"").nth(1)?;
+    Some(decode_xml(href.split('"').next()?))
+}
+
+fn decode_xml(raw: &str) -> String {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix("<![CDATA[")
+        .and_then(|r| r.strip_suffix("]]>"))
+        .unwrap_or(raw);
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let Some(semi) = tail.find(';').filter(|s| *s <= 10) else {
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let entity = &tail[1..semi];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            e if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16)
+                .ok()
+                .and_then(char::from_u32),
+            e if e.starts_with('#') => e[1..].parse::<u32>().ok().and_then(char::from_u32),
+            _ => None,
+        };
+        match decoded {
+            Some(c) => out.push(c),
+            None => out.push_str(&tail[..=semi]),
+        }
+        rest = &tail[semi + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Feeds carry HTML in their summaries; the agent gets text.
+fn strip_markup(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    for c in raw.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -670,5 +1147,193 @@ mod visible_text_guard_tests {
         assert!(!t.contains("window.r"), "{t}");
         assert!(t.contains("Result title"), "{t}");
         assert!(t.contains("and body"), "{t}");
+    }
+}
+
+#[cfg(test)]
+mod answer_contract_tests {
+    use super::*;
+
+    fn hit(url: &str, title: &str) -> Hit {
+        Hit {
+            title: title.into(),
+            url: url.into(),
+            snippet: String::new(),
+            rank: 0,
+            published: None,
+        }
+    }
+
+    #[test]
+    fn an_off_query_answer_is_not_content() {
+        // The measured shape: a 200 with ten items, none of which mentions the
+        // query. French forums and zhihu topics for an English query.
+        let hits = vec![
+            hit(
+                "https://forums.example.fr/t/1",
+                "Que faire en cas d'oubli d'adresse",
+            ),
+            hit(
+                "https://zhihu.example/q/2",
+                "Instagram密码正确但就是登录不了",
+            ),
+            hit(
+                "https://forums.example.fr/t/3",
+                "Appel instagram qui se coupe",
+            ),
+        ];
+        let class = classify("rust tokio spawn_blocking", &hits);
+        assert_eq!(class, AnswerClass::OffQuery);
+        assert!(!class.contributes(), "an off-query answer must not rank");
+        assert!(!class.credits(), "an off-query answer must not earn trust");
+        assert_eq!(class.status(), "off-query");
+    }
+
+    #[test]
+    fn an_on_topic_answer_is_content() {
+        let hits = vec![
+            hit(
+                "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
+                "spawn_blocking in tokio::task",
+            ),
+            hit(
+                "https://users.rust-lang.org/t/spawn-blocking",
+                "Tokio::spawn_blocking blocks the thread?",
+            ),
+            hit(
+                "https://tokio.rs/tokio/tutorial",
+                "Tokio tutorial: spawning tasks",
+            ),
+        ];
+        let class = classify("rust tokio spawn_blocking", &hits);
+        assert_eq!(class, AnswerClass::Content);
+        assert!(class.contributes() && class.credits());
+    }
+
+    #[test]
+    fn a_short_answer_is_thin_not_off_query() {
+        let hits = vec![hit(
+            "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
+            "spawn_blocking in tokio::task",
+        )];
+        let class = classify("rust tokio spawn_blocking", &hits);
+        assert_eq!(class, AnswerClass::Thin);
+        assert!(class.contributes(), "real items still answer");
+        assert!(!class.credits(), "one item is not proof about the source");
+    }
+
+    #[test]
+    fn no_items_is_empty_and_a_blank_query_is_taken_at_its_word() {
+        assert_eq!(classify("rust tokio", &[]), AnswerClass::Empty);
+        assert!(!AnswerClass::Empty.contributes());
+        // A query with no answer terms cannot be judged by engagement.
+        let hits = vec![hit("https://a.example/x", "anything at all")];
+        assert_eq!(classify("a", &hits), AnswerClass::Content);
+    }
+
+    #[test]
+    fn engagement_ignores_case_and_matches_plurals_by_prefix() {
+        let hits = vec![hit(
+            "https://docs.python.org/3/library/dataclasses.html",
+            "Dataclasses — Python documentation",
+        )];
+        // "dataclass" must reach "Dataclasses", "frozen" nothing.
+        assert!(engagement("python dataclass frozen", &hits) > 0.0);
+        assert_eq!(engagement("kubernetes liveness probe", &hits), 0.0);
+    }
+
+    #[test]
+    fn a_structured_answer_needs_no_selector() {
+        let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel><title>Bing: rust tokio</title>
+<item><title>spawn_blocking in tokio::task</title>
+  <link>https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html</link>
+  <description>Use &amp; enjoy spawn_blocking.</description>
+  <pubDate>Thu, 31 Jul 2026 07:00:00 GMT</pubDate></item>
+<item><title>No date here</title><link>https://example.com/b?x=1&amp;y=2</link>
+  <description><![CDATA[Use <b>spawn_blocking</b> for blocking work.]]></description></item>
+</channel></rss>"#;
+        let hits = parse_rss(body);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "spawn_blocking in tokio::task");
+        assert_eq!(hits[0].published.as_deref(), Some("2026-07-31"));
+        assert_eq!(hits[1].url, "https://example.com/b?x=1&y=2");
+        assert!(
+            hits[1].snippet.contains("spawn_blocking") && !hits[1].snippet.contains('<'),
+            "markup is stripped, entities decoded: {:?}",
+            hits[1].snippet
+        );
+        assert!(hits[1].published.is_none());
+        // Two items: real, but an incomplete answer.
+        assert_eq!(
+            classify("rust tokio spawn_blocking", &hits),
+            AnswerClass::Thin
+        );
+    }
+
+    fn shaped_serp(prefix: &str) -> String {
+        let item = |slug: &str, title: &str, text: &str| {
+            format!(
+                r#"<div class="{prefix}-item"><h3 class="{prefix}-title">
+                <a href="{slug}">{title}</a></h3><p class="{prefix}-text">{text}</p></div>"#
+            )
+        };
+        format!(
+            r#"<html><body><nav class="{prefix}-nav"><a href="/next">Next page</a>
+            <a href="/about">About us</a></nav><main class="{prefix}-main"><div class="{prefix}-list">
+            {a}{b}{c}</div></main></body></html>"#,
+            a = item(
+                "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
+                "spawn_blocking in tokio::task",
+                "Use spawn_blocking for short-lived blocking operations."
+            ),
+            b = item(
+                "https://users.rust-lang.org/t/spawn-blocking/85990",
+                "spawn_blocking blocks the thread",
+                "A forum thread about blocking calls in async code."
+            ),
+            c = item(
+                "https://tokio.rs/tokio/tutorial/spawning",
+                "Tokio tutorial: spawning",
+                "How the runtime spawns work and blocking tasks."
+            ),
+        )
+    }
+
+    #[test]
+    fn shape_reading_survives_a_restyle() {
+        // Two documents with identical content and no shared class name: the
+        // commonest way a scraped engine dies is a restyle, and shape reading
+        // must not care. This is the whole point of the fallback.
+        let base = "https://www.example-search.test/search?q=rust+tokio";
+        let one = shape_extract(&shaped_serp("s"), base);
+        let two = shape_extract(&shaped_serp("z9-kx"), base);
+        assert_eq!(one.len(), 3, "three results: {one:#?}");
+        assert_eq!(two.len(), 3, "three results: {two:#?}");
+        let urls = |v: &[Hit]| v.iter().map(|h| h.url.clone()).collect::<Vec<_>>();
+        assert_eq!(urls(&one), urls(&two));
+        assert_eq!(one[0].title, "spawn_blocking in tokio::task");
+        assert!(
+            one[0].snippet.starts_with("Use spawn_blocking"),
+            "snippet is the block's own text: {:?}",
+            one[0].snippet
+        );
+        // Navigation on the SERP's own host is never a result.
+        assert!(one.iter().all(|h| !h.url.contains("example-search.test")));
+    }
+
+    #[test]
+    fn shape_reading_decodes_a_wrapped_result_url() {
+        let body = format!(
+            r#"<html><body><div><div><h3><a href="https://lite.duckduckgo.com/lite/?q=x&amp;uddg={}">spawn_blocking in tokio</a></h3>
+            <p>Use it for blocking work.</p></div></div></body></html>"#,
+            "https%3A%2F%2Fdocs.rs%2Ftokio%2Flatest%2Ftokio%2Ftask%2Ffn.spawn_blocking.html"
+        );
+        let hits = shape_extract(&body, "https://lite.duckduckgo.com/lite/?q=x");
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert_eq!(
+            hits[0].url,
+            "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html"
+        );
     }
 }

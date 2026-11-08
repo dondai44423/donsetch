@@ -15,21 +15,28 @@ use crate::fetch::client::Fetcher;
 
 /// Engine fan-out outcome.
 ///
-/// Ok: (hits, latency_ms, egress_id, was_engine, instant).
-/// `was_engine` is true for web engines (pool bookkeeping applies)
-/// and false for verticals. `instant` is a byte-derived SERP
-/// answer, if any; it is never merged into the organic hit list.
+/// One lane's answer, with the class the *answer* earned (not the class the
+/// request earned): `contributes()` decides whether its items may enter the
+/// merge, `credits()` whether the source earned trust. See
+/// [`engines::AnswerClass`].
 /// Err: (status, egress_id, was_engine).
-pub(super) type EngineResult = Result<
-    (
-        Vec<engines::Hit>,
-        u64,
-        String,
-        bool,
-        Option<super::instant::InstantAnswer>,
-    ),
-    (String, String, bool),
->;
+#[derive(Debug)]
+pub(super) struct LaneAnswer {
+    pub hits: Vec<engines::Hit>,
+    /// Items the source actually returned, before the class decided whether
+    /// they may be used. The census reports this, so a source that answered
+    /// with ten off-query items is visible as such instead of as silence.
+    pub items: usize,
+    pub ms: u64,
+    pub egress: String,
+    /// True for web engines (pool bookkeeping applies), false for verticals.
+    pub engine_lane: bool,
+    /// A byte-derived SERP answer, if any; never merged into the hit list.
+    pub instant: Option<super::instant::InstantAnswer>,
+    pub class: engines::AnswerClass,
+}
+
+pub(super) type EngineResult = Result<LaneAnswer, (String, String, bool)>;
 
 pub(super) type TaskFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = (String, EngineResult)> + Send + 'a>>;
@@ -131,7 +138,6 @@ pub(super) async fn engine_task_with_budget(
         Ok(Err(e)) => return (label, Err((engine_fetch_status(&e), egress_id, true))),
         Ok(Ok(o)) => o,
     };
-    let ms = started.elapsed().as_millis() as u64;
     pool.observe_rtt(&egress_id, started.elapsed());
     // The deadline covers the FETCH only; the decode + DOM parse
     // below run synchronously after it. A hostile (or
@@ -168,7 +174,7 @@ pub(super) async fn engine_task_with_budget(
             Err((format!("blocked:{}", out.status), egress_id, true)),
         );
     }
-    let (mut hits, instant) = engines::parse_with_instant(&engine, &html);
+    let (mut hits, instant) = engines::parse_with_instant(&engine, &html, &url);
     let scoped = super::query::compile(&query).site;
     if let Some(site) = &scoped {
         let (site, path) = super::query::site_scope(site);
@@ -196,10 +202,93 @@ pub(super) async fn engine_task_with_budget(
         };
         return (label, Err((status.into(), egress_id, true)));
     }
-    if let Some(lease) = &lease {
-        google.finish(lease, "ok");
+    // The answer class, decided before a single item can influence ranking:
+    // an off-query answer is a bot-page wearing a 200, and its items never
+    // reach the merge whatever their rank.
+    let mut class = engines::classify(&query, &hits);
+    let mut instant = instant;
+    // bing's HTML lane is the one general source that also publishes a
+    // structured answer. When its layout answer does not credit the source,
+    // the same index is asked once as RSS: one extra request, no parser, ~5 KB.
+    // Its feed endpoint ignores `site:`, so a scoped query must not take an
+    // unscoped answer: the fallback is for the general case only.
+    if !class.credits()
+        && engine == "bing"
+        && scoped.is_none()
+        && let Some((rss_hits, rss_class)) =
+            bing_rss_fallback(&query, lane, fetcher, deadline).await
+        && rss_class.credits()
+    {
+        hits = rss_hits;
+        class = rss_class;
+        instant = None;
     }
-    (label, Ok((hits, ms, egress_id, true, instant)))
+    let items = hits.len();
+    if let Some(lease) = &lease {
+        google.finish(
+            lease,
+            if class.credits() {
+                "ok"
+            } else {
+                class.status()
+            },
+        );
+    }
+    let kept = if class.contributes() {
+        hits
+    } else {
+        Vec::new()
+    };
+    (
+        label,
+        Ok(LaneAnswer {
+            hits: kept,
+            items,
+            ms: started.elapsed().as_millis() as u64,
+            egress: egress_id,
+            engine_lane: true,
+            instant,
+            class,
+        }),
+    )
+}
+
+/// bing's structured answer, asked only when its layout answer failed to credit
+/// the source. Returns `None` when the deadline cannot carry another request or
+/// when the feed itself does not answer.
+async fn bing_rss_fallback(
+    query: &str,
+    lane: Option<&crate::egress::proxy::Proxy>,
+    fetcher: &Fetcher,
+    deadline: tokio::time::Instant,
+) -> Option<(Vec<engines::Hit>, engines::AnswerClass)> {
+    if deadline.saturating_duration_since(tokio::time::Instant::now())
+        < std::time::Duration::from_millis(400)
+    {
+        return None;
+    }
+    let url = engines::serp_url("bing_rss", query)?;
+    let out = tokio::time::timeout_at(
+        deadline,
+        fetcher.fetch_once_via(&url, &[], lane, false, None),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if out.status != 200 || !matches!(out.verdict, Verdict::ContentOk) {
+        return None;
+    }
+    let body = crate::extract::charset::decode(
+        &out.body,
+        out.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("application/xml"),
+    );
+    let hits = engines::parse_rss(&body);
+    let class = engines::classify(query, &hits);
+    Some((hits, class))
 }
 
 pub(super) async fn vertical_task(
@@ -236,7 +325,22 @@ fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (Stri
     if hits.is_empty() {
         return (vertical, Err(("no-results".into(), "direct".into(), false)));
     }
-    (vertical, Ok((hits, ms, "direct".into(), false, None)))
+    // A first-party API's own ranking is its contract; returning items is its
+    // only way to pass, and its class says so (see engines::vertical_class).
+    let class = engines::vertical_class(&hits);
+    let items = hits.len();
+    (
+        vertical,
+        Ok(LaneAnswer {
+            hits,
+            items,
+            ms,
+            egress: "direct".into(),
+            engine_lane: false,
+            instant: None,
+            class,
+        }),
+    )
 }
 
 /// The engine-report status for a SERP or vertical request a local rule
@@ -412,11 +516,11 @@ mod tests {
                 context,
             )
             .await;
-            let (hits, ms, egress, was_engine, _instant) =
-                outcome.expect("Google HTTP lane must return usable results");
+            let answer = outcome.expect("Google HTTP lane must return usable results");
+            let (hits, ms) = (&answer.hits, answer.ms);
             assert!(engine.starts_with("google@"));
-            assert_eq!(egress, "direct");
-            assert!(was_engine);
+            assert_eq!(answer.egress, "direct");
+            assert!(answer.engine_lane);
             assert!(hits.len() >= 3);
             assert!(
                 hits.iter()
@@ -469,12 +573,13 @@ mod tests {
     fn vertical_with_hits_is_success() {
         let (name, result) = vertical_success("github".into(), vec![hit("A", "https://a.com")], 42);
         assert_eq!(name, "github");
-        let (hits, ms, egress, was_engine, instant) = result.expect("hits => success");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(ms, 42);
-        assert_eq!(egress, "direct");
-        assert!(!was_engine);
-        assert!(instant.is_none());
+        let answer = result.expect("hits => success");
+        assert_eq!(answer.hits.len(), 1);
+        assert_eq!(answer.ms, 42);
+        assert_eq!(answer.egress, "direct");
+        assert!(!answer.engine_lane);
+        assert!(answer.instant.is_none());
+        assert_eq!(answer.class, crate::search::engines::AnswerClass::Content);
     }
 
     /// Serves `body` for one HTTPS request to `host` through a CONNECT
@@ -593,7 +698,7 @@ mod tests {
         ]);
         let (_, result) = run_bing("runtime site:github.com/tokio-rs", body).await;
         match result {
-            Ok((hits, ..)) => assert_eq!(hits.len(), 3),
+            Ok(answer) => assert_eq!(answer.hits.len(), 3),
             Err((status, ..)) => panic!(
                 "Bing returned 3 github.com/tokio-rs hits; the lane reported {status:?} with none kept"
             ),
@@ -610,7 +715,7 @@ mod tests {
             ("https://gitlab.com/tokio-rs/tokio", "tokio-rs/tokio mirror"),
         ]);
         let (_, result) = run_bing("runtime site:github.com/tokio-rs", body).await;
-        let (hits, ..) = result.expect("the one on-path hit is kept");
+        let hits = result.expect("the one on-path hit is kept").hits;
         let kept: Vec<&str> = hits.iter().map(|hit| hit.url.as_str()).collect();
         assert_eq!(kept, vec!["https://github.com/tokio-rs/tokio"]);
     }

@@ -425,7 +425,6 @@ impl ByokSearcher {
                     });
                     return Ok(SearchOutcome {
                         results,
-                        weak: false,
                         intent,
                         report,
                         cached: false,

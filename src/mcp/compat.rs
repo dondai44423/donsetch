@@ -30,7 +30,7 @@
 //! leading `[meta]` text block, `structuredContent` is dropped, and the document stays a
 //! clean markdown text block. Every tool folds the same way,
 //! web_search included: its model-facing `structuredContent` is the
-//! lean `{weak, results:[{rank,url,handle}]}` routing state built by
+//! lean `{results:[{rank,url,handle}], sources}` routing state built by
 //! `search_model_meta`, while the titles and snippets live in the
 //! markdown block. The per-result title/snippet/score/engines view
 //! is `search_debug_meta`, which rides in `_meta` and never reaches

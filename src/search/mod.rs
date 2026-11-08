@@ -26,7 +26,7 @@ pub use persist::load_outcome_for_status as persist_load_outcome_for_status;
 pub use persist::load_quality_for_status as persist_load_quality_for_status;
 pub use persist::outcome_class;
 
-pub use render::{render_compact_markdown, render_markdown, render_meta};
+pub use render::{census, render_compact_markdown, render_markdown, render_meta, source_states};
 
 use enrich::PrewarmCache;
 use persist::{
@@ -71,6 +71,16 @@ fn stage_budget(cap: Duration, reserve: Duration) -> Duration {
 /// Chronic-failure bench time. A walled engine stops wasting a
 /// fan-out slot for this long after 3 consecutive strikes.
 const QUARANTINE_TTL: Duration = Duration::from_secs(600);
+
+/// Trust at or below this means the source has proved it does not answer here.
+/// It stops holding a roster slot, so a dead engine costs zero requests instead
+/// of one per query (`google` and `mojeek` were failing on every search with a
+/// third of the fan-out spent on them).
+const TRUST_FLOOR: f64 = 0.35;
+
+/// How long a proven-dead source sits out before it is probed once. Reusing the
+/// quarantine TTL keeps one clock for "this source is not answering here".
+const REPROBE_AFTER: Duration = QUARANTINE_TTL;
 
 /// Intent + recency-aware cache TTL. Every cached query
 /// is a query that never touches an egress : the #1 rate
@@ -231,6 +241,16 @@ fn trust_target_for(engine: &str, status: &str, ok: bool) -> f64 {
     if ok {
         return 1.2;
     }
+    // An off-query answer beside peers that DID answer the same query is a
+    // bot-page wearing a 200: the source is walled, and decays like one. Alone
+    // -- no source engaged the query -- the shape is the query's, not the
+    // site's, and decays gently.
+    if status == "off-query" {
+        return 0.3;
+    }
+    if status == "off-query-alone" {
+        return 0.6;
+    }
     if engine == "mojeek" && status == "empty-parse" {
         return 0.15;
     }
@@ -244,9 +264,10 @@ fn early_consensus_enough(outcomes: &[(String, EngineResult)]) -> bool {
     let mut url_families: HashMap<String, HashSet<&str>> = HashMap::new();
     let mut families_ok: HashSet<&str> = HashSet::new();
     for (label, result) in outcomes {
-        let Ok((hits, _, _, _, _)) = result else {
+        let Ok(answer) = result else {
             continue;
         };
+        let hits = &answer.hits;
         let fam = rank::engine_family(engine_name(label));
         families_ok.insert(fam);
         for h in hits.iter().take(3) {
@@ -357,7 +378,6 @@ pub struct EngineReport {
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub results: Vec<Merged>,
-    pub weak: bool,
     pub intent: Intent,
     pub report: Vec<EngineReport>,
     pub cached: bool,
@@ -372,26 +392,6 @@ pub struct SearchOutcome {
     /// Post-fan-out phase timings for the search-debug meta:
     /// (stage, ms). Empty for the cache/BYOK paths.
     pub stage_ms: Vec<(&'static str, u128)>,
-}
-
-impl SearchOutcome {
-    /// Unavailable unique backends and total backends tried. A successful or
-    /// cached attempt wins over failed retries; `report` keeps every attempt.
-    pub(crate) fn engine_health(&self) -> (Vec<&EngineReport>, usize) {
-        let mut engines = std::collections::BTreeMap::new();
-        for report in &self.report {
-            let current = engines.entry(report.engine.as_str()).or_insert(report);
-            if matches!(report.status.as_str(), "ok" | "cached") {
-                *current = report;
-            }
-        }
-        let total = engines.len();
-        let failed = engines
-            .into_values()
-            .filter(|report| !matches!(report.status.as_str(), "ok" | "cached"))
-            .collect();
-        (failed, total)
-    }
 }
 
 impl Searcher {
@@ -465,10 +465,8 @@ impl Searcher {
         site_filter(query, &mut results);
         query::intitle_filter(query, &mut results);
         query::filetype_filter(query, &mut results);
-        let weak = results.is_empty() || rank::relevance_is_weak(&results, query);
         Some(SearchOutcome {
             results,
-            weak,
             intent,
             report: report.clone(),
             cached: true,
@@ -626,6 +624,17 @@ impl Searcher {
     }
 
     fn record_outcome(&self, engine: &str, ok: bool) {
+        // A source whose trust has already reached the floor is not on a
+        // probation it can fail three times: it benches on the next failure.
+        // The streak is what persists across processes (the loader keeps only
+        // streaks of three or more), so this is also what makes a dead engine
+        // stay out of a CLI that starts a fresh process per search.
+        let at_floor = self
+            .trust
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(engine)
+            .is_some_and(|t| *t <= TRUST_FLOOR);
         let mut f = self
             .failures
             .lock()
@@ -635,10 +644,43 @@ impl Searcher {
         } else {
             let e = f.entry(engine.to_string()).or_insert((0, Instant::now()));
             e.0 += 1;
+            if at_floor {
+                e.0 = e.0.max(3);
+            }
             e.1 = Instant::now();
         }
         self.health_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Should this source sit out this search?
+    ///
+    /// Yes when its trust is at the floor and it is inside its bench window,
+    /// which [`Searcher::record_outcome`] extends to [`REPROBE_AFTER`] once the
+    /// floor is reached. After the window it is tried exactly once; a failure
+    /// re-benches it, a success lifts it back into the roster. Nothing here
+    /// needs a restart, a human, or a separate probe schedule.
+    fn resting(&self, base_engine: &str) -> bool {
+        let trust = self
+            .trust
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(base_engine)
+            .copied()
+            .unwrap_or(1.0);
+        if trust > TRUST_FLOOR {
+            return false;
+        }
+        let failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failures.get(base_engine) {
+            Some((strikes, at)) => *strikes >= 3 && at.elapsed() < REPROBE_AFTER,
+            // At the floor with no streak on record is contradictory state (a
+            // hand-edited file); one request settles it either way.
+            None => false,
+        }
     }
 
     pub async fn search(
@@ -676,17 +718,15 @@ impl Searcher {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&format!("{}|{}", norm_query(query), intent_probe.code()))
                     .cloned();
-                if let Some((at, cached, total, reports)) = hit
+                if let Some((at, cached, _total, reports)) = hit
                     && at.elapsed() < cache_ttl(intent_probe, query)
                 {
                     let mut results = cached.iter().take(max_results).cloned().collect();
                     site_filter(query, &mut results);
                     query::intitle_filter(query, &mut results);
                     query::filetype_filter(query, &mut results);
-                    let weak = rank::is_weak(&results, total, query);
                     return Ok(SearchOutcome {
                         results,
-                        weak,
                         intent: intent_probe,
                         report: reports,
                         cached: true,
@@ -723,7 +763,7 @@ impl Searcher {
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
         let cache_key = format!("{}|{}", norm_query(query), intent.code());
 
-        if let Some((at, cached, total, reports)) = self
+        if let Some((at, cached, _total, reports)) = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -734,10 +774,8 @@ impl Searcher {
             site_filter(query, &mut results);
             query::intitle_filter(query, &mut results);
             query::filetype_filter(query, &mut results);
-            let weak = rank::is_weak(&results, *total, query);
             return Ok(SearchOutcome {
                 results,
-                weak,
                 intent,
                 report: reports.clone(),
                 cached: true,
@@ -780,8 +818,18 @@ impl Searcher {
         let mut live: Vec<&str> = engines
             .iter()
             .filter(|e| !self.quarantined(engine_health_key(e)))
+            .filter(|e| !self.resting(engine_health_key(e)))
             .copied()
             .collect();
+        // Every source resting at once means the roster, not the sources, is
+        // wrong: try them all rather than answering from nothing.
+        if live.is_empty() {
+            live = engines
+                .iter()
+                .filter(|e| !self.quarantined(engine_health_key(e)))
+                .copied()
+                .collect();
+        }
         // Rank engines by learned trust so width cuts drop
         // the weakest first. Per-intent sample wins; engine-global
         // is the fallback (B2).
@@ -896,11 +944,15 @@ impl Searcher {
         // through a fresh egress : but ONLY when the first
         // wave left the merge thin. A healthy merge never
         // pays retry latency; a degraded one recovers.
-        let ok_engines = outcomes.iter().filter(|(_, r)| r.is_ok()).count();
+        let ok_engines = outcomes
+            .iter()
+            .filter(|(_, r)| r.as_ref().is_ok_and(|a| a.class.credits()))
+            .count();
         let ok_hits: usize = outcomes
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
-            .map(|(h, _, _, _, _)| h.len())
+            .filter(|a| a.class.contributes())
+            .map(|a| a.hits.len())
             .sum();
         let merge_thin = ok_engines < 3 || ok_hits < 15;
         let failed: Vec<String> = if merge_thin {
@@ -984,6 +1036,10 @@ impl Searcher {
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
+        // Off-query verdicts wait for the whole query: a source that served a
+        // bot-page while three peers answered is walled; one that found nothing
+        // on a query nobody could answer is not.
+        let mut off_query: Vec<(String, String)> = Vec::new();
         // C5: best instant answer across lanes (first non-empty wins
         // by engine trust order, which outcomes already respect).
         let mut instant: Option<instant::InstantAnswer> = None;
@@ -992,29 +1048,40 @@ impl Searcher {
             let profile = label.split_once('@').map(|(_, p)| p.to_string());
             let engine = engine_name(&label).to_string();
             match outcome {
-                Ok((hits, ms, egress_id, was_engine, lane_instant)) => {
+                Ok(answer) => {
                     let base = engine_health_key(&engine);
-                    self.record_outcome(base, true);
-                    if was_engine {
-                        self.pool.report_ok(&engine, &egress_id);
-                    }
-                    if was_engine {
-                        self.bump_trust(base, intent, true);
+                    if answer.class.credits() {
+                        // A real answer: the only branch that earns the source,
+                        // the lane and the profile selector any credit.
+                        self.record_outcome(base, true);
+                        if answer.engine_lane {
+                            self.pool.report_ok(&engine, &answer.egress);
+                            self.bump_trust(base, intent, true);
+                        }
+                    } else if answer.class == engines::AnswerClass::Thin {
+                        // Real items, incomplete answer: use them, learn nothing.
+                        // Thinness is not evidence about the source.
+                    } else if answer.engine_lane {
+                        // Its items never reach the merge; what it means for the
+                        // source is decided once every answer is in (below).
+                        off_query.push((base.to_string(), engine.clone()));
                     }
                     if instant.is_none()
-                        && let Some(ans) = lane_instant
+                        && let Some(ans) = answer.instant
                     {
                         instant = Some(ans);
                     }
                     report.push(EngineReport {
                         engine: engine.clone(),
                         profile: profile.clone(),
-                        status: "ok".into(),
-                        hits: hits.len(),
-                        ms,
-                        egress: egress_id.clone(),
+                        status: answer.class.status().into(),
+                        hits: answer.items,
+                        ms: answer.ms,
+                        egress: answer.egress.clone(),
                     });
-                    per_engine.push((engine, hits));
+                    if !answer.hits.is_empty() {
+                        per_engine.push((engine, answer.hits));
+                    }
                 }
                 Err((status, egress_id, was_engine)) => {
                     let base = engine_health_key(&engine);
@@ -1044,6 +1111,20 @@ impl Searcher {
                         ms: 0,
                         egress: egress_id,
                     });
+                }
+            }
+        }
+
+        // Every lane has answered: now the off-query verdict has its context.
+        if !off_query.is_empty() {
+            let answered = report.iter().filter(|r| r.status == "ok").count();
+            for (base, _engine) in &off_query {
+                if answered >= 2 {
+                    // Peers answered this query; this source served a bot-page.
+                    self.record_outcome(base, false);
+                    self.bump_trust_status(base, intent, false, "off-query");
+                } else {
+                    self.bump_trust_status(base, intent, false, "off-query-alone");
                 }
             }
         }
@@ -1181,7 +1262,6 @@ impl Searcher {
         // halves of the build matrix.
         #[cfg(not(feature = "rerank"))]
         let topup_ms: u128 = 0;
-        let weak = rank::is_weak(&results, total, query);
         // Poisoning guard: a merge built while engines
         // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
@@ -1246,7 +1326,6 @@ impl Searcher {
 
         Ok(SearchOutcome {
             results: results.into_iter().take(max_results).collect(),
-            weak,
             intent,
             report,
             cached: false,
@@ -1809,7 +1888,6 @@ mod tests {
         }];
         SearchOutcome {
             results,
-            weak: false,
             intent: Intent::Web,
             report,
             cached: false,
@@ -1873,16 +1951,15 @@ mod tests {
             .expect("a fresh BYOK entry must hit");
         assert!(hit.cached, "a served BYOK cache entry must report cached");
         assert_eq!(hit.provider.as_deref(), Some("tinyfish"));
-        assert!(!hit.weak);
         assert_eq!(hit.results.len(), 2);
         assert_eq!(hit.results[0].url, "https://a.test/");
         s.byok_cache_put("qwertyuiop unrelated gibberish", &out);
         let unrelated = s
             .byok_cache_get("qwertyuiop unrelated gibberish", Intent::Web, 3)
             .unwrap();
-        assert!(
-            unrelated.weak,
-            "cached provider ranking cannot certify query relevance"
+        assert_eq!(
+            unrelated.results[0].url, "https://a.test/",
+            "the BYOK cache keys on the query, not on a relevance judgement"
         );
     }
 
@@ -2170,6 +2247,11 @@ mod tests {
         assert_eq!(trust_target_for("bing", "empty-parse", false), 0.3);
         assert_eq!(trust_target_for("mojeek", "blocked:429", false), 0.3);
         assert_eq!(trust_target_for("mojeek", "ok", true), 1.2);
+        // Off-query beside answering peers is a bot-page: it decays like a
+        // block. Alone, the shape is the query's, and decays gently.
+        assert_eq!(trust_target_for("bing", "off-query", false), 0.3);
+        assert_eq!(trust_target_for("brave", "off-query", false), 0.3);
+        assert_eq!(trust_target_for("bing", "off-query-alone", false), 0.6);
     }
 
     #[test]
@@ -2185,16 +2267,19 @@ mod tests {
         let ok = |engine: &str, urls: &[&str]| {
             (
                 engine.to_string(),
-                Ok((
-                    urls.iter()
+                Ok(crate::search::tasks::LaneAnswer {
+                    hits: urls
+                        .iter()
                         .enumerate()
                         .map(|(i, u)| hit(u, i + 1))
                         .collect::<Vec<_>>(),
-                    10u64,
-                    "direct".to_string(),
-                    true,
-                    None,
-                )),
+                    items: urls.len(),
+                    ms: 10,
+                    egress: "direct".to_string(),
+                    engine_lane: true,
+                    instant: None,
+                    class: crate::search::engines::AnswerClass::Content,
+                }),
             )
         };
         // Two families only: not enough.
@@ -2252,6 +2337,29 @@ mod tests {
         let hits = verticals::parse("news", body);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].snippet, "Wire News · Thu, 31 Jul 2026 07:00:00 GMT");
+    }
+
+    #[test]
+    fn a_source_at_the_trust_floor_loses_its_slot_and_earns_it_back() {
+        let s = test_searcher();
+        let key = engine_health_key("google");
+        assert!(!s.resting(key), "an unproven source is never rested");
+        // Eight failures is where the EWMA reaches the floor.
+        for _ in 0..8 {
+            s.bump_trust_status(key, Intent::Web, false, "blocked:http-status");
+            s.record_outcome(key, false);
+        }
+        assert!(
+            s.resting(key),
+            "a dead source must stop costing a request on every query"
+        );
+        assert!(
+            !s.resting(engine_health_key("brave")),
+            "a healthy source keeps its slot"
+        );
+        // One answer and it is back: no restart, no human, no probe schedule.
+        s.record_outcome(key, true);
+        assert!(!s.resting(key), "a success removes the bench");
     }
 
     #[test]
@@ -2623,7 +2731,6 @@ mod tests {
     fn outcome(results: Vec<Merged>) -> SearchOutcome {
         SearchOutcome {
             results,
-            weak: false,
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
@@ -2655,7 +2762,6 @@ mod tests {
         result.sources = vec![("bing".into(), 0), ("ddg".into(), 2)];
         result.score = 0.8312;
         let mut search = outcome(vec![result]);
-        search.weak = true;
         search.report = vec![
             EngineReport {
                 engine: "bing".into(),
@@ -2688,8 +2794,14 @@ mod tests {
             "index-family count follows the route hint: {markdown}"
         );
         assert!(markdown.contains("A focused explanation"));
-        assert!(markdown.contains("Weak results : low query relevance or cross-index agreement."));
-        assert!(markdown.contains("Degraded retrieval : 1/2 backends available."));
+        // The census names who answered and who did not; there is no
+        // "weak" verdict and no degraded ratio to read.
+        assert!(
+            markdown.contains("sources: bing 10 · ddg — 403"),
+            "census line missing: {markdown}"
+        );
+        assert!(!markdown.contains("Weak results"));
+        assert!(!markdown.contains("Degraded retrieval"));
         for diagnostic in [
             "engines:",
             "score:",

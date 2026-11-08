@@ -171,22 +171,23 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
             item
         })
         .collect::<Vec<_>>();
+    // The retrieval state, as facts: who answered, with how many items, and
+    // what every source that did not answer said. There is no verdict flag to
+    // read and no degraded ratio to interpret -- the census is the state.
+    let sources = crate::search::source_states(&out.report)
+        .into_iter()
+        .map(|(id, items, status)| json!({"id": id, "items": items, "status": status}))
+        .collect::<Vec<_>>();
     let mut item = json!({
         "ok": true,
-        "weak": out.weak,
         "results": results,
+        "sources": sources,
         "provider": out.provider.as_deref().unwrap_or("keyless"),
     });
-    let (failed, _) = out.engine_health();
-    let failed = failed.len();
-    if failed > 0 {
-        item["degraded"] = json!(true);
-        item["failed_engines"] = json!(failed);
-        if out.results.is_empty() {
-            item["next_action"] = json!(
-                "retrieval was incomplete; check provider/engine health with doctor --deep or retry another source before concluding that no answer exists"
-            );
-        }
+    if out.results.is_empty() && !out.report.is_empty() {
+        item["next_action"] = json!(
+            "no source returned matching items; rephrase or retry another source before concluding that no answer exists"
+        );
     }
     // Instant answers are decision aids, not ranked evidence: they
     // ride structuredContent (not the organic list) with their source.
@@ -383,9 +384,9 @@ pub(super) async fn search_outcome(
     // Local search (primary in local-first mode, fallback in BYOK-first).
     match daemon.searcher.search(query, max, intent).await {
         Ok(mut out) => {
-            // #285: fold the BYOK failure into the visible engines
-            // trail (the same `degraded:` field local engine
-            // failures use).
+            // #285: fold the BYOK failure into the source census, so a
+            // provider that was configured and did not answer is named
+            // beside the local sources instead of vanishing.
             if let Some(e) = byok_fail {
                 out.report.insert(
                     0,
@@ -470,7 +471,6 @@ async fn byok_search_cached(
             // zero added latency).
             crate::search::site_filter(query, &mut out.results);
             out.results.truncate(max.clamp(1, 12));
-            out.weak |= crate::search::rank::relevance_is_weak(&out.results, query);
             daemon.searcher.spawn_prewarm(&out.results);
             Ok(out)
         })
@@ -555,7 +555,6 @@ mod search_output_contract_tests {
                 score: 0.9,
                 published: None,
             }],
-            weak: false,
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
@@ -609,7 +608,6 @@ mod search_output_contract_tests {
         use crate::search::{EngineReport, render_compact_markdown, render_markdown};
         let mut output = SearchOutcome {
             results: Vec::new(),
-            weak: true,
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
@@ -633,24 +631,30 @@ mod search_output_contract_tests {
             report("bing", "pacing-timeout"),
             report("ddg", "blocked:403"),
         ];
-        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
+        // One state per source, whatever its retries: bing answered (a
+        // successful attempt outlives its retries), ddg did not.
+        let sources = search_model_meta(&output, &[])["sources"].clone();
+        assert_eq!(sources[0]["id"], "bing");
+        assert_eq!(sources[0]["status"], "ok");
+        assert_eq!(sources[1]["id"], "ddg");
+        assert_eq!(sources[1]["status"], "403");
         let compact = render_compact_markdown(&output, "Results", None, &[]);
-        assert!(compact.contains("1/2 backends available"), "{compact}");
+        assert!(compact.contains("sources: bing 0 · ddg — 403"), "{compact}");
         let full = render_markdown(&output, "query", None, &[]);
-        assert!(full.contains("1/2 engines ok (ddg: blocked:403)"), "{full}");
-        // A successful recovery or a cached provider remains available.
+        assert!(full.contains("sources: bing 0 · ddg — 403"), "{full}");
+        // A cached provider answer is still an answer, not a failure.
         output.report = vec![report("bing", "blocked:429"), report("bing", "cached")];
-        assert!(search_model_meta(&output, &[]).get("degraded").is_none());
-        assert!(!render_compact_markdown(&output, "Results", None, &[]).contains("Degraded"));
-        assert!(!render_markdown(&output, "query", None, &[]).contains("degraded"));
+        assert_eq!(
+            search_model_meta(&output, &[])["sources"][0]["status"],
+            "cached"
+        );
         output.report = vec![
             report("bing", "blocked:429"),
             report("bing", "pacing-timeout"),
         ];
-        assert_eq!(search_model_meta(&output, &[])["failed_engines"], 1);
-        assert!(
-            render_compact_markdown(&output, "Results", None, &[])
-                .contains("0/1 backends available")
+        assert_eq!(
+            search_model_meta(&output, &[])["sources"][0]["status"],
+            "429"
         );
     }
 
@@ -665,7 +669,6 @@ mod search_output_contract_tests {
                 score: 0.9,
                 published: None,
             }],
-            weak: false,
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
