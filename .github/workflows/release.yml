@@ -39,6 +39,9 @@ on:
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
+  # scripts/release-mirror.py reads this to fetch pinned prebuilts through
+  # the API asset URL when GitHub's releases/download path 504s.
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   build:
@@ -161,6 +164,29 @@ jobs:
           add-rust-environment-hash-key: "false"
           cache-on-failure: "true"
           save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      # GitHub's releases/download transfer path 504s from time to time
+      # (2026-11-08: every platform leg, for hours, while the API asset URL
+      # served the same bytes). build.rs already retries the PDFium and ONNX
+      # prebuilts through the API on its own; this starts a loopback mirror of
+      # the pinned v8 archive for the one crate that has no fallback. The step
+      # is non-fatal and prints the export it set: if the public path is
+      # healthy, cargo never asks the mirror anything.
+      - name: Mirror the v8 archive (fallback for release-download 504s)
+        shell: bash
+        run: |
+          ver=$(grep -A3 'name = "v8"' Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)
+          python3 scripts/release-mirror.py --port 18777 --v8 "$ver" > mirror.log 2>&1 &
+          for _ in $(seq 1 60); do
+            grep -q 'serving on' mirror.log && break; sleep 2
+          done
+          if grep -q 'serving on' mirror.log; then
+            echo "RUSTY_V8_MIRROR=http://127.0.0.1:18777/v8" >> "$GITHUB_ENV"
+            echo "mirror up for v8 $ver"
+          else
+            echo "::warning::v8 mirror did not start; the public path is used alone"
+            cat mirror.log || true
+          fi
 
       - name: Build
         env:
