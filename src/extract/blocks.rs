@@ -310,6 +310,20 @@ fn walk<'a>(
                 );
             }
         }
+        // A tabbed layout keeps each tab's whole content in a `<ul>` of
+        // `<li role="tabpanel">`: sections of the page, not list lines, and
+        // read as lines they would flatten the tables and headings inside.
+        "ul" | "ol" if holds_tab_panels(el) => {
+            for child in el.children() {
+                let Some(child_el) = ElementRef::wrap(child) else {
+                    continue;
+                };
+                if crate::extract::junk::skip(child_el) {
+                    continue;
+                }
+                walk(child_el, base, opts, headings, out, depth + 1, card);
+            }
+        }
         "ul" | "ol" => {
             let (items, ld) = list_items(el, base, opts, 0);
             if !items.is_empty() {
@@ -572,6 +586,14 @@ fn holds_structure(el: ElementRef<'_>) -> bool {
             "table" | "ul" | "ol" | "pre" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
         )
     })
+}
+
+/// True when a list's items are tab panels: any direct `<li>` says
+/// `role="tabpanel"`.
+fn holds_tab_panels(list: ElementRef<'_>) -> bool {
+    list.children()
+        .filter_map(ElementRef::wrap)
+        .any(|li| li.value().name() == "li" && li.value().attr("role") == Some("tabpanel"))
 }
 
 /// True when an element holds a heading.

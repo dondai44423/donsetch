@@ -3429,3 +3429,37 @@ fn a_tiny_window_still_advances() {
     let pages = pages_of(text, 2);
     assert_eq!(pages.concat(), text);
 }
+
+#[test]
+fn a_tabs_panels_keep_their_tables_and_headings() {
+    // The layout AWS's pricing pages use: each tab's content is an
+    // `<li role="tabpanel">` in a `<ul>`; the tab labels are a list of their own.
+    let html = r#"<html><body><main>
+        <ul role="tablist"><li role="tab">Event Functions</li><li role="tab">MicroVMs</li></ul>
+        <ul class="tabs-content">
+          <li role="tabpanel"><h2>Event Functions Pricing</h2>
+            <p>Event functions are priced per request and per unit of duration, as shown below.</p>
+            <table><thead><tr><th>Tier</th><th>Price</th></tr></thead>
+              <tbody><tr><td>First 6 billion</td><td>$0.0000166667</td></tr>
+              <tr><td>Next 9 billion</td><td>$0.000015</td></tr></tbody></table></li>
+          <li role="tabpanel"><h2>MicroVMs Pricing</h2>
+            <p>MicroVMs are priced per instance-second of provisioned capacity in a region.</p></li>
+        </ul></main></body></html>"#;
+    let out = extract_html(html).markdown;
+    assert!(
+        out.contains("| Tier | Price |") && out.contains("| First 6 billion | $0.0000166667 |"),
+        "the table stays a table: {out}"
+    );
+    assert!(out.contains("## Event Functions Pricing"), "{out}");
+    assert!(out.contains("## MicroVMs Pricing"), "{out}");
+}
+
+#[test]
+fn an_ordinary_list_with_a_table_in_an_item_is_still_a_list() {
+    let html = r#"<html><body><main><p>Steps for the procedure, written out in full below.</p>
+        <ul><li>First step, then read the table here<table><tr><td>a</td><td>b</td></tr></table></li>
+        <li>Second step is to continue with the work</li></ul></main></body></html>"#;
+    let out = extract_html(html).markdown;
+    assert!(out.contains("- First step"), "{out}");
+    assert!(out.contains("- Second step"), "{out}");
+}
