@@ -167,9 +167,34 @@ pub(super) async fn engine_task_with_budget(
             })
         });
     }
-    if hits.len() < if scoped.is_some() { 1 } else { 3 } {
-        // Honest "no results" is NOT an engine failure :
-        // don't burn trust/lanes for a dry query.
+    let mut thin = hits.len() < if scoped.is_some() { 1 } else { 3 };
+    // The answer class, decided before a single item can influence ranking:
+    // an off-query answer is a bot-page wearing a 200, and its items never
+    // reach the merge whatever their rank.
+    let mut class = engines::classify(&query, &hits);
+    let mut instant = instant;
+    // bing's HTML lane is the one general source that also publishes a
+    // structured answer, and the two disagree per query: the same index answers
+    // a layout request with a dry page and a feed request with ten items. One
+    // extra request when the layout answer is thin or does not credit the
+    // source. Its feed endpoint ignores `site:`, so a scoped query never takes
+    // an unscoped answer.
+    if (!class.credits() || thin)
+        && engine == "bing"
+        && scoped.is_none()
+        && let Some((rss_hits, rss_class)) =
+            bing_rss_fallback(&query, lane, fetcher, deadline).await
+        && rss_class.contributes()
+        && (thin || rss_class.credits())
+    {
+        hits = rss_hits;
+        class = rss_class;
+        thin = false;
+        instant = None;
+    }
+    if thin {
+        // Honest "no results" is NOT an engine failure : don't burn trust or
+        // lanes for a dry query.
         let lower = html.to_lowercase();
         let dry = lower.contains("no results")
             || lower.contains("did not match any")
@@ -181,27 +206,6 @@ pub(super) async fn engine_task_with_budget(
             "empty-parse"
         };
         return (label, Err((status.into(), egress_id, true)));
-    }
-    // The answer class, decided before a single item can influence ranking:
-    // an off-query answer is a bot-page wearing a 200, and its items never
-    // reach the merge whatever their rank.
-    let mut class = engines::classify(&query, &hits);
-    let mut instant = instant;
-    // bing's HTML lane is the one general source that also publishes a
-    // structured answer. When its layout answer does not credit the source,
-    // the same index is asked once as RSS: one extra request, no parser, ~5 KB.
-    // Its feed endpoint ignores `site:`, so a scoped query must not take an
-    // unscoped answer: the fallback is for the general case only.
-    if !class.credits()
-        && engine == "bing"
-        && scoped.is_none()
-        && let Some((rss_hits, rss_class)) =
-            bing_rss_fallback(&query, lane, fetcher, deadline).await
-        && rss_class.credits()
-    {
-        hits = rss_hits;
-        class = rss_class;
-        instant = None;
     }
     let items = hits.len();
     if let Some(lease) = &lease {
