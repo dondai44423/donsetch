@@ -568,6 +568,10 @@ fn download_release_asset(dest: &Path, url: &str) -> bool {
     let (Some(owner), Some(repo)) = (parts.first(), parts.get(1)) else {
         return false;
     };
+    // The tag segment is URL-encoded: pdfium-static tags a release
+    // `chromium/7809`, and a raw slash in the path answers 404, which then
+    // reads as "no such asset" when the asset is right there.
+    let tag = tag.replace('/', "%2F");
     let api = Command::new("gh")
         .args([
             "api",
