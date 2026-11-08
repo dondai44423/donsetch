@@ -306,13 +306,13 @@ Every view is computed over the whole extracted page (up to 8 MiB), whatever the
 
 | Option | What comes back |
 |---|---|
-| `must_contain` | Is it on the page? One term or up to 8: a phrase (case, spacing, quote and dash style and markdown emphasis ignored) or a `/regex/`. Per term: `found ×count`, the sections it occurs in and short excerpts, or `not found` with a near-miss hint ("its words all appear in §s4, not as one phrase"). Verdict `match`, `partial`, `no_match`, or `unverified` when part of the page was not read, so absence is never claimed without proof. With `section`, it searches only that part. |
-| `focus` | The passages that answer a question, best first, each under its section path (`§s21 · Syntax and features › Ownership and references › Lifetimes`): paragraphs, list items, table rows with their header row, code. Names the query words the page does not contain. A miss returns the outline, never the whole page. 12-language BM25: CJK unigrams and bigrams, stopwords, stemming, accent folding. |
+| `must_contain` | Is it on the page? One term or up to 8: a phrase (case, spacing, quote and dash style and markdown emphasis ignored) or a `/regex/`. Per term: `found ×count`, the sections it occurs in and short excerpts, or `not found` with a near-miss hint ("its words all appear in §s4, not as one phrase"). Amounts match by value in the page's spelling: `15M` finds `EUR 15 000 000`, `$1.5bn` finds `US$1,500 million`, `3%` finds `3 percent`. Verdict `match`, `partial`, `no_match`, or `unverified` when part of the page was not read, so absence is never claimed without proof. With `section`, it searches only that part. |
+| `focus` | The passages that answer a question, best first, each under its section path (`§s21 · Syntax and features › Ownership and references › Lifetimes`): paragraphs, list items, table rows with their header row, code. A figure in the query (`15M`, `3%`) is found by value, as `must_contain` finds it. Names the query words the page does not contain. A miss returns the outline, never the whole page. 12-language BM25: CJK unigrams and bigrams, stopwords, stemming, accent folding. |
 | `toc` | The heading outline with `sN` ids and sizes, no body. |
 | `section` | One part by `sN` id or heading text, subsections included. A miss returns the outline. |
 | `max_chars`, `offset` | Length cap (16,000 by default; the batch total for a URL array, 48,000 by default). A cut-off response carries `next_offset`; a paginated article names its next part as `next_page`. |
 | `since_last` | Re-check against your previous read: one `unchanged` line, or only the changed sections. |
-| `links` | Keep links as compact `[text](L-handle)` references; pass a handle as `url` to follow it. Off by default (~30% fewer tokens). |
+| `links` | Keep links. `true` or `"urls"`: `[text](https://...)` with the real address, to cite, check or follow it. `"handles"`: compact `[text](L-handle)` references, about half the tokens; pass a handle as `url` to follow it. Off by default: link text only (~30% fewer tokens). |
 | `image_text` | OCR the first four content images into an `image text` section that every view searches. |
 | `deadline_ms` | Hard time limit: a deadline error on expiry, never a hang. Real MCP cancellation and progress notifications. |
 
