@@ -64,8 +64,8 @@
               {
                 "type": "string",
                 "enum": [
-                  "handles",
-                  "urls"
+                  "urls",
+                  "handles"
                 ]
               }
             ],

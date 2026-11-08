@@ -264,8 +264,6 @@ fn is_furniture(el: ElementRef) -> bool {
 /// document, not one paragraph).
 pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &ExtractOptions) -> String {
     let mut out = String::new();
-    let mut opts = opts.clone();
-    opts.include_links = true; // interwiki links are the point of wiki
     for child in root.children() {
         let Some(el) = ElementRef::wrap(child) else {
             continue;
@@ -282,14 +280,14 @@ pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &Extract
                 }
             }
             "p" => {
-                let (m, _) = crate::extract::inline::markdown(el, url, &opts);
+                let (m, _) = crate::extract::inline::markdown(el, url, opts);
                 if !m.trim().is_empty() {
                     out.push_str(m.trim());
                     out.push_str("\n\n");
                 }
             }
             "ul" | "ol" => {
-                let (items, _) = crate::extract::blocks::list_items(el, url, &opts, 0);
+                let (items, _) = crate::extract::blocks::list_items(el, url, opts, 0);
                 if !items.is_empty() {
                     crate::extract::render::push_list(&mut out, &items, el.value().name() == "ol");
                 }
@@ -303,11 +301,11 @@ pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &Extract
             }
             "table" => {
                 // Regular data tables: first 12 rows as pipe table.
-                render_wiki_table(el, url, &opts, &mut out);
+                render_wiki_table(el, url, opts, &mut out);
             }
             "div" | "section" => {
                 // Recurse one level (gallery, columns…).
-                let inner = render_markdown_blocks(el, url, &opts);
+                let inner = render_markdown_blocks(el, url, opts);
                 if !inner.is_empty() {
                     out.push_str(&inner);
                 }
@@ -405,6 +403,36 @@ mod tests {
         for gone in ["Alpha topic", "Gamma topic", "VIAF"] {
             assert!(!ex.markdown.contains(gone), "{gone}: {}", ex.markdown);
         }
+    }
+
+    #[test]
+    fn article_links_follow_the_callers_choice() {
+        let html = WIKI.replace(
+            "multi-paradigm systems programming language",
+            r#"multi-paradigm <a href="/wiki/Systems_programming">systems programming</a> language"#,
+        );
+        let url = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+        let plain = extract(&html, url, &opts()).unwrap();
+        assert!(
+            plain
+                .markdown
+                .contains("multi-paradigm systems programming language"),
+            "{}",
+            plain.markdown
+        );
+        assert!(!plain.markdown.contains("]("), "{}", plain.markdown);
+        let linked_opts = ExtractOptions {
+            include_links: true,
+            ..opts()
+        };
+        let linked = extract(&html, url, &linked_opts).unwrap();
+        assert!(
+            linked.markdown.contains(
+                "[systems programming](https://en.wikipedia.org/wiki/Systems_programming)"
+            ),
+            "{}",
+            linked.markdown
+        );
     }
 
     #[test]

@@ -36,9 +36,10 @@ pub enum ParamKind {
     StrOrListMax(usize),
     /// JSON string from a fixed set; CLI validated choices.
     Enum(&'static [&'static str]),
-    /// JSON `true`/`false` or one string of a fixed set. On the CLI the
-    /// bare flag selects the first string (it sends `true`) and
-    /// `--flag=<value>` selects another.
+    /// JSON `true`/`false` or one string of a fixed set. The first string
+    /// is the mode `true` means: on the CLI the bare flag and
+    /// `--flag=<first>` both send `true`, and `--flag=<value>` sends any
+    /// other string as itself.
     BoolOr(&'static [&'static str]),
     /// JSON array of strings; CLI repeatable + comma-splittable.
     StrList,
@@ -187,7 +188,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
     ParamSpec {
         name: "links",
         flag: "links",
-        kind: ParamKind::BoolOr(&["handles", "urls"]),
+        kind: ParamKind::BoolOr(&["urls", "handles"]),
         cli: CliKind::Flag,
         required: false,
         help: "Keep the page's links. --links (or --links=urls) gives [text](https://...) with the real address, to cite a source, check where a link goes or follow it. --links=handles gives [text](handle) instead: a short L-handle that fetch accepts as its url, about half the tokens of the address. Off by default: link text only, which saves about a third of the tokens.",
@@ -1086,7 +1087,11 @@ mod tests {
         );
         assert_eq!(
             parse(&["fetch", "https://e.test/", "--links=urls"])["links"],
-            "urls"
+            true
+        );
+        assert_eq!(
+            parse(&["fetch", "https://e.test/", "--links=handles"])["links"],
+            "handles"
         );
         assert_eq!(
             parse(&["fetch", "--links", "https://e.test/"])["url"],
