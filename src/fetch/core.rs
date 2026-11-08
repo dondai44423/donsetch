@@ -170,7 +170,7 @@ impl CoreFetcher {
     /// tables in the page (see [`crate::fetch::pricing`]). A page that is not
     /// one, or a file that does not answer in time, leaves the body as served.
     async fn fill_price_tables(&self, out: &mut FetchOutcome, proxy: Option<&Proxy>) {
-        if out.status != 200 || !out.body.windows(20).any(|w| w == b"data-pricing-markup=") {
+        if out.status != 200 || memchr::memmem::find(&out.body, b"data-pricing-markup=").is_none() {
             return;
         }
         let Ok(html) = std::str::from_utf8(&out.body) else {
