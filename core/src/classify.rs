@@ -201,6 +201,24 @@ pub(crate) const ASKS_HUMAN: &[&str] = &[
     "checking your browser before accessing",
 ];
 
+/// A page that says, in so many words, that it does not serve this client's
+/// browser. Teams shows it to every desktop browser class and serves content to
+/// an Android app and a plain HTTP client. Apostrophes are folded before the
+/// match. Only consulted for a page whose content contract already failed, so a
+/// real page that carries such a string in a bundle or a hidden banner is still
+/// content; on a page that is not content, the worst a false match does is
+/// spend two more identities and name the wall (`unsupported-client:` in the
+/// evidence) instead of calling the page incomplete.
+const UNSUPPORTED_CLIENT: &[&str] = &[
+    "your browser version isn't supported",
+    "your browser isn't supported",
+    "your browser is not supported",
+    "this browser isn't supported",
+    "this browser is not supported",
+    "your browser is no longer supported",
+    "this browser is no longer supported",
+];
+
 /// A refusal with no page of its own.
 const REFUSALS: &[&str] = &[
     "access denied",
@@ -482,6 +500,24 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
         };
     }
 
+    // 2xx, contract failed, and the page itself says this browser is not
+    // served: the site is reacting to the client, so another client is asked.
+    if let Some(phrase) = UNSUPPORTED_CLIENT
+        .iter()
+        .find(|phrase| folded.contains(*phrase))
+    {
+        found.push(format!("unsupported-client:{phrase}"));
+        return Verdict {
+            class: Class::WallIdentity,
+            wall: Some(Wall {
+                vendor: "unknown".into(),
+                marker: (*phrase).to_string(),
+                asks: "a client it supports",
+            }),
+            evidence: found,
+        };
+    }
+
     // 2xx, no wall signature, contract failed: decide between a client-rendered
     // shell and an honest incomplete document. A shell is a document that ships
     // programs and little else.
@@ -503,21 +539,36 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
     }
 }
 
-/// Cheap text estimate for the shell test: strip tags, count the visible
+/// Cheap text estimate for the shell test: strip tags, skip the bodies of
+/// `<script>` and `<style>` (a program is not visible text), count the visible
 /// characters. Only used to separate a shell from a document; the contract does
 /// the real verification.
 fn text_chars(lower: &str) -> usize {
     let mut count = 0;
-    let mut inside = false;
-    for character in lower.chars() {
-        match character {
-            '<' => inside = true,
-            '>' => inside = false,
-            _ if !inside && !character.is_whitespace() => count += 1,
-            _ => {}
+    let mut rest = lower;
+    while let Some(open) = rest.find('<') {
+        count += rest[..open].chars().filter(|c| !c.is_whitespace()).count();
+        rest = &rest[open..];
+        // A script or style element: everything up to its closing tag is code.
+        let skip_to = ["script", "style"].iter().find_map(|tag| {
+            let starts = rest.strip_prefix('<')?.strip_prefix(tag)?;
+            starts
+                .starts_with(|c: char| c == '>' || c.is_whitespace() || c == '/')
+                .then(|| format!("</{tag}"))
+        });
+        if let Some(close) = skip_to {
+            rest = match rest.find(close.as_str()) {
+                Some(at) => &rest[at..],
+                None => "",
+            };
         }
+        // Past the end of this tag.
+        rest = match rest.find('>') {
+            Some(end) => &rest[end + 1..],
+            None => "",
+        };
     }
-    count
+    count + rest.chars().filter(|c| !c.is_whitespace()).count()
 }
 
 #[cfg(test)]
@@ -532,6 +583,58 @@ mod tests {
             headers: &[],
         })
         .class
+    }
+
+    /// Teams' answer to a desktop browser: a program-driven page whose notice
+    /// says the browser is not served. It is about this client, so it is an
+    /// identity wall; the same words on a page that passes the content contract
+    /// are just text.
+    /// A script's body is code, not text: a page of 24 scripts and nothing else
+    /// is a shell, however many characters the programs run to.
+    #[test]
+    fn a_page_of_scripts_is_a_shell_not_an_incomplete_document() {
+        let program = "var x = 1; function f(){ return x + 1; }".repeat(200);
+        let page = format!(
+            "<html><head><script>{program}</script><script src=\"/a.js\"></script>\
+             <style>body{{margin:0}}</style><script>{program}</script></head><body><div id=\"root\"></div></body></html>"
+        );
+        assert_eq!(class_of(200, &page, false), Class::Shell);
+        // The same programs around a real paragraph of text are not a shell.
+        let article = format!(
+            "<html><head><script>{program}</script><script>{program}</script><script>{program}</script></head>\
+             <body><p>{}</p></body></html>",
+            "A paragraph of actual words that a reader would see. ".repeat(10)
+        );
+        assert_eq!(class_of(200, &article, false), Class::Incomplete);
+    }
+
+    #[test]
+    fn a_page_that_says_this_browser_is_not_served_is_an_identity_wall() {
+        let notice = "<html><body><script>var a=1;</script><script>var b=2;</script><script>var c=3;</script>\
+                      <div>Hmm. Your browser version isn\u{2019}t supported. Download the desktop app.</div></body></html>";
+        let verdict = classify(Evidence {
+            status: 200,
+            body: notice,
+            content_ok: false,
+            headers: &[],
+        });
+        assert_eq!(verdict.class, Class::WallIdentity);
+        assert!(
+            verdict
+                .evidence
+                .iter()
+                .any(|e| e.starts_with("unsupported-client:")),
+            "{:?}",
+            verdict.evidence
+        );
+        // The same sentence inside a page that has its content is content.
+        let article = "<article><p>Your browser version isn't supported by some sites, so here is how to update it.</p></article>";
+        assert_eq!(class_of(200, article, true), Class::Content);
+        // A short page without the sentence stays incomplete, not a wall.
+        assert_eq!(
+            class_of(200, "<html><body><p>Hi</p></body></html>", false),
+            Class::Incomplete
+        );
     }
 
     #[test]

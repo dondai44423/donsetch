@@ -73,6 +73,13 @@ const REFUSAL_TITLE_PREFIXES: &[&str] = &[
     "error 403",
     "429 too many requests",
     "too many requests",
+    // The site refusing this client's browser (Teams: "Unsupported Browser |
+    // Microsoft Teams", 388 characters of text, so it passed the length floor).
+    "unsupported browser",
+    "browser not supported",
+    "browser is not supported",
+    "your browser is not supported",
+    "your browser isn't supported",
 ];
 
 /// Single words that are a refusal only when they are the whole title: a
@@ -418,6 +425,28 @@ mod tests {
             ..Contract::default()
         };
         assert!(verify(interstitial, "https://www.reddit.com/", &named).passed);
+    }
+
+    /// Teams, to every client it does not serve (2026-11-08): a 200 titled
+    /// "Unsupported Browser | Microsoft Teams" with 388 characters of text. It
+    /// passed the generic length floor and was reported as content. A page that
+    /// merely has "browser" in its title is not a refusal.
+    #[test]
+    fn a_page_titled_unsupported_browser_is_a_refusal_not_content() {
+        let teams = "<html><head><title>Unsupported Browser | Microsoft Teams</title></head><body>\
+            <h1>Hmm. Your browser version isn't supported.</h1><p>Quickest solution? Download the desktop app, \
+            or open Teams in a supported browser. Teams works best in the latest Chrome, Edge, Safari and Firefox, \
+            and in the desktop and mobile apps. Pick whichever suits you and sign in with your work or school account \
+            to join meetings, chat and collaborate with your colleagues wherever you are, on any device you like.</p></body></html>";
+        assert_eq!(refusal_page(teams), Some("unsupported browser"));
+        assert!(!verify(teams, "https://teams.microsoft.com/", &Contract::generic()).passed);
+        let review =
+            "<html><head><title>Best browser for privacy, reviewed</title></head><body><p>";
+        let review = format!(
+            "{review}{}</p></body></html>",
+            "Browsers differ in privacy. ".repeat(20)
+        );
+        assert_eq!(refusal_page(&review), None);
     }
 
     #[test]
