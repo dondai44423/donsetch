@@ -5,6 +5,42 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.1.1] - 2026-11-08
+
+A release that takes minutes of waiting instead of hours, and an updater that no
+longer crawls.
+
+### Fixed
+
+- **"Unsupported Browser" pages are reported as walls, not content.** A page that
+  only tells the client its browser is not served (Microsoft Teams was the witness)
+  used to come back as a successful read. It is now classified as an identity wall,
+  and a page made only of scripts is classified as an empty shell instead of an
+  incomplete document, because script and style text no longer counts as page text.
+- **PDF headings.** A row of figure or diagram labels (very short words, or words
+  separated by wide gaps) is no longer promoted to a heading.
+- **`donsetch update` no longer crawls on a throttled route.** The download watches
+  its own speed; a route that stays slow is abandoned and the next route (GitHub
+  release URL, GitHub API asset, configured proxies) continues from the bytes
+  already received, with SHA-256 verified at the end. A server that ignores resume
+  requests restarts cleanly instead of appending.
+
+### Changed
+
+- **One pipeline from push to npm.** A push to `master` whose version has no tag is
+  a release: one workflow tests on Linux, macOS and Windows, builds and gates the
+  five binaries in parallel, tags the tested commit, publishes the GitHub release
+  from those same gated binaries and publishes npm. Nothing is rebuilt between
+  "tested" and "shipped". `just ship <version>` is a single command that bumps the
+  manifests and pushes.
+- **Smaller, faster builds.** Three Cargo profiles remain (`fast` for the edit loop
+  and every CI test lane, `dist-thin` for shipped binaries, `release` for local
+  use); the `ci` and `dist` profiles are gone. Payload checks live in one script,
+  `scripts/gates.sh`, used by CI and `just gates`.
+- **A test budget with a ratchet.** The budget guard reports the slowest five tests,
+  warns when the ceilings carry unused slack, and `just ratchet` fails when a
+  ceiling could be lowered, so the suite cannot quietly grow.
+
 ## [5.1.0] - 2026-11-08
 
 The repository is one structure: the product is `src/`, the fetch core is
