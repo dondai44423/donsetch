@@ -95,7 +95,8 @@ the fixes and the hardening found since.
   found" `h2` is reported as not found (Medium's missing post came back as the
   app's membership plans), and the embedded-data rescue skips the app's own
   settings in the page state (`config`, feature flags, experiments,
-  environment, analytics, translations).
+  environment, analytics, translations) and long identifier names
+  (`expandableMetadataRenderer`, `engagement-panel-comments-section`).
 - **Page chrome is not read as the page.** When a page's visible text is thin,
   the rescue that reads its embedded app data took any JSON script: a job
   site's homepage came back as its navigation bar's prompt strings. A JSON
@@ -111,7 +112,9 @@ the fixes and the hardening found since.
   New York Times or WSJ article, a Stack Exchange question and a 4chan thread
   were answered with the front page's feed or listing; they are now read as
   their own document, and a wall or a 404 there is reported as such. Fronts,
-  sections, question listings and board pages still use the feed.
+  sections, question listings and board pages still use the feed, and a Stack
+  Exchange tag page (`/questions/tagged/c%2B%2B+async`) lists that tag's
+  questions instead of the site's newest.
 - **Walls.** A wall heading no longer overrides a substantive page.
 - **Proxy.** v5 reads no proxy environment of its own; a proxy URL the engine
   cannot read fails the request instead of going direct; credentials with
