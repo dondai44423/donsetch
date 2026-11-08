@@ -484,7 +484,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          draft: true
+          # Published by the workflow, not left as a draft: a release is a
+          # background job. `just ship` fires the tag and exits; this job
+          # builds, gates, publishes, and npm follows on the release event.
+          draft: false
           # A version with a prerelease component (-beta.1, -rc.2) is marked
           # as such, so it never becomes the "latest release" that npm's
           # installer and downstream dispatches resolve.

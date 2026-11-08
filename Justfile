@@ -306,45 +306,27 @@ ship version:
     git push -q origin "v{{version}}"
     # Match the run by its branch (the tag), not by "newest": the run for
     # this tag may not exist yet at this instant.
+    # Fire and forget. The Release workflow builds, gates, publishes and
+    # npm follows on the release event; `just runs` answers "did it land?"
+    # in one call. Nothing here blocks on a build.
     run=""
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 10); do
         run=$(gh run list --workflow=Release --limit 10 --json databaseId,headBranch \
             --jq "[.[]|select(.headBranch==\"v{{version}}\")][0].databaseId // empty")
         [ -n "$run" ] && break
-        sleep 3
+        sleep 2
     done
-    if [ -z "$run" ]; then
-        echo "ship: tag pushed, but no Release run appeared"; exit 1
-    fi
-    echo "ship: Release run $run — five platform builds in parallel"
-    gh run watch "$run" --exit-status --interval 20
-    echo "ship: publishing the draft release; npm publishes on 'released'"
-    published=0
-    for _ in $(seq 1 10); do
-        if gh release edit "v{{version}}" --draft=false >/dev/null 2>&1; then
-            published=1; break
-        fi
-        sleep 3
-    done
-    if [ "$published" != 1 ]; then
-        echo "ship: release built, but the draft could not be published"; exit 1
-    fi
-    # npm publish is triggered by the release event; the newest run is ours.
-    npm_run=""
-    for _ in $(seq 1 20); do
-        npm_run=$(gh run list --workflow "npm publish" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-        [ -n "$npm_run" ] && break
-        sleep 3
-    done
-    if [ -n "$npm_run" ]; then
-        gh run watch "$npm_run" --exit-status --interval 10
-    else
-        echo "ship: released, but no npm publish run appeared (run it: gh workflow run 'npm publish' -f tag=v{{version}})"
-    fi
-    gh release view "v{{version}}" --json url --jq '"ship: published " + .url'
+    echo "ship: v{{version}} pushed${run:+ (Release run $run)}."
+    echo "      build, publish and npm run in the background; check with: just runs"
 
-# Follow one GitHub Actions run to completion in the foreground.
-# This replaces every sleep loop and polling loop: one command, it
-# exits with the run's verdict.
-watch run-id:
-    gh run watch {{run-id}} --exit-status --interval 30
+# One status call: latest CI, Release and npm runs, plus the published
+# versions. No watching, no polling loops.
+runs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    gh run list --limit 6 --json workflowName,status,conclusion,headBranch,createdAt \
+      --jq '.[] | [.workflowName, .status, (.conclusion // ""), .headBranch, .createdAt] | @tsv' \
+      | awk -F'\t' '{printf "%-14s %-12s %-10s %-12s %s\n", $1, $2, $3, $4, $5}'
+    echo
+    echo "release: $(gh release view --json tagName,isDraft --jq '"\(.tagName) draft=\(.isDraft)"' 2>/dev/null || echo none)"
+    echo "npm:     $(curl -sS https://registry.npmjs.org/donsetch | python3 -c 'import json,sys;print(json.load(sys.stdin)["dist-tags"]["latest"])' 2>/dev/null || echo unknown)"
