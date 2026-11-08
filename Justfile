@@ -59,6 +59,11 @@
 # With sccache installed (rust-sccache), budget.sh wires RUSTC_WRAPPER and the
 # C/C++ compilers through it, so recompiles across profiles and branches are
 # cache hits instead of work.
+# GitHub release downloads 504 now and then. build.rs already retries the PDFium
+# and ONNX prebuilts through the API asset URL; for the v8 archive, start a local
+# mirror and export RELEASE_MIRROR (budget.sh maps it to RUSTY_V8_MIRROR):
+#   python3 scripts/release-mirror.py --port 18777 --v8 150.4.0 &
+#   RELEASE_MIRROR=http://127.0.0.1:18777/v8 just bin
 # Absolute, so a recipe that cd's first (fuzz) can still use it.
 budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
 feat := "--features ocr,rerank,http"

@@ -88,6 +88,14 @@ export CARGO_MAKEFLAGS="-j$jobs"
 # expensive thing in this graph, and every profile flip used to re-pay
 # it). The cache lives under target/ so it travels with the artifacts.
 # Incremental units are not cached (by design) : this buys the deps.
+# GitHub outage escape hatch: when releases/download 504s, build.sh's pinned
+# prebuilts fall back to the API asset URL on their own, but the v8 crate has no
+# fallback of its own. RELEASE_MIRROR=http://127.0.0.1:18777/v8 (from
+# scripts/release-mirror.py) points every v8 build at a local mirror of the same
+# pinned archive. Unset in normal use.
+if [ -n "${RELEASE_MIRROR:-}" ]; then
+    export RUSTY_V8_MIRROR="$RELEASE_MIRROR"
+fi
 if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
     export CC="${CC:-sccache cc}"
