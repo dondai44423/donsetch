@@ -46,7 +46,7 @@ pub struct Daemon {
     /// Session-local search references are useful only to a persistent caller.
     pub(crate) search_handles: bool,
     history: Arc<std::sync::Mutex<crate::pages::history::PageHistory>>,
-    /// Background route-memory prober handle (v4 phase 0.2);
+    /// Background route-memory prober handle;
     /// aborted on shutdown.
     probe_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Owned startup proxy probes; cancelled on shutdown or daemon drop.
@@ -89,7 +89,7 @@ impl Daemon {
         })
     }
 
-    /// Spawn the background route-memory prober (v4 phase 0.2).
+    /// Spawn the background route-memory prober.
     /// Called once the daemon is inside its runtime; one-shot CLI
     /// paths never call it, so short-lived processes stay clean.
     pub fn start_prober(self: &Arc<Self>) {

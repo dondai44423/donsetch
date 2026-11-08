@@ -103,7 +103,7 @@ donsetch update
 | `web_fetch` | Any URL as clean markdown, or only the part that answers: `must_contain` probes, `focus` passages, `toc` → `section`. Walls answered in-process, never by a browser. PDFs with OCR and per-page confidence, site adapters, page memory, batches of up to 12. |
 | `web_search` | Keyless multi-engine search: 10+ backends, consensus plus semantic reranking, query-aware official-source placement. Ranked URLs and snippets, never a scraped article dump. |
 | `web_crawl` | Best-first same-domain crawl. Sitemap plus frontier, `focus` ranking, elastic pacing, resume tokens, honest stop reasons. |
-| `web_screenshot` | Rendered PNG of any URL through DonSeTch's browser (used only for screenshots and login), with the usual URL safety guards. |
+| `web_screenshot` | Rendered PNG of any URL through DonSeTch's browser (used only for screenshots), with the usual URL safety guards. |
 
 MCP results default to self-contained text: leading `[meta]` JSON followed by source evidence, including for unknown client bridges. PNGs remain image blocks.
 
@@ -115,7 +115,7 @@ Every failure is structured: a stable `code` (`wall.challenge`, `guard.ssrf`, `d
 - **PDFs done properly.** A custom PDFium FFI, no Python subprocess. Tables and borders come from the rendered bitmap, text from the glyph stream, and the trust audit flags exactly the regions that need OCR.
 - **Crawl with manners.** Per-host adaptive pacing that honors `Retry-After` and robots `Crawl-delay`, cross-process politeness so two crawls do not double a site's rate, near-duplicate detection, resume tokens that survive restarts, and honest stop reasons.
 - **Fetch that answers honestly.** `content_ok`, `thin`, `changed` with section diffs, and `must_contain` says `unverified` instead of a false "not found" when part of a page was unread. No fake success.
-- **Walls named, not guessed.** A bot wall names its vendor and what it asks for; a login wall is a declared `wall.auth` (fetch carries no session in v5; session support is planned).
+- **Walls named, not guessed.** A bot wall names its vendor and what it asks for; a login wall is a declared `wall.auth` (the fetch carries no session; authenticated work belongs to a browser driver).
 - **Works everywhere.** Linux, macOS, Windows. npm, Homebrew, the Pi agent as a native extension, and the DeepSeek Harness as a first-class plugin.
 
 ## Sponsors

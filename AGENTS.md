@@ -14,21 +14,27 @@ work. They may be private and git-ignored; keep them that way. Current decisions
 and approval gates take precedence over historical plans and experimental
 artifacts. A branch or a dirty implementation is not an approved roadmap.
 
-## The fetch path is v5, and it has a shape
+## The fetch path has a shape
 
-`v5core/` (repo root, its own crate and CI job) is the whole fetching layer: carried
-client identity, carried state, a page cache, wall classification, the site's own
-interfaces, and an in-process V8 engine that runs a challenge page's own program. No
-browser is in the path. Module docs in `v5core/src/` are the mechanism; a maintainer
-checkout also holds the brief, the design with its guards and the current numbers
-(the files `status.md`/`project.md` name).
+`src/` is the product; `core/` (repo root, its own crate and CI job) is the whole
+fetching layer: carried client identity, carried state, a page cache, wall
+classification, the site's own interfaces, and an in-process V8 engine that runs a
+challenge page's own program. No browser is in the path. `design/` is the private
+working set (the brief, the mechanism, the core README); frozen v4 evidence lives
+outside the checkout, in `~/Projects/donsetch-evidence/`.
 
 Fetch work is one of exactly four contract classes — **identity, state, request
 contract, egress**. Anything else is drift, however plausible. Before code:
 
-- **Classify first.** A wall is one of nine classes with a vendor and an ask. Reproduce
-  it (`v5core probe` / `bench`), name the class, then say what would answer it. A wall a
-  clean reference client also receives on the same egress is not ours to fix.
+- **Classify first.** A wall is one of nine outcome classes with a vendor and an ask.
+  Reproduce it (`donsetch-core probe` / `bench`), name the class, then say what would
+  answer it. A wall a clean reference client also receives on the same egress is not
+  ours to fix.
+- **Only two asks are declared: human interaction and a login.** Identity, state,
+  request-contract and egress walls are always work. A page behind a login is
+  `wall_state`: this project never signs in, never stores credentials and never
+  carries a session. Authenticated browsing belongs to a real browser driver
+  (`bladebro`), not to the fetcher.
 - **Ask the site's own interface before calling a document a wall**, and run the site's
   own challenge program in the engine before declaring an identity gap.
 - **Identity is a whole coherent client** — TLS, HTTP/2, header set and order, hints —
@@ -37,8 +43,8 @@ contract, egress**. Anything else is drift, however plausible. Before code:
   across fingerprints, and pacing is part of identity.
 - **Never:** a browser or rendered page in the fetch path, layout or raster, a host
   surface no measured challenge needs, a second fetch architecture, a resumed
-  doncore/Persona-Engine experiment, or a heuristic that guesses a wall instead of
-  classifying it.
+  doncore/Persona-Engine experiment, a tier-1/tier-2 browser lane, a login or session
+  vault, or a heuristic that guesses a wall instead of classifying it.
 - **A witness or it did not happen.** A capability claim needs a request the origin
   accepted; a corpus number needs a `bench`/`probe` artifact from the same window as
   its paired curl. Report a wall as a declared outcome with its evidence — never as
@@ -47,6 +53,10 @@ contract, egress**. Anything else is drift, however plausible. Before code:
 Speed and stealth are one claim, not a trade-off: per-fetch cost is measured against
 curl on the first request, and any mechanism whose cost scales with page weight is
 disqualified from the default path.
+
+A major version is a fetch-engine change, not a patch: `donsetch update` refuses one
+without an explicit confirmation and `--yes` for unattended runs. Keep that warning's
+text current when a major ships, and keep its first-run notice for the upgrade path.
 
 ## An issue is a report, not a spec
 

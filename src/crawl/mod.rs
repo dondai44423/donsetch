@@ -440,7 +440,7 @@ pub struct CrawlResult {
 
 /// v3: (done, queued) : fired per completed page, throttled by the caller.
 pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>;
-/// v4 phase 3 delta crawl: (url, new_fingerprint) -> true when the
+/// delta crawl: (url, new_fingerprint) -> true when the
 /// page is unchanged since the last crawl (fingerprint on file matches).
 pub type UnchangedFn = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 /// v3: (url, fingerprint, markdown, title) : the delta-crawl memory feed.
@@ -474,7 +474,7 @@ pub struct CrawlOptions {
     /// v3: progress callback (done, queued) : fired per completed
     /// page, throttled by the caller.
     pub progress: Option<ProgressFn>,
-    /// v4 phase 3 delta crawl: called after extraction with the
+    /// delta crawl: called after extraction with the
     /// page's fresh fingerprint; true = unchanged since the last
     /// crawl. Unchanged pages are re-verified (history refreshed),
     /// their outlinks still harvested, but they are excluded from
@@ -484,11 +484,11 @@ pub struct CrawlOptions {
     /// v3: record a fetched page's fingerprint (url, fingerprint,
     /// markdown, title) : the delta-crawl memory feed.
     pub on_page: Option<OnPageFn>,
-    /// v4 phase 3 dataset mode: render one JSON object per page
+    /// dataset mode: render one JSON object per page
     /// (JSON Lines) instead of a markdown document. Output-format
     /// only; traversal, budgets, and pacing are unchanged.
     pub dataset: bool,
-    /// v4 phase 3 crawl-shape: reader-like pop jitter in the frontier
+    /// crawl-shape: reader-like pop jitter in the frontier
     /// (default true). False restores exact score-order traversal.
     /// Zero latency cost; DONSETCH_NO_CRAWL_SHAPE flips it at runtime
     /// without any rebuild (belt for operators, env wins over the
@@ -2040,7 +2040,7 @@ impl Crawler {
                     }
                     let mut chars = md.chars().count();
 
-                    // v4 phase 3 delta recrawl: compare the freshly
+                    // delta recrawl: compare the freshly
                     // extracted fingerprint with page history. An
                     // unchanged page is re-verified (history timestamp
                     // refreshed) and its outlinks are still harvested

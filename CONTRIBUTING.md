@@ -150,10 +150,10 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## Architecture overview
 
-The fetch layer is `v5core/` (repo root, its own crate and CI job): carried client
+The fetch layer is `core/` (repo root, its own crate and CI job): carried client
 identity, carried state, a page cache, wall classification, the site's own interfaces,
 and an in-process V8 engine that runs a challenge page's own program. No browser is in
-the fetch path — Chromium serves `web_screenshot` and `donsetch login` only. The
+the fetch path — Chromium serves `web_screenshot` and doctor's parity capture only. The
 [README architecture map](README.md#-built-from-scratch) is the public description of
 the whole product.
 
@@ -161,8 +161,8 @@ Fetch work is measured, not argued. The crate has `fetch`, `probe` (identity × 
 matrix), `bench` (cold, paired with curl in the same window) and `state`, and the rules
 for improving it — classify the wall first, then identity, state, request contract or
 egress, with a witness — are in
-[AGENTS.md](AGENTS.md#the-fetch-path-is-v5-and-it-has-a-shape). Its suite runs as its
-own CI job on linux-x86_64 and linux-aarch64: `cd v5core && cargo test --release
+[AGENTS.md](AGENTS.md#the-fetch-path-has-a-shape). Its suite runs as its
+own CI job on linux-x86_64 and linux-aarch64: `cd core && cargo test --release
 --locked`.
 
 Experimental branches may have a different source layout; do not treat their

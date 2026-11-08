@@ -607,10 +607,6 @@ pub fn print_top_help() {
     println!("MANAGEMENT:");
     println!("  {:10} Start MCP server (JSON-RPC on stdio)", "mcp");
     println!("  {:10} Manage BYOK search provider keys", "keys");
-    println!(
-        "  {:10} Sign into a site: later fetches replay your session",
-        "login"
-    );
     println!("  {:10} Manage proxy configuration", "proxy");
     println!(
         "  {:10} Explain what the local rules do with a URL (rules test <url>)",

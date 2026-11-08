@@ -33,7 +33,7 @@ DonSeTch is a local MCP server that fetches web pages, searches the web, and cra
 
 - **TLS handling**: the custom BoringSSL stack, certificate validation, and connection pooling.
 - **Challenge engine**: the embedded V8 that runs a walled page's own scripts against a bounded host, inside the DonSeTch process.
-- **Browser** (`web_screenshot`, `donsetch login`, and `donsetch doctor`'s launch check and `--stealth --parity` capture): CDP communication, login cookie handling, and the browser process lifecycle.
+- **Browser** (`web_screenshot` and `donsetch doctor`'s launch check and `--stealth --parity` capture): CDP communication and the browser process lifecycle.
 - **PDF parsing**: the PDFium FFI layer and untrusted-file handling.
 - **Search**: the egress pool, proxy handling, and rate-limit backoff.
 - **MCP daemon**: JSON-RPC input parsing and stdio handling.
@@ -51,8 +51,8 @@ an explicitly configured listener and supports bearer-token authentication.
 Do not expose an unauthenticated listener to untrusted networks.
 
 The default research tools need no API keys or accounts. Optional BYOK
-providers store user-supplied credentials, and browser login/session support
-stores cookies in the local state directory. Credential-bearing state uses
+providers store user-supplied credentials in their own config. The fetch state
+stores clearance cookies in the local state directory. Credential-bearing state uses
 owner-only file permissions on Unix; Windows relies on the state directory's
 OS access controls. Cached pages and downloaded model files also live locally.
 
@@ -61,8 +61,8 @@ optional model downloads. DonSeTch has no telemetry collection.
 PDFium libraries are downloaded at build time; OCR/reranker models are
 retrieved when needed. Page reads launch no browser: when a wall needs the
 page's own program, its scripts run in an embedded V8 inside the DonSeTch
-process. `web_screenshot`, `donsetch login` and
-`donsetch doctor --stealth --parity` (which loads tls.peet.ws) run page
+process. `web_screenshot` and `donsetch doctor --stealth --parity`
+(which loads tls.peet.ws) run page
 JavaScript inside the installed Chromium-family browser, so that browser and
 the operating system should be kept current.
 

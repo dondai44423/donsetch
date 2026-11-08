@@ -178,13 +178,13 @@ pub async fn run(args: &[String]) {
         (
             "warn",
             format!(
-                "{} browser unavailable: screenshot and login will not work",
+                "{} browser unavailable: screenshot will not work",
                 cli::red("warn")
             ),
         )
     };
 
-    // v4 phase 0: route-memory visibility (the self-improvement
+    // route-memory visibility (the self-improvement
     // loop must be observable, never magic).
     let route_memory_off =
         crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off;
@@ -205,9 +205,6 @@ pub async fn run(args: &[String]) {
             }
             if state.probes_total > 0 {
                 line.push_str(&format!(" · {} probes", state.probes_total));
-            }
-            if state.tier1_cookie_count() > 0 {
-                line.push_str(&format!(" · {} vaulted", state.tier1_cookie_count()));
             }
             if state.prewarmed_served_total > 0 {
                 line.push_str(&format!(" · {} prewarmed", state.prewarmed_served_total));
@@ -275,7 +272,6 @@ pub async fn run(args: &[String]) {
                     "flaky": flaky,
                     "personas": state.personas.len(),
                     "probes": state.probes_total,
-                    "vaulted": state.tier1_cookie_count(),
                 },
                 "improve": {
                     "warm_ready": warm,

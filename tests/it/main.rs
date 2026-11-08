@@ -64,7 +64,6 @@ pub(crate) fn sandbox() -> std::path::PathBuf {
     .clone()
 }
 
-mod auth_login;
 mod bypass_live;
 mod cli_surface;
 mod crawl_fresh_fetch;

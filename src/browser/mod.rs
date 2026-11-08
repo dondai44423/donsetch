@@ -1,11 +1,8 @@
 //! The locally installed browser, for capture-style work only.
 //!
-//! After the v5 swap no fetch touches a browser: the in-tree engine does
-//! all fetching. This module keeps the small remainder that needs real
-//! pixels or a real login session:
+//! No fetch touches a browser: the in-tree engine does all fetching. This
+//! module keeps the small remainder that needs real pixels:
 //!
-//! - `donsetch login`: a visible browser on the operator's display; the
-//!   session is harvested with one CDP call after the human is done.
 //! - `web_screenshot`: one short headless capture per call.
 //! - `doctor --stealth --parity`: the scorecard echo rendered by the
 //!   installed browser, the always-current reference the local fetch is
@@ -14,7 +11,7 @@
 //! One launch per call, a throwaway profile, no pool, no persistence.
 //! The resolution machinery (system paths, snap, distro launchers,
 //! Playwright caches) is carried over unchanged from the ghost era: it
-//! exists so login and doctor can always name the real binary.
+//! exists so screenshot and doctor can always name the real binary.
 //! `donsetch stop` sweeps crash leftovers of these profiles.
 
 pub mod cdp;
@@ -649,50 +646,9 @@ fn is_executable(path: &std::path::Path) -> bool {
 
 // ────────────────────────── cookies & captures ──────────────────────────
 
-/// Parse the `cookies` array of a Storage.getCookies CDP response
-/// into vault records. Shared by the login harvest and any future
-/// CDP cookie reader (all callers must store identical shapes).
-pub fn parse_cdp_cookies(res: &Value) -> Vec<crate::state::CookieRecord> {
-    let mut out = Vec::new();
-    if let Some(arr) = res.get("cookies").and_then(Value::as_array) {
-        for c in arr {
-            let name = c.get("name").and_then(Value::as_str).unwrap_or("");
-            let value = c.get("value").and_then(Value::as_str).unwrap_or("");
-            let domain = c.get("domain").and_then(Value::as_str).unwrap_or("");
-            let expires = c
-                .get("expires")
-                .and_then(|v| v.as_f64())
-                .filter(|&e| e > 0.0)
-                .map(|e| e as u64);
-            if !name.is_empty() {
-                out.push(crate::state::CookieRecord {
-                    name: name.to_string(),
-                    value: value.to_string(),
-                    domain: domain.to_string(),
-                    path: c
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    expires_at: expires,
-                    secure: c.get("secure").and_then(Value::as_bool).unwrap_or(false),
-                    http_only: c.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
-                    same_site: c
-                        .get("sameSite")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Lax")
-                        .to_string(),
-                });
-            }
-        }
-    }
-    out
-}
-
 /// Writes a captured image to `dest`, readable by its owner only.
 pub(crate) fn save_screenshot(dest: &std::path::Path, bytes: &[u8]) -> Result<(), FetchError> {
-    // A capture can show a logged-in page: same seal as the stores
-    // that hold the session itself.
+    // A capture can show a signed-in page: keep it owner-only.
     crate::config::write_private(dest, bytes)
         .map_err(|e| FetchError::browser(format!("screenshot: {e}")))
 }

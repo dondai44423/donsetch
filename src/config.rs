@@ -68,7 +68,6 @@ section!(PathsSection {
 section!(StateSection {
     no_disk_state: bool = false,
     route_memory: RouteMemory = RouteMemory::ReadWrite,
-    cookie_vault: bool = true,
 });
 
 section!(ProxySection {
@@ -771,14 +770,6 @@ fn legacy_layer() -> (VMap, Vec<String>) {
             "DONSETCH_ROUTE_MEMORY_READONLY",
         );
     }
-    if legacy_flag("DONSETCH_NO_COOKIE_VAULT") {
-        put(
-            &mut m,
-            "state.cookie_vault",
-            false.into(),
-            "DONSETCH_NO_COOKIE_VAULT",
-        );
-    }
     // fetch
     if legacy_flag("DONSETCH_ALLOW_PRIVATE_EGRESS") {
         put(
@@ -1384,13 +1375,6 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             "readwrite",
             "off | readwrite | readonly: per-domain stealth route memory",
         ),
-        (
-            "state",
-            "cookie_vault",
-            FieldKind::Bool,
-            "true",
-            "persist clearance cookies",
-        ),
         // proxy
         (
             "proxy",
@@ -1889,7 +1873,6 @@ const LEGACY_VARS: &[&str] = &[
     "DONSEEK_NO_DISK_STATE",
     "DONSETCH_NO_ROUTE_MEMORY",
     "DONSETCH_ROUTE_MEMORY_READONLY",
-    "DONSETCH_NO_COOKIE_VAULT",
     "DONSETCH_ALLOW_PRIVATE_EGRESS",
     "DONSETCH_H3",
     "DONSETCH_NO_H3",
@@ -2403,7 +2386,6 @@ pub(crate) fn legacy_target_of(name: &str) -> (&'static str, &'static str) {
         "DONSEEK_NO_DISK_STATE" => ("state", "no_disk_state"),
         "DONSETCH_NO_ROUTE_MEMORY" => ("state", "route_memory"),
         "DONSETCH_ROUTE_MEMORY_READONLY" => ("state", "route_memory"),
-        "DONSETCH_NO_COOKIE_VAULT" => ("state", "cookie_vault"),
         "DONSETCH_ALLOW_PRIVATE_EGRESS" => ("fetch", "allow_private_egress"),
         "DONSETCH_H3" => ("fetch", "h3"),
         "DONSETCH_NO_H3" => ("fetch", "h3"),

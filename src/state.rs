@@ -64,26 +64,9 @@ fn human_url_hash(url: &str) -> String {
 pub struct DomainProfile {
     #[serde(default)]
     pub human_wall: Option<HumanWall>,
-    // === Cookie vault (clearance cookies only) ===
+    // === Clearance cookies (bot-wall state only) ===
     #[serde(default)]
     pub cookies: Vec<CookieRecord>,
-    /// Session vault: login/session cookies harvested from the
-    /// browser after every tier-2 run and replayed into the next
-    /// browser launch. Distinct from `cookies` (bot-wall clearance
-    /// only): this holds the user's own authenticated state so a
-    /// login survives daemon restarts, crashes and even the
-    /// browser's own kill-without-flush.
-    #[serde(default)]
-    pub session_cookies: Vec<CookieRecord>,
-    /// Explicit login material is never evicted by automatic harvest caps.
-    #[serde(default)]
-    pub session_explicit: bool,
-    /// Last vault fence that deleted or replaced this host's session material
-    /// (logout / clear). A render captured at or before this stamp
-    /// must not survive a later merge, or an unsaved snapshot would
-    /// resurrect the logged-out DOM.
-    #[serde(default)]
-    pub session_cleared_epoch: u64,
     /// When tier 2 last solved (unix seconds).
     #[serde(default)]
     pub last_solved: u64,
@@ -130,7 +113,7 @@ pub struct DomainProfile {
     #[serde(default)]
     pub replay_ok: bool,
 
-    // === Solve-failure memory (v3.6: fail fast, honestly) ===
+    // === Solve-failure memory (fail fast, honestly) ===
     /// Consecutive ghost passes where the wall persisted even in a
     /// REAL browser (challenge never cleared, content never came).
     /// Two in a row puts the domain into a cooldown: the odds the
@@ -167,7 +150,7 @@ pub struct DomainProfile {
     #[serde(default)]
     pub failures: VecDeque<(u64, FailClass)>,
     /// The scheme this host was actually fetched over ("https" or
-    /// "http"). The background prober (v4 phase 0.2) probes the real
+    /// "http"). The background prober probes the real
     /// origin, not a guessed https upgrade.
     #[serde(default = "default_scheme")]
     pub origin_scheme: String,
@@ -263,15 +246,6 @@ pub enum RouteDecision {
     SolveCooldown(u64),
 }
 
-/// Whole-jar bucket cap (v4 phase 1.4): 500 distinct (name,
-/// domain, path) triples. Browsers hold far more (Chrome keeps
-/// ~180/domain, thousands per store); 500 covers any real agent
-/// working set and bounds the state file.
-const TIER1_COOKIE_MAX: usize = 500;
-/// Refuse to vault pathological cookie values: an oversized value
-/// is either junk or an attack surface on state writes.
-const TIER1_COOKIE_VALUE_MAX: usize = 4096;
-
 #[derive(Default, Serialize, Deserialize)]
 pub struct GhostState {
     /// State format version. 1 = pre-v4 (runs the one-time
@@ -279,62 +253,31 @@ pub struct GhostState {
     /// Persisted on every save; old files deserialize as 1.
     #[serde(default = "state_version_v1")]
     pub version: u32,
-    /// Lifetime background-probe attempts (v4 phase 0.2), surfaced
+    /// Lifetime background-probe attempts, surfaced
     /// in `donsetch status`: the self-improvement loop must be
     /// observable, never magic.
     #[serde(default)]
     pub probes_total: u64,
     /// Lifetime count of fetches served from the search->fetch
-    /// prewarm cache (v4 phase 2.1 warm handoff), surfaced in
+    /// prewarm cache (warm handoff), surfaced in
     /// donsetch status. Counter, not inventory: the RAM cache is
     /// one-shot and capped, so "served" proves the handoff saved a
     /// network fetch.
     #[serde(default)]
     pub prewarmed_served_total: u64,
-    /// Tier-1 whole-jar persistence (v4 phase 1.4): the browser
-    /// cookie-store view, so a returning agent replays device /
-    /// analytics / cf_bm cookies like a returning browser instead
-    /// of showing up fresh on every process. Login-worthy cookies
-    /// ride their own vault; this bucket holds the plain
-    /// navigation set (one store, like a browser: clearance
-    /// duplicates at boot merge to the same key harmlessly).
-    #[serde(default)]
-    pub tier1_cookies: Vec<CookieRecord>,
-    /// Per-domain stable identities (v4 phase 0.3): same key space
+    /// Per-domain stable identities: same key space
     /// as profiles, evicted together.
     #[serde(default)]
     pub personas: HashMap<String, crate::persona::Persona>,
     #[serde(default)]
     pub profiles: HashMap<String, DomainProfile>,
-    /// Tier-1 echo stashed by sync_tier1_cookies for the save that
-    /// follows to re-apply after disk reconciliation: (stamp of the
-    /// snapshot, rows). Process-local; never serialized.
-    #[serde(skip)]
-    pub pending_tier1: Option<(u64, Vec<CookieRecord>)>,
-    /// Vault epoch for cross-writer reconciliation: the session
-    /// vault has TWO writer classes (the load-modify-save helpers
-    /// store_session_cookies / clear_session_cookies_for, which
-    /// never touch a daemon's live in-memory snapshot, and the
-    /// snapshot's own sync_tier1_cookies). Every vault writer
-    /// stamps a strictly larger epoch before saving; save() adopts
-    /// the disk side's vault whenever disk carries a newer one, so
-    /// a helper's harvest survives the daemon's next save and a
-    /// logout's deletion is not resurrected by it.
-    #[serde(default)]
-    pub vault_epoch: u64,
-    /// Explicit login/logout identity. Ordinary cookie refreshes preserve it.
-    #[serde(default)]
-    pub auth_revision: String,
     /// Atomic cookie change marker, last in canonical JSON for bounded reads.
     #[serde(default)]
     pub session_revision: Option<String>,
 }
 
-fn change_session_revision(state: &mut GhostState, consent: bool) {
+fn change_session_revision(state: &mut GhostState) {
     state.session_revision = Some(crate::handles::random_base62(24));
-    if consent {
-        state.auth_revision = crate::handles::random_base62(24);
-    }
 }
 
 /// Give legacy vaults a stable cookie identity before a daemon freezes requests.
@@ -346,13 +289,12 @@ pub(crate) fn ensure_session_identity() {
         return;
     }
     let lock = StateWriteLock::acquire();
-    if !lock.locked || validate_login_vault().is_err() {
+    if !lock.locked {
         return;
     }
     let mut state = GhostState::load();
     if state.session_revision.is_none() {
-        change_session_revision(&mut state, false);
-        bump_vault_epoch(&mut state);
+        change_session_revision(&mut state);
         if let Err(error) = state.persist() {
             crate::diag!("[state] session identity persist failed: {error}");
         }
@@ -374,19 +316,12 @@ pub(crate) fn disk_session_stamp() -> Option<String> {
         {
             return Some(format!("session:{revision}"));
         }
-        if let Some((_, value)) = body.rsplit_once(",\"vault_epoch\":")
-            && let Ok(epoch) = value.split(',').next().unwrap_or(value).parse::<u64>()
-        {
-            return Some(format!("legacy:{epoch}"));
-        }
     }
     // Noncanonical/legacy files still work; only our canonical hot path is bounded.
     #[derive(Deserialize)]
     struct Stamp {
         #[serde(default)]
         session_revision: Option<String>,
-        #[serde(default)]
-        vault_epoch: u64,
     }
     file.seek(SeekFrom::Start(0)).ok()?;
     let stamp: Stamp = serde_json::from_reader(file).ok()?;
@@ -394,18 +329,8 @@ pub(crate) fn disk_session_stamp() -> Option<String> {
         stamp
             .session_revision
             .map(|s| format!("session:{s}"))
-            .unwrap_or_else(|| format!("legacy:{}", stamp.vault_epoch)),
+            .unwrap_or_else(|| "session:0".to_string()),
     )
-}
-
-/// Stamp a vault write one past the state it was built from. Every
-/// writer re-reads ghost-state.json under the write lock before
-/// modifying it, so disk epochs are totally ordered across
-/// processes; no process-local counter participates (a local chain
-/// can outrun the disk and then mis-order against a sibling
-/// process's logout). Saturating: u64::MAX stays u64::MAX.
-fn bump_vault_epoch(state: &mut GhostState) {
-    state.vault_epoch = state.vault_epoch.saturating_add(1);
 }
 
 /// Cross-process serialization for every ghost-state.json writer:
@@ -557,31 +482,7 @@ impl Drop for StateWriteLock {
     }
 }
 
-/// Stamp the deletion of `key`'s session material across every
-/// profile it touches (apex + subdomains) plus hosts that only ever
-/// appeared as render URLs: a capture recorded at or before `stamp`
-/// can never survive a later merge.
-fn stamp_session_cleared(state: &mut GhostState, key: &str, extra_hosts: &[String], stamp: u64) {
-    for (host, p) in state.profiles.iter_mut() {
-        if crate::auth::cookie_belongs_to(key, host) {
-            p.session_cleared_epoch = stamp;
-        }
-    }
-    for host in extra_hosts {
-        state
-            .profiles
-            .entry(host.clone())
-            .or_default()
-            .session_cleared_epoch = stamp;
-    }
-    state
-        .profiles
-        .entry(key.to_string())
-        .or_default()
-        .session_cleared_epoch = stamp;
-}
-
-// ────────────────────────── route memory (v4 phase 0) ──────────────────────────
+// ────────────────────────── route memory ──────────────────────────
 
 /// Max remembered domains: LRU-evict the coldest beyond this
 /// (route memory must never grow unbounded on a 24/7 daemon).
@@ -605,7 +506,7 @@ fn ewma_update(cur: f32, samples: u32, ok: bool) -> f32 {
     }
 }
 
-/// Route-memory kill switches (v4 phase 0). NO_ROUTE_MEMORY:
+/// Route-memory kill switches. NO_ROUTE_MEMORY:
 /// consult AND record both off (every fetch decides fresh, nothing
 /// persists). ROUTE_MEMORY_READONLY: consult on, record off (debug
 /// and A/B). Both fail closed through crate::config::env_flag.
@@ -700,462 +601,6 @@ fn filter_clearance(cookies: &[CookieRecord]) -> Vec<CookieRecord> {
         .collect()
 }
 
-// ────────────────────────── session vault ──────────────────────────
-
-/// Cap on vaulted session cookies: keeps ghost-state.json bounded
-/// even after months of multi-site browsing.
-const SESSION_MAX: usize = 500;
-
-/// Max chars one vaulted cookie value may hold: jumbo tokens are
-/// either junk or per-request blobs, never reusable login state.
-const SESSION_VALUE_MAX: usize = 8_192;
-
-/// Cookie names that are analytics/ad junk, never login state.
-/// Prefix-matched, lowercase.
-const SESSION_JUNK_PREFIXES: &[&str] = &[
-    "_ga",
-    "_gid",
-    "_gat",
-    "_gcl",
-    "_gac",
-    "__utma",
-    "__utmb",
-    "__utmc",
-    "__utmz",
-    "__utmv",
-    "__utmt",
-    "__utm",
-    "_fbp",
-    "_fbc",
-    "tdid",
-    "demdex",
-    "dpm",
-    "dextp",
-    "adobemc",
-    "mbox",
-    "s_cc",
-    "s_sq",
-    "optimizely",
-    "pardot",
-    "visitor_id",
-    "hubspotutk",
-    "intercom-id-",
-    "intercom-session-",
-    "akaalb_",
-    "akacd_",
-    // Ad-mesh session junk from real harvests (DSP sync, exchange
-    // seat ids, media sync timestamps): never login state.
-    "_hj",
-    "dsp2f_",
-    "sspz",
-    "sspr_",
-    "stx_",
-    "cnx_",
-    "nm_",
-    "st_usi",
-    "ruds",
-    "_cc_cc",
-    "_twsid",
-    "wp-wpml",
-    "_cf",
-    "wrv",
-    "seedtag",
-];
-
-/// Exact-match junk names (lowercase) too risky to prefix-match.
-const SESSION_JUNK_EXACT: &[&str] = &[
-    "tz",
-    "cpu_bucket",
-    "preferred_color_mode",
-    "countries_availability_flash_seen",
-    "ingresscookie",
-];
-
-/// Long-lived cookies named like login state are vaulted even when
-/// they carry an expiry (remember-me tokens). Lowercase substrings.
-const SESSION_AUTH_HINTS: &[&str] = &[
-    "session",
-    "sess",
-    "sid",
-    "auth",
-    "token",
-    "jwt",
-    "bearer",
-    "login",
-    "connect.sid",
-    "phpsessid",
-    "laravel_session",
-    "cfid",
-    "cftoken",
-    "cookiesupport",
-    "identity",
-    "loggedin",
-    "logged_in",
-    "remember",
-    "user_id",
-    "userid",
-    "guest",
-    "member",
-    "api_key",
-    "apikey",
-    "csrf",
-    "sid",
-];
-
-/// Would replaying this cookie plausibly restore an authenticated
-/// session? Session cookies (no expiry) are the login signature;
-/// explicit auth-shaped names pass even with an expiry. Everything
-/// else (trackers, preferences, A/B buckets) is dropped so the
-/// vault stays small and meaningful.
-pub fn is_session_worthy(c: &CookieRecord) -> bool {
-    if !is_session_usable(c) {
-        return false;
-    }
-    let n = c.name.to_ascii_lowercase();
-    if c.expires_at.is_none() {
-        return true;
-    }
-    SESSION_AUTH_HINTS.iter().any(|k| n.contains(k))
-}
-
-/// Cookies explicitly selected by a login may have opaque persistent names.
-/// Apply value/scope/expiry hygiene without guessing which names authenticate.
-pub fn is_session_usable(c: &CookieRecord) -> bool {
-    if c.domain.is_empty()
-        || c.name.is_empty()
-        || c.value.is_empty()
-        || c.value.len() > SESSION_VALUE_MAX
-        || c.expires_at.is_some_and(|e| e <= now())
-        || c.name
-            .chars()
-            .any(|ch| ch.is_control() || r#" ()<>@,;:\"/[]?={}"#.contains(ch))
-        || c.value.chars().any(|ch| ch.is_control() || ch == ';')
-        || (!c.path.is_empty() && !c.path.starts_with('/'))
-    {
-        return false;
-    }
-    let host = c.domain.trim_start_matches('.').trim_matches(['[', ']']);
-    if host != "localhost"
-        && host.parse::<std::net::IpAddr>().is_err()
-        && (url::Host::parse(host).is_err() || psl::domain(host.as_bytes()).is_none())
-    {
-        return false;
-    }
-    let n = c.name.to_ascii_lowercase();
-    !is_clearance_cookie(&n)
-        && !SESSION_JUNK_PREFIXES.iter().any(|p| n.starts_with(p))
-        && !SESSION_JUNK_EXACT.contains(&n.as_str())
-}
-
-/// Refuse to replace unreadable existing login material before capture starts.
-pub fn validate_login_vault() -> Result<(), String> {
-    match std::fs::read(path()) {
-        Ok(bytes) => {
-            serde_json::from_slice::<GhostState>(&bytes).map_err(|_| {
-                "existing login vault is unreadable; preserve it and repair before importing"
-                    .to_string()
-            })?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("login vault was not saved: {e}")),
-    }
-    Ok(())
-}
-
-/// Save an explicit login without silently truncating or evicting its cookies.
-/// Failure leaves the existing vault intact and is reported to the caller.
-pub fn store_login_cookies(cookies: &[CookieRecord]) -> Result<(), String> {
-    #[cfg(not(test))]
-    if crate::config::cfg().state.no_disk_state {
-        return Err("login requires disk state; state.no_disk_state is enabled".into());
-    }
-    let lock = StateWriteLock::acquire();
-    if !lock.locked {
-        return Err("login vault could not be locked; nothing stored".into());
-    }
-    validate_login_vault()?;
-    let mut state = GhostState::load();
-    for c in cookies {
-        if !is_session_usable(c) {
-            return Err("login contains an unusable cookie; nothing stored".into());
-        }
-        let p = state
-            .profiles
-            .entry(c.domain.trim_start_matches('.').to_ascii_lowercase())
-            .or_default();
-        p.session_explicit = true;
-        if let Some(old) = p
-            .session_cookies
-            .iter_mut()
-            .find(|old| old.name == c.name && old.domain == c.domain && old.path == c.path)
-        {
-            *old = c.clone();
-        } else {
-            p.session_cookies.push(c.clone());
-        }
-        if p.session_cookies.len() > 500 {
-            return Err("login exceeds the 500-cookie domain safety limit; nothing stored".into());
-        }
-    }
-    let total: usize = state
-        .profiles
-        .values()
-        .map(|p| p.session_cookies.len())
-        .sum();
-    if total > 5_000 {
-        return Err(
-            "login vault exceeds the 5000-cookie safety limit; log out unused sites first".into(),
-        );
-    }
-    if state.vault_epoch > u64::MAX - 2 {
-        return Err("login vault ordering is exhausted; preserve and repair the state".into());
-    }
-    bump_vault_epoch(&mut state);
-    let barrier = state.vault_epoch;
-    let scopes: Vec<(String, bool)> = cookies
-        .iter()
-        .map(|c| {
-            (
-                c.domain
-                    .trim_start_matches('.')
-                    .trim_matches(['[', ']'])
-                    .to_ascii_lowercase(),
-                c.domain.starts_with('.'),
-            )
-        })
-        .collect();
-    let affected = |host: &str| {
-        let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-        scopes.iter().any(|(domain, subdomains)| {
-            host == *domain || (*subdomains && host.ends_with(&format!(".{domain}")))
-        })
-    };
-    for (host, p) in &mut state.profiles {
-        if affected(host) {
-            p.session_cleared_epoch = barrier;
-            p.wall_fail_streak = 0;
-            p.last_wall_fail = 0;
-            p.human_wall = None;
-        }
-    }
-    change_session_revision(&mut state, true);
-    bump_vault_epoch(&mut state);
-    state
-        .persist()
-        .map_err(|e| format!("login vault was not saved: {e}"))?;
-    #[cfg(not(test))]
-    // Windows FlushFileBuffers requires a handle opened with write access.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path())
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("login vault sync failed: {e}"))?;
-    Ok(())
-}
-
-/// Merge one harvest into the session vault: dedupe by
-/// (name, domain), per-domain cap for safety.
-pub(crate) fn merge_session_cookies(vault: &mut Vec<CookieRecord>, harvested: &[CookieRecord]) {
-    const PER_DOMAIN_MAX: usize = 50;
-    for c in harvested {
-        if !is_session_worthy(c) {
-            continue;
-        }
-        // Same (name, domain): refresh in place (value/expiry
-        // evolve as the site rotates its session).
-        if let Some(existing) = vault
-            .iter_mut()
-            .find(|e| e.name == c.name && e.domain == c.domain && e.path == c.path)
-        {
-            *existing = c.clone();
-            continue;
-        }
-        vault.insert(0, c.clone());
-    }
-    vault.truncate(PER_DOMAIN_MAX);
-}
-
-/// Persist a fresh cookie harvest into the session vault on disk.
-/// Load-modify-save with the same atomic tmp+rename write as the
-/// rest of the state file: a mid-write crash can never corrupt the
-/// vault it updates.
-pub fn store_session_cookies(cookies: &[CookieRecord]) {
-    if cookies.is_empty() {
-        return;
-    }
-    // Serialize the whole load-modify-save with every other state
-    // writer (daemon saves, logouts, sibling processes): without it
-    // an interleaved pair lost whichever write landed first.
-    let _lock = StateWriteLock::acquire();
-    let mut state = GhostState::load();
-    let mut changed = false;
-    for c in cookies {
-        if !is_session_usable(c) {
-            continue;
-        }
-        let p = state
-            .profiles
-            .entry(c.domain.trim_start_matches('.').to_ascii_lowercase())
-            .or_default();
-        if p.session_explicit {
-            if let Some(old) = p
-                .session_cookies
-                .iter_mut()
-                .find(|old| old.name == c.name && old.domain == c.domain && old.path == c.path)
-            {
-                changed |= *old != *c;
-                *old = c.clone();
-            }
-        } else {
-            changed |= is_session_worthy(c) && !p.session_cookies.iter().any(|old| old == c);
-            merge_session_cookies(&mut p.session_cookies, std::slice::from_ref(c));
-        }
-    }
-    // Global cap: if the vault exceeds SESSION_MAX, drop the
-    // least-recently-solved domains' session vaults first
-    // (deterministic: last_solved is the recency signal).
-    let total: usize = state
-        .profiles
-        .values()
-        .filter(|p| !p.session_explicit)
-        .map(|p| p.session_cookies.len())
-        .sum();
-    if total > SESSION_MAX {
-        let mut keys: Vec<(u64, String)> = state
-            .profiles
-            .iter()
-            .filter(|(_, p)| !p.session_cookies.is_empty() && !p.session_explicit)
-            .map(|(k, p)| (p.last_solved, k.clone()))
-            .collect();
-        keys.sort_by_key(|(last, _)| *last);
-        let mut excess = total - SESSION_MAX;
-        for (_, key) in keys {
-            if excess == 0 {
-                break;
-            }
-            let p = state.profiles.get_mut(&key).expect("key from iter");
-            let drop = p.session_cookies.len().min(excess);
-            p.session_cookies.truncate(p.session_cookies.len() - drop);
-            excess -= drop;
-            changed |= drop > 0;
-        }
-    }
-    if changed {
-        change_session_revision(&mut state, false);
-    }
-    bump_vault_epoch(&mut state);
-    if let Err(error) = state.persist() {
-        crate::diag!("[state] cookie vault persist failed: {error}");
-    }
-}
-
-/// Everything currently vaulted, across all domains, for replay
-/// into a fresh browser launch.
-pub fn load_session_cookies() -> Vec<CookieRecord> {
-    let state = GhostState::load();
-    let mut out = Vec::new();
-    for p in state.profiles.values() {
-        for c in &p.session_cookies {
-            if is_session_usable(c) {
-                out.push(c.clone());
-            }
-        }
-    }
-    out
-}
-
-/// The cookie set a daemon replays from its persistent stores: the
-/// tier-1 jar echo, minus every key the session vault owns, then the
-/// vault's own cookies (#319). A login must outrank a jar entry for
-/// the same name and domain: the echo is browser truth, but a
-/// logged-out render can have written anonymous values over the
-/// login cookie, and replaying those keeps every later fetch
-/// anonymous until someone clears the jar. Jar-unique cookies
-/// (device and analytics ids) still replay; the vault rides last so
-/// any collision the filter cannot see still resolves its way
-/// inside the jar store itself.
-pub fn vault_over_jar(sessions: &[CookieRecord], jar: &[CookieRecord]) -> Vec<CookieRecord> {
-    // Compare domains the way the jar normalizes them: a leading
-    // dot and letter case must not hide a collision.
-    fn domain_key(d: &str) -> String {
-        d.trim_start_matches('.').to_ascii_lowercase()
-    }
-    let owned: std::collections::HashSet<(String, String, String)> = sessions
-        .iter()
-        .map(|c| (c.name.clone(), domain_key(&c.domain), c.path.clone()))
-        .collect();
-    let mut out: Vec<CookieRecord> = jar
-        .iter()
-        .filter(|c| !owned.contains(&(c.name.clone(), domain_key(&c.domain), c.path.clone())))
-        .cloned()
-        .collect();
-    out.extend(sessions.iter().cloned());
-    out
-}
-
-/// Logout helper: drop every vaulted cookie whose domain belongs
-/// to `domain` (apex + subdomains + host-only subdomain cookies
-/// that feed the same session). Returns true if anything was
-/// removed. Load-modify-save, atomic, same as the harvest path.
-pub fn clear_session_cookies_for(domain: &str) -> bool {
-    match clear_session_cookies_for_checked(domain) {
-        Ok(removed) => removed,
-        Err(e) => {
-            crate::diag!("[auth] logout failed: {e}");
-            false
-        }
-    }
-}
-
-pub fn clear_session_cookies_for_checked(domain: &str) -> Result<bool, String> {
-    #[cfg(not(test))]
-    if crate::config::cfg().state.no_disk_state {
-        return Err("logout requires disk state".into());
-    }
-    let key = domain.trim_start_matches('.').to_ascii_lowercase();
-    if key.is_empty() {
-        return Ok(false);
-    }
-    let lock = StateWriteLock::acquire();
-    if !lock.locked {
-        return Err("logout vault could not be locked; nothing removed".into());
-    }
-    validate_login_vault()?;
-    let mut state = GhostState::load();
-    let mut removed = false;
-    // Issue #173: the tier-1 echo of the vault (synced by sync_tier1_cookies)
-    // was a third copy of the session that logout missed. Same rule as
-    // the profile jar: cookies are removed only when they belong to the
-    // domain that is being logged out.
-    let before_t1 = state.tier1_cookies.len();
-    state.tier1_cookies.retain(|c| {
-        let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
-        !crate::auth::cookie_belongs_to(&key, &host)
-    });
-    removed |= state.tier1_cookies.len() != before_t1;
-    for p in state.profiles.values_mut() {
-        let before = p.session_cookies.len();
-        p.session_cookies.retain(|c| {
-            let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
-            !crate::auth::cookie_belongs_to(&key, &host)
-        });
-        removed |= p.session_cookies.len() != before;
-    }
-    if removed {
-        // Stamp the deletion so a live daemon snapshot (whose
-        // tier1_cookies predate this logout) adopts the disk side
-        // on its next save instead of resurrecting them.
-        change_session_revision(&mut state, true);
-        bump_vault_epoch(&mut state);
-        let stamp = state.vault_epoch;
-        stamp_session_cleared(&mut state, &key, &[], stamp);
-        state
-            .persist()
-            .map_err(|e| format!("logout vault was not saved: {e}"))?;
-    }
-    Ok(removed)
-}
-
 // ────────────────────────── helpers ──────────────────────────
 
 pub fn now() -> u64 {
@@ -1214,7 +659,7 @@ impl GhostState {
         self.session_revision
             .as_ref()
             .map(|s| format!("session:{s}"))
-            .unwrap_or_else(|| format!("legacy:{}", self.vault_epoch))
+            .unwrap_or_else(|| "session:0".to_string())
     }
 
     pub fn load() -> Self {
@@ -1244,23 +689,13 @@ impl GhostState {
                         }
                     }
                 }
-                // The session vault's own migration: junk from
-                // earlier filter versions fades out of old state
-                // files on load instead of lingering forever.
-                for profile in state.profiles.values_mut() {
-                    let before = profile.session_cookies.len();
-                    profile.session_cookies.retain(is_session_usable);
-                    if profile.session_cookies.len() != before {
-                        changed = true;
-                    }
-                }
                 // One-time un-poisoning (v2.2): pre-v2.2 code marked
                 // domains walled on ANY non-content verdict :
                 // a single 404 or rate-limit forced a walled route on
                 // every later fetch. Profiles that carry no wall
                 // knowledge (no cookies) are reset so they get a
                 // fresh cold chance.
-                // Gated on the state version (v4 phase 0): ungated,
+                // Gated on the state version: ungated,
                 // this migration ran on EVERY load and wiped the
                 // memory of legitimately-walled hosts between CLI
                 // invocations and daemon restarts (live-caught on
@@ -1345,7 +780,7 @@ impl GhostState {
             .unwrap_or_else(|| ("https".to_string(), 443))
     }
 
-    /// Remember the scheme a host is fetched over (v4 phase 0.2:
+    /// Remember the scheme a host is fetched over (
     /// the prober probes the real origin). Idempotent, cheap.
     pub fn note_origin(&mut self, host: &str, scheme: &str, port: u16) {
         if !route_memory_enabled() || route_memory_readonly() {
@@ -1362,8 +797,8 @@ impl GhostState {
         }
     }
 
-    /// Stale-walled hosts due for a background probe (v4 phase
-    /// 0.2), stalest first. Only hosts with tier-2 memory AND cold
+    /// Stale-walled hosts due for a background probe, stalest first.
+    /// Only hosts with tier-2 memory AND cold
     /// evidence older than `stale_secs` qualify. A host whose front
     /// page the local rules deny never qualifies, and never takes one
     /// of the `limit` slots.
@@ -1419,7 +854,7 @@ impl GhostState {
             .collect()
     }
 
-    /// v4 phase 2.1 visibility: count a fetch served from the
+    /// visibility: count a fetch served from the
     /// search prewarm cache. DONSETCH_NO_PREWARM stops entries
     /// being parked in the first place, so this only grows while
     /// prewarm is on; no extra gate here.
@@ -1452,7 +887,7 @@ impl GhostState {
     }
 
     /// The persona for a host, minting or re-minting as needed
-    /// (v4 phase 0.3). Longitudinal rule: an existing coherent
+    ///. Longitudinal rule: an existing coherent
     /// persona is returned unchanged for weeks; a burned
     /// (quarantined) or drifted one is replaced with generation+1,
     /// never resurrected.
@@ -1552,7 +987,6 @@ impl GhostState {
     }
 
     /// Aggregate route-memory stats for `donsetch status`
-    /// (v4 phase 0: self-improvement must be observable).
     pub fn route_stats(&self) -> (usize, usize, usize, usize, usize) {
         let n = now();
         let hosts = self.profiles.len();
@@ -1584,65 +1018,6 @@ impl GhostState {
         (hosts, walled, warm, cooldowns, flaky)
     }
 
-    /// Tier-1 jar flush (v4 phase 1.4): merge the whole jar into
-    /// the persisted snapshot. Browser-true mechanics: dedupe
-    /// (name, scope-folded domain, path), refresh in place at the front (cap
-    /// evicts the coldest tail), drop expired and pathological
-    /// values. Does NOT save: the caller is already inside the
-    /// state lock and the outcome record after it saves once.
-    pub fn sync_tier1_cookies(&mut self, all: &[CookieRecord]) {
-        if !crate::config::cfg().state.cookie_vault
-            || crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off
-        {
-            return;
-        }
-        // Stash the snapshot for the save that follows: persist()
-        // reconciles with disk first and re-applies the echo after,
-        // so a helper harvest or logout landing in between is adopted
-        // (never discarded by this writer, never discarded itself),
-        // and a row a deletion removed cannot be re-raised.
-        self.pending_tier1 = Some((self.vault_epoch, all.to_vec()));
-        self.merge_tier1_jar(all);
-    }
-
-    /// The jar-merge mechanics for sync_tier1_cookies: dedupe by
-    /// (name, scope-folded domain, path), refresh in place at the front, drop
-    /// expired and pathological values, cap the tail.
-    fn merge_tier1_jar(&mut self, all: &[CookieRecord]) {
-        let now = now();
-        for c in all {
-            if c.domain.is_empty()
-                || c.value.is_empty()
-                || c.value.len() > TIER1_COOKIE_VALUE_MAX
-                || c.expires_at.is_some_and(|e| e <= now)
-            {
-                continue;
-            }
-            // Scope-folded key: ".x.com" and "x.com" are one
-            // cookie to the jar (`store_raw` normalizes both to
-            // x.com), so a row re-synced under the scoped form must
-            // replace its bare twin, not sit beside it and let the
-            // older host-only flag win the next replay.
-            let fold = |d: &str| d.trim_start_matches('.').to_ascii_lowercase();
-            let key = (c.name.clone(), fold(&c.domain), c.path.clone());
-            if let Some(pos) = self
-                .tier1_cookies
-                .iter()
-                .position(|x| (x.name.clone(), fold(&x.domain), x.path.clone()) == key)
-            {
-                self.tier1_cookies.remove(pos);
-            }
-            self.tier1_cookies.insert(0, c.clone());
-        }
-        self.tier1_cookies.truncate(TIER1_COOKIE_MAX);
-    }
-
-    /// Cookie count for `donsetch status`: the vault must be
-    /// observable, never magic.
-    pub fn tier1_cookie_count(&self) -> usize {
-        crate::config::cfg().state.cookie_vault as usize * self.tier1_cookies.len()
-    }
-
     /// Write a complete snapshot to a private temporary file, then rename.
     /// Persistence errors are reported on stderr; in-memory learning survives.
     /// Unit-test builds and `state.no_disk_state` skip disk writes.
@@ -1665,14 +1040,13 @@ impl GhostState {
         // derives Default (version 0) and would otherwise keep
         // re-running one-time migrations on every load.
         self.version = STATE_VERSION;
-        // LRU bound (v4 phase 0): route memory must never grow
+        // LRU bound: route memory must never grow
         // unbounded on a 24/7 daemon. Evict the coldest domains
         // (oldest last-activity of any signal) past PROFILE_CAP.
         if self.profiles.len() > PROFILE_CAP {
             let mut by_activity: Vec<(String, u64)> = self
                 .profiles
                 .iter()
-                .filter(|(_, p)| p.session_cookies.is_empty())
                 .map(|(h, p)| (h.clone(), p.last_activity()))
                 .collect();
             by_activity.sort_by_key(|(_, a)| *a);
@@ -1706,25 +1080,6 @@ impl GhostState {
                     self.probes_total = self.probes_total.max(disk.probes_total);
                     self.prewarmed_served_total =
                         self.prewarmed_served_total.max(disk.prewarmed_served_total);
-                    self.merge_vault_from_disk(disk);
-                }
-                // A stashed tier-1 echo re-applies AFTER the merge:
-                // adoption cannot drop it, and a row a session clear
-                // that postdates the snapshot removed stays removed.
-                if let Some((snapshot_epoch, rows)) = self.pending_tier1.take() {
-                    let keep: Vec<CookieRecord> = rows
-                        .into_iter()
-                        .filter(|c| {
-                            let host = c.domain.trim_start_matches('.').to_ascii_lowercase();
-                            !disk.as_ref().is_some_and(|d| {
-                                d.profiles
-                                    .get(&host)
-                                    .is_some_and(|p| p.session_cleared_epoch > snapshot_epoch)
-                            })
-                        })
-                        .collect();
-                    self.merge_tier1_jar(&keep);
-                    bump_vault_epoch(self);
                 }
                 let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
                 // Unique per process: a mixed-version writer that does
@@ -1759,51 +1114,6 @@ impl GhostState {
             persist?;
         }
         Ok(())
-    }
-
-    /// Adopt the disk state's session vault into this snapshot.
-    /// Pure reconciliation over one loaded disk copy; called from
-    /// save() with the file as it exists RIGHT NOW.
-    ///
-    /// The vault (profiles[].session_cookies, tier1_cookies) has
-    /// TWO writer classes: the load-modify-save
-    /// helpers (store_session_cookies / clear_session_cookies_for),
-    /// which never touch a live daemon snapshot, and the snapshot
-    /// itself (sync_tier1_cookies). Both stamp a strictly larger
-    /// vault epoch before saving, so the winner is the newer stamp.
-    /// A TIE means no helper wrote since this snapshot loaded, so
-    /// its copy is exactly what disk holds (load() read the same
-    /// file) and keeping it is correct. Without this reconciliation
-    /// a daemon save rewrote the file from its boot-era snapshot:
-    /// every harvest since was erased, and every logout deletion
-    /// came back (dead sessions replayed on the next launch).
-    pub fn merge_vault_from_disk(&mut self, disk: &GhostState) {
-        if disk.vault_epoch <= self.vault_epoch {
-            return;
-        }
-        for (host, dp) in disk.profiles.iter() {
-            match self.profiles.get_mut(host) {
-                // Both sides know the host: disk's session vault wins,
-                // and its deletion stamp rides along so a later merge
-                // orders captures against it.
-                Some(p) => {
-                    p.session_cookies = dp.session_cookies.clone();
-                    p.session_explicit = dp.session_explicit;
-                    p.session_cleared_epoch = dp.session_cleared_epoch;
-                }
-                // Disk-only host: a helper harvested a host this
-                // snapshot has never seen. Adopt the whole profile
-                // (its wall-state rode along on disk; dropping it
-                // here would strand the harvest).
-                None => {
-                    self.profiles.insert(host.clone(), dp.clone());
-                }
-            }
-        }
-        self.tier1_cookies = disk.tier1_cookies.clone();
-        self.auth_revision = disk.auth_revision.clone();
-        self.session_revision = disk.session_revision.clone();
-        self.vault_epoch = disk.vault_epoch;
     }
 
     // ── Decision ──
@@ -1912,7 +1222,7 @@ impl GhostState {
             // Skip the doomed tier-1 attempt : go straight to solve.
             return RouteDecision::SkipToSolve;
         }
-        // Flaky-wall detection (v4 phase 0): the boolean flags only
+        // Flaky-wall detection: the boolean flags only
         // move on single verdicts, so a host whose wall appears
         // intermittently never gets needs_tier2 set and burns a
         // doomed tier-1 roundtrip plus an escalation on every fetch.
@@ -1943,7 +1253,7 @@ impl GhostState {
         self.save();
     }
 
-    /// Record a classified failure (v4 phase 0). Failure-class
+    /// Record a classified failure. Failure-class
     /// discipline: this updates ONLY the failure histogram and the
     /// counters; wall flags and EWMAs move exclusively on challenge
     /// verdicts, so a flaky network or a dead link can never poison
@@ -2188,144 +1498,7 @@ mod tests {
         assert!(!state.is_flaky("offline.example"));
     }
 
-    #[test]
-    fn newer_snapshot_keeps_its_vault() {
-        let mut mine = GhostState::default();
-        mine.profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cookies = vec![cr("sid", "fresh", ".ex.com", None)];
-        bump_vault_epoch(&mut mine);
-        // Disk carries an OLDER epoch with different cookies.
-        let mut disk = GhostState {
-            vault_epoch: 0,
-            ..Default::default()
-        };
-        disk.profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cookies = vec![cr("sid", "stale", ".ex.com", None)];
-        mine.merge_vault_from_disk(&disk);
-        assert_eq!(mine.profiles["ex.com"].session_cookies[0].value, "fresh");
-    }
-
-    // The core resurrection bug: a live daemon snapshot (boot-era
-    // vault) saving AFTER a helper deleted a domain's session must
-    // adopt the deletion, not rewrite the dead session back.
-    #[test]
-    fn newer_disk_vault_wins_so_logout_is_not_resurrected() {
-        // The daemon snapshot, loaded at boot (epoch 7).
-        let mut mine = GhostState {
-            vault_epoch: 7,
-            ..Default::default()
-        };
-        mine.profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cookies = vec![cr("sid", "dead-session", ".ex.com", None)];
-        mine.tier1_cookies = vec![cr("sid", "dead-session", ".ex.com", None)];
-        // The logout helper wrote disk: deletion, newer epoch.
-        // clear_session_cookies_for keeps the profile entry and
-        // empties its cookies, so disk carries ex.com with none.
-        let mut disk = GhostState {
-            vault_epoch: 8,
-            ..Default::default()
-        };
-        disk.profiles.entry("ex.com".into()).or_default();
-        mine.merge_vault_from_disk(&disk);
-        assert!(
-            mine.profiles["ex.com"].session_cookies.is_empty(),
-            "the logged-out session must stay deleted"
-        );
-        assert!(
-            mine.tier1_cookies.is_empty(),
-            "the logged-out tier-1 echo must stay deleted"
-        );
-    }
-
-    // A helper's harvest lands on disk with a newer epoch; the live
-    // snapshot's next save must ADOPT it, not erase it.
-    #[test]
-    fn newer_disk_harvest_is_adopted_by_the_snapshot() {
-        let mut mine = GhostState {
-            vault_epoch: 3,
-            ..Default::default()
-        };
-        // Boot-era: ex.com had nothing, other.com still does.
-        mine.profiles
-            .entry("other.com".into())
-            .or_default()
-            .session_cookies = vec![cr("o", "kept", ".other.com", None)];
-        let mut disk = GhostState {
-            vault_epoch: 4,
-            ..Default::default()
-        };
-        disk.profiles
-            .entry("ex.com".into())
-            .or_default()
-            .session_cookies = vec![cr("sid", "harvested", ".ex.com", None)];
-        mine.merge_vault_from_disk(&disk);
-        assert_eq!(
-            mine.profiles["ex.com"].session_cookies[0].value, "harvested",
-            "the harvest must survive the snapshot's next save"
-        );
-        assert_eq!(mine.vault_epoch, 4, "the adopted epoch must ride along");
-    }
-
-    // A tie means no helper wrote since this snapshot loaded, so its
-    // copy is exactly what disk holds: keep it (this is what lets a
-    // helper's own save keep its in-memory mutation).
-    #[test]
-    fn epoch_tie_keeps_the_snapshot() {
-        let mut mine = GhostState {
-            vault_epoch: 5,
-            ..Default::default()
-        };
-        mine.tier1_cookies = vec![cr("t1", "mine", ".ex.com", None)];
-        let mut disk = GhostState {
-            vault_epoch: 5,
-            ..Default::default()
-        };
-        disk.tier1_cookies = vec![];
-        mine.merge_vault_from_disk(&disk);
-        assert_eq!(mine.tier1_cookies.len(), 1, "tie = snapshot stands");
-    }
-
-    // Deletion stamps ride onto every profile the logout touches,
-    // including hosts listed as extras by the caller.
-    #[test]
-    fn session_clear_stamp_reaches_subdomains_and_listed_extras() {
-        let mut state = GhostState::default();
-        state.profiles.entry("ex.com".into()).or_default();
-        state.profiles.entry("app.ex.com".into()).or_default();
-        state.profiles.entry("other.com".into()).or_default();
-        let extras = vec!["deep.app.ex.com".to_string()];
-        stamp_session_cleared(&mut state, "ex.com", &extras, 42);
-        assert_eq!(state.profiles["ex.com"].session_cleared_epoch, 42);
-        assert_eq!(state.profiles["app.ex.com"].session_cleared_epoch, 42);
-        assert_eq!(state.profiles["deep.app.ex.com"].session_cleared_epoch, 42);
-        assert_eq!(state.profiles["other.com"].session_cleared_epoch, 0);
-    }
-
-    // Vault writes stamp one past the state they were built from
-    // and saturate instead of wrapping into the past.
-    #[test]
-    fn vault_writes_stamp_one_past_their_base_and_saturate() {
-        let mut base = GhostState {
-            vault_epoch: 40,
-            ..Default::default()
-        };
-        bump_vault_epoch(&mut base);
-        assert_eq!(base.vault_epoch, 41);
-        let mut top = GhostState {
-            vault_epoch: u64::MAX,
-            ..Default::default()
-        };
-        bump_vault_epoch(&mut top);
-        assert_eq!(top.vault_epoch, u64::MAX);
-    }
-
-    // == v4 phase 0: route memory ==
+    // == route memory ==
 
     #[test]
     fn ewma_math() {
@@ -2721,7 +1894,7 @@ mod tests {
         unsafe { std::env::remove_var("DONSETCH_ROUTE_MEMORY_READONLY") };
     }
 
-    // == v4 phase 0.3: personas ==
+    // == personas ==
 
     fn test_caps() -> crate::persona::PersonaCaps {
         crate::persona::PersonaCaps {
@@ -2829,74 +2002,6 @@ mod tests {
         assert!(p.failures.is_empty());
         assert!(p.needs_tier2);
         assert_eq!(p.fetch_count, 3);
-    }
-
-    // ── session vault ──
-
-    #[test]
-    fn session_worthy_keeps_and_drops() {
-        // Session cookie (no expiry) = the login signature.
-        assert!(is_session_worthy(&cr("probe", "v", "a.com", None)));
-        // Auth-named with expiry = remember-me.
-        assert!(is_session_worthy(&cr(
-            "sessionid",
-            "v",
-            "a.com",
-            Some(9_999_999_999)
-        )));
-        assert!(is_session_worthy(&cr(
-            "connect.sid",
-            "v",
-            "a.com",
-            Some(9_999_999_999)
-        )));
-        // Trackers never vault regardless of expiry.
-        assert!(!is_session_worthy(&cr("_ga", "v", "a.com", None)));
-        assert!(!is_session_worthy(&cr("TDID", "v", "a.com", None)));
-        // Clearance cookies belong to the wall vault, not here.
-        assert!(!is_session_worthy(&cr("cf_clearance", "v", "a.com", None)));
-        // A preference cookie with expiry: junk.
-        assert!(!is_session_worthy(&cr(
-            "theme",
-            "dark",
-            "a.com",
-            Some(9_999_999_999)
-        )));
-        // Degenerate shapes.
-        assert!(!is_session_worthy(&cr("x", "", "a.com", None)));
-        assert!(!is_session_worthy(&cr("x", "v", "", None)));
-        // Oversized value: never a reusable session token.
-        assert!(!is_session_worthy(&cr(
-            "tok",
-            &"a".repeat(8193),
-            "a.com",
-            None
-        )));
-    }
-
-    #[test]
-    fn session_merge_dedupes_and_caps_per_domain() {
-        let mut vault = vec![cr("a", "1", "site.com", None)];
-        // Same (name, domain) refreshes in place.
-        merge_session_cookies(
-            &mut vault,
-            std::slice::from_ref(&cr("a", "2", "site.com", None)),
-        );
-        assert_eq!(vault.len(), 1);
-        assert_eq!(vault[0].value, "2");
-        // Fill past the per-domain cap: oldest entries drop.
-        let many: Vec<CookieRecord> = (0..60)
-            .map(|i| cr(&format!("c{i}"), "v", "site.com", None))
-            .collect();
-        merge_session_cookies(&mut vault, &many);
-        assert!(
-            vault.len() <= 50,
-            "per-domain cap breached: {}",
-            vault.len()
-        );
-        // Newest survive: c59 must be present, c0 must not.
-        assert!(vault.iter().any(|c| c.name == "c59"));
-        assert!(vault.iter().all(|c| c.name != "c0"));
     }
 
     // ── cookies_fresh_at ──
@@ -3491,151 +2596,6 @@ mod tests {
         s.record_warm_ok("a.com", &cookies);
         let p = &s.profiles["a.com"];
         assert_eq!(p.cookies.len(), 2); // cf_clearance + datadome only
-    }
-
-    #[test]
-    fn tier1_jar_sync_dedupes_refreshes_and_caps() {
-        let mut st = GhostState::default();
-        let rec = |n: &str, v: &str, d: &str, exp: Option<u64>| CookieRecord {
-            name: n.into(),
-            value: v.into(),
-            domain: d.into(),
-            path: "/".into(),
-            expires_at: exp,
-            secure: false,
-            http_only: false,
-            same_site: "Lax".into(),
-        };
-        st.sync_tier1_cookies(&[rec("uid", "a", ".x.com", Some(now() + 999))]);
-        assert_eq!(st.tier1_cookies.len(), 1);
-        // Same key, new value: refresh in place, never duplicated.
-        st.sync_tier1_cookies(&[rec("uid", "b", ".x.com", Some(now() + 999))]);
-        assert_eq!(st.tier1_cookies.len(), 1);
-        assert_eq!(st.tier1_cookies[0].value, "b");
-        // Expired + empty-value + giant-value refused.
-        st.sync_tier1_cookies(&[
-            rec("dead", "v", ".x.com", Some(now().saturating_sub(10))),
-            rec("none", "", ".x.com", None),
-            rec(
-                "big",
-                ("x".repeat(TIER1_COOKIE_VALUE_MAX + 1)).as_str(),
-                ".x.com",
-                None,
-            ),
-        ]);
-        assert_eq!(st.tier1_cookies.len(), 1);
-        // Cap: flood past 500 distinct, cap holds, refreshed survives.
-        for i in 0..600 {
-            st.sync_tier1_cookies(&[rec(&format!("k{i}"), "v", ".x.com", None)]);
-        }
-        assert_eq!(st.tier1_cookies.len(), TIER1_COOKIE_MAX);
-        // Honest cap semantics: the freshest flood entries survived,
-        // the oldest (never-refreshed) tail left. uid was last
-        // touched before the flood: it is the first evicted.
-        assert!(st.tier1_cookies.iter().any(|c| c.name == "k599"));
-        assert!(st.tier1_cookies.iter().all(|c| c.name != "k0"));
-        // Roundtrip through serde (persistence shape).
-        let json = serde_json::to_string(&st).unwrap();
-        let back: GhostState = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.tier1_cookies.len(), TIER1_COOKIE_MAX);
-    }
-
-    // V02: a cookie re-synced under its scoped form (".x.com") must
-    // replace a bare twin ("x.com"), because `store_raw` folds both
-    // to one jar cookie : leaving the bare row in place let the
-    // older host-only form win the next replay.
-    #[test]
-    fn tier1_jar_sync_folds_scope_into_the_dedupe_key() {
-        let mut st = GhostState::default();
-        let rec = |n: &str, v: &str, d: &str| CookieRecord {
-            name: n.into(),
-            value: v.into(),
-            domain: d.into(),
-            path: "/".into(),
-            expires_at: None,
-            secure: false,
-            http_only: false,
-            same_site: "Lax".into(),
-        };
-        st.sync_tier1_cookies(&[rec("loid", "old", "reddit.com")]);
-        assert_eq!(st.tier1_cookies.len(), 1);
-        st.sync_tier1_cookies(&[rec("loid", "new", ".reddit.com")]);
-        assert_eq!(
-            st.tier1_cookies.len(),
-            1,
-            "the scoped form must replace the bare row, not sit beside it"
-        );
-        assert_eq!(st.tier1_cookies[0].value, "new");
-        // And the bare form folds back the same way.
-        st.sync_tier1_cookies(&[rec("loid", "bare", "reddit.com")]);
-        assert_eq!(st.tier1_cookies.len(), 1);
-        assert_eq!(st.tier1_cookies[0].value, "bare");
-    }
-
-    // The vault kill switch maps through the config layer
-    // (DONSETCH_NO_COOKIE_VAULT); set before the first cfg() touch.
-    #[test]
-    fn tier1_sync_honors_vault_kill_switch() {
-        unsafe { std::env::set_var("DONSETCH_NO_COOKIE_VAULT", "1") };
-        let mut st = GhostState::default();
-        let rec = CookieRecord {
-            name: "post".into(),
-            value: "v".into(),
-            domain: ".x.com".into(),
-            path: "/".into(),
-            expires_at: None,
-            secure: false,
-            http_only: false,
-            same_site: "Lax".into(),
-        };
-        st.sync_tier1_cookies(&[rec]);
-        assert!(st.tier1_cookies.iter().all(|c| c.name != "post"));
-        unsafe { std::env::remove_var("DONSETCH_NO_COOKIE_VAULT") };
-    }
-
-    // The vault outranks the tier-1 echo (#319): the replay set a
-    // daemon builds from (vault sessions, jar) must never let a jar
-    // entry shadow a login cookie for the same name and domain, and
-    // jar-unique cookies must still replay.
-    #[test]
-    fn vault_outranks_the_tier1_echo_on_the_same_key() {
-        let sessions = vec![
-            cr("token_v2", "LOGIN", ".reddit.com", None),
-            cr("reddit_session", "LOGIN2", ".reddit.com", None),
-        ];
-        // The echo: an anonymous value under a login key (dot and
-        // case differences must not hide it), a cookie of its own,
-        // and one from another domain.
-        let jar = vec![
-            cr("token_v2", "ANON", "reddit.com", Some(now() + 999)),
-            cr("loid", "anon-id", ".reddit.com", Some(now() + 999)),
-            cr("sid", "other", ".example.com", Some(now() + 999)),
-        ];
-        let replay = vault_over_jar(&sessions, &jar);
-        assert!(
-            replay
-                .iter()
-                .any(|c| c.name == "token_v2" && c.value == "LOGIN"),
-            "the login value must survive"
-        );
-        assert!(
-            replay.iter().all(|c| c.value != "ANON"),
-            "the anonymous echo must not shadow the login"
-        );
-        assert!(replay.iter().any(|c| c.name == "loid"), "jar-unique stays");
-        assert!(
-            replay
-                .iter()
-                .any(|c| c.name == "sid" && c.domain == ".example.com"),
-            "other domains are untouched"
-        );
-        // The vault rides last: a collision the filter cannot see
-        // still resolves in its favor inside the jar store itself.
-        assert_eq!(
-            replay.last().map(|c| c.name.as_str()),
-            Some("reddit_session")
-        );
-        assert_eq!(replay.len(), 4);
     }
 
     #[test]

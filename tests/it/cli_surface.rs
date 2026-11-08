@@ -12,8 +12,6 @@
 //! - `donsetch fetc` printed "unknown command" and the top help with no
 //!   suggestion; `donsetch help nonsense` exited 0.
 //! - `donsetch -V` was an unknown command while `-h` worked.
-//! - `donsetch login` with no terminal launched a real browser before
-//!   discovering the closed stdin.
 //!
 //! Plus the sponsor placement's hard lines: labelled, human-surface only,
 //! and switchable off without the config layer complaining about the
@@ -163,7 +161,7 @@ fn status_json_is_one_document() {
 }
 
 /// The browser health line names only what still needs the browser:
-/// screenshots and login.
+/// screenshots.
 #[test]
 fn status_browser_warning_names_only_what_uses_the_browser() {
     let sb = Sandbox::new("status-browser");
@@ -181,10 +179,7 @@ fn status_browser_warning_names_only_what_uses_the_browser() {
         .lines()
         .find(|l| l.contains("browser unavailable"))
         .unwrap_or_else(|| panic!("no browser warning in: {text}"));
-    assert!(
-        health.contains("screenshot and login will not work"),
-        "{health}"
-    );
+    assert!(health.contains("screenshot will not work"), "{health}");
     assert!(!health.contains("actions"), "{health}");
 
     // Negative case: with a browser present there is no warning at all.
@@ -214,9 +209,7 @@ fn status_browser_warning_names_only_what_uses_the_browser() {
 #[test]
 fn the_two_help_routes_cannot_drift() {
     let sb = Sandbox::new("help-routes");
-    for cmd in [
-        "proxy", "keys", "login", "status", "doctor", "adapters", "rules",
-    ] {
+    for cmd in ["proxy", "keys", "status", "doctor", "adapters", "rules"] {
         let routed = sb.run(&["help", cmd]);
         let direct = sb.run(&[cmd, "--help"]);
         assert_eq!(routed.status.code(), Some(0), "help {cmd}");
@@ -261,25 +254,6 @@ fn short_version_flag_works() {
     let out = sb.run(&["-V"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(stdout(&out).contains(env!("CARGO_PKG_VERSION")));
-}
-
-/// The other branches of `login` are non-interactive; the interactive one
-/// needs a human, and must say so before spawning anything.
-#[test]
-fn login_without_a_terminal_launches_no_browser() {
-    let sb = Sandbox::new("login-notty");
-    let out = sb.run(&["login"]);
-    assert_ne!(out.status.code(), Some(0));
-    assert!(
-        stderr(&out).contains("needs a terminal"),
-        "{}",
-        stderr(&out)
-    );
-    assert!(
-        !stdout(&out).contains("Starting browser"),
-        "a browser was launched for a login nobody could confirm: {}",
-        stdout(&out)
-    );
 }
 
 /// An empty export prints nothing on stdout (it is piped into other

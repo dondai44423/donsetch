@@ -31,7 +31,8 @@ async fn fetch_with_budget(
             witness.clone(),
             run_with_budget(
                 Box::pin(
-                    crate::fetch::v5::CALLER_DEADLINE.scope(until, fetch_single(daemon, args, url)),
+                    crate::fetch::core::CALLER_DEADLINE
+                        .scope(until, fetch_single(daemon, args, url)),
                 ),
                 deadline,
                 ctx,
@@ -976,7 +977,7 @@ async fn fetch_single_inner(
     let is_json_url = is_json_url_like(&url);
 
     // === Domain state before the fetch ===
-    // Remember the real origin scheme (v4 phase 0.2: the prober
+    // Remember the real origin scheme (the prober
     // probes the origin, not a guessed https upgrade).
     {
         let scheme = if url.starts_with("http://") {
@@ -990,7 +991,7 @@ async fn fetch_single_inner(
             .unwrap_or(if scheme == "http" { 80 } else { 443 });
         let mut state = daemon.state.lock().await;
         state.note_origin(&host, scheme, port);
-        // Longitudinal identity (v4 phase 0.3): mint or validate
+        // Longitudinal identity: mint or validate
         // the domain persona. Coherence drift or quarantine here
         // re-mints automatically.
         let caps = crate::persona::PersonaCaps::from_profile(daemon.fetcher.profile());

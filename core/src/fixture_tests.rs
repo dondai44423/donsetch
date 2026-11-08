@@ -12,7 +12,7 @@
 //!
 //! The bundles are AWS's code, not this crate's license, so they are not in the
 //! repository: the tests read them from `V5_FIXTURES` (default
-//! `../v5/core/fixtures`, the private tree) and are `#[ignore]`d so a checkout
+//! `../core/fixtures`, the private tree) and are `#[ignore]`d so a checkout
 //! without them reports them as not run, never as passed. Run them with
 //! `cargo test --release -- --include-ignored`.
 
@@ -35,7 +35,7 @@ fn fixture(shape: &str, file: &str) -> Vec<u8> {
     let root = std::env::var_os("V5_FIXTURES")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            [env!("CARGO_MANIFEST_DIR"), "..", "v5", "core", "fixtures"]
+            [env!("CARGO_MANIFEST_DIR"), "..", "core", "fixtures"]
                 .iter()
                 .collect()
         });

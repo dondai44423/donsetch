@@ -64,7 +64,7 @@ feat := "--features ocr,rerank,http"
 # scripts/budget.sh — that last one is what stops the growth, because a
 # session that builds and never pushes never reaches the other three.
 # Ceiling 45G; the floor under it is the warm artifact set (fast ~15G,
-# ci ~4G, v5core ~4G, sccache <=10G, a 3-day incremental window ~8G).
+# ci ~4G, core ~4G, sccache <=10G, a 3-day incremental window ~8G).
 # How the bloat regrew, and why the previous fixed-profile-list guard went
 # green while doing nothing, is in the script header.
 guard:
@@ -78,7 +78,7 @@ clean-bloat:
 # Instant size report: what each shell of the build tree costs, and how
 # much of the incremental caches is already reclaimable.
 space:
-	@du -shx target v5core/target fuzz/target v5/proof/target 2>/dev/null || true
+	@du -shx target core/target fuzz/target 2>/dev/null || true
 	@du -shx target/*/ 2>/dev/null | sort -rh | head -8
 	@sh scripts/guard.sh --report
 

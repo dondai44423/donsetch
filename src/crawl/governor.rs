@@ -849,7 +849,7 @@ mod tests {
         }
     }
 
-    // v4 phase 3 (law 11): the adaptive ladder is capped. At the
+    // (law 11): the adaptive ladder is capped. At the
     // top rung the wait must never exceed MAX_LADDER_WAIT, whatever
     // the jitter draws. Pre-cap, rung 6 reached ~16s.
     #[test]

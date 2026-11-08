@@ -5,6 +5,37 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The repository is one structure at the current version: the product is `src/`,
+the fetch core is `core/` (crate `donsetch-core`), and the private design set is
+`design/`. v4-era material has left the checkout. No version bump yet.
+
+### Changed
+
+- **One structure.** `v5core/` is now `core/` and the crate is `donsetch-core`;
+  the product's fetch module is `src/fetch/core.rs`; the private docs are
+  `design/brief.md` and `design/mechanism.md`. CI, `Justfile`, `guard.sh` and every
+  document follow. Frozen v4 evidence (Persona Engine, doncore, proof, the v4
+  design notes) moved out of the repository to `~/Projects/donsetch-evidence/`.
+- **A major update asks first.** `donsetch update` now prints what a major version
+  changes and refuses to install one without confirmation; an unattended run needs
+  `--yes`. The text names the v5 fetch-engine change when the jump is 4.x → 5.x.
+  A v4 install that already updated in place sees a one-time notice on its first
+  interactive run, on stderr only.
+
+### Removed
+
+- **`donsetch login` and the session vault.** The vault was written and never spent:
+  v5 keeps its own per-(host, identity) jars, the tier-1 echo that used to bridge
+  them had no caller, and `web_screenshot` uses a throwaway profile. A login wall
+  stays a declared `wall_state`; authenticated browsing belongs to a browser driver
+  (bladebro). Removed with it: `src/auth.rs`, the `--import`/`--logout`/`--status`
+  paths, `auth-state.json`, the vault fields in `ghost-state.json`, the `reqwest`
+  login probe, and the headful browser path.
+- **The `state.cookie_vault` knob and `DONSETCH_NO_COOKIE_VAULT`**, which gated that
+  vault and nothing else.
+
 ## [5.0.0] - 2026-11-08
 
 The stable release of v5: one fetch path (`v5core`: carried identity and state,

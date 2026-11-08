@@ -9,13 +9,15 @@
 //! Flow:
 //!   1. Fetch `releases.atom`, parse the first `<entry><title>` tag.
 //!   2. Compare with the current version (semver).
-//!   3. Download the platform-correct tarball + SHA256 from
+//!   3. A major version prints what it changes and asks first; `--yes`
+//!      answers for an unattended run (`confirm_major_update`).
+//!   4. Download the platform-correct tarball + SHA256 from
 //!      `releases/download/v<tag>/donsetch-{platform}.tar.gz`.
-//!   4. Verify SHA256.
-//!   5. Extract (flate2 + tar).
-//!   6. Replace the binary in place (atomic on Unix, rename-then-
+//!   5. Verify SHA256.
+//!   6. Extract (flate2 + tar).
+//!   7. Replace the binary in place (atomic on Unix, rename-then-
 //!      write on Windows). Also replaces pdfium.dll and onnxruntime.dll on Windows.
-//!   7. Clean up temp files and old backups.
+//!   8. Clean up temp files and old backups.
 
 use std::path::Path;
 
@@ -28,7 +30,8 @@ use crate::profile::BrowserProfile;
 const REPO: &str = "dondai44423/donsetch";
 
 pub async fn run(args: &[String]) {
-    crate::cli::args::Spec::new("update", "donsetch update", &[]).reject(&args[2..]);
+    crate::cli::args::Spec::new("update", "donsetch update [--yes]", &["--yes", "-y"])
+        .reject(&args[2..]);
     cli::init();
     cli::print_title(&format!("{DISPLAY_NAME} Update"));
 
@@ -112,6 +115,16 @@ pub async fn run(args: &[String]) {
             return;
         }
         Offer::Newer => {}
+    }
+
+    // ── Major-version guard ──────────────────────────────────
+    // A major release is a different fetch engine, not a patch: the v5
+    // update retires v4's browser tier, its login vault and its tier
+    // model. Warn before the download touches the install, and never
+    // install one unattended without --yes.
+    if is_major_jump(current, &latest) && !confirm_major_update(current, &latest, &args) {
+        println!("  Update cancelled.");
+        std::process::exit(1);
     }
 
     // ── Platform asset ───────────────────────────────────────
@@ -305,6 +318,57 @@ pub(crate) async fn fetch_feed(fetcher: &Fetcher) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&out.body).into_owned())
+}
+
+/// Does `latest` cross a major-version boundary above `current`?
+fn is_major_jump(current: &str, latest: &str) -> bool {
+    let (Ok(current), Ok(latest)) = (
+        semver::Version::parse(current),
+        semver::Version::parse(latest),
+    ) else {
+        return false;
+    };
+    latest.major > current.major
+}
+
+/// The warning a major update must pass before it installs.
+///
+/// Interactive installs answer a y/N prompt; a non-interactive one must
+/// pass `--yes`, so a script cannot cross a major version by accident.
+fn confirm_major_update(current: &str, latest: &str, args: &[String]) -> bool {
+    use std::io::{IsTerminal, Write};
+
+    println!();
+    println!("  {} MAJOR UPDATE: {current} -> {latest}", cli::icon_warn());
+    if current.starts_with("4.") && latest.starts_with("5.") {
+        println!("  v5 replaces the v4 fetch architecture; this is not a patch:");
+        println!("    - the fetch path becomes one binary with V8 in-process: no browser,");
+        println!("      no rendering, no tiers. Identity and state are carried and measured;");
+        println!("    - `donsetch login` and the session vault are gone. A login wall is");
+        println!("      reported, never crossed. Authenticated browsing belongs to a browser");
+        println!("      driver (bladebro), not to this fetcher;");
+        println!("    - hard sites will answer differently: some v4 fetches become content,");
+        println!("      some v4 workarounds become declared walls with evidence;");
+        println!("    - v4 state is left in place and ignored by the new engine.");
+    } else {
+        println!("  A major version changes what the fetch path guarantees and can retire");
+        println!("  commands you use. Read the release notes before installing.");
+    }
+    println!();
+    if args.iter().skip(2).any(|a| a == "--yes" || a == "-y") {
+        return true;
+    }
+    if !std::io::stdin().is_terminal() {
+        println!("  Not a terminal: re-run with --yes to install this major update.");
+        return false;
+    }
+    print!("  Continue? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// What `donsetch update` does for an install offered a release by
@@ -1507,5 +1571,28 @@ pub(crate) mod tests {
         assert!(note.contains("cannot be locked"), "{note}");
         assert!(note.contains(&cause.to_string()), "{note}");
         assert!(note.ends_with(';'), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod major_guard_tests {
+    use super::{confirm_major_update, is_major_jump};
+
+    #[test]
+    fn a_major_jump_is_only_a_major_jump() {
+        assert!(is_major_jump("4.9.0", "5.0.0"));
+        assert!(is_major_jump("5.0.0", "6.0.0"));
+        assert!(!is_major_jump("5.0.0", "5.1.0"));
+        assert!(!is_major_jump("5.1.0", "5.0.0"));
+        assert!(!is_major_jump("not-semver", "5.0.0"));
+    }
+
+    #[test]
+    fn a_major_update_needs_yes_when_nobody_is_watching() {
+        let args: Vec<String> = ["donsetch", "update", "--yes"].map(String::from).to_vec();
+        assert!(confirm_major_update("4.9.0", "5.0.0", &args));
+        let no_args: Vec<String> = ["donsetch", "update"].map(String::from).to_vec();
+        // Unit tests run without a terminal: the prompt is refused.
+        assert!(!confirm_major_update("4.9.0", "5.0.0", &no_args));
     }
 }

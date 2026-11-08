@@ -31,7 +31,7 @@ pub struct Persona {
 }
 
 /// The chrome-local persona: the fields this crate reads, distilled from the
-/// reference-browser capture (`v5/research/persona/chrome-local.json`) and built
+/// reference-browser capture (`~/Projects/donsetch-evidence/research/persona/chrome-local.json`) and built
 /// into the binary, so it does not depend on the working directory.
 const CHROME_LOCAL: &str = include_str!("../personas/chrome-local.json");
 

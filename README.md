@@ -180,7 +180,7 @@ cd donsetch
 cargo build --release --features ocr,rerank,http
 ```
 
-First build compiles BoringSSL and links V8 (a few minutes), cached after. Chromium is optional and never fetches pages: it serves `web_screenshot` and `donsetch login`. DonSeTch auto-discovers system Chromium, Playwright's cached builds, or Edge on Windows.
+First build compiles BoringSSL and links V8 (a few minutes), cached after. Chromium is optional and never fetches pages: it serves `web_screenshot` only. DonSeTch auto-discovers system Chromium, Playwright's cached builds, or Edge on Windows.
 
 PDFium's static archives use CREL (compact relocation) sections. A linker that does not know them, GNU ld before 2.44 and any lld before LLVM 20 (Ubuntu 22.04 and 24.04 ship bfd 2.38/2.42 and lld 14/18), skips them without an error and the link succeeds, but every relocation in those objects is left unapplied: the binary then calls a null constructor and dies with SIGSEGV before `main`. `build.rs` therefore links with the toolchain's own `rust-lld` (as new as rustc's LLVM, nothing to install) and falls back to an `ld.lld` of LLVM 20 or later on `PATH`. Do not force an older lld through `RUSTFLAGS`.
 
@@ -198,7 +198,7 @@ The same recipe covers the prebuilt baseline: every asset from v3.4.5+ is built 
 <details>
 <summary><b>Browser</b></summary>
 
-The browser serves screenshots and `donsetch login`, never page reads. DonSeTch drives an installed Chromium-family browser (Chromium, Chrome, or Edge on Windows) and downloads none: screenshots run it with `--headless=new`, and `donsetch login` opens a normal window on a profile of its own so you can sign in.
+The browser serves screenshots, never page reads. DonSeTch drives an installed Chromium-family browser (Chromium, Chrome, or Edge on Windows) and downloads none: screenshots run it headless in a throwaway profile.
 
 `browser.chromium_path` picks the binary; the legacy `DONGHOST_CHROME` sets the same value. Without it, DonSeTch takes the first executable among the usual install locations, Playwright's browser caches (including `browser.playwright_path` or `PLAYWRIGHT_BROWSERS_PATH`) and `PATH`.
 
@@ -586,12 +586,12 @@ Every layer in Rust.
 
 | Component | What | Where |
 |---|---|---|
-| 🛡️ **v5 core** | The fetch engine: client identities, learned state, page cache, wall classification, the site's own interfaces, the in-process V8 challenge engine | `v5core/` |
+| 🛡️ **Fetch core** | The fetch engine: client identities, learned state, page cache, wall classification, the site's own interfaces, the in-process V8 challenge engine | `core/` |
 | 📝 **DonSift** | HTML → markdown, block model, 12-language BM25, the page views (`must_contain`, `focus`, `toc`, `section`) | `src/extract/` |
 | 🔎 **DonSeek** | Keyless multi-engine search, RRF + BM25 + consensus + semantic reranking | `src/search/` |
 | 🕷️ **DonTread** | Crawl engine, sitemap, focus frontier, Governor pacing, resume tokens | `src/crawl/` |
 | 📄 **DonSheet** | PDF extraction, PDFium FFI, pixel-truth fusion, OCR cascade, forms | `src/pdf/` |
-| 📸 **Browser** | Screenshots and `donsetch login` only; never a page read | `src/browser/` |
+| 📸 **Browser** | Screenshots only, headless and throwaway; never a page read | `src/browser/` |
 | 🔌 **MCP daemon** | stdio + HTTP servers, JSON-RPC 2.0, four tools, crash-only supervisor | `src/mcp/` |
 
 1,900+ tests. Zero clippy warnings: `cargo clippy --all-targets --features ocr,rerank -- -Dwarnings` is the law, and CI runs the full matrix on Linux, macOS and Windows.
@@ -655,7 +655,6 @@ Thin adapter over the same engine the MCP server uses.
 | `donsetch status` | Version, keys, proxies, cache, health overview (`--json` for scripts and agents) |
 | `donsetch keys` | BYOK providers and plugins (`add`, `list`, `default`, `export`) |
 | `donsetch proxy` | Proxy management (`add`, `list`, `check`, `test`, `import`, `export`, `remove`, `clear`, `fetch on\|off`, `crawl on\|off`) |
-| `donsetch login` | Store a signed-in session in the private vault (`--list`, `--status`, `--logout`, `--import`); fetch does not send it yet |
 | `donsetch config` | `show`, `--markdown`, `--legacy` |
 | `donsetch rules test <url>` | Explain what the local rules do with a URL, offline |
 | `donsetch tools` | Tool schemas as JSON, same as MCP `tools/list` |
@@ -705,24 +704,20 @@ Set the environment and every fetch follows the curl convention:
 
 ## 🔐 Logged-in sessions
 
-**In v5, `web_fetch` never signs in and never sends a stored session.** A page behind a login (x.com, gated docs, internal tools) comes back as a declared `wall.auth`, not as content, and no cookie a browser harvested is ever spent by a fetch. Session support for fetch is planned as its own feature.
+**The fetcher never signs in and never carries a session.** A page behind a login
+(x.com, gated docs, internal tools) comes back as a declared `wall.auth` with its
+vendor and ask — not as content, and never with a cookie a browser harvested. That
+is the design, not a gap: the fetch layer answers *who is asking* with a coherent
+anonymous client, which is a different problem from *who you are*.
 
-`donsetch login` still stores sessions in the private vault, without ever seeing your credentials, ready for that feature:
+Authenticated browser work belongs to a real browser driver, not to this fetcher: a
+persistent Chrome profile with its own cookie state (bladebro is one), not a
+credential store inside `donsetch`. This fetch path opens no headed browser and
+stores no credentials. If you need a signed-in page, drive it there and hand the
+text back.
 
-```bash
-donsetch login x.com          # opens YOUR browser, you sign in, press Enter
-donsetch login --list         # stored sessions (names and counts only)
-donsetch login --status x.com # one domain, in detail
-donsetch login --logout x.com # forget a domain
-donsetch login --import cookies.txt x.com   # servers and CI, Netscape format
-```
-
-- Credentials never enter DonSeTch. It opens a real Chromium on your display in a dedicated profile, never the automation one. You type into the browser. No keystroke capture, no screenshots, no CDP attach until you press Enter.
-- Afterwards, cookies selected by your domain or explicit import are stored regardless of whether their names look like authentication tokens. Known analytics and clearance cookies, expired records and invalid values are excluded. Names and paths retain their identity, including opaque persistent names such as `c_user`, `xs` and `li_at`. Cookie values stay in the private vault; `Saved`/`Imported` lists names only. Captures from older browsers cannot overwrite the replacement session.
-- A named-domain post-login probe checks reachability and reports login/access redirects as unverified. A public home-page HTTP 200 cannot prove authentication, so it never earns a verified checkmark. Multi-site saves avoid one probe per domain.
-- Failed writes and captures return an error instead of reporting success. EOF and Ctrl+C save nothing to the vault; `--fresh` waits for the exclusive profile lock before wiping it. The dedicated browser profile may retain its own cookies until cleared with `--fresh`.
-- The registry (`auth-state.json`) stores metadata only: names, counts, expiries, probe verdicts. Never values.
-- Multi-site: run bare `donsetch login`, sign into as many tabs as you like, press Enter once. New cookies and rotated values are captured, including opaque persistent cookies.
+`web_screenshot` is the one browser use that stays: headless, throwaway profile, no
+cookies, one PNG.
 
 ## 🐳 Docker
 
@@ -788,7 +783,7 @@ The honest summary: nothing else in this space combines browser-free challenge h
 | Tool schema | **~2.0k tokens** | ~2.7k | varies | n/a | varies |
 | License | AGPL v3 | MIT | Apache 2.0 | proprietary | MIT |
 
-**Against Firecrawl, head to head, same tasks, live** (measured with v4; v5 numbers are coming). Firecrawl is a paid cloud API, DonSeTch is free, local and keyless:
+**Against Firecrawl, head to head, same tasks, live** (last run on v4; not re-run since the fetch-engine swap). Firecrawl is a paid cloud API, DonSeTch is free, local and keyless:
 
 - **Fetch**: Wikipedia comes back 16x smaller (16KB against 267KB). An arXiv PDF is 22x faster and 4.4x smaller (1.4s/16KB against 32.6s/71KB). Reddit: Firecrawl refuses the site, DonSeTch returns the real feed.
 - **Crawl**: 2.5x faster on the same docs target (18.7s against 47.6s), with `--topic` ranking the frontier instead of firehosing, and an honest small failure when the topic has no match instead of verbose unrelated content.

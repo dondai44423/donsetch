@@ -25,7 +25,7 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
     let mut opts = crawl_options(args);
     let resume = args.get("resume").and_then(Value::as_str).map(String::from);
 
-    // v4 phase 3 delta crawl: pages are re-checked and their fresh
+    // delta crawl: pages are re-checked and their fresh
     // fingerprint compared with page history; only changed or new
     // pages land in the results. Recording happens for every fetched
     // page below, so crawls keep feeding the same memory fetches do.
@@ -438,7 +438,7 @@ fn crawl_options(args: &Value) -> CrawlOptions {
     if let Some(q) = args.get("min_quality").and_then(Value::as_f64) {
         opts.min_quality = q.clamp(0.0, 1.0) as f32;
     }
-    // v4 phase 3: dataset mode is output-format only.
+    // dataset mode is output-format only.
     if args
         .get("dataset")
         .and_then(Value::as_bool)
@@ -615,7 +615,7 @@ pub(super) fn render_crawl_result(
     })
 }
 
-/// Dataset mode (v4 phase 3): one JSON object per fetched page,
+/// Dataset mode: one JSON object per fetched page,
 /// JSON Lines. Rows are sorted by URL for deterministic output
 /// (delta-friendly diffs across recrawls). Duplicate content pages
 /// are dropped: a dataset wants one row per page. serde_json does

@@ -272,9 +272,9 @@ pub async fn run(args: &[String]) {
         std::process::exit(0);
     }
 
-    // --stealth / --stealth-record: the drift scorecard (v4 phase
-    // 0.4). Standalone mode: skips the general check battery.
-    // --parity (with --stealth, v4 phase 1.1): diff the local fetch against
+    // --stealth / --stealth-record: the drift scorecard. Standalone
+    // mode: skips the general check battery.
+    // --parity (with --stealth): diff the local fetch against
     // the REAL local browser instead of the fixture.
     if stealth || stealth_record {
         let code = stealth_scorecard(stealth_record, json, parity).await;
@@ -350,7 +350,6 @@ pub async fn run(args: &[String]) {
     report!("Chrome/Chromium", check_chrome().await);
 
     // 5. Auth profile.
-    report!("Auth profile", check_auth_profile());
 
     // Browser availability means a real launch and selftest, including in
     // default mode. Deep adds network/provider probes.
@@ -367,9 +366,6 @@ pub async fn run(args: &[String]) {
 
     // 8. Cache directory.
     report!("Cache directory", check_cache_dir());
-
-    // 8b. Auth sessions (donsetch login).
-    report!("Auth sessions", check_auth_sessions());
 
     // 9. State permissions.
     report!("State permissions", check_state_permissions());
@@ -965,7 +961,7 @@ async fn check_browser_launch() -> CheckResult {
         Err(e) => {
             return CheckResult::Fail(
                 format!("launch failed: {e}"),
-                "Browser-backed features (screenshot, login) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
+                "Browser-backed features (screenshot) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
             );
         }
     };
@@ -976,7 +972,7 @@ async fn check_browser_launch() -> CheckResult {
             Err(e) => {
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
-                    "Browser-backed features (screenshot, login) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
+                    "Browser-backed features (screenshot) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
                 );
             }
         };
@@ -1211,17 +1207,6 @@ fn check_rerank_model() -> CheckResult {
     }
 }
 
-fn check_auth_profile() -> CheckResult {
-    let dir = crate::paths::cache_dir().join("auth-profile");
-    if !dir.exists() {
-        return CheckResult::Pass("not created yet (`donsetch login` creates it)".into());
-    }
-    match probe_writable(&dir) {
-        Ok(()) => CheckResult::Pass("writable; profile locks preserved".into()),
-        Err(e) => CheckResult::Fail("not writable".into(), format!("Check permissions: {e}")),
-    }
-}
-
 // Probe only a newly created file owned by this check. A fixed filename can
 // overwrite a user's file or follow a symlink; Chromium owns its own locks.
 fn probe_writable(dir: &Path) -> std::io::Result<()> {
@@ -1242,38 +1227,6 @@ fn probe_writable(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
-fn check_auth_sessions() -> CheckResult {
-    let reg = crate::auth::AuthRegistry::load();
-    if reg.domains.is_empty() {
-        return CheckResult::Pass(
-            "no stored logins (use `donsetch login <domain>` to fetch gated sites)".into(),
-        );
-    }
-    let t = crate::state::now();
-    let mut unverified = Vec::new();
-    let mut expiring = Vec::new();
-    for (d, s) in &reg.domains {
-        if s.verified == Some(false) {
-            unverified.push(d.clone());
-        }
-        // Session cookies (no expiry) never trip the near-expiry warn.
-        if let Some(min) = s.expires_min
-            && min > t
-            && min < t + 86_400
-        {
-            expiring.push(format!("{d} ({})", crate::auth::fmt_expiry(Some(min))));
-        }
-    }
-    let mut note = format!("{} domain(s) with stored sessions", reg.domains.len());
-    if !unverified.is_empty() {
-        note.push_str(&format!("; unverified: {}", unverified.join(", ")));
-    }
-    if !expiring.is_empty() {
-        note.push_str(&format!("; expiring soon: {}", expiring.join(", ")));
-    }
-    CheckResult::Pass(note)
-}
-
 fn check_cache_dir() -> CheckResult {
     let dir = paths::cache_dir();
 
@@ -1289,10 +1242,8 @@ fn check_cache_dir() -> CheckResult {
             let total = dir_size(&dir);
 
             // Breakdown by component : helps users understand what's
-            // using space. The auth-profile (Chrome's login cache) can
-            // grow; ghost-state.json (self-improvement) should be
+            // using space. ghost-state.json (self-improvement) should be
             // < 1MB after cookie filtering.
-            let auth_profile = dir.join("auth-profile");
             let ghost_state = dir.join("ghost-state.json");
             let ocr = dir.join("ocr");
             let rerank = dir.join("rerank");
@@ -1303,14 +1254,6 @@ fn check_cache_dir() -> CheckResult {
                     "self-improvement",
                     if ghost_state.exists() {
                         ghost_state.metadata().map(|m| m.len()).unwrap_or(0)
-                    } else {
-                        0
-                    },
-                ),
-                (
-                    "auth-profile",
-                    if auth_profile.exists() {
-                        dir_size(&auth_profile)
                     } else {
                         0
                     },
@@ -1741,8 +1684,6 @@ fn check_clearance_stores() -> CheckResult {
         bits.push("handles none".into());
     }
 
-    let vault = onoff(crate::config::cfg().state.cookie_vault);
-    bits.push(format!("cookie_vault {vault}"));
     CheckResult::Pass(bits.join(" · "))
 }
 
@@ -2342,10 +2283,10 @@ fn apply_fixes(collected: &mut [(String, String, String, String)]) {
     }
 }
 
-/// The stealth drift scorecard (v4 phase 0.4). Exit codes: 0 all
+/// The stealth drift scorecard. Exit codes: 0 all
 /// layers match the baseline, 1 drift or capture failure
 /// (--stealth-record writes the fixture and exits 0 on success).
-/// --parity (v4 phase 1.1) instead diffs the live local fetch
+/// --parity instead diffs the live local fetch
 /// against the REAL local browser: the evergreen check,
 /// no fixture involved. It cannot go stale; it fails when the
 /// profile and the floor diverge.
@@ -2555,36 +2496,6 @@ mod doctor_ultra_tests {
                 .join("")
                 .contains('\u{1b}')
         );
-    }
-
-    #[test]
-    fn wave450_doctor_preserves_profile_locks_and_existing_probe_file() {
-        let _cache = isolated_cache();
-        let profile = crate::paths::cache_dir().join("auth-profile");
-        std::fs::create_dir_all(&profile).unwrap();
-        for name in [
-            "SingletonLock",
-            "SingletonSocket",
-            "SingletonCookie",
-            ".doctor-write-test",
-        ] {
-            std::fs::write(profile.join(name), b"owned by another process").unwrap();
-        }
-        assert!(matches!(
-            check_auth_profile(),
-            CheckResult::Pass(_) | CheckResult::Warn(_)
-        ));
-        for name in [
-            "SingletonLock",
-            "SingletonSocket",
-            "SingletonCookie",
-            ".doctor-write-test",
-        ] {
-            assert_eq!(
-                std::fs::read(profile.join(name)).unwrap(),
-                b"owned by another process"
-            );
-        }
     }
 
     mod tempfile_dir {

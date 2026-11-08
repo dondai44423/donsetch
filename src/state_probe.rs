@@ -1,4 +1,4 @@
-//! Background probe-down recovery (v4 phase 0.2).
+//! Background probe-down recovery.
 //!
 //! Wall memory learns "this host is defended" from challenge
 //! verdicts. Without a healer, that decision is one-way: a site

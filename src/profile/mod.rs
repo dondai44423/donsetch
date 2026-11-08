@@ -168,7 +168,7 @@ impl BrowserProfile {
         self.h1_headers_for_class(host, path, RequestClass::Navigation)
     }
 
-    /// Class-aware header sets (v4 phase 1.2). A real browser does
+    /// Class-aware header sets. A real browser does
     /// not send one header set for everything: navigations carry
     /// upgrade-insecure-requests + sec-fetch-user + the document
     /// Accept; subresources carry per-type Accept, no-cors mode,
@@ -246,7 +246,7 @@ impl BrowserProfile {
 /// header on a .ru page is served the English stub (and is a mild
 /// incoherence signal). Derived from the host TLD and non-Latin
 /// script in the path; everything else stays Chrome-default en-US.
-/// What kind of request this is (v4 phase 1.2): header sets and
+/// What kind of request this is: header sets and
 /// JA4H profiles differ per class, so the wire must too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestClass {

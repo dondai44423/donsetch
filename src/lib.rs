@@ -5,8 +5,8 @@
 //!
 //! - [`extract`] : DonSift: HTML/PDF bytes → agent-native markdown
 //! - [`fetch`] : the fetch pipeline riding the in-tree engine
-//! - [`browser`] : the locally installed browser (login, screenshot, parity)
-//! - [`state`] : the disk-backed fetch state (route memory, session vault)
+//! - [`browser`] : the locally installed browser (screenshot, parity)
+//! - [`state`] : the disk-backed fetch state (route memory, wall memory, personas)
 //! - [`search`] : DonSeek: keyless multi-engine search
 //! - [`crawl`] : DonTread: sitemap-aware site walking
 //! - [`detect`] : wall/bot detection verdicts
@@ -17,7 +17,6 @@
 //! The binary in `main.rs` is a thin shell over this library.
 
 pub mod adapters;
-pub mod auth;
 pub mod browser;
 pub mod cli;
 pub mod config;

@@ -1335,6 +1335,7 @@ dependencies = [
  "clap",
  "config",
  "dirs",
+ "donsetch-core",
  "ed25519-dalek",
  "ego-tree",
  "encoding_rs",
@@ -1368,11 +1369,29 @@ dependencies = [
  "tower-http",
  "unicode-bidi",
  "url",
- "v5core",
  "windows-sys 0.61.2",
  "winresource",
  "zip",
  "zstd 0.14.3",
+]
+
+[[package]]
+name = "donsetch-core"
+version = "0.1.0"
+dependencies = [
+ "btls",
+ "deno_core",
+ "futures-util",
+ "getrandom 0.2.17",
+ "rustls-native-certs",
+ "scraper",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "webpki-root-certs",
+ "wreq",
+ "wreq-util",
 ]
 
 [[package]]
@@ -5142,25 +5161,6 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "v5core"
-version = "0.1.0"
-dependencies = [
- "btls",
- "deno_core",
- "futures-util",
- "getrandom 0.2.17",
- "rustls-native-certs",
- "scraper",
- "serde",
- "serde_json",
- "tokio",
- "url",
- "webpki-root-certs",
- "wreq",
- "wreq-util",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 //! The model that outlived the transport (v5 swap, 2026-10-23).
 //!
-//! The wire itself is the fetch core (`v5core`): these modules are the app's
+//! The wire itself is the fetch core (`core`): these modules are the app's
 //! pure model around it. `proxy` parses and persists egress lanes,
 //! `request_route` is the immutable routing policy shared by a fetch and
 //! its related reads, `dns` is the process-local resolver cache the

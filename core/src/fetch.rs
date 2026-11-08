@@ -191,7 +191,7 @@ enum Interface {
 }
 
 /// One fetching context: its own clients (one per identity and egress) and the
-/// state it learns into. Single-threaded; `v5core::Session` pools these.
+/// state it learns into. Single-threaded; `donsetch_core::Session` pools these.
 pub struct Worker {
     state: State,
     wires: HashMap<(&'static str, Option<String>), Wire>,
@@ -202,7 +202,7 @@ pub struct Worker {
     /// Learn from encounters: scores, cookies, credentials.
     persist: bool,
     /// Write what was learned to the state file. Off when an owner of several
-    /// workers persists their merged state itself (`v5core::Session`).
+    /// workers persists their merged state itself (`donsetch_core::Session`).
     saves: bool,
     /// The state file as this worker last read or wrote it: what a save merges from.
     base: State,

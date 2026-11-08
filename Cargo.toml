@@ -8,7 +8,7 @@ description = "Web fetch, search and crawl for AI agents. Custom stealthy fetch 
 [dependencies]
 # The fetch core, in-tree: carried identity and learned state per origin,
 # the page cache, data paths and the in-process V8 challenge engine.
-v5core = { path = "v5core" }
+donsetch-core = { path = "core" }
 tokio = { version = "1", features = ["full"] }
 url = "2"
 brotli = "9"
@@ -196,9 +196,9 @@ codegen-units = 256
 opt-level = 1
 
 # The fetch core's vendored forks: patches apply from the workspace ROOT
-# (v5core keeps the same table for its standalone builds).
+# (core keeps the same table for its standalone builds).
 #  wreq/btls-sys: Chrome ClientHello parity (trust_anchors extension +
 #  signature-algorithm list) that the published presets cannot express.
 [patch.crates-io]
-wreq = { path = "v5core/vendor/wreq" }
-btls-sys = { path = "v5core/vendor/btls-sys" }
+wreq = { path = "core/vendor/wreq" }
+btls-sys = { path = "core/vendor/btls-sys" }

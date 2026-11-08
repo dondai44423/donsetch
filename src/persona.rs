@@ -1,4 +1,4 @@
-//! Per-domain persona store (v4 phase 0.3).
+//! Per-domain persona store.
 //!
 //! Every stealth tool in the market randomizes per request. Modern
 //! bot scoring (JA4 + behavioral + consistency layers) scores

@@ -11,13 +11,13 @@
 //! The challenge engine runs the site's own program in-process, in V8, when a
 //! wall demands it. No browser is linked and none is launched.
 
+use donsetch_core::contract::{self, Contract};
+use donsetch_core::fetch::{self, class_name, Options, Worker};
+use donsetch_core::{classify, envelope, identity, state};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use v5core::contract::{self, Contract};
-use v5core::fetch::{self, class_name, Options, Worker};
-use v5core::{classify, envelope, identity, state};
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -73,13 +73,13 @@ fn main() {
         "identities" => command_identities(),
         "state" => command_state(&arguments, &flags),
         "cache" => {
-            v5core::cache::PageCache::for_state().clear();
+            donsetch_core::cache::PageCache::for_state().clear();
             println!("page cache cleared");
             0
         }
         _ => {
             eprintln!(
-                "usage: v5core <fetch <url>|probe --targets <file>|bench --targets <file>|identities|state>"
+                "usage: donsetch-core <fetch <url>|probe --targets <file>|bench --targets <file>|identities|state>"
             );
             2
         }
@@ -163,7 +163,7 @@ fn command_state(arguments: &[String], flags: &Flags) -> i32 {
     let action = arguments.get(2).map(String::as_str).unwrap_or("show");
     match action {
         "reset" => {
-            v5core::cache::PageCache::for_state().clear();
+            donsetch_core::cache::PageCache::for_state().clear();
             if let Some(path) = state::state_path() {
                 let _ = std::fs::remove_file(&path);
                 println!("cleared {}", path.display());
@@ -521,7 +521,7 @@ fn command_bench(flags: &Flags) -> i32 {
 
     let summary = summarize(&reports, &curl_rows);
     let document = serde_json::json!({
-        "schema": "v5core/bench/1",
+        "schema": "donsetch-core/bench/1",
         "runs": runs,
         "targets": reports,
         "curl": curl_rows,

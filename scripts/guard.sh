@@ -37,7 +37,7 @@
 # cache (budget.sh self-caps it at 10G), wave receipts.
 #
 # Ceiling 45000M. The floor under it is the warm artifact set measured after
-# the 2026-10-30 reclaim: fast ~15G, ci ~4G, v5core/target ~4G, sccache
+# the 2026-10-30 reclaim: fast ~15G, ci ~4G, core/target ~4G, sccache
 # <=10G (its own cap), a 3-day incremental window ~8G. ~41G is what a healthy
 # tree costs, so a crossing means rot rather than the ladder.
 #
@@ -61,12 +61,12 @@ case "${1:-}" in
     *) echo "guard: unknown argument: $1" >&2 ; exit 2 ;;
 esac
 
-# Every target dir this tree owns. v5core keeps a target of its own (its
-# standalone builds and tests) and v5/proof is the historical harness; both
-# count toward the ceiling so their caches cannot hide outside it. Review
+# Every target dir this tree owns. the core keeps a target of its own (its
+# standalone builds and tests); it
+# counts toward the ceiling so its cache cannot hide outside it. Review
 # worktrees under target/wt* are already inside `target`.
 target_dirs() {
-    for t in target v5core/target fuzz/target v5/proof/target v5/research/solve/target; do
+    for t in target core/target fuzz/target; do
         if [ -d "$t" ]; then
             printf '%s\n' "$t"
         fi

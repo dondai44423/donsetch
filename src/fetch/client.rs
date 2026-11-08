@@ -63,7 +63,7 @@ pub type RedirectGate = std::sync::Arc<
 
 pub struct Fetcher {
     profile: BrowserProfile,
-    v5: crate::fetch::v5::V5Fetcher,
+    v5: crate::fetch::core::CoreFetcher,
     /// Shared egress fabric (v4 A2). When present and a proxy pool
     /// is configured, fetch sticks to one lane per host and rotates
     /// on 429/407/dead/timeout. None = historical env/slot path.
@@ -76,7 +76,7 @@ impl Fetcher {
             profile,
             // `state.no_disk_state` keeps v5's learned state and page cache in
             // memory, like every other store.
-            v5: crate::fetch::v5::V5Fetcher::new(!crate::config::cfg().state.no_disk_state),
+            v5: crate::fetch::core::CoreFetcher::new(!crate::config::cfg().state.no_disk_state),
             egress: None,
         })
     }
@@ -123,7 +123,7 @@ impl Fetcher {
         self.fetch_via_jar_ref(url_str, proxy, use_jar, None).await
     }
 
-    /// Evidence-grade cold probe (v4 phase 0.2): no learned state and no
+    /// Evidence-grade cold probe: no learned state and no
     /// page cache (a cached page is not evidence about the wall RIGHT NOW).
     pub async fn fetch_cold_probe(&self, url_str: &str) -> Result<FetchOutcome, FetchError> {
         self.fetch_via_jar_opts(url_str, None, false, None, true, true, None)
@@ -227,7 +227,7 @@ impl Fetcher {
         let hop_proxy = route.proxy_for(url_str)?;
         let out = self
             .v5
-            .document(crate::fetch::v5::Document {
+            .document(crate::fetch::core::Document {
                 url: url_str,
                 proxy: hop_proxy,
                 route: route.clone(),
@@ -261,7 +261,7 @@ impl Fetcher {
         user_agent: &str,
     ) -> Result<FetchOutcome, FetchError> {
         self.v5
-            .once(crate::fetch::v5::OneShot {
+            .once(crate::fetch::core::OneShot {
                 url: url_str,
                 conditional: &[],
                 proxy,
@@ -296,7 +296,7 @@ impl Fetcher {
         .await
     }
 
-    /// Class-aware variant (v4 phase 1.2): subresource reads carry the
+    /// Class-aware variant: subresource reads carry the
     /// per-class header set on the wire.
     pub async fn fetch_once_via_class(
         &self,
@@ -308,7 +308,7 @@ impl Fetcher {
         class: RequestClass,
     ) -> Result<FetchOutcome, FetchError> {
         self.v5
-            .once(crate::fetch::v5::OneShot {
+            .once(crate::fetch::core::OneShot {
                 url: url_str,
                 conditional,
                 proxy,
@@ -514,7 +514,7 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
         // The lane's proxy answered that it could not reach the target, which
         // is how a name it cannot resolve can come back: the lane connected,
         // so it stays seated, as for a name the local guard cannot resolve.
-        FetchError::Io(error) if crate::fetch::v5::proxy_refused_the_target(error) => None,
+        FetchError::Io(error) if crate::fetch::core::proxy_refused_the_target(error) => None,
         FetchError::Io(_) | FetchError::Tls(_) => Some(LaneNote::Dead),
         // A proxy that demands credentials. Ahead of the text arms:
         // "CONNECT -> 407" must never read as a dead lane.

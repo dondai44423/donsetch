@@ -1,4 +1,4 @@
-//! Stealth scorecard (v4 phase 0.4): the drift alarm.
+//! Stealth scorecard: the drift alarm.
 //!
 //! The market-wide stealth failure mode is DRIFT: Chrome bumps
 //! every ~4 weeks, static mimicry rots, JA3/JA4 databases catch up,

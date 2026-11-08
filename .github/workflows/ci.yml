@@ -285,10 +285,10 @@ jobs:
       # rust-cache, per-branch keys), so the timeout has to clear the
       # slowest cold build; a hung TEST is caught by nextest's own
       # per-test slow-timeout, not by this number.
-      - name: v5core alone on this architecture
+      - name: core alone on this architecture
         if: matrix.name == 'linux-aarch64'
         run: |
-          cd v5core
+          cd core
           cargo test --release --locked --no-run
           cargo test --release --locked --lib
         timeout-minutes: 30
@@ -467,12 +467,12 @@ jobs:
       - name: Check advisories + licenses + bans + sources
         run: cargo deny --all-features check --hide-inclusion-graph
 
-  # ── v5core, the fetch engine, is its own crate with its own lockfile:
+  # ── core, the fetch engine, is its own crate with its own lockfile:
   # the product suite only reaches it through the product's API, so its
   # own offline suite (loopback servers, no network) runs here. The
   # network tests are #[ignore]d and stay a local, egress-gated run.
-  v5core:
-    name: v5core
+  core:
+    name: core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -486,26 +486,26 @@ jobs:
           go-version: '>=1.22.0'
       - name: Install NASM
         run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-      - name: Cache ~/.cargo and v5core/target
+      - name: Cache ~/.cargo and core/target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: v5core
+          workspaces: core
           save-if: ${{ github.event_name != 'pull_request' }}
       # The cache keeps v8's build-script fingerprint but not the archive it
       # downloaded into target/release/gn_out, so a v8 rebuild fails to link
       # ("could not find native static library rusty_v8"). Without the
       # archive, the build script runs again and fetches it.
       - name: Re-fetch the V8 archive the cache dropped
-        working-directory: v5core
+        working-directory: core
         run: |
           if [ ! -s target/release/gn_out/obj/librusty_v8.a ]; then
             rm -rf target/release/.fingerprint/v8-* target/release/build/v8-*
           fi
       - name: Test
-        working-directory: v5core
+        working-directory: core
         run: cargo test --release --locked
       - name: Clippy
-        working-directory: v5core
+        working-directory: core
         run: cargo clippy --release --all-targets --locked -- -Dwarnings
 
   # ── The npm wrapper's installer logic: resolution order, unwritable

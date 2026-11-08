@@ -132,7 +132,7 @@ pub struct MintLedger {
 }
 
 /// Which identities each vendor's wall has let through, best first: the
-/// identity matrix (`v5core probe`) over the friendly and hard corpora,
+/// identity matrix (`donsetch-core probe`) over the friendly and hard corpora,
 /// 2026-11-06, one direct home connection. A starting point that learned
 /// `vendor_priors` override, not a belief: re-measure with `probe` and replace.
 pub const VENDOR_SEED: &[(&str, &[&str])] = &[

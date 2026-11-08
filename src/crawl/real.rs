@@ -64,7 +64,7 @@ pub fn build(fetcher: Arc<Fetcher>, pool: Arc<EgressPool>) -> (Crawler, Arc<Gove
                 let fetcher = Arc::clone(&fetcher);
                 let pool = Arc::clone(&pool);
                 let proxies = Arc::clone(&proxies);
-                // v4 phase 3: the same adapter registry web_fetch uses
+                // the same adapter registry web_fetch uses
                 // shapes crawl fetches, so a reddit/npm class URL rides
                 // the cheap .json/registry path instead of the HTML app.
                 // The candidate URL stays canonical: dedup, history and

@@ -331,7 +331,7 @@ pub struct FrontierQueue {
     seen: HashSet<String>,
     /// Entries let go at the ceiling.
     dropped: usize,
-    /// v4 phase 3 crawl-shape: pop a reader-like jitter inside the
+    /// crawl-shape: pop a reader-like jitter inside the
     /// head window instead of always the exact top, so repeated
     /// crawls of the same site do not replay an identical,
     /// score-eager fetch order to server logs. Ordering only.

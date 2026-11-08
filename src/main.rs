@@ -92,6 +92,70 @@ fn config_cli(args: &[String]) {
 /// are used.
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// Say once, on stderr, that a v4 install is now running the v5 fetch engine.
+///
+/// The signal is the v4 state file: it carries the session-vault and tier-1
+/// fields this binary no longer writes. A fresh v5 install never has them, so
+/// this cannot fire for one. The stamp makes it once per cache directory.
+fn announce_upgrade_once(cmd: &str, args: &[String]) {
+    use std::io::IsTerminal;
+    if cmd == "mcp" || args.iter().any(|a| a == "--json") || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let cache = donsetch::paths::cache_dir();
+    let stamp = cache.join("upgrade-notice");
+    if stamp.exists() {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(cache.join("ghost-state.json")) else {
+        return;
+    };
+    if !has_v4_state(&bytes) {
+        return;
+    }
+    eprintln!();
+    eprintln!("  DonSeTch v5 is a different fetch engine, not a v4 patch.");
+    eprintln!("    - The fetch path embeds V8 and carries identity and state; no browser runs it.");
+    eprintln!("    - `donsetch login` and the session vault are gone. A login wall is reported,");
+    eprintln!(
+        "      never crossed; authenticated browsing belongs to a browser driver (bladebro)."
+    );
+    eprintln!("    - v4 state is left in place and ignored by the new engine.");
+    eprintln!(
+        "  Run `donsetch doctor` to see what this install uses, `donsetch help` for commands."
+    );
+    eprintln!();
+    let _ = std::fs::create_dir_all(&cache);
+    let _ = std::fs::write(&stamp, env!("CARGO_PKG_VERSION"));
+}
+
+/// Does this state file carry the v4 session vault? The fields are never
+/// written by this binary, so their presence dates the file to v4.
+fn has_v4_state(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(65_536)];
+    let text = String::from_utf8_lossy(head);
+    text.contains("\"vault_epoch\"")
+        || text.contains("\"session_cookies\"")
+        || text.contains("\"tier1_cookies\"")
+}
+
+#[cfg(test)]
+mod upgrade_notice_tests {
+    use super::has_v4_state;
+
+    #[test]
+    fn v4_state_is_recognised_by_its_vault_fields() {
+        assert!(has_v4_state(br#"{"vault_epoch":3,"profiles":{}}"#));
+        assert!(has_v4_state(
+            br#"{"profiles":{"x":{"session_cookies":[]}}}"#
+        ));
+        assert!(has_v4_state(br#"{"tier1_cookies":[]}"#));
+        assert!(!has_v4_state(
+            br#"{"version":5,"profiles":{},"personas":{}}"#
+        ));
+        assert!(!has_v4_state(b""));
+    }
+}
 /// Every top-level command, for the suggestion on a typo.
 const KNOWN_COMMANDS: &[&str] = &[
     "fetch",
@@ -101,7 +165,6 @@ const KNOWN_COMMANDS: &[&str] = &[
     "tools",
     "mcp",
     "keys",
-    "login",
     "proxy",
     "rules",
     "status",
@@ -158,7 +221,7 @@ async fn run() {
     }
 
     // `--help`/`-h` right after a command name always means HELP, never a
-    // run. The spec-driven tools plus keys/proxy/login/adapters carry their
+    // run. The spec-driven tools plus keys/proxy/adapters carry their
     // own help; every other management command used to EXECUTE on the flag
     // (`status --help` printed the status, `doctor --help` ran the whole
     // health check, `update --help` checked the network, `rollback --help`
@@ -168,7 +231,7 @@ async fn run() {
     if matches!(args.get(2).map(String::as_str), Some("--help" | "-h"))
         && !matches!(
             cmd,
-            "fetch" | "search" | "crawl" | "screenshot" | "keys" | "proxy" | "login" | "adapters"
+            "fetch" | "search" | "crawl" | "screenshot" | "keys" | "proxy" | "adapters"
         )
     {
         route_help(cmd).await;
@@ -186,6 +249,13 @@ async fn run() {
     ) {
         load_and_install_config(&args);
     }
+
+    // A v4 install updated in place lands on a different fetch engine, and
+    // the v4 binary that performed the update could not warn (it shipped
+    // before this check existed). The first interactive run after the
+    // update says what changed, once. stderr only: stdout belongs to the
+    // command's own result, and `mcp`/`--json` must stay machine-clean.
+    announce_upgrade_once(cmd, &args);
 
     match cmd {
         // ── Agent tools (spec-driven, shared core, clap-parsed) ──
@@ -276,12 +346,6 @@ async fn run() {
         "keys" => cli::keys::run(&args).await,
         "rules" => cli::rules::run(&args),
 
-        "login" => {
-            if let Err(e) = cli::login::run(&args).await {
-                donsetch::diag!("donsetch login: {e}");
-                std::process::exit(1);
-            }
-        }
         "proxy" => cli::proxy::run(&args).await,
         "status" => cli::status::run(&args).await,
         "adapters" => match args.get(2).map(String::as_str) {
@@ -328,12 +392,11 @@ async fn route_help(cmd: &str) {
         "adapters" => cli::adapters::help(),
         "rules" => cli::rules::help(),
         "status" => cli::status::help(),
-        // `proxy`, `keys` and `login` carry their own text; routing here
+        // `proxy`, `keys` and `adapters` carry their own text; routing here
         // means `donsetch help proxy` and `donsetch proxy --help` cannot
         // drift apart again (the copy that used to live here had gone
         // stale: it knew nothing of `proxy fetch|crawl on|off`).
         "proxy" => cli::proxy::help(),
-        "login" => cli::login::help(),
         "--help" | "-h" => cli::tool::print_top_help(),
         "config" => {
             println!("Usage: donsetch config show [--markdown] [--legacy]");
@@ -360,10 +423,12 @@ async fn route_help(cmd: &str) {
             println!("  --json     structured output for agents/CI");
         }
         "update" => {
-            println!("Usage: donsetch update");
+            println!("Usage: donsetch update [--yes]");
             println!();
             println!("  Checks for a new release and downloads the platform-correct binary");
             println!("  from GitHub Releases. Verifies SHA256, replaces in place, saves backup.");
+            println!("  A major version prints what it changes and asks first; --yes answers");
+            println!("  for an unattended run.");
         }
         "rollback" => {
             println!("Usage: donsetch rollback");

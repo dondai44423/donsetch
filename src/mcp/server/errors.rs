@@ -413,7 +413,7 @@ pub(super) fn tool_error_structured(
         }
         // The stable code lives where agents read it (inside
         // structuredContent so it survives the TextOnly [meta] fold,
-        // which clones structuredContent). v4.7 uniform envelope: a
+        // which clones structuredContent). : a
         // classified failure is a RETURNED result, never a throw :
         // `ok:false` is the machine failure flag every consumer and
         // client branches on.
@@ -521,7 +521,7 @@ fn moved_page_query(raw: &str) -> Option<String> {
     (!words.is_empty()).then(|| format!("site:{host} {}", words.join(" ")))
 }
 
-/// v4.7 uniform envelope: a classified failure is a NORMAL tool
+/// : a classified failure is a NORMAL tool
 /// result whose envelope carries `ok:false`; nothing raises. Lives on
 /// structuredContent so it survives the TextOnly `[meta]` fold. The
 /// one predicate every consumer branches on (MCP wire, batch

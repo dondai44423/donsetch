@@ -8,7 +8,6 @@ pub mod adapters;
 pub mod args;
 pub mod doctor;
 pub mod keys;
-pub mod login;
 pub mod proxy;
 pub mod rollback;
 pub mod rules;

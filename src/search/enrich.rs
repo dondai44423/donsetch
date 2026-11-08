@@ -96,7 +96,7 @@ impl Searcher {
         const ENRICH_TOP: usize = 5;
         const ENRICH_TIMEOUT: Duration = Duration::from_secs(4);
 
-        // Kill switch (v4 phase 2.1): with prewarm disabled ([fetch]
+        // Kill switch: with prewarm disabled ([fetch]
         // prewarm = false; historically DONSETCH_NO_PREWARM) no prewarm
         // fetch ever goes on the wire, so servers see no burst at all.
         // The honest-off state of the layer.
@@ -137,7 +137,7 @@ impl Searcher {
                 };
                 let out = tokio::time::timeout(
                     ENRICH_TIMEOUT,
-                    // v4 phase 2.1: enrichment rides the shared cookie
+                    // enrichment rides the shared cookie
                     // jar (browser-real). Fresh-jar enrichment + warm
                     // fetch = two devices from one IP within seconds;
                     // one store, like a browser.
@@ -298,7 +298,7 @@ impl Searcher {
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
 
-    /// v4 phase 2.1: detached warm-handoff for the BYOK takeover
+    /// detached warm-handoff for the BYOK takeover
     /// path. Provider results already carry real titles/snippets, so
     /// the search reply does not wait for the prefetch pass: it fires
     /// in the background and parks bodies while the model reads the
@@ -372,7 +372,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
-    // == v4 phase 2.1 battery: wire truth of the prewarm layer ==
+    // == battery: wire truth of the prewarm layer ==
     // Every fact is observed on the real socket; nothing mocked.
 
     enum RigMode {
