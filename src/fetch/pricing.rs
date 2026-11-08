@@ -353,15 +353,23 @@ fn escape(s: &str) -> String {
 }
 
 /// The element a missing price removes: the page drops a `tr` or `li` whose price
-/// it cannot show.
+/// it cannot show. The innermost one around `at`.
 fn row_around(template: &str, at: usize) -> Option<std::ops::Range<usize>> {
     ["tr", "li"]
         .iter()
         .filter_map(|tag| {
-            let open = template[..at].rfind(&format!("<{tag}"))?;
-            let close = template[at..].find(&format!("</{tag}>"))? + at + tag.len() + 3;
+            let open_tag = format!("<{tag}");
+            let close_tag = format!("</{tag}>");
+            // The nearest opening `<tr`/`<li` that is the tag itself, not `<link`.
+            let open = template[..at]
+                .rmatch_indices(&open_tag)
+                .find_map(|(i, _)| {
+                    let next = template.as_bytes().get(i + open_tag.len()).copied();
+                    matches!(next, Some(b'>' | b' ' | b'\n' | b'\t' | b'/')).then_some(i)
+                })?;
+            let close = template[at..].find(&close_tag)? + at + close_tag.len();
             // An element that closed before `at` does not enclose it.
-            (!template[open..at].contains(&format!("</{tag}>"))).then_some(open..close)
+            (!template[open..at].contains(&close_tag)).then_some(open..close)
         })
         .min_by_key(|r| r.end - r.start)
 }
@@ -685,6 +693,16 @@ mod tests {
         assert!(!out.contains("<td>Over</td>"), "{out}");
         assert!(!out.contains('{'), "no token survives: {out}");
         assert_eq!(out.matches("<tr>").count(), 3, "{out}");
+    }
+
+    #[test]
+    fn a_row_is_a_tr_or_li_itself_not_a_tag_that_starts_like_one() {
+        let t = "<li>a</li><link rel=x><p>{priceOf!f/f!K}</p></li>";
+        // No `li` encloses the token (the only `<li` before it is a closed item).
+        assert_eq!(row_around(t, t.find('{').unwrap()), None);
+        let t = "<ul><li>name <b>{priceOf!f/f!K}</b></li><li>other</li></ul>";
+        let row = row_around(t, t.find('{').unwrap()).unwrap();
+        assert_eq!(&t[row], "<li>name <b>{priceOf!f/f!K}</b></li>");
     }
 
     #[test]
