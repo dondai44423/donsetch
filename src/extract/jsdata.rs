@@ -688,6 +688,35 @@ fn tag_id(tag: &str) -> Option<&str> {
     None
 }
 
+/// Words that name an application's own settings inside its state:
+/// configuration, feature flags and experiments, environment, analytics,
+/// and the interface's translations. A subtree under such a key describes
+/// the app, never the page.
+const CONFIG_WORDS: &[&str] = &[
+    "config",
+    "configuration",
+    "settings",
+    "flags",
+    "experiments",
+    "env",
+    "analytics",
+    "tracking",
+    "i18n",
+    "l10n",
+    "translations",
+];
+
+/// Whether a state key names the app's configuration (`config`,
+/// `variantFlags`, `siteSettings`, `i18n`), matched by whole word so
+/// `configurable`, `environment` or `content` are read as usual. A false
+/// hit drops one subtree from the rescue; the document's own reading is
+/// untouched.
+fn config_key(key: &str) -> bool {
+    id_words(key)
+        .iter()
+        .any(|w| CONFIG_WORDS.contains(&w.as_str()))
+}
+
 /// The words an identifier is made of: split at punctuation and at
 /// camelCase humps (`AnalyticsConfigurationJSON` → analytics,
 /// configuration, json), lowercased.
@@ -847,7 +876,8 @@ fn walk(value: &Value, path: &str, out: &mut Vec<Item>, order: &mut usize, depth
                         | "user_agent"
                         | "supported_locales"
                         | "compMap"
-                ) {
+                ) || config_key(k)
+                {
                     continue;
                 }
                 let np = if path.is_empty() {
@@ -1318,6 +1348,42 @@ mod tests {
             super::tag_id(r#"<script data-id="x" type="application/json""#),
             None
         );
+    }
+
+    #[test]
+    fn the_rescue_reads_no_app_configuration_from_the_state() {
+        // Medium's missing-post shell: the page's state carries the app's
+        // payment plans and build under `config` and its experiments under
+        // `variantFlags`; the article, when there is one, sits beside them.
+        let state = |post: &str| {
+            serde_json::json!({
+                "config": {"version": "main-20261106-194312-0396eea50c", "paypal": {"monthlyPlan": {
+                    "name": "Medium Membership (Monthly) with setup fee",
+                    "description": "Unlimited access to the best and brightest stories on Medium. Membership billed monthly."
+                }}},
+                "variantFlags": [{"name": "enable_tick_landing_page", "description": "Shows the new landing page to readers who arrive from search."}],
+                "siteSettings": {"tagline": "Where good ideas find you, every single day of the week."},
+                "configurable": {"text": format!("{post} ")},
+                "post": {"content": post},
+            })
+        };
+        let page = |post: &str| {
+            format!(
+                "<title>Medium</title><script>window.__PRELOADED_STATE__ = {};</script>",
+                state(post)
+            )
+        };
+        let url = "https://medium.com/@someone/a-post-123";
+        let missing = super::extract(&page(""), url, &Default::default());
+        assert!(missing.is_none(), "{:?}", missing.map(|e| e.markdown));
+        let story = "The river had been rising for three days before anyone in the valley thought to move the grain. ".repeat(6);
+        let ex = super::extract(&page(&story), url, &Default::default()).unwrap();
+        assert!(ex.markdown.contains("The river had been rising"));
+        for noise in ["Membership", "main-2026", "landing page", "good ideas"] {
+            assert!(!ex.markdown.contains(noise), "{noise}: {}", ex.markdown);
+        }
+        assert!(super::config_key("featureFlags") && super::config_key("i18n"));
+        assert!(!super::config_key("configurable") && !super::config_key("environment"));
     }
 
     #[test]

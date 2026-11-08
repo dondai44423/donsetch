@@ -232,6 +232,21 @@ mod report_audit_tests {
         ] {
             assert_eq!(detect(200, &[], html.as_bytes()), Verdict::SoftNotFound);
         }
+        // No h1: the first h2 leads the page.
+        let medium = "<html><title>Medium</title><body><nav><a>Sign in</a></nav><div>PAGE NOT FOUND</div><h2><span>404</span></h2><h2>Out of nothing, something.</h2><p>You can find (just about) anything on Medium, apparently even a page that doesn't exist.</p></body></html>";
+        assert_eq!(detect(200, &[], medium.as_bytes()), Verdict::SoftNotFound);
+        for html in [
+            // An h1 leads; a "404" section below it is the page's subject.
+            "<html><title>HTTP status codes</title><body><h1>HTTP status codes</h1><h2>404</h2><p>The server cannot find the requested resource. Links that lead to a 404 page are often called broken or dead links.</p></body></html>",
+            // A first h2 that only mentions a 404 is not a not-found heading.
+            "<html><title>Blog</title><body><h2>404 pages that delight</h2><p>Here are twelve examples of error pages that turn a dead end into a reason to stay on the site, with notes on what makes each one work.</p></body></html>",
+        ] {
+            assert_eq!(
+                detect(200, &[], html.as_bytes()),
+                Verdict::ContentOk,
+                "{html}"
+            );
+        }
         let login = "<html><title>LinkedIn: Log In or Sign Up</title><body><h1>Welcome to your professional community</h1><form><input type='password'><button>Sign in</button></form></body></html>";
         assert_eq!(detect(200, &[], login.as_bytes()), Verdict::AuthWall);
         assert_eq!(
@@ -436,7 +451,23 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
         .map(crate::extract::inline::visible_text)
         .unwrap_or_default()
         .to_lowercase();
-    if [&title, &h1].iter().any(|heading| {
+    // A page without an `h1` leads with its first `h2` (Medium's missing
+    // post: title "Medium", then `<h2>404</h2>`). Only the not-found check
+    // reads it; sign-in headings keep to the title and `h1`.
+    let lead = if doc
+        .select(&scraper::Selector::parse("h1").unwrap())
+        .next()
+        .is_none()
+    {
+        doc.select(&scraper::Selector::parse("h2").unwrap())
+            .next()
+            .map(crate::extract::inline::visible_text)
+            .unwrap_or_default()
+            .to_lowercase()
+    } else {
+        String::new()
+    };
+    if [&title, &h1, &lead].iter().any(|heading| {
         heading.as_str() == "404"
             || heading.starts_with("404:")
             || heading.starts_with("404 -")
