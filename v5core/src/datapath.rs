@@ -334,27 +334,38 @@ fn parse_rss_items(body: &str, _source: &str) -> Vec<Item> {
     items
 }
 
-/// News fronts publish a feed of the stories the front page leads with.
+/// News fronts publish a feed of the stories the front page leads with. The
+/// feed answers a front or a section; an article, or any other page, is
+/// answered by its own document (a walled article stays a declared wall, never
+/// a list of other stories).
 fn resolve_news_feed(url: &Url) -> Option<Request> {
     let host = url.host_str()?;
+    let segments: Vec<&str> = url
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     let feed = if host.ends_with("nytimes.com") {
-        // A section page maps to that section's feed.
-        let section = url
-            .path()
-            .trim_matches('/')
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        match section.as_str() {
+        // Sections live at `/section/<name>`; a bare `/<name>` is the older
+        // spelling of the same page.
+        let section = match segments.as_slice() {
+            [] => "",
+            ["section", name] | [name] => name,
+            _ => return None,
+        };
+        match section {
+            "" => "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
             "world" => "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
             "business" => "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
             "technology" => "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
             "science" => "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml",
-            _ => "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+            _ => return None,
         }
     } else if host.ends_with("wsj.com") {
-        "https://feeds.a.dj.com/rss/RSSWorldNews.xml"
+        match segments.as_slice() {
+            [] | ["news", "world"] => "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+            _ => return None,
+        }
     } else {
         return None;
     };
@@ -380,6 +391,16 @@ fn resolve_stackexchange(url: &Url) -> Option<Request> {
     let host = url.host_str()?;
     // The API host already answers JSON; it needs no rewrite.
     if host.starts_with("api.") {
+        return None;
+    }
+    // The call below answers "what is being asked here": the site's front
+    // and its question listing. A question is answered by its own document.
+    let segments: Vec<&str> = url
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if !matches!(segments.as_slice(), [] | ["questions"]) {
         return None;
     }
     // The API's `site` parameter is the network host without the TLD.
@@ -544,10 +565,17 @@ fn parse_crates(body: &str, _source: &str) -> Vec<Item> {
 // ---- 4chan -------------------------------------------------------------
 
 fn resolve_fourchan(url: &Url) -> Option<Request> {
-    let path = url.path().trim_matches('/');
-    let target = match path.split('/').next() {
-        Some(board) if !board.is_empty() => format!("https://a.4cdn.org/{board}/1.json"),
-        _ => "https://a.4cdn.org/boards.json".to_string(),
+    let segments: Vec<&str> = url
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    // The board list and a board's front page; a thread is answered by its
+    // own document.
+    let target = match segments.as_slice() {
+        [] => "https://a.4cdn.org/boards.json".to_string(),
+        [board] | [board, "catalog"] => format!("https://a.4cdn.org/{board}/1.json"),
+        _ => return None,
     };
     Some(Request {
         method: "GET",
@@ -751,6 +779,49 @@ mod tests {
         assert!(find("4chan.org").is_some());
         assert!(find("www.twitch.tv").is_some());
         assert!(find("crates.io").is_some());
+    }
+
+    // An interface answers the question its URL asks. A feed of other
+    // stories is no answer to an article, nor a question list to a question.
+    #[test]
+    fn interfaces_answer_fronts_and_listings_and_leave_items_to_their_page() {
+        let feed = |u: &str| plan(u).map(|(_, request)| request.url);
+        assert_eq!(
+            feed("https://www.nytimes.com/").as_deref(),
+            Some("https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml")
+        );
+        assert_eq!(
+            feed("https://www.nytimes.com/section/world").as_deref(),
+            Some("https://rss.nytimes.com/services/xml/rss/nyt/World.xml")
+        );
+        assert_eq!(
+            feed("https://www.nytimes.com/technology").as_deref(),
+            Some("https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml")
+        );
+        assert!(feed("https://www.nytimes.com/2026/01/01/us/politics/some-story.html").is_none());
+        assert!(feed("https://www.nytimes.com/section/opinion").is_none());
+        assert!(feed("https://www.nytimes.com/athletic/123/a-story/").is_none());
+        assert!(feed("https://www.wsj.com/").is_some());
+        assert!(feed("https://www.wsj.com/articles/a-story-12345").is_none());
+
+        assert!(feed("https://stackoverflow.com/").is_some());
+        assert!(feed("https://stackoverflow.com/questions").is_some());
+        assert!(feed("https://stackoverflow.com/questions/11227809/why-is-it-faster").is_none());
+        assert!(feed("https://superuser.com/questions/42/title").is_none());
+
+        assert_eq!(
+            feed("https://boards.4chan.org/").as_deref(),
+            Some("https://a.4cdn.org/boards.json")
+        );
+        assert_eq!(
+            feed("https://boards.4chan.org/g/").as_deref(),
+            Some("https://a.4cdn.org/g/1.json")
+        );
+        assert_eq!(
+            feed("https://boards.4chan.org/g/catalog").as_deref(),
+            Some("https://a.4cdn.org/g/1.json")
+        );
+        assert!(feed("https://boards.4chan.org/g/thread/12345678").is_none());
     }
 
     #[test]
