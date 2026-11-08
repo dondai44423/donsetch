@@ -24,6 +24,7 @@ pub mod reddit_html;
 pub mod reddit_json;
 pub mod stackexchange;
 pub mod wiki_infobox;
+pub mod youtube;
 
 /// Kill switch : checked once, then cached.
 fn enabled() -> bool {
@@ -383,6 +384,7 @@ pub fn extract_html(
     }
     debug_dump(html, url);
     reddit_html::extract(html, url, opts)
+        .or_else(|| youtube::extract(html, url, opts))
         .or_else(|| github::extract(html, url, opts))
         .or_else(|| stackexchange::extract(html, url, opts))
         .or_else(|| wiki_infobox::extract(html, url, opts))
