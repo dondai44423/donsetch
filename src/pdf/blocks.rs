@@ -428,6 +428,9 @@ pub fn is_heading(l: &Line, ctx: &FontCtx) -> bool {
     if !numbered && t.ends_with(['.', '!', '?', ',', ';', ':']) {
         return false;
     }
+    if is_diagram_row(l) {
+        return false;
+    }
     let r = l.size / ctx.body_size.max(0.1);
     // Size-only branch: headings are short standalone lines. Long
     // big-font lines (license legalese etc.) are paragraphs.
@@ -451,6 +454,26 @@ pub fn is_heading(l: &Line, ctx: &FontCtx) -> bool {
         }
     }
     false
+}
+
+/// A line that cannot be a heading whatever its size: no letters to name a
+/// section ("2262", a figure's axis tick), or words placed far apart ("Swin
+/// Swin Swin Swin", "Stage 1 Stage 2 Stage 3": the labels of a diagram's
+/// columns, which the line builder joins because they share a baseline).
+/// A heading's words sit a word-space apart; a gap of more than 1.2 em is a
+/// separately placed fragment.
+///
+/// Failure mode, stated: a heading typeset with extreme word spacing loses its
+/// outline entry and reads as a paragraph. Nothing is dropped from the text.
+/// The other direction (a figure label that is one contiguous phrase, such as
+/// "Input-Input Layer5") still passes as a heading; this does not claim to
+/// catch every figure.
+fn is_diagram_row(l: &Line) -> bool {
+    if l.text.chars().filter(|c| c.is_alphabetic()).count() < 2 {
+        return true;
+    }
+    let limit = 1.2 * l.size;
+    l.words.windows(2).any(|w| w[1].x0 - w[0].x1 > limit)
 }
 
 fn numbered_section(t: &str) -> bool {
@@ -603,5 +626,89 @@ fn merge_continuations(blocks: &mut Vec<Block>) {
         } else {
             i += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod diagram_row_tests {
+    use super::*;
+    use crate::pdf::layout::Word;
+
+    /// A line from `(text, x0, x1)` words at `size` points.
+    fn line(size: f32, words: &[(&str, f32, f32)]) -> Line {
+        Line {
+            text: words.iter().map(|w| w.0).collect::<Vec<_>>().join(" "),
+            words: words
+                .iter()
+                .map(|(t, x0, x1)| Word {
+                    text: (*t).into(),
+                    x0: *x0,
+                    x1: *x1,
+                })
+                .collect(),
+            x0: words.first().map(|w| w.1).unwrap_or(0.0),
+            y0: 0.0,
+            x1: words.last().map(|w| w.2).unwrap_or(0.0),
+            y1: size,
+            size,
+            weight: 400,
+            italic: false,
+            mono: false,
+            font: 0,
+            glyphs: 20,
+            order: 0,
+            page: 0,
+        }
+    }
+
+    fn ctx() -> FontCtx {
+        FontCtx {
+            body_size: 10.0,
+            ladder: vec![14.0],
+        }
+    }
+
+    /// The labels of a diagram's columns share a baseline, so the line builder
+    /// joins them into one line at a large size. Words placed 80 points apart
+    /// are fragments, not a title.
+    #[test]
+    fn columns_of_a_figure_are_not_a_heading() {
+        let swin = line(
+            14.0,
+            &[
+                ("Swin", 10.0, 40.0),
+                ("Swin", 120.0, 150.0),
+                ("Swin", 230.0, 260.0),
+            ],
+        );
+        assert!(!is_heading(&swin, &ctx()));
+    }
+
+    #[test]
+    fn a_line_with_no_letters_is_not_a_heading() {
+        assert!(!is_heading(&line(14.0, &[("2262", 10.0, 40.0)]), &ctx()));
+        assert!(!is_heading(&line(14.0, &[("()", 10.0, 20.0)]), &ctx()));
+    }
+
+    /// The negatives: a real heading, a numbered one, and one set a little
+    /// loose still are headings.
+    #[test]
+    fn real_headings_still_are() {
+        let plain = line(
+            14.0,
+            &[
+                ("Scaled", 10.0, 50.0),
+                ("Dot-Product", 54.0, 120.0),
+                ("Attention", 124.0, 180.0),
+            ],
+        );
+        assert!(is_heading(&plain, &ctx()));
+        let loose = line(14.0, &[("Related", 10.0, 56.0), ("Work", 70.0, 100.0)]);
+        assert!(
+            is_heading(&loose, &ctx()),
+            "a 14 pt gap at 14 pt type is under 1.2 em"
+        );
+        let short = line(14.0, &[("FAQ", 10.0, 40.0)]);
+        assert!(is_heading(&short, &ctx()), "three letters is a heading");
     }
 }
