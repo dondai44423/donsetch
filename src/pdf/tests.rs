@@ -887,6 +887,46 @@ fn extract_integration_pdf() {
     assert!(out.quality > 0.0, "quality score must be positive");
 }
 
+/// The witness for figure labels typeset like headings: attention.pdf's appendix
+/// figures carry "Input-Input Layer5" in a large bold face, which no section of
+/// the paper is set in. The paper's own sections must survive.
+#[test]
+fn a_figures_labels_do_not_enter_the_outline() {
+    let Some(bytes) = read("attention.pdf") else {
+        return;
+    };
+    let opts = crate::extract::ExtractOptions {
+        max_chars: Some(120_000),
+        ..Default::default()
+    };
+    let out = crate::extract::extract(
+        &bytes,
+        "application/pdf",
+        "https://arxiv.org/pdf/1706.03762",
+        &opts,
+    )
+    .expect("extract");
+    let headings: Vec<&str> = out
+        .markdown
+        .lines()
+        .filter(|l| l.starts_with('#'))
+        .map(|l| l.trim_start_matches('#').trim())
+        .collect();
+    assert!(
+        !headings.iter().any(|h| h.contains("Input-Input Layer")),
+        "a figure's label became a heading: {headings:?}"
+    );
+    for real in [
+        "3.2.1 Scaled Dot-Product Attention",
+        "6.3 English Constituency Parsing",
+        "Attention Visualizations",
+    ] {
+        assert!(headings.contains(&real), "lost {real:?}: {headings:?}");
+    }
+    // The text itself is untouched: the label is still on the page.
+    assert!(out.markdown.contains("Input-Input Layer5"));
+}
+
 #[test]
 fn extract_integration_magic_sniff() {
     // Wrong content-type but real PDF magic must still route to DonSheet.

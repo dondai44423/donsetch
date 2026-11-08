@@ -14,10 +14,15 @@ use super::layout::{Line, PageLines};
 use super::tables;
 
 /// Per-document font context, derived from the glyphs themselves.
+#[derive(Clone)]
 pub struct FontCtx {
     pub body_size: f32,
     /// Sizes > 1.15× body, descending (the heading ladder).
     pub ladder: Vec<f32>,
+    /// The typefaces that have introduced text (see [`earned_headings`]).
+    /// `None` until [`classify`] has seen the document, and when no typeface
+    /// earned it; a line is then judged on its shape alone.
+    pub earned: Option<Earned>,
 }
 
 pub fn font_ctx(lines: &[&Line]) -> FontCtx {
@@ -41,13 +46,99 @@ pub fn font_ctx(lines: &[&Line]) -> FontCtx {
     ladder.sort_by(|a, b| b.total_cmp(a));
     ladder.dedup();
 
-    FontCtx { body_size, ladder }
+    FontCtx {
+        body_size,
+        ladder,
+        earned: None,
+    }
+}
+
+/// A caption introduces a figure or a table; it is body-sized text but it is not
+/// what a heading introduces.
+fn is_caption(text: &str) -> bool {
+    let t = text.trim_start();
+    ["Figure", "Fig.", "Table", "Algorithm", "Listing"]
+        .iter()
+        .any(|p| {
+            t.strip_prefix(p)
+                .is_some_and(|rest| rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        })
+}
+
+/// A line's size to the half point. Weight is left out on purpose: sibling
+/// headings differ in weight between 600 and 700 as often as they differ in size.
+fn style_of(l: &Line) -> u32 {
+    (l.size * 2.0).round() as u32
+}
+
+/// The fonts and sizes that have introduced text.
+#[derive(Clone, Default)]
+pub struct Earned {
+    fonts: Vec<u16>,
+    sizes: Vec<u32>,
+}
+
+/// Which typefaces have earned the right to make headings.
+///
+/// A heading introduces what follows it: a body-sized line that is not a caption.
+/// A figure's labels are typeset to look like headings (large, bold, short), but
+/// what follows them is another label, a smaller heading, a caption or nothing.
+/// A font, or a size, earns the right by introducing text at
+/// least twice. A font is not enough on its own because one document's headings
+/// can be set in several fonts, and a style is not enough on its own because a
+/// title, a section and a subsection differ in size; a line needs either. `None`
+/// where nothing earned it (a document of headings and no prose): nothing is
+/// demoted.
+///
+/// Failure mode, stated: a real heading in a font and a style used nowhere else,
+/// on a page after the first and followed by a table or a list, loses its outline
+/// entry and reads as a paragraph; no text is dropped. The first page is exempt (a
+/// title is often alone in its face), and so are numbered sections.
+fn earned_headings(ordered_by_page: &[Vec<Line>], ctx: &FontCtx) -> Option<Earned> {
+    use std::collections::BTreeMap;
+    let mut fonts: BTreeMap<u16, usize> = BTreeMap::new();
+    let mut sizes: BTreeMap<u32, usize> = BTreeMap::new();
+    for lines in ordered_by_page {
+        for (i, l) in lines.iter().enumerate() {
+            if !heading_shape(l, ctx) {
+                continue;
+            }
+            let introduces = lines.get(i + 1).is_some_and(|n| {
+                let r = n.size / ctx.body_size.max(0.1);
+                (0.85..=1.2).contains(&r)
+                    && !is_caption(&n.text)
+                    && !heading_shape(n, ctx)
+                    && n.glyphs >= 20
+            });
+            if introduces {
+                *fonts.entry(l.font).or_default() += 1;
+                *sizes.entry(style_of(l)).or_default() += 1;
+            }
+        }
+    }
+    let earned = Earned {
+        fonts: fonts
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|(f, _)| f)
+            .collect(),
+        sizes: sizes
+            .into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|(s, _)| s)
+            .collect(),
+    };
+    (!earned.fonts.is_empty() || !earned.sizes.is_empty()).then_some(earned)
 }
 
 /// Classify the ordered lines of all pages into semantic blocks.
 pub fn classify(pages: &[PageLines], ordered_by_page: &[Vec<Line>], ctx: &FontCtx) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let n_pages = pages.len();
+    let ctx = &FontCtx {
+        earned: earned_headings(ordered_by_page, ctx),
+        ..ctx.clone()
+    };
 
     for pi in 0..n_pages {
         let lines = &ordered_by_page[pi];
@@ -409,8 +500,20 @@ fn match_prefix(t: &str, re: &str) -> Option<usize> {
     }
 }
 
-/// Heading decision: size ladder + weight + typography signals.
+/// Heading decision: the line looks like one, and its typeface is one that
+/// introduces text rather than one a figure's labels are set in.
 pub fn is_heading(l: &Line, ctx: &FontCtx) -> bool {
+    heading_shape(l, ctx)
+        && (l.page == 0
+            || numbered_section(l.text.trim())
+            || ctx
+                .earned
+                .as_ref()
+                .is_none_or(|e| e.fonts.contains(&l.font) || e.sizes.contains(&style_of(l))))
+}
+
+/// Does the line look like a heading: size ladder + weight + typography signals.
+fn heading_shape(l: &Line, ctx: &FontCtx) -> bool {
     let t = l.text.trim();
     if t.len() > 140 {
         return false;
@@ -465,9 +568,8 @@ pub fn is_heading(l: &Line, ctx: &FontCtx) -> bool {
 ///
 /// Failure mode, stated: a heading typeset with extreme word spacing loses its
 /// outline entry and reads as a paragraph. Nothing is dropped from the text.
-/// The other direction (a figure label that is one contiguous phrase, such as
-/// "Input-Input Layer5") still passes as a heading; this does not claim to
-/// catch every figure.
+/// A figure label that is one contiguous phrase ("Input-Input Layer5") passes
+/// this check; [`earned_headings`] judges it by what follows it.
 fn is_diagram_row(l: &Line) -> bool {
     if l.text.chars().filter(|c| c.is_alphabetic()).count() < 2 {
         return true;
@@ -665,6 +767,7 @@ mod diagram_row_tests {
         FontCtx {
             body_size: 10.0,
             ladder: vec![14.0],
+            earned: None,
         }
     }
 
@@ -710,5 +813,136 @@ mod diagram_row_tests {
         );
         let short = line(14.0, &[("FAQ", 10.0, 40.0)]);
         assert!(is_heading(&short, &ctx()), "three letters is a heading");
+    }
+}
+
+#[cfg(test)]
+mod earned_heading_tests {
+    use super::*;
+    use crate::pdf::layout::Word;
+
+    fn line(text: &str, size: f32, font: u16, page: usize, glyphs: usize) -> Line {
+        Line {
+            text: text.into(),
+            words: vec![Word {
+                text: text.into(),
+                x0: 100.0,
+                x1: 100.0 + text.len() as f32 * size * 0.5,
+            }],
+            x0: 100.0,
+            y0: 0.0,
+            x1: 200.0,
+            y1: size,
+            size,
+            weight: 700,
+            italic: false,
+            mono: false,
+            font,
+            glyphs,
+            order: 0,
+            page,
+        }
+    }
+
+    fn body(page: usize) -> Line {
+        let mut l = line(
+            "A paragraph of running text that goes on for a while.",
+            10.0,
+            3,
+            page,
+            55,
+        );
+        l.weight = 400;
+        l
+    }
+
+    fn ctx() -> FontCtx {
+        FontCtx {
+            body_size: 10.0,
+            ladder: vec![14.0, 20.0],
+            earned: None,
+        }
+    }
+
+    /// Three real sections (font 1, 14 pt, each followed by prose) and a figure's
+    /// labels (font 24, 20 pt, followed by labels and a caption) on page 2.
+    fn document() -> Vec<Vec<Line>> {
+        vec![
+            vec![
+                line("Introduction", 14.0, 1, 0, 12),
+                body(0),
+                line("Method", 14.0, 1, 0, 6),
+                body(0),
+            ],
+            vec![
+                line("Results", 14.0, 1, 1, 7),
+                body(1),
+                line("Layer5", 20.0, 24, 1, 6),
+                line("Layer5", 20.0, 24, 1, 6),
+                line("Figure 4: Two attention heads.", 10.0, 3, 1, 30),
+            ],
+        ]
+    }
+
+    #[test]
+    fn a_figures_labels_are_not_headings_but_the_documents_headings_are() {
+        let doc = document();
+        let mut c = ctx();
+        c.earned = earned_headings(&doc, &c);
+        assert!(is_heading(&doc[1][0], &c), "Results introduces text");
+        assert!(!is_heading(&doc[1][2], &c), "Layer5 introduces nothing");
+        assert!(!is_heading(&doc[1][3], &c));
+    }
+
+    #[test]
+    fn the_first_page_and_numbered_sections_are_exempt() {
+        let mut doc = document();
+        // A title alone in its face, on the first page.
+        doc[0].insert(0, line("Pro Git Handbook", 20.0, 24, 0, 16));
+        // A numbered section in an unearned face, later.
+        doc[1].push(line("3.2 Attention", 20.0, 24, 1, 13));
+        let mut c = ctx();
+        c.earned = earned_headings(&doc, &c);
+        assert!(is_heading(&doc[0][0], &c), "a title on page one is kept");
+        assert!(
+            is_heading(doc[1].last().unwrap(), &c),
+            "a numbered section is a heading in any face"
+        );
+    }
+
+    #[test]
+    fn nothing_is_demoted_in_a_document_where_no_face_introduces_text() {
+        // Headings and nothing else: no face earns the right, so none loses it.
+        let doc = vec![vec![
+            line("Alpha", 14.0, 1, 1, 5),
+            line("Beta", 14.0, 1, 1, 4),
+            line("Gamma", 20.0, 24, 1, 5),
+        ]];
+        let mut c = ctx();
+        c.earned = earned_headings(&doc, &c);
+        assert!(c.earned.is_none());
+        assert!(doc[0].iter().all(|l| is_heading(l, &c)));
+    }
+
+    #[test]
+    fn a_sibling_heading_in_another_weight_shares_the_size_that_earned_it() {
+        // Foreword (w700) and Introduction (w600) at the same size, each once.
+        let mut foreword = line("Foreword", 14.0, 1, 1, 8);
+        foreword.weight = 700;
+        let mut intro = line("Introduction", 14.0, 2, 1, 12);
+        intro.weight = 600;
+        let doc = vec![vec![foreword, body(1), intro, body(1)]];
+        let mut c = ctx();
+        c.earned = earned_headings(&doc, &c);
+        assert!(is_heading(&doc[0][0], &c) && is_heading(&doc[0][2], &c));
+    }
+
+    #[test]
+    fn a_caption_is_not_what_a_heading_introduces() {
+        assert!(is_caption("Figure 4: Two attention heads."));
+        assert!(is_caption("Table 2 Results"));
+        assert!(is_caption("Fig. 3 The model"));
+        assert!(!is_caption("Figures of speech are plentiful."));
+        assert!(!is_caption("Tables turned"));
     }
 }
