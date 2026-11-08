@@ -187,7 +187,9 @@ jobs:
       # Both feature sets: a binding gated behind a feature and used
       # unconditionally only breaks the other build (the cfg-twin class).
       - name: Clippy (full features)
-        run: cargo clippy --profile fast --locked --workspace --all-targets --features ocr,rerank,http -- -Dwarnings
+        run: |
+          clippy() { cargo clippy --profile fast --locked --workspace --all-targets --features ocr,rerank,http -- -Dwarnings; }
+          clippy || { echo "::warning::first compile failed; retrying once (download outage?)"; sleep 45; clippy; }
       - name: Clippy (no features)
         run: cargo clippy --profile fast --locked --workspace --all-targets --no-default-features -- -Dwarnings
       - uses: ./.github/actions/save-cache
@@ -220,6 +222,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+
+      # Compile once, with one retry for a transient download outage (the v8,
+      # PDFium and ONNX prebuilts come from GitHub release assets), then run.
+      - name: Compile the tests
+        run: |
+          compile() { cargo nextest run --cargo-profile fast --locked ${{ matrix.features }} --workspace --no-run; }
+          compile || { echo "::warning::first compile failed; retrying once (download outage?)"; sleep 45; compile; }
 
       # Linux runs the whole default suite and the budget guard. The other two
       # run what differs by operating system: process spawn and restart policy,
@@ -309,7 +318,9 @@ jobs:
           # x86_64: the baseline ISA (SSE2, no AVX), so the code runs on emulated
           # and older CPUs. ONNX Runtime's AVX is handled by dynamic loading.
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --profile dist-thin --locked ${{ matrix.features }}
+        run: |
+          build() { cargo build --profile dist-thin --locked ${{ matrix.features }}; }
+          build || { echo "::warning::first build failed; retrying once (download outage?)"; sleep 45; build; }
 
       - name: QEMU (non-AVX gate)
         if: matrix.name == 'linux-x64'

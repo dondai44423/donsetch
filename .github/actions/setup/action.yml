@@ -45,6 +45,7 @@ runs:
       if: runner.os != 'Windows'
       with:
         go-version: '>=1.22.0'
+        cache: false
 
     - name: NASM (Linux)
       if: runner.os == 'Linux'
@@ -72,26 +73,12 @@ runs:
           Write-Host "defender: build paths excluded"
         } catch { Write-Host "defender: exclusions unavailable ($_)" }
 
-    # GitHub's releases/download path 504s from time to time (2026-11-08: every
-    # platform, for hours, while the API asset URL served the same bytes).
-    # build.rs retries the PDFium and ONNX prebuilts through the API on its own;
-    # this loopback mirror covers the v8 archive, which has no fallback. If the
-    # public path is healthy cargo never asks the mirror anything.
-    - name: v8 download fallback
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        ver=$(grep -A3 'name = "v8"' Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)
-        python3 scripts/release-mirror.py --port 18777 --v8 "$ver" > "$RUNNER_TEMP/mirror.log" 2>&1 &
-        for _ in $(seq 1 30); do
-          grep -q 'serving on' "$RUNNER_TEMP/mirror.log" && break; sleep 1
-        done
-        if grep -q 'serving on' "$RUNNER_TEMP/mirror.log"; then
-          echo "RUSTY_V8_MIRROR=http://127.0.0.1:18777/v8" >> "$GITHUB_ENV"
-        else
-          echo "::warning::v8 mirror did not start; the public path is used alone"
-        fi
+    # GitHub's releases/download path 504s now and then (2026-11-08: every
+    # platform, for hours). build.rs retries the PDFium and ONNX prebuilts
+    # through the API asset URL on its own, and every job retries its first
+    # compile once after a pause. A longer outage needs a local mirror of the v8
+    # archive (scripts/release-mirror.py, RUSTY_V8_MIRROR): not run here, because
+    # v8's build script treats the mirror as its ONLY source, not a fallback.
 
     # The cache is dependencies only: one entry per lane, keyed by the
     # dependency hash (this crate's own version and sources excluded, so a

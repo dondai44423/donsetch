@@ -99,7 +99,7 @@ all: guard fmt-check check lockgate lint budget-static
 # Manifest/lock coherence plus the loop-profile compile: one graph, shared with
 # `just check`, so this costs seconds when the loop is warm.
 lockgate:
-    {{budget}} cargo check --locked --profile fast --all-targets {{feat}}
+    {{budget}} cargo check --locked --profile fast --workspace --all-targets {{feat}}
 
 # The release pipeline's payload gates (size, ONNX payload, version, non-AVX
 # CPU) against a locally built shipped-shape binary. Only needed when
@@ -118,7 +118,7 @@ fmt-check:
 # the profile, and this reuses the loop's artifact graph instead of
 # compiling a second one.
 lint:
-    {{budget}} cargo clippy --profile fast --all-targets {{feat}} -- -Dwarnings
+    {{budget}} cargo clippy --profile fast --workspace --all-targets {{feat}} -- -Dwarnings
 
 # Windows cross-check from Linux: type-checks every cfg(windows) path
 # with the full feature set, the exact breakage a Linux-only change
@@ -229,7 +229,7 @@ bin-dist:
 # Fast when the check graph is warm; ~2.5 min when only the test graph is
 # (check and test build different artifacts for the deps).
 check:
-    {{budget}} cargo check --profile fast --all-targets {{feat}}
+    {{budget}} cargo check --profile fast --workspace --all-targets {{feat}}
 
 # What the ladder actually costs on THIS box, right now: warm check,
 # warm scoped test, and the artifact shells. Run it after changing
