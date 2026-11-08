@@ -37,6 +37,24 @@ def gh_asset_url(repo: str, tag: str, name: str) -> str:
     return url
 
 
+def gh_release_assets(repo: str, tag: str) -> dict[str, str]:
+    out = subprocess.run(
+        ["gh", "api", "--paginate", f"repos/{repo}/releases/tags/{tag}",
+         "--jq", r'.assets[]|"\(.name)\t\(.url)"'],
+        capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0:
+        sys.exit(f"release-mirror: cannot list {repo} {tag}: {out.stderr.strip()}")
+    found = {}
+    for line in out.stdout.splitlines():
+        name, _, url = line.partition("\t")
+        # --paginate appends an empty page after the last one; its jq
+        # output is a blank tab pair, which must not become an asset.
+        if name and url.startswith("https://"):
+            found[name] = url
+    return found
+
+
 def fetch(url: str, dest: pathlib.Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
@@ -58,23 +76,19 @@ def main() -> None:
                     help="owner/repo/tag/name of a pinned prebuilt")
     args = ap.parse_args()
 
-    routes: dict[str, pathlib.Path] = {}
+    routes: dict[str, tuple[str, pathlib.Path]] = {}
     if args.v8:
+        # Every asset of the release, not just this host's: a build machine
+        # that asks for another platform must get it, not a 404.
         ver = args.v8
         repo = "denoland/rusty_v8"
-        for name in (
-            f"librusty_v8_simdutf_release_x86_64-unknown-linux-gnu.a.gz",
-            f"src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs",
-        ):
-            dest = CACHE / "v8" / f"v{ver}" / name
-            fetch(gh_asset_url(repo, f"v{ver}", name), dest)
-            routes[f"/v8/v{ver}/{name}"] = dest
+        for name, url in gh_release_assets(repo, f"v{ver}").items():
+            routes[f"/v8/v{ver}/{name}"] = (url, CACHE / "v8" / f"v{ver}" / name)
         print(f"export RUSTY_V8_MIRROR=http://127.0.0.1:{args.port}/v8", file=sys.stderr)
     for spec in args.asset:
         owner, repo, tag, name = spec.split("/", 3)
         dest = CACHE / "asset" / owner / repo / tag / name
-        fetch(gh_asset_url(f"{owner}/{repo}", tag, name), dest)
-        routes[f"/asset/{owner}/{repo}/{tag}/{name}"] = dest
+        routes[f"/asset/{owner}/{repo}/{tag}/{name}"] = (gh_asset_url(f"{owner}/{repo}", tag, name), dest)
         print(f"asset: http://127.0.0.1:{args.port}/asset/{owner}/{repo}/{tag}/{name}", file=sys.stderr)
     if not routes:
         sys.exit("release-mirror: give --v8 and/or --asset")
@@ -83,9 +97,15 @@ def main() -> None:
         # Serve by hand: SimpleHTTPRequestHandler's translate_path re-roots
         # the path under the directory argument and would never find these.
         def do_GET(self):
-            target = routes.get(self.path.split("?")[0])
-            if target is None or not target.is_file():
+            entry = routes.get(self.path.split("?")[0])
+            if entry is None:
                 self.send_error(404)
+                return
+            url, target = entry
+            try:
+                fetch(url, target)  # first request for this asset downloads it
+            except Exception as e:  # noqa: BLE001 - report, never die
+                self.send_error(502, f"mirror fetch failed: {e}")
                 return
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -95,7 +115,7 @@ def main() -> None:
                 while chunk := f.read(1 << 20):
                     self.wfile.write(chunk)
 
-        def log_message(self, *a):
+        def log_message(self, format, *args):  # noqa: A002 - base signature
             print(f"release-mirror: {self.requestline}", file=sys.stderr)
 
     http.server.ThreadingHTTPServer.allow_reuse_address = True

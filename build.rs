@@ -644,6 +644,8 @@ fn fetch_pdfium(os: &str, arch: &str, vendored: &Path) {
     let tgz = vendored.join(&tgz_name);
     let _ = fs::create_dir_all(vendored);
 
+    // Same rule as ONNX: a stale or partial tarball is deleted, never reused.
+    let _ = fs::remove_file(&tgz);
     eprintln!("donsetch build: fetching pdfium {pair} from {url}");
     if !download_release_asset(&tgz, &url) {
         panic!("pdfium: download failed for {url}");
@@ -802,6 +804,9 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
         OnnxArchive::Tgz => "onnx.tgz",
         OnnxArchive::Zip => "onnx.zip",
     });
+    // A stale archive (an older pin, a partial download) must never be
+    // extracted under a new hash: start from nothing and re-fetch.
+    let _ = fs::remove_file(&tarball);
     eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
     if !download_release_asset(&tarball, &info.url) {
         panic!("ONNX: download failed for {}", info.url);
