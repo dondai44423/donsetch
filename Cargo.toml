@@ -3,6 +3,9 @@
 # product could not share a profile, a lockfile, or an artifact cache with it.
 [workspace]
 members = ["core"]
+# fuzz/ is a standalone crate with its own lock and nightly toolchain; it must
+# not be captured by the workspace manifest above.
+exclude = ["fuzz"]
 resolver = "2"
 
 [package]
