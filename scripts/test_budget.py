@@ -8,10 +8,23 @@ make the test cheaper, or move it to the heavy lane.
 Usage:
   python3 scripts/test_budget.py --static           # fixtures + budget sanity (fast, no build)
   python3 scripts/test_budget.py --json RUN.json    # a nextest libtest-json-plus run
+  python3 scripts/test_budget.py --json RUN.json --ratchet
+      # tighten tests/budget.json to what RUN.json measured (plus a little
+      # headroom), after a green full run. Ceilings only ever move on purpose:
+      # raising one is a reviewed edit to budget.json, lowering one is this.
+
+Three things keep the suite from growing by accident:
+  * ceilings (count, per-suite count, single-test time, total CPU, fixtures)
+    that fail the run when crossed;
+  * a slack warning when a ceiling sits far above what the suite really uses,
+    because a loose ceiling is room for growth nobody decided on;
+  * the slowest tests printed on every run, so creep is visible before it
+    crosses anything.
 """
 
 import argparse
 import json
+import math
 import pathlib
 import sys
 
@@ -26,6 +39,32 @@ def load_budget() -> dict:
         sys.exit(f"test_budget: missing {BUDGET}")
     except json.JSONDecodeError as e:
         sys.exit(f"test_budget: {BUDGET} is not valid JSON: {e}")
+
+
+# How far a ceiling may sit above the measured suite before the guard says so.
+SLACK_TESTS = 60
+# Headroom a ratchet leaves: new tests are allowed, a landfill is not.
+RATCHET_TESTS = 25
+RATCHET_SUITE = 15
+# CI runners are slower than the desktop the numbers are usually taken on.
+RATCHET_CPU_FACTOR = 2.5
+LAST_RUN: dict = {}
+
+
+def ratchet(budget: dict) -> None:
+    """Rewrite budget.json ceilings to the last measured run plus headroom."""
+    if not LAST_RUN:
+        sys.exit("test_budget: --ratchet needs --json RUN.json")
+    counts = LAST_RUN["counts"]
+    new = dict(budget)
+    new["max_total"] = LAST_RUN["total"] + RATCHET_TESTS
+    new["max_sum_s"] = int(math.ceil(LAST_RUN["sum_s"] * RATCHET_CPU_FACTOR / 10.0) * 10)
+    new["suites"] = {g: c + RATCHET_SUITE for g, c in sorted(counts.items())}
+    BUDGET.write_text(json.dumps(new, indent=2) + "\n")
+    print(
+        f"ratcheted: max_total {new['max_total']}, max_sum_s {new['max_sum_s']}, "
+        f"{len(new['suites'])} suite ceilings"
+    )
 
 
 def human_mb(n: int) -> str:
@@ -99,6 +138,8 @@ def check_run(budget: dict, path: pathlib.Path) -> list[str]:
             )
 
     total_sum = sum(t for t, _ in times)
+    global LAST_RUN
+    LAST_RUN = {"counts": dict(counts), "total": total, "sum_s": total_sum}
     if total_sum > budget["max_sum_s"]:
         errors.append(
             f"test CPU total {total_sum:.0f}s, over the {budget['max_sum_s']}s budget. "
@@ -106,11 +147,20 @@ def check_run(budget: dict, path: pathlib.Path) -> list[str]:
         )
 
     print(
-        f"test budget: {total} tests, {total_sum:.0f}s CPU, "
-        f"slowest {max((t for t, _ in times), default=0):.1f}s"
+        f"test budget: {total} tests (ceiling {max_total}), {total_sum:.0f}s CPU "
+        f"(ceiling {budget['max_sum_s']}s), slowest {max((t for t, _ in times), default=0):.1f}s"
     )
     for group in sorted(counts):
-        print(f"  {counts[group]:5d}  {group}")
+        print(f"  {counts[group]:5d}  {group}  (ceiling {budget.get('suites', {}).get(group, '-')})")
+    print("slowest five:")
+    for seconds, name in sorted(times, reverse=True)[:5]:
+        print(f"  {seconds:6.1f}s  {name.split('$', 1)[-1]}")
+    if max_total - total > SLACK_TESTS:
+        print(
+            f"note: max_total {max_total} is {max_total - total} above the {total} measured; "
+            "a loose ceiling is room to grow unnoticed. Tighten it: "
+            "python3 scripts/test_budget.py --json RUN.json --ratchet"
+        )
     return errors
 
 
@@ -118,6 +168,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--static", action="store_true", help="only fixtures and budget file")
     ap.add_argument("--json", type=pathlib.Path, help="nextest libtest-json-plus output")
+    ap.add_argument("--ratchet", action="store_true", help="tighten budget.json to the measured run")
     args = ap.parse_args()
     budget = load_budget()
     errors = check_static(budget)
@@ -125,6 +176,8 @@ def main() -> int:
         errors += check_run(budget, args.json)
     elif not args.static:
         ap.error("pass --static or --json RUN.json")
+    if args.ratchet and not errors:
+        ratchet(budget)
     if errors:
         print("\ntest budget failed:", file=sys.stderr)
         for e in errors:

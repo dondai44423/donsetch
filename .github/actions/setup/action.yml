@@ -1,0 +1,121 @@
+name: setup
+description: >
+  Everything a build lane needs before cargo runs: the pinned toolchain, the
+  native build tools, a faster Windows disk, the release-download fallback, and
+  the lane's dependency cache. Pair it with save-cache at the end of the job.
+
+inputs:
+  lane:
+    description: Cache lane name, unique per job shape and platform (test-linux-x86_64).
+    required: true
+  components:
+    description: Extra rustup components, space separated (clippy rustfmt).
+    default: ""
+  cache:
+    description: "'false' skips the dependency cache entirely."
+    default: "true"
+
+outputs:
+  cache-hit:
+    description: "'true' when the exact dependency cache was restored."
+    value: ${{ steps.restore.outputs.cache-hit }}
+  cache-key:
+    description: The exact key save-cache stores under.
+    value: ${{ steps.key.outputs.key }}
+
+runs:
+  using: composite
+  steps:
+    # One source for the toolchain: rust-toolchain.toml. The version used to be
+    # spelled in three places and only one of them was the file a developer's
+    # own cargo reads.
+    - name: Rust toolchain
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+        args=(--profile minimal --no-self-update)
+        for c in $COMPONENTS; do args+=(--component "$c"); done
+        rustup toolchain install "$ch" "${args[@]}"
+        rustup default "$ch"
+        rustc -vV
+
+    - uses: actions/setup-go@v7
+      if: runner.os != 'Windows'
+      with:
+        go-version: '>=1.22.0'
+
+    - name: NASM (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
+    - name: NASM (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install nasm
+    - name: NASM (Windows)
+      if: runner.os == 'Windows'
+      shell: cmd
+      run: choco install nasm -y
+
+    # Real-time antivirus scanning of every object file and rlib is the single
+    # biggest tax on a Windows Rust build. The exclusions are best effort: on a
+    # runner where they are refused the build is just slower.
+    - name: Windows - exclude the build from antivirus scanning
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        try {
+          Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup", $env:TEMP -ErrorAction Stop
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+          Write-Host "defender: build paths excluded"
+        } catch { Write-Host "defender: exclusions unavailable ($_)" }
+
+    # GitHub's releases/download path 504s from time to time (2026-11-08: every
+    # platform, for hours, while the API asset URL served the same bytes).
+    # build.rs retries the PDFium and ONNX prebuilts through the API on its own;
+    # this loopback mirror covers the v8 archive, which has no fallback. If the
+    # public path is healthy cargo never asks the mirror anything.
+    - name: v8 download fallback
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        ver=$(grep -A3 'name = "v8"' Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)
+        python3 scripts/release-mirror.py --port 18777 --v8 "$ver" > "$RUNNER_TEMP/mirror.log" 2>&1 &
+        for _ in $(seq 1 30); do
+          grep -q 'serving on' "$RUNNER_TEMP/mirror.log" && break; sleep 1
+        done
+        if grep -q 'serving on' "$RUNNER_TEMP/mirror.log"; then
+          echo "RUSTY_V8_MIRROR=http://127.0.0.1:18777/v8" >> "$GITHUB_ENV"
+        else
+          echo "::warning::v8 mirror did not start; the public path is used alone"
+        fi
+
+    # The cache is dependencies only: one entry per lane, keyed by the
+    # dependency hash (this crate's own version and sources excluded, so a
+    # release commit and every source edit hit it exactly) and the compiler. A
+    # dependency bump falls back to the lane's previous entry and recompiles only
+    # what changed; save-cache then replaces the old entry, so a lane never holds
+    # more than one. See .github/workflows/ci.yml for the size budget.
+    - name: Cache key
+      id: key
+      if: inputs.cache == 'true'
+      shell: bash
+      run: |
+        dep=$(python3 scripts/dep-hash.py)
+        rc=$(rustc -vV | sed -n 's/^commit-hash: \(.\{8\}\).*/\1/p')
+        echo "key=v1-${{ inputs.lane }}-$dep-$rc" >> "$GITHUB_OUTPUT"
+    - name: Restore dependency cache
+      id: restore
+      if: inputs.cache == 'true'
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          target
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: v1-${{ inputs.lane }}-

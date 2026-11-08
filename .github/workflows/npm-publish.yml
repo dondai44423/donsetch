@@ -1,5 +1,8 @@
-# Publish the npm wrapper package automatically when a GitHub
-# release is published (draft -> published included).
+# Publish the npm wrapper package. The CI pipeline calls this as its last job
+# (workflow_call) once it has published the GitHub release; it also runs when a
+# release is published by hand in the GitHub UI, and manually (workflow_dispatch)
+# to retry or to prove the credential. A release created by the pipeline's own
+# token raises no `release` event, which is why the pipeline calls this directly.
 #
 # History (2026-09-15): v4.0.0 and v4.1.0 shipped to GitHub releases
 # but npm stayed on 3.6.7 because publishing was a manual step nobody
@@ -26,6 +29,12 @@ permissions:
   id-token: write
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        type: string
   release:
     # `released` is a normal release; publishing a beta or rc draft fires
     # `prereleased` instead, so without this line no prerelease ever reached
@@ -146,7 +155,7 @@ jobs:
       - name: Dispatch release notifications
         env:
           DOWNSTREAM_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           # Token for the latest-release lookup on manual runs (the
           # dispatch PAT below only holds the two downstream repos and
           # cannot read this one). The dispatches re-export the PAT

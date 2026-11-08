@@ -1,15 +1,13 @@
 # cargo-nextest config: https://nexte.st/docs/configuration/
 #
-# NEXTEST 0.9.x IGNORES config-level `cargo-profile` (verified on
-# 0.9.143). The ONLY working pin is the CLI flag: `--cargo-profile ci`
-# in the Justfile and CI recipes. An unprotected `cargo nextest run`
-# compiles the whole dependency graph under the DEBUG profile (21G
-# of target/debug in two days, the 110G catch before that, and 4.6G
-# in one scoped run today). Scoped local runs go through
-# `just t <filter>`; raw nextest calls must carry the flag.
+# NEXTEST 0.9.x IGNORES config-level `cargo-profile` (verified on 0.9.143). The
+# ONLY working pin is the CLI flag, `--cargo-profile fast` (or `dist-thin` for
+# the heavy lane): the Justfile recipes and ci.yml carry it. An unprotected
+# `cargo nextest run` compiles the whole dependency graph under the DEBUG
+# profile (21G of target/debug in two days, 110G before that).
 #
-# Local: `cargo nextest run`           → fail-fast, stop at first red
-# CI:    `cargo nextest run --profile ci` → run everything, show all
+# Local: `cargo nextest run`               -> fail-fast, stop at first red
+# CI:    `cargo nextest run --profile ci`  -> run everything, show all
 
 [profile.default]
 fail-fast = true
@@ -24,11 +22,15 @@ default-filter = 'not (test(soak::soak_rss_stays_bounded) | test(pdf::tests::pro
 slow-timeout = { period = "60s", terminate-after = 1 }
 [profile.ci]
 fail-fast = false
-# A hung test (native code deadlock inside PDFium/ONNX has
-# happened before on aarch64) must fail the job in a bounded
-# time, not wedge it until the workflow timeout. 30s per test
-# then hard-terminate.
-slow-timeout = { period = "30s", terminate-after = 1 }
+# A hung test (native code deadlock inside PDFium/ONNX has happened before on
+# aarch64) must fail the job in a bounded time, not wedge it until the workflow
+# timeout. 30 s is a warning, 60 s a hard terminate: the loop profile is
+# opt-level 0 and the Windows/macOS runners are 3-4x slower than a desktop.
+slow-timeout = { period = "30s", terminate-after = 2 }
+# Failures are what a person reads: show them again in the summary and keep the
+# passing tests out of the log.
+status-level = "slow"
+final-status-level = "fail"
 
 # The progit corpus book (501 pages) parses in ~57s on this box: inside
 # the 60s default only when the box is idle; under full-suite parallelism

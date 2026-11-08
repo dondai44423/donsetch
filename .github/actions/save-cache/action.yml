@@ -1,0 +1,47 @@
+name: save-cache
+description: >
+  Store the lane's dependency cache and retire the entry it replaces. Run it as
+  the last step of a job that used the setup action, only after success, and
+  never on a pull request (a PR's cache is private to it and only crowds out
+  master's).
+
+inputs:
+  lane:
+    required: true
+  key:
+    description: The setup action's cache-key output.
+    required: true
+  profile:
+    description: The cargo profile directory to clean this workspace's own artifacts from.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # What is stored is dependencies. This workspace's own crates are rebuilt on
+    # every commit anyway, and they are the largest, fastest-changing part of the
+    # tree; leaving them out keeps the entry small enough that four or five lanes
+    # fit in the repository's 10 GB cache pool without evicting each other.
+    - name: Drop this workspace's own artifacts
+      shell: bash
+      run: |
+        cargo clean -p donsetch -p donsetch-core --profile "${{ inputs.profile }}" || true
+        rm -rf target/*/incremental
+        du -sm target | awk '{print "cache payload: " $1 " MB uncompressed"}'
+    - name: Save dependency cache
+      uses: actions/cache/save@v6
+      with:
+        path: |
+          target
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: ${{ inputs.key }}
+    - name: Retire the superseded entry
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh cache list --key "v1-${{ inputs.lane }}-" --limit 50 --json id,key \
+          --jq '.[] | select(.key != "${{ inputs.key }}") | .id' \
+          | while read -r id; do gh cache delete "$id" || true; done

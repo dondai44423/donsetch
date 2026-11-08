@@ -6,26 +6,22 @@
 #   1. just check       types + cfg, full feature set        ~1 s warm
 #   2. just t <expr>    the touched scope                    ~6 s warm
 #   3. just test        the whole default suite              ~35 s warm
-#   4. CI               the cross-platform matrix, async     ~8-10 min
+#   4. CI               Linux gate on every push, ~5 min; Windows and macOS on
+#                       platform-touching pushes, nightly and every release
 #
-# `just all` is the pre-push net: guard + fmt + check + lockgate + lint +
-# the static test budget. It does NOT run the suite: CI already does, in
-# parallel, on every platform.
+# `just all` is the pre-push net: guard + fmt + check + lockgate + lint + the
+# static test budget. It does NOT run the suite: CI already does.
 #
-# PROFILES. `fast` is the edit loop: this crate at opt-level 0, deps at
-# opt-level 1, no debuginfo, codegen-units 16. `ci` is the CI/test shape:
-# release opts, panic=abort, no LTO; the heavy suite runs there because it
-# measures time and memory. `dist` is the SHIPPED shape (fat LTO, one codegen
-# unit) and only release.yml builds it. Plain `release` is thin LTO for local
-# use, so nobody waits ten minutes for a binary that only runs gates.
+# TWO BUILD SHAPES. `fast` is the edit loop AND every CI test lane: this crate
+# at opt-level 0, deps at opt-level 1, no debuginfo, codegen-units 16.
+# `dist-thin` is the SHIPPED shape (opt-level 3, no LTO) and what the nightly
+# heavy suite runs on, because those tests measure time and memory. Nothing
+# else: the old `ci` and `dist` profiles are gone (see Cargo.toml).
 #
-# The 2026-11 workflow pass cut the two costs that made this feel like 2010:
-# deps at codegen-units 256 made one crate fan out into every core and one
-# relink cost 6.5 minutes (now 25 s at 16 units), and the memory model in
-# budget.sh dropped to one job on a busy desktop (now three to eight). The
-# suite's heavy tail (a 501-page PDF, a large scanned PDF) moved to the
-# heavy lane via nextest's default-filter; the default gate is 2,018 tests in
-# ~35 s, and `tests/budget.json` keeps it there.
+# SHIPPING IS ONE COMMAND. `just ship <version>` bumps the manifests and pushes
+# the release commit; the CI pipeline then tests it on five platforms, builds
+# and gates the shipped binaries, tags, publishes the GitHub release and npm,
+# and stops on the first red. Nothing runs on this machine, nothing waits here.
 #
 #   just check        compile-check, full feature set, fast profile
 #   just t <expr>     scoped tests, fast profile (`just t crawl::frontier`)
@@ -33,13 +29,16 @@
 #   just test         the default suite, fast profile
 #   just heavy        the heavy set (soak / corpus / PDF corpus / timing)
 #   just budget       the suite as the guard sees it, then the ceilings
-#   just tci <expr>   scoped tests on the ci profile (release parity)
+#   just ratchet      tighten the ceilings to what the suite really uses
+#   just tdist <expr> scoped tests on the shipped profile (release opts)
 #   just lint         clippy -Dwarnings, full feature set
 #   just all          pre-push net: guard + fmt + check + lockgate + lint + budget-static
 #   just bin          target/fast/donsetch (fast live smokes)
-#   just bin-ci       target/ci/donsetch  (release parity + the gates)
+#   just bin-dist     target/dist-thin/donsetch (the shipped shape)
+#   just gates        bin-dist + the payload gates the release pipeline runs
 #   just smoke        bin + doctor + fetch + search
-#   just ship <ver>   CI gate, bump, tag, build, publish, npm — one command
+#   just ship <ver>   bump + push the release commit; CI does the rest
+#   just runs         what CI, the release and npm are doing right now
 #   just loop-report  measure this ladder on this box, right now
 #   just fuzz extract 30s fuzz burst on one target
 #   just clean-bloat  reclaim all that regrows (incremental, worktrees)
@@ -97,31 +96,17 @@ space:
 # it on 5 platforms in parallel; a local full run only serializes it.
 all: guard fmt-check check lockgate lint budget-static
 
-# Pre-tag gate: `all` + the payload gates mirrored against the ci-profile
-# binary. Fat LTO is not built locally: the release workflow's own gates
-# are the authoritative payload check.
-preflight: all ci-gates
-
-# Full fat-LTO + gates, for when the release workflow itself changed and
-# the payload gates must be proven locally first.
-preflight-full: all gates
-
-# Manifest/lock coherence plus the ci-profile (release-shaped,
-# panic=abort) compile: the second half of the structural gate, and the
-# one that catches anything gated on the release profile.
+# Manifest/lock coherence plus the loop-profile compile: one graph, shared with
+# `just check`, so this costs seconds when the loop is warm.
 lockgate:
-    {{budget}} cargo check --locked --profile ci --all-targets {{feat}}
+    {{budget}} cargo check --locked --profile fast --all-targets {{feat}}
 
-# The tag-time gates (linux-x64 mirror of release.yml), against the
-# ci-profile binary: sizes/version/dylib presence/ONNX probe/QEMU all
-# hold there too, so the slow fat-LTO pass is CI's job.
-ci-gates: bin-ci
-    @sh scripts/gates.sh linux-x64 target/ci
-
-# The tag-time gates (linux-x64 mirror of release.yml).
-gates:
-    {{budget}} cargo build --profile dist {{feat}}
-    @sh scripts/gates.sh linux-x64 target/dist
+# The release pipeline's payload gates (size, ONNX payload, version, non-AVX
+# CPU) against a locally built shipped-shape binary. Only needed when
+# scripts/gates.sh or the release job itself changed: the pipeline runs the
+# same script on all five platforms.
+gates: bin-dist
+    @sh scripts/gates.sh linux-x64 target/dist-thin
 
 fmt:
     cargo fmt --all
@@ -203,6 +188,11 @@ budget:
     NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 {{budget}} cargo nextest run --cargo-profile fast {{feat}} --workspace --message-format libtest-json-plus > /var/tmp/donsetch-nextest.json
     python3 scripts/test_budget.py --json /var/tmp/donsetch-nextest.json
 
+# After a clean full run, tighten tests/budget.json to what the suite really
+# uses. Raising a ceiling is a reviewed edit; lowering one is this.
+ratchet: budget
+    python3 scripts/test_budget.py --json /var/tmp/donsetch-nextest.json --ratchet
+
 # Fixtures and the budget file only: seconds, no build. Runs in `just all`.
 budget-static:
     python3 scripts/test_budget.py --static
@@ -212,10 +202,10 @@ budget-static:
 t-native expression:
     {{budget}} cargo nextest run --cargo-profile fast {{feat}} --run-ignored only -E 'test({{expression}})'
 
-# Scoped run on the ci profile (release opts, panic=abort): use when the
+# Scoped run on the shipped profile (release opts, panic=abort): use when the
 # question is release-profile behavior, not "does it pass".
-tci expression:
-    {{budget}} cargo nextest run --cargo-profile ci {{feat}} -E 'test({{expression}})'
+tdist expression:
+    {{budget}} cargo nextest run --cargo-profile dist-thin {{feat}} -E 'test({{expression}})'
 
 # npm wrapper + installer suite (node --test): resolution order, the
 # unwritable-target contract (#361), atomic landing, wrapper
@@ -223,17 +213,17 @@ tci expression:
 npm-test:
     node --test --test-timeout=90000 npm/tests/*.test.js
 
-# The heavy set on the ci profile: soak, corpus, landmarks, live probes.
+# The heavy set on the shipped profile: soak, corpus, landmarks, live probes.
 heavy:
-    {{budget}} cargo nextest run --cargo-profile ci {{feat}} --ignore-default-filter -E '{{heavy_expr}}' --no-fail-fast
+    {{budget}} cargo nextest run --cargo-profile dist-thin {{feat}} --ignore-default-filter -E '{{heavy_expr}}' --no-fail-fast
 
 # The binary for live smokes (fast profile: seconds, real behavior).
 bin:
     {{budget}} cargo build --profile fast {{feat}}
 
-# The release-shaped binary for parity smokes and the payload gates.
-bin-ci:
-    {{budget}} cargo build --profile ci {{feat}}
+# The shipped-shape binary for parity smokes and the payload gates.
+bin-dist:
+    {{budget}} cargo build --profile dist-thin {{feat}}
 
 # Compile-only full-feature check: the whole-crate structural signal.
 # Fast when the check graph is warm; ~2.5 min when only the test graph is
@@ -271,7 +261,16 @@ smoke: bin
 fuzz target:
     cd fuzz && {{budget}} cargo fuzz run {{target}} -s none -- -max_total_time=30
 
-# Ship a version end to end (CI gate, bump, tag, build, publish, npm).
+# Ship a version: bump, commit, push. That is all that runs here.
+#
+# The pushed commit is what the CI pipeline recognises as a release (its
+# Cargo.toml version has no tag yet). The pipeline then runs the suite on
+# Linux, Windows and macOS, builds and gates the five shipped binaries in
+# parallel with it, and only when every one is green creates the tag and the
+# GitHub release and publishes npm. A red run publishes nothing: fix forward
+# and push again, the same version is simply tried again. Nothing to wait on
+# here and no state to roll back; `just runs` shows how far it got, and a
+# single failed job is re-run with `gh run rerun <id> --failed`.
 ship version:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -282,11 +281,8 @@ ship version:
     grep -q "^## \[{{version}}\] - " CHANGELOG.md || {
         echo "ship: CHANGELOG.md has no [{{version}}] section yet"; exit 1
     }
-    # The house rule is CI green on master first; enforce it here instead of
-    # remembering it. A running/queued CI is a "wait", not a pass.
-    ci=$(gh run list --workflow CI --branch master --limit 1 --json conclusion --jq '.[0].conclusion // "none"')
-    if [ "$ci" != "success" ]; then
-        echo "ship: master CI is '$ci' — wait for green (just watch <run-id>)"; exit 1
+    if git ls-remote --exit-code --tags origin "refs/tags/v{{version}}" >/dev/null 2>&1; then
+        echo "ship: v{{version}} is already tagged and released"; exit 1
     fi
     sed -i 's/^version = ".*"/version = "{{version}}"/' Cargo.toml
     sed -i 's/^  "version": ".*",/  "version": "{{version}}",/' npm/package.json
@@ -296,31 +292,16 @@ ship version:
     }
     git add Cargo.toml Cargo.lock npm/package.json CHANGELOG.md
     # Idempotent: the manifests may already carry this version (a release
-    # prepared ahead of its tag), and an empty commit would abort the ship
-    # with "nothing to commit" after the checks passed.
+    # prepared ahead of its push); an empty commit would abort the ship.
     if ! git diff --cached --quiet; then
         git commit -q -m "chore(release): {{version}}"
     fi
     git push -q origin HEAD
-    git tag "v{{version}}"
-    git push -q origin "v{{version}}"
-    # Match the run by its branch (the tag), not by "newest": the run for
-    # this tag may not exist yet at this instant.
-    # Fire and forget. The Release workflow builds, gates, publishes and
-    # npm follows on the release event; `just runs` answers "did it land?"
-    # in one call. Nothing here blocks on a build.
-    run=""
-    for _ in $(seq 1 10); do
-        run=$(gh run list --workflow=Release --limit 10 --json databaseId,headBranch \
-            --jq "[.[]|select(.headBranch==\"v{{version}}\")][0].databaseId // empty")
-        [ -n "$run" ] && break
-        sleep 2
-    done
-    echo "ship: v{{version}} pushed${run:+ (Release run $run)}."
-    echo "      build, publish and npm run in the background; check with: just runs"
+    echo "ship: v{{version}} pushed. CI tests, builds, tags, publishes and runs npm."
+    echo "      progress: just runs      watch live: gh run watch"
 
-# One status call: latest CI, Release and npm runs, plus the published
-# versions. No watching, no polling loops.
+# One status call: the pipeline's latest runs, the newest release and the npm
+# version. No watching, no polling loops.
 runs:
     #!/usr/bin/env bash
     set -euo pipefail

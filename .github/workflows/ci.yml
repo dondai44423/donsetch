@@ -1,37 +1,48 @@
-# DonSeTch CI.
+# DonSeTch pipeline: test, build, gate, tag, publish. One workflow, one place
+# to read, no hand-offs between workflows.
 #
-# Four lean jobs, then one nightly. The shape follows what each platform
-# actually proves, not a five-way matrix that recompiled the same code five
-# times:
+#   plan      what this event needs (seconds). Docs-only pushes run nothing.
+#   lint      fmt, cargo-deny, the test budget, clippy on both feature sets.
+#   test      the default suite on the `fast` profile. Linux on every push;
+#             Windows and macOS when the push touches platform code, and on
+#             every release and nightly run.
+#   build     the five shipped binaries (`dist-thin`), each gated by
+#             scripts/gates.sh and packaged. Release commits and nightly only.
+#   publish   tag + GitHub release from those exact artifacts, then npm.
+#   gate      the one required status check: green when nothing failed.
 #
-#   build-test (linux-x86_64)  the SEMANTIC gate: workspace clippy, the whole
-#                              default suite (pdf, extract, crawl, mcp, state),
-#                              the test-budget guard, the shipped binary
-#                              starting, --stealth --parity. Nothing else needs
-#                              to run the suite; a test in it is not
-#                              platform-specific or it would be named here.
-#   build-test (macos-arm64)   PLATFORM gate: clippy for the macOS cfg surface,
-#                              the process/restart, path, profile and PDF tests,
-#                              the binary starting, release-feature compile.
-#   build-test (windows-x86_64) PLATFORM gate: compile the whole crate (the
-#                              real converter is clippy --all-targets), the
-#                              Windows core suite on master, release-feature
-#                              compile.
-#   check                      cheap gates, no build: rustfmt, the static test
-#                              budget, cargo-deny.
+# A RELEASE is a push to master whose Cargo.toml version has no tag yet. That is
+# all `just ship <version>` does: it pushes such a commit. This workflow tests
+# it on three operating systems, builds and gates five binaries in parallel with
+# the tests, and publishes only when every job is green. The artifacts it
+# publishes are the ones it gated: nothing is rebuilt between "tested" and
+# "shipped". A red run publishes nothing and leaves nothing to undo; fix forward
+# and push again and the same version is tried again. One failed job re-runs
+# alone (`gh run rerun <id> --failed`), including the npm step.
 #
-# The fetch core is a workspace member: it compiles in PARALLEL with the
-# product, shares one lockfile and one target cache, and its clippy runs in the
-# same step as the product's. It has no CI job of its own any more.
+# WHY IT IS SHAPED THIS WAY (the numbers are from the runs of 2026-11-08):
+#   * Tests ran on release opts and the product crate compiled three times per
+#     leg (clippy, a "binary starts" build, the test build): 16 min on Linux,
+#     34 on Windows. Tests now share the `fast` profile with the local loop, and
+#     the binary the integration tests start is the one nextest already built.
+#   * Every master push ran all three operating systems and queued behind its
+#     predecessors. A newer push now cancels an older, unfinished master run,
+#     and Windows/macOS run when platform code changed (plus nightly, plus every
+#     release, which is when a platform regression would reach a user).
+#   * The cache pool is 10 GB per repository and was full, so entries evicted
+#     each other and builds ran cold. Each lane keeps ONE dependency-only entry
+#     (see .github/actions/save-cache), about 7 GB across all lanes.
+#   * A release was CI, then a wait, then a second workflow rebuilding the same
+#     code from a tag, then a third for npm. Now: one run.
 #
-# Nightly (schedule) is the only place that pays for: all five fuzz targets,
-# the heavy test set (soak, corpus PDFs, timing ceilings) and the aarch64
-# Linux lane. Everything expensive is scheduled, nothing per-push is.
+# Caches. Lanes and what they hold (compressed, approximate):
+#   lint-linux 0.8 GB, test-linux 1.3, test-macos 1.2, test-windows 0.9,
+#   build-windows 1.0, build-macos-arm64 1.4, build-macos-x64 1.4.
+#   The Linux release builds are cold on purpose (5-8 min). To reset every
+#   cache, bump `v1` in .github/actions/setup/action.yml and delete the old ones
+#   (`gh cache delete --all`).
 #
-# Branch protection requires these contexts on master:
-#   build-test (linux-x86_64) · build-test (macos-arm64) · build-test (windows-x86_64)
-# The names are deliberately unchanged; `check` is not required (it is a
-# lint/format gate, not a build verdict) but still fails the run.
+# Branch protection requires exactly one check: `gate`.
 
 name: CI
 
@@ -43,229 +54,431 @@ on:
   schedule:
     - cron: '0 6 * * *'
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: Also run the Windows and macOS test lanes
+        type: boolean
+        default: false
+      build:
+        description: Also build, gate and package the five release binaries (nothing is published)
+        type: boolean
+        default: false
 
-# One live run per pull request: a new push evicts that PR's own
-# still-running checks. Pushes are keyed per SHA (branch protection reads
-# per-commit results).
+# A newer push to master replaces an older run that has not finished (its
+# result no longer matters); a release run is never replaced, and neither are
+# scheduled or manual runs. A pull request replaces its own earlier run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && format('-{0}', github.sha) || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: >-
+    ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref)
+    || (github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'chore(release)')) && 'master'
+    || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'chore(release)')) }}
 
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 5
+  GH_TOKEN: ${{ github.token }}
 
 permissions:
   contents: read
 
+# Every step is bash, on Windows too (Git Bash), so one script works on all five.
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  # ── Cheap gates: no toolchain build, seconds each. ─────────────────
-  check:
-    name: check
+  # ── What does this event need? ─────────────────────────────────────────────
+  plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.p.outputs.code }}
+      release: ${{ steps.p.outputs.release }}
+      build: ${{ steps.p.outputs.build }}
+      version: ${{ steps.p.outputs.version }}
+      tests: ${{ steps.p.outputs.tests }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98
         with:
-          components: rustfmt
-      - name: Format
-        run: cargo fmt --all -- --check
+          fetch-depth: 0
+          filter: blob:none
+      - id: p
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          IN_PLATFORMS: ${{ inputs.platforms }}
+          IN_BUILD: ${{ inputs.build }}
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          code=true platforms=false build=false release=false
+
+          case "$EVENT" in
+            schedule)
+              platforms=true build=true ;;
+            workflow_dispatch)
+              platforms=${IN_PLATFORMS:-false} build=${IN_BUILD:-false} ;;
+            push|pull_request)
+              base="${PR_BASE:-$BEFORE}"
+              if [ -n "$base" ] && ! echo "$base" | grep -qE '^0+$' && git cat-file -e "$base^{commit}" 2>/dev/null; then
+                changed=$(git diff --name-only "$base" "$GITHUB_SHA")
+                # Docs, assets and community files cannot break a build or a test.
+                if ! echo "$changed" | grep -qvE '^(docs/|assets/|README\.md|CHANGELOG\.md|SECURITY\.md|CONTRIBUTING\.md|AGENTS\.md|CLAUDE\.md|LICENSE|npm/README\.md|\.github/(ISSUE_TEMPLATE/|FUNDING\.yml|CODEOWNERS|PULL_REQUEST_TEMPLATE\.md|dependabot\.yml))'; then
+                  code=false
+                fi
+                # Code whose behaviour differs by operating system: processes
+                # and restarts, paths, profile detection, PDF and ONNX natives,
+                # the updater, the build itself and this workflow.
+                if echo "$changed" | grep -qE '^(src/(mcp|profile|pdf|browser|cli)/|src/(paths|onnx|handles|cpu|persona|state_probe|egress/proxy)\.|core/|build\.rs|Cargo\.(toml|lock)|npm/|scripts/|\.github/)'; then
+                  platforms=true
+                fi
+              else
+                platforms=true   # no usable base (new branch, force push): be thorough
+              fi ;;
+          esac
+
+          # A release is a master push whose version has no tag yet.
+          if [ "$EVENT" = push ] && [ "$GITHUB_REF" = refs/heads/master ] \
+             && ! git ls-remote --exit-code --tags origin "refs/tags/v$ver" >/dev/null 2>&1; then
+            grep -q "^## \[$ver\] - " CHANGELOG.md || { echo "::error::CHANGELOG.md has no [$ver] section"; exit 1; }
+            release=true platforms=true build=true code=true
+          fi
+
+          # The test matrix: Linux always; the other two when asked for.
+          tests='[{"name":"linux-x86_64","os":"ubuntu-latest","features":"--features ocr,rerank,http","suite":"full"}'
+          if [ "$platforms" = true ]; then
+            tests="$tests"',{"name":"macos-arm64","os":"macos-latest","features":"--features ocr,rerank","suite":"platform"}'
+            tests="$tests"',{"name":"windows-x86_64","os":"windows-latest","features":"","suite":"platform"}'
+          fi
+          tests="$tests]"
+
+          {
+            echo "code=$code"; echo "release=$release"; echo "build=$build"
+            echo "version=$ver"; echo "tests=$tests"
+          } >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT code=$code platforms=$platforms build=$build release=$release version=$ver"
+
+  # ── Cheap gates and clippy ─────────────────────────────────────────────────
+  lint:
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          lane: lint-linux-x86_64
+          components: clippy rustfmt
+      - run: cargo fmt --all -- --check
       - name: Test budget (fixtures and ceilings, no build)
         run: python3 scripts/test_budget.py --static
-      - name: cargo-deny
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
       - run: cargo deny --all-features check --hide-inclusion-graph
+      # Both feature sets: a binding gated behind a feature and used
+      # unconditionally only breaks the other build (the cfg-twin class).
+      - name: Clippy (full features)
+        run: cargo clippy --profile fast --locked --workspace --all-targets --features ocr,rerank,http -- -Dwarnings
+      - name: Clippy (no features)
+        run: cargo clippy --profile fast --locked --workspace --all-targets --no-default-features -- -Dwarnings
+      - uses: ./.github/actions/save-cache
+        if: success() && github.event_name != 'pull_request' && steps.setup.outputs.cache-hit != 'true'
+        with:
+          lane: lint-linux-x86_64
+          key: ${{ steps.setup.outputs.cache-key }}
+          profile: fast
 
-  # ── A Linux build every tag proves, so no five-way release rebuild. ──
-  build-test:
-    name: build-test (${{ matrix.name }})
+  # ── The suite ──────────────────────────────────────────────────────────────
+  test:
+    name: test (${{ matrix.name }})
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
-      # Only lanes that run the suite write the machine-readable log.
-      SUITE: ${{ matrix.suite }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            features: --features ocr,rerank,http
-            suite: full
-            rustflags: ''
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            features: --features ocr,rerank
-            suite: platform
-            rustflags: ''
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            features: ''
-            suite: platform
-            rustflags: ''
-          # Nightly only: the aarch64 Linux asset, built and started on the
-          # hardware it ships to (PDFium's CREL relocations and the loader
-          # behaviour that once crashed call_init are arm64 concerns).
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            features: ''
-            suite: none
-            rustflags: ''
-
+        include: ${{ fromJSON(needs.plan.outputs.tests) }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98
+      - id: setup
+        uses: ./.github/actions/setup
         with:
-          components: clippy
-      - uses: actions/setup-go@v7
-        if: runner.os != 'Windows'
-        with:
-          go-version: '>=1.22.0'
-      - name: Install nasm (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-      - name: Install nasm (macOS)
-        if: runner.os == 'macOS'
-        run: brew install nasm
-      - name: Install nasm (Windows)
-        if: runner.os == 'Windows'
-        run: choco install nasm -y
-        shell: cmd
-
-      # ~/.cargo (index + .crate archives) only. The compiled tree lives in
-      # the cache below, which this action must not manage: its seven-day
-      # cleanup would delete artifacts the build still uses (CACHING.md).
-      - name: Cache ~/.cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-          save-if: ${{ github.event_name != 'pull_request' }}
-
-      - name: Compute version-insensitive dep hash
-        shell: bash
-        run: echo "DEP_HASH=$(python3 scripts/dep-hash.py)" >> "$GITHUB_ENV"
-
-      # One tree for the whole workspace (product + core). The key is the
-      # target, the dependency hash and a hash of THIS workflow; a change to
-      # the build recipe falls back to the previous entry and reuses what
-      # cargo can.
-      - name: Compute target/ cache key
-        shell: bash
-        run: |
-          wf=$(sha256sum .github/workflows/ci.yml | cut -c1-8)
-          echo "TARGET_CACHE_KEY=tgt-${{ matrix.target }}-${{ env.DEP_HASH }}-${wf}" >> "$GITHUB_ENV"
-
-      - name: Restore target/
-        id: target-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: target
-          key: ${{ env.TARGET_CACHE_KEY }}
-          restore-keys: |
-            tgt-${{ matrix.target }}-${{ env.DEP_HASH }}-
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+          lane: test-${{ matrix.name }}
+      - uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      # The semantic gate. One clippy pass covers the product AND the core
-      # (workspace-wide), every target, tests included.
-      - name: Clippy (workspace, all targets)
-        if: matrix.suite == 'full' || matrix.suite == 'platform'
-        run: cargo clippy --profile ci ${{ matrix.features }} --all-targets -- -Dwarnings
-
-      - name: The binary starts
-        if: matrix.suite != 'none'
-        shell: bash
-        run: |
-          cargo build --profile ci ${{ matrix.features }} --bin donsetch
-          ./target/ci/donsetch --version
-
-      # The full suite: everything in the default filter. Emits the
-      # machine-readable log the budget guard reads.
+      # Linux runs the whole default suite and the budget guard. The other two
+      # run what differs by operating system: process spawn and restart policy,
+      # paths, profile detection, PDF (the C++ static that once crashed an arm64
+      # lane), extraction, ONNX, the updater. A test there is one whose
+      # behaviour differs on this OS; the rest is Linux's job.
       - name: Test (full suite)
         if: matrix.suite == 'full'
         env:
           NEXTEST_EXPERIMENTAL_LIBTEST_JSON: '1'
-        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} --workspace --message-format libtest-json-plus > nextest.json
-        timeout-minutes: 30
-
+        run: |
+          cargo nextest run --profile ci --cargo-profile fast --locked ${{ matrix.features }} --workspace \
+            --message-format libtest-json-plus > nextest.json
       - name: Test budget
         if: matrix.suite == 'full'
         run: python3 scripts/test_budget.py --json nextest.json
-
-      # Platform-specific value only: process spawn and restart policy,
-      # paths, profile detection, PDF (the C++ static that once crashed an
-      # arm64 lane), extraction, MCP supervisor. A test here is one whose
-      # behaviour differs on this OS; the rest is linux's job above.
-      # The Windows lane runs this only on master: a Redmond path quirk
-      # would otherwise block every PR. macOS runs it on every event.
       - name: Test (platform suite)
-        if: matrix.suite == 'platform' && (matrix.name != 'windows-x86_64' || github.event_name != 'pull_request')
-        run: cargo nextest run --profile ci --cargo-profile ci ${{ matrix.features }} -E 'test(mcp::supervisor) | test(profile::) | test(pdf::) | test(extract::) | test(onnx::) | test(ghost::)'
-        timeout-minutes: 30
+        if: matrix.suite == 'platform'
+        run: |
+          cargo nextest run --profile ci --cargo-profile fast --locked ${{ matrix.features }} --workspace \
+            -E 'test(mcp::supervisor) | test(profile::) | test(pdf::) | test(extract::) | test(onnx::) | test(ghost::) | test(cli::update) | test(paths::)'
 
-      # The release feature set must COMPILE on Windows; linking 300 MB of
-      # MSVC ONNX is a tag-time cost (release.yml), not a per-push one.
-      - name: Compile the release feature set (Windows)
-        if: matrix.name == 'windows-x86_64'
-        run: cargo check --profile ci --features ocr,rerank,http
-        timeout-minutes: 15
-
-      # The scorecard echo, rendered by the installed browser and diffed
-      # against the local fetch: the one check that proves the identity
-      # stack against a real Chrome on this platform.
-      - name: Stealth parity
-        if: matrix.name == 'linux-x86_64' && github.event_name != 'pull_request'
-        run: ./target/ci/donsetch doctor --stealth --parity --json | head -40
-        timeout-minutes: 10
-
-      - name: Save target/
-        if: success() && steps.target-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
-        uses: actions/cache/save@v6
+      - uses: ./.github/actions/save-cache
+        if: success() && github.event_name != 'pull_request' && steps.setup.outputs.cache-hit != 'true'
         with:
-          path: target
-          key: ${{ env.TARGET_CACHE_KEY }}
+          lane: test-${{ matrix.name }}
+          key: ${{ steps.setup.outputs.cache-key }}
+          profile: fast
 
-  # ── Nightly only ───────────────────────────────────────────────────
-  # The tests that are real but too expensive for a push: soak, corpus
-  # PDFs, landmark runs, timing ceilings. They are excluded from the
-  # default suite by .config/nextest.toml; this lifts that filter.
-  heavy:
-    name: heavy
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+  # ── The five shipped binaries ──────────────────────────────────────────────
+  build:
+    name: build (${{ matrix.name }})
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            # Ubuntu 22.04 is the glibc 2.35 baseline: binaries built here run on
+            # every distro from 22.04 up. A newer builder leaks its glibc
+            # requirement into the artifact (issue #93); scripts/gates.sh checks.
+            os: ubuntu-22.04
+            features: --features ocr,rerank,http
+            rustflags: -C target-cpu=x86-64
+            cache: 'false'      # cold is 5-8 minutes; not worth 1.3 GB of the pool
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            # PDF is in; OCR and rerank are off: the official ONNX aarch64
+            # prebuilt deadlocks at dlopen on native arm64. No linker flag on
+            # purpose: build.rs links PDFium with the toolchain's own rust-lld,
+            # because the runner's apt lld silently skips PDFium's CREL
+            # relocations and yields a binary that segfaults before main.
+            features: ''
+            rustflags: ''
+            cache: 'false'
+          - name: darwin-arm64
+            os: macos-latest
+            features: --features ocr,rerank,http
+            rustflags: ''
+            cache: 'true'       # cold is 12-14 minutes
+          - name: darwin-x64
+            os: macos-15-intel
+            features: --features ocr,rerank,http
+            rustflags: ''
+            cache: 'true'       # cold is 15-25 minutes
+          - name: win32-x64
+            os: windows-latest
+            features: --features ocr,rerank,http
+            rustflags: ''
+            cache: 'true'       # cold is 16 minutes
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98
-      - uses: actions/setup-go@v7
+      - id: setup
+        uses: ./.github/actions/setup
         with:
-          go-version: '>=1.22.0'
-      - run: sudo apt-get update -o Acquire::Retries=5 && sudo apt-get install -y --no-install-recommends nasm
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          lane: build-${{ matrix.name }}
+          cache: ${{ matrix.cache }}
+      - name: Build (dist-thin)
+        shell: bash
+        env:
+          # x86_64: the baseline ISA (SSE2, no AVX), so the code runs on emulated
+          # and older CPUs. ONNX Runtime's AVX is handled by dynamic loading.
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --profile dist-thin --locked ${{ matrix.features }}
+
+      - name: QEMU (non-AVX gate)
+        if: matrix.name == 'linux-x64'
+        run: sudo apt-get install -y --no-install-recommends qemu-user binutils
+      - name: Payload gates
+        env:
+          CI: 'true'
+        run: sh scripts/gates.sh ${{ matrix.name }} target/dist-thin
+
+      # tar.gz on every platform, so the npm installer needs one extraction
+      # method. Paths are relative: GNU tar on Windows reads `D:\...` as a host.
+      - name: Package
+        shell: bash
+        run: |
+          cd target/dist-thin
+          case "${{ matrix.name }}" in
+            win32-x64)    files="donsetch.exe pdfium.dll onnxruntime.dll" ;;
+            linux-x64)    files="donsetch libonnxruntime.so" ;;
+            darwin-*)     files="donsetch libonnxruntime.dylib" ;;
+            *)            files="donsetch" ;;
+          esac
+          tar czf ../../donsetch-${{ matrix.name }}.tar.gz $files
+          cd ../..
+          sha256sum donsetch-${{ matrix.name }}.tar.gz | tee donsetch-${{ matrix.name }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v7
         with:
-          cache-targets: false
+          name: donsetch-${{ matrix.name }}
+          path: donsetch-${{ matrix.name }}.*
+          retention-days: 7
+
+      # The identity stack against a real Chrome on the same runner.
+      - name: Stealth parity (nightly, Linux)
+        if: matrix.name == 'linux-x64' && github.event_name == 'schedule'
+        run: ./target/dist-thin/donsetch doctor --stealth --parity --json | head -40
+        timeout-minutes: 10
+
+      - uses: ./.github/actions/save-cache
+        if: success() && matrix.cache == 'true' && github.event_name != 'pull_request' && steps.setup.outputs.cache-hit != 'true'
+        with:
+          lane: build-${{ matrix.name }}
+          key: ${{ steps.setup.outputs.cache-key }}
+          profile: dist-thin
+
+  # ── Tag + release + npm, from the artifacts that were just gated ───────────
+  publish:
+    needs: [plan, lint, test, build]
+    if: >-
+      needs.plan.outputs.release == 'true'
+      && needs.lint.result == 'success' && needs.test.result == 'success' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Check the artifacts
+        run: |
+          ls -la artifacts
+          for p in linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64; do
+            [ -f "artifacts/donsetch-$p.tar.gz" ] && [ -f "artifacts/donsetch-$p.tar.gz.sha256" ] \
+              || { echo "::error::missing artifact for $p"; exit 1; }
+            (cd artifacts && sha256sum -c "donsetch-$p.tar.gz.sha256")
+          done
+      - name: Release notes from CHANGELOG
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, sys
+          v = os.environ["VERSION"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[" + re.escape(v) + r"\] - .*?$", text, re.M)
+          if not m:
+              sys.exit(f"CHANGELOG.md has no [{v}] section")
+          rest = text[m.end():]
+          nxt = re.search(r"^## \[.*?\]", rest, re.M)
+          section = rest[:nxt.start()] if nxt else rest
+          open("RELEASE_BODY.md", "w", encoding="utf-8").write(f"DonSeTch v{v}\n\n" + section.strip() + "\n")
+          EOF
+      # Creating the release creates the tag, at the commit that was tested. A
+      # re-run after a partial failure finds the release already there and only
+      # makes sure its assets are.
+      - name: Tag and publish the release
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          pre=""; case "$VERSION" in *-*) pre="--prerelease" ;; esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/donsetch-*.tar.gz artifacts/donsetch-*.sha256 --clobber
+          else
+            gh release create "$tag" artifacts/donsetch-*.tar.gz artifacts/donsetch-*.sha256 \
+              --target "$GITHUB_SHA" --title "$tag" --notes-file RELEASE_BODY.md $pre
+          fi
+
+  npm:
+    needs: [plan, publish]
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/npm-publish.yml
+    with:
+      tag: v${{ needs.plan.outputs.version }}
+    secrets: inherit
+
+  # ── The one required check ─────────────────────────────────────────────────
+  gate:
+    name: gate
+    needs: [plan, lint, test, build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Nothing failed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+          bad = []
+          for job, v in json.loads(os.environ["NEEDS"]).items():
+              print(f"{job}: {v['result']}")
+              if v["result"] in ("failure", "cancelled"):
+                  bad.append(job)
+          sys.exit(1 if bad else 0)
+          EOF
+
+  # ── Nightly only ───────────────────────────────────────────────────────────
+  # Real but too expensive for a push: soak, corpus PDFs, landmark runs, timing
+  # ceilings. They run on the shipped profile because they measure time and
+  # memory. Excluded from the default suite by .config/nextest.toml.
+  heavy:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+      - id: setup
+        uses: ./.github/actions/setup
+        with:
+          lane: heavy-linux-x86_64
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
       - name: Heavy set
-        run: cargo nextest run --profile ci --cargo-profile ci --features ocr,rerank,http --workspace --ignore-default-filter -E 'test(soak) | test(corpus) | test(landmark) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling)' --no-fail-fast
-        timeout-minutes: 45
+        run: >-
+          cargo nextest run --profile ci --cargo-profile dist-thin --locked --features ocr,rerank,http --workspace
+          --ignore-default-filter --no-fail-fast
+          -E 'test(soak) | test(corpus) | test(landmark) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling)'
+      - uses: ./.github/actions/save-cache
+        if: success() && github.event_name != 'pull_request' && steps.setup.outputs.cache-hit != 'true'
+        with:
+          lane: heavy-linux-x86_64
+          key: ${{ steps.setup.outputs.cache-key }}
+          profile: dist-thin
 
-  # All five fuzz targets, nightly. A push runs one (PRs) or none: a
-  # fuzz target is a long-running search, not a per-commit verdict.
+  # All five fuzz targets, nightly: a long-running search, not a per-commit verdict.
   fuzz:
     name: fuzz (${{ matrix.target }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

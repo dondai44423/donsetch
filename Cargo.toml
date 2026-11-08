@@ -95,7 +95,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 # on some platforms (notably aarch64 Linux, see issue #9). `http` adds the
 # axum HTTP transport. CI and release builds pick features per target: the
 # full `--features ocr,rerank,http` where supported, fewer or none elsewhere
-# (see the matrices in .github/workflows/ci.yml and release.yml).
+# (see the matrices in .github/workflows/ci.yml).
 default = []
 ocr = ["dep:oar-ocr", "dep:image", "reqwest/blocking"]
 rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/blocking"]
@@ -160,44 +160,39 @@ debug = "line-tables-only"
 # peak memory per rustc without making the debug binary faster to run.
 codegen-units = 16
 
-# The LOCAL release shape: thin LTO and parallel codegen. A shipped binary is
-# built with `dist` below, which keeps fat LTO and one codegen unit; nobody
-# should wait ten minutes for a local release binary that only runs gates.
+# THREE profiles, each answering one question:
+#
+#   fast       the edit loop AND every test lane in CI (below). Opt-level 0 for
+#              this workspace, 1 for dependencies, no debuginfo.
+#   dist-thin  the SHIPPED shape: what the release pipeline builds and ships,
+#              and what the nightly heavy tests (soak, corpus, timing) run on,
+#              because those measure time and memory.
+#   release    thin LTO for `cargo build --release` on a developer machine only.
+#
+# There used to be two more (`ci`, `dist`). A test lane on release opts
+# compiled the 91k-line product crate at opt-level 3 twice per CI leg, and a
+# fat-LTO `dist` cost 20-26 minutes per platform, so both were removed: tests
+# do not need release opts (the shipped artifact is gated by scripts/gates.sh
+# instead), and thin LTO bought a few percent of size and speed at best.
+
 [profile.release]
 lto = "thin"
 codegen-units = 16
 strip = true
 panic = "abort"
 
-# The SHIPPED shape: what release.yml builds. Thin LTO with 16 codegen
-# units: fat LTO on one unit cost 20-26 minutes per platform (macOS Intel was
-# the worst) for a few percent of size and speeed. Cargo's own guidance is
-# "start with thin"; the payload gates still prove the result runs.
-[profile.dist]
-inherits = "release"
-lto = "thin"
-codegen-units = 16
-
-# What an unsigned branch/master build uses: the fastest shape that still
-# runs the real binary. Only a tag pays for `dist`.
+# What the release pipeline builds and ships. No LTO: opt-level 3 with 16
+# codegen units is the whole cost, and the payload gates prove the result runs.
 [profile.dist-thin]
-inherits = "dist"
+inherits = "release"
 lto = false
 codegen-units = 16
 
-# The LOCAL loop profile: the default for `just check`, `just t`,
-# `just lint` and `just bin`. Debug codegen for this crate (an edit
-# rebuilds in seconds instead of the 8-12 min an opt-level-3 whole-crate
-# recompile cost under the RAM-bounded job cap), deps at opt-level 1
-# (unoptimized deps made the suite crawl, and the debug graph hit 21G),
-# no debuginfo (linking 91k LOC + 512 deps with full DWARF is its own
-# tax), incremental for the edit-test loop.
-#
-# CI still runs the `ci` profile below: release opts, panic=abort, the
-# same shape the binary ships. `just tci` / `just bin-ci` use it when the
-# question is release-profile behavior specifically, and `just heavy`
-# (soak, corpus, landmarks, live) runs there because those tests measure
-# time and memory.
+# The edit loop and the CI test lanes: debug codegen for this crate (an edit
+# rebuilds in seconds), dependencies at opt-level 1 (unoptimized deps made the
+# suite crawl), no debuginfo (linking 91k LOC + 512 deps with full DWARF is its
+# own tax), incremental for the edit-test loop (CI sets CARGO_INCREMENTAL=0,
+# which wins over this). The heavy suite runs on `dist-thin`.
 [profile.fast]
 inherits = "dev"
 debug = 0
@@ -205,31 +200,6 @@ incremental = true
 codegen-units = 16
 
 [profile.fast.package."*"]
-opt-level = 1
-codegen-units = 16
-
-# Test/workflow profile: release optimizations minus fat LTO.
-#
-# Fat LTO makes every test-binary link minutes long (111 binaries
-# in this repo). Tests don't need cross-crate inlining; the shipped
-# binary still gets full fat LTO via the `release` profile built
-# only at release time. `panic = "abort"` is inherited so the
-# daemon-abort behavior stays faithful in tests, and opt-level 3
-# keeps runtime-sensitive tests honest.
-[profile.ci]
-inherits = "release"
-lto = false
-# 256 units made one 91k-LOC crate fan out into every core: 6.5 minutes to
-# relink the test binary, and several GB of LLVM state. 16 is the sweet spot
-# for this crate (measured: build ~2 min, runtime unchanged).
-codegen-units = 16
-
-# Dependencies compile at opt-level 1: cold-graph rebuilds (each
-# dependabot bump or feature flip recompiles the whole deps tree,
-# the 90% of the pain) get ~2-3x faster codegen. The local crate
-# keeps the inherited opt-level 3 so the runtime-sensitive tests
-# stay honest. Test binaries run on opt-1 dep object code only.
-[profile.ci.package."*"]
 opt-level = 1
 codegen-units = 16
 

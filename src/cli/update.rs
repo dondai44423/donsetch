@@ -23,6 +23,7 @@ use std::path::Path;
 
 use crate::DISPLAY_NAME;
 use crate::cli;
+use crate::cli::download;
 use crate::fetch::client::Fetcher;
 use crate::paths;
 use crate::profile::BrowserProfile;
@@ -151,50 +152,8 @@ pub async fn run(args: &[String]) {
     cli::print_kv("asset", &asset_label);
     println!();
 
-    // ── Download tarball ─────────────────────────────────────
-
-    let spinner = cli::Spinner::new(&format!("downloading {asset_label}"));
-    // Opaque bytes (a gzip): the one-shot wire read carries them verbatim
-    // and follows the release-asset redirect; the document path would
-    // decode them as text and corrupt the archive.
-    let tarball = match fetcher
-        .fetch_once_via(&tarball_url, &[], None, false, None)
-        .await
-    {
-        Ok(out) if out.status == 200 => out.body,
-        Ok(out) => {
-            spinner.stop();
-            println!(
-                "  {} Download failed: HTTP {}",
-                cli::icon_fail(),
-                out.status
-            );
-            if out.status == 404 {
-                println!(
-                    "    No prebuilt binary for {} {}.",
-                    std::env::consts::OS,
-                    std::env::consts::ARCH,
-                );
-                println!("    Build from source: cargo install --path .");
-            }
-            std::process::exit(1);
-        }
-        Err(e) => {
-            spinner.stop();
-            println!("  {} Download failed: {e}", cli::icon_fail());
-            std::process::exit(1);
-        }
-    };
-    spinner.stop();
-    let mb = tarball.len() / 1_000_000;
-    let kb = tarball.len() / 1_000;
-    if mb > 0 {
-        println!("  {} downloaded ({mb}MB)", cli::icon_pass());
-    } else {
-        println!("  {} downloaded ({kb}KB)", cli::icon_pass());
-    }
-
-    // ── Download + verify SHA256 ─────────────────────────────
+    // ── Checksum first: a few bytes, and a release without one is refused
+    //    before the big download starts ─────────────────────────────────────
 
     let sha256_text = match fetcher.fetch(&sha256_url).await {
         Ok(out) if out.status == 200 => String::from_utf8_lossy(&out.body).to_string(),
@@ -211,8 +170,87 @@ pub async fn run(args: &[String]) {
             std::process::exit(1);
         }
     };
+    let expected = sha256_text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
 
-    let expected = sha256_text.split_whitespace().next().unwrap_or("");
+    // ── Download tarball ─────────────────────────────────────
+    // Rate-watched and resumable (src/cli/download.rs): a route that crawls is
+    // abandoned for the next one, which continues from the same byte.
+
+    println!("  downloading {asset_label}");
+    let sources = vec![
+        download::Source::Url {
+            label: "GitHub release".into(),
+            url: tarball_url.clone(),
+        },
+        download::Source::GithubAsset {
+            repo: REPO.into(),
+            tag: tag.clone(),
+            name: asset_label.clone(),
+        },
+    ];
+    let routes = download::configured_routes();
+    let switched = std::cell::Cell::new(false);
+    let note = |n: &str| {
+        switched.set(true);
+        println!("  {} {n}", cli::icon_warn());
+    };
+    let mut tarball = match download::download(
+        &sources,
+        &routes,
+        &download::Policy::standard(),
+        |_| {},
+        note,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("  {} Download failed: {e}", cli::icon_fail());
+            if e.contains("HTTP 404") {
+                println!(
+                    "    No prebuilt binary for {} {}.",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                );
+                println!("    Build from source: cargo install --path .");
+            }
+            std::process::exit(1);
+        }
+    };
+    // Bytes spliced from two routes that disagree with the checksum are not
+    // trusted: one more try, from the first route only and without a rate floor.
+    if switched.get() && !expected.is_empty() && sha256_hex(&tarball) != expected {
+        println!(
+            "  {} checksum differs after switching routes; downloading again in one piece",
+            cli::icon_warn()
+        );
+        let patient = download::Policy {
+            min_per_window: 0,
+            ..download::Policy::standard()
+        };
+        tarball =
+            match download::download(&sources[..1], &routes[..1], &patient, |_| {}, |_| {}).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    println!("  {} Download failed: {e}", cli::icon_fail());
+                    std::process::exit(1);
+                }
+            };
+    }
+    let mb = tarball.len() / 1_000_000;
+    let kb = tarball.len() / 1_000;
+    if mb > 0 {
+        println!("  {} downloaded ({mb}MB)", cli::icon_pass());
+    } else {
+        println!("  {} downloaded ({kb}KB)", cli::icon_pass());
+    }
+
+    // ── Verify SHA256 ────────────────────────────────────────
+
     let actual = sha256_hex(&tarball);
 
     if expected.is_empty() || expected != actual {

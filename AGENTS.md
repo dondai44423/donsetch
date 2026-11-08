@@ -158,8 +158,10 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
   descriptions and schemas and the CLI subcommands. Every connected client
   and every CLI user sees what it holds: treat edits there as user-facing.
 - The version is bumped by the maintainer at release time. Do not touch it
-  in a PR. A release is `just ship <version>`: it gates on master CI, bumps,
-  tags, watches the five-platform build, publishes the draft and watches npm.
-  Do not hand-run those steps.
+  in a PR. A release is `just ship <version>`: it bumps the manifests and
+  pushes the release commit, and the CI pipeline (`.github/workflows/ci.yml`)
+  tests it, builds and gates the five binaries, tags, publishes the GitHub
+  release and runs npm, stopping at the first red. Do not hand-run those steps,
+  and do not tag by hand: the pipeline tags the commit it tested.
 - Commit messages follow Conventional Commits. Do not append tool or
   session trailers.

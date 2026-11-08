@@ -8,9 +8,8 @@ Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributi
 git clone https://github.com/dondai44423/donsetch.git
 cd donsetch
 just bin                      # edit-loop binary: target/fast/donsetch (seconds)
-just bin-ci                   # release-shaped binary: target/ci/donsetch (panic=abort)
+just bin-dist                 # the SHIPPED shape: target/dist-thin/donsetch (what CI releases)
 cargo build --release         # local release: thin LTO, parallel codegen
-cargo build --profile dist    # the SHIPPED shape (fat LTO); release.yml builds this
 ```
 
 **Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#-install) for platform-specific install commands.
@@ -27,11 +26,12 @@ just all                # pre-push: guard + fmt + check + lockgate + lint + budg
 ```
 
 `just check` and `just t` run the **`fast` profile** (this crate at opt-level 0,
-deps at opt-level 1, no debuginfo, codegen-units 16). `ci` is the test/gate
-shape (release opts, `panic = "abort"`, no LTO); the heavy suite runs there
-because it measures time and memory. `dist` is what ships (fat LTO, one codegen
-unit) and only the release workflow builds it. A plain `cargo build --release`
-is thin LTO on purpose: a local release binary should not cost ten minutes.
+deps at opt-level 1, no debuginfo, codegen-units 16), and so does every CI test
+lane: what you run is what CI runs. `dist-thin` is the shipped shape (opt-level
+3, no LTO, `panic = "abort"`); the release pipeline builds it and the nightly
+heavy suite runs on it, because those tests measure time and memory. There are
+no other profiles. A plain `cargo build --release` is thin LTO on purpose: a
+local release binary should not cost ten minutes.
 
 **Tests are budgeted.** The default filter in `.config/nextest.toml` excludes
 the four tests that parse a 501-page PDF, a large scanned PDF, or prove a
@@ -42,17 +42,34 @@ deliberate raise. A new test should be cheap and specific: prefer a unit test or
 one integration test for the contract, keep it under ~2 s, and put anything that
 needs a real corpus or a real clock in the heavy set.
 
-Use `just th <name>` to run a heavy test on purpose, `just tci <expr>` for
-release-profile behavior, and `just budget` to see the suite exactly as the
-guard does. Do **not** make a bare `cargo test` or `cargo build --release` your
+Use `just th <name>` to run a heavy test on purpose, `just tdist <expr>` for
+release-profile behavior, `just budget` to see the suite exactly as the guard
+does, and `just ratchet` after a clean run to pull the ceilings in to what the
+suite really uses (raising one stays a reviewed edit to `tests/budget.json`). Do **not** make a bare `cargo test` or `cargo build --release` your
 edit loop: those compile another artifact graph, and recompiling it is the
-slowest thing in this repository. CI is the full gate (five platforms, in
-parallel); `just all` is the only local gate you need before pushing.
+slowest thing in this repository. `just all` is the only local gate you need
+before pushing.
 
-A Windows-shaped failure fails the gate: the Windows lane runs the core suite on
-master pushes, tags and the nightly, while PR cycles keep a compile-only check
-there because the MSVC link is the expensive part. `macos-x86_64` is still
-compile-only for the same reason.
+### What CI runs, and when
+
+One workflow, `.github/workflows/ci.yml`, with one required check, `gate`:
+
+| Event | What runs |
+|---|---|
+| Docs-only push or PR | nothing (the gate passes) |
+| Any other push or PR | `lint` (fmt, deny, budget, clippy on both feature sets) and the full suite on Linux, about 5 minutes warm |
+| That push touches platform code (processes, paths, profile, PDF, ONNX, the updater, `core/`, build files, workflows) | the same, plus the platform suite on Windows and macOS |
+| A release commit, and the nightly | everything: all three test lanes, and the five shipped binaries built and gated |
+
+A newer push to master cancels the unfinished run of an older one; a release
+run is never cancelled. To run the Windows and macOS lanes on a branch, or to
+build and gate the five binaries without publishing, dispatch the workflow
+(`gh workflow run ci.yml --ref <branch> -f platforms=true -f build=true`).
+
+Caches hold dependencies only, one entry per lane, replaced when the
+dependency hash changes (`.github/actions/`). The repository's cache pool is
+10 GB; do not add a lane without checking `gh cache list` and the budget table
+at the top of `ci.yml`.
 
 [`sccache`](https://github.com/mozilla/sccache) is picked up automatically when
 installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
@@ -65,9 +82,16 @@ nasm). It also sizes the job count from `MemAvailable` right now (~700 MB per
 rustc at codegen-units 16, 1 GB reserved): three to four jobs with a browser
 open, eight on an idle box. `BG_JOBS=<n>` overrides it.
 
-Releasing is one command: `just ship <version>` gates on master CI, bumps the
-three manifests, tags, watches the five-platform build, publishes the draft, and
-watches npm. A red build stops before anything is published.
+Releasing is one command: `just ship <version>`. It bumps the manifests and
+pushes the release commit. A push to master whose version has no tag yet *is* a
+release to the pipeline: it runs the suite on Linux, Windows and macOS, builds
+the five binaries and runs `scripts/gates.sh` on each (size, ONNX payload,
+version, glibc 2.35 baseline, non-AVX CPU) while that happens, and only when
+everything is green creates the tag and the GitHub release from those exact
+binaries and publishes npm. A red run publishes nothing and leaves nothing to
+undo: fix forward and push, and the same version is tried again. One failed job
+(the npm step, say) re-runs alone with `gh run rerun <id> --failed`. Progress:
+`just runs`.
 
 ### Verifying Windows compilation from Linux
 
