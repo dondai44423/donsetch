@@ -651,6 +651,18 @@ static REFUSAL: LazyLock<Regex> = LazyLock::new(|| {
     .expect("refusal pattern")
 });
 
+/// A headline that is an age gate: the whole headline asks for the reader's
+/// birth date or age ("Please tell us: When were you born?", "Are you of
+/// legal drinking age?", "You must be 21 or older to enter this site"). It
+/// must end with the ask, so a headline that goes on ("Are you over 50?
+/// Here's what to know") heads an article.
+static AGE_GATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(\bwhen\s+were\s+you\s+born|\b(enter|confirm|verify|provide|select)\s+your\s+(date\s+of\s+birth|birth\s?date|birthday|age)|\bwhat(\s+is|.s)\s+your\s+(date\s+of\s+birth|birth\s?date|age)|\bare\s+you\s+(of\s+(legal\s+)?((drinking|smoking)\s+)?age|(over|at\s+least)\s+\d{2}(\s+years(\s+old)?)?|\d{2}\+?(\s+years(\s+old)?)?(\s+or\s+(older|over|above))?)|\byou\s+(must|have\s+to|need\s+to)\s+be\s+(of\s+(legal\s+)?((drinking|smoking)\s+)?age|(over\s+|at\s+least\s+)?\d{2}\+?(\s+years(\s+old)?)?(\s+or\s+(older|over|above))?)|^\W*age\s+(verification|gate|check|confirmation))(\s+to\s+(enter|continue|proceed|visit|access|view)(\s+(this|the|our)\s+(site|website|page|store))?)?\W*$",
+    )
+    .expect("age gate pattern")
+});
+
 static LOADING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)^(loading|please wait|one moment|just a moment|connecting|initiali[sz]ing|starting|fetching|preparing|finding|searching|redirecting|processing|waiting|checking)\b",
@@ -671,6 +683,9 @@ struct Ctx {
     link: usize,
     mount: usize,
     heading: u8,
+    /// The heading element the text is in: the lines of one heading split
+    /// by `<br>` share it.
+    heading_id: usize,
     pre: bool,
     row: usize,
     /// A header or footer kept out of the frame for holding most of the
@@ -1023,6 +1038,7 @@ fn walk(doc: &Html) -> Walk {
                         .filter(|l| (1..=6).contains(l))
                     {
                         ctx.heading = level;
+                        ctx.heading_id = next_id;
                     }
                     if name == "pre" {
                         ctx.pre = true;
@@ -1467,17 +1483,50 @@ pub fn assess(doc: &Html, url: &str) -> Page {
 
     let mut kinds = Vec::with_capacity(w.units.len());
     let mut auth_level: Option<u8> = None;
-    // A page whose headline refuses the reader's browser is that notice:
-    // what stands under the headline (an apology, a help link, a list of
-    // browsers to install) is the notice too. Any later heading ends it, so
-    // an article under such a headline keeps its sections as content.
+    // A page whose headline refuses the reader's browser, or asks the
+    // reader's age before letting them in, is that notice: what stands
+    // under the headline (an apology, a help link, a list of browsers to
+    // install, the drink-responsibly line) is the notice too. Any later
+    // heading ends it, so an article under such a headline keeps its
+    // sections as content.
     let mut refusal = false;
-    let mut headline_seen = false;
+    // The first heading element's id and text (its lines may be several
+    // units), the units it spans, and whether a later heading has passed.
+    let mut headline: Option<(usize, String)> = None;
+    let mut headline_units: Vec<usize> = Vec::new();
+    let mut past_headline = false;
+    let mut refusal_headline: Option<String> = None;
     let mut rows: Vec<(usize, usize)> = Vec::new();
     for u in &w.units {
-        if u.ctx.heading > 0 && !u.ctx.frame {
-            refusal = !headline_seen && REFUSAL.is_match(u.text.trim());
-            headline_seen = true;
+        if u.ctx.heading > 0 && !u.ctx.frame && !past_headline {
+            match &mut headline {
+                Some((id, text)) if *id == u.ctx.heading_id => {
+                    text.push(' ');
+                    text.push_str(u.text.trim());
+                }
+                Some(_) => past_headline = true,
+                None => headline = Some((u.ctx.heading_id, u.text.trim().to_string())),
+            }
+            refusal = !past_headline
+                && headline
+                    .as_ref()
+                    .is_some_and(|(_, t)| REFUSAL.is_match(t) || AGE_GATE.is_match(t));
+            if !past_headline {
+                headline_units.push(kinds.len());
+            }
+            // The headline's earlier lines are the notice too, and the
+            // whole headline is what the page says.
+            if refusal {
+                refusal_headline = headline.as_ref().map(|(_, t)| t.clone());
+                for &i in &headline_units {
+                    if matches!(
+                        kinds.get(i),
+                        Some(Kind::Sentence | Kind::Data | Kind::Entity)
+                    ) {
+                        kinds[i] = Kind::Notice;
+                    }
+                }
+            }
         }
         if u.ctx.heading > 0 {
             if auth_level.is_some_and(|l| u.ctx.heading <= l) {
@@ -1568,12 +1617,16 @@ pub fn assess(doc: &Html, url: &str) -> Page {
         || (w.bundle_scripts && text_chars == 0);
     let authform = w.units.iter().any(|u| u.ctx.authform);
 
-    let notice = w
-        .units
-        .iter()
-        .zip(&kinds)
-        .find(|(_, k)| matches!(k, Kind::Notice | Kind::ScriptsRequired))
-        .map(|(u, _)| u.text.chars().take(200).collect::<String>());
+    let notice = refusal_headline
+        .as_deref()
+        .or_else(|| {
+            w.units
+                .iter()
+                .zip(&kinds)
+                .find(|(_, k)| matches!(k, Kind::Notice | Kind::ScriptsRequired))
+                .map(|(u, _)| u.text.as_str())
+        })
+        .map(|text| text.chars().take(200).collect::<String>());
 
     let verdict = if w.units.is_empty() && noscript_text.is_empty() {
         Verdict::Empty

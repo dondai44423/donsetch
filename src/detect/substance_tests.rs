@@ -496,6 +496,58 @@ fn a_page_about_browsers_is_content() {
     assert_eq!(verdict(imperative), Verdict::Content);
 }
 
+// heineken.com served to a reader without the age cookie (2026-11-08): the
+// headline asks the birth date over a country list and a province picker.
+#[test]
+fn an_age_gate_is_a_notice() {
+    let heineken = format!(
+        r#"<body><div class="gate"><h1><span>Please tell us:<br>When were you born?</span></h1>
+        <form><select><option>Afghanistan</option><option>Albania</option><option>Algeria</option></select>
+        <input placeholder="DD"><input placeholder="MM"><input placeholder="YYYY"></form>
+        <p>Please select a province</p>
+        <p>Always drink responsibly. Always surf the web responsibly too.</p>
+        <p>You have to be of legal drinking age to enter this site.</p></div>{FOOTER}</body>"#
+    );
+    let page = assess(&Html::parse_document(&heineken), "https://example.test/");
+    assert_eq!(page.verdict, Verdict::Notice);
+    assert_eq!(
+        page.notice.as_deref(),
+        Some("Please tell us: When were you born?")
+    );
+    for headline in [
+        "Are you of legal drinking age?",
+        "Are you 21 or older?",
+        "Are you over 18 years old?",
+        "You must be 18 or older to enter this site",
+        "Please enter your date of birth",
+        "Age verification",
+    ] {
+        let gate = format!(
+            r#"<body><h1>{headline}</h1><p>By entering this site you agree to our terms of use and privacy policy.</p><button>Yes</button><button>No</button></body>"#
+        );
+        assert_eq!(verdict(&gate), Verdict::Notice, "{headline}");
+    }
+}
+
+#[test]
+fn an_article_about_age_is_content() {
+    for article in [
+        // The headline goes on past the question.
+        r#"<body><main><h1>Are you over 50? Here's what to know about the shingles vaccine</h1>
+        <p>Adults over fifty are offered two doses, given two to six months apart, and the protection lasts for years.</p>
+        <p>Side effects are usually mild: a sore arm, tiredness or a headache for a day or two.</p></main></body>"#,
+        // A question headline over sections.
+        r#"<body><main><h1>When were you born?</h1><p>Your birth year shapes the music you grew up with.</p>
+        <h2>The eighties</h2><p>Synthesizers moved from studios into bedrooms and every chart had a drum machine.</p>
+        <h2>The nineties</h2><p>Grunge and hip hop split the radio between two very different cities.</p></main></body>"#,
+        // A headline about age checks is not one.
+        r#"<body><main><h1>Age verification laws are spreading across the US</h1>
+        <p>Eight states now require adult sites to check a visitor's age with an ID or a third-party service.</p></main></body>"#,
+    ] {
+        assert_eq!(verdict(article), Verdict::Content, "{article}");
+    }
+}
+
 // claude.ai/new served to a reader with no session (2026-11-08): the only
 // text is the statutory Korean business footer, outside any footer element.
 #[test]
