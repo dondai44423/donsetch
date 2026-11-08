@@ -164,9 +164,7 @@ pub fn api_url(u: &url::Url) -> Option<String> {
     if now < API_BACKOFF_UNTIL.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    if !matches!(u.host_str()?, "stackoverflow.com" | "www.stackoverflow.com") {
-        return None;
-    }
+    let site = api_site(u.host_str()?)?;
     let id = u
         .path()
         .strip_prefix("/questions/")
@@ -179,20 +177,35 @@ pub fn api_url(u: &url::Url) -> Option<String> {
     let mut api =
         url::Url::parse(&format!("https://api.stackexchange.com/2.3/questions/{id}")).ok()?;
     api.query_pairs_mut()
-        .append_pair("site", "stackoverflow")
+        .append_pair("site", site)
         .append_pair("filter", API_FILTER);
     Some(api.to_string())
 }
 
-fn api_question(body: &[u8], url: &str) -> Option<serde_json::Value> {
-    let u = url::Url::parse(url).ok()?;
-    if u.host_str()? != "api.stackexchange.com"
-        || !u
-            .query_pairs()
-            .any(|(k, v)| k == "site" && v == "stackoverflow")
+/// The API `site` for a question host: the network site's own domain, which
+/// the API accepts as its site parameter and echoes in every question link.
+/// `None` for hosts that hold no questions (the network hub, chat, the API).
+fn api_site(host: &str) -> Option<&str> {
+    let site = host.strip_prefix("www.").unwrap_or(host);
+    if !is_se_host(site)
+        || site == "stackexchange.com"
+        || site.starts_with("api.")
+        || site.starts_with("chat.")
     {
         return None;
     }
+    Some(site)
+}
+
+fn api_question(body: &[u8], url: &str) -> Option<serde_json::Value> {
+    let u = url::Url::parse(url).ok()?;
+    if u.host_str()? != "api.stackexchange.com" {
+        return None;
+    }
+    let site = u
+        .query_pairs()
+        .find_map(|(k, v)| (k == "site").then_some(v))?;
+    let site = api_site(&site)?.to_string();
     let id: u64 = u.path().strip_prefix("/2.3/questions/")?.parse().ok()?;
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     if v.get("error_id").is_some() {
@@ -208,10 +221,7 @@ fn api_question(body: &[u8], url: &str) -> Option<serde_json::Value> {
     }
     let source = url::Url::parse(q["link"].as_str()?).ok()?;
     if source.scheme() != "https"
-        || !matches!(
-            source.host_str()?,
-            "stackoverflow.com" | "www.stackoverflow.com"
-        )
+        || api_site(source.host_str()?) != Some(site.as_str())
         || !source.username().is_empty()
         || source.password().is_some()
         || !source.path().starts_with("/questions/")
@@ -473,10 +483,35 @@ mod tests {
         for url in [
             "https://stackoverflow.com/questions/tagged/rust",
             "https://stackoverflow.com.evil.example/questions/123",
-            "https://meta.stackoverflow.com/questions/123",
+            "https://notsuperuser.com/questions/123",
+            "https://stackexchange.com/questions/123",
+            "https://chat.stackexchange.com/questions/123",
         ] {
-            assert!(api_url(&url::Url::parse(url).unwrap()).is_none());
+            assert!(api_url(&url::Url::parse(url).unwrap()).is_none(), "{url}");
         }
+        // Every network site answers through the same API, named by its host.
+        for (url, site) in [
+            ("https://superuser.com/questions/42/x", "superuser.com"),
+            ("https://www.superuser.com/q/42", "superuser.com"),
+            (
+                "https://unix.stackexchange.com/questions/42/x",
+                "unix.stackexchange.com",
+            ),
+            (
+                "https://meta.stackoverflow.com/questions/42",
+                "meta.stackoverflow.com",
+            ),
+            (
+                "https://mathoverflow.net/questions/42/x",
+                "mathoverflow.net",
+            ),
+        ] {
+            let api = api_url(&url::Url::parse(url).unwrap()).unwrap();
+            assert!(api.contains(&format!("site={site}&")), "{url} -> {api}");
+        }
+        // A reply is accepted only for the site it was asked about.
+        let elsewhere = endpoint.replace("site=stackoverflow.com", "site=superuser.com");
+        assert!(!api_payload_valid(&bytes, &elsewhere));
         record_api_backoff(br#"{"backoff":60}"#);
         assert!(
             api_url(&url::Url::parse(source).unwrap()).is_none(),

@@ -76,7 +76,7 @@ const BUILTIN_REWRITES: [BuiltinRewrite; 7] = [
     },
     BuiltinRewrite {
         via: "adapter:stackexchange-api",
-        description: "Stack Overflow questions -> public API question, answers and comments",
+        description: "Stack Exchange questions -> public API question, answers and comments",
         apply: stackexchange::api_url,
     },
     BuiltinRewrite {
