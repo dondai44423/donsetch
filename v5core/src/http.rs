@@ -957,7 +957,11 @@ impl Wire {
                 url,
             )
             .headers(headers)
-            .timeout(budget.max(timeout));
+            // A backstop only: the exchange below is bounded by `budget` on
+            // its own clock, which says how far a cut transfer got. Equal
+            // ceilings raced, and wreq's (started first) could win with a
+            // bare "operation timed out".
+            .timeout(budget.max(timeout) + WIRE_BACKSTOP_SLACK);
         if let Some(order) = order {
             request = request.default_headers(false).orig_headers(order);
         }
@@ -1102,6 +1106,9 @@ impl Wire {
         }
     }
 }
+
+/// How far past the exchange's own bound the HTTP client's timeout sits.
+const WIRE_BACKSTOP_SLACK: Duration = Duration::from_secs(1);
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
