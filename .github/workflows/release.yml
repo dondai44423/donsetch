@@ -383,7 +383,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: cmd
         run: |
-          cd target\${{ matrix.target }}\release
+          cd target\${{ matrix.target }}\dist
           if not exist pdfium.dll (
             echo ERROR: pdfium.dll not found - build.rs copy failed
             exit 1
