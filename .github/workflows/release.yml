@@ -460,6 +460,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The release gates on the CI run for the commit the binaries were
+          # actually built from (the tag's target), not on the tag ref: CI
+          # runs branch pushes, and a tag push creates no CI run at all.
+          sha=$(git rev-parse "${{ github.sha }}^{commit}")
           conclusion=""
           for i in $(seq 1 60); do
             # A cancelled or still-running duplicate is not evidence about
@@ -467,12 +471,12 @@ jobs:
             # cancel this SHA's run through the CI concurrency group, and
             # blocking on that ships nothing. Poll for a real verdict, and
             # still refuse on an actual failure.
-            conclusion=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}" \
+            conclusion=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$sha" \
               --jq '[.workflow_runs[] | select(.name == "CI") | .conclusion | select(. != null and . != "cancelled" and . != "skipped")] | first // ""')
             [ -n "$conclusion" ] && break
             sleep 30
           done
-          echo "CI conclusion for ${{ github.sha }}: ${conclusion:-none}"
+          echo "CI conclusion for $sha: ${conclusion:-none}"
           if [ "$conclusion" != "success" ]; then
             echo "release blocked: CI on this commit is ${conclusion:-missing}; fix and re-tag"
             exit 1
