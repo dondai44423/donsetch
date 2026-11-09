@@ -75,9 +75,6 @@ fn finish(
 /// Extract an instant answer from a SERP body. `None` when the page
 /// has none (the common case for most queries).
 pub fn parse_instant(engine: &str, html: &str) -> Option<InstantAnswer> {
-    if !crate::config::cfg().search.serp_instant {
-        return None;
-    }
     let doc = Html::parse_document(html);
     parse_instant_doc(engine, &doc)
 }
@@ -86,9 +83,6 @@ pub fn parse_instant(engine: &str, html: &str) -> Option<InstantAnswer> {
 /// engine fan-out parses the SERP once and feeds hits + instant
 /// from the same DOM (html5ever is not free on a 3MB page).
 pub fn parse_instant_doc(engine: &str, doc: &Html) -> Option<InstantAnswer> {
-    if !crate::config::cfg().search.serp_instant {
-        return None;
-    }
     match engine {
         "bing" => parse_bing_instant(doc, engine),
         "brave" => parse_brave_instant(doc, engine),

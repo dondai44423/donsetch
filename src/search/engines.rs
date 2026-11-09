@@ -179,7 +179,12 @@ pub fn parse_with_instant(
             hits = shaped;
         }
     }
-    let instant = super::instant::parse_instant_doc(engine, &doc);
+    // The block is page content; the caller decides whether to ask for it.
+    let instant = if crate::config::cfg().search.serp_instant {
+        super::instant::parse_instant_doc(engine, &doc)
+    } else {
+        None
+    };
     if hits.is_empty() && crate::config::cfg().debug.search {
         let dump = std::env::temp_dir().join(format!("donseek_debug_{engine}.html"));
         let dump = dump.to_string_lossy().into_owned();

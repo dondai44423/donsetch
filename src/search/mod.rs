@@ -65,6 +65,11 @@ const FANOUT_SOFT_MARK: Duration = Duration::from_millis(1200);
 /// Never wait past this, however slow the sources are: a search with no answer
 /// after four seconds is answered by `late`, not by a longer wait.
 const FANOUT_HARD_MARK: Duration = Duration::from_millis(4000);
+/// How long past the soft mark the call still listens for a straggler: the
+/// third source is usually a few hundred milliseconds behind, not absent, and
+/// waiting for it is what makes three sources agree. Past that, the answer is
+/// what it is.
+const FANOUT_LATE_MARK: Duration = Duration::from_millis(600);
 
 /// The merge is thin below this: fewer than three answering sources, or fewer
 /// items than a ranking can be built from. A thin merge gets one bounded second
@@ -1212,11 +1217,12 @@ impl Searcher {
             .into_iter()
             .filter(|v| !self.quarantined(v))
             .collect();
+        let mut vfuts: Vec<(String, TaskFut)> = Vec::new();
         for v in verticals {
             if !self.plan_lane(v, &mut skipped) {
                 continue;
             }
-            futures.push((
+            vfuts.push((
                 engine_name(v).to_string(),
                 Box::pin(vertical_task(
                     v.to_string(),
@@ -1227,6 +1233,14 @@ impl Searcher {
                     locale,
                 )),
             ));
+        }
+        if matches!(intent, Intent::Code | Intent::Paper | Intent::Entity) {
+            // For a record query the vertical is the answer: plan it before the
+            // engines, so the budget cannot spend its slot on a general index.
+            vfuts.append(&mut futures);
+            futures = vfuts;
+        } else {
+            futures.append(&mut vfuts);
         }
 
         // A bare name is resolved alongside the fan-out: no latency cost, and
@@ -1322,9 +1336,12 @@ impl Searcher {
             // bing may spend a second request on its structured fallback; the
             // budget counts the ceiling, not the hope.
             let cost = if name == "bing" { 2 } else { 1 };
+            // A paper query needs its three indexes; everything else is better
+            // served by another general index than by a third vertical.
+            let vert_cap = if intent == Intent::Paper { 3 } else { 2 };
             let room = match class {
                 0 => engines_kept < 4,
-                1 => verticals_kept < 3,
+                1 => verticals_kept < vert_cap,
                 2 => news_kept < 2,
                 _ => guesses_kept < 1,
             } && spent + cost <= budget;
@@ -1407,12 +1424,25 @@ impl Searcher {
             if now >= hard_deadline {
                 break;
             }
-            // Until the soft mark, then until the hard one: past the soft mark
-            // the wait continues, it does not collapse to zero.
+            // Until the soft mark, then a short late mark (a news query waits
+            // for its wire, a call with nothing usable yet keeps the hard
+            // budget). Past that, the call commits to what has answered: a
+            // straggler at 2.7 s is not worth 1.5 s of everyone's wall clock.
             let until = if now < soft_deadline {
                 soft_deadline
             } else {
-                hard_deadline
+                let (_, items) = answered(&outcomes);
+                let deadline = if items == 0 {
+                    hard_deadline
+                } else if news_pending {
+                    news_deadline.min(hard_deadline)
+                } else {
+                    soft_deadline + FANOUT_LATE_MARK
+                };
+                if now >= deadline {
+                    break;
+                }
+                deadline
             };
             match tokio::time::timeout_at(until, futs.next()).await {
                 Ok(Some((name, (label, result)))) => {
@@ -1542,9 +1572,14 @@ impl Searcher {
                         off_query.push((base.to_string(), engine.clone()));
                     }
                     if instant.is_none()
-                        && let Some(ans) = answer.instant
+                        && let Some(mut ans) = answer.instant
                     {
-                        instant = Some(ans);
+                        // The block is a convenience, never a hole in the URL
+                        // contract: unwrap it and keep it only if it is a page.
+                        ans.url = contract::canonical_url(&ans.url);
+                        if contract::url_class(&ans.url) == contract::UrlClass::Page {
+                            instant = Some(ans);
+                        }
                     }
                     report.push(EngineReport {
                         engine: engine.clone(),
@@ -1650,14 +1685,25 @@ impl Searcher {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 save_health_disk_if_dirty(self, &t, &ti, &f);
             }
-            return Err(FetchError::Http(format!(
-                "search: all engines failed : {}",
-                report
-                    .iter()
-                    .map(|r| format!("{}:{}", r.engine, r.status))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            // A source that answered "nothing relevant" is an answer: the web
+            // has nothing for this query, and that is not a tool failure. Only
+            // a call where nothing could be asked at all is an error.
+            let answered = report.iter().any(|r| {
+                matches!(
+                    r.status.split(':').next().unwrap_or(""),
+                    "off-query" | "no-results" | "empty-parse" | "thin"
+                )
+            });
+            if !answered {
+                return Err(FetchError::Http(format!(
+                    "search: all engines failed : {}",
+                    report
+                        .iter()
+                        .map(|r| format!("{}:{}", r.engine, r.status))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
         }
 
         let mut trust = self
@@ -1915,7 +1961,7 @@ impl Searcher {
             hits: resolved.hits.len(),
             ms: resolved.ms,
             egress: "direct".into(),
-            requests: 0,
+            requests: resolved.requests,
         }];
         SearchOutcome {
             results: results.into_iter().take(max_results).collect(),

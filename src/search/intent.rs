@@ -262,7 +262,9 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             if registry_words(&toks, CRATE_WORDS) {
                 v.push("crates");
             }
-            if registry_words(&toks, NPM_WORDS) {
+            // `node` is a Node.js query word, but `node_modules` is a path: the
+            // tokenizer cannot tell them apart once it splits on `_`.
+            if registry_words(&toks, NPM_WORDS) && !q.contains("node_modules") {
                 v.push("npm");
             }
             v

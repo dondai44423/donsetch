@@ -399,21 +399,39 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
             // `off-query` answer is named too, because a 200 full of unrelated
             // items is a fact about retrieval, not a success.
             if let Some(engines) = pick(&sc, &dbg, "engines").and_then(|e| e.as_array()) {
-                let degraded: Vec<String> = engines
-                    .iter()
-                    .filter_map(|e| {
-                        let status = e.get("status").and_then(|s| s.as_str())?;
-                        let name = e.get("engine").and_then(|n| n.as_str())?;
-                        if matches!(status, "ok" | "thin") {
-                            return None;
-                        }
-                        // Shorten status for compactness.
+                // One line per source, not per attempt: a lane can appear twice
+                // in a report (a retry, a second ask), and the footer used to
+                // say "yahoo not-asked, yahoo not-asked".
+                let mut worst: std::collections::BTreeMap<&str, &str> =
+                    std::collections::BTreeMap::new();
+                for e in engines {
+                    let Some(status) = e.get("status").and_then(|s| s.as_str()) else {
+                        continue;
+                    };
+                    let Some(name) = e.get("engine").and_then(|n| n.as_str()) else {
+                        continue;
+                    };
+                    if matches!(status, "ok" | "thin" | "cached") {
+                        continue;
+                    }
+                    let slot = worst.entry(name).or_insert(status);
+                    // Keep the more informative of the two: a wall beats a
+                    // scheduling outcome.
+                    if rank_state(slot) < rank_state(status) {
+                        *slot = status;
+                    }
+                }
+                let degraded: Vec<String> = worst
+                    .into_iter()
+                    .map(|(name, status)| {
                         let short = if let Some(code) = status.strip_prefix("blocked:") {
-                            format!("{name} {code}")
+                            code.to_string()
+                        } else if let Some(rest) = status.strip_prefix("rate-limited:") {
+                            format!("rate-limited {rest}")
                         } else {
-                            format!("{name} {status}")
+                            status.to_string()
                         };
-                        Some(short)
+                        format!("{name} {short}")
                     })
                     .collect();
                 if !degraded.is_empty() {
@@ -644,6 +662,19 @@ pub fn print_tools_json() {
 }
 
 // ── Tests ───────────────────────────────────────────────────
+
+/// How much a status says about a source: a wall beats a scheduling outcome,
+/// and the footer keeps the most informative one per source.
+fn rank_state(status: &str) -> u8 {
+    let head = status.split(':').next().unwrap_or(status);
+    match head {
+        "not-asked" | "pacing-timeout" => 0,
+        "rested" => 1,
+        "late" => 2,
+        "off-query" | "no-results" | "empty-parse" | "empty" => 3,
+        _ => 4,
+    }
+}
 
 #[cfg(test)]
 mod tests {

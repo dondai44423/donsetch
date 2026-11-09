@@ -1062,6 +1062,52 @@
     "weather\\.naver\\.com",
     "accuweather\\.com/ko"
    ]
+  },
+  {
+   "id": "d7-cargo",
+   "shape": "code",
+   "set": "gold",
+   "query": "cargo serde_json",
+   "gold": [
+    "docs\\.rs/serde_json",
+    "crates\\.io/crates/serde_json"
+   ],
+   "must_not": [
+    "serde\\.rs/"
+   ]
+  },
+  {
+   "id": "d7-npm-hyphen",
+   "shape": "code",
+   "set": "gold",
+   "query": "npm react-router",
+   "gold": [
+    "npmjs\\.com/package/react-router"
+   ]
+  },
+  {
+   "id": "d7-pip-hyphen",
+   "shape": "code",
+   "set": "gold",
+   "query": "pip scikit-learn",
+   "gold": [
+    "pypi\\.org/project/scikit-learn"
+   ]
+  },
+  {
+   "id": "d7-url-junk",
+   "shape": "web",
+   "set": "gold",
+   "query": "spacex starship next launch",
+   "gold": [
+    "spacex\\.com/launches",
+    "spacelaunchschedule",
+    "nextspaceflight"
+   ],
+   "must_not": [
+    "EF%BF%BD",
+    "ef%bf%bd"
+   ]
   }
  ]
 }

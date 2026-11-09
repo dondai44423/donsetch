@@ -512,9 +512,26 @@ fn publisher_url(raw: &str) -> String {
 }
 
 pub fn url_class(raw: &str) -> UrlClass {
+    // A replacement character or a control byte is the mark of a bad decode:
+    // the URL as printed is not the URL anyone can fetch. It hides percent-
+    // encoded too (`%EF%BF%BD` is one literal byte sequence of it).
+    if raw
+        .chars()
+        .any(|c| c == '\u{FFFD}' || c.is_control() || c.is_whitespace())
+    {
+        return UrlClass::Invalid;
+    }
+    let without_escapes = raw.replace("%EF%BF%BD", "").replace("%ef%bf%bd", "");
+    if without_escapes.len() != raw.len() {
+        return UrlClass::Invalid;
+    }
     let Ok(u) = url::Url::parse(raw) else {
         return UrlClass::Invalid;
     };
+    let decoded = percent_decode(u.path());
+    if decoded.contains('\u{FFFD}') {
+        return UrlClass::Invalid;
+    }
     if !matches!(u.scheme(), "http" | "https") {
         return UrlClass::Invalid;
     }

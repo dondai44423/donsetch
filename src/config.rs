@@ -157,9 +157,12 @@ section!(SearchSection {
     /// C2: compile site:/filetype:/intitle: per-engine (strip from
     /// engines that ignore them). Kill: DONSETCH_NO_QUERY_COMPILE.
     query_compile: bool = true,
-    /// C5: extract byte-derived featured/instant/knowledge answers
-    /// from SERP HTML. Kill: DONSETCH_NO_SERP_INSTANT.
-    serp_instant: bool = true,
+    /// C5: extract byte-derived featured/instant/knowledge answers from SERP
+    /// HTML. Default OFF: the block is page content, and search's place is the
+    /// URL plus a short snippet — the fetch tool reads the page. A SERP's
+    /// "featured snippet" also arrives with the wrapper URL attached.
+    /// Kill: DONSETCH_NO_SERP_INSTANT.
+    serp_instant: bool = false,
     /// Cross-encoder re-ranking of the merged candidates (ONNX, in-process).
     /// OFF by default: on the 40-query bench it moved no metric (hit@1 0.25 vs
     /// 0.23, hit@5 0.65 vs 0.62, MRR 0.434 vs 0.418 -- all inside noise, twice)
@@ -3499,20 +3502,16 @@ mod tests {
     }
 
     #[test]
-    fn serp_instant_defaults_on_and_honors_kill_switch() {
+    fn serp_instant_defaults_off_and_can_be_turned_on() {
         let guard = clean_env();
         set_env("DONSETCH_NO_CONFIG_FILE", "1");
         let loaded = load().expect("defaults");
         assert!(
-            loaded.config.search.serp_instant,
-            "search.serp_instant must default true"
-        );
-        set_env("DONSETCH_NO_SERP_INSTANT", "1");
-        let loaded = load().expect("kill switch");
-        assert!(
             !loaded.config.search.serp_instant,
-            "DONSETCH_NO_SERP_INSTANT must map to search.serp_instant=false"
+            "the instant block is page content: search returns the URL and a snippet"
         );
+        // Enabling it is a config-file decision ([search] serp_instant = true),
+        // not a default.
         assert_eq!(
             legacy_target_of("DONSETCH_NO_SERP_INSTANT"),
             ("search", "serp_instant")

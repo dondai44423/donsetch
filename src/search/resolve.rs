@@ -25,7 +25,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::contract::Profile;
 use super::engines::Hit;
 use crate::fetch::client::Fetcher;
 
@@ -118,11 +117,18 @@ pub fn plan(query: &str) -> Option<Plan> {
     {
         return None;
     }
-    let profile = Profile::new(query);
+    // Whitespace words, not extracted terms: a package name is one word, and
+    // `serde_json` or `react-router` must not be split into a topic.
     let mut ecosystem: Option<Ecosystem> = None;
     let mut name: Option<String> = None;
-    for term in profile.terms() {
-        if let Some(eco) = ecosystem_word(term) {
+    for word in query.split_whitespace() {
+        let word = word.trim_matches(|c: char| {
+            !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '/'))
+        });
+        if word.is_empty() {
+            continue;
+        }
+        if let Some(eco) = ecosystem_word(&word.to_ascii_lowercase()) {
             ecosystem.get_or_insert(eco);
             continue;
         }
@@ -130,7 +136,7 @@ pub fn plan(query: &str) -> Option<Plan> {
             // Two content words is a topic ("starship launch", "react hooks").
             return None;
         }
-        name = Some(term.to_string());
+        name = Some(word.to_string());
     }
     let name = name?;
     // A package or repository name is ASCII letters, digits and `- _ . @ /`.
@@ -712,6 +718,23 @@ mod tests {
             plan("github tokio").unwrap().ecosystem,
             Some(Ecosystem::Github)
         );
+    }
+
+    #[test]
+    fn a_package_name_keeps_its_hyphens_and_underscores() {
+        // A name is one word: splitting it on `_` or `-` turned a package into a
+        // topic and sent the query to the engines instead of the registry.
+        let p = plan("cargo serde_json").expect("a name");
+        assert_eq!(p.name, "serde_json");
+        assert_eq!(p.ecosystem, Some(Ecosystem::Crates));
+        let p = plan("npm react-router").expect("a name");
+        assert_eq!(p.name, "react-router");
+        assert_eq!(p.ecosystem, Some(Ecosystem::Npm));
+        let p = plan("pip scikit-learn").expect("a name");
+        assert_eq!(p.name, "scikit-learn");
+        assert_eq!(p.ecosystem, Some(Ecosystem::Pypi));
+        let p = plan("rust tokio").expect("a name");
+        assert_eq!(p.name, "tokio");
     }
 
     #[test]
