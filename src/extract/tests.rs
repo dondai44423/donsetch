@@ -3455,6 +3455,28 @@ fn a_tabs_panels_keep_their_tables_and_headings() {
 }
 
 #[test]
+fn an_accordions_sections_keep_their_tables() {
+    // AWS's RDS pricing accordion: each `<li>` is a section with a heading and
+    // its tables. Read as list lines, a table printed as one run of text.
+    let html = r#"<html><body><main><p>Pricing for every engine, by deployment option, below.</p>
+        <ul data-lb-comp="accordion">
+          <li><a role="button"><h3>RDS for MySQL</h3><div>Select to see details</div></a>
+            <div><p>The pricing below applies to a DB instance in one Availability Zone.</p>
+            <table><thead><tr><th>Instance</th><th>Price Per Hour</th></tr></thead>
+              <tbody><tr><td>db.t4g.micro</td><td>$0.016</td></tr>
+              <tr><td>db.t4g.small</td><td>$0.032</td></tr></tbody></table></div></li>
+          <li><a role="button"><h3>Storage</h3></a><div><p>Storage is billed per GB-month as below.</p></div></li>
+        </ul></main></body></html>"#;
+    let out = extract_html(html).markdown;
+    assert!(
+        out.contains("| db.t4g.micro | $0.016 |") && out.contains("| db.t4g.small | $0.032 |"),
+        "the table stays a table: {out}"
+    );
+    assert!(out.contains("### RDS for MySQL"), "{out}");
+    assert!(!out.contains("db.t4g.micro$0.016"), "{out}");
+}
+
+#[test]
 fn an_ordinary_list_with_a_table_in_an_item_is_still_a_list() {
     let html = r#"<html><body><main><p>Steps for the procedure, written out in full below.</p>
         <ul><li>First step, then read the table here<table><tr><td>a</td><td>b</td></tr></table></li>
