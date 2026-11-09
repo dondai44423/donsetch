@@ -11,14 +11,23 @@
 //! and [`apply`] puts the filled tables into the page. Nothing here fetches.
 //!
 //! What is claimed, and what is left alone:
-//! - Only `priceOf` and `stringOf` tokens, with the operators, `decimals=N`,
-//!   `opt` and `noregion` modifiers the page's own parser accepts. A template with
-//!   any other token (`bulkPriceOf`, `percentage`, `related`, `hide`,
-//!   `locationSelector`) is left exactly as the page served it.
-//! - Only the `aws` partition, USD, an `en` locale, and the page's default
-//!   region: the region the page's script shows when a visitor has chosen none.
+//! - `priceOf` and `stringOf` tokens, with the operators, `decimals=N`, `opt`
+//!   and `noregion` modifiers the page's own parser accepts, and bulk tables
+//!   (`bulkPriceOf`, `bulkStringOf`, one row per instance type; see [`bulk`]).
+//!   A template with any other token (`percentage`, `bulkPercentage`, `hide`,
+//!   `locationSelector`) or a sort order not read here is left exactly as the
+//!   page served it.
+//! - The `aws` partition (every template aws.amazon.com serves; the China
+//!   site prints its prices in the page), USD, the page's default region (the
+//!   one its script shows when a visitor has chosen none), and the fourteen
+//!   locales aws.amazon.com serves, written as that page writes them
+//!   ([`locale`]): `0,017 USD` on the German page, strings through its
+//!   dictionaries.
 //! - A row (`tr`, `li`) whose price is not published for that region is dropped,
 //!   as the page drops it; elsewhere an unpublished price reads `N/A`.
+
+mod bulk;
+mod locale;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
@@ -35,14 +44,17 @@ const S3_REGION: &str = "US East (N. Virginia)";
 const PAGE_HOST: &str = "aws.amazon.com";
 const DATA_HOST_SUFFIX: &str = ".awsstatic.com";
 
-/// A page's price tables draw on a handful of files (S3's on a dozen); more means
-/// this is not the page the contract was read from.
-const MAX_FILES: usize = 16;
+/// A page's price tables draw on a handful of files (S3's on a dozen,
+/// SageMaker's on twenty-two, 2.5 MB compressed in all, as the browser
+/// downloads them); more means this is not the page the contract was read from.
+const MAX_FILES: usize = 32;
 
 /// The price files a page needs, and the region they are read for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
-    /// Absolute URLs of price files, each with the `dir/file` name tokens use.
+    /// Absolute URLs of price files, each with the `dir/file` name tokens use,
+    /// and of the page's dictionaries (`@i18n/…`, `@g11n/…`) when a template
+    /// shows strings.
     pub files: Vec<(String, String)>,
     /// The page's origin, which the price file request names as its initiator.
     pub origin: String,
@@ -54,6 +66,12 @@ struct Markup {
     /// Byte offset just past the host element's opening tag.
     insert_at: usize,
     template: String,
+    locale: &'static locale::Locale,
+    /// `data-token-sets`: the sets a bulk table's rows come from.
+    sets: Vec<String>,
+    relates: Option<String>,
+    sort_property: String,
+    sort_order: String,
 }
 
 fn token_re() -> &'static Regex {
@@ -71,6 +89,11 @@ fn token_re() -> &'static Regex {
 struct Token<'a> {
     whole: std::ops::Range<usize>,
     string_of: bool,
+    /// `bulkPriceOf` / `bulkStringOf`: one value per row of a bulk table.
+    bulk: bool,
+    /// `{bulkStringOf!related}`: the value the rows are joined on.
+    related: bool,
+    /// Empty for a related token.
     path: &'a str,
     key: String,
     attr: Option<String>,
@@ -86,7 +109,9 @@ fn tokens(template: &str) -> Option<Vec<Token<'_>>> {
     let mut out = Vec::new();
     for c in token_re().captures_iter(template) {
         let ty = c.name("ty")?.as_str();
-        if !matches!(ty, "priceOf" | "stringOf") || c.name("related").is_some() {
+        let bulk = matches!(ty, "bulkPriceOf" | "bulkStringOf");
+        let related = c.name("related").is_some();
+        if !(bulk || matches!(ty, "priceOf" | "stringOf")) || (related && !bulk) {
             return None;
         }
         let mods = c.name("mods").map_or("", |m| m.as_str());
@@ -118,9 +143,17 @@ fn tokens(template: &str) -> Option<Vec<Token<'_>>> {
             .and_then(|d| d.parse().ok());
         out.push(Token {
             whole: c.get(0)?.range(),
-            string_of: ty == "stringOf",
-            path: c.name("path")?.as_str(),
-            key: c.name("key")?.as_str().replace('!', " ").trim().to_string(),
+            string_of: matches!(ty, "stringOf" | "bulkStringOf"),
+            bulk,
+            related,
+            path: c.name("path").map_or("", |m| m.as_str()),
+            // The page reads a template's text after the HTML parser has
+            // decoded it: `&nbsp;` in a key is a no-break space, which `trim`
+            // then removes.
+            key: decode_entities(c.name("key").map_or("", |m| m.as_str()))
+                .replace('!', " ")
+                .trim()
+                .to_string(),
             attr,
             op,
             decimals,
@@ -128,6 +161,20 @@ fn tokens(template: &str) -> Option<Vec<Token<'_>>> {
         });
     }
     Some(out)
+}
+
+/// The few entities a pricing template's text carries, decoded as the page's
+/// HTML parser decodes them.
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&nbsp;", "\u{a0}")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 /// The `dir/file` name of a price file, only when it is safe to place in a URL.
@@ -221,21 +268,30 @@ fn scan(html: &str, page: &url::Url) -> (Vec<Markup>, Vec<(String, String)>, Str
         ) else {
             continue;
         };
-        if attrs.get("data-partition").map(String::as_str) != Some("aws")
-            || !attrs
-                .get("data-locale")
-                .is_some_and(|l| l.starts_with("en"))
-            || !endpoint_ok(endpoint)
+        let Some(locale) = attrs.get("data-locale").and_then(|l| locale::locale(l)) else {
+            continue;
+        };
+        if attrs.get("data-partition").map(String::as_str) != Some("aws") || !endpoint_ok(endpoint)
         {
             continue;
         }
         let Some(toks) = tokens(template) else {
             continue;
         };
+        let sets: Vec<String> = attrs
+            .get("data-token-sets")
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        // A bulk table's rows come from the sets the markup names; without
+        // them the script shows none.
+        if toks.iter().any(|t| t.bulk) && sets.is_empty() {
+            continue;
+        }
         let mut needed = Vec::new();
-        for t in &toks {
+        let mut bad = false;
+        for t in toks.iter().filter(|t| !t.related) {
             let Some((dir, file)) = file_name(t.path) else {
-                needed.clear();
+                bad = true;
                 break;
             };
             needed.push((
@@ -246,14 +302,22 @@ fn scan(html: &str, page: &url::Url) -> (Vec<Markup>, Vec<(String, String)>, Str
                 ),
             ));
         }
-        if toks.is_empty() || needed.len() != toks.len() {
+        if toks.is_empty() || needed.is_empty() || bad {
             continue;
+        }
+        if toks.iter().any(|t| t.string_of) {
+            needed.extend(locale.dictionaries());
         }
         files.extend(needed);
         origin = page.origin().ascii_serialization();
         markups.push(Markup {
             insert_at: end + 1,
             template: template.clone(),
+            locale,
+            sets,
+            relates: attrs.get("data-relates").filter(|r| !r.is_empty()).cloned(),
+            sort_property: attrs.get("data-sort-property").cloned().unwrap_or_default(),
+            sort_order: attrs.get("data-sort-order").cloned().unwrap_or_default(),
         });
     }
     (markups, files.into_iter().collect(), origin)
@@ -287,7 +351,7 @@ pub fn apply(html: &str, page_url: &str, data: &HashMap<String, Value>) -> Optio
     let mut filled = 0;
     // Back to front, so an insertion never moves an offset still to be used.
     for m in markups.iter().rev() {
-        if let Some(table) = fill(&m.template, region, data) {
+        if let Some(table) = fill(m, region, data) {
             out.insert_str(m.insert_at, &table);
             filled += 1;
         }
@@ -295,12 +359,74 @@ pub fn apply(html: &str, page_url: &str, data: &HashMap<String, Value>) -> Optio
     (filled > 0).then_some(out)
 }
 
+/// What one template is filled with: the region, the files that arrived, and
+/// how its page writes a price and a string.
+struct Ctx<'a> {
+    region: &'a str,
+    data: &'a HashMap<String, Value>,
+    locale: &'static locale::Locale,
+    messages: Option<locale::Messages>,
+    /// The script copies wildcard-region entries over every region only for a
+    /// template that names no sets.
+    wildcards: bool,
+}
+
+impl Ctx<'_> {
+    fn text(&self, s: &str) -> String {
+        match &self.messages {
+            Some(m) => m.translate(s),
+            None => s.to_string(),
+        }
+    }
+
+    fn na(&self) -> String {
+        self.text("N/A")
+    }
+
+    /// A price as the page shows it; `N/A` (in the page's language) when the
+    /// published value is not a number.
+    fn price(&self, raw: &Value, t: &Token<'_>) -> String {
+        let raw = match raw {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => return self.na(),
+        };
+        if raw == "N/A" {
+            return self.na();
+        }
+        let shown = Dec::parse(&raw).and_then(|mut v| {
+            if let Some((op, operand)) = &t.op {
+                v = v.op(*op, operand)?;
+            }
+            let digits = t.decimals.unwrap_or_else(|| v.dp().max(2));
+            Some(v.localized(digits, self.locale))
+        });
+        shown.unwrap_or_else(|| self.na())
+    }
+
+    /// A string as the page shows it.
+    fn string(&self, raw: &Value) -> String {
+        match raw {
+            Value::String(s) => self.text(s),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => self.na(),
+        }
+    }
+}
+
+/// `raw` as a price in `locale`, with exactly `digits` places.
+#[cfg(test)]
+fn format_price(raw: &str, digits: u32, locale: &locale::Locale) -> Option<String> {
+    Some(Dec::parse(raw)?.localized(digits, locale))
+}
+
 /// The region's entry for `key`, as the page's script reads it: entries of the
 /// wildcard regions (`Any`, `All`, ``) are copied over every region's own when the
 /// file has more than one.
-fn entry<'a>(file: &'a Value, region: &str, key: &str) -> Option<&'a Value> {
+fn entry<'a>(file: &'a Value, region: &str, key: &str, wildcards: bool) -> Option<&'a Value> {
     let regions = file.get("regions")?.as_object()?;
-    if regions.len() != 1 {
+    if wildcards && regions.len() != 1 {
         for wild in ["", "All", "Any"] {
             if let Some(e) = regions.get(wild).and_then(|r| r.get(key)) {
                 return Some(e);
@@ -309,41 +435,26 @@ fn entry<'a>(file: &'a Value, region: &str, key: &str) -> Option<&'a Value> {
     }
     let own = regions.get(region).or_else(|| {
         // A file that holds one region-less map serves every region.
-        (regions.len() == 1).then(|| regions.get("Any")).flatten()
+        (wildcards && regions.len() == 1)
+            .then(|| regions.get("Any"))
+            .flatten()
     })?;
     own.get(key)
 }
 
-/// The text one token shows, `Ok(None)` when the file does not publish it.
-fn value(t: &Token<'_>, region: &str, data: &HashMap<String, Value>) -> Option<String> {
-    let file = data.get(t.path)?;
-    let e = entry(file, region, &t.key)?;
+/// The text one token shows, `None` when the file does not publish it.
+fn value(t: &Token<'_>, ctx: &Ctx<'_>) -> Option<String> {
+    let file = ctx.data.get(t.path)?;
+    let e = entry(file, ctx.region, &t.key, ctx.wildcards)?;
     if t.string_of {
         let s = t.attr.as_deref().and_then(|a| e.get(a));
         return Some(match s {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
+            Some(v) => ctx.string(v),
             None => String::new(),
         });
     }
-    let raw = match e.get(t.attr.as_deref().unwrap_or("price"))? {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        _ => return None,
-    };
-    if raw == "N/A" {
-        return Some("N/A".into());
-    }
-    Some(price(&raw, t).unwrap_or_else(|| "N/A".into()))
-}
-
-fn price(raw: &str, t: &Token<'_>) -> Option<String> {
-    let mut v = Dec::parse(raw)?;
-    if let Some((op, operand)) = &t.op {
-        v = v.op(*op, operand)?;
-    }
-    let digits = t.decimals.unwrap_or_else(|| v.dp().max(2));
-    Some(v.money(digits))
+    let raw = e.get(t.attr.as_deref().unwrap_or("price"))?;
+    Some(ctx.price(raw, t))
 }
 
 fn escape(s: &str) -> String {
@@ -375,28 +486,65 @@ fn row_around(template: &str, at: usize) -> Option<std::ops::Range<usize>> {
 }
 
 /// A template with its tokens filled; `None` when nothing in it could be.
-fn fill(template: &str, region: &str, data: &HashMap<String, Value>) -> Option<String> {
+fn fill(m: &Markup, region: &str, data: &HashMap<String, Value>) -> Option<String> {
+    let template = m.template.as_str();
     // The page's own region menu and location picker are controls, not prices:
     // the table is read for the region the menu starts on.
     if template.contains("{locationSelector}") {
         return None;
     }
+    let all = tokens(template)?;
+    // A file that did not arrive says nothing about its prices: the table stays
+    // as the page served it, instead of losing the rows that file would fill.
+    if all.iter().any(|t| !t.related && !data.contains_key(t.path)) {
+        return None;
+    }
+    let messages = if all.iter().any(|t| t.string_of) {
+        Some(m.locale.messages(data)?)
+    } else {
+        None
+    };
+    let ctx = Ctx {
+        region,
+        data,
+        locale: m.locale,
+        messages,
+        wildcards: m.sets.is_empty(),
+    };
     let template = template.replace(
         "{regionSelector}",
         &format!("Region shown: {region} (prices differ by region)"),
     );
-    let toks = tokens(&template)?;
-    // A file that did not arrive says nothing about its prices: the table stays
-    // as the page served it, instead of losing the rows that file would fill.
-    if toks.iter().any(|t| !data.contains_key(t.path)) {
-        return None;
+    let (template, tables) = if all.iter().any(|t| t.bulk) {
+        let mut paths: Vec<&str> = Vec::new();
+        for t in all.iter().filter(|t| !t.related) {
+            if !paths.contains(&t.path) {
+                paths.push(t.path);
+            }
+        }
+        let files: Vec<&Value> = paths.iter().filter_map(|p| data.get(*p)).collect();
+        bulk_tables(&template, m, &ctx, &files)?
+    } else {
+        (template, 0)
+    };
+    let filled = fill_tokens(&template, &ctx)?;
+    match filled {
+        Some(out) => Some(out),
+        None if tables > 0 => Some(template),
+        None => None,
     }
-    let values: Vec<Option<String>> = toks.iter().map(|t| value(t, region, data)).collect();
+}
+
+/// The single-value tokens of `template` filled. `Some(None)` when it holds
+/// none that resolved; `None` when it holds a token this contract cannot read.
+fn fill_tokens(template: &str, ctx: &Ctx<'_>) -> Option<Option<String>> {
+    let toks = tokens(template)?;
+    let values: Vec<Option<String>> = toks.iter().map(|t| value(t, ctx)).collect();
     let mut dropped: Vec<std::ops::Range<usize>> = Vec::new();
     for (t, v) in toks.iter().zip(&values) {
         if v.is_none()
             && !t.optional
-            && let Some(row) = row_around(&template, t.whole.start)
+            && let Some(row) = row_around(template, t.whole.start)
         {
             dropped.push(row);
         }
@@ -413,11 +561,11 @@ fn fill(template: &str, region: &str, data: &HashMap<String, Value>) -> Option<S
         resolved += usize::from(v.is_some());
         edits.push((
             t.whole.clone(),
-            v.as_deref().map_or_else(|| "N/A".to_string(), escape),
+            escape(&v.clone().unwrap_or_else(|| ctx.na())),
         ));
     }
     if resolved == 0 {
-        return None;
+        return Some(None);
     }
     let mut outer: Option<std::ops::Range<usize>> = None;
     for d in &dropped {
@@ -435,7 +583,203 @@ fn fill(template: &str, region: &str, data: &HashMap<String, Value>) -> Option<S
         at = range.end;
     }
     out.push_str(&template[at..]);
-    Some(out)
+    Some(Some(out))
+}
+
+/// Every table of `template` that holds bulk tokens, rendered as the page
+/// renders it: the header row, then one row per record. `None` when one
+/// cannot be (no header, no first row, no record for the region, an order
+/// not read), or a bulk token stands outside a table.
+fn bulk_tables(
+    template: &str,
+    m: &Markup,
+    ctx: &Ctx<'_>,
+    files: &[&Value],
+) -> Option<(String, usize)> {
+    let meta = bulk::Sets {
+        sets: &m.sets,
+        relates: m.relates.as_deref(),
+        sort_property: &m.sort_property,
+        sort_order: &m.sort_order,
+    };
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    let mut count = 0;
+    while let Some(open) = rest.find("<table") {
+        let close = rest[open..].find("</table>")? + open + "</table>".len();
+        let table = &rest[open..close];
+        if table[1..].contains("<table") {
+            return None;
+        }
+        out.push_str(&rest[..open]);
+        if table.contains("{bulk") {
+            out.push_str(&bulk_table(table, &meta, ctx, files)?);
+            count += 1;
+        } else {
+            out.push_str(table);
+        }
+        rest = &rest[close..];
+    }
+    out.push_str(rest);
+    if out.contains("{bulk") {
+        return None;
+    }
+    Some((out, count))
+}
+
+fn bulk_table(
+    table: &str,
+    meta: &bulk::Sets<'_>,
+    ctx: &Ctx<'_>,
+    files: &[&Value],
+) -> Option<String> {
+    use scraper::{ElementRef, Html, Node, Selector};
+    let doc = Html::parse_fragment(table);
+    let sel = |s: &str| Selector::parse(s).ok();
+    let head = doc.select(&sel("table > thead > tr")?).next()?;
+    let first = doc.select(&sel("table > tbody > tr")?).next()?;
+    let text_of = |el: ElementRef<'_>| -> String {
+        let mut s = String::new();
+        for node in el.descendants() {
+            match node.value() {
+                Node::Text(t) => s.push_str(t),
+                Node::Element(e) if e.name() == "br" => s.push(' '),
+                _ => {}
+            }
+        }
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let headers: Vec<String> = head
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|e| e.value().name() == "th")
+        .map(text_of)
+        .collect();
+    // A data cell is a `td` whose first child is text; that text is the cell.
+    let cells: Vec<String> = first
+        .children()
+        .filter_map(ElementRef::wrap)
+        .filter(|e| e.value().name() == "td")
+        .filter_map(|e| match e.first_child()?.value() {
+            Node::Text(t) => Some(t.to_string()),
+            _ => None,
+        })
+        .collect();
+    let cell_tokens: Vec<Vec<Token<'_>>> = cells
+        .iter()
+        .map(|c| tokens(c))
+        .collect::<Option<Vec<_>>>()?;
+    if !cell_tokens.iter().flatten().any(|t| t.bulk) {
+        return None;
+    }
+    let mut rows = bulk::rows(files, ctx.region, meta)?;
+    bulk::sort(&mut rows, meta)?;
+    let mut body = String::new();
+    for row in &rows {
+        // Each bulk token's value in this record; the record is dropped when a
+        // token that is not optional has none.
+        let mut values: Vec<Option<String>> = Vec::new();
+        let mut keep = true;
+        for t in cell_tokens.iter().flatten().filter(|t| t.bulk) {
+            let shown = if t.related {
+                bulk::related_value(row).map(|r| ctx.text(&r))
+            } else {
+                bulk::value(row, t).map(|raw| {
+                    if t.string_of {
+                        ctx.string(raw)
+                    } else {
+                        ctx.price(raw, t)
+                    }
+                })
+            };
+            if shown.is_none() && !t.optional {
+                keep = false;
+                break;
+            }
+            values.push(Some(shown.unwrap_or_else(|| ctx.na())));
+        }
+        if !keep {
+            continue;
+        }
+        let mut next = values.into_iter();
+        body.push_str("<tr>");
+        for (i, _) in headers.iter().enumerate() {
+            let shown = match (cells.get(i), cell_tokens.get(i)) {
+                (Some(text), Some(toks)) => {
+                    let mut text = text.clone();
+                    for t in toks {
+                        let whole = &cells[i][t.whole.clone()];
+                        if t.bulk {
+                            match next.next().flatten().filter(|v| !v.is_empty()) {
+                                Some(v) => text = js_replace(&text, whole, &v),
+                                None => text = "N/A".into(),
+                            }
+                        } else {
+                            let v = value(t, ctx).unwrap_or_else(|| ctx.na());
+                            text = js_replace(&text, whole, &v);
+                        }
+                    }
+                    text
+                }
+                _ => String::new(),
+            };
+            let shown = if shown.is_empty() {
+                "N/A".to_string()
+            } else {
+                shown
+            };
+            body.push_str(&format!("<td>{}</td>", escape(&shown)));
+        }
+        // Values of cells past the last column are consumed, not shown.
+        body.push_str("</tr>");
+    }
+    if body.is_empty() {
+        return None;
+    }
+    let head: String = headers
+        .iter()
+        .map(|h| format!("<th>{}</th>", escape(h)))
+        .collect();
+    Some(format!(
+        "<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+    ))
+}
+
+/// `text.replace(pattern, with)` in JavaScript: the first occurrence, with the
+/// replacement's `$$`, `$&`, `` $` `` and `$'` patterns expanded.
+fn js_replace(text: &str, pattern: &str, with: &str) -> String {
+    let Some(at) = text.find(pattern) else {
+        return text.to_string();
+    };
+    let (before, after) = (&text[..at], &text[at + pattern.len()..]);
+    let mut rep = String::with_capacity(with.len());
+    let mut chars = with.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            rep.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                rep.push('$');
+                chars.next();
+            }
+            Some('&') => {
+                rep.push_str(pattern);
+                chars.next();
+            }
+            Some('`') => {
+                rep.push_str(before);
+                chars.next();
+            }
+            Some('\'') => {
+                rep.push_str(after);
+                chars.next();
+            }
+            _ => rep.push('$'),
+        }
+    }
+    format!("{before}{rep}{after}")
 }
 
 /// A decimal number as the page's script holds it: exact, ordinary base-10
@@ -550,7 +894,14 @@ impl Dec {
 
     /// `$1,234.50`: dollars, thousands separated, exactly `digits` places, rounded
     /// half away from zero.
+    #[cfg(test)]
     fn money(&self, digits: u32) -> String {
+        self.localized(digits, locale::locale("en-US").expect("en-US"))
+    }
+
+    /// Exactly `digits` places, rounded half away from zero (the browser's
+    /// `halfExpand`), written as `locale` writes a dollar amount.
+    fn localized(&self, digits: u32, locale: &locale::Locale) -> String {
         let (mut m, mut scale) = (self.mantissa, self.scale);
         while scale > digits {
             let (q, r) = (m / 10, m % 10);
@@ -568,15 +919,7 @@ impl Dec {
         let neg = m < 0;
         let text = format!("{:0>width$}", m.unsigned_abs(), width = digits as usize + 1);
         let (int, frac) = text.split_at(text.len() - digits as usize);
-        let mut grouped = String::new();
-        for (i, c) in int.chars().enumerate() {
-            if i > 0 && (int.len() - i) % 3 == 0 {
-                grouped.push(',');
-            }
-            grouped.push(c);
-        }
-        let dot = if digits > 0 { "." } else { "" };
-        format!("{}${grouped}{dot}{frac}", if neg { "-" } else { "" })
+        locale.money(neg, int, frac)
     }
 }
 
@@ -636,8 +979,8 @@ mod tests {
     #[test]
     fn a_template_with_a_token_the_contract_has_not_read_is_left_alone() {
         for template in [
-            "{bulkPriceOf!a/b!K}",
-            "{priceOf!a/b!K} {bulkStringOf!a/b!K![To!Location]}",
+            "{bulkPercentage!a/b!K}",
+            "{priceOf!related}",
             "{percentage!a/b!K}",
             "{priceOf!a/b!K!hide}",
             "{priceOf!a/b!K!*}",
@@ -678,9 +1021,21 @@ mod tests {
         HashMap::from([("lambda/lambda".to_string(), lambda_file())])
     }
 
+    fn markup(template: &str) -> Markup {
+        Markup {
+            insert_at: 0,
+            template: template.to_string(),
+            locale: locale::locale("en-US").unwrap(),
+            sets: Vec::new(),
+            relates: None,
+            sort_property: String::new(),
+            sort_order: String::new(),
+        }
+    }
+
     #[test]
     fn a_table_is_filled_and_a_row_with_no_published_price_is_dropped() {
-        let out = fill(MARKUP, DEFAULT_REGION, &data()).unwrap();
+        let out = fill(&markup(MARKUP), DEFAULT_REGION, &data()).unwrap();
         assert!(out.contains("Region shown: US East (Ohio)"), "{out}");
         assert!(out.contains("$0.0000166667 per GB-s"), "{out}");
         assert!(out.contains("$0.20 per 1M"), "{out}");
@@ -707,7 +1062,7 @@ mod tests {
 
     #[test]
     fn another_region_reads_its_own_prices() {
-        let out = fill(MARKUP, "Africa (Cape Town)", &data()).unwrap();
+        let out = fill(&markup(MARKUP), "Africa (Cape Town)", &data()).unwrap();
         assert!(
             out.contains("$0.0000200000") || out.contains("$0.00002 per"),
             "{out}"
@@ -717,15 +1072,15 @@ mod tests {
 
     #[test]
     fn nothing_is_filled_when_the_file_has_nothing_for_the_region() {
-        assert!(fill(MARKUP, "Mars (Olympus)", &data()).is_none());
+        assert!(fill(&markup(MARKUP), "Mars (Olympus)", &data()).is_none());
     }
 
     #[test]
     fn a_file_that_did_not_arrive_leaves_its_table_as_served() {
         // Not "every price is unpublished": the rows must not be dropped.
-        assert!(fill(MARKUP, DEFAULT_REGION, &HashMap::new()).is_none());
+        assert!(fill(&markup(MARKUP), DEFAULT_REGION, &HashMap::new()).is_none());
         let two_files = format!("{MARKUP}<p>{{priceOf!other/file!Key}}</p>");
-        assert!(fill(&two_files, DEFAULT_REGION, &data()).is_none());
+        assert!(fill(&markup(&two_files), DEFAULT_REGION, &data()).is_none());
     }
 
     fn page(host: &str, endpoint: &str, template: &str) -> (String, String) {
@@ -790,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_with_only_bulk_tables_is_left_as_served() {
+    fn a_bulk_table_that_names_no_sets_is_left_as_served() {
         let (html, url) = page(
             PAGE_HOST,
             ENDPOINT,
@@ -814,9 +1169,224 @@ mod tests {
             "US East (Ohio)": {"Own": {"price": "1"}},
             "Europe (Paris)": {"Own": {"price": "2"}},
         }});
-        assert_eq!(entry(&file, DEFAULT_REGION, "Fee").unwrap()["price"], "5");
-        assert_eq!(entry(&file, "Europe (Paris)", "Own").unwrap()["price"], "2");
+        assert_eq!(
+            entry(&file, DEFAULT_REGION, "Fee", true).unwrap()["price"],
+            "5"
+        );
+        assert_eq!(
+            entry(&file, "Europe (Paris)", "Own", true).unwrap()["price"],
+            "2"
+        );
         let single = serde_json::json!({"regions": {"Any": {"Fee": {"price": "7"}}}});
-        assert_eq!(entry(&single, DEFAULT_REGION, "Fee").unwrap()["price"], "7");
+        assert_eq!(
+            entry(&single, DEFAULT_REGION, "Fee", true).unwrap()["price"],
+            "7"
+        );
+    }
+
+    /// A page holding one bulk template, with the markup attributes the RDS,
+    /// DocumentDB and ElastiCache pages carry.
+    fn bulk_page(template: &str, sets: &[&str], extra: &str, locale: &str) -> (String, String) {
+        let attr = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;")
+        };
+        let sets = attr(&serde_json::to_string(sets).unwrap());
+        (
+            format!(
+                "<html><body><div data-pricing-markup=\"{}\" data-token-sets=\"{sets}\" {extra} \
+                 data-pricing-endpoint=\"{ENDPOINT}\" data-partition=\"aws\" \
+                 data-locale=\"{locale}\"></div></body></html>",
+                attr(template)
+            ),
+            "https://aws.amazon.com/rds/mysql/pricing/".to_string(),
+        )
+    }
+
+    // Shape of aws.amazon.com's rds-mysql-ondemand file, trimmed: units are
+    // opaque ids, the set lists them, the region maps them to records.
+    fn rds_file() -> Value {
+        serde_json::json!({
+            "manifest": {"serviceId": "rds", "source": "rds-mysql-ondemand"},
+            "sets": {
+                "MySQL GP": ["u1", "u2", "u3", "u4", "u5"],
+                "MySQL Memory": ["u6"],
+            },
+            "regions": {
+                "US East (Ohio)": {
+                    "u1": {"price": "0.1710000000", "Instance Type": "db.m5.large", "vCPU": "2"},
+                    "u2": {"price": "0.0170000000", "Instance Type": "db.t3.micro", "vCPU": "2",
+                           "Network Performance": "Up to 5 Gigabit"},
+                    "u3": {"price": "0.1680000000", "Instance Type": "db.m7g.large", "vCPU": "2"},
+                    // Published without a price: its row is not shown.
+                    "u4": {"Instance Type": "db.m6g.large", "vCPU": "2"},
+                    "u6": {"price": "9", "Instance Type": "db.r5.large", "vCPU": "2"},
+                },
+                "Europe (Paris)": {
+                    "u5": {"price": "1", "Instance Type": "db.m5.xlarge", "vCPU": "4"},
+                },
+            },
+        })
+    }
+
+    const RDS_SETS: &[&str] = &["rds/rds-mysql-ondemand.[MySQL GP]"];
+    const RDS_SORT: &str = "data-sort-property=\"rds/rds-mysql-ondemand.[MySQL GP].[Instance Type]\" \
+        data-sort-order=\"instance-capacity\"";
+    const RDS_TABLE: &str = "<p>{regionSelector}</p><table><thead><tr><th>Instance<br>type</th>\
+        <th>vCPU</th><th>Network</th><th>Price per hour</th></tr></thead><tbody><tr>\
+        <td>{bulkStringOf!rds/rds-mysql-ondemand!MySQL!GP![Instance!Type]}</td>\
+        <td>{bulkStringOf!rds/rds-mysql-ondemand!MySQL!GP![vCPU]}</td>\
+        <td>{bulkStringOf!rds/rds-mysql-ondemand!MySQL!GP![Network!Performance]!opt}</td>\
+        <td>{bulkPriceOf!rds/rds-mysql-ondemand!MySQL!GP}</td></tr></tbody></table>";
+
+    fn dictionaries(lang: &str, file: &str, strings: Value) -> [(String, Value); 2] {
+        [
+            (format!("@i18n/{file}"), serde_json::json!({})),
+            (
+                format!("@g11n/{lang}"),
+                serde_json::json!({ lang: strings }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_bulk_table_lists_the_regions_records_in_the_pages_order() {
+        let (html, url) = bulk_page(RDS_TABLE, RDS_SETS, RDS_SORT, "en-US");
+        let p = plan(&html, &url).unwrap();
+        let names: Vec<&str> = p.files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["@g11n/en", "@i18n/en_US", "rds/rds-mysql-ondemand"]);
+        let mut data: HashMap<String, Value> = dictionaries("en", "en_US", serde_json::json!({}))
+            .into_iter()
+            .collect();
+        data.insert("rds/rds-mysql-ondemand".into(), rds_file());
+        let out = apply(&html, &url, &data).unwrap();
+        let table = &out[out.find("<table>").unwrap()..];
+        assert!(
+            table.starts_with(
+                "<table><thead><tr><th>Instance type</th><th>vCPU</th><th>Network</th>\
+             <th>Price per hour</th></tr></thead><tbody>"
+            ),
+            "{out}"
+        );
+        // Newest family first, then by size; the record with no price and
+        // the records of other sets and regions are not shown; a missing
+        // optional value shows N/A.
+        let rows: Vec<&str> = table.split("<tr>").skip(2).collect();
+        assert_eq!(
+            rows,
+            [
+                "<td>db.t3.micro</td><td>2</td><td>Up to 5 Gigabit</td><td>$0.017</td></tr>",
+                "<td>db.m7g.large</td><td>2</td><td>N/A</td><td>$0.168</td></tr>",
+                "<td>db.m5.large</td><td>2</td><td>N/A</td><td>$0.171</td></tr></tbody></table></div></body></html>",
+            ],
+            "{out}"
+        );
+        assert!(out.contains("Region shown: US East (Ohio)"), "{out}");
+        assert!(!table.contains('{'), "no token survives: {out}");
+    }
+
+    #[test]
+    fn a_bulk_table_waits_for_its_dictionaries_and_its_sets() {
+        let (html, url) = bulk_page(RDS_TABLE, RDS_SETS, RDS_SORT, "en-US");
+        let data = HashMap::from([("rds/rds-mysql-ondemand".to_string(), rds_file())]);
+        // Strings untranslated would be half the page's table.
+        assert!(apply(&html, &url, &data).is_none());
+        // No sets: the script shows no rows, so the table is left as served.
+        let (html, url) = bulk_page(RDS_TABLE, &[], RDS_SORT, "en-US");
+        assert!(plan(&html, &url).is_none());
+        // An order this contract has not read leaves the table as served.
+        let (html, url) = bulk_page(
+            RDS_TABLE,
+            RDS_SETS,
+            "data-sort-order=\"purchaseOption\"",
+            "en-US",
+        );
+        let mut data: HashMap<String, Value> = dictionaries("en", "en_US", serde_json::json!({}))
+            .into_iter()
+            .collect();
+        data.insert("rds/rds-mysql-ondemand".into(), rds_file());
+        assert!(apply(&html, &url, &data).is_none());
+    }
+
+    #[test]
+    fn a_localized_page_shows_its_own_prices_and_strings() {
+        let (html, url) = bulk_page(RDS_TABLE, RDS_SETS, RDS_SORT, "de-DE");
+        let p = plan(&html, &url).unwrap();
+        assert!(
+            p.files
+                .iter()
+                .any(|(n, u)| n == "@i18n/de_DE" && u.ends_with("/de_DE.json")),
+            "{:?}",
+            p.files
+        );
+        let mut data: HashMap<String, Value> = dictionaries(
+            "de",
+            "de_DE",
+            serde_json::json!({"Up to 5 Gigabit": "Bis zu 5 Gigabit", "N[slash]A": "k. A."}),
+        )
+        .into_iter()
+        .collect();
+        data.insert("rds/rds-mysql-ondemand".into(), rds_file());
+        let out = apply(&html, &url, &data).unwrap();
+        assert!(
+            out.contains(
+                "<td>db.t3.micro</td><td>2</td><td>Bis zu 5 Gigabit</td><td>0,017\u{a0}USD</td>"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("<td>k. A.</td><td>0,168\u{a0}USD</td>"),
+            "{out}"
+        );
+        // A page in a language this contract has not read is left alone.
+        let (html, url) = bulk_page(RDS_TABLE, RDS_SETS, RDS_SORT, "xx-XX");
+        assert!(plan(&html, &url).is_none());
+    }
+
+    #[test]
+    fn related_sets_join_into_one_row_per_shared_value() {
+        // DocumentDB's shape: standard and I/O-optimized sets of one file,
+        // joined on the instance type.
+        let docdb = serde_json::json!({
+            "manifest": {"serviceId": "docdb", "source": "docdb"},
+            "sets": {"OnDemand": ["a", "b"], "OnDemand IO": ["c"]},
+            "regions": {"US East (Ohio)": {
+                "a": {"price": "0.2770000000", "Instance Type": "db.r5.large"},
+                "b": {"price": "0.0780000000", "Instance Type": "db.t3.medium"},
+                "c": {"price": "0.3050000000", "Instance Type": "db.r5.large"},
+            }},
+        });
+        let template = "<table><thead><tr><th>Instance</th><th>Standard</th><th>I/O-Optimized</th>\
+            </tr></thead><tbody><tr><td>{bulkStringOf!related}</td>\
+            <td>{bulkPriceOf!docdb/docdb!OnDemand}</td><td>{bulkPriceOf!docdb/docdb!OnDemand!IO!opt}</td>\
+            </tr></tbody></table>";
+        let (html, url) = bulk_page(
+            template,
+            &[
+                "related",
+                "docdb/docdb.[OnDemand]",
+                "docdb/docdb.[OnDemand IO]",
+            ],
+            "data-relates=\"docdb/docdb.[OnDemand].[Instance Type],docdb/docdb.[OnDemand IO].[Instance Type]\" \
+             data-sort-order=\"instance-capacity\"",
+            "en-US",
+        );
+        let p = plan(&html, &url).unwrap();
+        let names: Vec<&str> = p.files.iter().map(|(n, _)| n.as_str()).collect();
+        // The joined value is a string the page translates.
+        assert_eq!(names, ["@g11n/en", "@i18n/en_US", "docdb/docdb"]);
+        let mut data: HashMap<String, Value> = dictionaries("en", "en_US", serde_json::json!({}))
+            .into_iter()
+            .collect();
+        data.insert("docdb/docdb".into(), docdb);
+        let out = apply(&html, &url, &data).unwrap();
+        assert!(
+            out.contains(
+                "<tbody><tr><td>db.t3.medium</td><td>$0.078</td><td>N/A</td></tr>\
+                 <tr><td>db.r5.large</td><td>$0.277</td><td>$0.305</td></tr></tbody>"
+            ),
+            "{out}"
+        );
     }
 }
