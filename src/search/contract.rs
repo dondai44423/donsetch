@@ -389,6 +389,128 @@ const REDIRECTORS: &[&str] = &[
     "webcache.googleusercontent.com/",
 ];
 
+/// Is this query parameter tracking junk rather than part of the page?
+fn is_tracking_param(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.starts_with("utm_")
+        || matches!(
+            key.as_str(),
+            "fbclid"
+                | "gclid"
+                | "dclid"
+                | "msclkid"
+                | "msockid"
+                | "mc_cid"
+                | "mc_eid"
+                | "igshid"
+                | "ref_src"
+                | "_ga"
+                | "_gl"
+                | "yclid"
+        )
+}
+
+pub(crate) fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A redirect wrapper's payload, decoded locally: Google's `/url?q=`, DDG's
+/// `uddg=`, Bing's `apiclick`, Yahoo's `/RU=`. `None` when the URL is not a
+/// wrapper, or when the wrapper does not carry its target.
+pub fn decode_redirect(raw: &str) -> Option<String> {
+    let Ok(u) = url::Url::parse(raw) else {
+        return None;
+    };
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let mut target: Option<String> = None;
+    if host.ends_with("google.com") && u.path() == "/url" {
+        target = u
+            .query_pairs()
+            .find(|(k, _)| k == "q" || k == "url")
+            .map(|(_, v)| v.into_owned());
+    } else if host.ends_with("duckduckgo.com") && u.path().starts_with("/l/") {
+        target = u
+            .query_pairs()
+            .find(|(k, _)| k == "uddg")
+            .map(|(_, v)| v.into_owned());
+    } else if host.ends_with("bing.com")
+        && (u.path().contains("/news/apiclick") || u.path() == "/ck/a")
+    {
+        target = u
+            .query_pairs()
+            .find(|(k, _)| k == "url" || k == "u")
+            .map(|(_, v)| v.into_owned());
+    } else if host.contains("search.yahoo.com") {
+        let decoded = percent_decode(u.path());
+        let at = decoded.find("/RU=").map(|i| i + 4)?;
+        let tail = &decoded[at..];
+        let end = tail.find('/').unwrap_or(tail.len());
+        target = Some(percent_decode(&tail[..end]));
+    }
+    let target = target?;
+    let target = percent_decode(&target);
+    let target = target.trim();
+    let parsed = url::Url::parse(target).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    // A wrapper inside a wrapper is not an answer.
+    let lower = target.to_ascii_lowercase();
+    if lower.contains("news.google.com") || REDIRECTORS.iter().any(|p| lower.contains(p)) {
+        return None;
+    }
+    Some(target.to_string())
+}
+
+/// The publisher's own URL: no fragment, no tracking parameters, host as it
+/// was registered. The one URL the caller is handed, so the fetch tool opens
+/// the page the index meant, not a beacon.
+pub fn canonical_url(raw: &str) -> String {
+    let Ok(mut u) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    u.set_fragment(None);
+    if u.query().is_some() {
+        let kept: Vec<(String, String)> = u
+            .query_pairs()
+            .filter(|(k, _)| !is_tracking_param(k))
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        if kept.is_empty() {
+            u.set_query(None);
+        } else {
+            u.query_pairs_mut().clear().extend_pairs(kept);
+        }
+    }
+    if let Some(host) = u.host_str() {
+        let lower = host.to_ascii_lowercase();
+        if lower != host {
+            let _ = u.set_host(Some(&lower));
+        }
+    }
+    u.to_string()
+}
+
+/// Decode a wrapper, then strip what the index added on the way.
+fn publisher_url(raw: &str) -> String {
+    canonical_url(&decode_redirect(raw).unwrap_or_else(|| raw.to_string()))
+}
+
 pub fn url_class(raw: &str) -> UrlClass {
     let Ok(u) = url::Url::parse(raw) else {
         return UrlClass::Invalid;
@@ -495,6 +617,14 @@ pub fn accept(query: &str, hits: Vec<Hit>) -> Accepted {
             items,
         };
     }
+    // Every hit is the publisher's own URL before anything judges it.
+    let hits: Vec<Hit> = hits
+        .into_iter()
+        .map(|mut h| {
+            h.url = publisher_url(&h.url);
+            h
+        })
+        .collect();
     let profile = Profile::new(query);
     let verdicts: Vec<Verdict> = hits
         .iter()
@@ -554,6 +684,13 @@ pub fn accept_first_party(query: &str, hits: Vec<Hit>) -> Vec<Hit> {
     if hits.is_empty() {
         return hits;
     }
+    let hits: Vec<Hit> = hits
+        .into_iter()
+        .map(|mut h| {
+            h.url = publisher_url(&h.url);
+            h
+        })
+        .collect();
     let profile = Profile::new(query);
     let admissible = |hit: &Hit| url_class(&hit.url) == UrlClass::Page;
     let mut named: HashMap<ScopeShape, HashSet<String>> = HashMap::new();
@@ -980,6 +1117,51 @@ mod tests {
             Some((ScopeShape::Pypi, "foo-bar".to_string()))
         );
         assert_eq!(scoped_root("https://example.com/x"), None);
+    }
+
+    #[test]
+    fn a_returned_url_is_the_publishers_own() {
+        assert_eq!(
+            canonical_url("https://Example.com/Post?utm_source=x&id=7&fbclid=z#top"),
+            "https://example.com/Post?id=7"
+        );
+        assert_eq!(
+            canonical_url("https://example.com/"),
+            "https://example.com/"
+        );
+        assert_eq!(canonical_url("not a url"), "not a url");
+        // A meaningful parameter survives: the page is the same page, the
+        // beacon is not part of it.
+        assert_eq!(
+            canonical_url("https://docs.rs/tokio/1.40.0?search=tokio&utm_medium=email"),
+            "https://docs.rs/tokio/1.40.0?search=tokio"
+        );
+    }
+
+    #[test]
+    fn a_wrapper_is_decoded_to_its_target_and_nothing_else() {
+        assert_eq!(
+            decode_redirect("https://www.google.com/url?q=https%3A%2F%2Ftokio.rs%2F&sa=D")
+                .as_deref(),
+            Some("https://tokio.rs/")
+        );
+        assert_eq!(
+            decode_redirect("https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa")
+                .as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(
+            decode_redirect("https://www.bing.com/news/apiclick?url=https%3A%2F%2Fexample.com%2Fb")
+                .as_deref(),
+            Some("https://example.com/b")
+        );
+        // A plain page is not a wrapper.
+        assert_eq!(decode_redirect("https://example.com/page"), None);
+        // A wrapper inside a wrapper is not an answer.
+        assert_eq!(
+            decode_redirect("https://www.google.com/url?q=https%3A%2F%2Fnews.google.com%2Frss"),
+            None
+        );
     }
 
     #[test]
