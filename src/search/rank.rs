@@ -94,7 +94,16 @@ pub fn norm_key(raw: &str) -> String {
                 .map(|id| id.trim_end_matches(".pdf").trim_end_matches('/'))
         })
         .flatten()
-        .map(|id| format!("/abs/{id}"));
+        // `2005.11401v4` is a version of `2005.11401`: one paper, one row.
+        .map(|id| {
+            let unversioned = id
+                .rsplit_once('v')
+                .filter(|(stem, n)| {
+                    !stem.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                })
+                .map_or(id, |(stem, _)| stem);
+            format!("/abs/{unversioned}")
+        });
     let path = arxiv_id.unwrap_or_else(|| u.path().to_string());
     let path = path
         .trim_end_matches('/')
@@ -337,11 +346,25 @@ fn merge_inner(
             if hit_snippet.len() > entry.snippet.len() && !hit_snippet.starts_with("Redirecting") {
                 entry.snippet = hit_snippet.clone();
             }
-            // Best title: breadcrumbs ("a › b › c") and
-            // URL-echoes are longer than real titles : keep
-            // the shortest CLEAN candidate.
-            let bad = |t: &str| t.contains(" › ") || t.starts_with("http") || t.len() < 3;
-            if !bad(&hit_title) && (bad(&entry.title) || hit_title.len() < entry.title.len()) {
+            // Best title: the CLEAN candidate that says most of what the query
+            // asked, then the shortest (breadcrumbs "a › b › c" and URL echoes
+            // are longer than real titles). A PDF's header line is not a title:
+            // "arXiv:2005.11401v4 [cs.CL] 12 Apr 2021" was the shortest
+            // candidate for the RAG paper and won over its real name.
+            let bad = |t: &str| {
+                t.contains(" › ")
+                    || t.starts_with("http")
+                    || t.len() < 3
+                    || t.to_ascii_lowercase().starts_with("arxiv:")
+            };
+            let better = || {
+                let (new, old) = (
+                    super::evidence::coverage(query, &hit_title),
+                    super::evidence::coverage(query, &entry.title),
+                );
+                new > old || (new == old && hit_title.len() < entry.title.len())
+            };
+            if !bad(&hit_title) && (bad(&entry.title) || better()) {
                 entry.title = hit_title.clone();
             }
             if entry.published.is_none() && hit.published.is_some() {
@@ -484,8 +507,21 @@ fn merge_inner(
             break;
         }
     }
+    // A host past its cap fills an empty slot only with a page that is itself
+    // about the query: its own title and URL cover it, not a snippet that
+    // mentions it. Filling with whatever was left put the subject's father and
+    // a mascot page into "who is Linus Torvalds" as the third and fourth
+    // Wikipedia rows; a shorter list costs the reader less.
     if diverse.len() < max_results {
-        diverse.extend(overflow.into_iter().take(max_results - diverse.len()));
+        let room = max_results - diverse.len();
+        diverse.extend(
+            overflow
+                .into_iter()
+                .filter(|r| {
+                    profile.verdict(&r.title, "", &r.url) == super::contract::Verdict::Exact
+                })
+                .take(room),
+        );
     }
     diverse.truncate(max_results);
     for r in &mut diverse {
@@ -855,6 +891,49 @@ mod tests {
         }
     }
 
+    /// Past its cap a host refills an empty slot only with a page whose own
+    /// title is about the query; a page that merely mentions it in a snippet
+    /// stays out, and the list is shorter instead.
+    #[test]
+    fn an_over_cap_host_refills_only_with_pages_about_the_query() {
+        let page = |title: &str, slug: &str, rank: usize| Hit {
+            title: title.into(),
+            url: format!("https://en.wikipedia.org/wiki/{slug}"),
+            snippet: "the son of Ole Torvalds and the father of Linus Torvalds".into(),
+            rank,
+            published: None,
+        };
+        let per = vec![(
+            "wikipedia".to_string(),
+            vec![
+                page("Linus Torvalds", "Linus_Torvalds", 0),
+                page("History of Linux", "History_of_Linux", 1),
+                page("Nils Torvalds", "Nils_Torvalds", 2),
+                page("Tux (mascot)", "Tux_(mascot)", 3),
+                page(
+                    "Linus Torvalds bibliography",
+                    "Linus_Torvalds_bibliography",
+                    4,
+                ),
+            ],
+        )];
+        let out = merge(
+            &per,
+            "who is Linus Torvalds",
+            Intent::Entity,
+            &std::collections::HashMap::new(),
+            &Families::default(),
+            7,
+        );
+        let titles: Vec<&str> = out.iter().map(|r| r.title.as_str()).collect();
+        assert!(
+            titles.contains(&"Linus Torvalds bibliography"),
+            "{titles:?}"
+        );
+        assert!(!titles.contains(&"Nils Torvalds"), "{titles:?}");
+        assert!(!titles.contains(&"Tux (mascot)"), "{titles:?}");
+    }
+
     #[test]
     fn norm_key_unifies_variants() {
         let a = norm_key("https://www.docs.rs/ratatui/index.html");
@@ -868,6 +947,18 @@ mod tests {
         assert_eq!(abs, norm_key("https://arxiv.org/pdf/1706.03762.pdf"));
         assert_eq!(abs, norm_key("http://www.arxiv.org/html/1706.03762"));
         assert_ne!(abs, norm_key("https://arxiv.org/abs/1706.03763"));
+        // A version is the same paper; an old-style id with a `v` in its
+        // archive name is not a version.
+        assert_eq!(abs, norm_key("https://arxiv.org/abs/1706.03762v7"));
+        assert_eq!(abs, norm_key("https://arxiv.org/pdf/1706.03762v2.pdf"));
+        assert_eq!(
+            norm_key("https://arxiv.org/abs/solv-int/9901001"),
+            "arxiv.org/abs/solv-int/9901001"
+        );
+        assert_eq!(
+            norm_key("https://arxiv.org/abs/hep-th/9901001v3"),
+            "arxiv.org/abs/hep-th/9901001"
+        );
         assert_ne!(abs, norm_key("https://example.org/pdf/1706.03762.pdf"));
     }
 

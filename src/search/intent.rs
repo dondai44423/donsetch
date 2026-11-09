@@ -115,6 +115,47 @@ const TECH: &[&str] = &[
     "terminal",
     "vec",
 ];
+/// TECH words that are also everyday nouns: rust on iron, a python in a
+/// zoo, java the island, a node on a bus map. They open the tech gate only
+/// when nothing in the query names the everyday sense.
+const TECH_HOMONYMS: &[&str] = &[
+    "rust", "python", "java", "ruby", "swift", "kernel", "shell", "node", "terminal", "script",
+    "code", "package", "library", "function",
+];
+/// Words that pin a homonym to its everyday sense. A false hit here only
+/// drops the code verticals for a query that also names, say, a car; a
+/// real code query almost always carries an unambiguous TECH word or a
+/// strong code signal, which still open the gate.
+const EVERYDAY_CONTEXT: &[&str] = &[
+    "iron",
+    "steel",
+    "metal",
+    "car",
+    "truck",
+    "bike",
+    "bicycle",
+    "boat",
+    "paint",
+    "snake",
+    "snakes",
+    "zoo",
+    "pet",
+    "coffee",
+    "island",
+    "indonesia",
+    "bird",
+    "birds",
+    "taylor",
+    "popcorn",
+    "corn",
+    "nut",
+    "beach",
+    "airport",
+    "parcel",
+    "delivery",
+    "postal",
+    "gemstone",
+];
 const PAPER_SIGNALS: &[&str] = &[
     "paper", "arxiv", "doi", "journal", "citation", "preprint", "ablation",
 ];
@@ -177,7 +218,10 @@ pub fn detect(query: &str) -> Intent {
     let q = query.to_lowercase();
     let toks = tokens(&q);
     let score = |signals: &[&str]| signals.iter().filter(|s| has_phrase(&toks, s)).count();
-    let tech = toks.iter().any(|w| TECH.contains(w));
+    let everyday = toks.iter().any(|w| EVERYDAY_CONTEXT.contains(w));
+    let tech = toks
+        .iter()
+        .any(|w| TECH.contains(w) && !(everyday && TECH_HOMONYMS.contains(w)));
     // Ambiguous utility words need tech context; strong
     // signals never do.
     // Asymmetric by design: a false Code label on
@@ -492,6 +536,16 @@ mod tests {
             Intent::Web
         );
         assert_eq!(detect("how to repair drywall hole"), Intent::Web);
+        // A homonym in its everyday sense is not a tech token.
+        assert_eq!(detect("how to remove rust from cast iron"), Intent::Web);
+        assert_eq!(detect("how to fix rust on a car"), Intent::Web);
+        assert_eq!(
+            detect("how to install a python snake enclosure"),
+            Intent::Web
+        );
+        // An unambiguous tech word or code signal still opens the gate.
+        assert_eq!(detect("rust iron crate install"), Intent::Code);
+        assert_eq!(detect("python car simulation error"), Intent::Code);
         assert_eq!(detect("best budget mechanical keyboard 2026"), Intent::Web);
         // Real code queries MUST stay Code.
         assert_eq!(detect("rust vec vs hashmap performance"), Intent::Code);

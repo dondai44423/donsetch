@@ -252,6 +252,57 @@ pub(crate) fn site_vertical(site: &str) -> Option<&'static str> {
     None
 }
 
+/// The query as the sources should receive it.
+///
+/// A pasted URL is a question about that page and its site: it becomes
+/// `site:<host>` plus the path's words, because engines read a raw URL as
+/// noise (`https://docs.rs/tokio` ranked Kubernetes pages first). Emoji carry
+/// no searchable meaning and are dropped when words remain ("🦀 rust" left two
+/// results); a query that is only symbols is left as typed.
+pub fn normalize(query: &str) -> String {
+    let t = query.trim();
+    if !t.contains(char::is_whitespace)
+        && let Ok(u) = url::Url::parse(t)
+        && matches!(u.scheme(), "http" | "https")
+        && let Some(host) = u.host_str()
+    {
+        let mut q = format!("site:{}", host.trim_start_matches("www."));
+        let mut seen: Vec<String> = Vec::new();
+        for word in u.path().split(|c: char| !c.is_alphanumeric()) {
+            let w = word.to_lowercase();
+            if w.chars().count() < 2
+                || matches!(
+                    w.as_str(),
+                    "html" | "htm" | "php" | "aspx" | "index" | "www"
+                )
+                || seen.contains(&w)
+            {
+                continue;
+            }
+            q.push(' ');
+            q.push_str(&w);
+            seen.push(w);
+        }
+        return q;
+    }
+    let is_pictograph = |c: char| {
+        matches!(c as u32,
+            0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0xFE0F | 0x200D | 0x20E3)
+    };
+    let stripped = t
+        .chars()
+        .map(|c| if is_pictograph(c) { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if stripped.chars().any(char::is_alphanumeric) {
+        stripped
+    } else {
+        t.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +468,29 @@ mod tests {
         ];
         filetype_filter("paper filetype:pdf", &mut rs);
         assert_eq!(rs.len(), 2, "pdf + extensionless kept: {rs:?}");
+    }
+
+    #[test]
+    fn a_pasted_url_searches_its_site_for_its_path() {
+        assert_eq!(normalize("https://docs.rs/tokio"), "site:docs.rs tokio");
+        assert_eq!(
+            normalize(" https://www.github.com/tokio-rs/tokio/index.html "),
+            "site:github.com tokio rs"
+        );
+        assert_eq!(normalize("https://example.com/"), "site:example.com");
+        // A URL inside a sentence is part of the question, not the question.
+        assert_eq!(
+            normalize("what is https://docs.rs/tokio"),
+            "what is https://docs.rs/tokio"
+        );
+    }
+
+    #[test]
+    fn emoji_are_dropped_when_words_remain() {
+        assert_eq!(normalize("🦀 rust"), "rust");
+        assert_eq!(normalize("best ☕️ in berlin"), "best in berlin");
+        assert_eq!(normalize("🦀"), "🦀");
+        assert_eq!(normalize("C++ std::optional"), "C++ std::optional");
+        assert_eq!(normalize("地震速報"), "地震速報");
     }
 }

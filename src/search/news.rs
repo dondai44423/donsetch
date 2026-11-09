@@ -29,6 +29,10 @@ use crate::fetch::client::Fetcher;
 
 const TTL_SECS: u64 = 600;
 const REFRESH_PER_SEARCH: usize = 2;
+/// How long a search waits on stale feeds before answering from the cache. It
+/// sits inside the fan-out's soft mark, so the lane answers instead of being
+/// cut as late; a feed slower than this lands on a later search.
+const REFRESH_WAIT: Duration = Duration::from_millis(1000);
 const MAX_ITEMS_PER_FEED: usize = 80;
 const DISK_VERSION: u32 = 1;
 const GDELT_MIN_SECS: u64 = 30;
@@ -70,7 +74,9 @@ pub struct Answer {
 /// Does this query want the news program? A News intent, or a query that states
 /// a window and asks for an announcement-shaped thing.
 pub fn wants_news(query: &str, intent: Intent) -> bool {
-    if intent == Intent::News {
+    // "this week", "yesterday", "past 3 days": the query asks what happened
+    // lately, whatever else it names.
+    if intent == Intent::News || super::contract::relative_window(query).is_some() {
         return true;
     }
     const WORDS: &[&str] = &[
@@ -570,26 +576,38 @@ pub async fn mesh(
     let refresh_list = stale_feeds(&disk, now);
     let requests = refresh_list.len();
     if !refresh_list.is_empty() {
-        let asks = refresh_list.iter().map(|(name, url)| {
-            let entry = disk.feeds.get(*url).cloned().unwrap_or_default();
-            async move {
-                (
-                    *url,
-                    refresh(
-                        fetcher,
-                        name,
-                        url,
-                        &entry.etag,
-                        &entry.last_modified,
-                        budget,
+        use futures_util::StreamExt as _;
+        let mut asks: futures_util::stream::FuturesUnordered<_> = refresh_list
+            .iter()
+            .map(|(name, url)| {
+                let entry = disk.feeds.get(*url).cloned().unwrap_or_default();
+                async move {
+                    (
+                        *url,
+                        refresh(
+                            fetcher,
+                            name,
+                            url,
+                            &entry.etag,
+                            &entry.last_modified,
+                            budget,
+                        )
+                        .await,
                     )
-                    .await,
-                )
-            }
-        });
-        let done = futures_util::future::join_all(asks).await;
-        for (url, outcome) in done {
-            let entry = disk.feeds.entry(url.to_string()).or_default();
+                }
+            })
+            .collect();
+        // Each feed is written the moment it lands. The search commits around
+        // its soft mark and drops this lane if it is still waiting; before this,
+        // a dropped lane lost every refresh it had made, so the mesh never warmed
+        // and the lane was late on every news query.
+        let wait_until = tokio::time::Instant::now() + REFRESH_WAIT.min(budget);
+        while let Ok(Some((url, outcome))) = tokio::time::timeout_at(wait_until, asks.next()).await
+        {
+            // Another process may have written the file meanwhile: merge into
+            // what is there now, not into the copy this search loaded.
+            let mut fresh = load_feeds();
+            let entry = fresh.feeds.entry(url.to_string()).or_default();
             entry.at = now;
             if let Refresh::Fetched {
                 etag,
@@ -601,8 +619,9 @@ pub async fn mesh(
                 entry.last_modified = last_modified;
                 entry.items = items;
             }
+            save_feeds(&fresh);
+            disk = fresh;
         }
-        save_feeds(&disk);
     }
     let hits = hits_from(match_items(&disk, profile, window));
     let ms = started.elapsed().as_millis() as u64;

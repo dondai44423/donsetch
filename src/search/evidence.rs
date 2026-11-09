@@ -42,8 +42,39 @@ fn topic(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Words a dot follows without ending a sentence.
+const ABBREVIATIONS: &[&str] = &[
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "e.g",
+    "i.e", "etc", "vs", "cf", "approx", "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "no",
+    "fig", "vol", "inc", "ltd", "co", "corp", "al",
+];
+
+/// Does the dot at `i` end a sentence? Not when the next word starts lower-case
+/// or with a digit ("Oct. 7", "approx. two"), and not after an abbreviation or
+/// a single initial ("e.g. Python", "J. Smith"): cutting there dropped the very
+/// date a release-date snippet carried.
+fn dot_ends(text: &str, i: usize) -> bool {
+    let bytes = text.as_bytes();
+    if !bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace()) {
+        return false;
+    }
+    if let Some(next) = text[i + 1..].trim_start().chars().next()
+        && (next.is_lowercase() || next.is_ascii_digit())
+    {
+        return false;
+    }
+    let word = text[..i]
+        .rsplit(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let single_initial = word.chars().count() == 1 && word.chars().all(char::is_alphabetic);
+    !(single_initial || ABBREVIATIONS.contains(&word.as_str()))
+}
+
 /// Sentences of `text`: split after `.`, `!`, `?` followed by whitespace, and at
-/// line breaks. A dot inside a token (`docs.rs`, `v1.2`, `e.g.`) is not an end.
+/// line breaks. A dot inside a token (`docs.rs`, `v1.2`) is not an end, and
+/// neither is one after an abbreviation (`e.g.`, `Oct.`).
 fn sentences(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
@@ -53,7 +84,8 @@ fn sentences(text: &str) -> Vec<&str> {
         let b = bytes[i];
         let ends = match b {
             b'\n' => true,
-            b'.' | b'!' | b'?' => bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace()),
+            b'.' => dot_ends(text, i),
+            b'!' | b'?' => bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace()),
             _ => false,
         };
         if ends {
@@ -253,6 +285,23 @@ mod tests {
             "ends at a boundary: {got}"
         );
         assert!(!got.contains("revi"), "no mid-word cut: {got}");
+    }
+
+    #[test]
+    fn an_abbreviation_or_a_date_does_not_end_a_sentence() {
+        let s = sentences("Release date: Oct. 7, 2025. Next one follows.");
+        assert_eq!(s, vec!["Release date: Oct. 7, 2025.", "Next one follows."]);
+        let s = sentences("Use a runtime, e.g. Tokio, for this. Dr. Smith agrees. J. Doe too.");
+        assert_eq!(
+            s,
+            vec![
+                "Use a runtime, e.g. Tokio, for this.",
+                "Dr. Smith agrees.",
+                "J. Doe too."
+            ]
+        );
+        // A real end before a capitalised word still splits.
+        assert_eq!(sentences("It works. Then it stops.").len(), 2);
     }
 
     #[test]

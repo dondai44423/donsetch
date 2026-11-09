@@ -36,7 +36,9 @@ pub use persist::load_outcome_for_status as persist_load_outcome_for_status;
 pub use persist::load_quality_for_status as persist_load_quality_for_status;
 pub use persist::outcome_class;
 
-pub use render::{census, render_compact_markdown, render_markdown, render_meta, source_states};
+pub use render::{
+    SourceLine, census, render_compact_markdown, render_markdown, render_meta, source_states,
+};
 
 use enrich::PrewarmCache;
 use persist::{
@@ -106,8 +108,13 @@ fn answered(outcomes: &[(String, EngineResult)]) -> (usize, usize) {
 /// A status a second ask can plausibly change: the source misbehaved, rather
 /// than the query being dry or the operator's config saying no.
 fn worth_second_ask(status: &str) -> bool {
-    !matches!(status, "no-results" | "pacing-timeout" | "late")
-        && !status.starts_with("invalid-config")
+    // A CAPTCHA or a 429 is the source asking us to stop: the ledger rests the
+    // lane, and asking again inside the same call is the rotation the design
+    // refuses (search waits, it does not rotate to beat a limit).
+    !matches!(
+        status,
+        "no-results" | "pacing-timeout" | "late" | "blocked:captcha" | "blocked:429"
+    ) && !status.starts_with("invalid-config")
         && !status.starts_with("rate-limited")
 }
 
@@ -284,6 +291,13 @@ fn byok_cache_key(query: &str, intent: Intent) -> String {
 /// timeout, net) erodes trust. A single predicate so quarantine and
 /// trust tracking can't drift out of sync with each other again.
 fn is_engine_fault(status: &str) -> bool {
+    // A lane the plan never asked, the ledger rested or the scheduler cut did
+    // nothing at all; counting it as a strike quarantined healthy engines the
+    // budget had merely left out three times in a row. The ledger's own reading
+    // of the status is the one rule for "was this the source's doing".
+    if ledger::classify(status).is_none() {
+        return false;
+    }
     !status.starts_with("dead")
         && status != "auth-fail"
         && status != "no-results"
@@ -953,6 +967,8 @@ impl Searcher {
         if let Some(problem) = validate_query(query) {
             return Err(FetchError::Http(format!("search: {problem}")));
         }
+        let normalized = query::normalize(query);
+        let query = normalized.as_str();
         let intent_probe = forced_intent.unwrap_or_else(|| intent::detect(query));
         // Single-flight keys on the CACHE key (query + intent), NOT
         // max_results: the leader publishes the full top-12 into
@@ -1108,12 +1124,9 @@ impl Searcher {
         }
         // Engines get the original query; the recall variant
         // goes only to the first two engines (top trust).
-        let mut live: Vec<&str> = engines
-            .iter()
-            .filter(|e| !self.quarantined(engine_health_key(e)))
-            .filter(|e| !self.resting(engine_health_key(e)))
-            .copied()
-            .collect();
+        let benched =
+            |e: &str| self.quarantined(engine_health_key(e)) || self.resting(engine_health_key(e));
+        let mut live: Vec<&str> = engines.iter().filter(|e| !benched(e)).copied().collect();
         // Every source resting at once means the roster, not the sources, is
         // wrong: try them all rather than answering from nothing.
         if live.is_empty() {
@@ -1122,6 +1135,15 @@ impl Searcher {
                 .filter(|e| !self.quarantined(engine_health_key(e)))
                 .copied()
                 .collect();
+        }
+        // A benched engine is named in the census as rested, never dropped
+        // without a word: a source missing from the census reads as one that
+        // was never part of the plan.
+        for e in engines.iter().filter(|e| !live.contains(e)) {
+            skipped.push((
+                engine_name(e).to_string(),
+                Err(("rested".into(), "bench".into(), false)),
+            ));
         }
         // Rank engines by learned trust so width cuts drop
         // the weakest first. Per-intent sample wins; engine-global
@@ -1150,7 +1172,12 @@ impl Searcher {
         // burning lanes : consensus survives at width 2 by
         // construction (two independent index families).
         let width = width_for_stress(self.pool.stress(), live.len());
-        live.truncate(width);
+        for e in live.drain(width..) {
+            skipped.push((
+                engine_name(e).to_string(),
+                Err(("not-asked".into(), "stress".into(), false)),
+            ));
+        }
         let mut assignments: Vec<(String, String)> = live
             .iter()
             .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
@@ -1323,6 +1350,14 @@ impl Searcher {
         // records (the answer to "what is this"), and a bare-name registry guess
         // only if there is room. Every lane over the line is reported
         // `not-asked`, never silently dropped.
+        // A query about what happened lately is answered by the news program:
+        // its lanes claim the budget first. Queued after the engines, they got
+        // what four engines left, which was one lane, and the feed mesh was
+        // never asked on a news query.
+        if intent == Intent::News || contract::relative_window(query).is_some() {
+            let is_news = |name: &str| matches!(name, "bing-news" | "feed" | "gdelt");
+            futures.sort_by_key(|(name, _)| !is_news(name));
+        }
         let mut kept: Vec<(String, TaskFut)> = Vec::with_capacity(futures.len());
         let (mut engines_kept, mut verticals_kept, mut news_kept, mut guesses_kept) =
             (0usize, 0usize, 0usize, 0usize);
@@ -2154,15 +2189,17 @@ pub(crate) fn validate_query(query: &str) -> Option<String> {
     None
 }
 
+/// How many engines a stressed pool still asks. Never fewer than two: rank
+/// mass is agreement between independent families, and one engine cannot
+/// agree with anything. A single engine's own failures are the ledger's to
+/// rest, lane by lane.
 fn width_for_stress(stress: f64, available: usize) -> usize {
     if stress < 0.15 {
         available
     } else if stress < 0.40 {
         available.min(3)
-    } else if stress < 0.65 {
-        available.min(2)
     } else {
-        available.min(1)
+        available.min(2)
     }
 }
 
@@ -2971,12 +3008,35 @@ mod tests {
             "pacing-timeout",
             "dead-proxy",
             "auth-fail",
+            // Scheduling outcomes: the source was never asked.
+            "not-asked",
+            "rested",
+            "rested:45",
+            "late",
+            "skipped",
         ] {
             assert!(
                 !is_engine_fault(status),
                 "{status} is not the source's fault"
             );
         }
+    }
+
+    /// The budget leaving a healthy source out is not the source failing: before
+    /// this held, three budget cuts in a row quarantined yahoo for ten minutes
+    /// and it vanished from every later search's census.
+    // Depends on nextest's process-per-test isolation (DONSETCH_CACHE_DIR).
+    #[test]
+    fn a_source_the_plan_left_out_is_never_benched_for_it() {
+        let s = test_searcher();
+        for _ in 0..5 {
+            for status in ["not-asked", "rested:30", "late"] {
+                if is_engine_fault(status) {
+                    s.record_outcome("yahoo", false);
+                }
+            }
+        }
+        assert!(!s.quarantined("yahoo") && !s.resting("yahoo"));
     }
 
     #[test]
@@ -3012,6 +3072,10 @@ mod tests {
         assert!(!is_engine_fault("invalid-config"));
         assert!(!is_engine_fault("rate-limited:900"));
         assert!(!worth_second_ask("rate-limited:900"));
+        assert!(!worth_second_ask("blocked:captcha"));
+        assert!(!worth_second_ask("blocked:429"));
+        assert!(worth_second_ask("blocked:403"));
+        assert!(worth_second_ask("timeout"));
         assert!(is_engine_fault("blocked:403"));
         assert!(is_engine_fault("blocked:captcha"));
         assert!(is_engine_fault("empty-parse"));
@@ -3277,7 +3341,8 @@ mod tests {
         assert_eq!(width_for_stress(0.05, 4), 4);
         assert_eq!(width_for_stress(0.30, 4), 3);
         assert_eq!(width_for_stress(0.50, 4), 2);
-        assert_eq!(width_for_stress(0.90, 4), 1);
+        assert_eq!(width_for_stress(0.90, 4), 2, "two families or no agreement");
+        assert_eq!(width_for_stress(0.90, 1), 1);
         assert_eq!(width_for_stress(0.90, 0), 0);
     }
 

@@ -376,7 +376,10 @@ pub enum UrlClass {
 /// result through it: either the link is decoded by the source's parser, or the
 /// item is dropped (D1: Google News is dropped).
 const REDIRECTORS: &[&str] = &[
-    "news.google.com/rss/articles",
+    // The whole of Google News is a script-built app that points elsewhere:
+    // an article, a topic hub or a story cluster, none of it readable by a
+    // fetch. Its articles are found through their publishers instead.
+    "news.google.com/",
     "google.com/url?",
     "bing.com/news/apiclick",
     "bing.com/ck/a",
@@ -729,9 +732,46 @@ pub fn accept_first_party(query: &str, hits: Vec<Hit>) -> Vec<Hit> {
             {
                 return false;
             }
-            true
+            github_engages(&profile, hit)
         })
         .collect()
+}
+
+/// GitHub's search matches a word anywhere in a README or an issue body, so
+/// its own ranking is no contract: "python 3.14 release date" returned a
+/// voice-assistant script and "latest rust release" a PROJ binding. A
+/// repository answers only when its own owner or name carries a query word
+/// (a prefix counts: `dataclass` names `dataclasses`); an issue or anything
+/// deeper is judged like any other page. Other hosts pass untouched.
+fn github_engages(profile: &Profile, hit: &Hit) -> bool {
+    let Ok(u) = url::Url::parse(&hit.url) else {
+        return true;
+    };
+    if u.host_str().map(|h| h.trim_start_matches("www.")) != Some("github.com") {
+        return true;
+    }
+    let segs: Vec<&str> = u.path().split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() == 2 {
+        let terms: Vec<&str> = profile.terms().collect();
+        if terms.is_empty() {
+            return true;
+        }
+        return segs
+            .iter()
+            .flat_map(|s| s.split(|c: char| !c.is_alphanumeric()))
+            .map(str::to_lowercase)
+            .filter(|w| !w.is_empty())
+            .any(|w| {
+                terms.iter().any(|t| {
+                    w == *t
+                        || (t.chars().count() >= 4 && w.starts_with(t))
+                        || (w.chars().count() >= 4 && t.starts_with(w.as_str()))
+                })
+            });
+    }
+    profile
+        .verdict(&hit.title, &hit.snippet, &hit.url)
+        .admitted()
 }
 
 // ── Date ────────────────────────────────────────────────────────────────
@@ -829,15 +869,22 @@ const MONTHS: [&str; 12] = [
     "december",
 ];
 
-/// The window a query states, if it states one. `latest` alone is not a window
-/// — it is a ranking hint, and a week would silently drop the right page.
-pub fn window_for(query: &str) -> Option<Window> {
-    let lower = query.to_ascii_lowercase();
-    let words: Vec<&str> = lower
+fn window_words(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
-        .collect();
-    let text = words.join(" ");
+        .map(String::from)
+        .collect()
+}
+
+/// A window measured back from today ("this week", "yesterday", "past 3
+/// days"): the query asks what happened lately, which is the news program's
+/// question. A named year or month is a window too, but not a recent one.
+pub fn relative_window(query: &str) -> Option<Window> {
+    let owned = window_words(query);
+    let words: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let text = format!(" {} ", words.join(" "));
     for (i, w) in words.iter().enumerate() {
         if !matches!(*w, "past" | "last" | "next") {
             continue;
@@ -860,18 +907,45 @@ pub fn window_for(query: &str) -> Option<Window> {
             return Some(window_days(days));
         }
     }
-    if text.contains("this week") || text.contains("past week") || text.contains("last week") {
-        return Some(window_days(7));
-    }
-    if text.contains("this month") || text.contains("past month") || text.contains("last month") {
-        return Some(window_days(31));
-    }
-    if text.contains("this year") {
+    let has = |phrases: &[&str]| phrases.iter().any(|p| text.contains(&format!(" {p} ")));
+    // Widest first: a query that states two windows ("breaking news this
+    // week") keeps the wider one, which can never drop the page it asked for.
+    if has(&["this year", "past year"]) {
         return Some(window_days(365));
     }
-    if text.contains("today") || text.contains("breaking") || text.contains("this morning") {
+    if has(&["this month", "past month", "last month"]) {
+        return Some(window_days(31));
+    }
+    if has(&["this week", "past week", "last week"]) {
+        return Some(window_days(7));
+    }
+    if has(&["this weekend", "last weekend"]) {
+        return Some(window_days(4));
+    }
+    if has(&["yesterday", "last night"]) {
+        return Some(window_days(2));
+    }
+    if has(&[
+        "today",
+        "breaking",
+        "this morning",
+        "tonight",
+        "this afternoon",
+        "this evening",
+    ]) {
         return Some(window_days(1));
     }
+    None
+}
+
+/// The window a query states, if it states one. `latest` alone is not a window
+/// — it is a ranking hint, and a week would silently drop the right page.
+pub fn window_for(query: &str) -> Option<Window> {
+    if let Some(w) = relative_window(query) {
+        return Some(w);
+    }
+    let owned = window_words(query);
+    let words: Vec<&str> = owned.iter().map(String::as_str).collect();
     // A named month inside a year: "november 2026" is that month, not the year.
     if let Some(mi) = MONTHS.iter().position(|m| words.contains(m)) {
         let year = words
@@ -1119,6 +1193,69 @@ mod tests {
         assert_eq!(urls, vec!["https://crates.io/crates/tokio"]);
     }
 
+    /// The two repositories GitHub's loose search returned on live queries are
+    /// out; repositories whose own name carries the query's words stay.
+    #[test]
+    fn a_github_repository_answers_only_through_its_own_name() {
+        let kept = |q: &str, hits: Vec<Hit>| -> Vec<String> {
+            accept_first_party(q, hits)
+                .into_iter()
+                .map(|h| h.url)
+                .collect()
+        };
+        let urls = kept(
+            "python 3.14 release date",
+            vec![hit(
+                "Rynkll696/HH import datetime from datetime import date",
+                "https://github.com/Rynkll696/HH",
+            )],
+        );
+        assert!(urls.is_empty(), "{urls:?}");
+        let urls = kept(
+            "latest rust release",
+            vec![
+                hit(
+                    "georust/proj bindings for the latest release",
+                    "https://github.com/georust/proj",
+                ),
+                hit("rust-lang/rust", "https://github.com/rust-lang/rust"),
+            ],
+        );
+        assert_eq!(urls, vec!["https://github.com/rust-lang/rust"]);
+        let urls = kept(
+            "docker compose healthcheck example",
+            vec![hit(
+                "peter-evans/docker-compose-healthcheck",
+                "https://github.com/peter-evans/docker-compose-healthcheck",
+            )],
+        );
+        assert_eq!(urls.len(), 1);
+        // A prefix names a plural.
+        let urls = kept(
+            "dataclass frozen hash",
+            vec![hit(
+                "ericvsmith/dataclasses",
+                "https://github.com/ericvsmith/dataclasses",
+            )],
+        );
+        assert_eq!(urls, vec!["https://github.com/ericvsmith/dataclasses"]);
+        // An issue is judged on its own text.
+        let urls = kept(
+            "frozen dataclass hash error",
+            vec![
+                hit(
+                    "acme/models: frozen dataclass hash error",
+                    "https://github.com/acme/models/issues/1",
+                ),
+                hit(
+                    "acme/widgets: unrelated crash",
+                    "https://github.com/acme/widgets/issues/2",
+                ),
+            ],
+        );
+        assert_eq!(urls, vec!["https://github.com/acme/models/issues/1"]);
+    }
+
     #[test]
     fn a_scope_root_is_the_name_at_the_root_not_a_path_segment() {
         assert_eq!(
@@ -1214,6 +1351,33 @@ mod tests {
         let year = window_for("nobel prize 2026 winner").expect("a year window");
         assert_eq!(year.start, day_of("2026-01-01").unwrap());
         assert_eq!(year.end, day_of("2027-01-01").unwrap());
+    }
+
+    #[test]
+    fn a_relative_window_is_read_from_the_words_people_use() {
+        assert_eq!(
+            relative_window("fed rate decision yesterday"),
+            Some(window_days(2))
+        );
+        assert_eq!(
+            relative_window("what happened last night in gaza"),
+            Some(window_days(2))
+        );
+        assert_eq!(
+            relative_window("f1 race this weekend"),
+            Some(window_days(4))
+        );
+        assert_eq!(relative_window("Apple event today"), Some(window_days(1)));
+        assert_eq!(relative_window("today's wordle"), Some(window_days(1)));
+        // Two windows: the wider one, which cannot drop the page asked for.
+        assert_eq!(
+            relative_window("breaking news this week"),
+            Some(window_days(7))
+        );
+        // Whole words only, and a named year is a window but not a recent one.
+        assert_eq!(relative_window("todayville bakery"), None);
+        assert_eq!(relative_window("lewis 2020 rag paper"), None);
+        assert!(window_for("lewis 2020 rag paper").is_some());
     }
 
     #[test]
