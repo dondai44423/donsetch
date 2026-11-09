@@ -178,7 +178,7 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
     // read and no degraded ratio to interpret -- the census is the state.
     let sources = crate::search::source_states(&out.report)
         .into_iter()
-        .map(|(id, items, status)| json!({"id": id, "items": items, "status": status}))
+        .map(|s| json!({"id": s.id, "items": s.items, "status": s.status, "state": s.state}))
         .collect::<Vec<_>>();
     let mut item = json!({
         "ok": true,
@@ -661,11 +661,15 @@ mod search_output_contract_tests {
         ];
         // One state per source, whatever its retries: bing answered (a
         // successful attempt outlives its retries), ddg did not.
+        // `status` is the raw outcome a 5.1 parser reads; `state` is the
+        // census word beside it.
         let sources = search_model_meta(&output, &[])["sources"].clone();
         assert_eq!(sources[0]["id"], "bing");
-        assert_eq!(sources[0]["status"], "answered");
+        assert_eq!(sources[0]["status"], "ok");
+        assert_eq!(sources[0]["state"], "answered");
         assert_eq!(sources[1]["id"], "ddg");
-        assert_eq!(sources[1]["status"], "failed");
+        assert_eq!(sources[1]["status"], "403");
+        assert_eq!(sources[1]["state"], "failed");
         let compact = render_compact_markdown(&output, "Results", None, &[]);
         assert!(
             compact.contains("sources: bing 0 · ddg — failed"),
@@ -675,19 +679,36 @@ mod search_output_contract_tests {
         assert!(full.contains("sources: bing 0 · ddg — failed"), "{full}");
         // A cached provider answer is still an answer, not a failure.
         output.report = vec![report("bing", "blocked:429"), report("bing", "cached")];
-        assert_eq!(
-            search_model_meta(&output, &[])["sources"][0]["status"],
-            "answered",
-            "a cached answer is an answer"
-        );
+        let cached = search_model_meta(&output, &[])["sources"][0].clone();
+        assert_eq!(cached["status"], "cached", "a cached answer is an answer");
+        assert_eq!(cached["state"], "answered", "a cached answer is an answer");
         output.report = vec![
             report("bing", "blocked:429"),
             report("bing", "pacing-timeout"),
         ];
-        assert_eq!(
-            search_model_meta(&output, &[])["sources"][0]["status"],
-            "failed"
-        );
+        let refused = search_model_meta(&output, &[])["sources"][0].clone();
+        assert_eq!(refused["status"], "429");
+        assert_eq!(refused["state"], "failed");
+        // A published rate limit rests the source; it did not fail.
+        output.report = vec![report("stackexchange", "rate-limited:3219")];
+        let rested = search_model_meta(&output, &[])["sources"][0].clone();
+        assert_eq!(rested["status"], "rate-limited:3219");
+        assert_eq!(rested["state"], "rested");
+        // A source the plan never asked is in the machine census but not in the
+        // footer the model reads; resting sources are counted there, not named.
+        output.report = vec![
+            report("bing", "ok"),
+            report("google", "not-asked"),
+            report("mojeek", "rested:120"),
+            report("yahoo", "rested"),
+        ];
+        let sources = search_model_meta(&output, &[])["sources"].clone();
+        assert_eq!(sources[1]["state"], "not asked");
+        assert_eq!(sources[2]["state"], "rested");
+        let compact = render_compact_markdown(&output, "Results", None, &[]);
+        assert!(compact.contains("sources: bing 0 · 2 resting"), "{compact}");
+        assert!(!compact.contains("google"), "{compact}");
+        assert!(!compact.contains("mojeek"), "{compact}");
     }
 
     #[test]

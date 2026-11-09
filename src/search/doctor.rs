@@ -183,7 +183,7 @@ pub fn record_owner(
 /// sources are judged here; first-party ones only by [`record_owner`].
 pub fn observe(
     canary: &Canary,
-    report: &[(String, usize, String)],
+    report: &[super::SourceLine],
     raw: &[(String, Vec<Hit>)],
     tallies: &mut BTreeMap<String, Tally>,
 ) {
@@ -195,19 +195,23 @@ pub fn observe(
             .filter(|(n, _)| n == name)
             .any(|(_, hits)| hits.iter().any(|h| expect.is_match(&h.url)))
     };
-    for (name, items, status) in report {
-        if rank::is_vertical(name) {
+    for line in report {
+        let name = &line.id;
+        // A source the plan did not ask, that the ledger rested, or that the
+        // scheduler cut as late said nothing about this canary: it is neither
+        // asked nor convicted.
+        if rank::is_vertical(name) || matches!(line.state, "not asked" | "rested" | "late") {
             continue;
         }
         let t = tallies.entry(name.clone()).or_default();
         t.asked += 1;
-        if matches!(status.as_str(), "ok" | "thin" | "cached") && *items > 0 {
+        if matches!(line.status.as_str(), "ok" | "thin" | "cached") && line.items > 0 {
             t.answered += 1;
             if contains(name) {
                 t.contained += 1;
             }
         } else {
-            *t.said.entry(status.clone()).or_default() += 1;
+            *t.said.entry(line.status.clone()).or_default() += 1;
         }
     }
 }
@@ -483,8 +487,20 @@ mod tests {
         }
     }
 
-    fn st(name: &str, items: usize, status: &str) -> (String, usize, String) {
-        (name.into(), items, status.into())
+    // Built through `source_states`, the path the live doctor takes: a test
+    // that fed `observe` hand-made statuses once passed while production
+    // handed it census words and convicted every source.
+    fn st(name: &str, items: usize, status: &str) -> crate::search::SourceLine {
+        let report = crate::search::EngineReport {
+            engine: name.into(),
+            profile: None,
+            status: status.into(),
+            hits: items,
+            ms: 0,
+            egress: "direct".into(),
+            requests: 1,
+        };
+        crate::search::source_states(&[report]).remove(0)
     }
 
     #[test]

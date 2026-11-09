@@ -113,31 +113,50 @@ pub(super) fn clip_snippet(s: &str, max: usize) -> String {
 /// off-query answers too — a 200 carrying ten unrelated items is a fact about
 /// retrieval, not a success.
 pub fn census(report: &[super::EngineReport]) -> String {
+    // A source the plan never asked did nothing: naming it spends the reader's
+    // context on a non-event. A source the ledger is resting is a standing
+    // condition, not news about this query, so it is counted, not named (a dead
+    // engine would otherwise be named on every search). Every source that was
+    // asked is named with what it did; the JSON census names them all.
     let states = source_states(report);
-    if states.is_empty() {
-        return "sources: none".into();
-    }
-    let parts: Vec<String> = states
+    let resting = states.iter().filter(|s| s.state == "rested").count();
+    let mut parts: Vec<String> = states
         .into_iter()
-        .map(|(name, hits, status)| {
-            if matches!(status.as_str(), "ok" | "cached" | "answered") {
-                format!("{name} {hits}")
-            } else if hits > 0 {
-                format!("{name} {hits} {status}")
-            } else {
-                format!("{name} — {status}")
-            }
+        .filter(|s| !matches!(s.state, "not asked" | "rested"))
+        .map(|s| match s.state {
+            "answered" => format!("{} {}", s.id, s.items),
+            state if s.items > 0 => format!("{} {} {state}", s.id, s.items),
+            state => format!("{} — {state}", s.id),
         })
         .collect();
+    if resting > 0 {
+        parts.push(format!("{resting} resting"));
+    }
+    if parts.is_empty() {
+        return "sources: none".into();
+    }
     format!("sources: {}", parts.join(" · "))
 }
 
-/// Deduped per-source retrieval state: `(source, items, status)`.
+/// What one source did in one search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLine {
+    pub id: String,
+    /// Items the source returned.
+    pub items: usize,
+    /// The raw outcome (`ok`, `no-results`, `403`, `rate-limited:3219`,
+    /// `late`, ...), stable since 5.1: `blocked:` is shortened to its code.
+    pub status: String,
+    /// The census word for it: `answered`, `empty`, `off`, `rested`,
+    /// `not asked`, `late` or `failed`.
+    pub state: &'static str,
+}
+
+/// Deduped per-source retrieval state, one line per source.
 ///
 /// The one source of truth behind the text census and the JSON `sources` field.
-/// A source that answered once and failed on a retry still counts as answered;
-/// `blocked:` is shortened to its code because the name says the rest.
-pub fn source_states(report: &[super::EngineReport]) -> Vec<(String, usize, String)> {
+/// A source that answered once and failed on a retry still counts as answered.
+pub fn source_states(report: &[super::EngineReport]) -> Vec<SourceLine> {
     use std::collections::BTreeMap;
     let mut best: BTreeMap<&str, &super::EngineReport> = BTreeMap::new();
     // The most informative attempt speaks for the source: an answer (even an
@@ -150,12 +169,15 @@ pub fn source_states(report: &[super::EngineReport]) -> Vec<(String, usize, Stri
         }
     }
     best.into_iter()
-        .map(|(name, entry)| {
-            (
-                name.to_string(),
-                entry.hits,
-                state_word(&entry.status).to_string(),
-            )
+        .map(|(name, entry)| SourceLine {
+            id: name.to_string(),
+            items: entry.hits,
+            status: entry
+                .status
+                .strip_prefix("blocked:")
+                .unwrap_or(&entry.status)
+                .to_string(),
+            state: state_word(&entry.status),
         })
         .collect()
 }
@@ -175,15 +197,16 @@ pub(crate) fn rank_state(status: &str) -> u8 {
 }
 
 /// The census vocabulary: `answered`, `empty`, `off`, `rested`, `not asked`,
-/// `failed` (with the transport detail kept after a colon), and `late` for a
-/// lane the scheduler cut. A source that was never asked is never a failure.
+/// `failed`, and `late` for a lane the scheduler cut. A source that was never
+/// asked is never a failure, and neither is one resting under a limit it
+/// published (`rate-limited:<secs>`); the raw status keeps the detail.
 fn state_word(status: &str) -> &'static str {
     let head = status.split(':').next().unwrap_or(status);
     match head {
         "ok" | "cached" | "thin" | "answered" => "answered",
         "no-results" | "empty" | "empty-parse" => "empty",
         "off-query" => "off",
-        "rested" => "rested",
+        "rested" | "rate-limited" => "rested",
         "not-asked" | "pacing-timeout" => "not asked",
         "late" => "late",
         _ => "failed",
