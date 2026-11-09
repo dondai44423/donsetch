@@ -208,8 +208,8 @@ impl CoreFetcher {
         };
         let data: std::collections::HashMap<String, serde_json::Value> =
             files.into_iter().flatten().collect();
-        let mut body = crate::fetch::pricing::apply(html, &out.url, &data)
-            .unwrap_or_else(|| html.to_string());
+        let mut body =
+            crate::fetch::pricing::apply(html, &out.url, &data).unwrap_or_else(|| html.to_string());
         // The EC2 on-demand page's instance grid is not one of its templates:
         // its iframe app builds the table at run time from its own price file.
         // Read that file for the selection the app opens with and put the rows

@@ -48,18 +48,16 @@ pub(super) fn plan(html: &str, page: &url::Url) -> Option<Grid> {
     // here, and a plain scan cannot disagree with the HTML parser about an
     // attribute the browser itself reads as text.
     let tag = &html[start..=end];
-    let src = tag
-        .split_once("data-src=")
-        .and_then(|(_, rest)| {
-            let rest = rest.trim_start();
-            let quote = rest.chars().next()?;
-            if quote != '"' && quote != '\'' {
-                return None;
-            }
-            let value = &rest[1..];
-            let close = value.find(quote)?;
-            Some(&value[..close])
-        })?;
+    let src = tag.split_once("data-src=").and_then(|(_, rest)| {
+        let rest = rest.trim_start();
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let value = &rest[1..];
+        let close = value.find(quote)?;
+        Some(&value[..close])
+    })?;
     // The app's own address names the plan; a page that points elsewhere is a
     // different widget and is left as served.
     if !src.contains("c0.b0.p.awsstatic.com/#/ec2/on-demand-plan") {
@@ -94,7 +92,10 @@ pub(super) fn render(json: &Value, region: &str) -> Option<String> {
             continue;
         };
         let price = price.trim();
-        if instance.is_empty() || price.is_empty() || !price.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        if instance.is_empty()
+            || price.is_empty()
+            || !price.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        {
             continue;
         }
         items.push((instance, price));
@@ -169,7 +170,10 @@ mod tests {
         let html = r#"<p>x</p><iframe sandbox="allow-scripts" data-src="https://c0.b0.p.awsstatic.com/#/ec2/on-demand-plan" data-test="ec2/on-demand-plan" loading="lazy"></iframe>"#;
         let planned = plan(html, &page("/ec2/pricing/on-demand/")).expect("grid");
         assert_eq!(planned.region, "US East (Ohio)");
-        assert_eq!(planned.insert_at, html.find("</iframe>").unwrap() + "</iframe>".len());
+        assert_eq!(
+            planned.insert_at,
+            html.find("</iframe>").unwrap() + "</iframe>".len()
+        );
         assert!(plan(html, &page("/s3/pricing/")).is_none());
         let other = html.replace("c0.b0.p.awsstatic.com", "example.com");
         assert!(plan(&other, &page("/ec2/pricing/on-demand/")).is_none());
@@ -179,11 +183,20 @@ mod tests {
     fn the_default_selection_renders_its_prices_sorted_and_trimmed() {
         let table = render(&price_file(), "US East (Ohio)").expect("table");
         assert!(table.contains("<th>Instance name</th>"), "{table}");
-        assert!(table.contains("Linux, US East (Ohio), USD per hour"), "{table}");
+        assert!(
+            table.contains("Linux, US East (Ohio), USD per hour"),
+            "{table}"
+        );
         assert!(table.contains("published 2026-11-07"), "{table}");
         // Linux rows only, hashed and Windows entries left out, sorted by name.
-        assert!(table.contains("<td>m7g.large</td><td>$0.0816</td>"), "{table}");
-        assert!(table.contains("<td>t3.medium</td><td>$0.0416</td>"), "{table}");
+        assert!(
+            table.contains("<td>m7g.large</td><td>$0.0816</td>"),
+            "{table}"
+        );
+        assert!(
+            table.contains("<td>t3.medium</td><td>$0.0416</td>"),
+            "{table}"
+        );
         assert!(!table.contains("hashed-key"), "{table}");
         assert!(!table.contains("9.99"), "{table}");
         assert!(!table.contains("Windows"), "{table}");

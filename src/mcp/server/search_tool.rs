@@ -202,10 +202,10 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
             "no source returned matching items; rephrase or retry another source before concluding that no answer exists"
         );
     } else if out.results.len() < 3 {
-        item["next_action"] =
-            json!("thin answer: a retry usually adds the sources that were late");
+        item["next_action"] = json!("thin answer: a retry usually adds the sources that were late");
     } else if answered < 2 {
-        item["next_action"] = json!("one source answered; a retry asks for independent confirmation");
+        item["next_action"] =
+            json!("one source answered; a retry asks for independent confirmation");
     }
     // Instant answers are decision aids, not ranked evidence: they
     // ride structuredContent (not the organic list) with their source.

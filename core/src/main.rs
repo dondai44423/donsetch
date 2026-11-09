@@ -252,7 +252,10 @@ fn command_scorecard(flags: &Flags) -> i32 {
             eprintln!("scorecard: cannot write {BASELINE}: {error}");
             return 1;
         }
-        println!("recorded {} identities in {BASELINE}", baseline.identities.len());
+        println!(
+            "recorded {} identities in {BASELINE}",
+            baseline.identities.len()
+        );
         return 0;
     }
     if flags.switches.contains("json") {

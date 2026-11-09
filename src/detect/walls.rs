@@ -256,7 +256,10 @@ mod report_audit_tests {
 <form><input type='email'><div class='g-recaptcha' data-sitekey='x'></div>\
 <button>Sign in</button></form></body></html>";
         assert!(
-            matches!(detect(200, &[], recaptcha.as_bytes()), Verdict::Challenge(_)),
+            matches!(
+                detect(200, &[], recaptcha.as_bytes()),
+                Verdict::Challenge(_)
+            ),
             "a captcha on a sign-in page is an interaction wall"
         );
         assert_eq!(

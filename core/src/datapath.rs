@@ -864,7 +864,8 @@ pub fn render(path: &DataPath, items: &[Item]) -> String {
 /// would report a deletion as an identity gap.
 pub fn absent(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains("\"error_name\":\"not_found\"") || lower.contains("\"error_name\": \"not_found\"")
+    lower.contains("\"error_name\":\"not_found\"")
+        || lower.contains("\"error_name\": \"not_found\"")
 }
 
 #[cfg(test)]
