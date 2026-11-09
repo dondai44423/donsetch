@@ -688,7 +688,7 @@ pub fn render_list(cfg: &ByokConfig) {
             cli::dim("(default)")
         );
         println!(
-            "    {} keyless 5-engine search (local-first, BYOK fallback)",
+            "    {} keyless search (local-first, BYOK fallback)",
             cli::dim("")
         );
         println!();

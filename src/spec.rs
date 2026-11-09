@@ -333,9 +333,9 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Enum(&["auto", "web", "code", "paper", "news", "entity"]),
         cli: CliKind::Flag,
         required: false,
-        help: "auto (default) detects from query signals (code/tech tokens, paper terms, news words, who/what-is). Keyless mode adds that intent's keyless verticals: code: GitHub, HN, StackExchange, MDN, crates.io and npm when the query names the ecosystem; paper: OpenAlex, arXiv, Europe PMC for biomedical terms; news: Google News, HN; entity: Wikipedia; web: general only. With a configured provider (donsetch keys) the provider replaces the fan-out: intent maps to its own filters and the keyless verticals do not join.",
+        help: "auto (default) detects from query signals (code/tech tokens, paper terms, news words, who/what-is). Keyless mode adds that intent's first-party sources: code: GitHub, HN, StackExchange, MDN, and the crates.io, npm or PyPI record for a package name (`npm zod`, `cargo serde_json`); paper: OpenAlex, arXiv, Europe PMC for biomedical terms; news, or any query with a recent window (`this week`, `yesterday`): the Bing News wire, publisher feeds, GDELT, HN; entity: Wikipedia; web: general only. With a configured provider (donsetch keys) the provider replaces the fan-out: intent maps to its own filters and the keyless verticals do not join.",
         mcp_help: Some(
-            "auto (default) detects from the query. Keyless mode adds keyless verticals: code: + GitHub, HN, StackExchange, MDN, crates.io/npm by ecosystem word; paper: + OpenAlex, arXiv, Europe PMC (biomedical); news: + Google News, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
+            "auto (default) detects from the query. Keyless mode adds first-party sources: code: + GitHub, HN, StackExchange, MDN, crates.io/npm/PyPI for a package name; paper: + OpenAlex, arXiv, Europe PMC (biomedical); news or a recent window ('this week'): + news wire, publisher feeds, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
         ),
     },
 ];
@@ -772,8 +772,9 @@ MCP search handles belong to their server session and cannot be reused \
 in a separate CLI invocation."
         }
         "search" => {
-            "Search the web across 10+ keyless engines, merged with \
-consensus ranking (no API keys needed). \
+            "Search the web without API keys: general engines, first-party \
+sources (package registries, papers, encyclopedias, a dated news wire) and \
+publisher feeds, merged by agreement between independent sources. \
 Results include reusable URLs: pass one to donsetch fetch <url>. \
 Session-local search handles are used only by the persistent MCP server. \
 Use --max-results to cap the list and --intent to pick a vertical \

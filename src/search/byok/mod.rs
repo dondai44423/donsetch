@@ -2,7 +2,7 @@
 //!
 //! When the user configures API keys for external search providers
 //! (Tavily, Exa, Serper.dev, SerpApi, Brave Search API, TinyFish,
-//! Parallel AI, Bright Data), the entire local 5-engine
+//! Parallel AI, Bright Data), the entire local keyless
 //! search system is bypassed. The provider handles everything:
 //! search, IP, rate limiting. DonSeTch just sends the query and
 //! normalizes the results.

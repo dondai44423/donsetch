@@ -913,7 +913,7 @@ pub fn help() {
     println!();
     println!("  {}", bold("Fallback:"));
     println!("    If all providers are exhausted, {DISPLAY_NAME} falls back");
-    println!("    to the local keyless 5-engine search system.");
+    println!("    to the local keyless search.");
     println!();
     println!("  {}", bold("Plugins (for unsupported providers):"));
     println!("    If the platform you have a key for is not natively");

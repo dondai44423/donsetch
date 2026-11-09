@@ -33,7 +33,8 @@ use crate::fetch::client::Fetcher;
 const TTL_SECS: u64 = 7 * 24 * 3600;
 const NEGATIVE_TTL_SECS: u64 = 24 * 3600;
 const MAX_ENTRIES: usize = 500;
-const DISK_VERSION: u32 = 1;
+/// 3: a name the query did not call a package is answered only by a strong record.
+const DISK_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecosystem {
@@ -83,7 +84,25 @@ pub struct Plan {
     /// The registries to ask: one when the ecosystem is named, otherwise the
     /// three package registries (never more than three requests).
     pub ask: Vec<Ecosystem>,
+    /// Set when the query calls the name a package ("crate", "npm", "pip",
+    /// "repo"). A language word alone ("rust ownership", "python decorators")
+    /// or a bare word may be a topic, so only a strong record answers it.
+    pub package_named: bool,
 }
+
+/// A word that says the query is about a package, not about a language.
+fn package_word(word: &str) -> bool {
+    matches!(
+        word,
+        "crate" | "crates" | "cargo" | "npm" | "pip" | "pypi" | "github" | "repo" | "repository"
+    )
+}
+
+/// The strength a record needs to answer a query that did not call the name a
+/// package: about 100k all-time downloads on crates.io, 5k a week on npm,
+/// a few hundred GitHub stars. PyPI publishes no popularity, so a PyPI record
+/// answers only a query that names it.
+const NAME_PROOF: f64 = 0.6;
 
 /// The word in the query that names a registry's world.
 fn ecosystem_word(word: &str) -> Option<Ecosystem> {
@@ -120,6 +139,7 @@ pub fn plan(query: &str) -> Option<Plan> {
     // Whitespace words, not extracted terms: a package name is one word, and
     // `serde_json` or `react-router` must not be split into a topic.
     let mut ecosystem: Option<Ecosystem> = None;
+    let mut package_named = false;
     let mut name: Option<String> = None;
     for word in query.split_whitespace() {
         let word = word.trim_matches(|c: char| {
@@ -128,8 +148,10 @@ pub fn plan(query: &str) -> Option<Plan> {
         if word.is_empty() {
             continue;
         }
-        if let Some(eco) = ecosystem_word(&word.to_ascii_lowercase()) {
+        let lower = word.to_ascii_lowercase();
+        if let Some(eco) = ecosystem_word(&lower) {
             ecosystem.get_or_insert(eco);
+            package_named |= package_word(&lower);
             continue;
         }
         if name.is_some() {
@@ -157,6 +179,7 @@ pub fn plan(query: &str) -> Option<Plan> {
         name,
         ecosystem,
         ask,
+        package_named,
     })
 }
 
@@ -177,6 +200,66 @@ struct Found {
     docs: Option<String>,
     /// A short fact for the snippet (downloads, stars).
     fact: String,
+    /// The project's own pages as the registry lists them: documentation,
+    /// homepage, source repository. Free: they came in the same answer.
+    links: Vec<(&'static str, String)>,
+}
+
+/// A registry's link as a page the caller can read: `git+https://…/x.git` and
+/// `git://` are clone addresses of the same repository page.
+fn page_link(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("git+").unwrap_or(raw);
+    let raw = match raw.strip_prefix("git://") {
+        Some(rest) => format!("https://{rest}"),
+        None => raw.to_string(),
+    };
+    let raw = raw
+        .strip_suffix(".git")
+        .unwrap_or(&raw)
+        .trim_end_matches('/');
+    let u = url::Url::parse(raw).ok()?;
+    if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// The project's pages, deduplicated, and never a page the answer already
+/// carries (the registry record, docs.rs).
+fn links_from(
+    already: &[&str],
+    candidates: &[(&'static str, Option<&str>)],
+) -> Vec<(&'static str, String)> {
+    let key = |u: &str| crate::search::rank::norm_key(u);
+    let mut seen: Vec<String> = already.iter().map(|u| key(u)).collect();
+    let mut out = Vec::new();
+    for (kind, raw) in candidates {
+        let Some(url) = raw.and_then(page_link) else {
+            continue;
+        };
+        let k = key(&url);
+        if seen.contains(&k) {
+            continue;
+        }
+        seen.push(k);
+        out.push((*kind, url));
+    }
+    out
+}
+
+/// npm's weekly downloads as a strength class. npm's own `popularity` is now
+/// 1 for every package (a 13-download package scored like React), so the
+/// download count is the evidence; a crate's count is all-time, npm's weekly.
+fn npm_downloads_strength(weekly: u64) -> f64 {
+    match weekly {
+        5_000_000.. => 1.0,
+        500_000.. => 0.9,
+        50_000.. => 0.8,
+        5_000.. => 0.6,
+        500.. => 0.3,
+        _ => 0.1,
+    }
 }
 
 fn crates_strength(downloads: u64) -> f64 {
@@ -289,15 +372,28 @@ fn parse(eco: Ecosystem, name: &str, body: &str) -> Vec<Found> {
                     continue;
                 }
                 let downloads = c["downloads"].as_u64().unwrap_or(0);
+                let docs = format!("https://docs.rs/{got}/latest/{got}/");
+                let url = format!("https://crates.io/crates/{got}");
+                // docs.rs is already the first row; a crate's own site and its
+                // repository follow the record.
+                let links = links_from(
+                    &[&docs, &url, &format!("https://docs.rs/{got}")],
+                    &[
+                        ("homepage", c["homepage"].as_str()),
+                        ("documentation", c["documentation"].as_str()),
+                        ("source", c["repository"].as_str()),
+                    ],
+                );
                 out.push(Found {
                     eco,
                     name: got.to_string(),
                     version: c["max_version"].as_str().unwrap_or("").to_string(),
                     description: c["description"].as_str().unwrap_or("").to_string(),
                     strength: crates_strength(downloads),
-                    url: format!("https://crates.io/crates/{got}"),
-                    docs: Some(format!("https://docs.rs/{got}/latest/{got}/")),
+                    url,
+                    docs: Some(docs),
                     fact: format!("{} downloads", compact(downloads)),
+                    links,
                 });
             }
         }
@@ -308,19 +404,39 @@ fn parse(eco: Ecosystem, name: &str, body: &str) -> Vec<Found> {
                 if !got.eq_ignore_ascii_case(&want) {
                     continue;
                 }
-                let popularity = o["score"]["detail"]["popularity"]
-                    .as_f64()
-                    .or_else(|| o["score"]["final"].as_f64())
-                    .unwrap_or(0.0);
+                // Weekly downloads are the evidence when npm sends them; an
+                // answer without them falls back to the score it used to carry.
+                let weekly = o["downloads"]["weekly"].as_u64();
+                let strength = match weekly {
+                    Some(n) => npm_downloads_strength(n),
+                    None => npm_strength(
+                        o["score"]["detail"]["popularity"]
+                            .as_f64()
+                            .or_else(|| o["score"]["final"].as_f64())
+                            .unwrap_or(0.0),
+                    ),
+                };
+                let url = format!("https://www.npmjs.com/package/{got}");
+                let links = links_from(
+                    &[&url],
+                    &[
+                        ("homepage", p["links"]["homepage"].as_str()),
+                        ("source", p["links"]["repository"].as_str()),
+                    ],
+                );
                 out.push(Found {
                     eco,
                     name: got.to_string(),
                     version: p["version"].as_str().unwrap_or("").to_string(),
                     description: p["description"].as_str().unwrap_or("").to_string(),
-                    strength: npm_strength(popularity),
-                    url: format!("https://www.npmjs.com/package/{got}"),
+                    strength,
+                    url,
                     docs: None,
-                    fact: "npm package".to_string(),
+                    fact: match weekly {
+                        Some(n) => format!("{} weekly downloads", compact(n)),
+                        None => String::new(),
+                    },
+                    links,
                 });
             }
         }
@@ -331,15 +447,41 @@ fn parse(eco: Ecosystem, name: &str, body: &str) -> Vec<Found> {
             if !got.eq_ignore_ascii_case(&want) {
                 return Vec::new();
             }
+            let info = &v["info"];
+            let url = format!("https://pypi.org/project/{got}/");
+            // `project_urls` keys are free text; these spellings cover the
+            // common ones, and the legacy fields come after them.
+            let urls = &info["project_urls"];
+            let pick = |keys: &[&str]| {
+                urls.as_object().and_then(|m| {
+                    m.iter()
+                        .find(|(k, _)| keys.iter().any(|w| k.eq_ignore_ascii_case(w)))
+                        .and_then(|(_, v)| v.as_str())
+                })
+            };
+            let links = links_from(
+                &[&url],
+                &[
+                    ("documentation", pick(&["Documentation", "Docs"])),
+                    ("documentation", info["docs_url"].as_str()),
+                    ("homepage", pick(&["Homepage", "Home", "Home Page"])),
+                    ("homepage", info["home_page"].as_str()),
+                    (
+                        "source",
+                        pick(&["Source", "Source Code", "Repository", "Code", "GitHub"]),
+                    ),
+                ],
+            );
             out.push(Found {
                 eco,
                 name: got.to_string(),
-                version: v["info"]["version"].as_str().unwrap_or("").to_string(),
-                description: v["info"]["summary"].as_str().unwrap_or("").to_string(),
+                version: info["version"].as_str().unwrap_or("").to_string(),
+                description: info["summary"].as_str().unwrap_or("").to_string(),
                 strength: PYPI_STRENGTH,
-                url: format!("https://pypi.org/project/{got}/"),
+                url,
                 docs: None,
-                fact: "PyPI project".to_string(),
+                fact: String::new(),
+                links,
             });
         }
         Ecosystem::Github => {
@@ -362,6 +504,10 @@ fn parse(eco: Ecosystem, name: &str, body: &str) -> Vec<Found> {
                         .unwrap_or_else(|| format!("https://github.com/{full}")),
                     docs: None,
                     fact: format!("{} stars", compact(stars)),
+                    links: links_from(
+                        &[r["html_url"].as_str().unwrap_or_default()],
+                        &[("homepage", r["homepage"].as_str())],
+                    ),
                 });
             }
         }
@@ -410,24 +556,45 @@ fn choose(found: Vec<Found>, ecosystem: Option<Ecosystem>) -> Vec<Found> {
 }
 
 /// Registry records become the results the agent sees: the documentation page
-/// first for a crate (that is what a caller reads), then the registry record.
+/// first for a crate (that is what a caller reads), then the registry record,
+/// then — when the answer is one package — the project's own pages the record
+/// lists (documentation, homepage, source repository), at no extra request.
 fn to_hits(chosen: &[Found]) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut rank = 0usize;
+    let one = chosen.len() == 1;
     for f in chosen {
-        let tail = |s: &str| {
-            let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-            if s.is_empty() {
-                String::new()
+        let desc: String = f
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(140)
+            .collect();
+        let line = |parts: &[&str]| -> String {
+            let head = parts
+                .iter()
+                .filter(|p| !p.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if desc.is_empty() {
+                head
             } else {
-                format!(" — {}", s.chars().take(140).collect::<String>())
+                format!("{head} — {desc}")
             }
+        };
+        let version = if f.version.is_empty() {
+            String::new()
+        } else {
+            format!("v{}", f.version)
         };
         if let Some(docs) = &f.docs {
             hits.push(Hit {
                 title: format!("{} — Rust crate documentation", f.name),
                 url: docs.clone(),
-                snippet: format!("docs.rs · v{}{}", f.version, tail(&f.description)),
+                snippet: line(&["docs.rs", &version]),
                 rank,
                 published: None,
             });
@@ -436,21 +603,28 @@ fn to_hits(chosen: &[Found]) -> Vec<Hit> {
         hits.push(Hit {
             title: format!("{} — {}", f.name, f.eco.label()),
             url: f.url.clone(),
-            snippet: format!(
-                "{} · {}{}{}",
-                f.eco.label(),
-                f.fact,
-                if f.version.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · v{}", f.version)
-                },
-                tail(&f.description)
-            ),
+            snippet: line(&[f.eco.label(), &f.fact, &version]),
             rank,
             published: None,
         });
         rank += 1;
+        if !one {
+            continue;
+        }
+        for (kind, url) in &f.links {
+            let what = match *kind {
+                "source" => "source repository",
+                other => other,
+            };
+            hits.push(Hit {
+                title: format!("{} — {what}", f.name),
+                url: url.clone(),
+                snippet: line(&[what]),
+                rank,
+                published: None,
+            });
+            rank += 1;
+        }
     }
     hits
 }
@@ -468,10 +642,22 @@ pub struct Resolved {
 
 fn cache_key(plan: &Plan) -> String {
     format!(
-        "{}:{}",
+        "{}{}:{}",
         plan.ecosystem.map(Ecosystem::key).unwrap_or("any"),
+        if plan.package_named { "" } else { "?" },
         plan.name.to_ascii_lowercase()
     )
+}
+
+/// Keep only the records that prove the query is about them.
+fn proven(chosen: Vec<Found>, package_named: bool) -> Vec<Found> {
+    if package_named {
+        return chosen;
+    }
+    chosen
+        .into_iter()
+        .filter(|f| f.strength >= NAME_PROOF)
+        .collect()
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -672,8 +858,10 @@ pub async fn run(plan: &Plan, fetcher: &Fetcher, budget: Duration) -> Resolution
     let answers: Vec<Answer> = futures_util::future::join_all(asks).await;
     let ms = started.elapsed().as_millis() as u64;
     let chosen = match settle(answers, plan.ecosystem) {
-        Settled::Chosen(chosen) => chosen,
-        Settled::Nothing => {
+        Settled::Chosen(chosen) if !proven(chosen.clone(), plan.package_named).is_empty() => {
+            proven(chosen, plan.package_named)
+        }
+        Settled::Chosen(_) | Settled::Nothing => {
             cache_put(&key, &[]);
             return Resolution::Nothing;
         }
@@ -787,6 +975,92 @@ mod tests {
         assert_eq!(chosen[0].eco, Ecosystem::Crates);
     }
 
+    /// npm now scores every package's popularity as 1; the weekly download
+    /// count in the same answer is the evidence. Live shapes, 2026-11-09.
+    #[test]
+    fn npm_strength_is_its_weekly_downloads_not_its_flat_score() {
+        let flat =
+            r#""score":{"final":393.6,"detail":{"popularity":1,"quality":1,"maintenance":1}}"#;
+        let npm = parse(
+            Ecosystem::Npm,
+            "tokio",
+            &format!(
+                r#"{{"objects":[{{"package":{{"name":"tokio","version":"0.1.2"}},{flat},"downloads":{{"monthly":37,"weekly":22}}}}]}}"#
+            ),
+        );
+        assert!(npm[0].strength <= 0.1, "{}", npm[0].strength);
+        assert_eq!(npm[0].fact, "22 weekly downloads");
+        let crates = parse(
+            Ecosystem::Crates,
+            "tokio",
+            r#"{"crates":[{"name":"tokio","max_version":"1.54.1","downloads":1166056286}]}"#,
+        );
+        let mut all = crates;
+        all.extend(npm);
+        let chosen = choose(all, None);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].eco, Ecosystem::Crates);
+        let giant = parse(
+            Ecosystem::Npm,
+            "zod",
+            &format!(
+                r#"{{"objects":[{{"package":{{"name":"zod","version":"4.6.7"}},{flat},"downloads":{{"weekly":456171850}}}}]}}"#
+            ),
+        );
+        assert_eq!(giant[0].strength, 1.0);
+    }
+
+    /// One package's answer carries its own pages from the same response: no
+    /// extra request, clone addresses turned into the repository page, and no
+    /// page twice.
+    #[test]
+    fn one_package_answers_with_its_documentation_homepage_and_source() {
+        let npm = parse(
+            Ecosystem::Npm,
+            "zod",
+            r#"{"objects":[{"package":{"name":"zod","version":"4.6.7","description":"TypeScript-first schema validation","links":{"homepage":"https://zod.dev","repository":"git+https://github.com/colinhacks/zod.git","bugs":"https://github.com/colinhacks/zod/issues","npm":"https://www.npmjs.com/package/zod"}},"downloads":{"weekly":456171850}}]}"#,
+        );
+        let urls: Vec<String> = to_hits(&npm).into_iter().map(|h| h.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.npmjs.com/package/zod",
+                "https://zod.dev",
+                "https://github.com/colinhacks/zod"
+            ]
+        );
+        let pypi = parse(
+            Ecosystem::Pypi,
+            "httpx",
+            r#"{"info":{"name":"httpx","version":"0.28.1","summary":"The next generation HTTP client.","home_page":null,"docs_url":null,"project_urls":{"Changelog":"https://github.com/encode/httpx/blob/master/CHANGELOG.md","Documentation":"https://www.python-httpx.org","Homepage":"https://github.com/encode/httpx","Source":"https://github.com/encode/httpx"}}}"#,
+        );
+        let hits = to_hits(&pypi);
+        let urls: Vec<&str> = hits.iter().map(|h| h.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://pypi.org/project/httpx/",
+                "https://www.python-httpx.org",
+                "https://github.com/encode/httpx"
+            ]
+        );
+        assert!(!hits[0].snippet.contains("·  ·"), "{}", hits[0].snippet);
+        let crates = parse(
+            Ecosystem::Crates,
+            "serde_json",
+            r#"{"crates":[{"name":"serde_json","max_version":"1.0.154","downloads":416135489,"homepage":null,"documentation":"https://docs.rs/serde_json","repository":"https://github.com/serde-rs/json"}]}"#,
+        );
+        let urls: Vec<String> = to_hits(&crates).into_iter().map(|h| h.url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://docs.rs/serde_json/latest/serde_json/",
+                "https://crates.io/crates/serde_json",
+                "https://github.com/serde-rs/json"
+            ]
+        );
+    }
+
     #[test]
     fn an_npm_giant_wins_its_own_name() {
         let crates = parse(
@@ -885,6 +1159,42 @@ mod tests {
         let chosen = choose(all, Some(Ecosystem::Crates));
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].eco, Ecosystem::Crates);
+    }
+
+    #[test]
+    fn a_language_word_is_not_a_package_word() {
+        // "rust ownership" is the borrow checker, not the 45k-download crate
+        // called `ownership` that answered it alone.
+        let topic = plan("rust ownership").expect("planned");
+        assert!(!topic.package_named);
+        assert!(plan("crate ownership").unwrap().package_named);
+        assert!(plan("npm react").unwrap().package_named);
+        assert!(!plan("tokio").unwrap().package_named);
+        assert_ne!(
+            cache_key(&topic),
+            cache_key(&plan("crate ownership").unwrap())
+        );
+        let weak = parse(
+            Ecosystem::Crates,
+            "ownership",
+            r#"{"crates":[{"name":"ownership","max_version":"0.4.0","description":"","downloads":45700}]}"#,
+        );
+        let strong = parse(
+            Ecosystem::Crates,
+            "tokio",
+            r#"{"crates":[{"name":"tokio","max_version":"1.0.0","description":"","downloads":400000000}]}"#,
+        );
+        assert!(proven(weak.clone(), false).is_empty());
+        assert_eq!(
+            proven(weak, true).len(),
+            1,
+            "a package word takes any record"
+        );
+        assert_eq!(
+            proven(strong, false).len(),
+            1,
+            "a strong record needs no package word"
+        );
     }
 
     #[test]
