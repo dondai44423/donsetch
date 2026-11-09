@@ -293,7 +293,7 @@ fn command_scorecard(flags: &Flags) -> i32 {
         }
         if drift.is_empty() {
             if !flags.switches.contains("quiet") {
-                println!("{name:<14} ok  {}", &got.ja4);
+                println!("{name:<14} ok  {}", got.ja4);
             }
         } else {
             failures.push(format!("{name}: {}", drift.join("; ")));
