@@ -1,0 +1,47 @@
+{
+  "endpoint": "https://tls.peet.ws/api/all",
+  "identities": {
+    "chrome": {
+      "ja4": "t13d1517h2_8daaf6152771_cb7bf5808d99",
+      "peetprint": "fc97c1cdfb1409c9a9326c1b726d1dee",
+      "akamai": "52d84b11737d980aef856699f885ca86",
+      "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+    },
+    "chrome-android": {
+      "ja4": "t13d1517h2_8daaf6152771_cb7bf5808d99",
+      "peetprint": "fc97c1cdfb1409c9a9326c1b726d1dee",
+      "akamai": "52d84b11737d980aef856699f885ca86",
+      "user_agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36"
+    },
+    "chrome-local": {
+      "ja4": "t13d1517h2_8daaf6152771_cb7bf5808d99",
+      "peetprint": "fc97c1cdfb1409c9a9326c1b726d1dee",
+      "akamai": "52d84b11737d980aef856699f885ca86",
+      "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+    },
+    "chrome-win": {
+      "ja4": "t13d1517h2_8daaf6152771_cb7bf5808d99",
+      "peetprint": "fc97c1cdfb1409c9a9326c1b726d1dee",
+      "akamai": "52d84b11737d980aef856699f885ca86",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+    },
+    "firefox": {
+      "ja4": "t13d1718h2_5b57614c22b0_56cb5e2c0c1d",
+      "peetprint": "95bd33b92c7ca37ef6a4fcf2a91558a7",
+      "akamai": "6ea73faa8fc5aac76bded7bd238f6433",
+      "user_agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0"
+    },
+    "okhttp": {
+      "ja4": "t13d1614h2_46e7e9700bed_8b786ce6f6b9",
+      "peetprint": "3ecb28bffe2916618801a1d53d77119c",
+      "akamai": "605a1154008045d7e3cb3c6fb062c0ce",
+      "user_agent": "okhttp/5.0.0"
+    },
+    "safari": {
+      "ja4": "t13d2015h2_a09f3c656075_5ffecec37d60",
+      "peetprint": "05fd23827cad6ab7c6fb75c1b9583361",
+      "akamai": "c52879e43202aeb92740be6e8c86ea96",
+      "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15"
+    }
+  }
+}

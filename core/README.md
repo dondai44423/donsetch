@@ -50,6 +50,10 @@ V5_STATE=/tmp/core/state.json ./target/release/donsetch-core bench \
 V5_ENGINE_LOG=1 ./target/release/donsetch-core fetch https://www.imdb.com/ --identity chrome-local
 
 ./target/release/donsetch-core identities [--headers]   # the portfolio and what each sends
+
+# identity scorecard: every browser identity's live wire (JA4, peetprint, Akamai H2,
+# UA) against the committed baseline; --record rewrites it deliberately
+./target/release/donsetch-core scorecard [--record] [--json]
 ./target/release/donsetch-core state [show|reset]       # scores, priors, jars (reset clears pages too)
 ./target/release/donsetch-core cache clear              # forget cached pages, keep what was learned
 ```
@@ -77,7 +81,7 @@ V5_ENGINE_LOG=1 ./target/release/donsetch-core fetch https://www.imdb.com/ --ide
 | `src/fixture_tests.rs`, `fixtures/aws-waf/` | The three AWS WAF shapes (goku, legacy inline, interstitial) run from captured bundles against a local verifier |
 | `src/session_tests.rs` | The library seam: threads, `spawn_blocking`, proxy, body capture, vendor escalation, route memory, state location |
 | `src/cache_tests.rs`, `src/redirect_tests.rs`, `src/revalidation_tests.rs` | The page cache against a local site that changes, lies, walls and redirects under it |
-| `src/main.rs` | CLI: `fetch`, `probe`, `bench`, `identities`, `state`, `cache` |
+| `src/main.rs` | CLI: `fetch`, `probe`, `bench`, `identities`, `scorecard`, `state`, `cache` |
 
 ## Rules
 

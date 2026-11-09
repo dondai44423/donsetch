@@ -71,6 +71,7 @@ fn main() {
         "probe" => command_probe(&flags),
         "bench" => command_bench(&flags),
         "identities" => command_identities(),
+        "scorecard" => command_scorecard(&flags),
         "state" => command_state(&arguments, &flags),
         "cache" => {
             donsetch_core::cache::PageCache::for_state().clear();
@@ -79,7 +80,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: donsetch-core <fetch <url>|probe --targets <file>|bench --targets <file>|identities|state>"
+                "usage: donsetch-core <fetch <url>|probe --targets <file>|bench --targets <file>|identities|scorecard|state>"
             );
             2
         }
@@ -157,6 +158,159 @@ fn command_identities() -> i32 {
         println!("         {}", identity.note);
     }
     0
+}
+
+/// What one identity actually put on the wire, as a public fingerprint echo
+/// reads it.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct WirePrint {
+    ja4: String,
+    peetprint: String,
+    akamai: String,
+    user_agent: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScoreBaseline {
+    endpoint: String,
+    identities: std::collections::BTreeMap<String, WirePrint>,
+}
+
+/// The live wire every browser identity presents, diffed against the recorded
+/// baseline.
+///
+/// An identity is a claim until it is measured, and the claim rots quietly: a
+/// dependency bump, a profile edit or a browser release changes the TLS/HTTP-2
+/// shape while the user agent still says the old version. One request per
+/// identity to a public fingerprint echo, every field compared; `--record`
+/// rewrites the baseline deliberately, never automatically.
+fn command_scorecard(flags: &Flags) -> i32 {
+    const ENDPOINT: &str = "https://tls.peet.ws/api/all";
+    const BASELINE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scorecard-baseline.json");
+    let field = |json: &serde_json::Value, path: [&str; 2]| -> String {
+        json.get(path[0])
+            .and_then(|inner| inner.get(path[1]))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut measured = std::collections::BTreeMap::new();
+    let mut unreachable = Vec::new();
+    for identity in identity::PORTFOLIO
+        .iter()
+        .filter(|identity| identity.family == identity::Family::Browser)
+    {
+        let options = Options {
+            capture_body: true,
+            proxy: None,
+            cache: false,
+            revalidate: false,
+            arrival: false,
+            max_tries: 1,
+            deadline: Duration::from_secs(10),
+            contract: Some(Contract::generic()),
+            persist: false,
+            identity: Some(identity.name.to_string()),
+            pace_ms: 900,
+            engine: envelope::Limits::from_env(),
+            policy: Default::default(),
+        };
+        let mut session = Worker::new(false);
+        let outcome = session.fetch(ENDPOINT, &options);
+        let Some(body) = outcome.body.as_deref() else {
+            unreachable.push(format!("{}: no body ({:?})", identity.name, outcome.class));
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+            unreachable.push(format!("{}: the echo did not answer JSON", identity.name));
+            continue;
+        };
+        measured.insert(
+            identity.name.to_string(),
+            WirePrint {
+                ja4: field(&json, ["tls", "ja4"]),
+                peetprint: field(&json, ["tls", "peetprint_hash"]),
+                akamai: field(&json, ["http2", "akamai_fingerprint_hash"]),
+                user_agent: json
+                    .get("user_agent")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+        );
+    }
+    if flags.switches.contains("record") {
+        let baseline = ScoreBaseline {
+            endpoint: ENDPOINT.to_string(),
+            identities: measured,
+        };
+        let Ok(json) = serde_json::to_string_pretty(&baseline) else {
+            eprintln!("scorecard: cannot serialise the baseline");
+            return 1;
+        };
+        if let Err(error) = std::fs::write(BASELINE, format!("{json}\n")) {
+            eprintln!("scorecard: cannot write {BASELINE}: {error}");
+            return 1;
+        }
+        println!("recorded {} identities in {BASELINE}", baseline.identities.len());
+        return 0;
+    }
+    if flags.switches.contains("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&measured).unwrap_or_default()
+        );
+    }
+    let Some(raw) = std::fs::read_to_string(BASELINE).ok() else {
+        eprintln!("scorecard: no baseline at {BASELINE}; record one with --record");
+        return 1;
+    };
+    let Ok(baseline) = serde_json::from_str::<ScoreBaseline>(&raw) else {
+        eprintln!("scorecard: {BASELINE} does not parse");
+        return 1;
+    };
+    let mut failures = unreachable;
+    let mut checked = 0usize;
+    for (name, want) in &baseline.identities {
+        let Some(got) = measured.get(name) else {
+            failures.push(format!("{name}: no measurement this run"));
+            continue;
+        };
+        checked += 1;
+        let mut drift = Vec::new();
+        for (field, want, got) in [
+            ("ja4", &want.ja4, &got.ja4),
+            ("peetprint", &want.peetprint, &got.peetprint),
+            ("akamai", &want.akamai, &got.akamai),
+            ("user-agent", &want.user_agent, &got.user_agent),
+        ] {
+            if want != got {
+                drift.push(format!("{field}: {want} -> {got}"));
+            }
+        }
+        if drift.is_empty() {
+            if !flags.switches.contains("quiet") {
+                println!("{name:<14} ok  {}", &got.ja4);
+            }
+        } else {
+            failures.push(format!("{name}: {}", drift.join("; ")));
+        }
+    }
+    for failure in &failures {
+        println!("DRIFT {failure}");
+    }
+    if failures.is_empty() {
+        println!("scorecard: {checked} identities match the baseline");
+        0
+    } else {
+        println!(
+            "scorecard: {} of {} identities drifted or were unmeasurable; re-capture deliberately \
+and record with `donsetch-core scorecard --record`",
+            failures.len(),
+            baseline.identities.len()
+        );
+        1
+    }
 }
 
 fn command_state(arguments: &[String], flags: &Flags) -> i32 {
