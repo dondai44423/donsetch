@@ -27,6 +27,7 @@
 //!   as the page drops it; elsewhere an unpublished price reads `N/A`.
 
 mod bulk;
+mod grid;
 mod locale;
 
 use std::collections::{BTreeSet, HashMap};
@@ -41,7 +42,7 @@ const DEFAULT_REGION: &str = "US East (Ohio)";
 const S3_REGION: &str = "US East (N. Virginia)";
 
 /// Pages this contract reads, and the hosts their price files are served from.
-const PAGE_HOST: &str = "aws.amazon.com";
+pub(crate) const PAGE_HOST: &str = "aws.amazon.com";
 const DATA_HOST_SUFFIX: &str = ".awsstatic.com";
 
 /// A page's price tables draw on a handful of files (S3's on a dozen,
@@ -205,7 +206,7 @@ fn tag_end(html: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Attributes of the one tag in `tag`, entity-decoded the way a browser reads them.
+/// Attributes of the one tag in `tag` that carries the pricing markup.
 fn attributes(tag: &str) -> HashMap<String, String> {
     let doc = scraper::Html::parse_fragment(tag);
     doc.root_element()
@@ -233,6 +234,18 @@ fn endpoint_ok(endpoint: &str) -> bool {
             .host_str()
             .is_some_and(|h| h.ends_with(DATA_HOST_SUFFIX))
         && url.path().starts_with("/pricing/")
+}
+
+/// The EC2 on-demand grid this page carries: where the iframe sits, the data
+/// file its app reads, and the selection the app shows by default.
+pub(crate) fn grid_plan(html: &str, page: &str) -> Option<(usize, String, &'static str)> {
+    let page = url::Url::parse(page).ok()?;
+    grid::plan(html, &page).map(|grid| (grid.insert_at, grid.url, grid.region))
+}
+
+/// The grid's rows for one selection, or `None` when the file is not its shape.
+pub(crate) fn grid_table(json: &Value, region: &str) -> Option<String> {
+    grid::render(json, region)
 }
 
 fn region_for(page: &url::Url) -> &'static str {

@@ -208,8 +208,42 @@ impl CoreFetcher {
         };
         let data: std::collections::HashMap<String, serde_json::Value> =
             files.into_iter().flatten().collect();
-        if let Some(filled) = crate::fetch::pricing::apply(html, &out.url, &data) {
-            out.body = filled.into_bytes();
+        let mut body = crate::fetch::pricing::apply(html, &out.url, &data)
+            .unwrap_or_else(|| html.to_string());
+        // The EC2 on-demand page's instance grid is not one of its templates:
+        // its iframe app builds the table at run time from its own price file.
+        // Read that file for the selection the app opens with and put the rows
+        // where the iframe sits (see [`crate::fetch::pricing::grid`]).
+        if let Some((at, url, region)) = crate::fetch::pricing::grid_plan(&body, &out.url) {
+            let origin = [(
+                "origin".to_string(),
+                format!("https://{}", crate::fetch::pricing::PAGE_HOST),
+            )];
+            let referer = out.url.as_str();
+            let reply = tokio::time::timeout(
+                PRICE_FILES_BUDGET,
+                self.once(OneShot {
+                    url: &url,
+                    conditional: &origin,
+                    proxy,
+                    use_jar: false,
+                    referer: Some(referer),
+                    class: RequestClass::Fetch,
+                    user_agent: None,
+                }),
+            )
+            .await;
+            if let Ok(Ok(reply)) = reply
+                && reply.status == 200
+                && reply.body.len() <= PRICE_FILE_MAX
+                && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&reply.body)
+                && let Some(table) = crate::fetch::pricing::grid_table(&json, region)
+            {
+                body.insert_str(at, &table);
+            }
+        }
+        if body != html {
+            out.body = body.into_bytes();
         }
     }
 
