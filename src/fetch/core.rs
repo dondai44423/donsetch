@@ -56,13 +56,13 @@ fn document_budget() -> Duration {
     }
 }
 
-/// A one-shot read's ceiling; callers wrap tighter deadlines around it. A file
-/// (the update tarball) is the longest thing read this way.
 /// How long an AWS pricing page waits for its price files, and the largest one
 /// it reads: a page that cannot have them in this time is served as it came.
 const PRICE_FILES_BUDGET: Duration = Duration::from_secs(8);
 const PRICE_FILE_MAX: usize = 16 * 1024 * 1024;
 
+/// A one-shot read's ceiling; callers wrap tighter deadlines around it. A file
+/// (the update tarball) is the longest thing read this way.
 const ONCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The identity a one-shot read presents: a real client profile from the
