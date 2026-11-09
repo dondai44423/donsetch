@@ -135,7 +135,17 @@ fn worth_second_ask(status: &str) -> bool {
         "no-results" | "pacing-timeout" | "late" | "empty-parse"
     ) && !status.starts_with("invalid-config")
         && !status.starts_with("rate-limited")
-        && !status.starts_with("blocked")
+        // A wall that asks a human, a login or a limit is the source asking us
+        // to stop; a bare refusal (403) is one a different lane can clear.
+        && ![
+            "blocked:captcha",
+            "blocked:challenge",
+            "blocked:login",
+            "blocked:paywall",
+            "blocked:429",
+        ]
+        .iter()
+        .any(|wall| status.starts_with(wall))
 }
 
 tokio::task_local! {
