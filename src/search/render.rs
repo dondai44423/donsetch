@@ -140,9 +140,12 @@ pub fn census(report: &[super::EngineReport]) -> String {
 pub fn source_states(report: &[super::EngineReport]) -> Vec<(String, usize, String)> {
     use std::collections::BTreeMap;
     let mut best: BTreeMap<&str, &super::EngineReport> = BTreeMap::new();
+    // The most informative attempt speaks for the source: an answer (even an
+    // empty or off-query one) beats a scheduling outcome, so a source asked
+    // once and skipped once is not reported as "not asked".
     for entry in report {
         let slot = best.entry(entry.engine.as_str()).or_insert(entry);
-        if matches!(entry.status.as_str(), "ok" | "thin" | "cached") {
+        if rank_state(&entry.status) > rank_state(&slot.status) {
             *slot = entry;
         }
     }
@@ -155,6 +158,20 @@ pub fn source_states(report: &[super::EngineReport]) -> Vec<(String, usize, Stri
             )
         })
         .collect()
+}
+
+/// How much a status says about a source, from "we never asked" to "it refused".
+pub(crate) fn rank_state(status: &str) -> u8 {
+    match status.split(':').next().unwrap_or(status) {
+        "not-asked" | "pacing-timeout" => 0,
+        "rested" => 1,
+        "late" => 2,
+        // A wall is worth saying — but an answer, even an empty one, is what
+        // the source actually did.
+        "off-query" | "no-results" | "empty-parse" | "thin" => 4,
+        "ok" | "cached" => 5,
+        _ => 3,
+    }
 }
 
 /// The census vocabulary: `answered`, `empty`, `off`, `rested`, `not asked`,

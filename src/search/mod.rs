@@ -27,6 +27,7 @@ mod locale;
 mod news;
 mod persist;
 mod render;
+pub(crate) use render::rank_state;
 mod resolve;
 mod tasks;
 
@@ -946,6 +947,9 @@ impl Searcher {
         forced_intent: Option<Intent>,
     ) -> Result<SearchOutcome, FetchError> {
         let started = Instant::now();
+        // The merge holds at most 12; asking for more is asking for what the
+        // cache cannot hold, and zero results is not a search.
+        let max_results = max_results.clamp(1, 12);
         if let Some(problem) = validate_query(query) {
             return Err(FetchError::Http(format!("search: {problem}")));
         }

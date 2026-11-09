@@ -417,7 +417,7 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
                     let slot = worst.entry(name).or_insert(status);
                     // Keep the more informative of the two: a wall beats a
                     // scheduling outcome.
-                    if rank_state(slot) < rank_state(status) {
+                    if crate::search::rank_state(slot) < crate::search::rank_state(status) {
                         *slot = status;
                     }
                 }
@@ -662,19 +662,6 @@ pub fn print_tools_json() {
 }
 
 // ── Tests ───────────────────────────────────────────────────
-
-/// How much a status says about a source: a wall beats a scheduling outcome,
-/// and the footer keeps the most informative one per source.
-fn rank_state(status: &str) -> u8 {
-    let head = status.split(':').next().unwrap_or(status);
-    match head {
-        "not-asked" | "pacing-timeout" => 0,
-        "rested" => 1,
-        "late" => 2,
-        "off-query" | "no-results" | "empty-parse" | "empty" => 3,
-        _ => 4,
-    }
-}
 
 #[cfg(test)]
 mod tests {
