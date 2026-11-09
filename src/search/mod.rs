@@ -3166,7 +3166,10 @@ mod tests {
     }
 
     #[test]
-    fn native_google_is_available_once_in_every_intent_roster() {
+    fn every_intent_roster_names_each_engine_once() {
+        // google and mojeek are not on this egress (blocked every query; an HTTP
+        // 200 captcha) and no longer hold a slot. What must hold is that a
+        // roster names no engine twice and keeps enough lanes for a ranking.
         for intent in [
             intent::Intent::Web,
             intent::Intent::Code,
@@ -3174,13 +3177,19 @@ mod tests {
             intent::Intent::Entity,
             intent::Intent::Paper,
         ] {
-            assert_eq!(
-                intent::engines_for(intent)
-                    .iter()
-                    .filter(|e| **e == "google")
-                    .count(),
-                1
-            );
+            let roster = intent::engines_for(intent);
+            // A paper query's answer is its three indexes: two general lanes
+            // beside them are enough, and the verticals carry the recall.
+            let floor = if matches!(intent, intent::Intent::Paper) {
+                2
+            } else {
+                3
+            };
+            assert!(roster.len() >= floor, "{intent:?}: {roster:?}");
+            let mut seen = std::collections::HashSet::new();
+            for engine in roster {
+                assert!(seen.insert(*engine), "{intent:?} names {engine} twice");
+            }
         }
     }
 
@@ -3466,8 +3475,12 @@ mod tests {
     fn governor_shrinks_width_under_stress() {
         assert_eq!(width_for_stress(0.05, 4), 4);
         assert_eq!(width_for_stress(0.30, 4), 3);
-        assert_eq!(width_for_stress(0.50, 4), 2);
-        assert_eq!(width_for_stress(0.90, 4), 2, "two families or no agreement");
+        assert_eq!(width_for_stress(0.50, 4), 3);
+        assert_eq!(
+            width_for_stress(0.90, 4),
+            3,
+            "three families are what a ranking is built from"
+        );
         assert_eq!(width_for_stress(0.90, 1), 1);
         assert_eq!(width_for_stress(0.90, 0), 0);
     }
