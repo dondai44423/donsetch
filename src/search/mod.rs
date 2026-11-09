@@ -74,6 +74,12 @@ const FANOUT_HARD_MARK: Duration = Duration::from_millis(4000);
 /// what it is.
 const FANOUT_LATE_MARK: Duration = Duration::from_millis(600);
 
+/// The longest a call waits for a lane's own pace before deciding the lane is
+/// not worth planning. A token bucket refills in seconds; a four-second wait is
+/// the ledger's own statement that the source is being asked too often, and the
+/// call reports the lane instead of spending that wait.
+const PACE_WAIT_MAX: Duration = Duration::from_millis(1200);
+
 /// The merge is thin below this: fewer than three answering sources, or fewer
 /// items than a ranking can be built from. A thin merge gets one bounded second
 /// ask (measured: it is where most of the recall lives on a bad minute).
@@ -95,6 +101,19 @@ fn lane_budget() -> Duration {
     )
 }
 
+/// Delay a lane's task by the pace it owes the source, without holding up the
+/// lanes beside it. A paced lane is asked, not skipped: a token bucket refill
+/// is the lane's own pace, not a wall.
+fn paced<'a>(pace: Duration, fut: tasks::TaskFut<'a>) -> tasks::TaskFut<'a> {
+    if pace.is_zero() {
+        return fut;
+    }
+    Box::pin(async move {
+        tokio::time::sleep(pace).await;
+        fut.await
+    })
+}
+
 /// Contributing sources and items in what has landed so far.
 fn answered(outcomes: &[(String, EngineResult)]) -> (usize, usize) {
     outcomes
@@ -113,9 +132,10 @@ fn worth_second_ask(status: &str) -> bool {
     // refuses (search waits, it does not rotate to beat a limit).
     !matches!(
         status,
-        "no-results" | "pacing-timeout" | "late" | "blocked:captcha" | "blocked:429"
+        "no-results" | "pacing-timeout" | "late" | "empty-parse"
     ) && !status.starts_with("invalid-config")
         && !status.starts_with("rate-limited")
+        && !status.starts_with("blocked")
 }
 
 tokio::task_local! {
@@ -587,7 +607,16 @@ impl Searcher {
 
     /// Decide whether one lane is planned: the ledger's standing first (a
     /// rested lane is a real answer, not a failure), then the request budget.
-    fn plan_lane(&self, source: &str, skipped: &mut Vec<(String, EngineResult)>) -> bool {
+    ///
+    /// Returns the wait the lane owes its own pace before the request may go
+    /// out (`Some(0)` when the bucket has a token). A lane the ledger is
+    /// resting, or one whose pace is longer than this call will pay, is
+    /// reported rather than silently dropped.
+    fn plan_lane(
+        &self,
+        source: &str,
+        skipped: &mut Vec<(String, EngineResult)>,
+    ) -> Option<Duration> {
         let key = ledger::key(lane_source(source), lane_of(source));
         let state = self
             .ledger
@@ -595,13 +624,25 @@ impl Searcher {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .ready(&key);
         match state {
-            ledger::State::Ready => true,
+            ledger::State::Ready => Some(Duration::ZERO),
+            ledger::State::Paced(secs) => {
+                let wait = Duration::from_secs(secs);
+                if wait <= PACE_WAIT_MAX {
+                    Some(wait)
+                } else {
+                    skipped.push((
+                        source.to_string(),
+                        Err((format!("paced:{secs}"), "ledger".into(), false)),
+                    ));
+                    None
+                }
+            }
             ledger::State::Rested(secs) => {
                 skipped.push((
                     source.to_string(),
                     Err((format!("rested:{secs}"), "ledger".into(), false)),
                 ));
-                false
+                None
             }
         }
     }
@@ -1227,20 +1268,23 @@ impl Searcher {
         for (engine, q, eg) in assign_egresses(self.pool.as_ref(), assignments, &mut used_egresses)
         {
             let name = engine_name(&engine).to_string();
-            if !self.plan_lane(&name, &mut skipped) {
+            let Some(pace) = self.plan_lane(&name, &mut skipped) else {
                 continue;
-            }
+            };
             futures.push((
                 name,
-                Box::pin(tasks::engine_task_with_budget(
-                    engine,
-                    q,
-                    eg.id,
-                    eg.proxy,
-                    context,
-                    lane_budget(),
-                    None,
-                )),
+                paced(
+                    pace,
+                    Box::pin(tasks::engine_task_with_budget(
+                        engine,
+                        q,
+                        eg.id,
+                        eg.proxy,
+                        context,
+                        lane_budget(),
+                        None,
+                    )),
+                ),
             ));
         }
         // Verticals: direct, friendly APIs.
@@ -1250,19 +1294,22 @@ impl Searcher {
             .collect();
         let mut vfuts: Vec<(String, TaskFut)> = Vec::new();
         for v in verticals {
-            if !self.plan_lane(v, &mut skipped) {
+            let Some(pace) = self.plan_lane(v, &mut skipped) else {
                 continue;
-            }
+            };
             vfuts.push((
                 engine_name(v).to_string(),
-                Box::pin(vertical_task(
-                    v.to_string(),
-                    query.to_string(),
-                    &self.fetcher,
-                    None,
-                    lane_budget(),
-                    locale,
-                )),
+                paced(
+                    pace,
+                    Box::pin(vertical_task(
+                        v.to_string(),
+                        query.to_string(),
+                        &self.fetcher,
+                        None,
+                        lane_budget(),
+                        locale,
+                    )),
+                ),
             ));
         }
         if matches!(intent, Intent::Code | Intent::Paper | Intent::Entity) {
@@ -1280,15 +1327,18 @@ impl Searcher {
         // the first ones instead of arriving late.
         if let Some(plan) = resolve::plan(query)
             && plan.ecosystem.is_none()
-            && self.plan_lane("registry", &mut skipped)
+            && let Some(pace) = self.plan_lane("registry", &mut skipped)
         {
             futures.push((
                 "registry".to_string(),
-                Box::pin(tasks::registry_task(
-                    plan,
-                    &self.fetcher,
-                    Duration::from_millis(900),
-                )),
+                paced(
+                    pace,
+                    Box::pin(tasks::registry_task(
+                        plan,
+                        &self.fetcher,
+                        Duration::from_millis(900),
+                    )),
+                ),
             ));
         }
 
@@ -1298,7 +1348,7 @@ impl Searcher {
         // window — but the open web still runs, because the official page an
         // announcement points at is often not in the wire's index.
         if news::wants_news(query, intent) {
-            if self.plan_lane("bing-news", &mut skipped) {
+            if let Some(pace) = self.plan_lane("bing-news", &mut skipped) {
                 // The wire is a search endpoint, not a publisher's API: it rides
                 // the pool like any engine, so one direct-IP throttle does not
                 // silence every news query.
@@ -1312,32 +1362,41 @@ impl Searcher {
                 };
                 futures.push((
                     "bing-news".to_string(),
-                    Box::pin(tasks::news_wire_task(
-                        query.to_string(),
-                        &self.fetcher,
-                        news_proxy,
-                        lane_budget(),
-                    )),
+                    paced(
+                        pace,
+                        Box::pin(tasks::news_wire_task(
+                            query.to_string(),
+                            &self.fetcher,
+                            news_proxy,
+                            lane_budget(),
+                        )),
+                    ),
                 ));
             }
-            if self.plan_lane("feed", &mut skipped) {
+            if let Some(pace) = self.plan_lane("feed", &mut skipped) {
                 futures.push((
                     "feed".to_string(),
-                    Box::pin(tasks::news_feed_task(
-                        query.to_string(),
-                        &self.fetcher,
-                        lane_budget(),
-                    )),
+                    paced(
+                        pace,
+                        Box::pin(tasks::news_feed_task(
+                            query.to_string(),
+                            &self.fetcher,
+                            lane_budget(),
+                        )),
+                    ),
                 ));
             }
-            if self.plan_lane("gdelt", &mut skipped) {
+            if let Some(pace) = self.plan_lane("gdelt", &mut skipped) {
                 futures.push((
                     "gdelt".to_string(),
-                    Box::pin(tasks::news_gdelt_task(
-                        query.to_string(),
-                        &self.fetcher,
-                        lane_budget(),
-                    )),
+                    paced(
+                        pace,
+                        Box::pin(tasks::news_gdelt_task(
+                            query.to_string(),
+                            &self.fetcher,
+                            lane_budget(),
+                        )),
+                    ),
                 ));
             }
         }
@@ -1544,6 +1603,62 @@ impl Searcher {
             }
             if !retry.is_empty() {
                 let secs: futures_util::stream::FuturesUnordered<_> = retry
+                    .into_iter()
+                    .map(|(name, fut)| {
+                        Box::pin(async move { (name, fut.await) })
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = (String, (String, EngineResult)),
+                                        > + Send,
+                                >,
+                            >
+                    })
+                    .collect();
+                let left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if let Ok(done) =
+                    tokio::time::timeout(left, futures_util::future::join_all(secs)).await
+                {
+                    for (name, outcome) in done {
+                        if let Some(n) = outstanding.get_mut(&name) {
+                            *n = n.saturating_sub(1);
+                        }
+                        outcomes.push(outcome);
+                    }
+                }
+            }
+        }
+
+        // A call with nothing yet gives the lanes the scheduler cut one more ask
+        // inside the hard mark: a straggler is slow, not absent, and an empty
+        // answer is the one outcome a caller cannot use. This is not a rotation
+        // around a limit — a lane that refused was rested by the ledger and is
+        // not outstanding here.
+        if answered(&outcomes).1 == 0 && tokio::time::Instant::now() < hard_deadline {
+            let mut rescue: Vec<(String, TaskFut)> = Vec::new();
+            for (name, pending) in &outstanding {
+                if *pending == 0 || !engines.contains(&name.as_str()) {
+                    continue;
+                }
+                let Some(eg) = self.pool.pick(name, &used_egresses, true) else {
+                    continue;
+                };
+                let budget = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+                rescue.push((
+                    name.clone(),
+                    Box::pin(tasks::engine_task_with_budget(
+                        name.clone(),
+                        query.to_string(),
+                        eg.id,
+                        eg.proxy,
+                        context,
+                        budget.min(SECOND_ASK),
+                        None,
+                    )),
+                ));
+            }
+            if !rescue.is_empty() {
+                let secs: futures_util::stream::FuturesUnordered<_> = rescue
                     .into_iter()
                     .map(|(name, fut)| {
                         Box::pin(async move { (name, fut.await) })
@@ -2194,12 +2309,13 @@ pub(crate) fn validate_query(query: &str) -> Option<String> {
 /// agree with anything. A single engine's own failures are the ledger's to
 /// rest, lane by lane.
 fn width_for_stress(stress: f64, available: usize) -> usize {
+    // Below the healthy mark every lane is asked. Above it the roster narrows
+    // to three, never fewer: three independent families are what a ranking is
+    // built from, and a two-lane merge is a coin toss presented as an answer.
     if stress < 0.15 {
         available
-    } else if stress < 0.40 {
-        available.min(3)
     } else {
-        available.min(2)
+        available.min(3)
     }
 }
 

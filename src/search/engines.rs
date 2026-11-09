@@ -584,6 +584,19 @@ pub fn serp_url_in(
             _ => String::new(),
         };
         url.push_str(&extra);
+    } else {
+        // A Latin query names no language, but the source still has to pick a
+        // market: without one, Bing answered this egress's own locale (a Nepali
+        // result page for an English query, which then looked off-query and
+        // cost the lane its standing). The default is the tool's own English
+        // market, stated rather than inherited from wherever the caller runs.
+        let extra = match engine {
+            "bing" | "bing_rss" => "&setlang=en&cc=us",
+            "ddg" | "ddg_lite" | "ddg_html" => "&kl=us-en",
+            "yahoo" => "&vl=lang_en",
+            _ => "",
+        };
+        url.push_str(extra);
     }
     Some(url)
 }

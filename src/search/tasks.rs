@@ -169,15 +169,74 @@ pub(super) async fn engine_task_with_budget(
         return (label, Err((status.into(), egress_id, true)));
     }
     if out.status == 429 || !matches!(out.verdict, Verdict::ContentOk) {
-        return (
-            label,
-            Err((format!("blocked:{}", out.status), egress_id, true)),
-        );
+        // A challenge is a wall, but Bing's layout page is a moving target and
+        // its own RSS interface answers the same question as data. The feed is
+        // asked once before the lane is called walled.
+        if engine == "bing"
+            && out.status != 429
+            && super::query::compile(&query).site.is_none()
+            && let Some((rss_hits, rss_class, rss_items)) =
+                bing_rss_fallback(&query, lane, fetcher, deadline, locale).await
+            && rss_class.contributes()
+        {
+            return (
+                label,
+                Ok(LaneAnswer {
+                    hits: rss_hits,
+                    items: rss_items,
+                    ms: started.elapsed().as_millis() as u64,
+                    egress: egress_id,
+                    engine_lane: true,
+                    instant: None,
+                    class: rss_class,
+                    requests: 2,
+                }),
+            );
+        }
+        // A 2xx that is not content is a wall, and a wall is named: reporting
+        // `blocked:200` told the ledger the source refused but not what it was,
+        // so a captcha page and a dry page read the same in the census.
+        let status = if out.status == 429 {
+            "blocked:429".to_string()
+        } else {
+            match out.verdict {
+                Verdict::Challenge(_) => "blocked:challenge".to_string(),
+                Verdict::AuthWall => "blocked:login".to_string(),
+                Verdict::Paywall => "blocked:paywall".to_string(),
+                Verdict::SoftNotFound => "no-results".to_string(),
+                Verdict::Blocked | Verdict::ContentOk => format!("blocked:{}", out.status),
+            }
+        };
+        return (label, Err((status, egress_id, true)));
     }
     let (mut hits, instant) = engines::parse_with_instant(&engine, &html, &url);
     // A page with no results that is a challenge is a wall, not an empty
     // answer: it fails the lane, and the ledger rests it on this refusal.
+    // Bing is the exception: its layout page is a moving target and its own
+    // RSS interface answers the same question as data, so the feed is asked
+    // once before the lane is called walled.
     if hits.is_empty() && engines::serp_challenge(&html) {
+        let scoped = super::query::compile(&query).site.is_some();
+        if engine == "bing"
+            && !scoped
+            && let Some((rss_hits, rss_class, rss_items)) =
+                bing_rss_fallback(&query, lane, fetcher, deadline, locale).await
+            && rss_class.contributes()
+        {
+            return (
+                label,
+                Ok(LaneAnswer {
+                    hits: rss_hits,
+                    items: rss_items,
+                    ms: started.elapsed().as_millis() as u64,
+                    egress: egress_id,
+                    engine_lane: true,
+                    instant: None,
+                    class: rss_class,
+                    requests: 2,
+                }),
+            );
+        }
         return (label, Err(("blocked:captcha".into(), egress_id, true)));
     }
     let scoped = super::query::compile(&query).site;

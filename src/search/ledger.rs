@@ -26,7 +26,11 @@ const THROTTLE_BASE: u64 = 60;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Ready,
-    /// Seconds until the lane may be asked again.
+    /// Seconds until the lane's own pace allows the next request (the token
+    /// bucket). Not a wall and not a rest: a caller may wait it out and ask.
+    Paced(u64),
+    /// Seconds until the lane may be asked again after a refusal or a run of
+    /// transport failures.
     Rested(u64),
 }
 
@@ -198,7 +202,7 @@ impl Ledger {
         }
         if lane.tokens < 1.0 {
             let wait = ((1.0 - lane.tokens) / rate).ceil().max(1.0) as u64;
-            return State::Rested(wait);
+            return State::Paced(wait);
         }
         State::Ready
     }
@@ -375,6 +379,7 @@ mod tests {
         l.record(&k, Outcome::Blocked, None);
         match l.ready(&k) {
             State::Rested(secs) => assert!(secs > 30, "{secs}"),
+            State::Paced(wait) => panic!("a blocked lane must rest, not pace {wait}s"),
             State::Ready => panic!("a blocked lane must rest"),
         }
         let first = l.lane(&k).unwrap().rest_secs;
@@ -412,6 +417,7 @@ mod tests {
         l.record(&k, Outcome::Throttled, Some(120));
         match l.ready(&k) {
             State::Rested(secs) => assert!((110..=120).contains(&secs), "{secs}"),
+            State::Paced(wait) => panic!("a throttle must rest the lane, not pace {wait}s"),
             State::Ready => panic!("a 429 must rest the lane"),
         }
     }

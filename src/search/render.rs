@@ -187,6 +187,7 @@ pub(crate) fn rank_state(status: &str) -> u8 {
     match status.split(':').next().unwrap_or(status) {
         "not-asked" | "pacing-timeout" => 0,
         "rested" => 1,
+        "paced" => 1,
         "late" => 2,
         // A wall is worth saying — but an answer, even an empty one, is what
         // the source actually did.
@@ -207,6 +208,7 @@ fn state_word(status: &str) -> &'static str {
         "no-results" | "empty" | "empty-parse" => "empty",
         "off-query" => "off",
         "rested" | "rate-limited" => "rested",
+        "paced" => "paced",
         "not-asked" | "pacing-timeout" => "not asked",
         "late" => "late",
         _ => "failed",
@@ -299,9 +301,12 @@ pub fn render_markdown(
     }
     if out.results.is_empty() {
         md.push_str(
-            "\n*0 results : try a simpler query, a different intent (news/code/paper), \
-or add an API-key provider (`donsetch keys add`)*\n",
+            "\n*0 results: retry once before rephrasing — a slow source is not a dry \
+query — then try a simpler query, a different intent (news/code/paper), or an \
+API-key provider (`donsetch keys add`)*\n",
         );
+    } else if out.results.len() < 3 {
+        md.push_str("\n*thin answer: a retry asks the sources that were late*\n");
     }
     let source = out.provider.as_deref().unwrap_or("local search");
     md.push_str(&format!(
@@ -449,6 +454,26 @@ fn egress_label(raw: &str) -> String {
 }
 
 pub fn render_meta(out: &SearchOutcome) -> Value {
+    // What a caller should know without reading the census: whether the list is
+    // an answer, and what to do when it is not. `ok` stays true for an empty
+    // answer ("nothing found" is a result), so these three fields carry the
+    // distinction an agent branches on.
+    let answered = out
+        .report
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "ok" | "cached" | "thin"))
+        .count();
+    let underfilled = out.results.len() < 3;
+    let degraded = answered < 2;
+    let next_action = if out.results.is_empty() {
+        Some("retry once: no source answered inside the budget; the second call usually lands them")
+    } else if underfilled {
+        Some("retry once, or rephrase: fewer results than a list to choose from")
+    } else if degraded {
+        Some("one source answered; a retry asks for independent confirmation")
+    } else {
+        None
+    };
     let instant = out.instant.as_ref().map(|ans| {
         json!({
             "kind": ans.kind,
@@ -477,6 +502,11 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
                 .collect::<serde_json::Map<String, serde_json::Value>>())
         },
         "provider": out.provider,
+        "filled": !out.results.is_empty(),
+        "underfilled": underfilled,
+        "degraded": degraded,
+        "answered_sources": answered,
+        "next_action": next_action,
         "rerank": if out.reranked { "on" } else { "off (RRF+BM25 fallback)" },
         "instant": instant,
         "results": out.results.iter().map(|r| {

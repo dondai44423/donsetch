@@ -186,10 +186,26 @@ pub(super) fn search_model_meta(out: &crate::search::SearchOutcome, handles: &[S
         "sources": sources,
         "provider": out.provider.as_deref().unwrap_or("keyless"),
     });
+    // The answer's standing, as fields a caller can branch on without reading
+    // the census: a list to choose from, a thin list, or nothing.
+    let answered = out
+        .report
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "ok" | "cached" | "thin"))
+        .count();
+    item["filled"] = json!(!out.results.is_empty());
+    item["underfilled"] = json!(out.results.len() < 3);
+    item["degraded"] = json!(answered < 2);
+    item["answered_sources"] = json!(answered);
     if out.results.is_empty() && !out.report.is_empty() {
         item["next_action"] = json!(
             "no source returned matching items; rephrase or retry another source before concluding that no answer exists"
         );
+    } else if out.results.len() < 3 {
+        item["next_action"] =
+            json!("thin answer: a retry usually adds the sources that were late");
+    } else if answered < 2 {
+        item["next_action"] = json!("one source answered; a retry asks for independent confirmation");
     }
     // Instant answers are decision aids, not ranked evidence: they
     // ride structuredContent (not the organic list) with their source.

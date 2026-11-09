@@ -267,11 +267,13 @@ pub fn detect(query: &str) -> Intent {
 /// lane because proxy IPs get CAPTCHA'd/429'd.
 pub fn engines_for(intent: Intent) -> &'static [&'static str] {
     match intent {
-        // 6 engines, 4 index families (bing, mojeek, brave, google).
+        // 3 engines, 3 index families: every lane here answers this egress.
+        // mojeek is not one of them: it answers our identity with an HTTP 200
+        // captcha page, so a slot spent on it is a slot not spent on an answer.
         Intent::Web | Intent::Code | Intent::News | Intent::Entity => {
-            &["bing", "ddg", "mojeek", "yahoo", "brave", "google"]
+            &["bing", "ddg", "yahoo", "brave"]
         }
-        Intent::Paper => &["bing", "ddg", "mojeek", "google"],
+        Intent::Paper => &["bing", "ddg"],
     }
 }
 
