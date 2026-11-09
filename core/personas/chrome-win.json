@@ -1,0 +1,28 @@
+{
+ "_source": "Google Chrome 156.0.8078.80, Windows (platformVersion 19.0.0), captured 2026-11-09 against tls.peet.ws; full capture in donsetch-evidence/research/persona/chrome-win-156",
+ "navigator": {
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+  "userAgentData": {
+   "brands": [
+    {
+     "brand": "Not:A-Brand",
+     "version": "8"
+    },
+    {
+     "brand": "Chromium",
+     "version": "156"
+    },
+    {
+     "brand": "Google Chrome",
+     "version": "156"
+    }
+   ],
+   "mobile": false,
+   "platform": "Windows"
+  }
+ },
+ "requestHeaders": {
+  "accept-language": "en-US,en;q=0.9",
+  "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+ }
+}

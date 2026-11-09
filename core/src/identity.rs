@@ -35,6 +35,10 @@ pub struct Persona {
 /// into the binary, so it does not depend on the working directory.
 const CHROME_LOCAL: &str = include_str!("../personas/chrome-local.json");
 
+/// Google Chrome on Windows, captured the same way
+/// (`~/Projects/donsetch-evidence/research/persona/chrome-win-156`).
+const CHROME_WINDOWS: &str = include_str!("../personas/chrome-win.json");
+
 /// `V5_PERSONA` names a full capture (or a distilled one) to use instead.
 fn persona_source() -> Option<String> {
     match std::env::var("V5_PERSONA") {
@@ -43,47 +47,57 @@ fn persona_source() -> Option<String> {
     }
 }
 
+/// The local reference browser's persona (`chrome-local`).
 pub fn persona() -> Option<&'static Persona> {
     static PERSONA: OnceLock<Option<Persona>> = OnceLock::new();
     PERSONA
-        .get_or_init(|| {
-            let raw = persona_source()?;
-            let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            let navigator = &value["navigator"];
-            let data = &navigator["userAgentData"];
-            let brands = data["brands"]
-                .as_array()
-                .map(|brands| {
-                    brands
-                        .iter()
-                        .filter_map(|brand| {
-                            Some(format!(
-                                "\"{}\";v=\"{}\"",
-                                brand["brand"].as_str()?,
-                                brand["version"].as_str()?
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            Some(Persona {
-                user_agent: navigator["userAgent"].as_str()?.to_string(),
-                brands,
-                platform: data["platform"].as_str().unwrap_or("Linux").to_string(),
-                mobile: data["mobile"].as_bool().unwrap_or(false),
-                accept_language: value["requestHeaders"]["accept-language"]
-                    .as_str()
-                    .map(str::to_string),
-                accept: value["requestHeaders"]["accept"]
-                    .as_str()
-                    .map(str::to_string),
-                webgl: value.get("webgl").cloned(),
-                hardware_concurrency: navigator["hardwareConcurrency"].as_u64(),
-                screen: value.get("screen").cloned(),
-            })
-        })
+        .get_or_init(|| parse_persona(&persona_source()?))
         .as_ref()
+}
+
+/// The Windows reference browser's persona (`chrome-win`).
+fn windows_persona() -> Option<&'static Persona> {
+    static PERSONA: OnceLock<Option<Persona>> = OnceLock::new();
+    PERSONA
+        .get_or_init(|| parse_persona(CHROME_WINDOWS))
+        .as_ref()
+}
+
+fn parse_persona(raw: &str) -> Option<Persona> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let navigator = &value["navigator"];
+    let data = &navigator["userAgentData"];
+    let brands = data["brands"]
+        .as_array()
+        .map(|brands| {
+            brands
+                .iter()
+                .filter_map(|brand| {
+                    Some(format!(
+                        "\"{}\";v=\"{}\"",
+                        brand["brand"].as_str()?,
+                        brand["version"].as_str()?
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    Some(Persona {
+        user_agent: navigator["userAgent"].as_str()?.to_string(),
+        brands,
+        platform: data["platform"].as_str().unwrap_or("Linux").to_string(),
+        mobile: data["mobile"].as_bool().unwrap_or(false),
+        accept_language: value["requestHeaders"]["accept-language"]
+            .as_str()
+            .map(str::to_string),
+        accept: value["requestHeaders"]["accept"]
+            .as_str()
+            .map(str::to_string),
+        webgl: value.get("webgl").cloned(),
+        hardware_concurrency: navigator["hardwareConcurrency"].as_u64(),
+        screen: value.get("screen").cloned(),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,52 +141,49 @@ impl Identity {
                 .build()
                 .into_emulation()
         })?;
-        // The identities that carry the reference browser's own strings: a
+        // The identities that carry a reference browser's own strings: a
         // clearance that browser earned is spendable by them.
-        if self.reference_strings() {
-            if let Some(persona) = persona() {
-                let mut set = |name: &str, value: &str| {
-                    if let (Ok(name), Ok(value)) = (
-                        HeaderName::from_bytes(name.as_bytes()),
-                        HeaderValue::from_str(value),
-                    ) {
-                        emulation.headers.insert(name, value);
-                    }
-                };
-                set("user-agent", &persona.user_agent);
-                set("sec-ch-ua", &persona.brands);
-                set("sec-ch-ua-mobile", if persona.mobile { "?1" } else { "?0" });
-                set("sec-ch-ua-platform", &format!("\"{}\"", persona.platform));
-                if let Some(language) = &persona.accept_language {
-                    set("accept-language", language);
+        if let Some(persona) = self.reference() {
+            let mut set = |name: &str, value: &str| {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    emulation.headers.insert(name, value);
                 }
-                if let Some(accept) = &persona.accept {
-                    set("accept", accept);
-                }
+            };
+            set("user-agent", &persona.user_agent);
+            set("sec-ch-ua", &persona.brands);
+            set("sec-ch-ua-mobile", if persona.mobile { "?1" } else { "?0" });
+            set("sec-ch-ua-platform", &format!("\"{}\"", persona.platform));
+            if let Some(language) = &persona.accept_language {
+                set("accept-language", language);
+            }
+            if let Some(accept) = &persona.accept {
+                set("accept", accept);
             }
         }
         Some(emulation)
     }
 
-    /// Whether this identity sends the reference browser's own user agent and
-    /// client hints (its captured persona) instead of its profile's.
+    /// The reference browser whose user agent and client hints this identity
+    /// sends instead of its profile's, when it has one.
     ///
-    /// `chrome-local` always does. The Linux `chrome` identity does when the
-    /// persona is a Linux desktop Chrome: its TLS, HTTP/2 and header order were
-    /// measured identical to the reference browser's (JA4, peetprint, Akamai
-    /// HTTP/2 fingerprint, header order against Chromium 156 on the same host),
-    /// so the only thing the profile had older was the version it printed. The
-    /// Windows and Android identities keep their profile's strings: no reference
-    /// browser of those platforms exists here to measure them against.
-    fn reference_strings(&self) -> bool {
+    /// Each one's TLS (JA4, peetprint), Akamai HTTP/2 fingerprint and header
+    /// order were measured identical to its reference browser's first request,
+    /// so the only thing the profile had older was the version it printed:
+    /// `chrome-local` and the Linux `chrome` against Chromium 156 on Linux,
+    /// `chrome-win` against Google Chrome 156 on Windows.
+    fn reference(&self) -> Option<&'static Persona> {
         match self.name {
-            "chrome-local" => true,
-            "chrome" => persona().is_some_and(|persona| {
+            "chrome-local" => persona(),
+            "chrome" => persona().filter(|persona| {
                 persona.platform == "Linux"
                     && !persona.mobile
                     && persona.user_agent.contains("Chrome/")
             }),
-            _ => false,
+            "chrome-win" => windows_persona(),
+            _ => None,
         }
     }
 
@@ -409,7 +420,7 @@ pub const PORTFOLIO: &[Identity] = &[
     Identity {
         name: "chrome-win",
         family: Family::Browser,
-        note: "Chrome 149 / Windows desktop",
+        note: "Chrome 156 / Windows desktop, wire measured against Chrome on Windows",
         profile: Some((Profile::Chrome149, Platform::Windows)),
         extra: &[
             // Measured against the reference browser's own document request:
@@ -464,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn the_linux_chrome_identity_sends_the_reference_browsers_own_strings() {
+    fn each_measured_chrome_identity_sends_its_reference_browsers_own_strings() {
         let persona = persona().expect("embedded persona");
         let header = |name: &str, header: &str| {
             let emulation = lookup(name).expect(name).emulation().expect("a browser");
@@ -486,14 +497,26 @@ mod tests {
                 "{name}"
             );
         }
-        // Other platforms have no reference browser to measure: their
-        // profile's own strings stand, and say their own platform.
-        let windows = header("chrome-win", "user-agent").unwrap_or_default();
+        // Windows carries its own reference browser's strings, which name
+        // its own platform, never the local one's.
+        let windows = windows_persona().expect("embedded Windows persona");
+        assert_eq!(
+            header("chrome-win", "user-agent").as_deref(),
+            Some(windows.user_agent.as_str())
+        );
+        assert_eq!(
+            header("chrome-win", "sec-ch-ua").as_deref(),
+            Some(windows.brands.as_str())
+        );
+        assert_eq!(
+            header("chrome-win", "sec-ch-ua-platform").as_deref(),
+            Some("\"Windows\"")
+        );
+        assert!(windows.user_agent.contains("Windows NT 10.0; Win64; x64"));
+        assert!(windows.brands.contains("\"Google Chrome\""));
+        assert_ne!(windows.user_agent, persona.user_agent);
         let android = header("chrome-android", "user-agent").unwrap_or_default();
-        assert!(windows.contains("Windows"), "{windows}");
         assert!(android.contains("Android"), "{android}");
-        assert_ne!(windows, persona.user_agent);
-        assert_ne!(android, persona.user_agent);
     }
 
     #[test]
