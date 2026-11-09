@@ -110,6 +110,11 @@ pub(super) fn verdict_error(verdict: Verdict, status: u16, url: &str) -> String 
                 _ => format!("blocked: {url} returned HTTP {status}"),
             }
         }
+        // No vendor named: the page refused this client ("unsupported
+        // browser") or challenged it, and nothing identifies whose wall it is.
+        Verdict::Challenge(Vendor::Generic) => {
+            format!("bot wall: {url} refuses this client or serves a challenge that did not clear")
+        }
         Verdict::Challenge(v) => format!("bot wall: {url} is protected by {:?}", v),
         Verdict::ContentOk => format!("unexpected error: {url} (status {status})"),
     }
@@ -564,8 +569,11 @@ pub(super) fn next_action_for(verdict: Option<Verdict>, status: u16, kind: &str)
         Some(Verdict::SoftNotFound) => {
             "verify the URL (typo? deleted page?) : or web_search the page title to find the moved copy".into()
         }
+        // A human check is answered before this (it has its own message):
+        // here the site refused every client identity tried, or served a
+        // challenge none of them cleared.
         Some(Verdict::Challenge(_)) if kind == "walled" => {
-            "interactive verification needed : the local system does not solve interactive captchas".into()
+            "this site does not serve its content to this client : open it in an interactive browser, or web_search for another copy".into()
         }
         Some(Verdict::Challenge(_)) => {
             "retry later : this challenge may clear on its own".into()
@@ -1005,6 +1013,26 @@ mod stitch_tests {
 }
 #[cfg(test)]
 mod error_code_tests {
+    #[test]
+    fn a_wall_no_vendor_names_is_not_called_a_captcha() {
+        use super::*;
+        // Teams answers every identity with an "unsupported browser" page:
+        // a refusal, not a human check, and no vendor's.
+        let v = Verdict::Challenge(Vendor::Generic);
+        let msg = verdict_error(v, 200, "https://teams.microsoft.com/v2/");
+        assert!(!msg.contains("Generic"), "{msg}");
+        assert!(msg.starts_with("bot wall: "), "{msg}");
+        let next = next_action_for(Some(v), 200, verdict_kind(v, 200));
+        assert!(!next.contains("captcha"), "{next}");
+        // A named vendor is still named.
+        let named = verdict_error(
+            Verdict::Challenge(Vendor::Cloudflare),
+            403,
+            "https://a.test/",
+        );
+        assert!(named.contains("Cloudflare"), "{named}");
+    }
+
     #[test]
     fn report_audit_all_errors_supply_machine_state_and_next_action() {
         let raw = tool_error("invalid URL: not-a-url");
