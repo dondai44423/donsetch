@@ -5,6 +5,7 @@
 
 use std::time::Instant;
 
+use super::contract;
 use super::egress::EgressPool;
 use super::engines;
 use super::verticals;
@@ -183,9 +184,13 @@ pub(super) async fn engine_task_with_budget(
     }
     let mut thin = hits.len() < if scoped.is_some() { 1 } else { 3 };
     // The answer class, decided before a single item can influence ranking:
-    // an off-query answer is a bot-page wearing a 200, and its items never
-    // reach the merge whatever their rank.
-    let mut class = engines::classify(&query, &hits);
+    // every item is judged against the query's own rubric, and the source is
+    // judged by the verdicts its items earned. An off-query answer is a
+    // bot-page wearing a 200; its items never reach the merge.
+    let accepted = contract::accept(&query, std::mem::take(&mut hits));
+    let mut class = accepted.class;
+    let mut items = accepted.items;
+    hits = accepted.kept;
     let mut instant = instant;
     // bing's HTML lane is the one general source that also publishes a
     // structured answer, and the two disagree per query: the same index answers
@@ -196,13 +201,14 @@ pub(super) async fn engine_task_with_budget(
     if (!class.credits() || thin)
         && engine == "bing"
         && scoped.is_none()
-        && let Some((rss_hits, rss_class)) =
+        && let Some((rss_hits, rss_class, rss_items)) =
             bing_rss_fallback(&query, lane, fetcher, deadline).await
         && rss_class.contributes()
         && (thin || rss_class.credits())
     {
         hits = rss_hits;
         class = rss_class;
+        items = rss_items;
         thin = false;
         instant = None;
     }
@@ -221,7 +227,6 @@ pub(super) async fn engine_task_with_budget(
         };
         return (label, Err((status.into(), egress_id, true)));
     }
-    let items = hits.len();
     if let Some(lease) = &lease {
         google.finish(
             lease,
@@ -259,7 +264,7 @@ async fn bing_rss_fallback(
     lane: Option<&crate::egress::proxy::Proxy>,
     fetcher: &Fetcher,
     deadline: tokio::time::Instant,
-) -> Option<(Vec<engines::Hit>, engines::AnswerClass)> {
+) -> Option<(Vec<engines::Hit>, engines::AnswerClass, usize)> {
     if deadline.saturating_duration_since(tokio::time::Instant::now())
         < std::time::Duration::from_millis(400)
     {
@@ -285,8 +290,8 @@ async fn bing_rss_fallback(
             .unwrap_or("application/xml"),
     );
     let hits = engines::parse_rss(&body);
-    let class = engines::classify(query, &hits);
-    Some((hits, class))
+    let accepted = contract::accept(query, hits);
+    Some((accepted.kept, accepted.class, accepted.items))
 }
 
 /// One vertical's answer, bounded by `budget` rather than the engine ceiling:
@@ -312,7 +317,9 @@ pub(super) async fn vertical_task(
             vertical,
             Err((vertical_error_status(&e), "direct".into(), false)),
         ),
-        Ok(Ok(hits)) => vertical_success(vertical, hits, started.elapsed().as_millis() as u64),
+        Ok(Ok(hits)) => {
+            vertical_success(vertical, &query, hits, started.elapsed().as_millis() as u64)
+        }
     }
 }
 
@@ -324,12 +331,18 @@ pub(super) async fn vertical_task(
 /// retrieval is worst. "no-results" is excluded from retries, trust
 /// penalties, and egress fault reporting (is_engine_fault), so this
 /// stays an honest, penalty-free report.
-fn vertical_success(vertical: String, hits: Vec<engines::Hit>, ms: u64) -> (String, EngineResult) {
+fn vertical_success(
+    vertical: String,
+    query: &str,
+    hits: Vec<engines::Hit>,
+    ms: u64,
+) -> (String, EngineResult) {
+    // A first-party API's own ranking is its contract; it only loses redirects
+    // and look-alike namespaces, never its relevance order.
+    let hits = contract::accept_first_party(query, hits);
     if hits.is_empty() {
         return (vertical, Err(("no-results".into(), "direct".into(), false)));
     }
-    // A first-party API's own ranking is its contract; returning items is its
-    // only way to pass, and its class says so (see engines::vertical_class).
     let class = engines::vertical_class(&hits);
     let items = hits.len();
     (
@@ -573,7 +586,7 @@ mod tests {
         // #164: an empty vertical used to count as a healthy engine,
         // inflating ok_engines and relaxing retry/cache gates exactly
         // when retrieval was worst. It must report no-results instead.
-        let (name, result) = vertical_success("github".into(), Vec::new(), 12);
+        let (name, result) = vertical_success("github".into(), "github", Vec::new(), 12);
         assert_eq!(name, "github");
         let (status, egress, was_engine) = result.expect_err("empty vertical must not be Ok");
         assert_eq!(status, "no-results");
@@ -583,7 +596,7 @@ mod tests {
 
     #[test]
     fn vertical_no_results_is_neither_retried_nor_a_fault() {
-        let (_, result) = vertical_success("wikipedia".into(), Vec::new(), 5);
+        let (_, result) = vertical_success("wikipedia".into(), "wikipedia", Vec::new(), 5);
         let (status, _, _) = result.expect_err("empty vertical must be Err");
         assert!(
             !crate::search::is_engine_fault(&status),
@@ -593,7 +606,12 @@ mod tests {
 
     #[test]
     fn vertical_with_hits_is_success() {
-        let (name, result) = vertical_success("github".into(), vec![hit("A", "https://a.com")], 42);
+        let (name, result) = vertical_success(
+            "github".into(),
+            "github",
+            vec![hit("A", "https://a.com")],
+            42,
+        );
         assert_eq!(name, "github");
         let answer = result.expect("hits => success");
         assert_eq!(answer.hits.len(), 1);

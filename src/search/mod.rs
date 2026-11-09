@@ -20,6 +20,7 @@ pub mod rerank;
 pub mod verticals;
 
 mod authority;
+mod contract;
 mod enrich;
 mod persist;
 mod render;
@@ -2262,6 +2263,7 @@ mod tests {
                 published: None,
                 families: 0,
                 from_page: false,
+                tier: 0,
             })
             .collect::<Vec<_>>();
         let report = vec![EngineReport {
@@ -3306,6 +3308,7 @@ mod tests {
             published: None,
             families: 0,
             from_page: false,
+            tier: 0,
         }
     }
 

@@ -311,6 +311,7 @@ mod tests {
             published: None,
             families: 0,
             from_page: false,
+            tier: 0,
         }
     }
 

@@ -692,6 +692,7 @@ mod inner {
                 published: None,
                 families: 0,
                 from_page: false,
+                tier: 0,
             }];
             rerank("test", &mut results);
             assert!((results[0].score - 1.0).abs() < 1e-6);
@@ -709,6 +710,7 @@ mod inner {
                     published: None,
                     families: 0,
                     from_page: false,
+                    tier: 0,
                 },
                 Merged {
                     title: "B".into(),
@@ -719,6 +721,7 @@ mod inner {
                     published: None,
                     families: 0,
                     from_page: false,
+                    tier: 0,
                 },
             ];
             rerank("   ", &mut results);
@@ -785,6 +788,7 @@ mod inner {
                 published: None,
                 families: 0,
                 from_page: false,
+                tier: 0,
             }
         }
 

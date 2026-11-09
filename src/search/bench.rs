@@ -34,6 +34,10 @@ struct BenchQuery {
     set: String,
     query: String,
     gold: Vec<String>,
+    /// Patterns that must not appear in any returned URL or title. A row with a
+    /// must_not is a gate: the run fails when one matches.
+    #[serde(default)]
+    must_not: Vec<String>,
 }
 
 struct Options {
@@ -485,6 +489,8 @@ pub async fn run(args: &[String]) -> i32 {
     let mut all = Tally::default();
     let mut by_shape: std::collections::BTreeMap<String, Tally> = Default::default();
     let mut rows = Vec::new();
+    let mut violations_total = 0usize;
+    let mut redirects_total = 0usize;
     for (n, q) in queries.iter().enumerate() {
         if n > 0 {
             tokio::time::sleep(opts.pace).await;
@@ -494,13 +500,31 @@ pub async fn run(args: &[String]) -> i32 {
         let outcome = searcher.search(&q.query, opts.max_results, None).await;
         let ms = t0.elapsed().as_millis() as u64;
         let raw = searcher.last_raw();
-        let (urls, census): (Vec<String>, String) = match &outcome {
+        let (urls, titles, census): (Vec<String>, Vec<String>, String) = match &outcome {
             Ok(o) => (
                 o.results.iter().map(|r| r.url.clone()).collect(),
+                o.results.iter().map(|r| r.title.clone()).collect(),
                 render::census(&o.report),
             ),
-            Err(e) => (Vec::new(), format!("error: {e}")),
+            Err(e) => (Vec::new(), Vec::new(), format!("error: {e}")),
         };
+        let negative: Vec<Regex> = q
+            .must_not
+            .iter()
+            .filter_map(|p| Regex::new(p).ok())
+            .collect();
+        let violations: Vec<String> = urls
+            .iter()
+            .zip(titles.iter())
+            .filter(|(u, t)| negative.iter().any(|r| r.is_match(u) || r.is_match(t)))
+            .map(|(u, _)| u.clone())
+            .collect();
+        let redirects = urls
+            .iter()
+            .filter(|u| super::contract::url_class(u) != super::contract::UrlClass::Page)
+            .count();
+        violations_total += violations.len();
+        redirects_total += redirects;
         let hit = first_match(&gold, &urls);
         let raw_best: Vec<(String, Option<usize>)> = raw
             .iter()
@@ -515,10 +539,14 @@ pub async fn run(args: &[String]) -> i32 {
             .entry(q.shape.clone())
             .or_default()
             .add(hit, recalled, ms);
-        let verdict = match (hit, recalled) {
-            (Some(h), _) => format!("HIT@{h}"),
-            (None, true) => "RANK-LOST".to_string(),
-            (None, false) => "NO-RECALL".to_string(),
+        let verdict = if !violations.is_empty() {
+            "VIOLATION".to_string()
+        } else {
+            match (hit, recalled) {
+                (Some(h), _) => format!("HIT@{h}"),
+                (None, true) => "RANK-LOST".to_string(),
+                (None, false) => "NO-RECALL".to_string(),
+            }
         };
         crate::diag!(
             "{:<6} {:<10} {:>5.1}s  {}  [{}]",
@@ -532,6 +560,7 @@ pub async fn run(args: &[String]) -> i32 {
             "id": q.id, "set": q.set, "shape": q.shape, "query": q.query,
             "hit": hit, "recalled": recalled, "ms": ms, "census": census,
             "urls": urls,
+            "must_not": violations, "redirects": redirects,
             "recall_by_source": raw_best.iter()
                 .map(|(s, r)| json!({"source": s, "rank": r})).collect::<Vec<_>>(),
             "raw": raw.iter().map(|(s, hits)| json!({
@@ -553,6 +582,11 @@ pub async fn run(args: &[String]) -> i32 {
         crate::diag!("{}", t.line(shape));
     }
     crate::diag!("{}", all.line("ALL"));
+    crate::diag!(
+        "redirects {}  must-not violations {}",
+        redirects_total,
+        violations_total
+    );
 
     if let Some(path) = &opts.out {
         let doc = json!({
@@ -576,6 +610,9 @@ pub async fn run(args: &[String]) -> i32 {
                 return 1;
             }
         }
+    }
+    if redirects_total > 0 || violations_total > 0 {
+        return 3;
     }
     0
 }
@@ -635,6 +672,9 @@ mod tests {
             assert!(!q.gold.is_empty(), "{} has no gold", q.id);
             for g in &q.gold {
                 Regex::new(g).unwrap_or_else(|e| panic!("{}: {g}: {e}", q.id));
+            }
+            for g in &q.must_not {
+                Regex::new(g).unwrap_or_else(|e| panic!("{} must_not: {g}: {e}", q.id));
             }
         }
         for id in SMOKE {

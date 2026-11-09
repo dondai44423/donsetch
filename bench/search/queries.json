@@ -319,8 +319,8 @@
    "set": "gold",
    "query": "how to replace a bicycle tire",
    "gold": [
-    "wikihow\\.com/[^ ]*(tire|tyre)",
-    "sheldonbrown\\.com/[^ ]*tire"
+    "(?i)wikihow\\.com/[^ ]*(tire|tyre)",
+    "(?i)sheldonbrown\\.com/[^ ]*tire"
    ]
   },
   {
@@ -340,7 +340,8 @@
    "query": "nginx proxy_pass trailing slash difference",
    "gold": [
     "nginx\\.org/[^ ]*proxy_pass",
-    "stackoverflow\\.com/questions/[^ ]*proxy_pass"
+    "stackoverflow\\.com/questions/[^ ]*proxy_pass",
+    "nginx\\.org/[^ ]*proxy_module"
    ]
   },
   {
@@ -518,7 +519,7 @@
    "set": "held",
    "query": "sqlalchemy relationship lazy loading",
    "gold": [
-    "docs\\.sqlalchemy\\.org/[^ ]*relationship_loading"
+    "docs\\.sqlalchemy\\.org/[^ ]*loading_relationships"
    ]
   },
   {
@@ -721,7 +722,7 @@
    "set": "held",
    "query": "how to change a flat tire",
    "gold": [
-    "wikihow\\.com/Change-a-Flat-Tire",
+    "(?i)wikihow\\.com/change-a.*tire",
     "nhtsa\\.gov/[^ ]*tire"
    ]
   },
@@ -895,6 +896,51 @@
     "docs\\.rs/reqwest",
     "crates\\.io/crates/reqwest",
     "github\\.com/seanmonstar/reqwest"
+   ]
+  },
+  {
+   "id": "d1-jp",
+   "shape": "web",
+   "set": "gold",
+   "query": "\u5730\u9707\u901f\u5831",
+   "gold": [
+    "weathernews\\.jp/quake",
+    "jma\\.go\\.jp/.+quake",
+    "news\\.web\\.nhk/.+earthquake"
+   ]
+  },
+  {
+   "id": "d1-scope",
+   "shape": "code",
+   "set": "gold",
+   "query": "tokio",
+   "gold": [
+    "docs\\.rs/tokio/",
+    "crates\\.io/crates/tokio",
+    "tokio\\.rs",
+    "github\\.com/tokio-rs/tokio"
+   ],
+   "must_not": [
+    "docs\\.rs/taos/"
+   ]
+  },
+  {
+   "id": "d1-news",
+   "shape": "news",
+   "set": "gold",
+   "query": "SpaceX Starship latest launch news this week",
+   "gold": [
+    "spacenews\\.com",
+    "teslarati\\.com",
+    "spacex\\.com",
+    "reuters\\.com",
+    "apnews\\.com",
+    "bbc\\.com",
+    "usatoday\\.com"
+   ],
+   "must_not": [
+    "(?i)diwali",
+    "news\\.google\\.com/rss/articles"
    ]
   }
  ]

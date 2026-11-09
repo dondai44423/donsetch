@@ -59,6 +59,12 @@ pub struct Merged {
     /// source's teaser.
     #[serde(default)]
     pub from_page: bool,
+    /// Admission class: 0 a scope-named record, 1 everything else. Only the
+    /// scope promotion is a tier; inside it the measured score decides. A
+    /// first-party-exact tier was measured against `consensus_beats_vertical_only`
+    /// and lost: a vertical's keyword match is not worth more than agreement.
+    #[serde(default)]
+    pub tier: u8,
 }
 
 /// Normalize a URL for consensus matching: scheme-less,
@@ -317,6 +323,7 @@ fn merge_inner(
                 published: None,
                 families: 0,
                 from_page: false,
+                tier: 1,
             });
             // Keep the longest snippet (most informative), skipping redirect
             // stubs. Both sides are already bounded (MAX_SNIPPET_CHARS), so no
@@ -405,7 +412,23 @@ fn merge_inner(
     // about a result's host or title moves it.
     crate::search::authority::freshen(intent, &mut results);
 
-    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    // Admission classes, not score multipliers. A page whose root the query
+    // named by name is the answer to a name query and outranks any amount of
+    // agreement; everything else is ordered by the measured score, unchanged.
+    // A first-party-exact tier was tried and lost a measured gate (a vertical's
+    // keyword match is weaker than consensus), so it is not a tier.
+    let profile = super::contract::Profile::new(query);
+    for r in &mut results {
+        let named = super::contract::scope_is_named(&profile, &r.url)
+            && profile.verdict(&r.title, &r.snippet, &r.url).admitted();
+        r.tier = if named { 0 } else { 1 };
+    }
+
+    results.sort_by(|a, b| {
+        a.tier
+            .cmp(&b.tier)
+            .then_with(|| b.score.total_cmp(&a.score))
+    });
 
     // Syndicated content dedup: same article republished under
     // different local TV/radio sites (fox43, localmemphis, etc.)
@@ -556,6 +579,33 @@ mod tests {
         let out = merge(&per, "q", Intent::Web, &trust, &Families::default(), 10);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].title.chars().count(), MAX_TITLE_CHARS);
+    }
+
+    #[test]
+    fn a_scope_named_page_leads_the_list() {
+        // The query names `clap`; its docs page is the record asked for, even
+        // ranked far below a book chapter by the sources themselves.
+        let per = vec![
+            (
+                "ddg".to_string(),
+                vec![hit("https://doc.rust-lang.org/book/ch12-01.html", 1)],
+            ),
+            (
+                "brave".to_string(),
+                vec![hit("https://docs.rs/clap/latest/clap/", 8)],
+            ),
+        ];
+        let out = merge(
+            &per,
+            "rust clap command line argument parser crate",
+            Intent::Code,
+            &HashMap::new(),
+            &Families::default(),
+            10,
+        );
+        assert_eq!(out[0].url, "https://docs.rs/clap/latest/clap/");
+        assert_eq!(out[0].tier, 0);
+        assert_eq!(out[1].tier, 1);
     }
 
     #[test]

@@ -576,6 +576,7 @@ fn to_merged(hits: Vec<SearchHit>, provider: &str, max: usize) -> Vec<Merged> {
             published: None,
             families: 0,
             from_page: false,
+            tier: 3,
         })
         .collect()
 }

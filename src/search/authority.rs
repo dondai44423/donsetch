@@ -445,6 +445,7 @@ mod tests {
             published,
             families: 1,
             from_page: false,
+            tier: 0,
         }
     }
 

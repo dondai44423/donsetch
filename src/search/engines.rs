@@ -551,79 +551,6 @@ impl AnswerClass {
     }
 }
 
-/// Query words that carry no answer signal when matching a result list.
-const ANSWER_STOP: &[&str] = &[
-    "the", "and", "for", "how", "what", "who", "why", "when", "where", "which", "does", "did",
-    "can", "could", "should", "would", "with", "without", "from", "into", "about", "best", "vs",
-    "versus", "you", "your", "are", "was", "were", "this", "that", "these", "those", "there",
-];
-
-/// The words an answer has to show to count as answering `query`.
-pub fn answer_terms(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .filter(|w| !ANSWER_STOP.contains(&w.as_str()))
-        // One-char tokens ("c", "r") match everything; keep two and up, which
-        // is what "go", "js" and "5g" need.
-        .filter(|w| w.chars().count() >= 2 || w.chars().any(|c| c.is_numeric()))
-        .collect()
-}
-
-/// Does `text` engage any of the query's terms? Whole-token match for short
-/// words, prefix match for long ones so "dataclass" finds "dataclasses".
-fn engages(terms: &[String], text: &str) -> bool {
-    if terms.is_empty() {
-        return true;
-    }
-    let lower = text.to_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
-        .filter(|w| !w.is_empty())
-        .collect();
-    terms.iter().any(|t| {
-        words
-            .iter()
-            .any(|w| *w == t.as_str() || (t.chars().count() >= 5 && w.starts_with(t.as_str())))
-    })
-}
-
-/// Fraction of the top ten items that show any engagement with the query.
-pub fn engagement(query: &str, hits: &[Hit]) -> f64 {
-    let terms = answer_terms(query);
-    if hits.is_empty() {
-        return 0.0;
-    }
-    let top = hits.iter().take(10).collect::<Vec<_>>();
-    let engaged = top
-        .iter()
-        .filter(|h| engages(&terms, &format!("{} {} {}", h.title, h.snippet, h.url)))
-        .count();
-    engaged as f64 / top.len() as f64
-}
-
-/// Classify a web source's answer. Verticals do not come through here: an API
-/// that returns items has answered, and its own relevance ranking is the
-/// contract (`vertical_class`).
-pub fn classify(query: &str, hits: &[Hit]) -> AnswerClass {
-    if hits.is_empty() {
-        return AnswerClass::Empty;
-    }
-    let share = engagement(query, hits);
-    // A query with no answer terms (a bare number, a symbol) cannot be judged
-    // by engagement; take the items at their word.
-    if answer_terms(query).is_empty() {
-        return AnswerClass::Content;
-    }
-    match (hits.len(), share) {
-        (3.., s) if s >= 0.5 => AnswerClass::Content,
-        (3.., s) if s < 0.25 => AnswerClass::OffQuery,
-        (_, s) if s >= 0.5 => AnswerClass::Thin,
-        _ => AnswerClass::Thin,
-    }
-}
-
 /// A first-party interface answered with items: its own ranking is the
 /// contract, so the only failure it can commit here is returning nothing.
 pub fn vertical_class(hits: &[Hit]) -> AnswerClass {
@@ -1200,96 +1127,8 @@ mod visible_text_guard_tests {
 }
 
 #[cfg(test)]
-mod answer_contract_tests {
+mod structured_answer_tests {
     use super::*;
-
-    fn hit(url: &str, title: &str) -> Hit {
-        Hit {
-            title: title.into(),
-            url: url.into(),
-            snippet: String::new(),
-            rank: 0,
-            published: None,
-        }
-    }
-
-    #[test]
-    fn an_off_query_answer_is_not_content() {
-        // The measured shape: a 200 with ten items, none of which mentions the
-        // query. French forums and zhihu topics for an English query.
-        let hits = vec![
-            hit(
-                "https://forums.example.fr/t/1",
-                "Que faire en cas d'oubli d'adresse",
-            ),
-            hit(
-                "https://zhihu.example/q/2",
-                "Instagram密码正确但就是登录不了",
-            ),
-            hit(
-                "https://forums.example.fr/t/3",
-                "Appel instagram qui se coupe",
-            ),
-        ];
-        let class = classify("rust tokio spawn_blocking", &hits);
-        assert_eq!(class, AnswerClass::OffQuery);
-        assert!(!class.contributes(), "an off-query answer must not rank");
-        assert!(!class.credits(), "an off-query answer must not earn trust");
-        assert_eq!(class.status(), "off-query");
-    }
-
-    #[test]
-    fn an_on_topic_answer_is_content() {
-        let hits = vec![
-            hit(
-                "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
-                "spawn_blocking in tokio::task",
-            ),
-            hit(
-                "https://users.rust-lang.org/t/spawn-blocking",
-                "Tokio::spawn_blocking blocks the thread?",
-            ),
-            hit(
-                "https://tokio.rs/tokio/tutorial",
-                "Tokio tutorial: spawning tasks",
-            ),
-        ];
-        let class = classify("rust tokio spawn_blocking", &hits);
-        assert_eq!(class, AnswerClass::Content);
-        assert!(class.contributes() && class.credits());
-    }
-
-    #[test]
-    fn a_short_answer_is_thin_not_off_query() {
-        let hits = vec![hit(
-            "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
-            "spawn_blocking in tokio::task",
-        )];
-        let class = classify("rust tokio spawn_blocking", &hits);
-        assert_eq!(class, AnswerClass::Thin);
-        assert!(class.contributes(), "real items still answer");
-        assert!(!class.credits(), "one item is not proof about the source");
-    }
-
-    #[test]
-    fn no_items_is_empty_and_a_blank_query_is_taken_at_its_word() {
-        assert_eq!(classify("rust tokio", &[]), AnswerClass::Empty);
-        assert!(!AnswerClass::Empty.contributes());
-        // A query with no answer terms cannot be judged by engagement.
-        let hits = vec![hit("https://a.example/x", "anything at all")];
-        assert_eq!(classify("a", &hits), AnswerClass::Content);
-    }
-
-    #[test]
-    fn engagement_ignores_case_and_matches_plurals_by_prefix() {
-        let hits = vec![hit(
-            "https://docs.python.org/3/library/dataclasses.html",
-            "Dataclasses — Python documentation",
-        )];
-        // "dataclass" must reach "Dataclasses", "frozen" nothing.
-        assert!(engagement("python dataclass frozen", &hits) > 0.0);
-        assert_eq!(engagement("kubernetes liveness probe", &hits), 0.0);
-    }
 
     #[test]
     fn a_structured_answer_needs_no_selector() {
@@ -1313,11 +1152,6 @@ mod answer_contract_tests {
             hits[1].snippet
         );
         assert!(hits[1].published.is_none());
-        // Two items: real, but an incomplete answer.
-        assert_eq!(
-            classify("rust tokio spawn_blocking", &hits),
-            AnswerClass::Thin
-        );
     }
 
     fn shaped_serp(prefix: &str) -> String {
