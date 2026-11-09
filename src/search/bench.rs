@@ -508,6 +508,7 @@ pub async fn run(args: &[String]) -> i32 {
     let mut rows = Vec::new();
     let mut violations_total = 0usize;
     let mut redirects_total = 0usize;
+    let mut reqs: Vec<usize> = Vec::new();
     let mut stale_total = 0usize;
     let mut undated_total = 0usize;
     let mut foreign_total = 0usize;
@@ -519,6 +520,11 @@ pub async fn run(args: &[String]) -> i32 {
         let t0 = Instant::now();
         let outcome = searcher.search(&q.query, opts.max_results, None).await;
         let ms = t0.elapsed().as_millis() as u64;
+        let requests: usize = outcome
+            .as_ref()
+            .map(|o| o.report.iter().map(|r| r.requests).sum())
+            .unwrap_or(0);
+        reqs.push(requests);
         let raw = searcher.last_raw();
         let (urls, titles, snippets, _published, census): RowOut = match &outcome {
             Ok(o) => (
@@ -631,7 +637,10 @@ pub async fn run(args: &[String]) -> i32 {
             "urls": urls,
             "must_not": violations, "redirects": redirects,
             "window": q.window, "stale": stale, "undated": undated,
-            "lang": q.lang, "foreign": foreign,
+            "lang": q.lang, "foreign": foreign, "requests": requests,
+            "lane_requests": outcome.as_ref().map(|o| o.report.iter()
+                .map(|r| json!({"source": r.engine, "status": r.status, "requests": r.requests}))
+                .collect::<Vec<_>>()).unwrap_or_default(),
             "recall_by_source": raw_best.iter()
                 .map(|(s, r)| json!({"source": s, "rank": r})).collect::<Vec<_>>(),
             "raw": raw.iter().map(|(s, hits)| json!({
@@ -653,8 +662,12 @@ pub async fn run(args: &[String]) -> i32 {
         crate::diag!("{}", t.line(shape));
     }
     crate::diag!("{}", all.line("ALL"));
+    let mut sorted = reqs.clone();
+    sorted.sort_unstable();
+    let req_median = sorted.get(sorted.len() / 2).copied().unwrap_or(0);
+    let req_max = sorted.last().copied().unwrap_or(0);
     crate::diag!(
-        "redirects {}  must-not violations {}  stale {}  undated {}  foreign {}",
+        "redirects {}  must-not violations {}  stale {}  undated {}  foreign {}  requests/search median {req_median} max {req_max}",
         redirects_total,
         violations_total,
         stale_total,

@@ -120,7 +120,7 @@ pub fn census(report: &[super::EngineReport]) -> String {
     let parts: Vec<String> = states
         .into_iter()
         .map(|(name, hits, status)| {
-            if matches!(status.as_str(), "ok" | "cached") {
+            if matches!(status.as_str(), "ok" | "cached" | "answered") {
                 format!("{name} {hits}")
             } else if hits > 0 {
                 format!("{name} {hits} {status}")
@@ -148,14 +148,29 @@ pub fn source_states(report: &[super::EngineReport]) -> Vec<(String, usize, Stri
     }
     best.into_iter()
         .map(|(name, entry)| {
-            let status = entry
-                .status
-                .strip_prefix("blocked:")
-                .unwrap_or(&entry.status)
-                .to_string();
-            (name.to_string(), entry.hits, status)
+            (
+                name.to_string(),
+                entry.hits,
+                state_word(&entry.status).to_string(),
+            )
         })
         .collect()
+}
+
+/// The census vocabulary: `answered`, `empty`, `off`, `rested`, `not asked`,
+/// `failed` (with the transport detail kept after a colon), and `late` for a
+/// lane the scheduler cut. A source that was never asked is never a failure.
+fn state_word(status: &str) -> &'static str {
+    let head = status.split(':').next().unwrap_or(status);
+    match head {
+        "ok" | "cached" | "thin" | "answered" => "answered",
+        "no-results" | "empty" | "empty-parse" => "empty",
+        "off-query" => "off",
+        "rested" => "rested",
+        "not-asked" | "pacing-timeout" => "not asked",
+        "late" => "late",
+        _ => "failed",
+    }
 }
 
 /// Markdown rendering for the MCP/CLI surface.

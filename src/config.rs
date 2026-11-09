@@ -148,6 +148,9 @@ section!(SearchSection {
     /// DEFAULT OFF until the 24h soak proves it. Never triggers
     /// extra fetches; only soft-demotes (class, host) for ranking.
     outcome_feedback: bool = false,
+    /// D5: the most lanes one search may ask. A lane past the budget is
+    /// reported `not-asked`, never silently dropped.
+    request_budget: usize = 6,
     /// C4: cancel stragglers once ≥3 independent families agree
     /// on a top-3 URL. Kill: DONSETCH_NO_SEARCH_EARLY.
     search_early: bool = true,

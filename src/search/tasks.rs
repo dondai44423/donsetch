@@ -34,6 +34,8 @@ pub(super) struct LaneAnswer {
     /// A byte-derived SERP answer, if any; never merged into the hit list.
     pub instant: Option<super::instant::InstantAnswer>,
     pub class: engines::AnswerClass,
+    /// Outbound requests this lane spent.
+    pub requests: usize,
 }
 
 pub(super) type EngineResult = Result<LaneAnswer, (String, String, bool)>;
@@ -201,19 +203,21 @@ pub(super) async fn engine_task_with_budget(
     // extra request when the layout answer is thin or does not credit the
     // source. Its feed endpoint ignores `site:`, so a scoped query never takes
     // an unscoped answer.
-    if (!class.credits() || thin)
-        && engine == "bing"
-        && scoped.is_none()
-        && let Some((rss_hits, rss_class, rss_items)) =
-            bing_rss_fallback(&query, lane, fetcher, deadline, locale).await
-        && rss_class.contributes()
-        && (thin || rss_class.credits())
-    {
-        hits = rss_hits;
-        class = rss_class;
-        items = rss_items;
-        thin = false;
-        instant = None;
+    let mut requests = 1usize;
+    if (!class.credits() || thin) && engine == "bing" && scoped.is_none() {
+        let rss = bing_rss_fallback(&query, lane, fetcher, deadline, locale).await;
+        // Asked, whatever it returned: the budget counts the request.
+        requests += 1;
+        if let Some((rss_hits, rss_class, rss_items)) = rss
+            && rss_class.contributes()
+            && (thin || rss_class.credits())
+        {
+            hits = rss_hits;
+            class = rss_class;
+            items = rss_items;
+            thin = false;
+            instant = None;
+        }
     }
     if thin {
         // Honest "no results" is NOT an engine failure : don't burn trust or
@@ -255,6 +259,7 @@ pub(super) async fn engine_task_with_budget(
             engine_lane: true,
             instant,
             class,
+            requests,
         }),
     )
 }
@@ -314,6 +319,7 @@ fn news_lane(name: &str, answer: super::news::Answer) -> (String, EngineResult) 
             engine_lane: false,
             instant: None,
             class,
+            requests: answer.requests,
         })
     };
     (name.to_string(), result)
@@ -371,6 +377,7 @@ pub(super) async fn registry_task(
                     engine_lane: false,
                     instant: None,
                     class,
+                    requests: resolved.requests,
                 }),
             )
         }
@@ -429,6 +436,7 @@ fn vertical_success(
     hits: Vec<engines::Hit>,
     ms: u64,
 ) -> (String, EngineResult) {
+    let requests = 1usize;
     // A first-party API's own ranking is its contract; it only loses redirects
     // and look-alike namespaces, never its relevance order.
     let hits = contract::accept_first_party(query, hits);
@@ -447,6 +455,7 @@ fn vertical_success(
             engine_lane: false,
             instant: None,
             class,
+            requests,
         }),
     )
 }

@@ -406,6 +406,7 @@ impl ByokSearcher {
                             hits: 0,
                             ms: attempt_ms,
                             egress: "byok".into(),
+                            requests: 0,
                         });
                         continue;
                     }
@@ -422,6 +423,7 @@ impl ByokSearcher {
                         hits: results.len(),
                         ms: outcome.ms,
                         egress: "byok".into(),
+                        requests: 0,
                     });
                     return Ok(SearchOutcome {
                         results,
@@ -465,6 +467,7 @@ impl ByokSearcher {
                         hits: 0,
                         ms: attempt_ms,
                         egress: "byok".into(),
+                        requests: 0,
                     });
 
                     // Update key state if this is a key-level error.

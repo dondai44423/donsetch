@@ -22,6 +22,7 @@ pub mod verticals;
 mod authority;
 mod contract;
 mod enrich;
+mod ledger;
 mod locale;
 mod news;
 mod persist;
@@ -393,7 +394,7 @@ fn early_consensus_enough(
                 .insert(fam.clone());
         }
     }
-    families_ok.len() >= 3 && url_families.values().any(|fams| fams.len() >= 3)
+    families_ok.len() >= 2 && url_families.values().any(|fams| fams.len() >= 2)
 }
 
 pub struct Searcher {
@@ -428,6 +429,9 @@ pub struct Searcher {
     /// benched across a crash + restart instead of being
     /// re-paid three times from zero.
     failures: Mutex<HashMap<String, (u32, Instant)>>,
+    /// The lane ledger: per (source, lane) standing, shared across calls and
+    /// processes. Loaded once, written back when a search taught it something.
+    ledger: Mutex<ledger::Ledger>,
     /// Single-flight: two identical in-flight queries spend
     /// egress budget ONCE : the follower awaits the
     /// leader's result. Stampedes are an agent reality
@@ -498,6 +502,9 @@ pub struct EngineReport {
     /// Which lane carried it (observability for the
     /// governor's routing decisions).
     pub egress: String,
+    /// Outbound requests this lane spent (a feed refresh can be two).
+    #[serde(default)]
+    pub requests: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +543,7 @@ impl Searcher {
             health_dirty: std::sync::atomic::AtomicBool::new(false),
             cache: Mutex::new(load_cache_disk()),
             failures: Mutex::new(failures),
+            ledger: Mutex::new(ledger::Ledger::load()),
             inflight: Mutex::new(std::collections::HashSet::new()),
             byok_inflight: Mutex::new(std::collections::HashSet::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
@@ -555,6 +563,40 @@ impl Searcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Decide whether one lane is planned: the ledger's standing first (a
+    /// rested lane is a real answer, not a failure), then the request budget.
+    fn plan_lane(&self, source: &str, skipped: &mut Vec<(String, EngineResult)>) -> bool {
+        let key = ledger::key(lane_source(source), lane_of(source));
+        let state = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready(&key);
+        match state {
+            ledger::State::Ready => true,
+            ledger::State::Rested(secs) => {
+                skipped.push((
+                    source.to_string(),
+                    Err((format!("rested:{secs}"), "ledger".into(), false)),
+                ));
+                false
+            }
+        }
+    }
+
+    /// Tell the ledger what a lane's request amounted to.
+    fn record_lane(&self, source: &str, status: &str) {
+        let Some(outcome) = ledger::classify(status) else {
+            return;
+        };
+        let retry = ledger::retry_after(status);
+        let key = ledger::key(lane_source(source), lane_of(source));
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&key, outcome, retry);
     }
 
     /// The shared egress pool (crawl/fetch attach the same Arc).
@@ -955,8 +997,15 @@ impl Searcher {
             map: &self.inflight,
             key: sf_key,
         };
-        self.search_inner(query, max_results, forced_intent, started)
-            .await
+        let outcome = self
+            .search_inner(query, max_results, forced_intent, started)
+            .await;
+        // The ledger learned something: rest a lane, or walk it back.
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .save_if_dirty();
+        outcome
     }
 
     async fn search_inner(
@@ -1039,6 +1088,10 @@ impl Searcher {
         // Fan out: engines each get their own egress
         // (spreading is the anti-rate-limit move).
         let mut futures: Vec<(String, TaskFut)> = Vec::new();
+        // A lane the ledger rests, or the budget cannot afford, is reported
+        // rather than silently dropped: the census says which, and why.
+        let mut skipped: Vec<(String, EngineResult)> = Vec::new();
+        let budget = crate::config::cfg().search.request_budget;
         let mut used_egresses: Vec<String> = Vec::new();
         let mut queries: Vec<String> = vec![query.to_string()];
         if let Some(v) = intent::variant(query) {
@@ -1138,6 +1191,9 @@ impl Searcher {
         for (engine, q, eg) in assign_egresses(self.pool.as_ref(), assignments, &mut used_egresses)
         {
             let name = engine_name(&engine).to_string();
+            if !self.plan_lane(&name, &mut skipped) {
+                continue;
+            }
             futures.push((
                 name,
                 Box::pin(tasks::engine_task_with_budget(
@@ -1157,6 +1213,9 @@ impl Searcher {
             .filter(|v| !self.quarantined(v))
             .collect();
         for v in verticals {
+            if !self.plan_lane(v, &mut skipped) {
+                continue;
+            }
             futures.push((
                 engine_name(v).to_string(),
                 Box::pin(vertical_task(
@@ -1176,6 +1235,7 @@ impl Searcher {
         // the first ones instead of arriving late.
         if let Some(plan) = resolve::plan(query)
             && plan.ecosystem.is_none()
+            && self.plan_lane("registry", &mut skipped)
         {
             futures.push((
                 "registry".to_string(),
@@ -1193,43 +1253,95 @@ impl Searcher {
         // window — but the open web still runs, because the official page an
         // announcement points at is often not in the wire's index.
         if news::wants_news(query, intent) {
-            // The wire is a search endpoint, not a publisher's API: it rides the
-            // pool like any engine, so one direct-IP throttle does not silence
-            // every news query.
-            let news_proxy = self.pool.pick("bing-news", &used_egresses, true);
-            let news_proxy = match news_proxy {
-                Some(egress) => {
-                    used_egresses.push(egress.id.clone());
-                    egress.proxy.clone()
-                }
-                None => None,
-            };
-            futures.push((
-                "bing-news".to_string(),
-                Box::pin(tasks::news_wire_task(
-                    query.to_string(),
-                    &self.fetcher,
-                    news_proxy,
-                    lane_budget(),
-                )),
-            ));
-            futures.push((
-                "feed".to_string(),
-                Box::pin(tasks::news_feed_task(
-                    query.to_string(),
-                    &self.fetcher,
-                    lane_budget(),
-                )),
-            ));
-            futures.push((
-                "gdelt".to_string(),
-                Box::pin(tasks::news_gdelt_task(
-                    query.to_string(),
-                    &self.fetcher,
-                    lane_budget(),
-                )),
-            ));
+            if self.plan_lane("bing-news", &mut skipped) {
+                // The wire is a search endpoint, not a publisher's API: it rides
+                // the pool like any engine, so one direct-IP throttle does not
+                // silence every news query.
+                let news_proxy = self.pool.pick("bing-news", &used_egresses, true);
+                let news_proxy = match news_proxy {
+                    Some(egress) => {
+                        used_egresses.push(egress.id.clone());
+                        egress.proxy.clone()
+                    }
+                    None => None,
+                };
+                futures.push((
+                    "bing-news".to_string(),
+                    Box::pin(tasks::news_wire_task(
+                        query.to_string(),
+                        &self.fetcher,
+                        news_proxy,
+                        lane_budget(),
+                    )),
+                ));
+            }
+            if self.plan_lane("feed", &mut skipped) {
+                futures.push((
+                    "feed".to_string(),
+                    Box::pin(tasks::news_feed_task(
+                        query.to_string(),
+                        &self.fetcher,
+                        lane_budget(),
+                    )),
+                ));
+            }
+            if self.plan_lane("gdelt", &mut skipped) {
+                futures.push((
+                    "gdelt".to_string(),
+                    Box::pin(tasks::news_gdelt_task(
+                        query.to_string(),
+                        &self.fetcher,
+                        lane_budget(),
+                    )),
+                ));
+            }
         }
+
+        // ── The budget ──
+        //
+        // A search has a request ceiling, and the lanes are chosen by class so
+        // the answer is the last thing cut: up to four engines (the general
+        // recall), two news lanes (the answer to "what happened"), two vertical
+        // records (the answer to "what is this"), and a bare-name registry guess
+        // only if there is room. Every lane over the line is reported
+        // `not-asked`, never silently dropped.
+        let mut kept: Vec<(String, TaskFut)> = Vec::with_capacity(futures.len());
+        let (mut engines_kept, mut verticals_kept, mut news_kept, mut guesses_kept) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut spent = 0usize;
+        for (name, fut) in futures.drain(..) {
+            let class = if matches!(name.as_str(), "bing-news" | "feed" | "gdelt") {
+                2
+            } else if matches!(name.as_str(), "registry" | "registry-any") {
+                3
+            } else if rank::is_vertical(&name) {
+                1
+            } else {
+                0
+            };
+            // bing may spend a second request on its structured fallback; the
+            // budget counts the ceiling, not the hope.
+            let cost = if name == "bing" { 2 } else { 1 };
+            let room = match class {
+                0 => engines_kept < 4,
+                1 => verticals_kept < 3,
+                2 => news_kept < 2,
+                _ => guesses_kept < 1,
+            } && spent + cost <= budget;
+            if room {
+                match class {
+                    0 => engines_kept += 1,
+                    1 => verticals_kept += 1,
+                    2 => news_kept += 1,
+                    _ => guesses_kept += 1,
+                }
+                spent += cost;
+                kept.push((name, fut));
+            } else {
+                skipped.push((name, Err(("not-asked".into(), "budget".into(), false))));
+            }
+        }
+        let futures = kept;
 
         // ── One budget, raced ──
         //
@@ -1269,7 +1381,7 @@ impl Searcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let mut outcomes: Vec<(String, EngineResult)> = Vec::new();
+        let mut outcomes: Vec<(String, EngineResult)> = skipped;
         // A news query's answer is the wire: committing on consensus before the
         // news lanes report drops the record the query asked for. They get a
         // bounded head start past the soft mark; then the call commits anyway.
@@ -1412,6 +1524,7 @@ impl Searcher {
             match outcome {
                 Ok(answer) => {
                     let base = engine_health_key(&engine);
+                    self.record_lane(&engine, "ok");
                     if answer.class.credits() {
                         // A real answer: the only branch that earns the source,
                         // the lane and the profile selector any credit.
@@ -1440,6 +1553,7 @@ impl Searcher {
                         hits: answer.items,
                         ms: answer.ms,
                         egress: answer.egress.clone(),
+                        requests: answer.requests,
                     });
                     if !answer.hits.is_empty() {
                         per_engine.push((engine, answer.hits));
@@ -1447,6 +1561,7 @@ impl Searcher {
                 }
                 Err((status, egress_id, was_engine)) => {
                     let base = engine_health_key(&engine);
+                    self.record_lane(&engine, &status);
                     // Dead proxies and auth failures are egress/BYOK
                     // problems, not engine failures : don't quarantine
                     // or distrust the engine over them.
@@ -1469,6 +1584,12 @@ impl Searcher {
                     if was_engine && is_engine_fault(&status) {
                         self.bump_trust_status(base, intent, false, &status);
                     }
+                    // A lane that was asked spent a request, whatever came
+                    // back; a lane the plan never asked spent none.
+                    let asked = !matches!(
+                        status.split(':').next().unwrap_or(&status),
+                        "rested" | "not-asked" | "pacing-timeout"
+                    );
                     report.push(EngineReport {
                         engine,
                         profile,
@@ -1476,6 +1597,7 @@ impl Searcher {
                         hits: 0,
                         ms: 0,
                         egress: egress_id,
+                        requests: usize::from(asked),
                     });
                 }
             }
@@ -1498,6 +1620,9 @@ impl Searcher {
         // A source that did not answer inside the budget is named as late, not
         // as absent: the difference is whether rephrasing could help.
         for name in late {
+            // A lane that could not answer inside the budget is a slow lane:
+            // the ledger rests it briefly so the next search does not wait on it.
+            self.record_lane(&name, "late");
             report.push(EngineReport {
                 engine: name,
                 profile: None,
@@ -1505,6 +1630,7 @@ impl Searcher {
                 hits: 0,
                 ms: 0,
                 egress: "-".into(),
+                requests: 0,
             });
         }
 
@@ -1789,6 +1915,7 @@ impl Searcher {
             hits: resolved.hits.len(),
             ms: resolved.ms,
             egress: "direct".into(),
+            requests: 0,
         }];
         SearchOutcome {
             results: results.into_iter().take(max_results).collect(),
@@ -1926,6 +2053,27 @@ fn assign_egresses(
 
 fn engine_name(label: &str) -> &str {
     label.split('@').next().unwrap_or(label)
+}
+
+/// The lane inside a source: bing's SERP and bing-news's wire are different
+/// products with different limits, and one lesson must not rest the other.
+fn lane_of(source: &str) -> &'static str {
+    match source {
+        "bing-news" => "wire",
+        "feed" => "mesh",
+        "gdelt" | "registry" | "crates" | "npm" | "pypi" | "wikipedia" | "hn" | "arxiv"
+        | "openalex" | "europepmc" | "stackexchange" | "github" | "mdn" | "docs" => "api",
+        _ => "serp",
+    }
+}
+
+/// A lane's ledger key: the source is normalised so a bare-name registry guess
+/// and a stated registry share one standing.
+fn lane_source(source: &str) -> &str {
+    match source {
+        "registry-any" => "registry",
+        other => other,
+    }
 }
 
 fn engine_health_key(engine: &str) -> &str {
@@ -2418,6 +2566,7 @@ mod tests {
             hits: results.len(),
             ms: 12,
             egress: "byok".into(),
+            requests: 0,
         }];
         SearchOutcome {
             results,
@@ -2696,6 +2845,7 @@ mod tests {
                     engine_lane: true,
                     instant: None,
                     class: crate::search::engines::AnswerClass::Content,
+                    requests: 1,
                 }),
             )
         };
@@ -2735,6 +2885,7 @@ mod tests {
                     engine_lane: true,
                     instant: None,
                     class: crate::search::engines::AnswerClass::Content,
+                    requests: 1,
                 }),
             )
         };
@@ -2833,7 +2984,7 @@ mod tests {
     }
 
     #[test]
-    fn early_consensus_needs_three_families_on_a_shared_top3() {
+    fn early_consensus_needs_two_families_on_a_shared_top3() {
         use crate::search::engines::Hit;
         let hit = |url: &str, rank: usize| Hit {
             title: "t".into(),
@@ -2857,30 +3008,27 @@ mod tests {
                     engine_lane: true,
                     instant: None,
                     class: crate::search::engines::AnswerClass::Content,
+                    requests: 1,
                 }),
             )
         };
-        // Two families only: not enough.
+        // Two families that share a top-3 URL: agreement, commit.
         let two = vec![
             ok("brave", &["https://a.com/x", "https://b.com/y"]),
             ok("bing", &["https://a.com/x", "https://b.com/y"]),
         ];
         let fam = families::Families::default();
-        assert!(!early_consensus_enough(&two, &fam));
-        // Three families, shared top URL: enough.
-        let three = vec![
-            ok("brave", &["https://a.com/x", "https://b.com/y"]),
-            ok("bing", &["https://a.com/x", "https://c.com/z"]),
-            ok("mojeek", &["https://a.com/x", "https://d.com/w"]),
-        ];
-        assert!(early_consensus_enough(&three, &fam));
-        // Three families but no shared top-3 URL: not enough.
+        assert!(early_consensus_enough(&two, &fam));
+        // Three families but no shared top-3 URL: no agreement, keep waiting.
         let disjoint = vec![
             ok("brave", &["https://a.com/x"]),
             ok("bing", &["https://b.com/y"]),
             ok("mojeek", &["https://c.com/z"]),
         ];
         assert!(!early_consensus_enough(&disjoint, &fam));
+        // One family alone is never enough, however many lanes it fills.
+        let one = vec![ok("brave", &["https://a.com/x"])];
+        assert!(!early_consensus_enough(&one, &fam));
     }
 
     // The family count a result carries is the one measured when it was ranked,
@@ -3367,6 +3515,7 @@ mod tests {
                 hits: 10,
                 ms: 12,
                 egress: "direct".into(),
+                requests: 0,
             },
             EngineReport {
                 engine: "ddg".into(),
@@ -3375,6 +3524,7 @@ mod tests {
                 hits: 0,
                 ms: 20,
                 egress: "proxy".into(),
+                requests: 0,
             },
         ];
 
@@ -3392,7 +3542,7 @@ mod tests {
         // The census names who answered and who did not; there is no
         // "weak" verdict and no degraded ratio to read.
         assert!(
-            markdown.contains("sources: bing 10 · ddg — 403"),
+            markdown.contains("sources: bing 10 · ddg — failed"),
             "census line missing: {markdown}"
         );
         assert!(!markdown.contains("Weak results"));

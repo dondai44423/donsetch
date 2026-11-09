@@ -63,6 +63,8 @@ pub struct Answer {
     pub ms: u64,
     /// `ok`, `no-results`, `rested`, `failed` or `late` — the census vocabulary.
     pub status: &'static str,
+    /// Outbound requests this lane spent (a mesh refresh can be two).
+    pub requests: usize,
 }
 
 /// Does this query want the news program? A News intent, or a query that states
@@ -351,6 +353,7 @@ pub async fn bing_news(
             return Answer {
                 ms: started.elapsed().as_millis() as u64,
                 status: "failed",
+                requests: 1,
                 ..Default::default()
             };
         }
@@ -358,6 +361,7 @@ pub async fn bing_news(
             return Answer {
                 ms: started.elapsed().as_millis() as u64,
                 status: "late",
+                requests: 1,
                 ..Default::default()
             };
         }
@@ -366,6 +370,7 @@ pub async fn bing_news(
         return Answer {
             ms: started.elapsed().as_millis() as u64,
             status: "failed",
+            requests: 1,
             ..Default::default()
         };
     }
@@ -383,6 +388,7 @@ pub async fn bing_news(
         status: if hits.is_empty() { "no-results" } else { "ok" },
         hits,
         ms,
+        requests: 1,
     }
 }
 
@@ -557,10 +563,12 @@ pub async fn mesh(
             hits: hits_from(cached),
             ms: started.elapsed().as_millis() as u64,
             status: "ok",
+            requests: 0,
         };
     }
     let now = now_secs();
     let refresh_list = stale_feeds(&disk, now);
+    let requests = refresh_list.len();
     if !refresh_list.is_empty() {
         let asks = refresh_list.iter().map(|(name, url)| {
             let entry = disk.feeds.get(*url).cloned().unwrap_or_default();
@@ -602,6 +610,7 @@ pub async fn mesh(
         status: if hits.is_empty() { "no-results" } else { "ok" },
         hits,
         ms,
+        requests,
     }
 }
 
@@ -748,6 +757,7 @@ pub async fn gdelt(query: &str, fetcher: &Fetcher, budget: Duration) -> Answer {
                 return Answer {
                     ms: started.elapsed().as_millis() as u64,
                     status: "failed",
+                    requests: 1,
                     ..Default::default()
                 };
             }
@@ -767,6 +777,7 @@ pub async fn gdelt(query: &str, fetcher: &Fetcher, budget: Duration) -> Answer {
                 ms: started.elapsed().as_millis() as u64,
                 status: if hits.is_empty() { "no-results" } else { "ok" },
                 hits,
+                requests: 1,
             };
         }
         429 => {
@@ -782,6 +793,7 @@ pub async fn gdelt(query: &str, fetcher: &Fetcher, budget: Duration) -> Answer {
     Answer {
         ms: started.elapsed().as_millis() as u64,
         status,
+        requests: 1,
         ..Default::default()
     }
 }

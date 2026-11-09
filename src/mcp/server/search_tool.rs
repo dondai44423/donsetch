@@ -420,6 +420,7 @@ pub(super) async fn search_outcome(
                         hits: 0,
                         ms: 0,
                         egress: "byok".into(),
+                        requests: 0,
                     },
                 );
             }
@@ -650,6 +651,7 @@ mod search_output_contract_tests {
             hits: 0,
             ms: 0,
             egress: "direct".into(),
+            requests: 0,
         };
         output.report = vec![
             report("bing", "ok"),
@@ -661,18 +663,22 @@ mod search_output_contract_tests {
         // successful attempt outlives its retries), ddg did not.
         let sources = search_model_meta(&output, &[])["sources"].clone();
         assert_eq!(sources[0]["id"], "bing");
-        assert_eq!(sources[0]["status"], "ok");
+        assert_eq!(sources[0]["status"], "answered");
         assert_eq!(sources[1]["id"], "ddg");
-        assert_eq!(sources[1]["status"], "403");
+        assert_eq!(sources[1]["status"], "failed");
         let compact = render_compact_markdown(&output, "Results", None, &[]);
-        assert!(compact.contains("sources: bing 0 · ddg — 403"), "{compact}");
+        assert!(
+            compact.contains("sources: bing 0 · ddg — failed"),
+            "{compact}"
+        );
         let full = render_markdown(&output, "query", None, &[]);
-        assert!(full.contains("sources: bing 0 · ddg — 403"), "{full}");
+        assert!(full.contains("sources: bing 0 · ddg — failed"), "{full}");
         // A cached provider answer is still an answer, not a failure.
         output.report = vec![report("bing", "blocked:429"), report("bing", "cached")];
         assert_eq!(
             search_model_meta(&output, &[])["sources"][0]["status"],
-            "cached"
+            "answered",
+            "a cached answer is an answer"
         );
         output.report = vec![
             report("bing", "blocked:429"),
@@ -680,7 +686,7 @@ mod search_output_contract_tests {
         ];
         assert_eq!(
             search_model_meta(&output, &[])["sources"][0]["status"],
-            "429"
+            "failed"
         );
     }
 

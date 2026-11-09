@@ -456,6 +456,8 @@ pub struct Resolved {
     pub ms: u64,
     /// The ecosystem that answered, for the census.
     pub label: String,
+    /// Outbound requests the resolution spent.
+    pub requests: usize,
 }
 
 fn cache_key(plan: &Plan) -> String {
@@ -646,7 +648,12 @@ pub async fn run(plan: &Plan, fetcher: &Fetcher, budget: Duration) -> Resolution
                 .map(Ecosystem::label)
                 .unwrap_or("registry")
                 .to_string();
-            return Resolution::Hits(Resolved { hits, ms: 0, label });
+            return Resolution::Hits(Resolved {
+                hits,
+                ms: 0,
+                label,
+                requests: 0,
+            });
         }
         Cached::Negative => return Resolution::Nothing,
         Cached::Miss => {}
@@ -678,7 +685,12 @@ pub async fn run(plan: &Plan, fetcher: &Fetcher, budget: Duration) -> Resolution
             }
         })
         .unwrap_or_else(|| "registry".to_string());
-    Resolution::Hits(Resolved { hits, ms, label })
+    Resolution::Hits(Resolved {
+        hits,
+        ms,
+        label,
+        requests: plan.ask.len(),
+    })
 }
 
 #[cfg(test)]
