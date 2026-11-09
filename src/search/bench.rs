@@ -42,6 +42,10 @@ struct BenchQuery {
     /// dated and inside it, or the row fails.
     #[serde(default)]
     window: Option<String>,
+    /// The query's language (`ja`, `ko`, `ru`): the top three results must be
+    /// written in its script, or the row fails.
+    #[serde(default)]
+    lang: Option<String>,
 }
 
 struct Options {
@@ -60,6 +64,15 @@ struct Options {
     replay: Vec<PathBuf>,
     verbose: bool,
 }
+
+/// What one row's search returned: URLs, titles, snippets, dates, census.
+type RowOut = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<Option<String>>,
+    String,
+);
 
 const USAGE: &str = "usage: donsetch search-bench [--queries FILE] [--set gold|held|all] \
 [--shape SHAPE] [--only ID,ID] [--smoke] [--limit N] [--pace-ms N] [--max-results N] \
@@ -497,6 +510,7 @@ pub async fn run(args: &[String]) -> i32 {
     let mut redirects_total = 0usize;
     let mut stale_total = 0usize;
     let mut undated_total = 0usize;
+    let mut foreign_total = 0usize;
     for (n, q) in queries.iter().enumerate() {
         if n > 0 {
             tokio::time::sleep(opts.pace).await;
@@ -506,19 +520,21 @@ pub async fn run(args: &[String]) -> i32 {
         let outcome = searcher.search(&q.query, opts.max_results, None).await;
         let ms = t0.elapsed().as_millis() as u64;
         let raw = searcher.last_raw();
-        let (urls, titles, _published, census): (
-            Vec<String>,
-            Vec<String>,
-            Vec<Option<String>>,
-            String,
-        ) = match &outcome {
+        let (urls, titles, snippets, _published, census): RowOut = match &outcome {
             Ok(o) => (
                 o.results.iter().map(|r| r.url.clone()).collect(),
                 o.results.iter().map(|r| r.title.clone()).collect(),
+                o.results.iter().map(|r| r.snippet.clone()).collect(),
                 o.results.iter().map(|r| r.published.clone()).collect(),
                 render::census(&o.report),
             ),
-            Err(e) => (Vec::new(), Vec::new(), Vec::new(), format!("error: {e}")),
+            Err(e) => (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                format!("error: {e}"),
+            ),
         };
         let negative: Vec<Regex> = q
             .must_not
@@ -563,6 +579,16 @@ pub async fn run(args: &[String]) -> i32 {
         }
         stale_total += stale;
         undated_total += undated;
+        // Native results: the top three answer in the query's own script.
+        let mut foreign = 0usize;
+        if let Some(lang) = q.lang.as_deref() {
+            for (title, snippet) in titles.iter().zip(snippets.iter()).take(3) {
+                if !super::locale::native(lang, title, snippet) {
+                    foreign += 1;
+                }
+            }
+        }
+        foreign_total += foreign;
         let raw_best: Vec<(String, Option<usize>)> = raw
             .iter()
             .map(|(name, hits)| {
@@ -582,6 +608,8 @@ pub async fn run(args: &[String]) -> i32 {
             "STALE".to_string()
         } else if undated > 0 {
             "UNDATED".to_string()
+        } else if foreign > 0 {
+            "FOREIGN".to_string()
         } else {
             match (hit, recalled) {
                 (Some(h), _) => format!("HIT@{h}"),
@@ -603,6 +631,7 @@ pub async fn run(args: &[String]) -> i32 {
             "urls": urls,
             "must_not": violations, "redirects": redirects,
             "window": q.window, "stale": stale, "undated": undated,
+            "lang": q.lang, "foreign": foreign,
             "recall_by_source": raw_best.iter()
                 .map(|(s, r)| json!({"source": s, "rank": r})).collect::<Vec<_>>(),
             "raw": raw.iter().map(|(s, hits)| json!({
@@ -625,11 +654,12 @@ pub async fn run(args: &[String]) -> i32 {
     }
     crate::diag!("{}", all.line("ALL"));
     crate::diag!(
-        "redirects {}  must-not violations {}  stale {}  undated {}",
+        "redirects {}  must-not violations {}  stale {}  undated {}  foreign {}",
         redirects_total,
         violations_total,
         stale_total,
-        undated_total
+        undated_total,
+        foreign_total
     );
 
     if let Some(path) = &opts.out {
@@ -655,7 +685,12 @@ pub async fn run(args: &[String]) -> i32 {
             }
         }
     }
-    if redirects_total > 0 || violations_total > 0 || stale_total > 0 || undated_total > 0 {
+    if redirects_total > 0
+        || violations_total > 0
+        || stale_total > 0
+        || undated_total > 0
+        || foreign_total > 0
+    {
         return 3;
     }
     0

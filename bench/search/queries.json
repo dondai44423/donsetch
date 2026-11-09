@@ -917,8 +917,10 @@
    "gold": [
     "weathernews\\.jp/quake",
     "jma\\.go\\.jp/.+quake",
-    "news\\.web\\.nhk/.+earthquake"
-   ]
+    "news\\.web\\.nhk/.+earthquake",
+    "earthquake\\.tenki\\.jp"
+   ],
+   "lang": "ja"
   },
   {
    "id": "d1-scope",
@@ -993,6 +995,72 @@
    "must_not": [
     "crates\\.io/crates/requests",
     "npmjs\\.com/package/requests"
+   ]
+  },
+  {
+   "id": "d4-ja",
+   "shape": "web",
+   "set": "gold",
+   "query": "\u6771\u4eac\u306e\u5929\u6c17\u4e88\u5831",
+   "lang": "ja",
+   "gold": [
+    "weathernews\\.jp/onebox/tenki",
+    "tenki\\.jp",
+    "weather\\.yahoo\\.co\\.jp",
+    "jma\\.go\\.jp"
+   ]
+  },
+  {
+   "id": "d4-ko",
+   "shape": "web",
+   "set": "gold",
+   "query": "\uc11c\uc6b8 \ub0a0\uc528",
+   "lang": "ko",
+   "gold": [
+    "weather\\.go\\.kr",
+    "weather\\.naver\\.com",
+    "accuweather\\.com/ko"
+   ]
+  },
+  {
+   "id": "d4-ru",
+   "shape": "web",
+   "set": "gold",
+   "query": "\u043d\u043e\u0432\u043e\u0441\u0442\u0438 \u043c\u043e\u0441\u043a\u0432\u044b",
+   "lang": "ru",
+   "gold": [
+    "ria\\.ru",
+    "tass\\.ru",
+    "kommersant\\.ru",
+    "msk1\\.ru",
+    "m24\\.ru",
+    "lenta\\.ru"
+   ]
+  },
+  {
+   "id": "h-d4-ja",
+   "shape": "web",
+   "set": "held",
+   "query": "\u5927\u962a\u306e\u5929\u6c17",
+   "lang": "ja",
+   "gold": [
+    "tenki\\.jp",
+    "weathernews\\.jp",
+    "weather\\.yahoo\\.co\\.jp",
+    "jma\\.go\\.jp"
+   ]
+  },
+  {
+   "id": "h-d4-ko",
+   "shape": "web",
+   "set": "held",
+   "query": "\ubd80\uc0b0 \ub0a0\uc528",
+   "lang": "ko",
+   "gold": [
+    "kma\\.go\\.kr",
+    "weather\\.go\\.kr",
+    "weather\\.naver\\.com",
+    "accuweather\\.com/ko"
    ]
   }
  ]

@@ -22,6 +22,7 @@ pub mod verticals;
 mod authority;
 mod contract;
 mod enrich;
+mod locale;
 mod news;
 mod persist;
 mod render;
@@ -815,7 +816,7 @@ impl Searcher {
         const ORACLE_BUDGET: Duration = Duration::from_secs(8);
         tokio::time::timeout(
             ORACLE_BUDGET,
-            verticals::run(&self.fetcher, vertical, query, None),
+            verticals::run(&self.fetcher, vertical, query, None, None),
         )
         .await
         .ok()
@@ -973,6 +974,10 @@ impl Searcher {
         // re-lists the same tail.
         let max_results = max_results.clamp(1, 12);
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
+        // The query's language, from its script. It goes to the sources that
+        // accept one and to Wikipedia's own edition; the contract uses the same
+        // script test to tell a native result from a foreign page.
+        let locale = locale::detect(query);
         let cache_key = format!("{}|{}", norm_query(query), intent.code());
 
         if let Some((at, cached, _total, reports)) = self
@@ -1128,6 +1133,7 @@ impl Searcher {
             fetcher: &self.fetcher,
             pool: self.pool.as_ref(),
             google: &self.google,
+            locale,
         };
         for (engine, q, eg) in assign_egresses(self.pool.as_ref(), assignments, &mut used_egresses)
         {
@@ -1159,6 +1165,7 @@ impl Searcher {
                     &self.fetcher,
                     None,
                     lane_budget(),
+                    locale,
                 )),
             ));
         }

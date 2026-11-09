@@ -37,10 +37,21 @@ fn q(query: &str) -> String {
 }
 
 pub fn endpoint(vertical: &str, raw: &str) -> Option<String> {
+    endpoint_in(vertical, raw, None)
+}
+
+/// The endpoint with the query's language written into the source that has an
+/// edition per language (Wikipedia), and left alone for the rest.
+pub fn endpoint_in(
+    vertical: &str,
+    raw: &str,
+    locale: Option<super::locale::Locale>,
+) -> Option<String> {
     let query = q(raw);
+    let wiki = locale.map(|l| l.lang).unwrap_or("en");
     match vertical {
         "wikipedia" => Some(format!(
-            "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json&srlimit=5"
+            "https://{wiki}.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json&srlimit=5"
         )),
         "hn" => Some(format!(
             "https://hn.algolia.com/api/v1/search?query={query}&hitsPerPage=5"
@@ -151,8 +162,9 @@ pub async fn run(
     vertical: &str,
     query: &str,
     proxy: Option<&crate::egress::proxy::Proxy>,
+    locale: Option<super::locale::Locale>,
 ) -> Result<Vec<Hit>, VerticalError> {
-    let Some(url) = endpoint(vertical, query) else {
+    let Some(url) = endpoint_in(vertical, query, locale) else {
         return Ok(Vec::new());
     };
     let out = fetcher
@@ -168,7 +180,7 @@ pub async fn run(
         ))));
     }
     let body = String::from_utf8_lossy(&out.body);
-    let hits = parse(vertical, &body);
+    let hits = parse_in(vertical, &body, locale);
     if vertical == "arxiv" && title_terms(query).is_some() {
         // The title lookup is an exact-ish contract: it is credited only for
         // returned titles that cover the query. When none does, the query was
@@ -201,7 +213,11 @@ pub async fn run(
                 out.status
             ))));
         }
-        return Ok(parse("arxiv", &String::from_utf8_lossy(&out.body)));
+        return Ok(parse_in(
+            "arxiv",
+            &String::from_utf8_lossy(&out.body),
+            locale,
+        ));
     }
     Ok(hits)
 }
@@ -395,9 +411,13 @@ pub(crate) fn throttle(
 
 /// Body → hits router, shared by run() and tests.
 pub fn parse(vertical: &str, body: &str) -> Vec<Hit> {
+    parse_in(vertical, body, None)
+}
+
+pub fn parse_in(vertical: &str, body: &str, locale: Option<super::locale::Locale>) -> Vec<Hit> {
     match vertical {
         "arxiv" => parse_arxiv(body),
-        _ => parse_json(vertical, body),
+        _ => parse_json(vertical, body, locale),
     }
 }
 
@@ -416,7 +436,7 @@ pub fn rss_date_to_iso(date: &str) -> Option<String> {
     Some(format!("{}-{:02}-{}", parts[3], month + 1, parts[1]))
 }
 
-fn parse_json(vertical: &str, body: &str) -> Vec<Hit> {
+fn parse_json(vertical: &str, body: &str, locale: Option<super::locale::Locale>) -> Vec<Hit> {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return Vec::new();
     };
@@ -433,7 +453,8 @@ fn parse_json(vertical: &str, body: &str) -> Vec<Hit> {
                     .map(|(rank, it)| Hit {
                         title: it["title"].as_str().unwrap_or("").to_string(),
                         url: format!(
-                            "https://en.wikipedia.org/wiki/{}",
+                            "https://{}.wikipedia.org/wiki/{}",
+                            locale.map(|l| l.lang).unwrap_or("en"),
                             it["title"].as_str().unwrap_or("").replace(' ', "_")
                         ),
                         snippet: strip_tags(it["snippet"].as_str().unwrap_or("")),

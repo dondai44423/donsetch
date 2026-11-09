@@ -281,7 +281,9 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
         // Wiki safety net only on CONCEPTUAL web queries :
         // firing it everywhere flooded merges and crowded
         // out real canonicals (bench round 2 regression).
-        Intent::Web if is_conceptual(query) => vec!["wikipedia"],
+        Intent::Web if is_conceptual(query) || super::locale::detect(query).is_some() => {
+            vec!["wikipedia"]
+        }
         Intent::Web => vec![],
     }
 }

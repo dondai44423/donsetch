@@ -474,8 +474,19 @@ fn parse_yahoo(doc: &Html) -> Vec<Hit> {
 
 /// Engine URL builders.
 pub fn serp_url(engine: &str, query: &str) -> Option<String> {
+    serp_url_in(engine, query, None)
+}
+
+/// The same URL with the query's locale in the parameters the source honors:
+/// Bing's `setlang`/`cc`, DuckDuckGo's `kl`, Yahoo's `vl`. Sources without a
+/// locale parameter are unchanged.
+pub fn serp_url_in(
+    engine: &str,
+    query: &str,
+    locale: Option<super::locale::Locale>,
+) -> Option<String> {
     let q = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
-    match engine {
+    let mut url = match engine {
         "google" => Some(google_wml::url(query)),
         "brave" => Some(format!("https://search.brave.com/search?q={q}")),
         "bing" => Some(format!("https://www.bing.com/search?q={q}&count=15")),
@@ -490,7 +501,17 @@ pub fn serp_url(engine: &str, query: &str) -> Option<String> {
         // no `site:` support. Used as bing's fallback, never as a 7th slot.
         "bing_rss" => Some(format!("https://www.bing.com/search?format=rss&q={q}")),
         _ => None,
+    }?;
+    if let Some(l) = locale {
+        let extra = match engine {
+            "bing" | "bing_rss" => format!("&setlang={}&cc={}", l.lang, l.region),
+            "ddg" | "ddg_lite" | "ddg_html" => format!("&kl={}", l.kl()),
+            "yahoo" => format!("&vl=lang_{}", l.lang),
+            _ => String::new(),
+        };
+        url.push_str(&extra);
     }
+    Some(url)
 }
 
 // ── Answer contracts: what a source replied, not just that it replied ────────

@@ -46,6 +46,8 @@ pub(super) struct EngineContext<'a> {
     pub fetcher: &'a Fetcher,
     pub pool: &'a EgressPool,
     pub google: &'a engines::google_wml::ProfileSelector,
+    /// The query's language, when the script named one.
+    pub locale: Option<super::locale::Locale>,
 }
 
 /// The pacing gate a request is admitted through. A `site:`-scoped query is a
@@ -76,6 +78,7 @@ pub(super) async fn engine_task_with_budget(
         fetcher,
         pool,
         google,
+        locale,
     } = context;
     let mut label = engine.clone();
     let deadline = tokio::time::Instant::now() + budget;
@@ -98,7 +101,7 @@ pub(super) async fn engine_task_with_budget(
         None
     };
     let google_ua = lease.as_ref().map(|lease| lease.user_agent());
-    let Some(url) = engines::serp_url(&engine, &query) else {
+    let Some(url) = engines::serp_url_in(&engine, &query, locale) else {
         return (label, Err(("no-url".into(), egress_id, true)));
     };
     // The search lane hands over a picked egress lane, and with no pool
@@ -202,7 +205,7 @@ pub(super) async fn engine_task_with_budget(
         && engine == "bing"
         && scoped.is_none()
         && let Some((rss_hits, rss_class, rss_items)) =
-            bing_rss_fallback(&query, lane, fetcher, deadline).await
+            bing_rss_fallback(&query, lane, fetcher, deadline, locale).await
         && rss_class.contributes()
         && (thin || rss_class.credits())
     {
@@ -264,13 +267,14 @@ async fn bing_rss_fallback(
     lane: Option<&crate::egress::proxy::Proxy>,
     fetcher: &Fetcher,
     deadline: tokio::time::Instant,
+    locale: Option<super::locale::Locale>,
 ) -> Option<(Vec<engines::Hit>, engines::AnswerClass, usize)> {
     if deadline.saturating_duration_since(tokio::time::Instant::now())
         < std::time::Duration::from_millis(400)
     {
         return None;
     }
-    let url = engines::serp_url("bing_rss", query)?;
+    let url = engines::serp_url_in("bing_rss", query, locale)?;
     let out = tokio::time::timeout_at(
         deadline,
         fetcher.fetch_once_via(&url, &[], lane, false, None),
@@ -391,11 +395,12 @@ pub(super) async fn vertical_task(
     fetcher: &Fetcher,
     proxy: Option<crate::egress::proxy::Proxy>,
     budget: std::time::Duration,
+    locale: Option<super::locale::Locale>,
 ) -> (String, EngineResult) {
     let started = Instant::now();
     match tokio::time::timeout(
         budget,
-        verticals::run(fetcher, &vertical, &query, proxy.as_ref()),
+        verticals::run(fetcher, &vertical, &query, proxy.as_ref(), locale),
     )
     .await
     {
@@ -593,6 +598,7 @@ mod tests {
             fetcher: &fetcher,
             pool: &pool,
             google: &google,
+            locale: None,
         };
         pool.pace("bing", "direct").await;
         let (_, outcome) = engine_task_with_budget(
@@ -622,6 +628,7 @@ mod tests {
             fetcher: &fetcher,
             pool: &pool,
             google: &google,
+            locale: None,
         };
         for query in [
             "rust programming language",
@@ -797,6 +804,7 @@ mod tests {
             fetcher: &fetcher,
             pool: &pool,
             google: &google,
+            locale: None,
         };
         let out = engine_task_with_budget(
             "bing".into(),
