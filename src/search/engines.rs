@@ -20,10 +20,79 @@ pub struct Hit {
     pub published: Option<String>,
 }
 
+/// The element's visible text as a reader sees it: an inline tag adds no
+/// space of its own, so `<b>select</b>!` reads `select!` and
+/// `proxy_<b>pass</b>` reads `proxy_pass`; a block boundary or a `<br>`
+/// separates words. Script and style subtrees are never text.
 fn text(el: scraper::ElementRef) -> String {
-    // Visible text only: a script/style subtree in a SERP cell is
-    // source, never snippet text (#288's class, search side).
-    crate::extract::inline::visible_text(el)
+    // Engines bold the query's words, and every bold run is its own text
+    // node. Joining nodes with a space (the extractor's shape) printed
+    // "select ! macro" and "proxy _ pass" into every snippet.
+    use scraper::Node;
+    const INVISIBLE: &[&str] = &[
+        "script", "style", "noscript", "template", "svg", "canvas", "iframe", "object", "embed",
+    ];
+    const BLOCK: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "td",
+        "th",
+        "tr",
+        "ul",
+    ];
+    enum Step<'a> {
+        Visit(ego_tree::NodeRef<'a, Node>),
+        Gap,
+    }
+    let mut buf = String::new();
+    let mut stack: Vec<Step> = el.children().rev().map(Step::Visit).collect();
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Gap => buf.push(' '),
+            Step::Visit(n) => match n.value() {
+                Node::Text(t) => buf.push_str(t),
+                Node::Element(e) => {
+                    if INVISIBLE.contains(&e.name()) {
+                        continue;
+                    }
+                    let block = BLOCK.contains(&e.name());
+                    if block {
+                        stack.push(Step::Gap);
+                    }
+                    stack.extend(n.children().rev().map(Step::Visit));
+                    if block {
+                        stack.push(Step::Gap);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    buf.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn sel(css: &str) -> Selector {
@@ -517,6 +586,28 @@ pub fn serp_url_in(
         url.push_str(&extra);
     }
     Some(url)
+}
+
+/// Is a SERP that yielded no results a challenge page rather than an empty
+/// answer? DuckDuckGo's lite endpoint answers a burst with HTTP 200 and an
+/// image CAPTCHA ("bots use DuckDuckGo too", `anomaly.js`), which parsed to
+/// zero items and was reported as an empty answer: the census told the caller
+/// the source found nothing, and the ledger never rested the lane. Only asked
+/// of a page that yielded nothing, so a results page that mentions a CAPTCHA
+/// is never read as one.
+pub fn serp_challenge(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "anomaly.js",
+        "anomaly-modal",
+        "bots use duckduckgo too",
+        "please complete the following challenge",
+        "confirm this search was made by a human",
+        "/sorry/index",
+        "unusual traffic from your computer",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+        || crate::detect::walls::interactive_captcha(html.as_bytes())
 }
 
 // ── Answer contracts: what a source replied, not just that it replied ────────
@@ -1130,6 +1221,26 @@ mod tests {
 }
 
 #[cfg(test)]
+mod serp_challenge_tests {
+    use super::*;
+
+    /// The page DuckDuckGo lite served on 2026-11-09 in place of results.
+    #[test]
+    fn duckduckgos_anomaly_page_is_a_challenge_not_an_empty_answer() {
+        let html = include_str!("../../tests/fixtures/ddg-anomaly.html");
+        assert!(parse("ddg", html).is_empty());
+        assert!(serp_challenge(html));
+    }
+
+    #[test]
+    fn an_empty_results_page_is_not_a_challenge() {
+        let html = "<html><body><p>No results found for <b>zzqx</b>.</p>\
+            <p>Try different keywords.</p></body></html>";
+        assert!(!serp_challenge(html));
+    }
+}
+
+#[cfg(test)]
 mod visible_text_guard_tests {
     use super::*;
 
@@ -1149,6 +1260,46 @@ mod visible_text_guard_tests {
         assert!(!t.contains("window.r"), "{t}");
         assert!(t.contains("Result title"), "{t}");
         assert!(t.contains("and body"), "{t}");
+    }
+
+    fn first_child_text(html: &str) -> String {
+        let doc = Html::parse_fragment(html);
+        let el = doc
+            .root_element()
+            .children()
+            .filter_map(scraper::ElementRef::wrap)
+            .next()
+            .unwrap();
+        text(el)
+    }
+
+    // Engines bold the query's words; a bold run is not a word boundary.
+    #[test]
+    fn an_inline_tag_adds_no_space() {
+        assert_eq!(
+            first_child_text(
+                "<p>The <b>select</b>! macro and <b>proxy</b>_<b>pass</b>, in <code>tokio</code>.</p>"
+            ),
+            "The select! macro and proxy_pass, in tokio."
+        );
+        assert_eq!(
+            first_child_text("<p>Python 3.14<b>.0</b> is out</p>"),
+            "Python 3.14.0 is out"
+        );
+    }
+
+    // A block boundary or a line break still separates words, and source
+    // whitespace still counts.
+    #[test]
+    fn a_block_boundary_or_break_separates_words() {
+        assert_eq!(
+            first_child_text("<div><p>one</p><p>two</p>three<br>four</div>"),
+            "one two three four"
+        );
+        assert_eq!(
+            first_child_text("<p>spaced <b>bold</b>\n  words</p>"),
+            "spaced bold words"
+        );
     }
 }
 

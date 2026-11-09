@@ -175,6 +175,11 @@ pub(super) async fn engine_task_with_budget(
         );
     }
     let (mut hits, instant) = engines::parse_with_instant(&engine, &html, &url);
+    // A page with no results that is a challenge is a wall, not an empty
+    // answer: it fails the lane, and the ledger rests it on this refusal.
+    if hits.is_empty() && engines::serp_challenge(&html) {
+        return (label, Err(("blocked:captcha".into(), egress_id, true)));
+    }
     let scoped = super::query::compile(&query).site;
     if let Some(site) = &scoped {
         let (site, path) = super::query::site_scope(site);
