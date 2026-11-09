@@ -24,6 +24,7 @@ mod contract;
 mod enrich;
 mod persist;
 mod render;
+mod resolve;
 mod tasks;
 
 pub use persist::load_for_status as persist_load_for_status;
@@ -999,6 +1000,20 @@ impl Searcher {
             });
         }
 
+        // A name with an ecosystem word is answered by the registry that owns
+        // it: one request, no fan-out, no ambiguity to rank around.
+        if let Some(plan) = resolve::plan(query)
+            && plan.ecosystem.is_some()
+            && let resolve::Resolution::Hits(resolved) = resolve::run(
+                &plan,
+                &self.fetcher,
+                stage_budget(Duration::from_millis(1500), Duration::from_millis(300)),
+            )
+            .await
+        {
+            return Ok(self.resolved_outcome(query, intent, max_results, started, resolved));
+        }
+
         let engines = intent::engines_for(intent);
         // C2: compile operators once; each engine gets the form it
         // actually honors (DDG lite strips site: so BM25 is not
@@ -1143,6 +1158,23 @@ impl Searcher {
                     &self.fetcher,
                     None,
                     lane_budget(),
+                )),
+            ));
+        }
+
+        // A bare name is resolved alongside the fan-out: no latency cost, and
+        // its records lead the list when the name is real. The lane gets a
+        // shorter budget than the fan-out's soft mark so its answer lands with
+        // the first ones instead of arriving late.
+        if let Some(plan) = resolve::plan(query)
+            && plan.ecosystem.is_none()
+        {
+            futures.push((
+                "registry".to_string(),
+                Box::pin(tasks::registry_task(
+                    plan,
+                    &self.fetcher,
+                    Duration::from_millis(900),
                 )),
             ));
         }
@@ -1521,7 +1553,11 @@ impl Searcher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             persist::apply_outcome_demote(&mut results, &outcome);
         }
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        results.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
 
         // ── Result enrichment: prefetch top results to extract
         // real <title> and <meta description> from the actual
@@ -1656,6 +1692,51 @@ impl Searcher {
             instant,
             stage_ms: stages,
         })
+    }
+
+    /// A resolved name becomes an answer without a fan-out: the registry is the
+    /// first-party source, and its records enter the ordinary merge as one lane
+    /// (so evidence picking, tiers and diversity apply unchanged).
+    fn resolved_outcome(
+        &self,
+        query: &str,
+        intent: Intent,
+        max_results: usize,
+        started: Instant,
+        resolved: resolve::Resolved,
+    ) -> SearchOutcome {
+        let per_engine = vec![("registry".to_string(), resolved.hits.clone())];
+        *self
+            .last_raw
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = per_engine.clone();
+        let results = rank::merge(
+            &per_engine,
+            query,
+            intent,
+            &HashMap::new(),
+            &families::Families::default(),
+            12,
+        );
+        let report = vec![EngineReport {
+            engine: "registry".into(),
+            profile: Some(resolved.label),
+            status: "ok".into(),
+            hits: resolved.hits.len(),
+            ms: resolved.ms,
+            egress: "direct".into(),
+        }];
+        SearchOutcome {
+            results: results.into_iter().take(max_results).collect(),
+            intent,
+            report,
+            cached: false,
+            elapsed: started.elapsed(),
+            provider: None,
+            reranked: false,
+            instant: None,
+            stage_ms: vec![("resolve", resolved.ms as u128)],
+        }
     }
 
     fn bump_trust(&self, base_engine: &str, intent: Intent, ok: bool) {

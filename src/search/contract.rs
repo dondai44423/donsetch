@@ -234,6 +234,12 @@ impl Profile {
         }
     }
 
+    /// The query's content terms, lowercased and stripped of operators — what
+    /// the resolver reads to decide whether the query names one thing.
+    pub fn terms(&self) -> impl Iterator<Item = &str> {
+        self.terms.iter().map(|t| t.text.as_str())
+    }
+
     /// Does `root` name one of the query's terms? `_` and `-` are the same in a
     /// package name.
     fn names(&self, root: &str) -> bool {
@@ -447,9 +453,13 @@ pub fn scoped_root(raw: &str) -> Option<(ScopeShape, String)> {
     }
 }
 
-/// True when the URL is scoped and its root names one of the query's terms.
-pub fn scope_is_named(profile: &Profile, raw: &str) -> bool {
-    scoped_root(raw).is_some_and(|(_, root)| profile.names(&root))
+/// A scoped record from a package registry (not a GitHub repository) whose root
+/// the query names.
+pub fn package_scope_named(profile: &Profile, raw: &str) -> bool {
+    matches!(
+        scoped_root(raw),
+        Some((shape, root)) if shape != ScopeShape::Github && profile.names(&root)
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

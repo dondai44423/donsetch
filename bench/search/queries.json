@@ -656,7 +656,7 @@
    "set": "held",
    "query": "python 3.14 release notes",
    "gold": [
-    "docs\\.python\\.org/3/whatsnew/3\\.14",
+    "docs\\.python\\.org/[^ ]*whatsnew/3\\.14",
     "python\\.org/downloads/release/python-314"
    ]
   },
@@ -675,7 +675,8 @@
    "set": "held",
    "query": "kubernetes 1.34 release",
    "gold": [
-    "kubernetes\\.io/blog/[^ ]*(1-34|v1-34)"
+    "kubernetes\\.io/blog/[^ ]*(1-34|v1-34)",
+    "kubernetes\\.io/releases/1\\.34"
    ]
   },
   {
@@ -693,7 +694,8 @@
    "set": "held",
    "query": "typescript 5.9 announcement",
    "gold": [
-    "devblogs\\.microsoft\\.com/typescript/announcing-typescript-5-9"
+    "devblogs\\.microsoft\\.com/typescript/announcing-typescript-5-9",
+    "typescriptlang\\.org/[^ ]*release-notes/typescript-5-9"
    ]
   },
   {
@@ -941,6 +943,46 @@
    "must_not": [
     "(?i)diwali",
     "news\\.google\\.com/rss/articles"
+   ]
+  },
+  {
+   "id": "d2-crate",
+   "shape": "code",
+   "set": "gold",
+   "query": "rust tokio",
+   "gold": [
+    "docs\\.rs/tokio/latest/tokio",
+    "crates\\.io/crates/tokio"
+   ],
+   "must_not": [
+    "npmjs\\.com/package/tokio",
+    "pypi\\.org/project/tokio"
+   ]
+  },
+  {
+   "id": "d2-npm",
+   "shape": "code",
+   "set": "gold",
+   "query": "npm react",
+   "gold": [
+    "npmjs\\.com/package/react"
+   ],
+   "must_not": [
+    "crates\\.io/crates/react",
+    "pypi\\.org/project/react"
+   ]
+  },
+  {
+   "id": "d2-pypi",
+   "shape": "code",
+   "set": "gold",
+   "query": "pypi requests",
+   "gold": [
+    "pypi\\.org/project/requests"
+   ],
+   "must_not": [
+    "crates\\.io/crates/requests",
+    "npmjs\\.com/package/requests"
    ]
   }
  ]

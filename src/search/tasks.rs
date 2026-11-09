@@ -294,6 +294,42 @@ async fn bing_rss_fallback(
     Some((accepted.kept, accepted.class, accepted.items))
 }
 
+/// The registry lane: a bare name resolved while the fan-out runs. It is a
+/// first-party source, so it reports `no-results` rather than a fault when the
+/// name is not a package.
+pub(super) async fn registry_task(
+    plan: super::resolve::Plan,
+    fetcher: &Fetcher,
+    budget: std::time::Duration,
+) -> (String, EngineResult) {
+    match super::resolve::run(&plan, fetcher, budget).await {
+        super::resolve::Resolution::Hits(resolved) => {
+            let class = engines::vertical_class(&resolved.hits);
+            let items = resolved.hits.len();
+            (
+                "registry-any".to_string(),
+                Ok(LaneAnswer {
+                    hits: resolved.hits,
+                    items,
+                    ms: resolved.ms,
+                    egress: "direct".into(),
+                    engine_lane: false,
+                    instant: None,
+                    class,
+                }),
+            )
+        }
+        super::resolve::Resolution::Nothing => (
+            "registry-any".to_string(),
+            Err(("no-results".into(), "direct".into(), false)),
+        ),
+        super::resolve::Resolution::Unknown => (
+            "registry-any".to_string(),
+            Err(("late".into(), "direct".into(), false)),
+        ),
+    }
+}
+
 /// One vertical's answer, bounded by `budget` rather than the engine ceiling:
 /// a lane must not outlive the call that cancelled it (a cancelled blocking
 /// fetch keeps the process alive, which showed up as a 4.9 s wall clock on a

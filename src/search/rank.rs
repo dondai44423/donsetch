@@ -37,6 +37,8 @@ pub(crate) fn is_vertical(engine: &str) -> bool {
             | "europepmc"
             | "crates"
             | "npm"
+            | "registry"
+            | "registry-any"
     )
 }
 
@@ -59,10 +61,11 @@ pub struct Merged {
     /// source's teaser.
     #[serde(default)]
     pub from_page: bool,
-    /// Admission class: 0 a scope-named record, 1 everything else. Only the
-    /// scope promotion is a tier; inside it the measured score decides. A
-    /// first-party-exact tier was measured against `consensus_beats_vertical_only`
-    /// and lost: a vertical's keyword match is not worth more than agreement.
+    /// Admission class: 0 the resolver's own record for the name, 1 everything
+    /// else. Only a registry answer is proof that the query named the page; a
+    /// scoped URL an engine happened to find is not (an npm package called
+    /// "photosynthesis" is not the encyclopedia article). Inside a class the
+    /// measured score decides.
     #[serde(default)]
     pub tier: u8,
 }
@@ -412,16 +415,20 @@ fn merge_inner(
     // about a result's host or title moves it.
     crate::search::authority::freshen(intent, &mut results);
 
-    // Admission classes, not score multipliers. A page whose root the query
-    // named by name is the answer to a name query and outranks any amount of
-    // agreement; everything else is ordered by the measured score, unchanged.
-    // A first-party-exact tier was tried and lost a measured gate (a vertical's
-    // keyword match is weaker than consensus), so it is not a tier.
+    // Admission classes, not score multipliers. Two things are proof enough to
+    // lead: the resolver's own record, and (for a code query) a package
+    // registry page whose root the query names and whose text covers the query.
+    // Everything else keeps the measured score. D1 promoted any scoped URL and
+    // measured the cost: an npm package called "photosynthesis" took rank 1
+    // from the encyclopedia, a GitHub changelog from a release note, and a
+    // crates page matched on one word from the crate the query actually named.
     let profile = super::contract::Profile::new(query);
     for r in &mut results {
-        let named = super::contract::scope_is_named(&profile, &r.url)
-            && profile.verdict(&r.title, &r.snippet, &r.url).admitted();
-        r.tier = if named { 0 } else { 1 };
+        let resolved = r.sources.iter().any(|(engine, _)| engine == "registry");
+        let record = intent == Intent::Code
+            && super::contract::package_scope_named(&profile, &r.url)
+            && profile.verdict(&r.title, &r.snippet, &r.url) == super::contract::Verdict::Exact;
+        r.tier = if resolved || record { 0 } else { 1 };
     }
 
     results.sort_by(|a, b| {
@@ -582,18 +589,44 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_named_page_leads_the_list() {
-        // The query names `clap`; its docs page is the record asked for, even
-        // ranked far below a book chapter by the sources themselves.
+    fn only_the_registrys_own_record_leads_the_list() {
+        // An npm package called "photosynthesis" is a real record, but it is
+        // not the encyclopedia article the query asks for; a scoped URL found
+        // by an engine is not proof of anything.
+        let per = vec![
+            (
+                "ddg".to_string(),
+                vec![hit("https://en.wikipedia.org/wiki/Photosynthesis", 1)],
+            ),
+            (
+                "registry-any".to_string(),
+                vec![hit("https://www.npmjs.com/package/photosynthesis", 1)],
+            ),
+        ];
+        let out = merge(
+            &per,
+            "photosynthesis",
+            Intent::Entity,
+            &HashMap::new(),
+            &Families::default(),
+            10,
+        );
+        assert_eq!(out[0].url, "https://en.wikipedia.org/wiki/Photosynthesis");
+        assert_eq!(out[1].tier, 1, "a bare-name guess is not a tier promotion");
+    }
+
+    #[test]
+    fn a_code_query_leads_with_the_package_it_names() {
+        let mut docs = hit("https://docs.rs/clap/latest/clap/", 8);
+        docs.title = "clap — Rust crate documentation".into();
+        docs.snippet =
+            "A simple to use, efficient, and full-featured Command Line Argument Parser".into();
         let per = vec![
             (
                 "ddg".to_string(),
                 vec![hit("https://doc.rust-lang.org/book/ch12-01.html", 1)],
             ),
-            (
-                "brave".to_string(),
-                vec![hit("https://docs.rs/clap/latest/clap/", 8)],
-            ),
+            ("brave".to_string(), vec![docs]),
         ];
         let out = merge(
             &per,
@@ -605,7 +638,61 @@ mod tests {
         );
         assert_eq!(out[0].url, "https://docs.rs/clap/latest/clap/");
         assert_eq!(out[0].tier, 0);
-        assert_eq!(out[1].tier, 1);
+    }
+
+    #[test]
+    fn a_record_matched_on_one_word_does_not_lead() {
+        // The serde query is about serde_json; crates.io/crates/serde matches
+        // one word of it and is not the record asked for.
+        let mut serde = hit("https://crates.io/crates/serde", 1);
+        serde.title = "serde".into();
+        serde.snippet = "A serialization framework".into();
+        let mut answer = hit("https://serde.rs/field-attrs.html", 1);
+        answer.title = "Field attributes · Serde".into();
+        answer.snippet = "Rename fields with serde json attributes".into();
+        let per = vec![
+            ("ddg".to_string(), vec![answer.clone()]),
+            ("yahoo".to_string(), vec![answer]),
+            ("brave".to_string(), vec![serde]),
+        ];
+        let out = merge(
+            &per,
+            "rust serde json crate",
+            Intent::Code,
+            &HashMap::new(),
+            &Families::default(),
+            10,
+        );
+        assert_eq!(out[0].url, "https://serde.rs/field-attrs.html");
+        let crates = out
+            .iter()
+            .find(|r| r.url.contains("crates.io/crates/serde"))
+            .expect("the crate page is still a result");
+        assert_eq!(crates.tier, 1, "a one-word match is not a promotion");
+    }
+
+    #[test]
+    fn a_resolved_record_leads_the_list() {
+        let per = vec![
+            (
+                "ddg".to_string(),
+                vec![hit("https://example.com/blog/tokio", 1)],
+            ),
+            (
+                "registry".to_string(),
+                vec![hit("https://docs.rs/tokio/latest/tokio/", 1)],
+            ),
+        ];
+        let out = merge(
+            &per,
+            "rust tokio",
+            Intent::Code,
+            &HashMap::new(),
+            &Families::default(),
+            10,
+        );
+        assert_eq!(out[0].url, "https://docs.rs/tokio/latest/tokio/");
+        assert_eq!(out[0].tier, 0);
     }
 
     #[test]
