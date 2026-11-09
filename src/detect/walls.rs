@@ -249,6 +249,16 @@ mod report_audit_tests {
         }
         let login = "<html><title>LinkedIn: Log In or Sign Up</title><body><h1>Welcome to your professional community</h1><form><input type='password'><button>Sign in</button></form></body></html>";
         assert_eq!(detect(200, &[], login.as_bytes()), Verdict::AuthWall);
+        // A human-verification widget is an interaction wall, not a login: a
+        // page whose copy says "sign in" and which carries a reCAPTCHA
+        // (federalregister.gov) asks for a human step, not a password.
+        let recaptcha = "<html><title>Sign in</title><body><h1>Sign in to continue</h1>\
+<form><input type='email'><div class='g-recaptcha' data-sitekey='x'></div>\
+<button>Sign in</button></form></body></html>";
+        assert!(
+            matches!(detect(200, &[], recaptcha.as_bytes()), Verdict::Challenge(_)),
+            "a captcha on a sign-in page is an interaction wall"
+        );
         assert_eq!(
             detect_dom_smart(
                 "<html><title>Login – Vercel</title><body><h1>Log in to Vercel</h1></body></html>"
@@ -475,6 +485,20 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
             || heading.as_str() == "this page could not be found."
     }) {
         return Some(Verdict::SoftNotFound);
+    }
+    // A human-verification *widget* on a page whose copy says "sign in" is an
+    // interaction wall, not a login: federalregister.gov's reCAPTCHA page was
+    // read as an auth gate, which is a declared outcome and hid a wall whose
+    // ask is a human step. The widget is the fact; a page that merely mentions
+    // a vendor in its text is not one.
+    let captcha = scraper::Selector::parse(
+        ".g-recaptcha, .h-captcha, #px-captcha, iframe[src*='recaptcha'], \
+         iframe[src*='hcaptcha'], iframe[src*='captcha-delivery'], \
+         script[src*='recaptcha'], script[src*='hcaptcha']",
+    )
+    .expect("static captcha selectors");
+    if doc.select(&captcha).next().is_some() {
+        return Some(Verdict::Challenge(Vendor::Generic));
     }
     if doc.select(&scraper::Selector::parse("form#login_form input[type='password'], form[name='login-form'] input[type='password']").unwrap()).next().is_some()
         && doc.select(&scraper::Selector::parse("article").unwrap()).next().is_none() {

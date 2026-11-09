@@ -404,6 +404,38 @@ impl Worker {
             } else {
                 Vec::new()
             };
+            // The interface answered "no such item" in its own words: that is a
+            // result, not a wall to work. Without this, a deleted question fell
+            // through to the page and its Cloudflare wall was reported as an
+            // identity gap the fetch could not close.
+            if items.len() < path.min_items && datapath::absent(&body) {
+                return Interface::Answered(Box::new(Outcome {
+                    url: url.to_string(),
+                    cache: None,
+                    host,
+                    final_url: url.to_string(),
+                    class: Class::HttpError,
+                    identity: Some(identity.name.to_string()),
+                    status,
+                    ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                    ms_first: first_ms,
+                    attempts: std::mem::take(attempts),
+                    title: String::new(),
+                    text_chars: 0,
+                    wall: None,
+                    evidence: vec![format!("{}: not found", path.id)],
+                    failures: Vec::new(),
+                    spent_state: false,
+                    transport: "data".to_string(),
+                    items: 0,
+                    sample: Vec::new(),
+                    sample_urls: Vec::new(),
+                    body_text: String::new(),
+                    body: None,
+                    headers: Vec::new(),
+                    bytes: None,
+                }));
+            }
             let (mut elapsed, mut size, mut calls) = (elapsed, size, 1);
             // A first page too short to be content, from an interface that names
             // its own next page: ask that page once, as the page itself would.

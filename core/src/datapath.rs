@@ -857,9 +857,30 @@ pub fn render(path: &DataPath, items: &[Item]) -> String {
     out
 }
 
+/// The interface's own answer that the item does not exist: Stack Exchange
+/// answers a deleted or never-asked question with `error_name: not_found` on a
+/// non-200 status. A deleted question is a result, not a wall — the source that
+/// owns the item said so, and falling through to the page's Cloudflare wall
+/// would report a deletion as an identity gap.
+pub fn absent(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("\"error_name\":\"not_found\"") || lower.contains("\"error_name\": \"not_found\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deleted_item_is_an_answer_not_a_wall() {
+        // Stack Exchange's own words for a question that no longer exists.
+        assert!(absent(
+            r#"{"error_id":404,"error_message":"no questions found","error_name":"not_found"}"#
+        ));
+        assert!(absent(r#"{ "error_name": "not_found" }"#));
+        // A normal answer (even an empty one) is not an absence.
+        assert!(!absent(r#"{"items":[],"has_more":false}"#));
+    }
 
     #[test]
     fn paths_match_their_own_hosts_only() {

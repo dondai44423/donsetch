@@ -1217,6 +1217,13 @@
         const nonce = /nonce\s*=\s*"([^"]*)"/i.exec(match[1]);
         if (nonce) el.nonce = nonce[1];
         el.textContent = match[2];
+        // The tag is in the document, and `document.currentScript.parentNode` is
+        // how an inline integration (GTM, a WAF bootstrap) finds where to put
+        // the element it owns. The host has one head node; the script hangs
+        // there, as a page's script tag hangs off its parent element. Set the
+        // link directly: `appendChild` would run the script a second time.
+        el.parentNode = document.head;
+        document.head.childNodes.push(el);
         scriptEls.push(el);
       }
       document.scripts = scriptEls;
