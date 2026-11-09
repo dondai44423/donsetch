@@ -294,6 +294,57 @@ async fn bing_rss_fallback(
     Some((accepted.kept, accepted.class, accepted.items))
 }
 
+/// Turn one news source's answer into a lane. Each source races on its own, so
+/// a slow wire never hides a fast feed, and a rested GDELT is visible.
+fn news_lane(name: &str, answer: super::news::Answer) -> (String, EngineResult) {
+    let result = if answer.hits.is_empty() {
+        Err((answer.status.into(), "direct".into(), false))
+    } else {
+        let class = engines::vertical_class(&answer.hits);
+        let items = answer.hits.len();
+        Ok(LaneAnswer {
+            hits: answer.hits,
+            items,
+            ms: answer.ms,
+            egress: "direct".into(),
+            engine_lane: false,
+            instant: None,
+            class,
+        })
+    };
+    (name.to_string(), result)
+}
+
+pub(super) async fn news_wire_task(
+    query: String,
+    fetcher: &Fetcher,
+    proxy: Option<crate::egress::proxy::Proxy>,
+    budget: std::time::Duration,
+) -> (String, EngineResult) {
+    let answer = super::news::bing_news(&query, fetcher, proxy.as_ref(), budget).await;
+    news_lane("bing-news", answer)
+}
+
+pub(super) async fn news_feed_task(
+    query: String,
+    fetcher: &Fetcher,
+    budget: std::time::Duration,
+) -> (String, EngineResult) {
+    let profile = super::contract::Profile::new(&query);
+    let window = super::contract::window_for(&query);
+    let answer = super::news::mesh(&profile, window, fetcher, budget).await;
+    news_lane("feed", answer)
+}
+
+pub(super) async fn news_gdelt_task(
+    query: String,
+    fetcher: &Fetcher,
+    budget: std::time::Duration,
+) -> (String, EngineResult) {
+    let answer = super::news::gdelt(&query, fetcher, budget).await;
+    news_lane("gdelt", answer)
+}
+
 /// The registry lane: a bare name resolved while the fan-out runs. It is a
 /// first-party source, so it reports `no-results` rather than a fault when the
 /// name is not a package.

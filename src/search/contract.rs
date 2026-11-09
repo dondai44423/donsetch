@@ -580,6 +580,171 @@ pub fn accept_first_party(query: &str, hits: Vec<Hit>) -> Vec<Hit> {
         .collect()
 }
 
+// ── Date ────────────────────────────────────────────────────────────────
+//
+// The date contract: a dated query means a window, and an item is part of the
+// answer only when its own date falls inside it. Days are UTC day numbers, so
+// the comparison is one subtraction — no timezone rules, no calendar crate.
+
+/// A query's date window: `start` inclusive, `end` exclusive, UTC days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub start: i64,
+    pub end: i64,
+}
+
+impl Window {
+    pub fn contains(&self, day: i64) -> bool {
+        day >= self.start && day < self.end
+    }
+}
+
+/// Days since the Unix epoch, UTC.
+pub fn today() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+}
+
+/// Howard Hinnant's civil-days conversion: 1970-01-01 is day 0.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The UTC day a `YYYY-MM-DD…` stamp falls on.
+pub fn day_of(stamp: &str) -> Option<i64> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let y: i64 = stamp.get(0..4)?.parse().ok()?;
+    let m: i64 = stamp.get(5..7)?.parse().ok()?;
+    let d: i64 = stamp.get(8..10)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// A rolling window of the last `days` days, including today.
+pub fn window_days(days: i64) -> Window {
+    let now = today();
+    Window {
+        start: now - days + 1,
+        end: now + 1,
+    }
+}
+
+/// A bench row's window: `"7d"`, `"365d"`, `"12h"`, `"4w"`.
+pub fn window_from_str(span: &str) -> Option<Window> {
+    let span = span.trim();
+    let (num, unit) = span.split_at(span.len().checked_sub(1)?);
+    let n: i64 = num.trim().parse().ok()?;
+    if n <= 0 || n > 3650 {
+        return None;
+    }
+    Some(window_days(match unit {
+        "d" => n,
+        "w" => n * 7,
+        "m" => n * 31,
+        "y" => n * 365,
+        "h" => (n + 23) / 24,
+        _ => return None,
+    }))
+}
+
+const MONTHS: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+/// The window a query states, if it states one. `latest` alone is not a window
+/// — it is a ranking hint, and a week would silently drop the right page.
+pub fn window_for(query: &str) -> Option<Window> {
+    let lower = query.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let text = words.join(" ");
+    for (i, w) in words.iter().enumerate() {
+        if !matches!(*w, "past" | "last" | "next") {
+            continue;
+        }
+        let Some(n) = words.get(i + 1).and_then(|s| s.parse::<i64>().ok()) else {
+            continue;
+        };
+        let Some(unit) = words.get(i + 2) else {
+            continue;
+        };
+        let days = match *unit {
+            "hour" | "hours" => (n + 23) / 24,
+            "day" | "days" => n,
+            "week" | "weeks" => n * 7,
+            "month" | "months" => n * 31,
+            "year" | "years" => n * 365,
+            _ => continue,
+        };
+        if (1..=3650).contains(&days) {
+            return Some(window_days(days));
+        }
+    }
+    if text.contains("this week") || text.contains("past week") || text.contains("last week") {
+        return Some(window_days(7));
+    }
+    if text.contains("this month") || text.contains("past month") || text.contains("last month") {
+        return Some(window_days(31));
+    }
+    if text.contains("this year") {
+        return Some(window_days(365));
+    }
+    if text.contains("today") || text.contains("breaking") || text.contains("this morning") {
+        return Some(window_days(1));
+    }
+    // A named month inside a year: "november 2026" is that month, not the year.
+    if let Some(mi) = MONTHS.iter().position(|m| words.contains(m)) {
+        let year = words
+            .iter()
+            .find_map(|w| w.parse::<i64>().ok().filter(|y| (2020..=2100).contains(y)));
+        if let Some(y) = year {
+            let month = mi as i64 + 1;
+            let (end_year, end_month) = if month == 12 {
+                (y + 1, 1)
+            } else {
+                (y, month + 1)
+            };
+            return Some(Window {
+                start: days_from_civil(y, month, 1),
+                end: days_from_civil(end_year, end_month, 1),
+            });
+        }
+    }
+    let year = words
+        .iter()
+        .find_map(|w| w.parse::<i64>().ok().filter(|y| (2020..=2100).contains(y)))?;
+    Some(Window {
+        start: days_from_civil(year, 1, 1),
+        end: days_from_civil(year + 1, 1, 1),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,5 +980,49 @@ mod tests {
             Some((ScopeShape::Pypi, "foo-bar".to_string()))
         );
         assert_eq!(scoped_root("https://example.com/x"), None);
+    }
+
+    #[test]
+    fn days_are_counted_from_the_epoch() {
+        assert_eq!(day_of("1970-01-01"), Some(0));
+        assert_eq!(day_of("2000-01-01"), Some(10_957));
+        assert_eq!(day_of("2026-11-09"), Some(20_766));
+        assert_eq!(day_of("2026-11-08"), Some(20_765));
+        assert_eq!(day_of("not a date"), None);
+        assert_eq!(day_of("2026-13-01"), None);
+    }
+
+    #[test]
+    fn a_query_that_states_a_window_gets_one() {
+        let week = window_days(7);
+        assert_eq!(
+            window_for("spacex starship latest news this week"),
+            Some(week)
+        );
+        assert_eq!(
+            window_for("what happened last 3 days"),
+            Some(window_days(3))
+        );
+        assert_eq!(window_for("tokio"), None, "a bare name has no window");
+        assert_eq!(
+            window_for("latest release"),
+            None,
+            "latest alone is a ranking hint, not a window"
+        );
+        let november = window_for("federal reserve november 2026").expect("a month window");
+        assert_eq!(november.start, day_of("2026-11-01").unwrap());
+        assert_eq!(november.end, day_of("2026-12-01").unwrap());
+        let year = window_for("nobel prize 2026 winner").expect("a year window");
+        assert_eq!(year.start, day_of("2026-01-01").unwrap());
+        assert_eq!(year.end, day_of("2027-01-01").unwrap());
+    }
+
+    #[test]
+    fn a_bench_window_parses_and_stays_inside_the_calendar() {
+        assert_eq!(window_from_str("7d"), Some(window_days(7)));
+        assert_eq!(window_from_str("2w"), Some(window_days(14)));
+        assert_eq!(window_from_str("12h"), Some(window_days(1)));
+        assert_eq!(window_from_str("0d"), None);
+        assert_eq!(window_from_str("7x"), None);
     }
 }

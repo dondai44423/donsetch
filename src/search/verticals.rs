@@ -100,9 +100,6 @@ pub fn endpoint(vertical: &str, raw: &str) -> Option<String> {
         "scholar" => Some(format!(
             "https://api.semanticscholar.org/graph/v1/paper/search?query={query}&limit=5&fields=title,url,abstract,year"
         )),
-        "news" => Some(format!(
-            "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-        )),
         "arxiv" => {
             // A query that reads as a paper's title is looked up as one: every
             // word must be in the title, which finds the paper itself where
@@ -399,7 +396,6 @@ pub(crate) fn throttle(
 /// Body → hits router, shared by run() and tests.
 pub fn parse(vertical: &str, body: &str) -> Vec<Hit> {
     match vertical {
-        "news" => parse_rss(body),
         "arxiv" => parse_arxiv(body),
         _ => parse_json(vertical, body),
     }
@@ -574,57 +570,6 @@ fn parse_json(vertical: &str, body: &str) -> Vec<Hit> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
-}
-
-/// Google News RSS: loose parse (items are well-formed
-/// enough for tag scanning; no XML dep needed).
-fn parse_rss(body: &str) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    for (rank, item) in body.split("<item>").skip(1).enumerate() {
-        if rank >= 8 {
-            break;
-        }
-        let grab = |tag: &str| -> String {
-            let open = format!("<{tag}>");
-            let close = format!("</{tag}>");
-            item.split_once(&open)
-                .and_then(|(_, rest)| rest.split_once(&close))
-                .map(|(inner, _)| {
-                    inner
-                        .trim_start_matches("<![CDATA[")
-                        .trim_end_matches("]]>")
-                        .to_string()
-                })
-                .unwrap_or_default()
-        };
-        let title = grab("title");
-        let url = grab("link");
-        let date = grab("pubDate");
-        let iso = rss_date_to_iso(&date);
-        if !title.is_empty() && url.starts_with("http") {
-            // Google News titles end in " - Publisher"; a date
-            // alone is a snippet that says nothing about the
-            // story, so carry publisher + date instead.
-            let publisher = title
-                .rsplit_once(" - ")
-                .map(|(_, p)| p.trim())
-                .unwrap_or("")
-                .to_string();
-            let snippet = if publisher.is_empty() {
-                date.clone()
-            } else {
-                format!("{publisher} · {date}")
-            };
-            hits.push(Hit {
-                title,
-                url,
-                snippet,
-                rank,
-                published: iso,
-            });
-        }
-    }
-    hits
 }
 
 /// arXiv Atom feed: loose tag scan like the RSS parser.

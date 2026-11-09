@@ -276,7 +276,7 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             }
             v
         }
-        Intent::News => vec!["news", "hn"],
+        Intent::News => vec!["hn"],
         Intent::Entity => vec!["wikipedia"],
         // Wiki safety net only on CONCEPTUAL web queries :
         // firing it everywhere flooded merges and crowded

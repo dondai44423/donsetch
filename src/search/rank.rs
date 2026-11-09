@@ -39,6 +39,9 @@ pub(crate) fn is_vertical(engine: &str) -> bool {
             | "npm"
             | "registry"
             | "registry-any"
+            | "bing-news"
+            | "feed"
+            | "gdelt"
     )
 }
 
@@ -428,7 +431,19 @@ fn merge_inner(
         let record = intent == Intent::Code
             && super::contract::package_scope_named(&profile, &r.url)
             && profile.verdict(&r.title, &r.snippet, &r.url) == super::contract::Verdict::Exact;
-        r.tier = if resolved || record { 0 } else { 1 };
+        // A dated item from the news program answers a dated query: one record
+        // per news lane leads (its top item), not the whole wire — promoting
+        // every wire item buried the official page an announcement points at.
+        let dated_news = r.published.is_some()
+            && r.sources.iter().any(|(engine, rank)| {
+                *rank == 0 && matches!(engine.as_str(), "bing-news" | "feed" | "gdelt")
+            })
+            && (intent == Intent::News || super::contract::window_for(query).is_some());
+        r.tier = if resolved || record || dated_news {
+            0
+        } else {
+            1
+        };
     }
 
     results.sort_by(|a, b| {

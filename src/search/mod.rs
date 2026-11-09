@@ -22,6 +22,7 @@ pub mod verticals;
 mod authority;
 mod contract;
 mod enrich;
+mod news;
 mod persist;
 mod render;
 mod resolve;
@@ -1179,6 +1180,50 @@ impl Searcher {
             ));
         }
 
+        // The news program races with the rest: the wire, the feeds and the
+        // leased index, each its own lane. A news answer is dated and exact,
+        // and the date contract has already dropped what is outside the query's
+        // window — but the open web still runs, because the official page an
+        // announcement points at is often not in the wire's index.
+        if news::wants_news(query, intent) {
+            // The wire is a search endpoint, not a publisher's API: it rides the
+            // pool like any engine, so one direct-IP throttle does not silence
+            // every news query.
+            let news_proxy = self.pool.pick("bing-news", &used_egresses, true);
+            let news_proxy = match news_proxy {
+                Some(egress) => {
+                    used_egresses.push(egress.id.clone());
+                    egress.proxy.clone()
+                }
+                None => None,
+            };
+            futures.push((
+                "bing-news".to_string(),
+                Box::pin(tasks::news_wire_task(
+                    query.to_string(),
+                    &self.fetcher,
+                    news_proxy,
+                    lane_budget(),
+                )),
+            ));
+            futures.push((
+                "feed".to_string(),
+                Box::pin(tasks::news_feed_task(
+                    query.to_string(),
+                    &self.fetcher,
+                    lane_budget(),
+                )),
+            ));
+            futures.push((
+                "gdelt".to_string(),
+                Box::pin(tasks::news_gdelt_task(
+                    query.to_string(),
+                    &self.fetcher,
+                    lane_budget(),
+                )),
+            ));
+        }
+
         // ── One budget, raced ──
         //
         // The call commits to what has answered by the soft mark and cancels the
@@ -1218,8 +1263,20 @@ impl Searcher {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let mut outcomes: Vec<(String, EngineResult)> = Vec::new();
+        // A news query's answer is the wire: committing on consensus before the
+        // news lanes report drops the record the query asked for. They get a
+        // bounded head start past the soft mark; then the call commits anyway.
+        let news_deadline = tokio::time::Instant::now() + Duration::from_millis(1800);
+        let news_wanted = news::wants_news(query, intent);
         loop {
-            if enough_answered(&outcomes, early, &known_families) {
+            let news_pending = news_wanted
+                && ["bing-news", "feed", "gdelt"]
+                    .iter()
+                    .any(|lane| outstanding.get(*lane).copied().unwrap_or(0) > 0);
+            let now = tokio::time::Instant::now();
+            if enough_answered(&outcomes, early, &known_families)
+                && (!news_pending || now >= news_deadline)
+            {
                 break;
             }
             // The soft mark only ends the wait when the answer is already
@@ -2870,18 +2927,6 @@ mod tests {
         assert_eq!(rank::family_count(&measured[0]), 3);
         let markdown = render_compact_markdown(&outcome(vec![measured[0].clone()]), "", None, &[]);
         assert!(markdown.contains(" · 3 indexes"), "{markdown}");
-    }
-
-    #[test]
-    fn news_snippet_carries_publisher_not_bare_date() {
-        let body = r#"<rss><item>
-          <title>Power grid restore advances - Wire News</title>
-          <link>https://example.gov/grid</link>
-          <pubDate>Thu, 31 Jul 2026 07:00:00 GMT</pubDate>
-        </item></rss>"#;
-        let hits = verticals::parse("news", body);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].snippet, "Wire News · Thu, 31 Jul 2026 07:00:00 GMT");
     }
 
     #[test]

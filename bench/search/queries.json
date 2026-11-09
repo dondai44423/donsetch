@@ -204,7 +204,8 @@
     "nobelprize\\.org",
     "indianexpress\\.com/[^ ]*nobel",
     "aps\\.org/[^ ]*nobel"
-   ]
+   ],
+   "window": "365d"
   },
   {
    "id": "n2",
@@ -214,7 +215,8 @@
    "gold": [
     "blog\\.rust-lang\\.org/[^ ]*1\\.90",
     "releases\\.rust-lang\\.org"
-   ]
+   ],
+   "window": "365d"
   },
   {
    "id": "n3",
@@ -223,7 +225,8 @@
    "query": "federal reserve interest rate decision november 2026",
    "gold": [
     "federalreserve\\.gov/newsevents/pressreleases"
-   ]
+   ],
+   "window": "60d"
   },
   {
    "id": "n4",
@@ -232,7 +235,8 @@
    "query": "openai gpt release announcement",
    "gold": [
     "openai\\.com/[^ ]*(index|news|gpt)"
-   ]
+   ],
+   "window": "365d"
   },
   {
    "id": "n5",
@@ -242,7 +246,8 @@
    "gold": [
     "apple\\.com/[^ ]*earnings",
     "investor\\.apple\\.com"
-   ]
+   ],
+   "window": "120d"
   },
   {
    "id": "b1",
@@ -667,7 +672,8 @@
    "query": "node.js 24 release announcement",
    "gold": [
     "nodejs\\.org/[^ ]*(blog/release/v24|v24)"
-   ]
+   ],
+   "window": "365d"
   },
   {
    "id": "h-n3",
@@ -677,7 +683,8 @@
    "gold": [
     "kubernetes\\.io/blog/[^ ]*(1-34|v1-34)",
     "kubernetes\\.io/releases/1\\.34"
-   ]
+   ],
+   "window": "365d"
   },
   {
    "id": "h-n4",
@@ -686,7 +693,8 @@
    "query": "postgresql 18 released",
    "gold": [
     "postgresql\\.org/about/news/postgresql-18"
-   ]
+   ],
+   "window": "365d"
   },
   {
    "id": "h-n5",
@@ -696,7 +704,8 @@
    "gold": [
     "devblogs\\.microsoft\\.com/typescript/announcing-typescript-5-9",
     "typescriptlang\\.org/[^ ]*release-notes/typescript-5-9"
-   ]
+   ],
+   "window": "365d"
   },
   {
    "id": "h-b1",
@@ -943,7 +952,8 @@
    "must_not": [
     "(?i)diwali",
     "news\\.google\\.com/rss/articles"
-   ]
+   ],
+   "window": "7d"
   },
   {
    "id": "d2-crate",

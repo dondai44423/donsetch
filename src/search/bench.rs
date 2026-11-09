@@ -38,6 +38,10 @@ struct BenchQuery {
     /// must_not is a gate: the run fails when one matches.
     #[serde(default)]
     must_not: Vec<String>,
+    /// A dated query's freshness (`7d`, `365d`): the top three results must be
+    /// dated and inside it, or the row fails.
+    #[serde(default)]
+    window: Option<String>,
 }
 
 struct Options {
@@ -491,6 +495,8 @@ pub async fn run(args: &[String]) -> i32 {
     let mut rows = Vec::new();
     let mut violations_total = 0usize;
     let mut redirects_total = 0usize;
+    let mut stale_total = 0usize;
+    let mut undated_total = 0usize;
     for (n, q) in queries.iter().enumerate() {
         if n > 0 {
             tokio::time::sleep(opts.pace).await;
@@ -500,13 +506,19 @@ pub async fn run(args: &[String]) -> i32 {
         let outcome = searcher.search(&q.query, opts.max_results, None).await;
         let ms = t0.elapsed().as_millis() as u64;
         let raw = searcher.last_raw();
-        let (urls, titles, census): (Vec<String>, Vec<String>, String) = match &outcome {
+        let (urls, titles, _published, census): (
+            Vec<String>,
+            Vec<String>,
+            Vec<Option<String>>,
+            String,
+        ) = match &outcome {
             Ok(o) => (
                 o.results.iter().map(|r| r.url.clone()).collect(),
                 o.results.iter().map(|r| r.title.clone()).collect(),
+                o.results.iter().map(|r| r.published.clone()).collect(),
                 render::census(&o.report),
             ),
-            Err(e) => (Vec::new(), Vec::new(), format!("error: {e}")),
+            Err(e) => (Vec::new(), Vec::new(), Vec::new(), format!("error: {e}")),
         };
         let negative: Vec<Regex> = q
             .must_not
@@ -526,6 +538,31 @@ pub async fn run(args: &[String]) -> i32 {
         violations_total += violations.len();
         redirects_total += redirects;
         let hit = first_match(&gold, &urls);
+        // The date contract, measured on what the news program offered: every
+        // item a news lane returns is dated, and dated inside the query's
+        // window. The general web is not held to a date it does not carry.
+        let mut stale = 0usize;
+        let mut undated = 0usize;
+        if let Some(window) = q
+            .window
+            .as_deref()
+            .and_then(super::contract::window_from_str)
+        {
+            for (lane, hits) in &raw {
+                if !matches!(lane.as_str(), "bing-news" | "feed" | "gdelt") {
+                    continue;
+                }
+                for h in hits {
+                    match h.published.as_deref().and_then(super::contract::day_of) {
+                        None => undated += 1,
+                        Some(day) if !window.contains(day) => stale += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        stale_total += stale;
+        undated_total += undated;
         let raw_best: Vec<(String, Option<usize>)> = raw
             .iter()
             .map(|(name, hits)| {
@@ -541,6 +578,10 @@ pub async fn run(args: &[String]) -> i32 {
             .add(hit, recalled, ms);
         let verdict = if !violations.is_empty() {
             "VIOLATION".to_string()
+        } else if stale > 0 {
+            "STALE".to_string()
+        } else if undated > 0 {
+            "UNDATED".to_string()
         } else {
             match (hit, recalled) {
                 (Some(h), _) => format!("HIT@{h}"),
@@ -561,6 +602,7 @@ pub async fn run(args: &[String]) -> i32 {
             "hit": hit, "recalled": recalled, "ms": ms, "census": census,
             "urls": urls,
             "must_not": violations, "redirects": redirects,
+            "window": q.window, "stale": stale, "undated": undated,
             "recall_by_source": raw_best.iter()
                 .map(|(s, r)| json!({"source": s, "rank": r})).collect::<Vec<_>>(),
             "raw": raw.iter().map(|(s, hits)| json!({
@@ -583,9 +625,11 @@ pub async fn run(args: &[String]) -> i32 {
     }
     crate::diag!("{}", all.line("ALL"));
     crate::diag!(
-        "redirects {}  must-not violations {}",
+        "redirects {}  must-not violations {}  stale {}  undated {}",
         redirects_total,
-        violations_total
+        violations_total,
+        stale_total,
+        undated_total
     );
 
     if let Some(path) = &opts.out {
@@ -611,7 +655,7 @@ pub async fn run(args: &[String]) -> i32 {
             }
         }
     }
-    if redirects_total > 0 || violations_total > 0 {
+    if redirects_total > 0 || violations_total > 0 || stale_total > 0 || undated_total > 0 {
         return 3;
     }
     0
