@@ -435,6 +435,10 @@ pub const PORTFOLIO: &[Identity] = &[
         family: Family::Browser,
         note: "Chrome 149 / Android phone",
         profile: Some((Profile::Chrome149, Platform::Android)),
+        // Not carried to a current version: Chromium 156 and 157 on Android,
+        // measured on their first request, send TLS extension 4832, which no
+        // wreq-util profile sends, so no current Android browser matches
+        // this wire and it is not relabelled as one.
         extra: &[],
     },
     Identity {
