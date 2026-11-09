@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.1] - 2026-11-10
+
+Search that answers on the first call, an EC2 instance price list, and a scorecard that
+measures the identities that actually ship.
+
+### Added
+
+- **The EC2 on-demand instance list.** `aws.amazon.com/ec2/pricing/on-demand/` fills
+  every template it carries, but its instance grid is a separate app in an iframe that
+  builds its table at run time; a reader without scripts saw no instance price at all.
+  The grid's own price file is read and its rows are placed beside the widget: instance
+  name and On-Demand hourly rate for the app's default selection (Linux, US East (Ohio)),
+  with the publication date, 1,228 instances. Ask for a larger `max_chars` to read past
+  the default projection of a long page.
+- **`donsetch-core scorecard`.** Every browser identity's live wire — JA4, peetprint, the
+  Akamai HTTP/2 fingerprint and the user agent — is measured against
+  `core/scorecard-baseline.json`, so an identity that rots is caught instead of claimed;
+  `--record` rewrites the baseline deliberately. The weekly stealth workflow now runs it
+  and reads the persona's Chrome version for its drift alarm.
+- **Search results say how they stand.** The search envelope carries `filled`,
+  `underfilled`, `degraded` and `answered_sources`, with a `next_action` when the list is
+  empty, thin, or confirmed by a single source, so a caller does not have to read the
+  census to know whether to retry.
+
+### Fixed
+
+- **A search answers on the first call.** A lane whose own pace (a token bucket) is
+  waiting is now waited out and asked instead of being skipped as if it were walled, the
+  fan-out keeps three lanes even under stress, and a call with nothing yet gives the
+  lanes it cut one more ask inside its budget. Back-to-back searches no longer degrade to
+  two lanes and an empty answer.
+- **A source is judged by what it answered, not by where the caller runs.** Google, DDG
+  and Yahoo were asked without a locale when a query named none, so Bing answered this
+  egress's own market — a Nepali result page for an English query — and the items were
+  scored off-query against the source. The default market is now stated (en-US).
+- **Bing's wire answers when its layout page does not.** When the layout page wears a
+  challenge, Bing's own RSS interface is asked once before the lane is reported walled.
+- **A wall is named.** A 2xx that is not content reports what it is (`blocked:challenge`,
+  `blocked:login`, `blocked:paywall`) instead of `blocked:200`, and a source that keeps
+  answering with a captcha no longer holds a roster slot (mojeek, HTTP 200 captcha page).
+- **A deleted Stack Exchange question is not a wall.** The API's own `not_found` is
+  reported as a missing item rather than falling through to the page's Cloudflare wall.
+- **A reCAPTCHA is an interaction wall, not a login gate.** A page whose copy says "sign
+  in" and which carries a human-verification widget (federalregister.gov) no longer reads
+  as an auth gate.
+- **An inline script has a parent.** `document.currentScript.parentNode` is the element
+  the script tag hangs from, as a browser's is, so an inline integration (GTM) can place
+  its own element.
+
 ## [5.2.0] - 2026-11-09
 
 Local search that checks every result against the question, answers package names
