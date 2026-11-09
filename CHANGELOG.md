@@ -7,6 +7,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-11-09
+
+Local search that checks every result against the question, answers package names
+from the registry that owns them and news from dated sources; AWS instance price
+tables in every language aws.amazon.com serves; and a Windows Chrome identity
+measured against Chrome on Windows.
+
+### Added
+
+- **Every result must answer the query it came from.** A candidate is judged
+  against the query that fetched it: the scope it asked for, its weighted terms
+  (with two-character runs for Chinese and Japanese text), the date window, and
+  whether the address is a real page. A source is judged by what its own results
+  earned. Every returned URL is the publisher's own: tracking parameters and
+  fragments are stripped, and a redirect wrapper (Google's `/url?q=`, DDG's
+  `uddg=`, Bing's `apiclick`, Yahoo's `/RU=`) is decoded to its target.
+- **A package name is answered by the registry that owns it.** A query that
+  names its ecosystem (`rust tokio`, `npm react`, `pip scikit-learn`,
+  `cargo serde_json`) asks that one registry and nothing else: one to three
+  requests, exact records. A bare name asks crates.io, npm and PyPI together and
+  is settled only when all three have answered; a rate limit or a timeout counts
+  as "unknown", never as "no". A record answers a bare name, or a language word
+  plus a name ("rust ownership"), only when the package is widely used (about
+  100k crate downloads, or 5k npm downloads a week); otherwise the query goes to
+  the ordinary search. The answer carries the project's documentation, homepage
+  and repository from the record itself.
+- **News is dated and inside the query's window.** A news query, or any query
+  with a window ("this week", "today", "since Monday"), reads three news lanes
+  beside the general search: Bing News, eleven publisher feeds read with
+  conditional requests (a warm cache costs nothing), and GDELT. Every item is
+  dated and falls inside the window. The Google News lane is gone: every link it
+  returned was a redirect.
+- **A query's script picks its market.** Japanese, Korean, Russian and other
+  scripts send their locale to every source that accepts one and to Wikipedia's
+  own edition, so a Korean query gets Korean results. Han characters alone are
+  not guessed into a market.
+- **A source that failed once does not fail ten times.** One standing per
+  source and lane, in a locked file every process shares: a request budget,
+  the source's own `Retry-After`, and a rest after a refusal (a captcha, a 403)
+  or after a second transient failure. A search spends at most six requests,
+  chosen so the answer is the last thing cut, and every lane it did not ask is
+  reported as not asked, never as a failure.
+- **Each source reports what happened in two words.** The search meta part's
+  `sources[]` gains `state` (answered, empty, off, failed, late, rested, not
+  asked) beside `status`, which stays the raw outcome it was in 5.1.2 (`ok`,
+  `403`, `captcha`, and now also `late`, `rested`, `not-asked`). The plain
+  footer counts resting and unasked sources instead of listing them.
+- **AWS instance price tables.** An aws.amazon.com pricing page's instance
+  tables (RDS, ElastiCache, DocumentDB, SageMaker, OpenSearch, MemoryDB, Neptune,
+  EC2's data transfer) are templates its own script fills with one row per
+  instance type. The fetch now fills them the same way: the records of the sets
+  the page names, joined on the instance type where the page joins them, sorted
+  in the page's order. Measured live: RDS MySQL 726 rows in about 2 s,
+  SageMaker 2,646 rows from 22 price files in 6.6 s.
+- **AWS pricing pages in every language aws.amazon.com serves.** A page in any
+  of its fourteen languages is written as that page writes it: `0,017 USD` on
+  the German page, `USD 0.016` on the Japanese one, with its labels translated
+  through the page's own dictionaries.
+
+### Changed
+
+- **The Windows Chrome identity is Chrome 156, measured on Windows.**
+  `chrome-win` printed Chrome 149. Google Chrome 156 on Windows, captured on its
+  first request, has exactly the identity's TLS fingerprint (JA4, peetprint),
+  HTTP/2 fingerprint and header order; only the user agent, the client-hint
+  brands and the `accept` list were older. `chrome-win` now sends that browser's
+  own strings, and measured again, every layer and every header value matches.
+  `chrome-android` is unchanged: Chromium 156 and 157 on Android send a TLS
+  extension that no available profile sends, so no current Android browser
+  matches that identity's wire, and it is not relabelled as one.
+- **"Nothing found" is an answer.** A search whose sources all answered with
+  nothing returns an empty success with the census, not `ok: false`.
+- **Search waits for stragglers 600 ms past the point where sources agree**, not
+  to the hard deadline. `--max-results` is held to 1–12. The instant-answer
+  block is off by default; when asked for, its link passes the same checks.
+- **Measured on all 109 bench rows, live:** hit@1 0.73, hit@3 0.94, hit@5 0.97,
+  MRR 0.833, p50 1.05 s, p95 1.91 s; median 3 requests per search (at most 6);
+  0 redirect links, 0 undated or out-of-window news items, and no
+  foreign-language result in the top three of the Japanese, Korean and Russian
+  rows. News is the weakest shape: the right story is in the top three every
+  time, first 45% of the time.
+
+### Fixed
+
+- **A pasted URL searches its own site.** A query that is a URL becomes a
+  search of that site for its path's words; emoji are dropped when words
+  remain; "rust" next to cast iron or "python" next to a snake is not a code
+  query.
+- **Snippets read as written.** Engines bold the query's words; joining the
+  bold runs with spaces printed "select ! macro" and "proxy _ pass".
+- **DuckDuckGo's bot check is a wall, not an empty answer.** It answers a
+  suspected bot with an HTTP 200 anomaly page, which read as "empty-parse", a
+  fault of the parser. It is now `captcha`, and the lane rests instead of being
+  asked again.
+- **A source's state follows its most informative attempt.** A source asked,
+  skipped and asked again could read "not asked" after it had answered.
+- **An accordion's sections keep their tables.** A list item holding a heading
+  and a table (the AWS pricing pages' sections) was flattened into one line of
+  text; it is now read as a section with its table.
+- **A wall no vendor names is not called a captcha.** A site that refuses every
+  client (Microsoft Teams' "unsupported browser" page) was reported as
+  "protected by Generic" with advice about captchas. The message now says the
+  site does not serve its content to this client.
+
 ## [5.1.2] - 2026-11-09
 
 Local search that ranks by agreement and answers from first-party records, price
