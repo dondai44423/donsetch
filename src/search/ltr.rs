@@ -1,4 +1,4 @@
-//! The learned ranker: eighteen features, one linear model, and the reason each
+//! The learned ranker: twenty-two features, one linear model, and the reason each
 //! feature is there.
 //!
 //! There is no model runtime here. The weights are trained offline on the bench
@@ -11,12 +11,12 @@
 //! shipped; [`super::rank_weights::trained`] is false until the script writes
 //! weights, and the ranker then stays on the measured fusion.
 
-use super::query::{QueryFacts, Shape};
+use super::query::QueryFacts;
 use super::rank::Merged;
 
 /// How many features a result carries. Fixed by the trained model: changing it
 /// invalidates every weight file, which the header of `rank_weights.rs` records.
-pub const FEATURES: usize = 18;
+pub const FEATURES: usize = 22;
 
 /// What kind of page a URL is. The ranker learns how much each kind is worth for
 /// each query shape instead of being told.
@@ -265,18 +265,43 @@ fn age_days(published: &Option<String>) -> Option<f64> {
     Some((today - day).max(0) as f64)
 }
 
-/// One result's feature vector, in the order [`FEATURES`] documents.
+/// Does the site's own name say what the query asks about? `wireguard.com` for
+/// "set up a wireguard server", `postgresql.org` for "postgres index only scan",
+/// `docs.python.org` for "python asyncio gather". The host's labels (and their
+/// `-` parts) are compared with the query's Latin words, the top-level domain
+/// excluded; a label that starts with a word of four or more letters counts, so
+/// "postgres" names `postgresql`. A fact about the URL, not a host list: the
+/// model learns what it is worth, and an SEO domain that wears the word pays the
+/// same feature with none of the agreement a first-party page earns.
+fn host_named(facts: &QueryFacts, url: &str) -> f64 {
+    let host = host_of(url);
+    let mut labels: Vec<&str> = host.split('.').collect();
+    labels.pop();
+    let parts: Vec<&str> = labels.iter().flat_map(|l| l.split('-')).collect();
+    let named = facts.terms().any(|term| {
+        let n = term.chars().count();
+        n >= 3
+            && term.chars().all(|c| c.is_ascii_alphanumeric())
+            && !super::query::is_stop_word(term)
+            && parts
+                .iter()
+                .any(|p| *p == term || (n >= 4 && p.starts_with(term)))
+    });
+    f64::from(named)
+}
+
+/// One result's feature vector, in the order [`NAMES`] lists.
 ///
-/// Everything here is a fact about the candidate and the query — no thresholds,
-/// no weights. What each is worth is the model's business.
-pub fn features(
-    facts: &QueryFacts,
-    items: &[Merged],
-    trust: &std::collections::HashMap<String, f64>,
-) -> Vec<[f64; FEATURES]> {
-    let bm25 = super::fuse::lexical(facts, items);
-    let rm3 = super::fuse::reweight(facts, items);
-    let rm3_top = rm3.iter().copied().fold(0.0, f64::max);
+/// Everything here is a fact about the candidate, the query and the pool it was
+/// merged into — no thresholds, no weights. What each is worth is the model's
+/// business. Scores that depend on the query's length (the fusion's vote, BM25+
+/// per field, RM3) are scaled against the pool's strongest candidate, so one
+/// weight means the same thing on a two-word query and a twelve-word one.
+pub fn features(facts: &QueryFacts, items: &[Merged]) -> Vec<[f64; FEATURES]> {
+    use super::fuse::normalize;
+    let vote = normalize(&items.iter().map(|m| m.score).collect::<Vec<_>>());
+    let [title, snippet, url, host] = super::fuse::fields(facts, items).map(|f| normalize(&f));
+    let rm3 = normalize(&super::fuse::reweight(facts, items));
     let window = super::contract::window_for(facts.raw());
     let ident = facts.identifier_parts().map(|(root, rest)| {
         let mut tokens = vec![root];
@@ -293,6 +318,11 @@ pub fn features(
             .unwrap_or_default();
         let segments = path.split('/').filter(|s| !s.is_empty()).count() as f64;
         let kind = kind(&item.url);
+        // A kind is evidence only where the query's shape asks for it: an
+        // encyclopedia article is the answer to a name and a tangent to
+        // `東京の天気予報`. Read as one global bonus, `record` lifted the
+        // Wikipedia article over the weather service on every web query.
+        let fits = kind.matches(expected);
         let (any_anchor, all_anchors) =
             facts.anchor_state(&format!("{} {} {}", item.title, item.snippet, item.url));
         let anchor = if facts.anchors().is_empty() || all_anchors {
@@ -302,20 +332,13 @@ pub fn features(
         } else {
             0.0
         };
-        // The best engine that returned this, by learned trust for this intent.
-        let shape_trust = item
-            .sources
-            .iter()
-            .map(|(engine, _)| {
-                trust
-                    .get(super::egress::health_key(engine))
-                    .copied()
-                    .unwrap_or(1.0)
-            })
-            .fold(0.0_f64, f64::max);
+        // Rank in a general index only. A vertical searches its own small
+        // corpus and puts its own page first almost always, so its rank 1 is
+        // not the evidence Bing's rank 1 is; `vertical_only` carries those.
         let best_rank = item
             .sources
             .iter()
+            .filter(|(engine, _)| !super::rank::is_vertical(engine))
             .map(|(_, rank)| *rank)
             .min()
             .map(|r| 1.0 / (1.0 + r as f64))
@@ -347,79 +370,84 @@ pub fn features(
                 found as f64 / tokens.len() as f64
             })
             .unwrap_or(0.0);
-        let mut x = [0.0; FEATURES];
-        // 1–3: lexical evidence per field, from the same BM25+ the fusion uses.
-        // The split is by field weight, so the model can learn that a title match
-        // is worth more than a URL match for one shape and less for another.
-        x[0] = bm25[i] * 3.0;
-        x[1] = bm25[i];
-        x[2] = bm25[i] * 1.5;
-        // 4–6: agreement and rank.
-        x[3] = item.families as f64;
-        x[4] = best_rank;
-        x[5] = shape_trust;
-        // 7–9: result kind.
-        x[6] = f64::from(kind == Kind::Record);
-        x[7] = f64::from(kind == Kind::Publisher);
-        x[8] = f64::from(kind == Kind::Aggregator);
-        // 10–14: freshness, anchors, the identifier itself, expansion, morphology.
-        x[9] = fresh;
-        x[10] = anchor;
-        x[11] = ident_hit;
-        x[12] = if rm3_top > 0.0 { rm3[i] / rm3_top } else { 0.0 };
-        x[13] = ngram_cosine(facts.raw(), &format!("{} {}", item.title, item.snippet));
-        // 15–18: snippet quality, URL depth, shape match, bias.
-        x[14] = snippet_q;
-        x[15] = 1.0 / (1.0 + segments);
-        x[16] = f64::from(kind.matches(expected));
-        x[17] = 1.0;
-        out.push(x);
+        out.push([
+            vote[i],
+            title[i],
+            snippet[i],
+            url[i],
+            host[i],
+            host_named(facts, &item.url),
+            item.families.min(4) as f64,
+            best_rank,
+            f64::from(fits && kind == Kind::Record),
+            f64::from(fits && kind == Kind::Publisher),
+            f64::from(fits && kind == Kind::Community),
+            f64::from(kind == Kind::Aggregator),
+            fresh,
+            anchor,
+            ident_hit,
+            rm3[i],
+            ngram_cosine(facts.raw(), &format!("{} {}", item.title, item.snippet)),
+            snippet_q,
+            1.0 / (1.0 + segments),
+            // A record, publisher or community page the shape does not ask for.
+            f64::from(!fits && matches!(kind, Kind::Record | Kind::Publisher | Kind::Community)),
+            // How much of the query this candidate says, in absolute terms: the
+            // pool-relative BM25 above cannot tell a page that matches one of
+            // four parts of the query from one that matches all four.
+            facts.coverage(&format!("{} {} {}", item.title, item.snippet, item.url)),
+            // Only a first-party vertical returned it: no general index agreed.
+            f64::from(
+                !item.sources.is_empty()
+                    && item
+                        .sources
+                        .iter()
+                        .all(|(engine, _)| super::rank::is_vertical(engine)),
+            ),
+        ]);
     }
     out
+}
+
+/// The standardised value of feature `j`: what the weight multiplies.
+fn standard(weights: &super::rank_weights::Weights, x: &[f64; FEATURES], j: usize) -> f64 {
+    let std = if weights.std[j].abs() < 1e-9 {
+        1.0
+    } else {
+        weights.std[j]
+    };
+    (x[j] - weights.mean[j]) / std
 }
 
 /// The linear model: standardise each feature by the trained mean and spread,
 /// then take the dot product.
 pub fn score(weights: &super::rank_weights::Weights, x: &[f64; FEATURES]) -> f64 {
-    let mut total = 0.0;
-    for j in 0..FEATURES {
-        let std = if weights.std[j].abs() < 1e-9 {
-            1.0
-        } else {
-            weights.std[j]
-        };
-        total += weights.w[j] * ((x[j] - weights.mean[j]) / std);
-    }
-    total
+    contribution(weights, x).iter().sum()
 }
 
-/// One feature's contribution to a score: the same arithmetic, shown.
+/// Each feature's share of a score: the same arithmetic, shown. The shares sum
+/// to [`score`] exactly.
 pub fn contribution(
     weights: &super::rank_weights::Weights,
     x: &[f64; FEATURES],
 ) -> [f64; FEATURES] {
-    let mut out = [0.0; FEATURES];
-    for j in 0..FEATURES {
-        let std = if weights.std[j].abs() < 1e-9 {
-            1.0
-        } else {
-            weights.std[j]
-        };
-        out[j] = weights.w[j] * ((x[j] - weights.mean[j]) / std);
-    }
-    out
+    std::array::from_fn(|j| weights.w[j] * standard(weights, x, j))
 }
 
-/// The name of each feature, in order: what `--explain` prints.
+/// The name of each feature, in order: what `--explain` prints and what
+/// `scripts/train_rank.py` writes beside each weight.
 pub const NAMES: [&str; FEATURES] = [
+    "vote",
     "bm25_title",
     "bm25_snippet",
     "bm25_url",
+    "bm25_host",
+    "host_named",
     "families",
     "best_rank",
-    "shape_trust",
     "kind_record",
     "kind_publisher",
+    "kind_community",
     "kind_aggregator",
     "fresh",
     "anchor",
@@ -428,18 +456,15 @@ pub const NAMES: [&str; FEATURES] = [
     "ngram",
     "snippet_q",
     "depth",
-    "shape_match",
-    "bias",
+    "off_shape",
+    "coverage",
+    "vertical_only",
 ];
-
-/// The shape's expected kinds, as the model sees them.
-pub fn expected(shape: Shape) -> &'static [&'static str] {
-    shape.expected_kinds()
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::query::Shape;
 
     fn m(url: &str, title: &str, snippet: &str) -> Merged {
         Merged {
@@ -490,19 +515,19 @@ mod tests {
             ),
             m("https://example.org/x", "Something else", ""),
         ];
-        let trust = std::collections::HashMap::new();
-        let f = features(&facts, &items, &trust);
+        let f = features(&facts, &items);
         assert_eq!(f.len(), 2);
         assert_eq!(f[0].len(), FEATURES);
         // The docs page matches the query and is a record: both must show.
-        assert!(f[0][0] > f[1][0], "bm25 title: {:?}", (f[0][0], f[1][0]));
-        assert_eq!(f[0][6], 1.0, "kind_record");
-        assert_eq!(f[0][17], 1.0, "bias is always 1");
-        assert!(f[0][15] < 1.0, "depth is a fraction");
+        assert!(f[0][1] > f[1][1], "bm25 title: {:?}", (f[0][1], f[1][1]));
+        assert_eq!(f[0][8] + f[0][19], 1.0, "a record, on the shape or off it");
+        assert!(f[0][18] < 1.0, "depth is a fraction");
+        // Pool-relative scores top out at 1 on the strongest candidate.
+        assert!(f.iter().all(|x| (0.0..=1.0).contains(&x[1])));
     }
 
     #[test]
-    fn shape_match_follows_the_query_shape() {
+    fn a_kind_counts_only_where_the_shape_asks_for_it() {
         let facts = QueryFacts::new("itertools::izip");
         assert_eq!(facts.shape(), Shape::Identifier);
         let items = vec![m(
@@ -510,9 +535,57 @@ mod tests {
             "izip in itertools - Rust",
             "Create an iterator.",
         )];
-        let f = features(&facts, &items, &std::collections::HashMap::new());
-        assert_eq!(f[0][16], 1.0, "a record answers a name");
-        assert_eq!(f[0][11], 1.0, "the identifier appears in the URL");
+        let f = features(&facts, &items);
+        assert_eq!(f[0][8], 1.0, "a record answers a name");
+        assert_eq!(f[0][19], 0.0, "and is on shape");
+        assert_eq!(f[0][14], 1.0, "the identifier appears in the URL");
+
+        let facts = QueryFacts::new("東京の天気予報");
+        assert_eq!(facts.shape(), Shape::Web);
+        let wiki = m(
+            "https://ja.wikipedia.org/wiki/天気予報",
+            "天気予報 - Wikipedia",
+            "天気予報とは",
+        );
+        let f = features(&facts, &[wiki]);
+        assert_eq!(f[0][8], 0.0, "an encyclopedia does not answer the weather");
+        assert_eq!(f[0][19], 1.0, "it is off the shape");
+    }
+
+    #[test]
+    fn host_named_reads_the_site_name_not_a_list() {
+        let facts = QueryFacts::new("how to set up a wireguard vpn server");
+        assert_eq!(
+            host_named(&facts, "https://www.wireguard.com/quickstart/"),
+            1.0
+        );
+        assert_eq!(
+            host_named(&facts, "https://tech-insider.org/wireguard/"),
+            0.0
+        );
+        // A word of four or more letters names a longer label; the TLD is not a
+        // label, and a stop word names nothing.
+        let pg = QueryFacts::new("postgres index only scan");
+        assert_eq!(host_named(&pg, "https://www.postgresql.org/docs/x"), 1.0);
+        let org = QueryFacts::new("org chart software");
+        assert_eq!(host_named(&org, "https://example.org/"), 0.0);
+        let parts = QueryFacts::new("git commit message");
+        assert_eq!(
+            host_named(&parts, "https://git-scm.com/docs/git-commit"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn the_vote_is_a_feature_so_the_model_can_keep_the_fusion() {
+        let facts = QueryFacts::new("tokio");
+        let mut a = m("https://a.example/1", "tokio", "");
+        a.score = 2.0;
+        let mut b = m("https://b.example/2", "tokio", "");
+        b.score = 1.0;
+        let f = features(&facts, &[a, b]);
+        assert_eq!(f[0][0], 1.0);
+        assert_eq!(f[1][0], 0.5);
     }
 
     #[test]
@@ -528,7 +601,7 @@ mod tests {
         let w = super::super::rank_weights::Weights::PLACEHOLDER;
         let facts = QueryFacts::new("x");
         let items = vec![m("https://docs.rs/x/latest/x/", "x", "x")];
-        let x = features(&facts, &items, &std::collections::HashMap::new())[0];
+        let x = features(&facts, &items)[0];
         let total: f64 = contribution(&w, &x).iter().sum();
         assert!((total - score(&w, &x)).abs() < 1e-9);
     }

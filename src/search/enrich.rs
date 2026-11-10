@@ -35,6 +35,9 @@ pub struct PrewarmEntry {
     pub at: Instant,
 }
 
+/// The most pages one search reads, for `read` and for snippet repair together:
+/// more is the agent fetching pages through search.
+const READ_MAX: usize = 3;
 const PREWARM_CAP: usize = 10;
 const PREWARM_BODY_MAX: usize = 1_500_000;
 const PREWARM_TTL: Duration = Duration::from_secs(600);
@@ -305,23 +308,39 @@ impl Searcher {
     /// teaser: reading never demotes, reorders or removes a result. Bodies are
     /// parked for the follow-up `web_fetch` unless prewarm is switched off.
     pub async fn read_results(&self, results: &mut [Merged], query: &str, k: usize) {
-        /// More than this is the agent fetching pages through search.
-        const READ_MAX: usize = 3;
+        let n = results.len().min(k.min(READ_MAX));
+        self.read_at(results, query, (0..n).collect()).await;
+    }
+
+    /// Repair the top three's stub snippets (empty, a few words, a redirect
+    /// notice) by reading those pages, inside what `read` left of the same
+    /// three-page budget: `already` is how many `read` asked for. A result whose
+    /// snippet says something is never fetched, so a search whose sources sent
+    /// real text pays nothing (measured: no top-5 result in 1,667 had an empty
+    /// snippet).
+    pub async fn repair_snippets(&self, results: &mut [Merged], query: &str, already: usize) {
+        let stubs: Vec<usize> = (already..results.len().min(READ_MAX))
+            .filter(|&i| !results[i].from_page && super::evidence::is_stub(&results[i].snippet))
+            .collect();
+        self.read_at(results, query, stubs).await;
+    }
+
+    /// Fetch the results at `indices` in parallel inside the call's budget and
+    /// replace each teaser with the page's passage that answers the query.
+    async fn read_at(&self, results: &mut [Merged], query: &str, indices: Vec<usize>) {
         const READ_TIMEOUT: Duration = Duration::from_secs(4);
         /// Share of the query's topic words a passage must hold to be shown.
         const READ_MIN_COVER: f64 = 0.4;
-        let n = results.len().min(k.min(READ_MAX));
-        if n == 0 {
+        if indices.is_empty() {
             return;
         }
         let park = crate::config::cfg().fetch.prewarm;
         let budget = super::stage_budget(READ_TIMEOUT, Duration::from_millis(100));
         let fetcher = &self.fetcher;
         let sink = self.prewarms.clone();
-        let mut set: futures_util::stream::FuturesUnordered<_> = results
-            .iter()
-            .take(n)
-            .enumerate()
+        let mut set: futures_util::stream::FuturesUnordered<_> = indices
+            .into_iter()
+            .filter_map(|i| results.get(i).map(|r| (i, r)))
             .map(|(i, r)| {
                 let url = r.url.clone();
                 let sink = sink.clone();

@@ -620,8 +620,8 @@ pub fn print_top_help() {
         "tools"
     );
     println!(
-        "  {:10} Where every search source stands (--sources); run the canary battery (--doctor)",
-        "search"
+        "  {:10} Where every search source stands (--sources); run the canary battery (--doctor);\n  {:10} why each result ranks where it does (--explain <query>)",
+        "search", ""
     );
     println!();
     println!("MANAGEMENT:");

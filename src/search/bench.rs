@@ -483,6 +483,11 @@ pub struct Options {
     /// Start every run from an empty cache directory. On by default: a bench run
     /// that inherits the user's learned state measures the user's history.
     pub cold: bool,
+    /// Run every shape of a cold run from one state instead of one fresh state
+    /// per shape. Off by default: a long single-state run exhausts the general
+    /// lanes part-way (every bing/ddg/brave lane `rested` from row ~111 of 214),
+    /// and the rows after that measure the roster's rest, not search.
+    pub one_ledger: bool,
     /// How many times the corpus is run, each its own measurement.
     pub runs: usize,
     /// Minutes to wait between runs, so a multi-run measurement can land in
@@ -493,16 +498,17 @@ pub struct Options {
     /// Re-rank the candidates saved in these bench files with the current code,
     /// offline, instead of searching the web.
     pub replay: Vec<PathBuf>,
-    /// Write one JSON line per row: the candidate set with its labels and the
-    /// eighteen ranking features. What `scripts/train_rank.py` trains on.
+    /// With `--replay`: write one JSON line per row — the whole candidate pool
+    /// with its labels and ranking features. What `scripts/train_rank.py`
+    /// trains on.
     pub features_out: Option<PathBuf>,
     pub verbose: bool,
 }
 
 const USAGE: &str = "usage: donsetch search-bench [--queries FILE] [--set gold|held|all] \
 [--shape SHAPE] [--only ID,ID] [--smoke] [--limit N] [--pace-ms N] [--max-results N] \
-[--runs N] [--gap-min N] [--cold] [--keep-state] [--bin PATH] [--out FILE] \
-[--replay FILE]...";
+[--runs N] [--gap-min N] [--cold] [--keep-state] [--one-ledger] [--bin PATH] [--out FILE] \
+[--replay FILE]... [--features-out FILE]";
 
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -516,6 +522,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         max_results: 10,
         out: None,
         cold: true,
+        one_ledger: false,
         runs: 1,
         gap: Duration::ZERO,
         bin: None,
@@ -564,6 +571,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--gap-min" => o.gap = Duration::from_secs(number(&mut i, "--gap-min")? * 60),
             "--cold" => o.cold = true,
             "--keep-state" => o.cold = false,
+            "--one-ledger" => o.one_ledger = true,
             "--bin" => o.bin = Some(PathBuf::from(value(&mut i)?)),
             "--out" => o.out = Some(PathBuf::from(value(&mut i)?)),
             "--replay" => o.replay.push(PathBuf::from(value(&mut i)?)),
@@ -573,6 +581,11 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
         i += 1;
+    }
+    if o.features_out.is_some() && o.replay.is_empty() {
+        return Err(format!(
+            "--features-out reads saved candidate pools: pass --replay FILE\n{USAGE}"
+        ));
     }
     if !matches!(o.set.as_str(), "gold" | "held" | "all") {
         return Err(format!("--set is gold, held or all\n{USAGE}"));
@@ -809,13 +822,6 @@ async fn in_process_row(searcher: &Searcher, opts: &Options, q: &BenchQuery) -> 
         Err(e) => (Vec::new(), format!("error: {e}")),
     };
     let judged = judge(q, &answers);
-    // The training dump: what the ranker was offered, what each candidate's
-    // features are, and which one the row's answer key says is right.
-    if let Some(path) = &opts.features_out
-        && let Ok(outcome) = &outcome
-    {
-        write_features(path, q, &outcome.results);
-    }
     let redirects = answers
         .iter()
         .filter(|r| super::contract::url_class(&r.url) != super::contract::UrlClass::Page)
@@ -1124,14 +1130,28 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
                 })
                 .collect();
             families.observe(&lists);
-            let merged = rank::merge(
-                &per_engine,
-                &q.query,
-                intent::detect(&q.query),
-                &trust,
-                &families,
-                12,
-            );
+            let intent = intent::detect(&q.query);
+            if let Some(path) = &opts.features_out {
+                let mut pool = rank::pool(&per_engine, &q.query, intent, &trust, &families);
+                rank::order(&mut pool, None);
+                // What the operator filters remove after the merge is never shown,
+                // so it is never a training example either.
+                super::site_filter(&q.query, &mut pool.items);
+                super::query::intitle_filter(&q.query, &mut pool.items);
+                super::query::filetype_filter(&q.query, &mut pool.items);
+                write_features(path, q, &pool);
+            }
+            // The live path, step for step: an operator query merges deeper
+            // because its own filters cut the list after the merge.
+            let depth = if super::query::compile(&q.query).has_operators() {
+                40
+            } else {
+                12
+            };
+            let mut merged = rank::merge(&per_engine, &q.query, intent, &trust, &families, depth);
+            super::site_filter(&q.query, &mut merged);
+            super::query::intitle_filter(&q.query, &mut merged);
+            super::query::filetype_filter(&q.query, &mut merged);
             for m in merged.iter().take(7) {
                 let key = rank::norm_key(&m.url);
                 let longest = per_engine
@@ -1343,19 +1363,19 @@ fn gold_host(pattern: &str) -> Option<String> {
     looks_like_host.then_some(cleaned)
 }
 
-/// Append one row's training example: the candidates the ranker was given, their
-/// features, and the label the row's answer key gives each of them.
-fn write_features(path: &std::path::Path, q: &BenchQuery, results: &[super::rank::Merged]) {
+/// Append one row's training example: every candidate in the pool the ranker
+/// ordered, in the fusion's order, with its features and the label the row's
+/// gold patterns give it.
+fn write_features(path: &std::path::Path, q: &BenchQuery, pool: &super::rank::Pool) {
     use std::io::Write;
-    let facts = super::query::QueryFacts::new(&q.query);
-    let trust = std::collections::HashMap::new();
-    let features = super::ltr::features(&facts, results, &trust);
-    let candidates: Vec<serde_json::Value> = results
+    let features = super::ltr::features(&pool.facts, &pool.items);
+    let candidates: Vec<serde_json::Value> = pool
+        .items
         .iter()
         .zip(&features)
         .filter_map(|(r, x)| {
             let label = label_of(q, &r.url)?;
-            Some(json!({ "url": r.url, "label": label, "x": x.to_vec() }))
+            Some(json!({ "url": r.url, "tier": r.tier, "label": label, "x": x.to_vec() }))
         })
         .collect();
     if candidates.is_empty() {
@@ -1365,6 +1385,7 @@ fn write_features(path: &std::path::Path, q: &BenchQuery, results: &[super::rank
         "id": q.id,
         "set": q.set,
         "shape": q.shape,
+        "query_shape": pool.facts.shape().label(),
         "query": q.query,
         "candidates": candidates,
     });

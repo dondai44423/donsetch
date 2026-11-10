@@ -486,7 +486,11 @@ impl Shape {
             Shape::HowTo => &["publisher", "community"],
             Shape::Shopping => &["publisher", "community"],
             Shape::Entity => &["record", "publisher"],
-            Shape::Web => &["publisher", "community", "record"],
+            // The residual shape expects no kind: listing three of five made
+            // "matches the shape" mean "is not an ordinary site", and lifted a
+            // tangential encyclopedia article over the weather service a
+            // `東京の天気予報` query asked for (a bench gold row).
+            Shape::Web => &[],
         }
     }
 }

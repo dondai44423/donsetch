@@ -37,6 +37,8 @@
 #   just bin-dist     target/dist-thin/donsetch (the shipped shape)
 #   just gates        bin-dist + the payload gates the release pipeline runs
 #   just smoke        bin + doctor + fetch + search
+#   just bench        the live search bench, each shape cold (bench-smoke: 3 min)
+#   just rank-train   retrain the search ranker from saved bench artifacts
 #   just ship <ver>   bump + push the release commit; CI does the rest
 #   just runs         what CI, the release and npm are doing right now
 #   just loop-report  measure this ladder on this box, right now
@@ -253,6 +255,32 @@ smoke: bin
     echo
     target/fast/donsetch search "linux kernel" --json 2>/dev/null | head -c 120
     echo
+
+# The search bench on the shipped shape: live, cold, every shape from its own
+# fresh state (the fair measurement; `--one-ledger` measures the roster's rest
+# instead). Pass any `search-bench` flag: `just bench --set held --runs 3
+# --gap-min 60 --out bench/results/x.json`. `bench-smoke` is one row per shape
+# in ~3 minutes, for iteration; a release never quotes it.
+bench *args: bin-dist
+    target/dist-thin/donsetch search-bench --set all {{args}}
+
+bench-smoke *args: bin-dist
+    target/dist-thin/donsetch search-bench --set all --smoke {{args}}
+
+# Retrain the ranker from saved bench artifacts: their candidate pools are
+# replayed through this build, dumped with their features, and trained on the
+# gold rows; scripts/train_rank.py writes src/search/rank_weights.rs only when
+# held-out MRR beats the fusion and no shape falls.
+#   just rank-train bench/results/5.3.0-*.json
+rank-train +artifacts: bin
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dump=target/rank-features.jsonl
+    rm -f "$dump"
+    for a in {{artifacts}}; do
+        target/fast/donsetch search-bench --set all --replay "$a" --features-out "$dump" >/dev/null
+    done
+    python3 scripts/train_rank.py --features "$dump"
 
 # 30-second fuzz burst on one target: just fuzz extract
 # Fuzzing is the one thing that can escape a job cap entirely (the

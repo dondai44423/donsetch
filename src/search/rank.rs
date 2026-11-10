@@ -197,7 +197,111 @@ pub fn merge(
     families: &Families,
     max_results: usize,
 ) -> Vec<Merged> {
-    merge_inner(per_engine, query, intent, trust, families, max_results)
+    let mut candidates = pool(per_engine, query, intent, trust, families);
+    order(&mut candidates, model());
+    finish(candidates, max_results)
+}
+
+/// The exact inputs of one merge. The live search keeps the last one so
+/// `search-bench` can tell a retrieval miss from an ordering miss and
+/// `search --explain` can re-rank the very same candidates.
+#[derive(Clone)]
+pub struct MergeInput {
+    pub per_engine: Vec<(String, Vec<Hit>)>,
+    pub query: String,
+    pub intent: Intent,
+    pub trust: HashMap<String, f64>,
+    pub families: Families,
+    pub depth: usize,
+}
+
+impl MergeInput {
+    pub fn merge(&self) -> Vec<Merged> {
+        merge(
+            &self.per_engine,
+            &self.query,
+            self.intent,
+            &self.trust,
+            &self.families,
+            self.depth,
+        )
+    }
+}
+
+/// One merged result with the evidence that placed it: its tier, the score it
+/// was sorted by, its feature vector and — when the learned ranker is installed
+/// — each feature's share of that score.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Explained {
+    pub url: String,
+    pub tier: u8,
+    pub score: f64,
+    pub x: [f64; super::ltr::FEATURES],
+    pub parts: Option<[f64; super::ltr::FEATURES]>,
+}
+
+/// The merge, explained: the same pool, order and cut as [`merge`], with each
+/// result's features. Features are computed over the whole pool before it is
+/// ordered, exactly as the ranker computes them.
+pub fn explain(input: &MergeInput) -> Vec<Explained> {
+    let mut candidates = pool(
+        &input.per_engine,
+        &input.query,
+        input.intent,
+        &input.trust,
+        &input.families,
+    );
+    let vectors: HashMap<String, [f64; super::ltr::FEATURES]> = candidates
+        .items
+        .iter()
+        .zip(super::ltr::features(&candidates.facts, &candidates.items))
+        .map(|(m, x)| (norm_key(&m.url), x))
+        .collect();
+    let weights = model().filter(|w| w.ranks(candidates.facts.shape()));
+    order(&mut candidates, weights);
+    let placed: HashMap<String, (u8, f64)> = candidates
+        .items
+        .iter()
+        .map(|m| (norm_key(&m.url), (m.tier, m.score)))
+        .collect();
+    finish(candidates, input.depth)
+        .into_iter()
+        .map(|m| {
+            let key = norm_key(&m.url);
+            let x = vectors
+                .get(&key)
+                .copied()
+                .unwrap_or([0.0; super::ltr::FEATURES]);
+            let (tier, score) = placed.get(&key).copied().unwrap_or((m.tier, m.score));
+            Explained {
+                url: m.url,
+                tier,
+                score,
+                x,
+                parts: weights.map(|w| super::ltr::contribution(w, &x)),
+            }
+        })
+        .collect()
+}
+
+/// The installed ranker, when one is trained and not switched off
+/// (`search.learned_rank`). `None` ranks by the fusion alone.
+pub(crate) fn model() -> Option<&'static super::rank_weights::Weights> {
+    (super::rank_weights::trained() && crate::config::cfg().search.learned_rank)
+        .then_some(&super::rank_weights::WEIGHTS)
+}
+
+/// Every merged candidate for one query, scored by the fusion and classed by
+/// tier, before any is cut. The live merge, the training dump and `--explain`
+/// all read this one pool, so a feature vector is always computed over the
+/// same set the ranker saw.
+pub(crate) struct Pool {
+    pub items: Vec<Merged>,
+    pub facts: super::query::QueryFacts,
+    query: String,
+    /// Every source's snippet per URL key: the shown one is picked once the
+    /// order is settled (`evidence::pick`), so ranking never reads a cut text.
+    snippets: HashMap<String, Vec<String>>,
 }
 
 /// Fusion over measured independence, and nothing else *in this layer*.
@@ -214,14 +318,13 @@ pub fn merge(
 /// bury (SEO restatements of the query). What survives here is a bounded
 /// coverage penalty for wrong versions and mangled compound terms, and a
 /// freshness lift for dated news items.
-fn merge_inner(
+pub(crate) fn pool(
     per_engine: &[(String, Vec<Hit>)],
     query: &str,
     intent: Intent,
     trust: &HashMap<String, f64>,
     families: &Families,
-    max_results: usize,
-) -> Vec<Merged> {
+) -> Pool {
     // Group by normalized URL. RRF mass is counted PER MEASURED FAMILY, not per
     // engine: sources that return the same results are one opinion, so a farm
     // ranked by all of them out-masses nobody (bench round 3: three engines on
@@ -309,8 +412,7 @@ fn merge_inner(
                 tier: 1,
             });
             // Keep the longest snippet (most informative), skipping redirect
-            // stubs. Both sides are already bounded (MAX_SNIPPET_CHARS), so no
-            // source can inflate the cross-encoder's batch.
+            // stubs. Both sides are already bounded (MAX_SNIPPET_CHARS).
             if hit_snippet.len() > entry.snippet.len() && !hit_snippet.starts_with("Redirecting") {
                 entry.snippet = hit_snippet.clone();
             }
@@ -438,25 +540,43 @@ fn merge_inner(
             r.score = fused;
         }
     }
+    Pool {
+        items: results,
+        facts,
+        query: query.to_string(),
+        snippets,
+    }
+}
 
-    // The learned ranker, when one is installed: the same candidates, scored by
-    // the trained linear model over the eighteen features instead of the fusion.
-    // `trained()` is false until `scripts/train_rank.py` writes weights that beat
-    // the fusion on held-out rows, so this branch is dead in a shipped build that
-    // never proved one.
-    if super::rank_weights::trained() {
-        let weights = &super::rank_weights::WEIGHTS;
-        let model = super::ltr::features(&facts, &results, trust);
-        for (r, x) in results.iter_mut().zip(&model) {
+/// Order the pool: tiers first, then the learned ranker's score when one is
+/// installed and ranks this query's shape, else the fusion's. The model replaces the score, never the tier —
+/// a resolver's record is proof the query named the page.
+pub(crate) fn order(pool: &mut Pool, model: Option<&super::rank_weights::Weights>) {
+    if let Some(weights) = model.filter(|w| w.ranks(pool.facts.shape())) {
+        let x = super::ltr::features(&pool.facts, &pool.items);
+        for (r, x) in pool.items.iter_mut().zip(&x) {
             r.score = super::ltr::score(weights, x);
         }
     }
-
-    results.sort_by(|a, b| {
+    // Stable: candidates the score cannot separate keep first-seen order, so a
+    // tie resolves the same way on every run.
+    pool.items.sort_by(|a, b| {
         a.tier
             .cmp(&b.tier)
             .then_with(|| b.score.total_cmp(&a.score))
     });
+}
+
+/// The answer from an ordered pool: syndication dedup, diversity, the result
+/// cap, and the snippet each result shows.
+pub(crate) fn finish(pool: Pool, max_results: usize) -> Vec<Merged> {
+    let Pool {
+        items: mut results,
+        facts,
+        query,
+        snippets,
+    } = pool;
+    let query = query.as_str();
     // Syndicated content dedup: same article republished under
     // different local TV/radio sites (fox43, localmemphis, etc.)
     // appears as separate hits with identical titles. Collapse
@@ -489,9 +609,9 @@ fn merge_inner(
         );
     }
     diverse.truncate(max_results);
-    for r in &mut diverse {
+    for (position, r) in diverse.iter_mut().enumerate() {
         if let Some(candidates) = snippets.get(&norm_key(&r.url)) {
-            r.snippet = super::evidence::pick(query, candidates, super::evidence::EVIDENCE_CHARS);
+            r.snippet = super::evidence::pick(query, candidates, super::evidence::budget(position));
         }
     }
     diverse
@@ -730,6 +850,48 @@ mod tests {
             10,
         );
         assert_eq!(out[0].url, "https://a.com/x", "consensus must win");
+    }
+
+    #[test]
+    fn explain_shows_the_merge_it_explains() {
+        let per = vec![
+            (
+                "bing".to_string(),
+                (0..6)
+                    .map(|i| hit(&format!("https://h{i}.example/rust-async"), i))
+                    .collect(),
+            ),
+            (
+                "ddg".to_string(),
+                vec![hit("https://h3.example/rust-async", 0)],
+            ),
+            ("github".to_string(), vec![hit("https://gh.example/r", 0)]),
+        ];
+        let input = MergeInput {
+            per_engine: per,
+            query: "rust async runtime".into(),
+            intent: Intent::Code,
+            trust: HashMap::new(),
+            families: Families::default(),
+            depth: 5,
+        };
+        let merged: Vec<String> = input.merge().into_iter().map(|m| m.url).collect();
+        let explained = explain(&input);
+        let urls: Vec<String> = explained.iter().map(|e| e.url.clone()).collect();
+        assert_eq!(urls, merged, "the same results, in the same order");
+        assert!(
+            explained
+                .windows(2)
+                .all(|w| (w[0].tier, -w[0].score) <= (w[1].tier, -w[1].score)),
+            "the scores give the order shown"
+        );
+        if let Some(parts) = &explained[0].parts {
+            let total: f64 = parts.iter().sum();
+            assert!(
+                (total - explained[0].score).abs() < 1e-9,
+                "shares sum to the score"
+            );
+        }
     }
 
     // The syndication dedup keyed titles after stripping ALL

@@ -320,7 +320,7 @@ pub fn wants(args: &[String]) -> bool {
     args.iter().any(|a| a == "--doctor" || a == "--sources")
 }
 
-fn searcher() -> Result<Searcher, String> {
+pub(crate) fn searcher() -> Result<Searcher, String> {
     let egress = std::sync::Arc::new(super::egress::EgressPool::from_env());
     super::egress::install_global(std::sync::Arc::clone(&egress));
     let fetcher =

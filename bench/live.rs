@@ -5,10 +5,11 @@
 //!
 //! **Three things make a search number mean something.**
 //!
-//! 1. **A cold cache per run.** Egress state, the lane ledger, the learned
-//!    identity scores and the page cache all change what a call returns. A bench
-//!    that inherits the user's state measures the user's history, so `--cold`
-//!    (the default) gives every run an empty `DONSETCH_CACHE_DIR`. Because the
+//! 1. **A cold cache per run and shape.** Egress state, the lane ledger, the
+//!    learned identity scores and the page cache all change what a call returns.
+//!    A bench that inherits the user's state measures the user's history, so
+//!    `--cold` (the default) gives every shape of every run an empty
+//!    `DONSETCH_CACHE_DIR`; `--one-ledger` runs all shapes of a run from one. Because the
 //!    BYOK keys live under that same cache root, a cold run is also keyless by
 //!    construction — "BYOK is off when local is measured" is enforced by the
 //!    filesystem, not by a flag someone can forget.
@@ -51,8 +52,9 @@ pub async fn protocol(opts: &Options, queries: &[BenchQuery]) -> i32 {
             }
         };
     }
-    // Cold: one child process per run, each with its own cache directory, so no
-    // learned state, ledger entry or warm page survives from one run to the next.
+    // Cold: one child process per run and shape, each with its own cache
+    // directory, so no learned state, ledger entry or warm page survives from one
+    // measurement into the next.
     let root = temp_root();
     let mut runs = Vec::new();
     for i in 0..opts.runs {
@@ -64,17 +66,44 @@ pub async fn protocol(opts: &Options, queries: &[BenchQuery]) -> i32 {
             );
             tokio::time::sleep(opts.gap).await;
         }
-        let out = root.join(format!("run-{i}.json"));
-        match child_run(opts, i, &out) {
-            Ok(run) => runs.push(run),
-            Err(e) => {
-                crate::diag!("search-bench: {e}");
-                let _ = std::fs::remove_dir_all(&root);
-                return 1;
+        let mut run = Run {
+            started_unix: now_unix(),
+            finished_unix: 0,
+            rows: Vec::new(),
+        };
+        for (g, ids) in groups(opts, queries).iter().enumerate() {
+            let out = root.join(format!("run-{i}-{g}.json"));
+            match child_run(opts, ids, &out) {
+                Ok(part) => run.rows.extend(part.rows),
+                Err(e) => {
+                    crate::diag!("search-bench: {e}");
+                    let _ = std::fs::remove_dir_all(&root);
+                    return 1;
+                }
             }
         }
+        run.finished_unix = now_unix();
+        runs.push(run);
     }
     finish(opts, "in-process", None, &runs, Some(&root), true)
+}
+
+/// The rows of one run, split into the groups that each start from an empty
+/// state: one per shape, in corpus order, or the whole selection with
+/// `--one-ledger`. Each group is named by its row ids, so a child runs exactly
+/// the rows the parent selected.
+fn groups(opts: &Options, queries: &[BenchQuery]) -> Vec<Vec<String>> {
+    if opts.one_ledger {
+        return vec![queries.iter().map(|q| q.id.clone()).collect()];
+    }
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for q in queries {
+        match out.iter_mut().find(|(shape, _)| *shape == q.shape) {
+            Some((_, ids)) => ids.push(q.id.clone()),
+            None => out.push((q.shape.clone(), vec![q.id.clone()])),
+        }
+    }
+    out.into_iter().map(|(_, ids)| ids).collect()
 }
 
 /// Set on the child process of a cold run: it writes its artifact and prints
@@ -90,13 +119,16 @@ fn temp_root() -> PathBuf {
 
 /// Everything a run needs, as arguments: built explicitly rather than by editing
 /// the parent's argv, so a flag added later cannot make a child re-orchestrate.
-fn child_args(opts: &Options, out: &Path) -> Vec<String> {
+/// The rows are named by id: the parent selected them once.
+fn child_args(opts: &Options, ids: &[String], out: &Path) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "search-bench".into(),
         "--queries".into(),
         opts.queries.display().to_string(),
         "--set".into(),
-        opts.set.clone(),
+        "all".into(),
+        "--only".into(),
+        ids.join(","),
         "--pace-ms".into(),
         opts.pace.as_millis().to_string(),
         "--max-results".into(),
@@ -105,21 +137,6 @@ fn child_args(opts: &Options, out: &Path) -> Vec<String> {
         "--out".into(),
         out.display().to_string(),
     ];
-    if let Some(shape) = &opts.shape {
-        a.push("--shape".into());
-        a.push(shape.clone());
-    }
-    if !opts.only.is_empty() {
-        a.push("--only".into());
-        a.push(opts.only.join(","));
-    }
-    if opts.smoke {
-        a.push("--smoke".into());
-    }
-    if let Some(n) = opts.limit {
-        a.push("--limit".into());
-        a.push(n.to_string());
-    }
     if opts.verbose {
         a.push("-v".into());
     }
@@ -127,13 +144,13 @@ fn child_args(opts: &Options, out: &Path) -> Vec<String> {
 }
 
 /// One child run: same binary, empty cache, artifact on disk.
-fn child_run(opts: &Options, index: usize, out: &Path) -> Result<Run, String> {
+fn child_run(opts: &Options, ids: &[String], out: &Path) -> Result<Run, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find this executable: {e}"))?;
-    let cache = out.with_file_name(format!("cache-{index}"));
+    let cache = out.with_extension("cache");
     std::fs::create_dir_all(&cache)
         .map_err(|e| format!("cannot create {}: {e}", cache.display()))?;
     let status = Command::new(&exe)
-        .args(child_args(opts, out))
+        .args(child_args(opts, ids, out))
         .env("DONSETCH_CACHE_DIR", &cache)
         .env(CHILD_ENV, "1")
         .status()
@@ -143,7 +160,7 @@ fn child_run(opts: &Options, index: usize, out: &Path) -> Result<Run, String> {
     // reports, not a failure of the run — the same rule `exit_code` applies to
     // a single-process run.
     if !status.success() && status.code() != Some(3) {
-        return Err(format!("child run {index} exited with {status}"));
+        return Err(format!("child run {} exited with {status}", out.display()));
     }
     read_run(out)
 }
@@ -264,18 +281,20 @@ async fn external(opts: &Options, queries: &[BenchQuery], bin: &Path) -> i32 {
             );
             tokio::time::sleep(opts.gap).await;
         }
-        let cache = root.join(format!("bin-cache-{i}"));
-        if let Err(e) = std::fs::create_dir_all(&cache) {
-            crate::diag!("search-bench: cannot create {}: {e}", cache.display());
-            return 1;
-        }
         let started_unix = now_unix();
         let mut rows = Vec::new();
-        for (n, q) in queries.iter().enumerate() {
-            if n > 0 {
-                tokio::time::sleep(opts.pace).await;
+        for (g, ids) in groups(opts, queries).iter().enumerate() {
+            let cache = root.join(format!("bin-cache-{i}-{g}"));
+            if let Err(e) = std::fs::create_dir_all(&cache) {
+                crate::diag!("search-bench: cannot create {}: {e}", cache.display());
+                return 1;
             }
-            rows.push(external_row(bin, &cache, opts, q));
+            for (n, q) in queries.iter().filter(|q| ids.contains(&q.id)).enumerate() {
+                if n > 0 || !rows.is_empty() {
+                    tokio::time::sleep(opts.pace).await;
+                }
+                rows.push(external_row(bin, &cache, opts, q));
+            }
         }
         runs.push(Run {
             started_unix,

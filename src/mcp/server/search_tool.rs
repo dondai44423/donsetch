@@ -359,8 +359,9 @@ pub(super) async fn search_batch_inner(
 }
 
 /// The search pipeline, then `read`: the top `read` results' pages are fetched
-/// inside the same deadline and their passages replace the teasers. Applies to a
-/// provider's results as much as to the local fan-out.
+/// inside the same deadline and their passages replace the teasers, and a stub
+/// snippet in the top three is repaired the same way. Applies to a provider's
+/// results as much as to the local fan-out.
 async fn search_read(
     daemon: &Arc<Daemon>,
     query: &str,
@@ -375,6 +376,12 @@ async fn search_read(
             .read_results(&mut out.results, query, read)
             .await;
     }
+    // A stub snippet in the top three is read from its page, inside what
+    // `read` left of the same budget.
+    daemon
+        .searcher
+        .repair_snippets(&mut out.results, query, read)
+        .await;
     Ok(out)
 }
 

@@ -107,26 +107,41 @@ pub fn lexical(facts: &QueryFacts, items: &[Merged]) -> Vec<f64> {
 /// BM25+ over the candidates with an explicit term list: what RM3 hands back,
 /// and what the query means before it is expanded.
 pub fn lexical_with(terms: &[(String, f64)], items: &[Merged]) -> Vec<f64> {
+    let [title, snippet, url, host] = fields_with(terms, items);
+    (0..items.len())
+        .map(|i| {
+            (W_TITLE * title[i] + W_SNIPPET * snippet[i] + W_URL * url[i] + W_HOST * host[i])
+                / W_TOTAL
+        })
+        .collect()
+}
+
+/// BM25+ per field, unweighted: `[title, snippet, url, host]`, one score per
+/// candidate in each. What the field weights above blend, kept apart so the
+/// learned ranker can weigh a title match differently from a host match.
+pub fn fields(facts: &QueryFacts, items: &[Merged]) -> [Vec<f64>; 4] {
+    let terms: Vec<(String, f64)> = facts
+        .weighted_terms()
+        .map(|(t, w)| (t.to_string(), w))
+        .collect();
+    fields_with(&terms, items)
+}
+
+fn fields_with(terms: &[(String, f64)], items: &[Merged]) -> [Vec<f64>; 4] {
     if items.is_empty() || terms.is_empty() {
-        return vec![0.0; items.len()];
+        return std::array::from_fn(|_| vec![0.0; items.len()]);
     }
     let hosts: Vec<String> = items.iter().map(|m| host_of(&m.url)).collect();
     let titles: Vec<&str> = items.iter().map(|m| m.title.as_str()).collect();
     let snippets: Vec<&str> = items.iter().map(|m| m.snippet.as_str()).collect();
     let urls: Vec<&str> = items.iter().map(|m| m.url.as_str()).collect();
     let host_refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
-    let mut total = vec![0.0; items.len()];
-    for (texts, weight) in [
-        (titles, W_TITLE),
-        (snippets, W_SNIPPET),
-        (urls, W_URL),
-        (host_refs, W_HOST),
-    ] {
-        for (slot, part) in total.iter_mut().zip(field_scores(terms, &texts, weight)) {
-            *slot += part;
-        }
-    }
-    total.into_iter().map(|s| s / W_TOTAL).collect()
+    [
+        field_scores(terms, &titles, 1.0),
+        field_scores(terms, &snippets, 1.0),
+        field_scores(terms, &urls, 1.0),
+        field_scores(terms, &host_refs, 1.0),
+    ]
 }
 
 /// Expansion terms from the answer set (RM3), or `None` when the set is too

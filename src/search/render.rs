@@ -8,14 +8,6 @@ use serde_json::{Value, json};
 use super::SearchOutcome;
 use super::rank;
 
-/// Snippet budget for the markdown list. 120 cut mid-phrase far
-/// too often : the detail that distinguishes two results sat just
-/// past the cut, and the agent paid a whole fetch to learn what the
-/// snippet nearly said. 180 (v4 C token trim) is where a snippet
-/// still reliably carries one complete claim while saving ~3 tokens
-/// per result vs 200 across the default 7.
-const SNIPPET_CHARS: usize = 180;
-
 /// Below this fraction (4/5) of the budget, a word-boundary cut
 /// throws away more than it saves : see `clip_snippet`.
 const CLIP_FLOOR_NUM: usize = 4;
@@ -250,7 +242,7 @@ pub fn render_markdown(
         let host = rank::host_of(&r.url);
         md.push_str(&format!("{}. **{}** : {}\n", i + 1, r.title, host));
         if !r.snippet.is_empty() {
-            let snip = clip_snippet(&r.snippet, SNIPPET_CHARS);
+            let snip = clip_snippet(&r.snippet, snippet_limit(i, r));
             md.push_str(&format!("   {snip}\n"));
         }
         // v3 handles: a random S-handle replaces the
@@ -353,6 +345,17 @@ fn display_title(title: &str, host: &str) -> String {
     title.to_string()
 }
 
+/// What the snippet of the result at `position` (0-based) may show: a passage
+/// read from the page, or one of the lead results, takes the passage budget;
+/// the rest the snippet budget.
+fn snippet_limit(position: usize, result: &super::rank::Merged) -> usize {
+    if result.from_page {
+        super::evidence::PASSAGE_CHARS
+    } else {
+        super::evidence::budget(position)
+    }
+}
+
 /// One result on the compact surface: a line naming it (handle, title, host,
 /// kind, route hint, and how many independent indexes returned it when more than
 /// one did) and the snippet under it. A single index is the unremarkable case and
@@ -382,11 +385,7 @@ pub(super) fn compact_row(
     }
     row.push('\n');
     if !result.snippet.is_empty() {
-        let limit = if result.from_page {
-            super::evidence::PASSAGE_CHARS
-        } else {
-            SNIPPET_CHARS
-        };
+        let limit = snippet_limit(number.saturating_sub(1), result);
         row.push_str("   ");
         if result.from_page {
             row.push_str("page: ");
@@ -608,10 +607,59 @@ mod tests {
     fn a_page_passage_is_labelled_and_may_run_longer_than_a_teaser() {
         let long = "word ".repeat(60);
         let mut r = result("T", "https://example.com/a", long.trim());
-        let teaser = compact_row(1, "S1", &r, None);
+        // Past the lead results a teaser takes the short budget.
+        let teaser = compact_row(5, "S5", &r, None);
         r.from_page = true;
-        let page = compact_row(1, "S1", &r, None);
+        let page = compact_row(5, "S5", &r, None);
         assert!(page.contains("   page: word"), "{page}");
-        assert!(page.len() > teaser.len(), "a passage has the longer limit");
+        assert!(
+            page.len() > teaser.len() + 100,
+            "a passage has the longer limit"
+        );
+    }
+
+    #[test]
+    fn the_lead_results_carry_more_evidence_and_the_answer_stays_in_budget() {
+        let long = "evidence ".repeat(80);
+        let row = |n| {
+            compact_row(
+                n,
+                "S1",
+                &result("T", "https://example.com/a", long.trim()),
+                None,
+            )
+        };
+        assert!(
+            row(3).len() > row(4).len() + 100,
+            "{} vs {}",
+            row(3).len(),
+            row(4).len()
+        );
+        // The worst case the surface can show: twelve results, every snippet
+        // at its cap and a long title. Four characters to a token, generously,
+        // the whole list stays inside the 1,500-token evidence budget.
+        let title = "A long result title that names the page and then some more ".repeat(2);
+        let out = SearchOutcome {
+            results: (0..12)
+                .map(|i| {
+                    result(
+                        &title,
+                        &format!("https://host{i}.example.com/a/b/c"),
+                        long.trim(),
+                    )
+                })
+                .collect(),
+            intent: crate::search::intent::Intent::Web,
+            report: Vec::new(),
+            cached: false,
+            elapsed: std::time::Duration::ZERO,
+            provider: None,
+            reranked: false,
+            instant: None,
+            stage_ms: Vec::new(),
+        };
+        let md = render_compact_markdown(&out, "", None, &[]);
+        let tokens = md.chars().count() / 4;
+        assert!(tokens <= 1_500, "{tokens} tokens");
     }
 }

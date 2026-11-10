@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod egress;
 pub mod engines;
 pub mod evidence;
+pub mod explain;
 pub mod families;
 pub mod fuse;
 pub mod instant;
@@ -507,11 +508,11 @@ pub struct Searcher {
     /// Default off (`search.outcome_feedback`); never extra fetches.
     outcome: Mutex<OutcomeMap>,
     outcome_dirty: std::sync::atomic::AtomicBool,
-    /// What each source returned for the most recent local fan-out, before the
-    /// merge. Read by `search-bench` to tell a retrieval miss (the answer never
-    /// arrived) from an ordering miss (it arrived and was ranked low); nothing
-    /// else reads it, and a concurrent caller simply overwrites it.
-    last_raw: Mutex<Vec<(String, Vec<engines::Hit>)>>,
+    /// The inputs of the most recent local merge: what each source returned,
+    /// and the trust, families and depth it was ranked with. Read by
+    /// `search-bench` (a retrieval miss or an ordering miss) and by
+    /// `search --explain`; a concurrent caller simply overwrites it.
+    last_merge: Mutex<Option<rank::MergeInput>>,
     /// Which sources return the same results, learned from their overlap.
     families: Mutex<families::Families>,
 }
@@ -583,7 +584,7 @@ impl Searcher {
             quality_dirty: std::sync::atomic::AtomicBool::new(false),
             outcome: Mutex::new(load_outcome_disk()),
             outcome_dirty: std::sync::atomic::AtomicBool::new(false),
-            last_raw: Mutex::new(Vec::new()),
+            last_merge: Mutex::new(None),
             families: Mutex::new(families::load()),
         }
     }
@@ -591,10 +592,29 @@ impl Searcher {
     /// The per-source results of the most recent uncached local search, in the
     /// order the sources answered. Empty when the last call was a cache hit.
     pub fn last_raw(&self) -> Vec<(String, Vec<engines::Hit>)> {
-        self.last_raw
+        self.last_merge()
+            .map(|input| input.per_engine)
+            .unwrap_or_default()
+    }
+
+    /// The inputs of the most recent uncached local merge; `None` after a cache
+    /// hit or a BYOK answer.
+    pub fn last_merge(&self) -> Option<rank::MergeInput> {
+        self.last_merge
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Drop the cached answer for a query, so the next call fans out and ranks
+    /// afresh. `search --explain` uses it: a replayed answer has no merge to
+    /// explain.
+    pub fn forget(&self, query: &str) {
+        let key = norm_query(&query::normalize(query));
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|k, _| k.rsplit_once('|').map(|(q, _)| q) != Some(key.as_str()));
     }
 
     /// Decide whether one lane is planned: the ledger's standing first (a
@@ -1073,10 +1093,10 @@ impl Searcher {
         forced_intent: Option<Intent>,
         started: Instant,
     ) -> Result<SearchOutcome, FetchError> {
-        self.last_raw
+        *self
+            .last_merge
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         // Cache stores top-12; asking for more just
         // re-lists the same tail.
         let max_results = max_results.clamp(1, 12);
@@ -1911,10 +1931,6 @@ impl Searcher {
             }
             guard.clone()
         };
-        *self
-            .last_raw
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = per_engine.clone();
         // Always merge 12 results for the cache, then trim to
         // max_results for the response. Without this, a first
         // search with max=2 caches only 2 results, and a later
@@ -1924,14 +1940,19 @@ impl Searcher {
         // title filter (measured: `intitle:"Attention Is All You Need" arxiv` came
         // back empty while three lanes had answered — the paper sat beyond slot 12).
         let merge_depth = if compiled.has_operators() { 40 } else { 12 };
-        let mut results = rank::merge(
-            &per_engine,
-            query,
+        let input = rank::MergeInput {
+            per_engine,
+            query: query.to_string(),
             intent,
-            &trust,
-            &families_now,
-            merge_depth,
-        );
+            trust,
+            families: families_now,
+            depth: merge_depth,
+        };
+        let mut results = input.merge();
+        *self
+            .last_merge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
         // B3: learned host quality nudge. After merge (and its
         // diversity cap) so it only reorders survivors with a
         // small weight; consensus still dominates.
@@ -2091,19 +2112,19 @@ impl Searcher {
         started: Instant,
         resolved: resolve::Resolved,
     ) -> SearchOutcome {
-        let per_engine = vec![("registry".to_string(), resolved.hits.clone())];
-        *self
-            .last_raw
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = per_engine.clone();
-        let results = rank::merge(
-            &per_engine,
-            query,
+        let input = rank::MergeInput {
+            per_engine: vec![("registry".to_string(), resolved.hits.clone())],
+            query: query.to_string(),
             intent,
-            &HashMap::new(),
-            &families::Families::default(),
-            12,
-        );
+            trust: HashMap::new(),
+            families: families::Families::default(),
+            depth: 12,
+        };
+        let results = input.merge();
+        *self
+            .last_merge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
         let report = vec![EngineReport {
             engine: "registry".into(),
             profile: Some(resolved.label),
@@ -3539,7 +3560,7 @@ mod tests {
 
     // ── snippet truncation ───────────────────────────────────
     // A small budget keeps the expectations readable; the logic
-    // is identical at SNIPPET_CHARS.
+    // is identical at every snippet budget (`evidence::budget`).
 
     #[test]
     fn clip_leaves_short_snippets_alone() {

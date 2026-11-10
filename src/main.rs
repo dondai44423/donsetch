@@ -254,6 +254,11 @@ async fn run() {
             let code = donsetch::search::doctor::run(&args[2..]).await;
             std::process::exit(code);
         }
+        // `search --explain <query>`: each result's features and weights.
+        "search" if donsetch::search::explain::wants(&args[2..]) => {
+            let code = donsetch::search::explain::run(&args[2..]).await;
+            std::process::exit(code);
+        }
         "fetch" | "search" | "crawl" | "screenshot" => {
             let code = cli::tool::run(cmd, &args[2..]).await;
             std::process::exit(code as i32);

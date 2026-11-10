@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Results are admitted by veto, not by a coverage test.** A hit is refused only when no answer
+  can be it — a redirector, a search page, a negated term, a bare front door, an encyclopedia or
+  video for a one-identifier query — and everything else enters with a graded score. The old test
+  dropped a whole engine when half its top ten scored low: a long query returned nothing while
+  two engines had delivered thirty real results. The answer *set* is judged once (answered, thin
+  or junk), and junk never benches a source.
+- **A learned ranker orders code, how-to and shopping results.** A linear model over 22
+  features — the engines' vote, BM25+ per field, whether the site is the thing the query names,
+  agreement, rank, result kind, freshness, RM3 feedback, n-grams, coverage and more — trained
+  offline on the bench's `gold` rows. It ranks the query shapes where it beat the engines' vote in
+  training, and shipped because, on the `held` rows it never saw, the right page comes first in
+  61.8% of final answers against 58.2%, with no shape lower. Every other query keeps the vote.
+  The weights are compiled in: no download, no runtime, microseconds per search.
+  `search.learned_rank = false` ranks every query by the vote.
+- **The top results carry more evidence.** The first three results keep up to 320 characters of
+  the sources' own text, the rest 180, so a 12-result answer stays under 1,500 tokens. A
+  top-three result whose snippet is a stub (under 20 characters, or a redirect notice) is read
+  from its page, with or without `read`, inside the same three-page budget; measured, no top-five
+  result in 1,667 had an empty snippet, so this is a guard that rarely fires.
 - **Search carries no model.** The `rerank` feature is gone: no cross-encoder, no 23 MB download
   and no ONNX in the search path (`ort` stays for OCR alone). `search.rerank*` config keys are
   accepted as deprecated no-ops for one release, and the envelope's `reranked` is always `false`.
@@ -23,9 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `std::mem::take` and `serde_json::Value` ask the module index page of the crate that owns them
   and read the item's own href — `izip` is a macro, `Value` a struct, `take` a function, and a
   guessed URL is a 404 returned as an answer. One request, cached for a week.
-- **`search-bench --features-out`** writes the candidate set with its labels and the eighteen
-  ranking features: the training input for `scripts/train_rank.py`, whose model is gated on
-  held-out MRR against the fusion it would replace.
+- **`donsetch search --explain <query>`** prints why each result sits where it does: its score
+  and the features that moved it, each weight's share of the score, and whether those scores
+  reproduce the order the search returned (`--json` for the whole vector).
+- **A search bench that can fail.** `donsetch search-bench` runs 214 rows over 14 shapes, half
+  held out, cold, against any build (`--bin`); each shape runs in its own process so one shape's
+  rate limits never empty the next (`--one-ledger` for one process). `--replay` re-ranks saved
+  candidate pools offline and `--features-out` dumps them for `just rank-train`, which retrains
+  the ranker and writes the weights only when the held-out gate passes.
 
 ### Fixed
 

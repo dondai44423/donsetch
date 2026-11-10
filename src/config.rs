@@ -161,8 +161,12 @@ section!(SearchSection {
     /// rewards a page for repeating the query and the vote carries what three
     /// indexes already learned. The evidence reaches the ranking through the
     /// trained model instead, whose weights are fitted on the bench and gated on
-    /// held-out rows; this window is the fallback when no model is installed.
+    /// held-out rows; this window applies wherever the model does not rank.
     tie_window: f64 = 0.0,
+    /// Rank with the compiled-in linear model (`search/rank_weights.rs`) on the
+    /// query shapes it was shipped for. Off ranks by the fusion alone: the switch that measures
+    /// one against the other on the same candidates (`search-bench --replay`).
+    learned_rank: bool = true,
     /// C4: cancel stragglers once ≥3 independent families agree
     /// on a top-3 URL. Kill: DONSETCH_NO_SEARCH_EARLY.
     search_early: bool = true,
@@ -1718,6 +1722,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             FieldKind::Bool,
             "true",
             "learned host quality from enrich success; small rank nudge",
+        ),
+        (
+            "search",
+            "learned_rank",
+            FieldKind::Bool,
+            "true",
+            "rank code, how-to and shopping queries with the compiled-in linear model; false ranks every query by the family vote",
         ),
         (
             "search",

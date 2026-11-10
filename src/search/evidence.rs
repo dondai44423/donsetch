@@ -10,12 +10,28 @@
 
 use std::collections::HashSet;
 
-/// What a snippet may take, in characters. The render clips at the same number,
-/// so a picked snippet is shown whole.
+/// What a snippet below the lead results may take, in characters: where a
+/// snippet still reliably carries one complete claim. The render clips at the
+/// same [`budget`], so a picked snippet is shown whole.
 pub const EVIDENCE_CHARS: usize = 180;
 
 /// A page passage is read from the page itself, so it may be longer.
 pub const PASSAGE_CHARS: usize = 320;
+
+/// How many results lead the answer and carry the longer budget: the answer is
+/// most often among them, and a fuller passage there saves the fetch an agent
+/// would otherwise spend to learn what the snippet nearly said.
+pub const LEAD_RESULTS: usize = 3;
+
+/// What a snippet may take at `position` (0-based) in the answer: the lead
+/// results up to [`PASSAGE_CHARS`], the rest [`EVIDENCE_CHARS`].
+pub fn budget(position: usize) -> usize {
+    if position < LEAD_RESULTS {
+        PASSAGE_CHARS
+    } else {
+        EVIDENCE_CHARS
+    }
+}
 
 /// Words that carry no topic. Short on purpose: a stop list that grows is a
 /// language model written by hand.
@@ -195,7 +211,7 @@ fn strip_lead_date(s: &str) -> &str {
 }
 
 /// A stub a source returns instead of a description.
-fn is_stub(s: &str) -> bool {
+pub(crate) fn is_stub(s: &str) -> bool {
     let t = s.trim();
     t.chars().count() < 20 || t.starts_with("Redirecting")
 }
