@@ -650,11 +650,17 @@ pub fn format(engine: &str) -> Format {
 /// the merge so one bot-page cannot pollute a query's ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnswerClass {
-    Content,
+    /// The answer is real and full: its items may rank, and the source earns
+    /// trust.
+    Answered,
     /// Few items, or a mixed bag: the items are real, the answer is not full.
     Thin,
-    /// A 200 with a result list that does not engage the query at all.
-    OffQuery,
+    /// A 200 whose items are provably another topic: they never reach the merge.
+    /// The census still calls it `off-query` — the word the model has read since
+    /// 5.2 — but it is now produced by the set-level rule in `quality`, which is
+    /// far narrower than the per-hit coverage test it replaces.
+    Junk,
+    /// Nothing came back at all.
     Empty,
 }
 
@@ -662,22 +668,22 @@ impl AnswerClass {
     /// Status string for the report; stable names, they reach the model.
     pub fn status(self) -> &'static str {
         match self {
-            Self::Content => "ok",
+            Self::Answered => "ok",
             Self::Thin => "thin",
-            Self::OffQuery => "off-query",
+            Self::Junk => "off-query",
             Self::Empty => "empty-parse",
         }
     }
 
     /// Whether these items may enter the merge.
     pub fn contributes(self) -> bool {
-        matches!(self, Self::Content | Self::Thin)
+        matches!(self, Self::Answered | Self::Thin)
     }
 
     /// Whether this answer earns the source trust. A thin answer is real but
-    /// unproven; an off-query one is evidence against the source.
+    /// unproven; a junk one is evidence against the source.
     pub fn credits(self) -> bool {
-        matches!(self, Self::Content)
+        matches!(self, Self::Answered)
     }
 }
 
@@ -687,7 +693,7 @@ pub fn vertical_class(hits: &[Hit]) -> AnswerClass {
     if hits.is_empty() {
         AnswerClass::Empty
     } else {
-        AnswerClass::Content
+        AnswerClass::Answered
     }
 }
 

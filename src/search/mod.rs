@@ -26,6 +26,7 @@ mod ledger;
 mod locale;
 mod news;
 mod persist;
+mod quality;
 mod render;
 pub(crate) use render::rank_state;
 mod resolve;
@@ -347,14 +348,14 @@ fn trust_target_for(engine: &str, status: &str, ok: bool) -> f64 {
     if ok {
         return 1.2;
     }
-    // An off-query answer beside peers that DID answer the same query is a
-    // bot-page wearing a 200: the source is walled, and decays like one. Alone
-    // -- no source engaged the query -- the shape is the query's, not the
-    // site's, and decays gently.
+    // A set that is *provably* another topic (quality's three-way rule: mean
+    // relevance near zero, no rare term shared, and the query names an entity)
+    // is the one content verdict that touches trust — and it decays gently.
+    // Everything else about a source's content is our arithmetic over its own
+    // items, never evidence about the source (§4). The old split between
+    // "off-query" beside answering peers and "off-query alone" died with the
+    // per-hit coverage test that needed it.
     if status == "off-query" {
-        return 0.3;
-    }
-    if status == "off-query-alone" {
         return 0.6;
     }
     if engine == "mojeek" && status == "empty-parse" {
@@ -1704,9 +1705,9 @@ impl Searcher {
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
-        // Off-query verdicts wait for the whole query: a source that served a
-        // bot-page while three peers answered is walled; one that found nothing
-        // on a query nobody could answer is not.
+        // A provable junk set waits for the whole query: a set is another topic
+        // only when the query names an entity and the set shares none of its
+        // rare terms (§4). A set that answered nothing is `Empty`, never this.
         let mut off_query: Vec<(String, String)> = Vec::new();
         // C5: best instant answer across lanes (first non-empty wins
         // by engine trust order, which outcomes already respect).
@@ -1730,9 +1731,8 @@ impl Searcher {
                     } else if answer.class == engines::AnswerClass::Thin {
                         // Real items, incomplete answer: use them, learn nothing.
                         // Thinness is not evidence about the source.
-                    } else if answer.engine_lane {
-                        // Its items never reach the merge; what it means for the
-                        // source is decided once every answer is in (below).
+                    } else if answer.class == engines::AnswerClass::Junk && answer.engine_lane {
+                        // Provably another topic: its items never reach the merge.
                         off_query.push((base.to_string(), engine.clone()));
                     }
                     if instant.is_none()
@@ -1802,18 +1802,12 @@ impl Searcher {
             }
         }
 
-        // Every lane has answered: now the off-query verdict has its context.
-        if !off_query.is_empty() {
-            let answered = report.iter().filter(|r| r.status == "ok").count();
-            for (base, _engine) in &off_query {
-                if answered >= 2 {
-                    // Peers answered this query; this source served a bot-page.
-                    self.record_outcome(base, false);
-                    self.bump_trust_status(base, intent, false, "off-query");
-                } else {
-                    self.bump_trust_status(base, intent, false, "off-query-alone");
-                }
-            }
+        // Every lane has answered. A set that is provably another topic decays
+        // the source's trust, gently, and nothing else: it does not count as a
+        // failure, and it never benches the lane (§4: trust follows transport,
+        // walls and provable junk — never our own coverage arithmetic).
+        for (base, _engine) in &off_query {
+            self.bump_trust_status(base, intent, false, "off-query");
         }
 
         // A source that did not answer inside the budget is named as late, not
@@ -3057,7 +3051,7 @@ mod tests {
                     egress: "direct".into(),
                     engine_lane: true,
                     instant: None,
-                    class: crate::search::engines::AnswerClass::Content,
+                    class: crate::search::engines::AnswerClass::Answered,
                     requests: 1,
                 }),
             )
@@ -3097,7 +3091,7 @@ mod tests {
                     egress: "direct".into(),
                     engine_lane: true,
                     instant: None,
-                    class: crate::search::engines::AnswerClass::Content,
+                    class: crate::search::engines::AnswerClass::Answered,
                     requests: 1,
                 }),
             )
@@ -3225,11 +3219,11 @@ mod tests {
         assert_eq!(trust_target_for("bing", "empty-parse", false), 0.3);
         assert_eq!(trust_target_for("mojeek", "blocked:429", false), 0.3);
         assert_eq!(trust_target_for("mojeek", "ok", true), 1.2);
-        // Off-query beside answering peers is a bot-page: it decays like a
-        // block. Alone, the shape is the query's, and decays gently.
-        assert_eq!(trust_target_for("bing", "off-query", false), 0.3);
-        assert_eq!(trust_target_for("brave", "off-query", false), 0.3);
-        assert_eq!(trust_target_for("bing", "off-query-alone", false), 0.6);
+        // Provable junk is the one content verdict that touches trust, and it
+        // decays gently: the source was reachable and answered, it just
+        // answered another question.
+        assert_eq!(trust_target_for("bing", "off-query", false), 0.6);
+        assert_eq!(trust_target_for("brave", "off-query", false), 0.6);
     }
 
     #[test]
@@ -3256,7 +3250,7 @@ mod tests {
                     egress: "direct".to_string(),
                     engine_lane: true,
                     instant: None,
-                    class: crate::search::engines::AnswerClass::Content,
+                    class: crate::search::engines::AnswerClass::Answered,
                     requests: 1,
                 }),
             )

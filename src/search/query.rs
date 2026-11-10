@@ -303,6 +303,436 @@ pub fn normalize(query: &str) -> String {
     }
 }
 
+/// The scripts this matcher distinguishes. Only the CJK family changes the
+/// matching rule; the rest are recorded so a locale or language decision can
+/// read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Script {
+    Latin,
+    Kana,
+    Han,
+    Hangul,
+    Cyrillic,
+    Arabic,
+    Devanagari,
+    Other,
+}
+
+fn is_kana(c: char) -> bool {
+    ('\u{3040}'..='\u{30ff}').contains(&c)
+}
+
+fn is_han(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
+        || ('\u{3400}'..='\u{4dbf}').contains(&c)
+        || ('\u{f900}'..='\u{faff}').contains(&c)
+}
+
+fn is_hangul(c: char) -> bool {
+    ('\u{ac00}'..='\u{d7af}').contains(&c)
+}
+
+pub(crate) fn is_cjk(c: char) -> bool {
+    is_kana(c) || is_han(c) || is_hangul(c)
+}
+
+/// The script a text is written in, by its first character that has one. A query
+/// is judged by what it is written in, and a hit by whether it shares that.
+pub fn script_of(text: &str) -> Script {
+    for c in text.chars() {
+        if is_kana(c) {
+            return Script::Kana;
+        }
+        if is_hangul(c) {
+            return Script::Hangul;
+        }
+        if is_han(c) {
+            return Script::Han;
+        }
+        if ('\u{0400}'..='\u{04ff}').contains(&c) {
+            return Script::Cyrillic;
+        }
+        if ('\u{0600}'..='\u{06ff}').contains(&c) {
+            return Script::Arabic;
+        }
+        if ('\u{0900}'..='\u{097f}').contains(&c) {
+            return Script::Devanagari;
+        }
+        if ('\u{0370}'..='\u{03ff}').contains(&c) {
+            return Script::Other;
+        }
+    }
+    Script::Latin
+}
+
+/// Words that carry no topic: function words and the temporal vocabulary of a
+/// news query. A title containing "this week" is not about the query because
+/// the query also said "week".
+const STOP: &[&str] = &[
+    "the",
+    "and",
+    "for",
+    "how",
+    "what",
+    "who",
+    "why",
+    "when",
+    "where",
+    "which",
+    "does",
+    "did",
+    "can",
+    "could",
+    "should",
+    "would",
+    "with",
+    "without",
+    "from",
+    "into",
+    "about",
+    "best",
+    "vs",
+    "versus",
+    "you",
+    "your",
+    "are",
+    "was",
+    "were",
+    "is",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "there",
+    "of",
+    "to",
+    "in",
+    "on",
+    "or",
+    "a",
+    "an",
+    "latest",
+    "today",
+    "tonight",
+    "yesterday",
+    "week",
+    "breaking",
+    "recent",
+    "update",
+    "updates",
+    "news",
+    "live",
+];
+
+/// Capitalised words that are sentence furniture, never a named entity.
+const ANCHOR_STOP: &[&str] = &[
+    "the", "a", "an", "how", "what", "who", "why", "when", "where", "which", "is", "are", "was",
+    "were", "do", "does", "did", "can", "could", "should", "would", "this", "that", "these",
+    "those", "it", "its", "of", "to", "in", "on", "for", "and", "or", "with", "without", "from",
+    "into", "about",
+];
+
+/// One weighted query term. CJK terms are character bigrams; a Latin term is a
+/// word. The weight is 2 for a quoted phrase, 1 otherwise.
+#[derive(Debug, Clone)]
+struct Term {
+    text: String,
+    weight: f64,
+}
+
+/// The query, compiled once into the facts every later judgement reads.
+///
+/// This replaces the contract's `Profile`, which was the same machine wearing a
+/// filter's name: it judged hits one at a time and threw away what it did not
+/// recognise. The facts here are *about the query* — its terms and their
+/// weights, its named anchors, its negations, its operators, its script — and
+/// the judgement lives where it belongs: a veto list per hit and a set-level
+/// class in [`super::quality`].
+#[derive(Debug, Clone)]
+pub struct QueryFacts {
+    raw: String,
+    compiled: CompiledQuery,
+    terms: Vec<Term>,
+    /// Named entities: capitalised runs (an internal capital counts even in the
+    /// first word, so "SpaceX" is one and a sentence-start "Latest" is not) and
+    /// quoted spans.
+    anchors: Vec<String>,
+    /// `-word` exclusions.
+    negated: Vec<String>,
+    script: Script,
+}
+
+impl QueryFacts {
+    pub fn new(query: &str) -> Self {
+        let mut terms: Vec<Term> = Vec::new();
+        let mut anchors: Vec<String> = Vec::new();
+        let mut negated: Vec<String> = Vec::new();
+        // Whitespace tokens carry the operators; each token is then split into
+        // words. Quotes are stripped but remembered: a quoted word is stronger.
+        let mut first_word = true;
+        for raw in query.split_whitespace() {
+            if let Some(rest) = raw.strip_prefix('-')
+                && !rest.is_empty()
+            {
+                negated.push(rest.trim_matches('"').to_lowercase());
+                continue;
+            }
+            // `site:` names a host and, often, a path: the path words are part
+            // of what the query asked for, so they are terms too. The host is
+            // the lane's own filter.
+            let lower = raw.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("site:") {
+                if let Some((_host, path)) = value.split_once('/') {
+                    for word in path.split(|c: char| !c.is_alphanumeric()) {
+                        if word.chars().count() >= 2 && !STOP.contains(&word) {
+                            push_term(&mut terms, word.to_string(), 1.0);
+                        }
+                    }
+                }
+                continue;
+            }
+            let quoted = raw.starts_with('"') || raw.ends_with('"');
+            let bare = raw.trim_matches('"');
+            if quoted && !bare.is_empty() {
+                anchors.push(bare.to_lowercase());
+            }
+            // A CJK run is one unit: bigrams, never whitespace words.
+            if script_of(bare) != Script::Latin {
+                for run in cjk_runs(bare) {
+                    for term in bigrams(&run) {
+                        push_term(&mut terms, term, 1.0);
+                    }
+                }
+                first_word = false;
+                continue;
+            }
+            let capitalised = bare.chars().next().is_some_and(char::is_uppercase);
+            let internal_capital = bare.chars().skip(1).any(char::is_uppercase);
+            let anchor_ok = capitalised
+                && (internal_capital || !first_word)
+                && !ANCHOR_STOP.contains(&bare.to_lowercase().as_str())
+                && bare.chars().count() >= 2;
+            if anchor_ok {
+                anchors.push(bare.to_lowercase());
+            }
+            for word in bare.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#') {
+                let lower = word.to_lowercase();
+                if lower.is_empty() || STOP.contains(&lower.as_str()) {
+                    continue;
+                }
+                if lower.chars().count() < 2 && !lower.chars().any(|c| c.is_numeric()) {
+                    continue;
+                }
+                push_term(&mut terms, lower, if quoted { 2.0 } else { 1.0 });
+            }
+            first_word = false;
+        }
+        anchors.sort();
+        anchors.dedup();
+        negated.sort();
+        negated.dedup();
+        Self {
+            raw: query.to_string(),
+            compiled: compile(query),
+            terms,
+            anchors,
+            negated,
+            script: script_of(query),
+        }
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// The operators the query states, and its free text without them.
+    pub fn compiled(&self) -> &CompiledQuery {
+        &self.compiled
+    }
+
+    /// The query's content terms, lowercased and stripped of operators — what
+    /// the resolver reads to decide whether the query names one thing.
+    pub fn terms(&self) -> impl Iterator<Item = &str> {
+        self.terms.iter().map(|t| t.text.as_str())
+    }
+
+    pub fn anchors(&self) -> &[String] {
+        &self.anchors
+    }
+
+    pub fn negated(&self) -> &[String] {
+        &self.negated
+    }
+
+    /// The script the query is written in: the language it asked for, when it
+    /// asks for one by writing in it.
+    pub fn script(&self) -> Script {
+        self.script
+    }
+
+    /// Whether the query is **one identifier and nothing else**: a macro
+    /// (`select!`), a path (`std::mem::take`), an attribute (`#[tokio::main]`),
+    /// a scoped package (`@types/node`), a version (`v1.2.3`) or a name with a
+    /// code signal in it (`serde_json::Value`, `camelCase`).
+    ///
+    /// The shape decides what can answer: the name's own record or documentation,
+    /// never a general encyclopedia or a video. `tokio::spawn` returning
+    /// Wikipedia's Japanese article on the band TOKIO is the measured failure
+    /// this exists to stop (5.3.0 A baseline, rows i2/i6/i7/i8).
+    pub fn is_identifier(&self) -> bool {
+        let text = self.compiled.text.trim();
+        if text.is_empty() || text.contains(char::is_whitespace) {
+            return false;
+        }
+        if text.contains("::") || text.starts_with('#') || text.starts_with('@') {
+            return true;
+        }
+        if text.ends_with('!') || text.contains('_') {
+            return true;
+        }
+        // `v1.2.3`, and only that: a bare number is not an identifier.
+        let version = text.strip_prefix('v').unwrap_or(text);
+        if version.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && version.split('.').count() >= 2
+            && version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.')
+        {
+            return true;
+        }
+        // camelCase: a capital after the first character, lowercase around it.
+        let chars: Vec<char> = text.chars().collect();
+        chars.len() > 2
+            && chars[0].is_lowercase()
+            && chars.iter().skip(1).any(|c| c.is_uppercase())
+            && chars.iter().any(|c| c.is_lowercase())
+    }
+
+    /// The query's rarest terms: long Latin words and CJK bigrams. A set that
+    /// shares none of them is not about this query, whatever its numbers say.
+    pub fn rare_terms(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .terms
+            .iter()
+            .filter(|t| t.text.chars().any(is_cjk) || t.text.chars().count() >= 6)
+            .map(|t| t.text.as_str())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out.truncate(6);
+        out
+    }
+
+    /// Does `root` name one of the query's terms? `_` and `-` are the same in a
+    /// package name.
+    pub(crate) fn names(&self, root: &str) -> bool {
+        let root = root.replace('_', "-").to_lowercase();
+        self.terms.iter().any(|t| {
+            t.text.replace('_', "-").to_lowercase() == root
+                || t.text.eq_ignore_ascii_case(root.as_str())
+        })
+    }
+
+    /// How much of the query's weight a text carries, in 0..=1.
+    pub fn coverage(&self, text: &str) -> f64 {
+        let total: f64 = self.terms.iter().map(|t| t.weight).sum();
+        if total == 0.0 {
+            return 1.0;
+        }
+        let matched: f64 = self
+            .terms
+            .iter()
+            .filter(|t| matches(&t.text, text))
+            .map(|t| t.weight)
+            .sum();
+        matched / total
+    }
+
+    /// `(any anchor present, all anchors present)`. Both are true when the query
+    /// names nothing.
+    pub fn anchor_state(&self, text: &str) -> (bool, bool) {
+        if self.anchors.is_empty() {
+            return (true, true);
+        }
+        let hit: Vec<bool> = self.anchors.iter().map(|a| matches(a, text)).collect();
+        (hit.iter().any(|b| *b), hit.iter().all(|b| *b))
+    }
+
+    /// Whether this text is *the* record the query asked for: it covers the
+    /// query at 0.6 or more and carries every anchor. This is the old contract's
+    /// `Verdict::Exact`, kept as a predicate because two callers (the news wire
+    /// and the record-admission tier) need exactly that strength, while the
+    /// ranking score uses the gradient in `contract::relevance`.
+    pub fn is_exact(&self, title: &str, snippet: &str, url: &str) -> bool {
+        let text = format!("{title} {snippet} {url}");
+        if self
+            .negated
+            .iter()
+            .any(|n| matches(n, &text) || text.to_lowercase().contains(n))
+        {
+            return false;
+        }
+        if self.terms.is_empty() {
+            return true;
+        }
+        let (_, all) = self.anchor_state(&text);
+        self.coverage(&text) >= 0.6 && all
+    }
+}
+
+fn push_term(terms: &mut Vec<Term>, text: String, weight: f64) {
+    if let Some(existing) = terms.iter_mut().find(|t| t.text == text) {
+        existing.weight = existing.weight.max(weight);
+    } else {
+        terms.push(Term { text, weight });
+    }
+}
+
+/// Runs of CJK characters inside one token, e.g. "地震速報" or "東京の".
+fn cjk_runs(token: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    for c in token.chars() {
+        if is_cjk(c) {
+            current.push(c);
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+/// Character bigrams of a run; a one-character run is its own term.
+fn bigrams(run: &str) -> Vec<String> {
+    let chars: Vec<char> = run.chars().collect();
+    if chars.len() <= 1 {
+        return vec![run.to_string()];
+    }
+    chars
+        .windows(2)
+        .map(|w| w.iter().collect())
+        .collect::<Vec<String>>()
+}
+
+/// Does `term` occur in `text`? Latin terms are whole words, with a prefix
+/// match for long ones ("dataclass" finds "dataclasses"); CJK terms are
+/// substrings, because a Japanese title has no spaces to split on.
+pub(crate) fn matches(term: &str, text: &str) -> bool {
+    if term.chars().any(is_cjk) {
+        return text.contains(term);
+    }
+    let lower = text.to_lowercase();
+    let words = lower.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#');
+    words
+        .into_iter()
+        .any(|w| w == term || (term.chars().count() >= 5 && w.starts_with(term)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

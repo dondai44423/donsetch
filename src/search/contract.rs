@@ -15,349 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::engines::{AnswerClass, Hit, is_serp_url};
-
-/// Words that carry no topic: function words and the temporal vocabulary of a
-/// news query. A title containing "this week" is not about the query because
-/// the query also said "week".
-const STOP: &[&str] = &[
-    "the",
-    "and",
-    "for",
-    "how",
-    "what",
-    "who",
-    "why",
-    "when",
-    "where",
-    "which",
-    "does",
-    "did",
-    "can",
-    "could",
-    "should",
-    "would",
-    "with",
-    "without",
-    "from",
-    "into",
-    "about",
-    "best",
-    "vs",
-    "versus",
-    "you",
-    "your",
-    "are",
-    "was",
-    "were",
-    "is",
-    "it",
-    "its",
-    "this",
-    "that",
-    "these",
-    "those",
-    "there",
-    "of",
-    "to",
-    "in",
-    "on",
-    "or",
-    "a",
-    "an",
-    "latest",
-    "today",
-    "tonight",
-    "yesterday",
-    "week",
-    "breaking",
-    "recent",
-    "update",
-    "updates",
-    "news",
-    "live",
-];
-
-/// Capitalised words that are sentence furniture, never a named entity.
-const ANCHOR_STOP: &[&str] = &[
-    "the", "a", "an", "how", "what", "who", "why", "when", "where", "which", "is", "are", "was",
-    "were", "do", "does", "did", "can", "could", "should", "would", "this", "that", "these",
-    "those", "it", "its", "of", "to", "in", "on", "for", "and", "or", "with", "without", "from",
-    "into", "about",
-];
-
-/// The scripts this matcher distinguishes. Only the CJK family changes the
-/// matching rule; the rest are recorded so a locale decision can read them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Script {
-    Latin,
-    Kana,
-    Han,
-    Hangul,
-    Cyrillic,
-    Arabic,
-    Devanagari,
-}
-
-fn is_kana(c: char) -> bool {
-    ('\u{3040}'..='\u{30ff}').contains(&c)
-}
-fn is_han(c: char) -> bool {
-    ('\u{4e00}'..='\u{9fff}').contains(&c)
-        || ('\u{3400}'..='\u{4dbf}').contains(&c)
-        || ('\u{f900}'..='\u{faff}').contains(&c)
-}
-fn is_hangul(c: char) -> bool {
-    ('\u{ac00}'..='\u{d7af}').contains(&c)
-}
-fn is_cjk(c: char) -> bool {
-    is_kana(c) || is_han(c) || is_hangul(c)
-}
-
-pub fn script_of(text: &str) -> Script {
-    for c in text.chars() {
-        if is_kana(c) {
-            return Script::Kana;
-        }
-        if is_hangul(c) {
-            return Script::Hangul;
-        }
-        if is_han(c) {
-            return Script::Han;
-        }
-        if ('\u{0400}'..='\u{04ff}').contains(&c) {
-            return Script::Cyrillic;
-        }
-        if ('\u{0600}'..='\u{06ff}').contains(&c) {
-            return Script::Arabic;
-        }
-        if ('\u{0900}'..='\u{097f}').contains(&c) {
-            return Script::Devanagari;
-        }
-    }
-    Script::Latin
-}
-
-/// One weighted query term. CJK terms are character bigrams; a Latin term is a
-/// word. The weight is 2 for a quoted phrase, 1 otherwise.
-#[derive(Debug, Clone)]
-struct Term {
-    text: String,
-    weight: f64,
-}
-
-/// The query, compiled into the rubric its candidates are judged by.
-#[derive(Debug, Clone)]
-pub struct Profile {
-    terms: Vec<Term>,
-    /// Named entities: capitalised runs (an internal capital counts even in the
-    /// first word, so "SpaceX" is one and a sentence-start "Latest" is not) and
-    /// quoted spans.
-    anchors: Vec<String>,
-    /// `-word` exclusions.
-    negated: Vec<String>,
-}
-
-impl Profile {
-    pub fn new(query: &str) -> Self {
-        let mut terms: Vec<Term> = Vec::new();
-        let mut anchors: Vec<String> = Vec::new();
-        let mut negated: Vec<String> = Vec::new();
-        // Whitespace tokens carry the operators; each token is then split into
-        // words. Quotes are stripped but remembered: a quoted word is stronger.
-        let mut first_word = true;
-        for raw in query.split_whitespace() {
-            if let Some(rest) = raw.strip_prefix('-')
-                && !rest.is_empty()
-            {
-                negated.push(rest.trim_matches('"').to_lowercase());
-                continue;
-            }
-            // `site:` names a host and, often, a path: the path words are part
-            // of what the query asked for, so they are terms too. The host is
-            // already the lane's filter (`tasks` drops hits off it).
-            let lower = raw.to_ascii_lowercase();
-            if let Some(value) = lower.strip_prefix("site:") {
-                if let Some((_host, path)) = value.split_once('/') {
-                    for word in path.split(|c: char| !c.is_alphanumeric()) {
-                        if word.chars().count() >= 2 && !STOP.contains(&word) {
-                            push_term(&mut terms, word.to_string(), 1.0);
-                        }
-                    }
-                }
-                continue;
-            }
-            let quoted = raw.starts_with('"') || raw.ends_with('"');
-            let bare = raw.trim_matches('"');
-            if quoted && !bare.is_empty() {
-                anchors.push(bare.to_lowercase());
-            }
-            // A CJK run is one unit: bigrams, never whitespace words.
-            if script_of(bare) != Script::Latin {
-                for run in cjk_runs(bare) {
-                    for term in bigrams(&run) {
-                        push_term(&mut terms, term, 1.0);
-                    }
-                }
-                first_word = false;
-                continue;
-            }
-            let capitalised = bare.chars().next().is_some_and(char::is_uppercase);
-            let internal_capital = bare.chars().skip(1).any(char::is_uppercase);
-            let anchor_ok = capitalised
-                && (internal_capital || !first_word)
-                && !ANCHOR_STOP.contains(&bare.to_lowercase().as_str())
-                && bare.chars().count() >= 2;
-            if anchor_ok {
-                anchors.push(bare.to_lowercase());
-            }
-            for word in bare.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#') {
-                let lower = word.to_lowercase();
-                if lower.is_empty() || STOP.contains(&lower.as_str()) {
-                    continue;
-                }
-                if lower.chars().count() < 2 && !lower.chars().any(|c| c.is_numeric()) {
-                    continue;
-                }
-                push_term(&mut terms, lower, if quoted { 2.0 } else { 1.0 });
-            }
-            first_word = false;
-        }
-        anchors.sort();
-        anchors.dedup();
-        negated.sort();
-        negated.dedup();
-        Self {
-            terms,
-            anchors,
-            negated,
-        }
-    }
-
-    /// The query's content terms, lowercased and stripped of operators — what
-    /// the resolver reads to decide whether the query names one thing.
-    pub fn terms(&self) -> impl Iterator<Item = &str> {
-        self.terms.iter().map(|t| t.text.as_str())
-    }
-
-    /// Does `root` name one of the query's terms? `_` and `-` are the same in a
-    /// package name.
-    fn names(&self, root: &str) -> bool {
-        let root = root.replace('_', "-").to_lowercase();
-        self.terms.iter().any(|t| {
-            t.text.replace('_', "-").to_lowercase() == root
-                || t.text.eq_ignore_ascii_case(root.as_str())
-        })
-    }
-
-    fn coverage(&self, text: &str) -> f64 {
-        let total: f64 = self.terms.iter().map(|t| t.weight).sum();
-        if total == 0.0 {
-            return 1.0;
-        }
-        let matched: f64 = self
-            .terms
-            .iter()
-            .filter(|t| matches(&t.text, text))
-            .map(|t| t.weight)
-            .sum();
-        matched / total
-    }
-
-    fn anchor_state(&self, text: &str) -> (bool, bool) {
-        if self.anchors.is_empty() {
-            return (true, true);
-        }
-        let hit: Vec<bool> = self.anchors.iter().map(|a| matches(a, text)).collect();
-        (hit.iter().any(|b| *b), hit.iter().all(|b| *b))
-    }
-
-    /// The verdict for one candidate.
-    pub fn verdict(&self, title: &str, snippet: &str, url: &str) -> Verdict {
-        if url_class(url) != UrlClass::Page {
-            return Verdict::Off;
-        }
-        let text = format!("{title} {snippet} {url}");
-        if self
-            .negated
-            .iter()
-            .any(|n| matches(n, &text) || text.to_lowercase().contains(n))
-        {
-            return Verdict::Off;
-        }
-        if self.terms.is_empty() {
-            // Nothing to judge (a bare symbol, a number): take the item at its word.
-            return Verdict::Exact;
-        }
-        // Nothing is vetoed here on a single term: the answer set proves which
-        // name the query meant (see `accept`), and a `site:` query names a host,
-        // not an entity.
-        let coverage = self.coverage(&text);
-        let (any_anchor, all_anchors) = self.anchor_state(&text);
-        // A scoped URL whose root is one of the query's terms is the record the
-        // query named: the URL itself is the evidence, so a thin title cannot
-        // put it out of the pool. Exact still needs the text to cover the query.
-        let named = scoped_root(url).is_some_and(|(_, root)| self.names(&root));
-        if coverage >= 0.6 && all_anchors {
-            Verdict::Exact
-        } else if named || (coverage >= 0.2 && any_anchor) {
-            Verdict::Partial
-        } else {
-            Verdict::Off
-        }
-    }
-}
-
-fn push_term(terms: &mut Vec<Term>, text: String, weight: f64) {
-    if let Some(existing) = terms.iter_mut().find(|t| t.text == text) {
-        existing.weight = existing.weight.max(weight);
-    } else {
-        terms.push(Term { text, weight });
-    }
-}
-
-/// Runs of CJK characters inside one token, e.g. "地震速報" or "東京の".
-fn cjk_runs(token: &str) -> Vec<String> {
-    let mut runs = Vec::new();
-    let mut current = String::new();
-    for c in token.chars() {
-        if is_cjk(c) {
-            current.push(c);
-        } else if !current.is_empty() {
-            runs.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        runs.push(current);
-    }
-    runs
-}
-
-/// Character bigrams of a run; a one-character run is its own term.
-fn bigrams(run: &str) -> Vec<String> {
-    let chars: Vec<char> = run.chars().collect();
-    if chars.len() <= 1 {
-        return vec![run.to_string()];
-    }
-    chars
-        .windows(2)
-        .map(|w| w.iter().collect())
-        .collect::<Vec<String>>()
-}
-
-/// Does `term` occur in `text`? Latin terms are whole words, with a prefix
-/// match for long ones ("dataclass" finds "dataclasses"); CJK terms are
-/// substrings, because a Japanese title has no spaces to split on.
-fn matches(term: &str, text: &str) -> bool {
-    if term.chars().any(is_cjk) {
-        return text.contains(term);
-    }
-    let lower = text.to_lowercase();
-    let words = lower.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#');
-    words
-        .into_iter()
-        .any(|w| w == term || (term.chars().count() >= 5 && w.starts_with(term)))
-}
+use super::engines::{Hit, is_serp_url};
+use super::query::{QueryFacts, matches};
 
 /// What a URL is, before anything else is judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,7 +169,7 @@ pub fn canonical_url(raw: &str) -> String {
 }
 
 /// Decode a wrapper, then strip what the index added on the way.
-fn publisher_url(raw: &str) -> String {
+pub(crate) fn publisher_url(raw: &str) -> String {
     canonical_url(&decode_redirect(raw).unwrap_or_else(|| raw.to_string()))
 }
 
@@ -597,110 +256,158 @@ pub fn scoped_root(raw: &str) -> Option<(ScopeShape, String)> {
 
 /// A scoped record from a package registry (not a GitHub repository) whose root
 /// the query names.
-pub fn package_scope_named(profile: &Profile, raw: &str) -> bool {
+pub fn package_scope_named(facts: &QueryFacts, raw: &str) -> bool {
     matches!(
         scoped_root(raw),
-        Some((shape, root)) if shape != ScopeShape::Github && profile.names(&root)
+        Some((shape, root)) if shape != ScopeShape::Github && facts.names(&root)
     )
 }
 
+/// Why a candidate is refused, before it can influence anything.
+///
+/// This is the veto list and nothing else. There is no verdict, no grade and no
+/// coverage floor: a candidate that is not vetoed enters the pool with its score,
+/// and the *set* is judged once, in [`super::quality`]. The list is short because
+/// every entry is a fact about the item — it is a wrapper, it is a SERP, it
+/// contains a term the query excluded — never a guess about the query's topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    Exact,
-    Partial,
-    Off,
+pub enum Veto {
+    /// A redirector or a SERP: a link to the answer, or a page of links.
+    Shape,
+    /// Not http(s) at all, or a decode that produced a replacement character.
+    Invalid,
+    /// Contains a `-term` the query excluded.
+    Negative,
+    /// A general encyclopedia or a video, for a query that names one identifier.
+    /// The name's own record or documentation answers those; a page about the
+    /// word does not (`tokio::spawn` → ja.wikipedia's article on the band TOKIO).
+    Reference,
 }
 
-impl Verdict {
-    pub fn admitted(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-}
+/// Hosts that answer a *topic* and never a *name*.
+const REFERENCE_HOSTS: &[&str] = &["wikipedia.org", "britannica.com", "youtube.com", "youtu.be"];
 
-/// A source's answer after the contracts ran.
-#[derive(Debug)]
-pub struct Accepted {
-    pub class: AnswerClass,
-    /// Items that may enter the merge.
-    pub kept: Vec<Hit>,
-    /// Items the source returned, before any were dropped.
-    pub items: usize,
-}
-
-/// Judge every item of a web source's answer, then judge the answer by them.
-pub fn accept(query: &str, hits: Vec<Hit>) -> Accepted {
-    let items = hits.len();
-    if hits.is_empty() {
-        return Accepted {
-            class: AnswerClass::Empty,
-            kept: Vec::new(),
-            items,
-        };
-    }
-    // Every hit is the publisher's own URL before anything judges it.
-    let hits: Vec<Hit> = hits
-        .into_iter()
-        .map(|mut h| {
-            h.url = publisher_url(&h.url);
-            h
+fn is_reference(raw: &str) -> bool {
+    url::Url::parse(raw)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
         })
-        .collect();
-    let profile = Profile::new(query);
-    let verdicts: Vec<Verdict> = hits
+        .is_some_and(|h| {
+            REFERENCE_HOSTS
+                .iter()
+                .any(|r| h == *r || h.ends_with(&format!(".{r}")))
+        })
+}
+
+/// The reason a candidate may not enter the pool, if any.
+pub fn veto(facts: &QueryFacts, hit: &Hit) -> Option<Veto> {
+    match url_class(&hit.url) {
+        UrlClass::Page => {}
+        UrlClass::Invalid => return Some(Veto::Invalid),
+        UrlClass::Redirect | UrlClass::Serp => return Some(Veto::Shape),
+    }
+    let text = format!("{} {} {}", hit.title, hit.snippet, hit.url);
+    if facts
+        .negated()
         .iter()
-        .map(|h| profile.verdict(&h.title, &h.snippet, &h.url))
-        .collect();
-
-    // A look-alike is only a look-alike when the answer set proves the name it
-    // meant: if some scoped page's root is a query term, pages of the same shape
-    // with another root are cousins, not answers. Without that anchor the query
-    // is topical and its scoped results are left alone.
-    let mut named: HashMap<ScopeShape, HashSet<String>> = HashMap::new();
-    for (hit, verdict) in hits.iter().zip(&verdicts) {
-        if verdict.admitted()
-            && let Some((shape, root)) = scoped_root(&hit.url)
-            && profile.names(&root)
-        {
-            named.entry(shape).or_default().insert(root);
-        }
+        .any(|n| matches(n, &text) || text.to_lowercase().contains(n))
+    {
+        return Some(Veto::Negative);
     }
+    None
+}
 
-    let mut kept = Vec::new();
-    let mut engaged = 0usize;
-    for (hit, verdict) in hits.into_iter().zip(verdicts) {
-        let mut verdict = verdict;
-        if verdict.admitted()
-            && let Some((shape, root)) = scoped_root(&hit.url)
-            && let Some(roots) = named.get(&shape)
-            && !roots.contains(&root)
-        {
-            verdict = Verdict::Off;
-        }
-        if verdict.admitted() {
-            engaged += 1;
-            kept.push(hit);
-        }
+/// The veto list as it applies to a **search engine's** answer.
+///
+/// A SERP's own furniture is not an answer: the encyclopedia entry for the word
+/// a one-identifier query named, or the site's bare front door. A first-party
+/// API is judged by [`veto`] alone — its own ranking is its contract, and the
+/// registry's root page is that registry's answer, not furniture.
+pub fn veto_lane(facts: &QueryFacts, hit: &Hit) -> Option<Veto> {
+    if let Some(v) = veto(facts, hit) {
+        return Some(v);
     }
+    if facts.is_identifier() && is_reference(&hit.url) {
+        return Some(Veto::Reference);
+    }
+    if is_bare_homepage(&hit.url) && !names_host(facts, &hit.url) {
+        return Some(Veto::Shape);
+    }
+    None
+}
 
-    let top = items.min(10);
-    let share = engaged.min(top) as f64 / top as f64;
-    let class = if items >= 3 {
-        if share >= 0.5 {
-            AnswerClass::Content
-        } else if share < 0.25 {
-            AnswerClass::OffQuery
-        } else {
-            AnswerClass::Thin
-        }
-    } else {
-        AnswerClass::Thin
+/// A site's front door, not an answer: no path, or `/` alone.
+///
+/// Measured in the 5.3.0 A block-paired run: `go context package cancel`
+/// returned `https://www.google.com/` at rank 1.
+fn is_bare_homepage(raw: &str) -> bool {
+    url::Url::parse(raw)
+        .ok()
+        .is_some_and(|u| u.path().trim_matches('/').is_empty() && u.query().is_none())
+}
+
+/// A homepage is the answer when the query names the site: `tokio` may answer
+/// with `tokio.rs/`, and `go.dev` with its own front page.
+fn names_host(facts: &QueryFacts, raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else {
+        return false;
     };
-    Accepted { class, kept, items }
+    let Some(host) = u
+        .host_str()
+        .map(|h| h.trim_start_matches("www.").to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    facts.terms().any(|t| {
+        let t = t.replace('_', "-");
+        t == host || labels.iter().any(|l| *l == t)
+    })
+}
+
+/// A candidate's graded relevance to the query, 0..=1.
+///
+/// The query's terms weighted by where they were found — title ×3, snippet ×1,
+/// URL ×1.5, host ×1 — scaled by how much of the query's named entity the text
+/// carries. This is the coverage gradient, not BM25: BM25+ over the merged
+/// candidate set (with its idf and field lengths) needs the set this function
+/// cannot see, and it is B2's work. What is needed here is one number per hit
+/// that orders the pool and lets a set be judged as a whole, without a verdict
+/// being taken on any single item.
+pub fn relevance(facts: &QueryFacts, title: &str, snippet: &str, url: &str) -> f64 {
+    if url_class(url) != UrlClass::Page {
+        return 0.0;
+    }
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.trim_start_matches("www.").to_string())
+        })
+        .unwrap_or_default();
+    let weighted = (3.0 * facts.coverage(title)
+        + facts.coverage(snippet)
+        + 1.5 * facts.coverage(url)
+        + facts.coverage(&host))
+        / 6.5;
+    let text = format!("{title} {snippet} {url}");
+    let (any, all) = facts.anchor_state(&text);
+    let anchor = if facts.anchors().is_empty() || all {
+        1.0
+    } else if any {
+        0.7
+    } else {
+        0.35
+    };
+    (weighted * anchor).clamp(0.0, 1.0)
 }
 
 /// First-party items keep their own ranking (the API's relevance is the
-/// contract), but they still lose redirects and look-alike namespaces.
-pub fn accept_first_party(query: &str, hits: Vec<Hit>) -> Vec<Hit> {
+/// contract), but they still lose what the veto list refuses, and look-alike
+/// namespaces whose root the query names elsewhere.
+pub fn accept_first_party(facts: &QueryFacts, hits: Vec<Hit>) -> Vec<Hit> {
     if hits.is_empty() {
         return hits;
     }
@@ -711,28 +418,26 @@ pub fn accept_first_party(query: &str, hits: Vec<Hit>) -> Vec<Hit> {
             h
         })
         .collect();
-    let profile = Profile::new(query);
-    let admissible = |hit: &Hit| url_class(&hit.url) == UrlClass::Page;
     let mut named: HashMap<ScopeShape, HashSet<String>> = HashMap::new();
-    for hit in hits.iter().filter(|h| admissible(h)) {
+    for hit in hits.iter().filter(|h| veto(facts, h).is_none()) {
         if let Some((shape, root)) = scoped_root(&hit.url)
-            && profile.names(&root)
+            && facts.names(&root)
         {
             named.entry(shape).or_default().insert(root);
         }
     }
     hits.into_iter()
         .filter(|hit| {
-            if !admissible(hit) {
+            if veto(facts, hit).is_some() {
                 return false;
             }
             if let Some((shape, root)) = scoped_root(&hit.url)
                 && named.contains_key(&shape)
-                && !profile.names(&root)
+                && !facts.names(&root)
             {
                 return false;
             }
-            github_engages(&profile, hit)
+            github_engages(facts, hit)
         })
         .collect()
 }
@@ -743,7 +448,7 @@ pub fn accept_first_party(query: &str, hits: Vec<Hit>) -> Vec<Hit> {
 /// repository answers only when its own owner or name carries a query word
 /// (a prefix counts: `dataclass` names `dataclasses`); an issue or anything
 /// deeper is judged like any other page. Other hosts pass untouched.
-fn github_engages(profile: &Profile, hit: &Hit) -> bool {
+fn github_engages(facts: &QueryFacts, hit: &Hit) -> bool {
     let Ok(u) = url::Url::parse(&hit.url) else {
         return true;
     };
@@ -752,7 +457,7 @@ fn github_engages(profile: &Profile, hit: &Hit) -> bool {
     }
     let segs: Vec<&str> = u.path().split('/').filter(|s| !s.is_empty()).collect();
     if segs.len() == 2 {
-        let terms: Vec<&str> = profile.terms().collect();
+        let terms: Vec<&str> = facts.terms().collect();
         if terms.is_empty() {
             return true;
         }
@@ -769,9 +474,7 @@ fn github_engages(profile: &Profile, hit: &Hit) -> bool {
                 })
             });
     }
-    profile
-        .verdict(&hit.title, &hit.snippet, &hit.url)
-        .admitted()
+    facts.is_exact(&hit.title, &hit.snippet, &hit.url)
 }
 
 // ── Date ────────────────────────────────────────────────────────────────
@@ -987,147 +690,195 @@ mod tests {
         }
     }
 
-    fn verdict(query: &str, title: &str, url: &str) -> Verdict {
-        Profile::new(query).verdict(title, "", url)
-    }
-
     #[test]
-    fn a_trending_page_does_not_answer_a_named_query() {
-        let q = "SpaceX Starship latest launch news this week";
-        assert_eq!(
-            verdict(
-                q,
-                "Diwali 2026: celebrations this week - AP News",
-                "https://apnews.com/x"
-            ),
-            Verdict::Off
+    fn a_trending_page_is_not_the_answer_but_the_covering_page_is() {
+        let q = QueryFacts::new("SpaceX Starship latest launch news this week");
+        let diwali = (
+            "Diwali 2026: celebrations this week - AP News",
+            "https://apnews.com/x",
         );
+        assert!(!q.is_exact(diwali.0, "", diwali.1));
         assert_eq!(
-            verdict(
-                q,
-                "SpaceX will perform Starship double catch attempt with Flight 15",
-                "https://www.teslarati.com/x"
-            ),
-            Verdict::Exact
+            relevance(&q, diwali.0, "", diwali.1),
+            0.0,
+            "no query term at all"
         );
+        let teslarati = (
+            "SpaceX will perform Starship double catch attempt with Flight 15",
+            "https://www.teslarati.com/x",
+        );
+        assert!(q.is_exact(teslarati.0, "", teslarati.1));
+        assert!(relevance(&q, teslarati.0, "", teslarati.1) > 0.25);
     }
 
     #[test]
     fn a_temporal_word_is_not_evidence() {
-        let p = Profile::new("starship latest news this week");
-        let text = "Diwali celebrations this week";
-        assert_eq!(p.coverage(text), 0.0, "only temporal words matched");
+        let q = QueryFacts::new("starship latest news this week");
+        assert_eq!(q.coverage("Diwali celebrations this week"), 0.0);
     }
 
     #[test]
-    fn a_scope_named_page_is_admitted_on_its_url_alone() {
+    fn a_scoped_record_is_recognised_by_the_root_the_query_names() {
         // The docs page's title is just the crate name; the URL root is what
-        // proves it answers the query.
+        // proves it answers the query, so it is never vetoed and never a cousin.
+        let q = QueryFacts::new("rust clap command line argument parser crate");
+        assert!(q.names("clap"));
+        assert!(!q.names("taos"));
+        assert!(veto(&q, &hit("clap 4.5", "https://docs.rs/clap/latest/clap/")).is_none());
+    }
+
+    #[test]
+    fn an_unspaced_japanese_query_covers_its_answers() {
+        let q = QueryFacts::new("地震速報");
+        assert!(
+            q.coverage("地震速報 - NHK のニュース") > 0.9,
+            "{}",
+            q.coverage("地震速報 - NHK のニュース")
+        );
+        // The spacing a caller types does not change the question.
+        let spaced = QueryFacts::new("東京 地震 速報");
+        assert!(spaced.coverage("地震速報 - NHK") >= 0.6);
+    }
+
+    #[test]
+    fn a_bare_homepage_is_not_an_answer_unless_the_query_names_the_site() {
+        // Measured: `go context package cancel` returned google.com's front page
+        // at rank 1 in the 5.3.0 A block-paired run.
+        let q = QueryFacts::new("go context package cancel");
         assert_eq!(
-            verdict(
-                "rust clap command line argument parser crate",
-                "clap 4.5",
-                "https://docs.rs/clap/latest/clap/"
+            veto_lane(&q, &hit("Google", "https://www.google.com/")),
+            Some(Veto::Shape)
+        );
+        // The site the query names may answer with its own front page.
+        let tokio = QueryFacts::new("tokio");
+        assert!(veto_lane(&tokio, &hit("Tokio", "https://tokio.rs/")).is_none());
+        // A deeper page is never a homepage.
+        assert!(veto_lane(&q, &hit("context", "https://pkg.go.dev/context")).is_none());
+    }
+
+    #[test]
+    fn a_redirect_a_serp_an_excluded_term_or_a_bad_url_is_vetoed() {
+        let q = QueryFacts::new("rust async -python");
+        assert_eq!(
+            veto(
+                &q,
+                &hit(
+                    "Starship launch",
+                    "https://news.google.com/rss/articles/CBMi"
+                )
             ),
-            Verdict::Partial
+            Some(Veto::Shape)
         );
         assert_eq!(
-            verdict(
-                "rust clap command line argument parser crate",
-                "select",
-                "https://docs.rs/taos/latest/taos/"
+            veto(&q, &hit("x", "https://www.bing.com/search?q=x")),
+            Some(Veto::Shape)
+        );
+        assert_eq!(
+            veto(&q, &hit("Async Python", "https://example.com/python")),
+            Some(Veto::Negative)
+        );
+        assert_eq!(
+            veto(&q, &hit("alert", "javascript:alert(1)")),
+            Some(Veto::Invalid)
+        );
+        assert!(veto(&q, &hit("Rust async", "https://example.com/rust")).is_none());
+    }
+
+    #[test]
+    fn a_page_that_carries_the_query_outranks_one_that_does_not() {
+        let q = QueryFacts::new("tokio spawn_blocking");
+        let on = relevance(
+            &q,
+            "tokio::task::spawn_blocking",
+            "Runs a blocking closure",
+            "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
+        );
+        let off = relevance(
+            &q,
+            "Python decorators",
+            "",
+            "https://example.com/decorators",
+        );
+        assert!(on > 0.6, "{on}");
+        assert!(off < 0.1, "{off}");
+        // The title outweighs a snippet mention of the same term.
+        let title = relevance(&q, "tokio", "", "https://example.com/x");
+        let snippet = relevance(&q, "unrelated", "tokio", "https://example.com/x");
+        assert!(title > snippet, "title {title} vs snippet {snippet}");
+    }
+
+    #[test]
+    fn one_identifier_is_never_answered_by_an_encyclopedia_or_a_video() {
+        // Measured: 5.2.1 answered `tokio::spawn` and `#[tokio::main]` with
+        // ja.wikipedia's article on the band TOKIO, twice, in one run.
+        let q = QueryFacts::new("tokio::spawn");
+        assert!(q.is_identifier());
+        assert_eq!(
+            veto_lane(
+                &q,
+                &hit("TOKIO - Wikipedia", "https://ja.wikipedia.org/wiki/TOKIO")
             ),
-            Verdict::Off
+            Some(Veto::Reference)
+        );
+        assert_eq!(
+            veto_lane(&q, &hit("Tokio spawn", "https://www.youtube.com/watch?v=x")),
+            Some(Veto::Reference)
+        );
+        assert!(
+            veto_lane(
+                &q,
+                &hit("tokio::spawn", "https://tokio.rs/tokio/tutorial/spawn")
+            )
+            .is_none()
+        );
+        // The shape is one identifier, not any query containing a code word.
+        assert!(!QueryFacts::new("tokio spawn tutorial").is_identifier());
+        assert!(!QueryFacts::new("what is tokio").is_identifier());
+        // And a topic query keeps its encyclopedia page.
+        let topic = QueryFacts::new("quantum entanglement");
+        assert!(
+            veto(
+                &topic,
+                &hit(
+                    "Quantum entanglement",
+                    "https://en.wikipedia.org/wiki/Quantum_entanglement"
+                )
+            )
+            .is_none()
         );
     }
 
     #[test]
-    fn an_unspaced_japanese_query_finds_its_answers() {
-        let hits = vec![
-            hit(
-                "地震情報 - ウェザーニュース",
-                "https://weathernews.jp/quake/",
-            ),
-            hit("地震速報 - NHK", "https://news.web.nhk/earthquake/"),
-            hit("気象庁 地震情報", "https://www.data.jma.go.jp/quake/"),
-            hit("東京都の地震情報", "https://map.bosai.metro.tokyo.lg.jp/"),
-            hit(
-                "地震速報 - Yahoo!天気",
-                "https://typhoon.yahoo.co.jp/earthquake/",
-            ),
-        ];
-        let accepted = accept("地震速報", hits);
-        assert_eq!(accepted.class, AnswerClass::Content);
-        assert_eq!(accepted.kept.len(), 5);
-    }
-
-    #[test]
-    fn spaces_do_not_change_a_japanese_answer() {
-        let hits = vec![
-            hit(
-                "地震情報 - ウェザーニュース",
-                "https://weathernews.jp/quake/",
-            ),
-            hit("地震速報 - NHK", "https://news.web.nhk/earthquake/"),
-            hit("気象庁 地震情報", "https://www.data.jma.go.jp/quake/"),
-            hit("東京都の地震情報", "https://map.bosai.metro.tokyo.lg.jp/"),
-            hit(
-                "地震速報 - Yahoo!天気",
-                "https://typhoon.yahoo.co.jp/earthquake/",
-            ),
-        ];
-        let spaced = accept("東京 地震 速報", hits);
-        assert_eq!(spaced.class, AnswerClass::Content);
-    }
-
-    #[test]
-    fn a_look_alike_crate_is_rejected_by_the_name_it_names() {
-        let hits = vec![
-            hit("tokio - Rust", "https://docs.rs/tokio/latest/tokio/"),
-            hit(
-                "select in taos::tokio",
-                "https://docs.rs/taos/latest/taos/tokio/macro.select.html",
-            ),
-        ];
-        let accepted = accept("tokio", hits);
-        let urls: Vec<&str> = accepted.kept.iter().map(|h| h.url.as_str()).collect();
-        assert_eq!(urls, vec!["https://docs.rs/tokio/latest/tokio/"]);
-    }
-
-    #[test]
-    fn a_topical_query_does_not_veto_other_crates() {
-        let hits = vec![
-            hit(
-                "taos — an async runtime",
-                "https://docs.rs/taos/latest/taos/",
-            ),
-            hit(
-                "tokio — an async runtime",
-                "https://docs.rs/tokio/latest/tokio/",
-            ),
-        ];
-        let accepted = accept("async runtime rust", hits);
-        assert_eq!(
-            accepted.kept.len(),
-            2,
-            "no query term names either crate, so neither is a look-alike"
-        );
-    }
-
-    #[test]
-    fn an_aggregator_redirect_is_never_a_result() {
-        assert_eq!(
-            url_class("https://news.google.com/rss/articles/CBMiabc?oc=5"),
-            UrlClass::Redirect
-        );
-        assert_eq!(
-            verdict(
-                "starship launch",
-                "SpaceX Starship launch",
-                "https://news.google.com/rss/articles/CBMiabc?oc=5"
-            ),
-            Verdict::Off
-        );
+    fn the_identifiers_that_count_as_one_are_the_code_shapes() {
+        for q in [
+            "select!",
+            "std::mem::take",
+            "serde_json::Value",
+            "@types/node",
+            "v8::Isolate",
+            "itertools::izip",
+            "#[tokio::main]",
+            "__dirname",
+            "ngOnDestroy",
+            "v1.2.3",
+        ] {
+            assert!(
+                QueryFacts::new(q).is_identifier(),
+                "{q} should be one identifier"
+            );
+        }
+        for q in [
+            "rust programming",
+            "what is a monad",
+            "git rev-parse --short HEAD",
+            "tokio",
+            "C++",
+        ] {
+            assert!(
+                !QueryFacts::new(q).is_identifier(),
+                "{q} is a question, not an identifier"
+            );
+        }
     }
 
     #[test]
@@ -1138,57 +889,13 @@ mod tests {
     }
 
     #[test]
-    fn latin_prefix_matching_survives() {
-        assert!(matches("dataclass", "Python Dataclasses — documentation"));
-        assert!(!matches("dataclass", "Python decorators"));
-    }
-
-    #[test]
-    fn an_exclusion_term_rejects_the_item() {
-        assert_eq!(
-            verdict(
-                "rust async -python",
-                "Async Python",
-                "https://example.com/python"
-            ),
-            Verdict::Off
-        );
-    }
-
-    #[test]
-    fn an_off_query_answer_is_named_and_kept_out() {
-        let hits: Vec<Hit> = (0..6)
-            .map(|i| {
-                hit(
-                    &format!("Diwali celebration {i}"),
-                    &format!("https://example.com/diwali/{i}"),
-                )
-            })
-            .collect();
-        let accepted = accept("SpaceX Starship launch", hits);
-        assert_eq!(accepted.class, AnswerClass::OffQuery);
-        assert!(accepted.kept.is_empty());
-    }
-
-    #[test]
-    fn a_short_answer_is_thin_not_off_query() {
-        let hits = vec![
-            hit("Starship launch date", "https://example.com/a"),
-            hit("Falcon 9 booster recovery", "https://example.com/b"),
-        ];
-        let accepted = accept("starship launch", hits);
-        assert_eq!(accepted.class, AnswerClass::Thin);
-        assert_eq!(accepted.kept.len(), 1);
-    }
-
-    #[test]
     fn a_first_party_answer_loses_redirects_and_look_alikes() {
         let hits = vec![
             hit("crate tokio", "https://crates.io/crates/tokio"),
             hit("crate taos", "https://crates.io/crates/taos"),
             hit("tokio news", "https://news.google.com/rss/articles/x"),
         ];
-        let kept = accept_first_party("tokio", hits);
+        let kept = accept_first_party(&QueryFacts::new("tokio"), hits);
         let urls: Vec<&str> = kept.iter().map(|h| h.url.as_str()).collect();
         assert_eq!(urls, vec!["https://crates.io/crates/tokio"]);
     }
@@ -1198,7 +905,7 @@ mod tests {
     #[test]
     fn a_github_repository_answers_only_through_its_own_name() {
         let kept = |q: &str, hits: Vec<Hit>| -> Vec<String> {
-            accept_first_party(q, hits)
+            accept_first_party(&QueryFacts::new(q), hits)
                 .into_iter()
                 .map(|h| h.url)
                 .collect()

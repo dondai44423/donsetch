@@ -1,1113 +1,3265 @@
 {
- "version": 1,
- "about": "Gold set for donsetch search-bench. `gold` rows are the tuning set; `held` rows are validation only and are never tuned against. Gold regexes match a result URL. Add a row for every real miss found.",
- "queries": [
-  {
-   "id": "c1",
-   "shape": "code",
-   "set": "gold",
-   "query": "rust tokio spawn_blocking",
-   "gold": [
-    "docs\\.rs/tokio/[^ ]*spawn_blocking"
-   ]
-  },
-  {
-   "id": "c2",
-   "shape": "code",
-   "set": "gold",
-   "query": "python dataclass frozen",
-   "gold": [
-    "docs\\.python\\.org/3/library/dataclasses"
-   ]
-  },
-  {
-   "id": "c3",
-   "shape": "code",
-   "set": "gold",
-   "query": "typescript satisfies operator",
-   "gold": [
-    "typescriptlang\\.org/[^ ]*4-9",
-    "typescriptlang\\.org/[^ ]*satisfies"
-   ]
-  },
-  {
-   "id": "c4",
-   "shape": "code",
-   "set": "gold",
-   "query": "go context package cancel",
-   "gold": [
-    "pkg\\.go\\.dev/context",
-    "go\\.dev/pkg/context"
-   ]
-  },
-  {
-   "id": "c5",
-   "shape": "code",
-   "set": "gold",
-   "query": "postgres vacuum full command",
-   "gold": [
-    "postgresql\\.org/docs/[^ ]*sql-vacuum"
-   ]
-  },
-  {
-   "id": "c6",
-   "shape": "code",
-   "set": "gold",
-   "query": "git rebase interactive squash commits",
-   "gold": [
-    "git-scm\\.com/docs/git-rebase"
-   ]
-  },
-  {
-   "id": "c7",
-   "shape": "code",
-   "set": "gold",
-   "query": "sqlite write-ahead logging wal",
-   "gold": [
-    "sqlite\\.org/wal\\.html",
-    "sqlite\\.org/[^ ]*wal"
-   ]
-  },
-  {
-   "id": "c8",
-   "shape": "code",
-   "set": "gold",
-   "query": "react useeffect cleanup function",
-   "gold": [
-    "react\\.dev/reference/react/useEffect"
-   ]
-  },
-  {
-   "id": "e1",
-   "shape": "entity",
-   "set": "gold",
-   "query": "what is quantum entanglement",
-   "gold": [
-    "wikipedia\\.org/wiki/Quantum_entanglement"
-   ]
-  },
-  {
-   "id": "e2",
-   "shape": "entity",
-   "set": "gold",
-   "query": "who was ada lovelace",
-   "gold": [
-    "wikipedia\\.org/wiki/Ada_Lovelace"
-   ]
-  },
-  {
-   "id": "e3",
-   "shape": "entity",
-   "set": "gold",
-   "query": "capital of australia",
-   "gold": [
-    "wikipedia\\.org/wiki/Canberra",
-    "britannica\\.com/[^ ]*Canberra"
-   ]
-  },
-  {
-   "id": "e4",
-   "shape": "entity",
-   "set": "gold",
-   "query": "population of tokyo",
-   "gold": [
-    "wikipedia\\.org/wiki/Tokyo"
-   ]
-  },
-  {
-   "id": "e5",
-   "shape": "entity",
-   "set": "gold",
-   "query": "what is a monad functional programming",
-   "gold": [
-    "wikipedia\\.org/wiki/Monad_\\(functional_programming\\)"
-   ]
-  },
-  {
-   "id": "e6",
-   "shape": "entity",
-   "set": "gold",
-   "query": "epistemology definition",
-   "gold": [
-    "wikipedia\\.org/wiki/Epistemology"
-   ]
-  },
-  {
-   "id": "e7",
-   "shape": "entity",
-   "set": "gold",
-   "query": "who invented the telephone",
-   "gold": [
-    "wikipedia\\.org/wiki/Alexander_Graham_Bell"
-   ]
-  },
-  {
-   "id": "e8",
-   "shape": "entity",
-   "set": "gold",
-   "query": "speed of light in vacuum",
-   "gold": [
-    "wikipedia\\.org/wiki/Speed_of_light"
-   ]
-  },
-  {
-   "id": "p1",
-   "shape": "paper",
-   "set": "gold",
-   "query": "attention is all you need",
-   "gold": [
-    "arxiv\\.org/abs/1706\\.03762"
-   ]
-  },
-  {
-   "id": "p2",
-   "shape": "paper",
-   "set": "gold",
-   "query": "bert pre-training deep bidirectional transformers",
-   "gold": [
-    "arxiv\\.org/abs/1810\\.04805"
-   ]
-  },
-  {
-   "id": "p3",
-   "shape": "paper",
-   "set": "gold",
-   "query": "deep residual learning image recognition resnet",
-   "gold": [
-    "arxiv\\.org/abs/1512\\.03385"
-   ]
-  },
-  {
-   "id": "p4",
-   "shape": "paper",
-   "set": "gold",
-   "query": "scaling laws for neural language models",
-   "gold": [
-    "arxiv\\.org/abs/2001\\.08361"
-   ]
-  },
-  {
-   "id": "p5",
-   "shape": "paper",
-   "set": "gold",
-   "query": "lora low-rank adaptation large language models",
-   "gold": [
-    "arxiv\\.org/abs/2106\\.09685"
-   ]
-  },
-  {
-   "id": "n1",
-   "shape": "news",
-   "set": "gold",
-   "query": "nobel prize in physics 2026 winner",
-   "gold": [
-    "nobelprize\\.org",
-    "indianexpress\\.com/[^ ]*nobel",
-    "aps\\.org/[^ ]*nobel"
-   ],
-   "window": "365d"
-  },
-  {
-   "id": "n2",
-   "shape": "news",
-   "set": "gold",
-   "query": "rust 1.90 release announcement",
-   "gold": [
-    "blog\\.rust-lang\\.org/[^ ]*1\\.90",
-    "releases\\.rust-lang\\.org"
-   ],
-   "window": "365d"
-  },
-  {
-   "id": "n3",
-   "shape": "news",
-   "set": "gold",
-   "query": "federal reserve interest rate decision november 2026",
-   "gold": [
-    "federalreserve\\.gov/newsevents/pressreleases"
-   ],
-   "window": "60d"
-  },
-  {
-   "id": "n4",
-   "shape": "news",
-   "set": "gold",
-   "query": "openai gpt release announcement",
-   "gold": [
-    "openai\\.com/[^ ]*(index|news|gpt)"
-   ],
-   "window": "365d"
-  },
-  {
-   "id": "n5",
-   "shape": "news",
-   "set": "gold",
-   "query": "apple q4 2026 earnings results",
-   "gold": [
-    "apple\\.com/[^ ]*earnings",
-    "investor\\.apple\\.com"
-   ],
-   "window": "120d"
-  },
-  {
-   "id": "b1",
-   "shape": "web",
-   "set": "gold",
-   "query": "best mechanical keyboard for programming",
-   "gold": [
-    "rtings\\.com/keyboard",
-    "keychron\\.com"
-   ]
-  },
-  {
-   "id": "b2",
-   "shape": "web",
-   "set": "gold",
-   "query": "best noise cancelling headphones review",
-   "gold": [
-    "rtings\\.com/headphones"
-   ]
-  },
-  {
-   "id": "b3",
-   "shape": "web",
-   "set": "gold",
-   "query": "sony wh-1000xm5 specifications",
-   "gold": [
-    "sony\\.com/[^ ]*wh-1000xm5",
-    "sony\\.co\\.uk/[^ ]*wh-1000xm5"
-   ]
-  },
-  {
-   "id": "b4",
-   "shape": "web",
-   "set": "gold",
-   "query": "thinkpad x1 carbon gen 13 specifications",
-   "gold": [
-    "lenovo\\.com/[^ ]*x1-carbon",
-    "psref\\.lenovo\\.com"
-   ]
-  },
-  {
-   "id": "b5",
-   "shape": "web",
-   "set": "gold",
-   "query": "keychron q1 pro review",
-   "gold": [
-    "keychron\\.com",
-    "rtings\\.com/keyboard"
-   ]
-  },
-  {
-   "id": "l1",
-   "shape": "code",
-   "set": "gold",
-   "query": "failed to run custom build command for libz-sys",
-   "gold": [
-    "github\\.com/rust-lang/libz-sys",
-    "stackoverflow\\.com/questions/[^ ]*libz"
-   ]
-  },
-  {
-   "id": "l2",
-   "shape": "code",
-   "set": "gold",
-   "query": "donsetch mcp server",
-   "gold": [
-    "github\\.com/dondai44423/donsetch",
-    "npmjs\\.com/package/donsetch"
-   ]
-  },
-  {
-   "id": "l3",
-   "shape": "web",
-   "set": "gold",
-   "query": "how to replace a bicycle tire",
-   "gold": [
-    "(?i)wikihow\\.com/[^ ]*(tire|tyre)",
-    "(?i)sheldonbrown\\.com/[^ ]*tire"
-   ]
-  },
-  {
-   "id": "l4",
-   "shape": "code",
-   "set": "gold",
-   "query": "docker compose depends_on condition service_healthy",
-   "gold": [
-    "docs\\.docker\\.com/[^ ]*depends_on",
-    "docs\\.docker\\.com/[^ ]*compose-file"
-   ]
-  },
-  {
-   "id": "l5",
-   "shape": "code",
-   "set": "gold",
-   "query": "nginx proxy_pass trailing slash difference",
-   "gold": [
-    "nginx\\.org/[^ ]*proxy_pass",
-    "stackoverflow\\.com/questions/[^ ]*proxy_pass",
-    "nginx\\.org/[^ ]*proxy_module"
-   ]
-  },
-  {
-   "id": "d1",
-   "shape": "code",
-   "set": "gold",
-   "query": "tokio select macro documentation",
-   "gold": [
-    "docs\\.rs/tokio/[^ ]*macro\\.select"
-   ]
-  },
-  {
-   "id": "d2",
-   "shape": "code",
-   "set": "gold",
-   "query": "pandas read_csv dtype parameter",
-   "gold": [
-    "pandas\\.pydata\\.org/[^ ]*read_csv"
-   ]
-  },
-  {
-   "id": "d3",
-   "shape": "code",
-   "set": "gold",
-   "query": "kubernetes liveness probe configuration",
-   "gold": [
-    "kubernetes\\.io/docs/[^ ]*liveness"
-   ]
-  },
-  {
-   "id": "d4",
-   "shape": "code",
-   "set": "gold",
-   "query": "mdn array reduce",
-   "gold": [
-    "developer\\.mozilla\\.org/[^ ]*Array/reduce"
-   ]
-  },
-  {
-   "id": "h-c1",
-   "shape": "code",
-   "set": "held",
-   "query": "python asyncio gather return_exceptions",
-   "gold": [
-    "docs\\.python\\.org/3/library/asyncio-task"
-   ]
-  },
-  {
-   "id": "h-c2",
-   "shape": "code",
-   "set": "held",
-   "query": "rust serde derive rename field",
-   "gold": [
-    "serde\\.rs/field-attrs",
-    "serde\\.rs/attr-rename"
-   ]
-  },
-  {
-   "id": "h-c3",
-   "shape": "code",
-   "set": "held",
-   "query": "javascript promise allsettled",
-   "gold": [
-    "developer\\.mozilla\\.org/[^ ]*Promise/allSettled"
-   ]
-  },
-  {
-   "id": "h-c4",
-   "shape": "code",
-   "set": "held",
-   "query": "css grid template areas",
-   "gold": [
-    "developer\\.mozilla\\.org/[^ ]*grid-template-areas",
-    "css-tricks\\.com/[^ ]*grid-template-areas"
-   ]
-  },
-  {
-   "id": "h-c5",
-   "shape": "code",
-   "set": "held",
-   "query": "systemd timer unit oncalendar",
-   "gold": [
-    "freedesktop\\.org/software/systemd/man/[^ ]*systemd\\.timer",
-    "man7\\.org/[^ ]*systemd\\.timer"
-   ]
-  },
-  {
-   "id": "h-c6",
-   "shape": "code",
-   "set": "held",
-   "query": "kubernetes horizontal pod autoscaler",
-   "gold": [
-    "kubernetes\\.io/docs/[^ ]*horizontal-pod-autoscal"
-   ]
-  },
-  {
-   "id": "h-c7",
-   "shape": "code",
-   "set": "held",
-   "query": "postgresql jsonb operators",
-   "gold": [
-    "postgresql\\.org/docs/[^ ]*(functions-json|datatype-json)"
-   ]
-  },
-  {
-   "id": "h-c8",
-   "shape": "code",
-   "set": "held",
-   "query": "docker multi-stage builds",
-   "gold": [
-    "docs\\.docker\\.com/[^ ]*multi-stage"
-   ]
-  },
-  {
-   "id": "h-c9",
-   "shape": "code",
-   "set": "held",
-   "query": "numpy broadcasting rules",
-   "gold": [
-    "numpy\\.org/doc/[^ ]*broadcasting"
-   ]
-  },
-  {
-   "id": "h-c10",
-   "shape": "code",
-   "set": "held",
-   "query": "git stash pop vs apply",
-   "gold": [
-    "git-scm\\.com/docs/git-stash",
-    "stackoverflow\\.com/questions/[^ ]*stash"
-   ]
-  },
-  {
-   "id": "h-c11",
-   "shape": "code",
-   "set": "held",
-   "query": "typescript generics constraints",
-   "gold": [
-    "typescriptlang\\.org/docs/handbook/2/generics"
-   ]
-  },
-  {
-   "id": "h-c12",
-   "shape": "code",
-   "set": "held",
-   "query": "go generics type parameters tutorial",
-   "gold": [
-    "go\\.dev/doc/tutorial/generics",
-    "go\\.dev/blog/intro-generics"
-   ]
-  },
-  {
-   "id": "h-c13",
-   "shape": "code",
-   "set": "held",
-   "query": "java streams collectors groupingby",
-   "gold": [
-    "docs\\.oracle\\.com/[^ ]*Collectors",
-    "baeldung\\.com/[^ ]*grouping"
-   ]
-  },
-  {
-   "id": "h-c14",
-   "shape": "code",
-   "set": "held",
-   "query": "redis sorted set zadd",
-   "gold": [
-    "redis\\.io/[^ ]*zadd",
-    "redis\\.io/docs/[^ ]*sorted-sets"
-   ]
-  },
-  {
-   "id": "h-c15",
-   "shape": "code",
-   "set": "held",
-   "query": "sqlalchemy relationship lazy loading",
-   "gold": [
-    "docs\\.sqlalchemy\\.org/[^ ]*loading_relationships"
-   ]
-  },
-  {
-   "id": "h-c16",
-   "shape": "code",
-   "set": "held",
-   "query": "bash parameter expansion default value",
-   "gold": [
-    "gnu\\.org/software/bash/manual",
-    "stackoverflow\\.com/questions/[^ ]*(default|unset)"
-   ]
-  },
-  {
-   "id": "h-e1",
-   "shape": "entity",
-   "set": "held",
-   "query": "who discovered penicillin",
-   "gold": [
-    "wikipedia\\.org/wiki/(Alexander_Fleming|Penicillin)"
-   ]
-  },
-  {
-   "id": "h-e2",
-   "shape": "entity",
-   "set": "held",
-   "query": "what is photosynthesis",
-   "gold": [
-    "wikipedia\\.org/wiki/Photosynthesis"
-   ]
-  },
-  {
-   "id": "h-e3",
-   "shape": "entity",
-   "set": "held",
-   "query": "height of mount everest",
-   "gold": [
-    "wikipedia\\.org/wiki/Mount_Everest"
-   ]
-  },
-  {
-   "id": "h-e4",
-   "shape": "entity",
-   "set": "held",
-   "query": "what is the theory of relativity",
-   "gold": [
-    "wikipedia\\.org/wiki/Theory_of_relativity"
-   ]
-  },
-  {
-   "id": "h-e5",
-   "shape": "entity",
-   "set": "held",
-   "query": "who wrote pride and prejudice",
-   "gold": [
-    "wikipedia\\.org/wiki/(Jane_Austen|Pride_and_Prejudice)"
-   ]
-  },
-  {
-   "id": "h-e6",
-   "shape": "entity",
-   "set": "held",
-   "query": "when did world war 2 end",
-   "gold": [
-    "wikipedia\\.org/wiki/(World_War_II|End_of_World_War_II)"
-   ]
-  },
-  {
-   "id": "h-e7",
-   "shape": "entity",
-   "set": "held",
-   "query": "what is blockchain",
-   "gold": [
-    "wikipedia\\.org/wiki/Blockchain"
-   ]
-  },
-  {
-   "id": "h-e8",
-   "shape": "entity",
-   "set": "held",
-   "query": "boiling point of water",
-   "gold": [
-    "wikipedia\\.org/wiki/(Boiling_point|Water_\\(properties\\))",
-    "britannica\\.com/[^ ]*boiling-point"
-   ]
-  },
-  {
-   "id": "h-p1",
-   "shape": "paper",
-   "set": "held",
-   "query": "generative adversarial networks goodfellow",
-   "gold": [
-    "arxiv\\.org/abs/1406\\.2661"
-   ]
-  },
-  {
-   "id": "h-p2",
-   "shape": "paper",
-   "set": "held",
-   "query": "adam a method for stochastic optimization",
-   "gold": [
-    "arxiv\\.org/abs/1412\\.6980"
-   ]
-  },
-  {
-   "id": "h-p3",
-   "shape": "paper",
-   "set": "held",
-   "query": "language models are few-shot learners",
-   "gold": [
-    "arxiv\\.org/abs/2005\\.14165"
-   ]
-  },
-  {
-   "id": "h-p4",
-   "shape": "paper",
-   "set": "held",
-   "query": "denoising diffusion probabilistic models",
-   "gold": [
-    "arxiv\\.org/abs/2006\\.11239"
-   ]
-  },
-  {
-   "id": "h-p5",
-   "shape": "paper",
-   "set": "held",
-   "query": "chain-of-thought prompting elicits reasoning in large language models",
-   "gold": [
-    "arxiv\\.org/abs/2201\\.11903"
-   ]
-  },
-  {
-   "id": "h-n1",
-   "shape": "news",
-   "set": "held",
-   "query": "python 3.14 release notes",
-   "gold": [
-    "docs\\.python\\.org/[^ ]*whatsnew/3\\.14",
-    "python\\.org/downloads/release/python-314"
-   ]
-  },
-  {
-   "id": "h-n2",
-   "shape": "news",
-   "set": "held",
-   "query": "node.js 24 release announcement",
-   "gold": [
-    "nodejs\\.org/[^ ]*(blog/release/v24|v24)"
-   ],
-   "window": "365d"
-  },
-  {
-   "id": "h-n3",
-   "shape": "news",
-   "set": "held",
-   "query": "kubernetes 1.34 release",
-   "gold": [
-    "kubernetes\\.io/blog/[^ ]*(1-34|v1-34)",
-    "kubernetes\\.io/releases/1\\.34"
-   ],
-   "window": "365d"
-  },
-  {
-   "id": "h-n4",
-   "shape": "news",
-   "set": "held",
-   "query": "postgresql 18 released",
-   "gold": [
-    "postgresql\\.org/about/news/postgresql-18"
-   ],
-   "window": "365d"
-  },
-  {
-   "id": "h-n5",
-   "shape": "news",
-   "set": "held",
-   "query": "typescript 5.9 announcement",
-   "gold": [
-    "devblogs\\.microsoft\\.com/typescript/announcing-typescript-5-9",
-    "typescriptlang\\.org/[^ ]*release-notes/typescript-5-9"
-   ],
-   "window": "365d"
-  },
-  {
-   "id": "h-b1",
-   "shape": "web",
-   "set": "held",
-   "query": "iphone 17 pro specifications",
-   "gold": [
-    "apple\\.com/[^ ]*iphone-17-pro[^ ]*specs",
-    "support\\.apple\\.com/[^ ]*iphone-17-pro"
-   ]
-  },
-  {
-   "id": "h-b2",
-   "shape": "web",
-   "set": "held",
-   "query": "steam deck oled specifications",
-   "gold": [
-    "steamdeck\\.com/[^ ]*tech",
-    "store\\.steampowered\\.com/steamdeck"
-   ]
-  },
-  {
-   "id": "h-b3",
-   "shape": "web",
-   "set": "held",
-   "query": "how to change a flat tire",
-   "gold": [
-    "(?i)wikihow\\.com/change-a.*tire",
-    "nhtsa\\.gov/[^ ]*tire"
-   ]
-  },
-  {
-   "id": "h-b4",
-   "shape": "web",
-   "set": "held",
-   "query": "how to tie a windsor knot",
-   "gold": [
-    "wikihow\\.com/[^ ]*Windsor",
-    "wikipedia\\.org/wiki/Windsor_knot"
-   ]
-  },
-  {
-   "id": "h-b5",
-   "shape": "web",
-   "set": "held",
-   "query": "best monitors for programming rtings",
-   "gold": [
-    "rtings\\.com/monitor"
-   ]
-  },
-  {
-   "id": "h-b6",
-   "shape": "web",
-   "set": "held",
-   "query": "raspberry pi 5 specifications",
-   "gold": [
-    "raspberrypi\\.com/products/raspberry-pi-5",
-    "raspberrypi\\.com/documentation/[^ ]*raspberry-pi-5"
-   ]
-  },
-  {
-   "id": "p6",
-   "shape": "paper",
-   "set": "gold",
-   "query": "swin transformer hierarchical vision transformer using shifted windows",
-   "gold": [
-    "arxiv\\.org/abs/2103\\.14030"
-   ]
-  },
-  {
-   "id": "p7",
-   "shape": "paper",
-   "set": "gold",
-   "query": "learning transferable visual models from natural language supervision",
-   "gold": [
-    "arxiv\\.org/abs/2103\\.00020"
-   ]
-  },
-  {
-   "id": "k1",
-   "shape": "code",
-   "set": "gold",
-   "query": "rust anyhow error handling crate",
-   "gold": [
-    "crates\\.io/crates/anyhow",
-    "docs\\.rs/anyhow",
-    "github\\.com/dtolnay/anyhow"
-   ]
-  },
-  {
-   "id": "k2",
-   "shape": "code",
-   "set": "gold",
-   "query": "npm react-router package",
-   "gold": [
-    "npmjs\\.com/package/react-router",
-    "reactrouter\\.com"
-   ]
-  },
-  {
-   "id": "h-p6",
-   "shape": "paper",
-   "set": "held",
-   "query": "mrna vaccine bnt162b2 safety and efficacy",
-   "gold": [
-    "nejm\\.org/doi/[^ ]*NEJMoa2034577",
-    "pubmed\\.ncbi\\.nlm\\.nih\\.gov/33301246",
-    "pmc\\.ncbi\\.nlm\\.nih\\.gov/articles/PMC7745181"
-   ]
-  },
-  {
-   "id": "h-p7",
-   "shape": "paper",
-   "set": "held",
-   "query": "highly accurate protein structure prediction with alphafold",
-   "gold": [
-    "nature\\.com/articles/s41586-021-03819-2",
-    "pubmed\\.ncbi\\.nlm\\.nih\\.gov/34265844",
-    "pmc\\.ncbi\\.nlm\\.nih\\.gov/articles/PMC8371605"
-   ]
-  },
-  {
-   "id": "h-p8",
-   "shape": "paper",
-   "set": "held",
-   "query": "proximal policy optimization algorithms",
-   "gold": [
-    "arxiv\\.org/abs/1707\\.06347"
-   ]
-  },
-  {
-   "id": "h-p9",
-   "shape": "paper",
-   "set": "held",
-   "query": "llama open and efficient foundation language models",
-   "gold": [
-    "arxiv\\.org/abs/2302\\.13971"
-   ]
-  },
-  {
-   "id": "h-p10",
-   "shape": "paper",
-   "set": "held",
-   "query": "the lottery ticket hypothesis finding sparse trainable neural networks",
-   "gold": [
-    "arxiv\\.org/abs/1803\\.03635"
-   ]
-  },
-  {
-   "id": "h-k1",
-   "shape": "code",
-   "set": "held",
-   "query": "rust serde json crate",
-   "gold": [
-    "crates\\.io/crates/serde_json",
-    "docs\\.rs/serde_json",
-    "github\\.com/serde-rs/json"
-   ]
-  },
-  {
-   "id": "h-k2",
-   "shape": "code",
-   "set": "held",
-   "query": "npm lodash package",
-   "gold": [
-    "npmjs\\.com/package/lodash",
-    "lodash\\.com",
-    "github\\.com/lodash/lodash"
-   ]
-  },
-  {
-   "id": "h-k3",
-   "shape": "code",
-   "set": "held",
-   "query": "rust clap command line argument parser crate",
-   "gold": [
-    "crates\\.io/crates/clap",
-    "docs\\.rs/clap",
-    "github\\.com/clap-rs/clap"
-   ]
-  },
-  {
-   "id": "h-k4",
-   "shape": "code",
-   "set": "held",
-   "query": "npm zod schema validation",
-   "gold": [
-    "npmjs\\.com/package/zod",
-    "zod\\.dev",
-    "github\\.com/colinhacks/zod"
-   ]
-  },
-  {
-   "id": "h-k5",
-   "shape": "code",
-   "set": "held",
-   "query": "rust reqwest http client",
-   "gold": [
-    "docs\\.rs/reqwest",
-    "crates\\.io/crates/reqwest",
-    "github\\.com/seanmonstar/reqwest"
-   ]
-  },
-  {
-   "id": "d1-jp",
-   "shape": "web",
-   "set": "gold",
-   "query": "\u5730\u9707\u901f\u5831",
-   "gold": [
-    "weathernews\\.jp/quake",
-    "jma\\.go\\.jp/.+quake",
-    "news\\.web\\.nhk/.+earthquake",
-    "earthquake\\.tenki\\.jp"
-   ],
-   "lang": "ja"
-  },
-  {
-   "id": "d1-scope",
-   "shape": "code",
-   "set": "gold",
-   "query": "tokio",
-   "gold": [
-    "docs\\.rs/tokio/",
-    "crates\\.io/crates/tokio",
-    "tokio\\.rs",
-    "github\\.com/tokio-rs/tokio"
-   ],
-   "must_not": [
-    "docs\\.rs/taos/"
-   ]
-  },
-  {
-   "id": "d1-news",
-   "shape": "news",
-   "set": "gold",
-   "query": "SpaceX Starship latest launch news this week",
-   "gold": [
-    "spacenews\\.com",
-    "teslarati\\.com",
-    "spacex\\.com",
-    "reuters\\.com",
-    "apnews\\.com",
-    "bbc\\.com",
-    "usatoday\\.com"
-   ],
-   "must_not": [
-    "(?i)diwali",
-    "news\\.google\\.com/rss/articles"
-   ],
-   "window": "7d"
-  },
-  {
-   "id": "d2-crate",
-   "shape": "code",
-   "set": "gold",
-   "query": "rust tokio",
-   "gold": [
-    "docs\\.rs/tokio/latest/tokio",
-    "crates\\.io/crates/tokio"
-   ],
-   "must_not": [
-    "npmjs\\.com/package/tokio",
-    "pypi\\.org/project/tokio"
-   ]
-  },
-  {
-   "id": "d2-npm",
-   "shape": "code",
-   "set": "gold",
-   "query": "npm react",
-   "gold": [
-    "npmjs\\.com/package/react"
-   ],
-   "must_not": [
-    "crates\\.io/crates/react",
-    "pypi\\.org/project/react"
-   ]
-  },
-  {
-   "id": "d2-pypi",
-   "shape": "code",
-   "set": "gold",
-   "query": "pypi requests",
-   "gold": [
-    "pypi\\.org/project/requests"
-   ],
-   "must_not": [
-    "crates\\.io/crates/requests",
-    "npmjs\\.com/package/requests"
-   ]
-  },
-  {
-   "id": "d4-ja",
-   "shape": "web",
-   "set": "gold",
-   "query": "\u6771\u4eac\u306e\u5929\u6c17\u4e88\u5831",
-   "lang": "ja",
-   "gold": [
-    "weathernews\\.jp/onebox/tenki",
-    "tenki\\.jp",
-    "weather\\.yahoo\\.co\\.jp",
-    "jma\\.go\\.jp"
-   ]
-  },
-  {
-   "id": "d4-ko",
-   "shape": "web",
-   "set": "gold",
-   "query": "\uc11c\uc6b8 \ub0a0\uc528",
-   "lang": "ko",
-   "gold": [
-    "weather\\.go\\.kr",
-    "weather\\.naver\\.com",
-    "accuweather\\.com/ko"
-   ]
-  },
-  {
-   "id": "d4-ru",
-   "shape": "web",
-   "set": "gold",
-   "query": "\u043d\u043e\u0432\u043e\u0441\u0442\u0438 \u043c\u043e\u0441\u043a\u0432\u044b",
-   "lang": "ru",
-   "gold": [
-    "ria\\.ru",
-    "tass\\.ru",
-    "kommersant\\.ru",
-    "msk1\\.ru",
-    "m24\\.ru",
-    "lenta\\.ru"
-   ]
-  },
-  {
-   "id": "h-d4-ja",
-   "shape": "web",
-   "set": "held",
-   "query": "\u5927\u962a\u306e\u5929\u6c17",
-   "lang": "ja",
-   "gold": [
-    "tenki\\.jp",
-    "weathernews\\.jp",
-    "weather\\.yahoo\\.co\\.jp",
-    "jma\\.go\\.jp"
-   ]
-  },
-  {
-   "id": "h-d4-ko",
-   "shape": "web",
-   "set": "held",
-   "query": "\ubd80\uc0b0 \ub0a0\uc528",
-   "lang": "ko",
-   "gold": [
-    "kma\\.go\\.kr",
-    "weather\\.go\\.kr",
-    "weather\\.naver\\.com",
-    "accuweather\\.com/ko"
-   ]
-  },
-  {
-   "id": "d7-cargo",
-   "shape": "code",
-   "set": "gold",
-   "query": "cargo serde_json",
-   "gold": [
-    "docs\\.rs/serde_json",
-    "crates\\.io/crates/serde_json"
-   ],
-   "must_not": [
-    "serde\\.rs/"
-   ]
-  },
-  {
-   "id": "d7-npm-hyphen",
-   "shape": "code",
-   "set": "gold",
-   "query": "npm react-router",
-   "gold": [
-    "npmjs\\.com/package/react-router"
-   ]
-  },
-  {
-   "id": "d7-pip-hyphen",
-   "shape": "code",
-   "set": "gold",
-   "query": "pip scikit-learn",
-   "gold": [
-    "pypi\\.org/project/scikit-learn"
-   ]
-  },
-  {
-   "id": "d7-url-junk",
-   "shape": "web",
-   "set": "gold",
-   "query": "spacex starship next launch",
-   "gold": [
-    "spacex\\.com/launches",
-    "spacelaunchschedule",
-    "nextspaceflight"
-   ],
-   "must_not": [
-    "EF%BF%BD",
-    "ef%bf%bd"
-   ]
-  }
- ]
+  "queries": [
+    {
+      "id": "c1",
+      "shape": "code",
+      "set": "gold",
+      "query": "rust tokio spawn_blocking",
+      "gold": [
+        "docs\\.rs/tokio/[^ ]*spawn_blocking"
+      ],
+      "answer_key": [
+        "spawn_blocking"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c2",
+      "shape": "code",
+      "set": "gold",
+      "query": "python dataclass frozen",
+      "gold": [
+        "docs\\.python\\.org/3/library/dataclasses"
+      ],
+      "answer_key": [
+        "dataclass"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c3",
+      "shape": "code",
+      "set": "gold",
+      "query": "typescript satisfies operator",
+      "gold": [
+        "typescriptlang\\.org/[^ ]*4-9",
+        "typescriptlang\\.org/[^ ]*satisfies"
+      ],
+      "answer_key": [
+        "satisfies"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c4",
+      "shape": "code",
+      "set": "gold",
+      "query": "go context package cancel",
+      "gold": [
+        "pkg\\.go\\.dev/context",
+        "go\\.dev/pkg/context"
+      ],
+      "answer_key": [
+        "context"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c5",
+      "shape": "code",
+      "set": "gold",
+      "query": "postgres vacuum full command",
+      "gold": [
+        "postgresql\\.org/docs/[^ ]*sql-vacuum"
+      ],
+      "answer_key": [
+        "VACUUM"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c6",
+      "shape": "code",
+      "set": "gold",
+      "query": "git rebase interactive squash commits",
+      "gold": [
+        "git-scm\\.com/docs/git-rebase"
+      ],
+      "answer_key": [
+        "rebase"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c7",
+      "shape": "code",
+      "set": "gold",
+      "query": "sqlite write-ahead logging wal",
+      "gold": [
+        "sqlite\\.org/wal\\.html",
+        "sqlite\\.org/[^ ]*wal"
+      ],
+      "answer_key": [
+        "write-ahead"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c8",
+      "shape": "code",
+      "set": "gold",
+      "query": "react useeffect cleanup function",
+      "gold": [
+        "react\\.dev/reference/react/useEffect"
+      ],
+      "answer_key": [
+        "useEffect"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e1",
+      "shape": "entity",
+      "set": "gold",
+      "query": "what is quantum entanglement",
+      "gold": [
+        "wikipedia\\.org/wiki/Quantum_entanglement"
+      ],
+      "answer_key": [
+        "entanglement"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e2",
+      "shape": "entity",
+      "set": "gold",
+      "query": "who was ada lovelace",
+      "gold": [
+        "wikipedia\\.org/wiki/Ada_Lovelace"
+      ],
+      "answer_key": [
+        "Lovelace"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e3",
+      "shape": "entity",
+      "set": "gold",
+      "query": "capital of australia",
+      "gold": [
+        "wikipedia\\.org/wiki/Canberra",
+        "britannica\\.com/[^ ]*Canberra"
+      ],
+      "answer_key": [
+        "Canberra"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e4",
+      "shape": "entity",
+      "set": "gold",
+      "query": "population of tokyo",
+      "gold": [
+        "wikipedia\\.org/wiki/Tokyo"
+      ],
+      "answer_key": [
+        "Tokyo"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e5",
+      "shape": "entity",
+      "set": "gold",
+      "query": "what is a monad functional programming",
+      "gold": [
+        "wikipedia\\.org/wiki/Monad_\\(functional_programming\\)"
+      ],
+      "answer_key": [
+        "monad"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e6",
+      "shape": "entity",
+      "set": "gold",
+      "query": "epistemology definition",
+      "gold": [
+        "wikipedia\\.org/wiki/Epistemology"
+      ],
+      "answer_key": [
+        "epistemology"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e7",
+      "shape": "entity",
+      "set": "gold",
+      "query": "who invented the telephone",
+      "gold": [
+        "wikipedia\\.org/wiki/Alexander_Graham_Bell"
+      ],
+      "answer_key": [
+        "Bell"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "e8",
+      "shape": "entity",
+      "set": "gold",
+      "query": "speed of light in vacuum",
+      "gold": [
+        "wikipedia\\.org/wiki/Speed_of_light"
+      ],
+      "answer_key": [
+        "299"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "p1",
+      "shape": "paper",
+      "set": "gold",
+      "query": "attention is all you need",
+      "gold": [
+        "arxiv\\.org/abs/1706\\.03762"
+      ],
+      "answer_key": [
+        "attention is all you need"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "p2",
+      "shape": "paper",
+      "set": "gold",
+      "query": "bert pre-training deep bidirectional transformers",
+      "gold": [
+        "arxiv\\.org/abs/1810\\.04805"
+      ],
+      "answer_key": [
+        "BERT"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "p3",
+      "shape": "paper",
+      "set": "gold",
+      "query": "deep residual learning image recognition resnet",
+      "gold": [
+        "arxiv\\.org/abs/1512\\.03385"
+      ],
+      "answer_key": [
+        "deep residual learning"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "p4",
+      "shape": "paper",
+      "set": "gold",
+      "query": "scaling laws for neural language models",
+      "gold": [
+        "arxiv\\.org/abs/2001\\.08361"
+      ],
+      "answer_key": [
+        "scaling laws for neural language models"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "p5",
+      "shape": "paper",
+      "set": "gold",
+      "query": "lora low-rank adaptation large language models",
+      "gold": [
+        "arxiv\\.org/abs/2106\\.09685"
+      ],
+      "answer_key": [
+        "LoRA"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "n1",
+      "shape": "news",
+      "set": "gold",
+      "query": "nobel prize in physics 2026 winner",
+      "gold": [
+        "nobelprize\\.org",
+        "indianexpress\\.com/[^ ]*nobel",
+        "aps\\.org/[^ ]*nobel"
+      ],
+      "answer_key": [
+        "Nobel"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "365d"
+    },
+    {
+      "id": "n2",
+      "shape": "news",
+      "set": "gold",
+      "query": "rust 1.90 release announcement",
+      "gold": [
+        "blog\\.rust-lang\\.org/[^ ]*1\\.90",
+        "releases\\.rust-lang\\.org"
+      ],
+      "answer_key": [
+        "1.90"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "365d"
+    },
+    {
+      "id": "n3",
+      "shape": "news",
+      "set": "gold",
+      "query": "federal reserve interest rate decision november 2026",
+      "gold": [
+        "federalreserve\\.gov/newsevents/pressreleases"
+      ],
+      "answer_key": [
+        "federal reserve"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "60d"
+    },
+    {
+      "id": "n4",
+      "shape": "news",
+      "set": "gold",
+      "query": "openai gpt release announcement",
+      "gold": [
+        "openai\\.com/[^ ]*(index|news|gpt)"
+      ],
+      "answer_key": [
+        "OpenAI"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "365d"
+    },
+    {
+      "id": "n5",
+      "shape": "news",
+      "set": "gold",
+      "query": "apple q4 2026 earnings results",
+      "gold": [
+        "apple\\.com/[^ ]*earnings",
+        "investor\\.apple\\.com"
+      ],
+      "answer_key": [
+        "Apple"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "120d"
+    },
+    {
+      "id": "b1",
+      "shape": "web",
+      "set": "gold",
+      "query": "best mechanical keyboard for programming",
+      "gold": [
+        "rtings\\.com/keyboard",
+        "keychron\\.com"
+      ],
+      "answer_key": [
+        "keyboard"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "b2",
+      "shape": "web",
+      "set": "gold",
+      "query": "best noise cancelling headphones review",
+      "gold": [
+        "rtings\\.com/headphones"
+      ],
+      "answer_key": [
+        "headphone"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "b3",
+      "shape": "web",
+      "set": "gold",
+      "query": "sony wh-1000xm5 specifications",
+      "gold": [
+        "sony\\.com/[^ ]*wh-1000xm5",
+        "sony\\.co\\.uk/[^ ]*wh-1000xm5"
+      ],
+      "answer_key": [
+        "WH-1000XM5"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "b4",
+      "shape": "web",
+      "set": "gold",
+      "query": "thinkpad x1 carbon gen 13 specifications",
+      "gold": [
+        "lenovo\\.com/[^ ]*x1-carbon",
+        "psref\\.lenovo\\.com"
+      ],
+      "answer_key": [
+        "X1 Carbon"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "b5",
+      "shape": "web",
+      "set": "gold",
+      "query": "keychron q1 pro review",
+      "gold": [
+        "keychron\\.com",
+        "rtings\\.com/keyboard"
+      ],
+      "answer_key": [
+        "Q1 Pro"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l1",
+      "shape": "code",
+      "set": "gold",
+      "query": "failed to run custom build command for libz-sys",
+      "gold": [
+        "github\\.com/rust-lang/libz-sys",
+        "stackoverflow\\.com/questions/[^ ]*libz"
+      ],
+      "answer_key": [
+        "libz-sys"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l2",
+      "shape": "code",
+      "set": "gold",
+      "query": "donsetch mcp server",
+      "gold": [
+        "github\\.com/dondai44423/donsetch",
+        "npmjs\\.com/package/donsetch"
+      ],
+      "answer_key": [
+        "donsetch"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l3",
+      "shape": "web",
+      "set": "gold",
+      "query": "how to replace a bicycle tire",
+      "gold": [
+        "(?i)wikihow\\.com/[^ ]*(tire|tyre)",
+        "(?i)sheldonbrown\\.com/[^ ]*tire"
+      ],
+      "answer_key": [
+        "tire"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l4",
+      "shape": "code",
+      "set": "gold",
+      "query": "docker compose depends_on condition service_healthy",
+      "gold": [
+        "docs\\.docker\\.com/[^ ]*depends_on",
+        "docs\\.docker\\.com/[^ ]*compose-file"
+      ],
+      "answer_key": [
+        "depends_on"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l5",
+      "shape": "code",
+      "set": "gold",
+      "query": "nginx proxy_pass trailing slash difference",
+      "gold": [
+        "nginx\\.org/[^ ]*proxy_pass",
+        "stackoverflow\\.com/questions/[^ ]*proxy_pass",
+        "nginx\\.org/[^ ]*proxy_module"
+      ],
+      "answer_key": [
+        "proxy_pass"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "d1",
+      "shape": "code",
+      "set": "gold",
+      "query": "tokio select macro documentation",
+      "gold": [
+        "docs\\.rs/tokio/[^ ]*macro\\.select"
+      ],
+      "answer_key": [
+        "select"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "d2",
+      "shape": "code",
+      "set": "gold",
+      "query": "pandas read_csv dtype parameter",
+      "gold": [
+        "pandas\\.pydata\\.org/[^ ]*read_csv"
+      ],
+      "answer_key": [
+        "read_csv"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "d3",
+      "shape": "code",
+      "set": "gold",
+      "query": "kubernetes liveness probe configuration",
+      "gold": [
+        "kubernetes\\.io/docs/[^ ]*liveness"
+      ],
+      "answer_key": [
+        "liveness"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "d4",
+      "shape": "code",
+      "set": "gold",
+      "query": "mdn array reduce",
+      "gold": [
+        "developer\\.mozilla\\.org/[^ ]*Array/reduce"
+      ],
+      "answer_key": [
+        "reduce"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c1",
+      "shape": "code",
+      "set": "held",
+      "query": "python asyncio gather return_exceptions",
+      "gold": [
+        "docs\\.python\\.org/3/library/asyncio-task"
+      ],
+      "answer_key": [
+        "return_exceptions"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c2",
+      "shape": "code",
+      "set": "held",
+      "query": "rust serde derive rename field",
+      "gold": [
+        "serde\\.rs/field-attrs",
+        "serde\\.rs/attr-rename"
+      ],
+      "answer_key": [
+        "rename"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c3",
+      "shape": "code",
+      "set": "held",
+      "query": "javascript promise allsettled",
+      "gold": [
+        "developer\\.mozilla\\.org/[^ ]*Promise/allSettled"
+      ],
+      "answer_key": [
+        "allSettled"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c4",
+      "shape": "code",
+      "set": "held",
+      "query": "css grid template areas",
+      "gold": [
+        "developer\\.mozilla\\.org/[^ ]*grid-template-areas",
+        "css-tricks\\.com/[^ ]*grid-template-areas"
+      ],
+      "answer_key": [
+        "grid-template-areas"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c5",
+      "shape": "code",
+      "set": "held",
+      "query": "systemd timer unit oncalendar",
+      "gold": [
+        "freedesktop\\.org/software/systemd/man/[^ ]*systemd\\.timer",
+        "man7\\.org/[^ ]*systemd\\.timer"
+      ],
+      "answer_key": [
+        "OnCalendar"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c6",
+      "shape": "code",
+      "set": "held",
+      "query": "kubernetes horizontal pod autoscaler",
+      "gold": [
+        "kubernetes\\.io/docs/[^ ]*horizontal-pod-autoscal"
+      ],
+      "answer_key": [
+        "HorizontalPodAutoscaler"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c7",
+      "shape": "code",
+      "set": "held",
+      "query": "postgresql jsonb operators",
+      "gold": [
+        "postgresql\\.org/docs/[^ ]*(functions-json|datatype-json)"
+      ],
+      "answer_key": [
+        "jsonb"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c8",
+      "shape": "code",
+      "set": "held",
+      "query": "docker multi-stage builds",
+      "gold": [
+        "docs\\.docker\\.com/[^ ]*multi-stage"
+      ],
+      "answer_key": [
+        "multi-stage"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c9",
+      "shape": "code",
+      "set": "held",
+      "query": "numpy broadcasting rules",
+      "gold": [
+        "numpy\\.org/doc/[^ ]*broadcasting"
+      ],
+      "answer_key": [
+        "broadcast"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c10",
+      "shape": "code",
+      "set": "held",
+      "query": "git stash pop vs apply",
+      "gold": [
+        "git-scm\\.com/docs/git-stash",
+        "stackoverflow\\.com/questions/[^ ]*stash"
+      ],
+      "answer_key": [
+        "stash"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c11",
+      "shape": "code",
+      "set": "held",
+      "query": "typescript generics constraints",
+      "gold": [
+        "typescriptlang\\.org/docs/handbook/2/generics"
+      ],
+      "answer_key": [
+        "extends"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c12",
+      "shape": "code",
+      "set": "held",
+      "query": "go generics type parameters tutorial",
+      "gold": [
+        "go\\.dev/doc/tutorial/generics",
+        "go\\.dev/blog/intro-generics"
+      ],
+      "answer_key": [
+        "type parameter"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c13",
+      "shape": "code",
+      "set": "held",
+      "query": "java streams collectors groupingby",
+      "gold": [
+        "docs\\.oracle\\.com/[^ ]*Collectors",
+        "baeldung\\.com/[^ ]*grouping"
+      ],
+      "answer_key": [
+        "groupingBy"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c14",
+      "shape": "code",
+      "set": "held",
+      "query": "redis sorted set zadd",
+      "gold": [
+        "redis\\.io/[^ ]*zadd",
+        "redis\\.io/docs/[^ ]*sorted-sets"
+      ],
+      "answer_key": [
+        "ZADD"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c15",
+      "shape": "code",
+      "set": "held",
+      "query": "sqlalchemy relationship lazy loading",
+      "gold": [
+        "docs\\.sqlalchemy\\.org/[^ ]*loading_relationships"
+      ],
+      "answer_key": [
+        "lazy"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-c16",
+      "shape": "code",
+      "set": "held",
+      "query": "bash parameter expansion default value",
+      "gold": [
+        "gnu\\.org/software/bash/manual",
+        "stackoverflow\\.com/questions/[^ ]*(default|unset)"
+      ],
+      "answer_key": [
+        "parameter expansion"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e1",
+      "shape": "entity",
+      "set": "held",
+      "query": "who discovered penicillin",
+      "gold": [
+        "wikipedia\\.org/wiki/(Alexander_Fleming|Penicillin)"
+      ],
+      "answer_key": [
+        "Fleming"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e2",
+      "shape": "entity",
+      "set": "held",
+      "query": "what is photosynthesis",
+      "gold": [
+        "wikipedia\\.org/wiki/Photosynthesis"
+      ],
+      "answer_key": [
+        "photosynthesis"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e3",
+      "shape": "entity",
+      "set": "held",
+      "query": "height of mount everest",
+      "gold": [
+        "wikipedia\\.org/wiki/Mount_Everest"
+      ],
+      "answer_key": [
+        "Everest"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e4",
+      "shape": "entity",
+      "set": "held",
+      "query": "what is the theory of relativity",
+      "gold": [
+        "wikipedia\\.org/wiki/Theory_of_relativity"
+      ],
+      "answer_key": [
+        "relativity"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e5",
+      "shape": "entity",
+      "set": "held",
+      "query": "who wrote pride and prejudice",
+      "gold": [
+        "wikipedia\\.org/wiki/(Jane_Austen|Pride_and_Prejudice)"
+      ],
+      "answer_key": [
+        "Austen"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e6",
+      "shape": "entity",
+      "set": "held",
+      "query": "when did world war 2 end",
+      "gold": [
+        "wikipedia\\.org/wiki/(World_War_II|End_of_World_War_II)"
+      ],
+      "answer_key": [
+        "1945"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e7",
+      "shape": "entity",
+      "set": "held",
+      "query": "what is blockchain",
+      "gold": [
+        "wikipedia\\.org/wiki/Blockchain"
+      ],
+      "answer_key": [
+        "blockchain"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-e8",
+      "shape": "entity",
+      "set": "held",
+      "query": "boiling point of water",
+      "gold": [
+        "wikipedia\\.org/wiki/(Boiling_point|Water_\\(properties\\))",
+        "britannica\\.com/[^ ]*boiling-point"
+      ],
+      "answer_key": [
+        "boiling point"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p1",
+      "shape": "paper",
+      "set": "held",
+      "query": "generative adversarial networks goodfellow",
+      "gold": [
+        "arxiv\\.org/abs/1406\\.2661"
+      ],
+      "answer_key": [
+        "generative adversarial"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p2",
+      "shape": "paper",
+      "set": "held",
+      "query": "adam a method for stochastic optimization",
+      "gold": [
+        "arxiv\\.org/abs/1412\\.6980"
+      ],
+      "answer_key": [
+        "a method for stochastic optimization"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p3",
+      "shape": "paper",
+      "set": "held",
+      "query": "language models are few-shot learners",
+      "gold": [
+        "arxiv\\.org/abs/2005\\.14165"
+      ],
+      "answer_key": [
+        "few-shot learners"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p4",
+      "shape": "paper",
+      "set": "held",
+      "query": "denoising diffusion probabilistic models",
+      "gold": [
+        "arxiv\\.org/abs/2006\\.11239"
+      ],
+      "answer_key": [
+        "denoising diffusion"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p5",
+      "shape": "paper",
+      "set": "held",
+      "query": "chain-of-thought prompting elicits reasoning in large language models",
+      "gold": [
+        "arxiv\\.org/abs/2201\\.11903"
+      ],
+      "answer_key": [
+        "chain-of-thought"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-n1",
+      "shape": "news",
+      "set": "held",
+      "query": "python 3.14 release notes",
+      "gold": [
+        "docs\\.python\\.org/[^ ]*whatsnew/3\\.14",
+        "python\\.org/downloads/release/python-314"
+      ],
+      "answer_key": [
+        "3.14"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-n2",
+      "shape": "news",
+      "set": "held",
+      "query": "node.js 24 release announcement",
+      "gold": [
+        "nodejs\\.org/[^ ]*(blog/release/v24|v24)"
+      ],
+      "answer_key": [
+        "24"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "365d"
+    },
+    {
+      "id": "h-n3",
+      "shape": "news",
+      "set": "held",
+      "query": "kubernetes 1.34 release",
+      "gold": [
+        "kubernetes\\.io/blog/[^ ]*(1-34|v1-34)",
+        "kubernetes\\.io/releases/1\\.34"
+      ],
+      "answer_key": [
+        "1.34"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "365d"
+    },
+    {
+      "id": "h-n4",
+      "shape": "news",
+      "set": "held",
+      "query": "postgresql 18 released",
+      "gold": [
+        "postgresql\\.org/about/news/postgresql-18"
+      ],
+      "answer_key": [
+        "18"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "365d"
+    },
+    {
+      "id": "h-n5",
+      "shape": "news",
+      "set": "held",
+      "query": "typescript 5.9 announcement",
+      "gold": [
+        "devblogs\\.microsoft\\.com/typescript/announcing-typescript-5-9",
+        "typescriptlang\\.org/[^ ]*release-notes/typescript-5-9"
+      ],
+      "answer_key": [
+        "5.9"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "window": "365d"
+    },
+    {
+      "id": "h-b1",
+      "shape": "web",
+      "set": "held",
+      "query": "iphone 17 pro specifications",
+      "gold": [
+        "apple\\.com/[^ ]*iphone-17-pro[^ ]*specs",
+        "support\\.apple\\.com/[^ ]*iphone-17-pro"
+      ],
+      "answer_key": [
+        "iPhone 17 Pro"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-b2",
+      "shape": "web",
+      "set": "held",
+      "query": "steam deck oled specifications",
+      "gold": [
+        "steamdeck\\.com/[^ ]*tech",
+        "store\\.steampowered\\.com/steamdeck"
+      ],
+      "answer_key": [
+        "Steam Deck"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-b3",
+      "shape": "web",
+      "set": "held",
+      "query": "how to change a flat tire",
+      "gold": [
+        "(?i)wikihow\\.com/change-a.*tire",
+        "nhtsa\\.gov/[^ ]*tire"
+      ],
+      "answer_key": [
+        "tire"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-b4",
+      "shape": "web",
+      "set": "held",
+      "query": "how to tie a windsor knot",
+      "gold": [
+        "wikihow\\.com/[^ ]*Windsor",
+        "wikipedia\\.org/wiki/Windsor_knot"
+      ],
+      "answer_key": [
+        "Windsor"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-b5",
+      "shape": "web",
+      "set": "held",
+      "query": "best monitors for programming rtings",
+      "gold": [
+        "rtings\\.com/monitor"
+      ],
+      "answer_key": [
+        "monitor"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-b6",
+      "shape": "web",
+      "set": "held",
+      "query": "raspberry pi 5 specifications",
+      "gold": [
+        "raspberrypi\\.com/products/raspberry-pi-5",
+        "raspberrypi\\.com/documentation/[^ ]*raspberry-pi-5"
+      ],
+      "answer_key": [
+        "Raspberry Pi 5"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "p6",
+      "shape": "paper",
+      "set": "gold",
+      "query": "swin transformer hierarchical vision transformer using shifted windows",
+      "gold": [
+        "arxiv\\.org/abs/2103\\.14030"
+      ],
+      "answer_key": [
+        "swin transformer"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "p7",
+      "shape": "paper",
+      "set": "gold",
+      "query": "learning transferable visual models from natural language supervision",
+      "gold": [
+        "arxiv\\.org/abs/2103\\.00020"
+      ],
+      "answer_key": [
+        "learning transferable visual models"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "k1",
+      "shape": "code",
+      "set": "gold",
+      "query": "rust anyhow error handling crate",
+      "gold": [
+        "crates\\.io/crates/anyhow",
+        "docs\\.rs/anyhow",
+        "github\\.com/dtolnay/anyhow"
+      ],
+      "answer_key": [
+        "anyhow"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "k2",
+      "shape": "code",
+      "set": "gold",
+      "query": "npm react-router package",
+      "gold": [
+        "npmjs\\.com/package/react-router",
+        "reactrouter\\.com"
+      ],
+      "answer_key": [
+        "react-router"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p6",
+      "shape": "paper",
+      "set": "held",
+      "query": "mrna vaccine bnt162b2 safety and efficacy",
+      "gold": [
+        "nejm\\.org/doi/[^ ]*NEJMoa2034577",
+        "pubmed\\.ncbi\\.nlm\\.nih\\.gov/33301246",
+        "pmc\\.ncbi\\.nlm\\.nih\\.gov/articles/PMC7745181"
+      ],
+      "answer_key": [
+        "BNT162b2"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p7",
+      "shape": "paper",
+      "set": "held",
+      "query": "highly accurate protein structure prediction with alphafold",
+      "gold": [
+        "nature\\.com/articles/s41586-021-03819-2",
+        "pubmed\\.ncbi\\.nlm\\.nih\\.gov/34265844",
+        "pmc\\.ncbi\\.nlm\\.nih\\.gov/articles/PMC8371605"
+      ],
+      "answer_key": [
+        "AlphaFold"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p8",
+      "shape": "paper",
+      "set": "held",
+      "query": "proximal policy optimization algorithms",
+      "gold": [
+        "arxiv\\.org/abs/1707\\.06347"
+      ],
+      "answer_key": [
+        "proximal policy optimization"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p9",
+      "shape": "paper",
+      "set": "held",
+      "query": "llama open and efficient foundation language models",
+      "gold": [
+        "arxiv\\.org/abs/2302\\.13971"
+      ],
+      "answer_key": [
+        "LLaMA"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-p10",
+      "shape": "paper",
+      "set": "held",
+      "query": "the lottery ticket hypothesis finding sparse trainable neural networks",
+      "gold": [
+        "arxiv\\.org/abs/1803\\.03635"
+      ],
+      "answer_key": [
+        "lottery ticket"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-k1",
+      "shape": "code",
+      "set": "held",
+      "query": "rust serde json crate",
+      "gold": [
+        "crates\\.io/crates/serde_json",
+        "docs\\.rs/serde_json",
+        "github\\.com/serde-rs/json"
+      ],
+      "answer_key": [
+        "serde_json"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-k2",
+      "shape": "code",
+      "set": "held",
+      "query": "npm lodash package",
+      "gold": [
+        "npmjs\\.com/package/lodash",
+        "lodash\\.com",
+        "github\\.com/lodash/lodash"
+      ],
+      "answer_key": [
+        "lodash"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-k3",
+      "shape": "code",
+      "set": "held",
+      "query": "rust clap command line argument parser crate",
+      "gold": [
+        "crates\\.io/crates/clap",
+        "docs\\.rs/clap",
+        "github\\.com/clap-rs/clap"
+      ],
+      "answer_key": [
+        "clap"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-k4",
+      "shape": "code",
+      "set": "held",
+      "query": "npm zod schema validation",
+      "gold": [
+        "npmjs\\.com/package/zod",
+        "zod\\.dev",
+        "github\\.com/colinhacks/zod"
+      ],
+      "answer_key": [
+        "zod"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "h-k5",
+      "shape": "code",
+      "set": "held",
+      "query": "rust reqwest http client",
+      "gold": [
+        "docs\\.rs/reqwest",
+        "crates\\.io/crates/reqwest",
+        "github\\.com/seanmonstar/reqwest"
+      ],
+      "answer_key": [
+        "reqwest"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "d1-jp",
+      "shape": "web",
+      "set": "gold",
+      "query": "地震速報",
+      "gold": [
+        "weathernews\\.jp/quake",
+        "jma\\.go\\.jp/.+quake",
+        "news\\.web\\.nhk/.+earthquake",
+        "earthquake\\.tenki\\.jp"
+      ],
+      "answer_key": [
+        "地震"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "d1-scope",
+      "shape": "code",
+      "set": "gold",
+      "query": "tokio",
+      "gold": [
+        "docs\\.rs/tokio/",
+        "crates\\.io/crates/tokio",
+        "tokio\\.rs",
+        "github\\.com/tokio-rs/tokio"
+      ],
+      "answer_key": [
+        "tokio"
+      ],
+      "must_not": [
+        "docs\\.rs/taos/"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "d1-news",
+      "shape": "news",
+      "set": "gold",
+      "query": "SpaceX Starship latest launch news this week",
+      "gold": [
+        "spacenews\\.com",
+        "teslarati\\.com",
+        "spacex\\.com",
+        "reuters\\.com",
+        "apnews\\.com",
+        "bbc\\.com",
+        "usatoday\\.com"
+      ],
+      "answer_key": [
+        "Starship"
+      ],
+      "must_not": [
+        "(?i)diwali",
+        "news\\.google\\.com/rss/articles"
+      ],
+      "expect": "answer",
+      "window": "7d"
+    },
+    {
+      "id": "d2-crate",
+      "shape": "code",
+      "set": "gold",
+      "query": "rust tokio",
+      "gold": [
+        "docs\\.rs/tokio/latest/tokio",
+        "crates\\.io/crates/tokio"
+      ],
+      "answer_key": [
+        "tokio"
+      ],
+      "must_not": [
+        "npmjs\\.com/package/tokio",
+        "pypi\\.org/project/tokio"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "d2-npm",
+      "shape": "code",
+      "set": "gold",
+      "query": "npm react",
+      "gold": [
+        "npmjs\\.com/package/react"
+      ],
+      "answer_key": [
+        "react"
+      ],
+      "must_not": [
+        "crates\\.io/crates/react",
+        "pypi\\.org/project/react"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "d2-pypi",
+      "shape": "code",
+      "set": "gold",
+      "query": "pypi requests",
+      "gold": [
+        "pypi\\.org/project/requests"
+      ],
+      "answer_key": [
+        "requests"
+      ],
+      "must_not": [
+        "crates\\.io/crates/requests",
+        "npmjs\\.com/package/requests"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "d4-ja",
+      "shape": "web",
+      "set": "gold",
+      "query": "東京の天気予報",
+      "gold": [
+        "weathernews\\.jp/onebox/tenki",
+        "tenki\\.jp",
+        "weather\\.yahoo\\.co\\.jp",
+        "jma\\.go\\.jp"
+      ],
+      "answer_key": [
+        "天気"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "d4-ko",
+      "shape": "web",
+      "set": "gold",
+      "query": "서울 날씨",
+      "gold": [
+        "weather\\.go\\.kr",
+        "weather\\.naver\\.com",
+        "accuweather\\.com/ko"
+      ],
+      "answer_key": [
+        "날씨"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ko"
+    },
+    {
+      "id": "d4-ru",
+      "shape": "web",
+      "set": "gold",
+      "query": "новости москвы",
+      "gold": [
+        "ria\\.ru",
+        "tass\\.ru",
+        "kommersant\\.ru",
+        "msk1\\.ru",
+        "m24\\.ru",
+        "lenta\\.ru"
+      ],
+      "answer_key": [
+        "Москв"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ru"
+    },
+    {
+      "id": "h-d4-ja",
+      "shape": "web",
+      "set": "held",
+      "query": "大阪の天気",
+      "gold": [
+        "tenki\\.jp",
+        "weathernews\\.jp",
+        "weather\\.yahoo\\.co\\.jp",
+        "jma\\.go\\.jp"
+      ],
+      "answer_key": [
+        "天気"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "h-d4-ko",
+      "shape": "web",
+      "set": "held",
+      "query": "부산 날씨",
+      "gold": [
+        "kma\\.go\\.kr",
+        "weather\\.go\\.kr",
+        "weather\\.naver\\.com",
+        "accuweather\\.com/ko"
+      ],
+      "answer_key": [
+        "날씨"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ko"
+    },
+    {
+      "id": "d7-cargo",
+      "shape": "code",
+      "set": "gold",
+      "query": "cargo serde_json",
+      "gold": [
+        "docs\\.rs/serde_json",
+        "crates\\.io/crates/serde_json"
+      ],
+      "answer_key": [
+        "serde_json"
+      ],
+      "must_not": [
+        "serde\\.rs/"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "d7-npm-hyphen",
+      "shape": "code",
+      "set": "gold",
+      "query": "npm react-router",
+      "gold": [
+        "npmjs\\.com/package/react-router"
+      ],
+      "answer_key": [
+        "react-router"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "d7-pip-hyphen",
+      "shape": "code",
+      "set": "gold",
+      "query": "pip scikit-learn",
+      "gold": [
+        "pypi\\.org/project/scikit-learn"
+      ],
+      "answer_key": [
+        "scikit-learn"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "d7-url-junk",
+      "shape": "web",
+      "set": "gold",
+      "query": "spacex starship next launch",
+      "gold": [
+        "spacex\\.com/launches",
+        "spacelaunchschedule",
+        "nextspaceflight"
+      ],
+      "answer_key": [
+        "Starship"
+      ],
+      "must_not": [
+        "EF%BF%BD",
+        "ef%bf%bd"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i1",
+      "shape": "identifier",
+      "set": "held",
+      "query": "select!",
+      "gold": [
+        "docs\\.rs/(tokio|futures)[^ ]*select"
+      ],
+      "answer_key": [
+        "select"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i2",
+      "shape": "identifier",
+      "set": "held",
+      "query": "std::mem::take",
+      "gold": [
+        "doc\\.rust-lang\\.org/std/mem/fn\\.take\\.html",
+        "doc\\.rust-lang\\.org/std/mem/fn\\.replace"
+      ],
+      "answer_key": [
+        "mem"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i3",
+      "shape": "identifier",
+      "set": "held",
+      "query": "serde_json::Value",
+      "gold": [
+        "docs\\.rs/serde_json[^ ]*Value",
+        "github\\.com/serde-rs/json"
+      ],
+      "answer_key": [
+        "Value"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i4",
+      "shape": "identifier",
+      "set": "held",
+      "query": "@types/node",
+      "gold": [
+        "npmjs\\.com/package/@types/node",
+        "github\\.com/DefinitelyTyped/DefinitelyTyped"
+      ],
+      "answer_key": [
+        "@types/node"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i5",
+      "shape": "identifier",
+      "set": "held",
+      "query": "v8::Isolate",
+      "gold": [
+        "docs\\.rs/v8[^ ]*Isolate",
+        "v8\\.dev"
+      ],
+      "answer_key": [
+        "Isolate"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i6",
+      "shape": "identifier",
+      "set": "held",
+      "query": "itertools::izip",
+      "gold": [
+        "docs\\.rs/itertools[^ ]*izip",
+        "docs\\.rs/itertools"
+      ],
+      "answer_key": [
+        "izip"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i7",
+      "shape": "identifier",
+      "set": "gold",
+      "query": "tokio::spawn",
+      "gold": [
+        "docs\\.rs/tokio[^ ]*fn\\.spawn",
+        "docs\\.rs/tokio[^ ]*spawn"
+      ],
+      "answer_key": [
+        "spawn"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i8",
+      "shape": "identifier",
+      "set": "held",
+      "query": "#[tokio::main]",
+      "gold": [
+        "docs\\.rs/tokio[^ ]*(attr\\.main|macro\\.main)"
+      ],
+      "answer_key": [
+        "main"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i9",
+      "shape": "identifier",
+      "set": "gold",
+      "query": "useState react hook",
+      "gold": [
+        "react\\.dev/reference/react/useState",
+        "react\\.dev[^ ]*useState"
+      ],
+      "answer_key": [
+        "useState"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i10",
+      "shape": "identifier",
+      "set": "held",
+      "query": "ngOnDestroy lifecycle hook",
+      "gold": [
+        "angular\\.dev[^ ]*lifecycle",
+        "angular\\.io[^ ]*lifecycle"
+      ],
+      "answer_key": [
+        "ngOnDestroy"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i11",
+      "shape": "identifier",
+      "set": "gold",
+      "query": "git rev-parse --short HEAD",
+      "gold": [
+        "git-scm\\.com/docs/git-rev-parse"
+      ],
+      "answer_key": [
+        "rev-parse"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "i12",
+      "shape": "identifier",
+      "set": "held",
+      "query": "__dirname nodejs",
+      "gold": [
+        "nodejs\\.org/[^ ]*__dirname",
+        "nodejs\\.org/api/[^ ]*modules"
+      ],
+      "answer_key": [
+        "__dirname"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "o1",
+      "shape": "operator",
+      "set": "gold",
+      "query": "site:docs.rs tokio spawn_blocking",
+      "gold": [
+        "docs\\.rs/tokio[^ ]*spawn_blocking"
+      ],
+      "answer_key": [
+        "spawn_blocking"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "docs.rs"
+    },
+    {
+      "id": "o2",
+      "shape": "operator",
+      "set": "held",
+      "query": "site:github.com/rust-lang rfcs",
+      "gold": [
+        "github\\.com/rust-lang/rfcs"
+      ],
+      "answer_key": [
+        "rfcs"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "github.com"
+    },
+    {
+      "id": "o3",
+      "shape": "operator",
+      "set": "gold",
+      "query": "site:wikipedia.org transformer machine learning",
+      "gold": [
+        "wikipedia\\.org/wiki/(Transformer|Attention)"
+      ],
+      "answer_key": [
+        "transformer"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "wikipedia.org"
+    },
+    {
+      "id": "o4",
+      "shape": "operator",
+      "set": "held",
+      "query": "rfc 9110 filetype:pdf",
+      "gold": [
+        "rfc-editor\\.org/[^ ]*9110",
+        "datatracker\\.ietf\\.org/doc/rfc9110"
+      ],
+      "answer_key": [
+        "HTTP"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "o5",
+      "shape": "operator",
+      "set": "gold",
+      "query": "intitle:\"Attention Is All You Need\" arxiv",
+      "gold": [
+        "arxiv\\.org/abs/1706\\.03762"
+      ],
+      "answer_key": [
+        "1706.03762"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "o6",
+      "shape": "operator",
+      "set": "held",
+      "query": "\"quantum entanglement\" site:wikipedia.org",
+      "gold": [
+        "wikipedia\\.org/wiki/Quantum_entanglement"
+      ],
+      "answer_key": [
+        "entanglement"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "wikipedia.org"
+    },
+    {
+      "id": "o7",
+      "shape": "operator",
+      "set": "gold",
+      "query": "tokio tutorial -youtube",
+      "gold": [
+        "tokio\\.rs/tokio/tutorial",
+        "tokio\\.rs/[^ ]*tutorial"
+      ],
+      "answer_key": [
+        "tokio"
+      ],
+      "must_not": [
+        "(?i)youtube"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "o8",
+      "shape": "operator",
+      "set": "held",
+      "query": "rust book ownership site:doc.rust-lang.org",
+      "gold": [
+        "doc\\.rust-lang\\.org/book/ch04"
+      ],
+      "answer_key": [
+        "ownership"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "doc.rust-lang.org"
+    },
+    {
+      "id": "o9",
+      "shape": "operator",
+      "set": "gold",
+      "query": "site:news.ycombinator.com sqlite",
+      "gold": [
+        "news\\.ycombinator\\.com/item"
+      ],
+      "answer_key": [
+        "sqlite"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "news.ycombinator.com"
+    },
+    {
+      "id": "o10",
+      "shape": "operator",
+      "set": "held",
+      "query": "site:stackoverflow.com rust lifetime elision",
+      "gold": [
+        "stackoverflow\\.com/questions"
+      ],
+      "answer_key": [
+        "lifetime"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "stackoverflow.com"
+    },
+    {
+      "id": "o11",
+      "shape": "operator",
+      "set": "gold",
+      "query": "attention is all you need filetype:pdf",
+      "gold": [
+        "arxiv\\.org/pdf/1706\\.03762"
+      ],
+      "answer_key": [
+        "1706.03762"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "o12",
+      "shape": "operator",
+      "set": "held",
+      "query": "site:docs.python.org asyncio.gather",
+      "gold": [
+        "docs\\.python\\.org/3/library/asyncio-task"
+      ],
+      "answer_key": [
+        "asyncio"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "docs.python.org"
+    },
+    {
+      "id": "l6",
+      "shape": "long",
+      "set": "gold",
+      "query": "postgresql logical replication slot wal retention disk full troubleshooting",
+      "gold": [
+        "postgresql\\.org/docs/[^ ]*(logicaldecoding|wal|runtime-config)"
+      ],
+      "answer_key": [
+        "replication"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l7",
+      "shape": "long",
+      "set": "held",
+      "query": "kubernetes pod stuck containercreating failed to assign an ip address to sandbox",
+      "gold": [
+        "kubernetes\\.io/docs/[^ ]*(debug|network|pod)"
+      ],
+      "answer_key": [
+        "sandbox"
+      ],
+      "must_not": [
+        "(?i)wikipedia"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "l8",
+      "shape": "long",
+      "set": "gold",
+      "query": "rust borrow checker cannot borrow as mutable more than once at a time explanation",
+      "gold": [
+        "doc\\.rust-lang\\.org/book/ch04",
+        "doc\\.rust-lang\\.org/[^ ]*borrow"
+      ],
+      "answer_key": [
+        "borrow"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l9",
+      "shape": "long",
+      "set": "held",
+      "query": "python asyncio event loop is closed error after subprocess on windows",
+      "gold": [
+        "docs\\.python\\.org/3/library/asyncio",
+        "bugs\\.python\\.org",
+        "stackoverflow\\.com/questions"
+      ],
+      "answer_key": [
+        "asyncio"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l10",
+      "shape": "long",
+      "set": "gold",
+      "query": "nginx 502 bad gateway upstream prematurely closed connection while reading response header",
+      "gold": [
+        "nginx\\.org/[^ ]*(proxy|ngx_http_proxy)",
+        "stackoverflow\\.com/questions"
+      ],
+      "answer_key": [
+        "upstream"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l11",
+      "shape": "long",
+      "set": "held",
+      "query": "docker build exec format error on apple silicon arm64 base image",
+      "gold": [
+        "docs\\.docker\\.com/[^ ]*(multi-platform|build|building)"
+      ],
+      "answer_key": [
+        "platform"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l12",
+      "shape": "long",
+      "set": "gold",
+      "query": "sqlite database is locked error busy_timeout multiple processes",
+      "gold": [
+        "sqlite\\.org/[^ ]*(lockingv3|busy_timeout|c3ref)"
+      ],
+      "answer_key": [
+        "busy"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l13",
+      "shape": "long",
+      "set": "held",
+      "query": "terraform state lock error conditional check failed acquire lock dynamodb",
+      "gold": [
+        "developer\\.hashicorp\\.com/terraform[^ ]*(state|lock)",
+        "hashicorp\\.com/[^ ]*terraform"
+      ],
+      "answer_key": [
+        "lock"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l14",
+      "shape": "long",
+      "set": "gold",
+      "query": "git fatal detected dubious ownership in repository at safe directory",
+      "gold": [
+        "git-scm\\.com/docs/git-config",
+        "stackoverflow\\.com/questions"
+      ],
+      "answer_key": [
+        "safe.directory"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l15",
+      "shape": "long",
+      "set": "held",
+      "query": "chrome headless new mode print to pdf background graphics flag",
+      "gold": [
+        "developer\\.chrome\\.com/[^ ]*headless",
+        "peter\\.sh/chrome-headless-shell",
+        "chromium\\.org/[^ ]*headless"
+      ],
+      "answer_key": [
+        "headless"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l16",
+      "shape": "long",
+      "set": "gold",
+      "query": "aws lambda cold start provisioned concurrency versus reserved concurrency difference",
+      "gold": [
+        "docs\\.aws\\.amazon\\.com/lambda[^ ]*concurren"
+      ],
+      "answer_key": [
+        "concurrency"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l17",
+      "shape": "long",
+      "set": "held",
+      "query": "ibus mozc japanese input not working wayland arch linux",
+      "gold": [
+        "wiki\\.archlinux\\.org/[^ ]*(IBus|Fcitx|Mozc|日本語)",
+        "github\\.com/[^ ]*(mozc|ibus)"
+      ],
+      "answer_key": [
+        "mozc"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l18",
+      "shape": "long",
+      "set": "gold",
+      "query": "systemd service restart on failure with backoff rate limit configuration",
+      "gold": [
+        "freedesktop\\.org/software/systemd/man/[^ ]*systemd\\.service",
+        "man7\\.org/[^ ]*systemd\\.service"
+      ],
+      "answer_key": [
+        "Restart"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l19",
+      "shape": "long",
+      "set": "held",
+      "query": "llama.cpp gguf quantization q4_k_m versus q5_k_m quality size tradeoff",
+      "gold": [
+        "github\\.com/[^ ]*llama\\.cpp"
+      ],
+      "answer_key": [
+        "quantiz"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l21",
+      "shape": "long",
+      "set": "gold",
+      "query": "fastembed rust model2vec static embeddings CPU small fast rerank 2026",
+      "gold": [
+        "github\\.com/[^ ]*fastembed",
+        "docs\\.rs/fastembed",
+        "pypi\\.org/project/fastembed",
+        "huggingface\\.co/[^ ]*(fastembed|model2vec)"
+      ],
+      "answer_key": [
+        "fastembed"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "l20",
+      "shape": "long",
+      "set": "held",
+      "query": "postgres index only scan not used because of visibility map vacuum",
+      "gold": [
+        "postgresql\\.org/docs/[^ ]*(indexes-index-only-scans|routine-vacuuming|storage-vm)"
+      ],
+      "answer_key": [
+        "visibility"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g1",
+      "shape": "howto",
+      "set": "gold",
+      "query": "how to replace disc brake pads on a bicycle",
+      "gold": [
+        "(?i)parktool\\.com/[^ ]*brake",
+        "(?i)sheldonbrown\\.com/[^ ]*brake",
+        "(?i)wikihow\\.com"
+      ],
+      "answer_key": [
+        "brake"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g2",
+      "shape": "howto",
+      "set": "held",
+      "query": "how to change an ssh key passphrase",
+      "gold": [
+        "man7\\.org/[^ ]*ssh-keygen",
+        "docs\\.github\\.com/[^ ]*ssh",
+        "stackoverflow\\.com/questions"
+      ],
+      "answer_key": [
+        "passphrase"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g3",
+      "shape": "howto",
+      "set": "gold",
+      "query": "how to make a sourdough starter from scratch",
+      "gold": [
+        "kingarthurbaking\\.com/[^ ]*sourdough",
+        "(?i)sourdough"
+      ],
+      "answer_key": [
+        "starter"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g4",
+      "shape": "howto",
+      "set": "held",
+      "query": "how to hibernate linux with a swap file",
+      "gold": [
+        "wiki\\.archlinux\\.org/[^ ]*(hibernate|Power_management)",
+        "kernel\\.org/doc/html/[^ ]*swap"
+      ],
+      "answer_key": [
+        "hibernate"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g5",
+      "shape": "howto",
+      "set": "gold",
+      "query": "how to install nodejs with nvm on linux",
+      "gold": [
+        "github\\.com/nvm-sh/nvm"
+      ],
+      "answer_key": [
+        "nvm"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g6",
+      "shape": "howto",
+      "set": "held",
+      "query": "how to set up a wireguard vpn server",
+      "gold": [
+        "wireguard\\.com/[^ ]*(quickstart|install)"
+      ],
+      "answer_key": [
+        "WireGuard"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g7",
+      "shape": "howto",
+      "set": "gold",
+      "query": "how to recover deleted files from ext4",
+      "gold": [
+        "wiki\\.archlinux\\.org/[^ ]*(file_recovery|ext4)",
+        "(?i)(extundelete|testdisk|photorec)"
+      ],
+      "answer_key": [
+        "ext4"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g8",
+      "shape": "howto",
+      "set": "held",
+      "query": "how to fix permission denied publickey git over ssh",
+      "gold": [
+        "docs\\.github\\.com/[^ ]*ssh",
+        "stackoverflow\\.com/questions"
+      ],
+      "answer_key": [
+        "publickey"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g9",
+      "shape": "howto",
+      "set": "gold",
+      "query": "how to convert video to h265 with ffmpeg",
+      "gold": [
+        "ffmpeg\\.org/[^ ]*(h265|hevc)",
+        "trac\\.ffmpeg\\.org/wiki/[^ ]*(H\\.265|Encode)"
+      ],
+      "answer_key": [
+        "265"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g10",
+      "shape": "howto",
+      "set": "held",
+      "query": "how to build a raised garden bed",
+      "gold": [
+        "(?i)thisoldhouse\\.com",
+        "(?i)familyhandyman\\.com",
+        "(?i)gardeners\\.com"
+      ],
+      "answer_key": [
+        "raised bed"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g11",
+      "shape": "howto",
+      "set": "gold",
+      "query": "how to calibrate a 3d printer first layer",
+      "gold": [
+        "(?i)prusa[^ ]*knowledge",
+        "(?i)help\\.prusa3d\\.com",
+        "(?i)all3dp\\.com"
+      ],
+      "answer_key": [
+        "first layer"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "g12",
+      "shape": "howto",
+      "set": "held",
+      "query": "how to write a good git commit message",
+      "gold": [
+        "cbea\\.ms/git-commit",
+        "git-scm\\.com/[^ ]*commit",
+        "conventionalcommits\\.org"
+      ],
+      "answer_key": [
+        "commit"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s1",
+      "shape": "shopping",
+      "set": "gold",
+      "query": "sony wh-1000xm6 price",
+      "gold": [
+        "sony\\.com/[^ ]*wh-1000xm6",
+        "sony\\.co\\.uk/[^ ]*wh-1000xm6"
+      ],
+      "answer_key": [
+        "WH-1000XM6"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s2",
+      "shape": "shopping",
+      "set": "held",
+      "query": "thinkpad t14 gen 6 price",
+      "gold": [
+        "lenovo\\.com/[^ ]*t14",
+        "psref\\.lenovo\\.com"
+      ],
+      "answer_key": [
+        "T14"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s3",
+      "shape": "shopping",
+      "set": "gold",
+      "query": "nvidia rtx 5090 price",
+      "gold": [
+        "nvidia\\.com/[^ ]*(5090|geforce)"
+      ],
+      "answer_key": [
+        "5090"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s4",
+      "shape": "shopping",
+      "set": "held",
+      "query": "iphone 17 pro max 256gb price",
+      "gold": [
+        "apple\\.com/[^ ]*iphone-17-pro"
+      ],
+      "answer_key": [
+        "iPhone 17 Pro"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s5",
+      "shape": "shopping",
+      "set": "gold",
+      "query": "herman miller aeron size b price",
+      "gold": [
+        "hermanmiller\\.com/[^ ]*aeron",
+        "store\\.hermanmiller\\.com"
+      ],
+      "answer_key": [
+        "Aeron"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s6",
+      "shape": "shopping",
+      "set": "held",
+      "query": "amd ryzen 9 9950x price",
+      "gold": [
+        "amd\\.com/[^ ]*9950x"
+      ],
+      "answer_key": [
+        "9950X"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s7",
+      "shape": "shopping",
+      "set": "gold",
+      "query": "samsung 990 pro 2tb price",
+      "gold": [
+        "samsung\\.com/[^ ]*990-pro",
+        "semiconductor\\.samsung\\.com"
+      ],
+      "answer_key": [
+        "990 PRO"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s8",
+      "shape": "shopping",
+      "set": "held",
+      "query": "keychron q1 pro price",
+      "gold": [
+        "keychron\\.com/[^ ]*q1-pro",
+        "keychron\\.com/products"
+      ],
+      "answer_key": [
+        "Q1 Pro"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s9",
+      "shape": "shopping",
+      "set": "gold",
+      "query": "steam deck oled 1tb price",
+      "gold": [
+        "steamdeck\\.com/[^ ]*(oled|tech)",
+        "store\\.steampowered\\.com/steamdeck"
+      ],
+      "answer_key": [
+        "Steam Deck"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "s10",
+      "shape": "shopping",
+      "set": "held",
+      "query": "unifi u7 pro access point price",
+      "gold": [
+        "ui\\.com/[^ ]*u7",
+        "store\\.ui\\.com/[^ ]*u7"
+      ],
+      "answer_key": [
+        "U7"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "j1",
+      "shape": "cjk",
+      "set": "gold",
+      "query": "東京証券取引所 上場企業数",
+      "gold": [
+        "jpx\\.co\\.jp"
+      ],
+      "answer_key": [
+        "上場"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "j2",
+      "shape": "cjk",
+      "set": "held",
+      "query": "原子力発電所 再稼働 最新",
+      "gold": [
+        "(?:jma|meti|nhk|asahi|yomiuri|kyodo|denki|japc)\\.(?:go\\.jp|co\\.jp|or\\.jp|com|ne\\.jp)"
+      ],
+      "answer_key": [
+        "原子力"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja",
+      "window": "365d"
+    },
+    {
+      "id": "j3",
+      "shape": "cjk",
+      "set": "gold",
+      "query": "人工知能 とは",
+      "gold": [
+        "ja\\.wikipedia\\.org/wiki/",
+        "(?i)ai\\.go\\.jp"
+      ],
+      "answer_key": [
+        "人工知能"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "j4",
+      "shape": "cjk",
+      "set": "held",
+      "query": "量子力学 入門",
+      "gold": [
+        "ja\\.wikipedia\\.org/wiki/(量子力学|量子論)"
+      ],
+      "answer_key": [
+        "量子"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "j5",
+      "shape": "cjk",
+      "set": "gold",
+      "query": "京都 紅葉 見頃",
+      "gold": [
+        "(?i)japan-guide\\.com",
+        "(?i)kyoto[^ ]*\\.(?:jp|com|net|or\\.jp)"
+      ],
+      "answer_key": [
+        "紅葉"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "j6",
+      "shape": "cjk",
+      "set": "held",
+      "query": "日本語入力 ibus mozc 設定",
+      "gold": [
+        "wiki\\.archlinux\\.org/[^ ]*(IBus|Mozc|日本語)",
+        "wiki\\.archlinux\\.jp/[^ ]*(IBus|Mozc|日本語)"
+      ],
+      "answer_key": [
+        "Mozc"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "j7",
+      "shape": "cjk",
+      "set": "gold",
+      "query": "中国 人口 統計",
+      "gold": [
+        "zh\\.wikipedia\\.org/wiki/",
+        "stats\\.gov\\.cn"
+      ],
+      "answer_key": [
+        "人口"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "zh"
+    },
+    {
+      "id": "j8",
+      "shape": "cjk",
+      "set": "held",
+      "query": "台湾 半導体 TSMC 工場",
+      "gold": [
+        "(?:zh|ja)\\.wikipedia\\.org/wiki/",
+        "(?i)tsmc\\.com"
+      ],
+      "answer_key": [
+        "TSMC"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "zh"
+    },
+    {
+      "id": "j9",
+      "shape": "cjk",
+      "set": "gold",
+      "query": "한국 전쟁 원인",
+      "gold": [
+        "ko\\.wikipedia\\.org/wiki/"
+      ],
+      "answer_key": [
+        "전쟁"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ko"
+    },
+    {
+      "id": "j10",
+      "shape": "cjk",
+      "set": "held",
+      "query": "서울 지하철 2호선 노선도",
+      "gold": [
+        "(?i)seoulmetro\\.co\\.kr",
+        "(?i)seoul\\.go\\.kr"
+      ],
+      "answer_key": [
+        "2호선"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ko"
+    },
+    {
+      "id": "j11",
+      "shape": "cjk",
+      "set": "gold",
+      "query": "중국 인구 2025",
+      "gold": [
+        "ko\\.wikipedia\\.org/wiki/",
+        "zh\\.wikipedia\\.org/wiki/"
+      ],
+      "answer_key": [
+        "인구"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ko"
+    },
+    {
+      "id": "j12",
+      "shape": "cjk",
+      "set": "held",
+      "query": "地震 速報 緊急",
+      "gold": [
+        "(?:jma\\.go\\.jp|weathernews\\.jp|tenki\\.jp|nhk\\.or\\.jp)"
+      ],
+      "answer_key": [
+        "地震"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "j13",
+      "shape": "cjk",
+      "set": "gold",
+      "query": "ラーメン 東京 おすすめ",
+      "gold": [
+        "(?i)tabelog\\.com",
+        "(?i)hotpepper\\.jp",
+        "(?i)ramendb"
+      ],
+      "answer_key": [
+        "ラーメン"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "j14",
+      "shape": "cjk",
+      "set": "held",
+      "query": "富士山 標高",
+      "gold": [
+        "ja\\.wikipedia\\.org/wiki/富士山"
+      ],
+      "answer_key": [
+        "3776"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "m1",
+      "shape": "mixed",
+      "set": "gold",
+      "query": "rust 日本語 入門",
+      "gold": [
+        "doc\\.rust-jp\\.rs",
+        "rust-lang\\.org/ja"
+      ],
+      "answer_key": [
+        "Rust"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "m2",
+      "shape": "mixed",
+      "set": "held",
+      "query": "python 한국어 문서",
+      "gold": [
+        "docs\\.python\\.org/ko",
+        "(?i)wikidocs\\.net"
+      ],
+      "answer_key": [
+        "Python"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ko"
+    },
+    {
+      "id": "m3",
+      "shape": "mixed",
+      "set": "gold",
+      "query": "React 中国語 ドキュメント",
+      "gold": [
+        "zh-hans\\.react\\.dev",
+        "react\\.dev/zh-hans"
+      ],
+      "answer_key": [
+        "React"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "zh"
+    },
+    {
+      "id": "m4",
+      "shape": "mixed",
+      "set": "held",
+      "query": "kubernetes 日本語 ドキュメント",
+      "gold": [
+        "kubernetes\\.io/ja"
+      ],
+      "answer_key": [
+        "Kubernetes"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "m5",
+      "shape": "mixed",
+      "set": "gold",
+      "query": "docker 中国 dockerfile 教程",
+      "gold": [
+        "docs\\.docker\\.com/zh",
+        "(?i)docker\\.com/zh"
+      ],
+      "answer_key": [
+        "Docker"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "zh"
+    },
+    {
+      "id": "m6",
+      "shape": "mixed",
+      "set": "held",
+      "query": "typescript 型 ガイド",
+      "gold": [
+        "typescriptlang\\.org/ja",
+        "(?i)typescript-jp\\.gitbook\\.io"
+      ],
+      "answer_key": [
+        "TypeScript"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "m7",
+      "shape": "mixed",
+      "set": "gold",
+      "query": "aws 料金 日本語",
+      "gold": [
+        "aws\\.amazon\\.com/jp/pricing",
+        "aws\\.amazon\\.com/ja_jp"
+      ],
+      "answer_key": [
+        "料金"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "m8",
+      "shape": "mixed",
+      "set": "held",
+      "query": "vim 設定 vimrc おすすめ",
+      "gold": [
+        "(?i)qiita\\.com",
+        "(?i)zenn\\.dev",
+        "vim-jp\\.org"
+      ],
+      "answer_key": [
+        "vimrc"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "m9",
+      "shape": "mixed",
+      "set": "gold",
+      "query": "linux 명령어 정리",
+      "gold": [
+        "(?i)ko\\.wikipedia\\.org",
+        "(?i)tistory\\.com",
+        "(?i)man7\\.org"
+      ],
+      "answer_key": [
+        "명령"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ko"
+    },
+    {
+      "id": "m10",
+      "shape": "mixed",
+      "set": "held",
+      "query": "go 言語 並行処理 goroutine",
+      "gold": [
+        "(?i)go\\.dev",
+        "(?i)go\\.go\\.jp",
+        "(?i)zenn\\.dev"
+      ],
+      "answer_key": [
+        "goroutine"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "lang": "ja"
+    },
+    {
+      "id": "a1",
+      "shape": "ambiguous",
+      "set": "gold",
+      "query": "python",
+      "gold": [
+        "python\\.org",
+        "(?i)wikipedia\\.org/wiki/Python"
+      ],
+      "answer_key": [
+        "Python"
+      ],
+      "must_not": [
+        "(?i)wikipedia\\.org/wiki/Python_\\(genus\\)"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "a2",
+      "shape": "ambiguous",
+      "set": "held",
+      "query": "rust programming language",
+      "gold": [
+        "rust-lang\\.org",
+        "doc\\.rust-lang\\.org",
+        "(?i)wikipedia\\.org/wiki/Rust"
+      ],
+      "answer_key": [
+        "Rust"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "a3",
+      "shape": "ambiguous",
+      "set": "gold",
+      "query": "go programming language",
+      "gold": [
+        "go\\.dev",
+        "(?i)wikipedia\\.org/wiki/Go_\\(programming_language\\)"
+      ],
+      "answer_key": [
+        "Go"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "a4",
+      "shape": "ambiguous",
+      "set": "held",
+      "query": "swift programming language",
+      "gold": [
+        "swift\\.org",
+        "(?i)wikipedia\\.org/wiki/Swift_\\(programming_language\\)"
+      ],
+      "answer_key": [
+        "Swift"
+      ],
+      "must_not": [
+        "(?i)taylor"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "a5",
+      "shape": "ambiguous",
+      "set": "gold",
+      "query": "jaguar animal",
+      "gold": [
+        "(?i)wikipedia\\.org/wiki/Jaguar",
+        "(?i)nationalgeographic\\.com"
+      ],
+      "answer_key": [
+        "jaguar"
+      ],
+      "must_not": [
+        "(?i)jaguar\\.com",
+        "(?i)jaguarlandrover"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "a6",
+      "shape": "ambiguous",
+      "set": "held",
+      "query": "apple silicon chip",
+      "gold": [
+        "(?i)wikipedia\\.org/wiki/Apple_silicon",
+        "apple\\.com/[^ ]*silicon"
+      ],
+      "answer_key": [
+        "Apple"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "a7",
+      "shape": "ambiguous",
+      "set": "gold",
+      "query": "nix package manager",
+      "gold": [
+        "nixos\\.org",
+        "(?i)wikipedia\\.org/wiki/NixOS"
+      ],
+      "answer_key": [
+        "Nix"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "a8",
+      "shape": "ambiguous",
+      "set": "held",
+      "query": "deno runtime",
+      "gold": [
+        "deno\\.com",
+        "(?i)wikipedia\\.org/wiki/Deno"
+      ],
+      "answer_key": [
+        "Deno"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "a9",
+      "shape": "ambiguous",
+      "set": "gold",
+      "query": "kotlin language",
+      "gold": [
+        "kotlinlang\\.org",
+        "(?i)wikipedia\\.org/wiki/Kotlin"
+      ],
+      "answer_key": [
+        "Kotlin"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "a10",
+      "shape": "ambiguous",
+      "set": "held",
+      "query": "mercury planet",
+      "gold": [
+        "(?i)wikipedia\\.org/wiki/Mercury_\\(planet\\)",
+        "(?i)science\\.nasa\\.gov/mercury"
+      ],
+      "answer_key": [
+        "Mercury"
+      ],
+      "must_not": [
+        "(?i)mercury_\\(element\\)"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "x1",
+      "shape": "adversarial",
+      "set": "gold",
+      "query": "site:example.com tokio",
+      "gold": [],
+      "answer_key": [],
+      "must_not": [
+        "docs\\.rs/",
+        "crates\\.io/crates/tokio",
+        "tokio\\.rs"
+      ],
+      "expect": "refuse"
+    },
+    {
+      "id": "x3",
+      "shape": "adversarial",
+      "set": "held",
+      "query": "site:github.com/qz9-nonexistent-user/repo",
+      "gold": [],
+      "answer_key": [],
+      "must_not": [],
+      "expect": "refuse",
+      "only_host": "github.com"
+    },
+    {
+      "id": "x4",
+      "shape": "adversarial",
+      "set": "gold",
+      "query": "\"the quick brown fox\" site:nonexistent-domain-qz.invalid",
+      "gold": [],
+      "answer_key": [],
+      "must_not": [
+        "^https?://"
+      ],
+      "expect": "refuse"
+    },
+    {
+      "id": "x5",
+      "shape": "adversarial",
+      "set": "held",
+      "query": "site:docs.rs site:github.com tokio spawn_blocking",
+      "gold": [
+        "docs\\.rs/tokio[^ ]*spawn_blocking"
+      ],
+      "answer_key": [
+        "spawn_blocking"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "x6",
+      "shape": "adversarial",
+      "set": "gold",
+      "query": "-python javascript array sort",
+      "gold": [
+        "developer\\.mozilla\\.org/[^ ]*Array/sort"
+      ],
+      "answer_key": [
+        "sort"
+      ],
+      "must_not": [
+        "(?i)python\\.org"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "x7",
+      "shape": "adversarial",
+      "set": "held",
+      "query": "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html",
+      "gold": [
+        "docs\\.rs/tokio[^ ]*spawn_blocking"
+      ],
+      "answer_key": [
+        "spawn_blocking"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "x8",
+      "shape": "adversarial",
+      "set": "gold",
+      "query": "\"attention is all you need\" arxiv",
+      "gold": [
+        "arxiv\\.org/abs/1706\\.03762"
+      ],
+      "answer_key": [
+        "attention is all you need"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "x9",
+      "shape": "adversarial",
+      "set": "held",
+      "query": "select! tokio futures macro",
+      "gold": [
+        "docs\\.rs/(tokio|futures)[^ ]*select"
+      ],
+      "answer_key": [
+        "select"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "x10",
+      "shape": "adversarial",
+      "set": "gold",
+      "query": "C++ operator<< overload ostream",
+      "gold": [
+        "cppreference\\.com/[^ ]*operator_ltlt",
+        "cppreference\\.com/[^ ]*ostream"
+      ],
+      "answer_key": [
+        "operator<<"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    }
+  ]
 }

@@ -252,14 +252,27 @@ pub(super) async fn engine_task_with_budget(
         });
     }
     let mut thin = hits.len() < if scoped.is_some() { 1 } else { 3 };
-    // The answer class, decided before a single item can influence ranking:
-    // every item is judged against the query's own rubric, and the source is
-    // judged by the verdicts its items earned. An off-query answer is a
-    // bot-page wearing a 200; its items never reach the merge.
-    let accepted = contract::accept(&query, std::mem::take(&mut hits));
-    let mut class = accepted.class;
-    let mut items = accepted.items;
-    hits = accepted.kept;
+    // The answer class, decided before a single item can influence ranking. Two
+    // questions, kept apart: did the parser find a result list at all (`thin`,
+    // above), and is what it found about this query (`quality::judge`). The
+    // second is set-level and narrow — a veto list per hit, then one class for
+    // the set — because the per-hit coverage test this replaces was the thing
+    // that turned a long query into a zero result and a lane into a rested one.
+    let facts = super::query::QueryFacts::new(&query);
+    let judged = super::quality::judge(&facts, std::mem::take(&mut hits));
+    let mut class = judged.class;
+    let mut items = judged.items;
+    hits = judged.kept;
+    // The set-level thresholds are the ones a tuning round will move, so a thin
+    // or junk answer says what it scored. Debug only: the census carries the
+    // class, and a caller never needs our arithmetic.
+    if items > 0 && !class.credits() && crate::config::cfg().debug.search {
+        crate::diag!(
+            "[search] {engine} answered {items} items, {} (mean relevance {:.2})",
+            class.status(),
+            judged.mean
+        );
+    }
     let mut instant = instant;
     // bing's HTML lane is the one general source that also publishes a
     // structured answer, and the two disagree per query: the same index answers
@@ -363,8 +376,9 @@ async fn bing_rss_fallback(
             .unwrap_or("application/xml"),
     );
     let hits = engines::parse_rss(&body);
-    let accepted = contract::accept(query, hits);
-    Some((accepted.kept, accepted.class, accepted.items))
+    let facts = super::query::QueryFacts::new(query);
+    let judged = super::quality::judge(&facts, hits);
+    Some((judged.kept, judged.class, judged.items))
 }
 
 /// Turn one news source's answer into a lane. Each source races on its own, so
@@ -404,9 +418,9 @@ pub(super) async fn news_feed_task(
     fetcher: &Fetcher,
     budget: std::time::Duration,
 ) -> (String, EngineResult) {
-    let profile = super::contract::Profile::new(&query);
+    let facts = super::query::QueryFacts::new(&query);
     let window = super::contract::window_for(&query);
-    let answer = super::news::mesh(&profile, window, fetcher, budget).await;
+    let answer = super::news::mesh(&facts, window, fetcher, budget).await;
     news_lane("feed", answer)
 }
 
@@ -501,9 +515,11 @@ fn vertical_success(
     ms: u64,
 ) -> (String, EngineResult) {
     let requests = 1usize;
-    // A first-party API's own ranking is its contract; it only loses redirects
-    // and look-alike namespaces, never its relevance order.
-    let hits = contract::accept_first_party(query, hits);
+    // A first-party API's own ranking is its contract; it only loses what the
+    // veto list refuses (wrappers, negated terms) and look-alike namespaces,
+    // never its relevance order.
+    let facts = super::query::QueryFacts::new(query);
+    let hits = contract::accept_first_party(&facts, hits);
     if hits.is_empty() {
         return (vertical, Err(("no-results".into(), "direct".into(), false)));
     }
@@ -786,7 +802,7 @@ mod tests {
         assert_eq!(answer.egress, "direct");
         assert!(!answer.engine_lane);
         assert!(answer.instant.is_none());
-        assert_eq!(answer.class, crate::search::engines::AnswerClass::Content);
+        assert_eq!(answer.class, crate::search::engines::AnswerClass::Answered);
     }
 
     /// Serves `body` for one HTTPS request to `host` through a CONNECT

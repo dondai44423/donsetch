@@ -21,9 +21,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::contract::{Profile, Verdict, Window, day_of, window_for};
+use super::contract::{Window, day_of, window_for};
 use super::engines::Hit;
 use super::intent::Intent;
+use super::query::QueryFacts;
 use super::verticals::rss_date_to_iso;
 use crate::fetch::client::Fetcher;
 
@@ -296,7 +297,7 @@ fn parse_rss_items(body: &str, limit: usize) -> Vec<Parsed> {
 /// How many of the query's content terms the item's text carries. The wire is
 /// date-sorted, and a week-old tangential piece must not sit above today's
 /// story that actually covers the query.
-fn coverage(profile: &Profile, h: &Hit) -> usize {
+fn coverage(profile: &QueryFacts, h: &Hit) -> usize {
     let text = format!("{} {} {}", h.title, h.snippet, h.url).to_ascii_lowercase();
     profile.terms().filter(|t| text.contains(*t)).count()
 }
@@ -313,7 +314,7 @@ fn hit_from(parsed: &Parsed, rank: usize) -> Hit {
 
 /// Keep what the query is about: exact matches only. A news slot is scarce, and
 /// a headline that shares one word with the query is noise next to the story.
-fn grade(hits: Vec<Hit>, profile: &Profile, window: Option<Window>, cap: usize) -> Vec<Hit> {
+fn grade(hits: Vec<Hit>, profile: &QueryFacts, window: Option<Window>, cap: usize) -> Vec<Hit> {
     let mut kept: Vec<Hit> = hits
         .into_iter()
         .filter(|h| {
@@ -325,7 +326,7 @@ fn grade(hits: Vec<Hit>, profile: &Profile, window: Option<Window>, cap: usize) 
             {
                 return false;
             }
-            profile.verdict(&h.title, &h.snippet, &h.url) == Verdict::Exact
+            profile.is_exact(&h.title, &h.snippet, &h.url)
         })
         .collect();
     kept.sort_by_key(|h| std::cmp::Reverse(coverage(profile, h)));
@@ -387,7 +388,7 @@ pub async fn bing_news(
         .enumerate()
         .map(|(i, p)| hit_from(p, i))
         .collect();
-    let profile = Profile::new(query);
+    let profile = QueryFacts::new(query);
     let hits = grade(hits, &profile, window_for(query), 12);
     let ms = started.elapsed().as_millis() as u64;
     Answer {
@@ -554,7 +555,7 @@ async fn refresh(
 /// cached. Matching is exact — a feed is keyword-blind, so a tangential item
 /// is noise, not a candidate.
 pub async fn mesh(
-    profile: &Profile,
+    profile: &QueryFacts,
     window: Option<Window>,
     fetcher: &Fetcher,
     budget: Duration,
@@ -652,7 +653,7 @@ fn hits_from(matched: Vec<&StoredItem>) -> Vec<Hit> {
 /// newest first. A feed is keyword-blind, so a tangential item is noise.
 fn match_items<'a>(
     disk: &'a FeedDisk,
-    profile: &Profile,
+    profile: &QueryFacts,
     window: Option<Window>,
 ) -> Vec<&'a StoredItem> {
     let mut matched: Vec<(&StoredItem, i64, usize)> = Vec::new();
@@ -666,7 +667,7 @@ fn match_items<'a>(
             {
                 continue;
             }
-            if profile.verdict(&item.title, &item.summary, &item.url) != Verdict::Exact {
+            if !profile.is_exact(&item.title, &item.summary, &item.url) {
                 continue;
             }
             let text = format!("{} {} {}", item.title, item.summary, item.url).to_ascii_lowercase();
@@ -788,7 +789,7 @@ pub async fn gdelt(query: &str, fetcher: &Fetcher, budget: Duration) -> Answer {
             let body = String::from_utf8_lossy(&out.body);
             let hits = grade(
                 parse_gdelt(&body),
-                &Profile::new(query),
+                &QueryFacts::new(query),
                 window_for(query),
                 10,
             );
@@ -880,7 +881,7 @@ mod tests {
 
     #[test]
     fn matching_is_exact_and_inside_the_window() {
-        let profile = Profile::new("apple q4 2026 earnings");
+        let profile = QueryFacts::new("apple q4 2026 earnings");
         let window = window_for("apple q4 2026 earnings");
         let today = super::super::contract::today();
         let fresh = StoredItem {

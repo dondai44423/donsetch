@@ -448,12 +448,12 @@ fn merge_inner(
     // measured the cost: an npm package called "photosynthesis" took rank 1
     // from the encyclopedia, a GitHub changelog from a release note, and a
     // crates page matched on one word from the crate the query actually named.
-    let profile = super::contract::Profile::new(query);
+    let facts = super::query::QueryFacts::new(query);
     for r in &mut results {
         let resolved = r.sources.iter().any(|(engine, _)| engine == "registry");
         let record = intent == Intent::Code
-            && super::contract::package_scope_named(&profile, &r.url)
-            && profile.verdict(&r.title, &r.snippet, &r.url) == super::contract::Verdict::Exact;
+            && super::contract::package_scope_named(&facts, &r.url)
+            && facts.is_exact(&r.title, &r.snippet, &r.url);
         // A dated item from the news program answers a dated query: one record
         // per news lane leads (its top item), not the whole wire — promoting
         // every wire item buried the official page an announcement points at.
@@ -517,9 +517,7 @@ fn merge_inner(
         diverse.extend(
             overflow
                 .into_iter()
-                .filter(|r| {
-                    profile.verdict(&r.title, "", &r.url) == super::contract::Verdict::Exact
-                })
+                .filter(|r| facts.is_exact(&r.title, "", &r.url))
                 .take(room),
         );
     }
