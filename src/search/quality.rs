@@ -83,7 +83,14 @@ pub fn judge(facts: &QueryFacts, hits: Vec<Hit>) -> Judgement {
     let mut seen: HashSet<String> = HashSet::new();
     let mut kept: Vec<Hit> = Vec::with_capacity(items);
     for h in hits {
-        if contract::veto(facts, &h).is_some() {
+        // This is a **search engine's** answer, so it faces the full lane veto:
+        // the universal list plus the two shape vetoes that were measured on
+        // this very corpus — the encyclopedia or video a one-identifier query
+        // must never be answered by (`tokio::spawn` → ja.wikipedia's article on
+        // the band TOKIO), and the site's bare front door. A first-party API
+        // never reaches this function ([`super::contract::accept_first_party`]
+        // judges those), because its own ranking is its contract.
+        if contract::veto_lane(facts, &h).is_some() {
             continue;
         }
         if !seen.insert(contract::canonical_url(&h.url)) {

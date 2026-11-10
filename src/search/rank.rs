@@ -39,6 +39,7 @@ pub(crate) fn is_vertical(engine: &str) -> bool {
             | "npm"
             | "registry"
             | "registry-any"
+            | "docs"
             | "bing-news"
             | "feed"
             | "gdelt"
@@ -450,7 +451,10 @@ fn merge_inner(
     // crates page matched on one word from the crate the query actually named.
     let facts = super::query::QueryFacts::new(query);
     for r in &mut results {
-        let resolved = r.sources.iter().any(|(engine, _)| engine == "registry");
+        let resolved = r
+            .sources
+            .iter()
+            .any(|(engine, _)| engine == "registry" || engine == "docs");
         let record = intent == Intent::Code
             && super::contract::package_scope_named(&facts, &r.url)
             && facts.is_exact(&r.title, &r.snippet, &r.url);

@@ -1332,6 +1332,27 @@ impl Searcher {
             futures.append(&mut vfuts);
         }
 
+        // One item of one owner is answered by the documentation that owns it:
+        // `itertools::izip` asks docs.rs's own index page for the crate, in
+        // parallel with the fan-out and with no ambiguity to rank around. The
+        // href is read from that page, never guessed, so an item that does not
+        // exist produces nothing rather than a 404 dressed as an answer.
+        if let Some(item) = resolve::item(&query::QueryFacts::new(query))
+            && let Some(pace) = self.plan_lane("docs", &mut skipped)
+        {
+            futures.push((
+                "docs".to_string(),
+                paced(
+                    pace,
+                    Box::pin(tasks::docs_task(
+                        item,
+                        &self.fetcher,
+                        Duration::from_millis(900),
+                    )),
+                ),
+            ));
+        }
+
         // A bare name is resolved alongside the fan-out: no latency cost, and
         // its records lead the list when the name is real. The lane gets a
         // shorter budget than the fan-out's soft mark so its answer lands with
@@ -1876,6 +1897,16 @@ impl Searcher {
             .copied()
             .unwrap_or(1.0);
         trust.insert("google".into(), google_trust);
+        if crate::config::cfg().debug.search {
+            crate::diag!(
+                "[search] lanes into merge: {:?}",
+                per_engine
+                    .iter()
+                    .map(|(e, h)| (e.as_str(), h.len()))
+                    .collect::<Vec<_>>()
+            );
+        }
+
         let total = rank::merged_total(&per_engine);
         // What each general source returned teaches the independence graph, and
         // this query is ranked with what it just learned.
@@ -1977,9 +2008,24 @@ impl Searcher {
         // leak through. Filter them out post-merge so the agent
         // only sees what it asked for.
         let filters_t = std::time::Instant::now();
+        if crate::config::cfg().debug.search {
+            crate::diag!(
+                "[search] pre-filter {} results; intitle={:?} titles: {:?}",
+                results.len(),
+                query::compile(query).intitle,
+                results
+                    .iter()
+                    .take(6)
+                    .map(|r| r.title.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
         site_filter(query, &mut results);
         query::intitle_filter(query, &mut results);
         query::filetype_filter(query, &mut results);
+        if crate::config::cfg().debug.search {
+            crate::diag!("[search] post-filter {} results", results.len());
+        }
         let filters_ms = filters_t.elapsed().as_millis();
 
         // Post-enrichment top-up: the cross-encoder now sees the

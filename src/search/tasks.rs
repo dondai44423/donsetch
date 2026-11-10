@@ -470,6 +470,39 @@ pub(super) async fn registry_task(
     }
 }
 
+/// The documentation lane: one path identifier answered from the docs that own
+/// it (`itertools::izip` → docs.rs's own index page for the crate). First-party,
+/// so a miss is `no-results` and never a fault.
+pub(super) async fn docs_task(
+    item: super::resolve::Item,
+    fetcher: &Fetcher,
+    budget: std::time::Duration,
+) -> (String, EngineResult) {
+    let doc = super::resolve::docs(&item, fetcher, budget).await;
+    if doc.hits.is_empty() {
+        return (
+            "docs".to_string(),
+            Err(("no-results".into(), "direct".into(), false)),
+        );
+    }
+    let items = doc.hits.len();
+    let class = engines::vertical_class(&doc.hits);
+    (
+        // The lane is named for what it asked: `docs.rs` or `doc.rust-lang.org`.
+        "docs".to_string(),
+        Ok(LaneAnswer {
+            hits: doc.hits,
+            items,
+            ms: doc.ms,
+            egress: "direct".into(),
+            engine_lane: false,
+            instant: None,
+            class,
+            requests: doc.requests,
+        }),
+    )
+}
+
 /// One vertical's answer, bounded by `budget` rather than the engine ceiling:
 /// a lane must not outlive the call that cancelled it (a cancelled blocking
 /// fetch keeps the process alive, which showed up as a 4.9 s wall clock on a

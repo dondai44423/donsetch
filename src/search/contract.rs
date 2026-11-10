@@ -284,8 +284,25 @@ pub enum Veto {
     Reference,
 }
 
-/// Hosts that answer a *topic* and never a *name*.
-const REFERENCE_HOSTS: &[&str] = &["wikipedia.org", "britannica.com", "youtube.com", "youtu.be"];
+/// Hosts that answer a *topic* and never a *name*. A dictionary definition of
+/// "select" is not the `select!` macro, and an encyclopedia entry about the band
+/// TOKIO is not `tokio::spawn` — both were returned for one-identifier queries on
+/// this corpus.
+const REFERENCE_HOSTS: &[&str] = &[
+    "wikipedia.org",
+    "britannica.com",
+    "youtube.com",
+    "youtu.be",
+    // Dictionaries: a definition is a page about the word, not the thing.
+    "merriam-webster.com",
+    "dictionary.com",
+    "thesaurus.com",
+    "collinsdictionary.com",
+    "oxfordlearnersdictionaries.com",
+    "dictionary.cambridge.org",
+    "vocabulary.com",
+    "wiktionary.org",
+];
 
 fn is_reference(raw: &str) -> bool {
     url::Url::parse(raw)

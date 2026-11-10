@@ -887,9 +887,391 @@ pub async fn run(plan: &Plan, fetcher: &Fetcher, budget: Duration) -> Resolution
     })
 }
 
+// ── Documentation: a path identifier answered by the page that owns it ──────
+//
+// `itertools::izip` is not a topic: it is one item of one crate, and the answer
+// is that item's own page. The site's interface for its items is the module
+// index page, which lists every item with its href — so the href is **read**,
+// never guessed (`izip` is a macro, `Value` is a struct, `take` is a function,
+// and a guessed file name is a 404 returned as an answer).
+
+/// A path identifier: the name that owns it, the module path between them, and
+/// the item itself. `std::mem::take` → root `std`, module `["mem"]`, item
+/// `take`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    pub root: String,
+    pub module: Vec<String>,
+    pub name: String,
+}
+
+impl Item {
+    /// The rustdoc page that lists the owning module's items.
+    fn index_url(&self, base: &str) -> String {
+        let mut path = String::new();
+        for segment in &self.module {
+            path.push_str(segment);
+            path.push('/');
+        }
+        format!("{base}{path}index.html")
+    }
+
+    /// `std::mem::take`, the way the docs spell it.
+    fn path(&self) -> String {
+        let mut out = self.root.clone();
+        for segment in &self.module {
+            out.push_str("::");
+            out.push_str(segment);
+        }
+        out.push_str("::");
+        out.push_str(&self.name);
+        out
+    }
+
+    fn key(&self) -> String {
+        format!("docs:{}", self.path())
+    }
+}
+
+/// The language's own documentation, which no registry owns.
+fn std_base(root: &str) -> Option<String> {
+    let base = match root {
+        "std" => "https://doc.rust-lang.org/std/",
+        "core" => "https://doc.rust-lang.org/core/",
+        "alloc" => "https://doc.rust-lang.org/alloc/",
+        "proc_macro" => "https://doc.rust-lang.org/proc_macro/",
+        _ => return None,
+    };
+    Some(base.to_string())
+}
+
+/// The item a query names, when it names one item of one owner.
+///
+/// A bare name has no owner to ask: `select!` may be a macro of any crate, and
+/// a guessed owner is a wrong answer wearing a confident title, so the caller's
+/// fan-out answers those instead.
+pub fn item(facts: &super::query::QueryFacts) -> Option<Item> {
+    let (root, mut rest) = facts.identifier_parts()?;
+    let name = rest.pop()?;
+    Some(Item {
+        root,
+        module: rest,
+        name,
+    })
+}
+
+/// One documentation answer: at most one hit, the item's own page.
+#[derive(Debug, Default)]
+pub struct Doc {
+    pub hits: Vec<Hit>,
+    pub ms: u64,
+    pub requests: usize,
+}
+
+/// Ask the documentation that owns the item.
+///
+/// ONE request: the module index page, which proves the owner exists, names
+/// the item's real href and carries the sentence the docs write about it.
+/// Cached for a week — a published item's URL does not move. A failure here is
+/// not a "no": the name is unproven, and the fan-out is still there to answer
+/// it.
+pub async fn docs(item: &Item, fetcher: &Fetcher, budget: Duration) -> Doc {
+    let started = std::time::Instant::now();
+    let key = item.key();
+    if let Cached::Fresh(hits) = cache_get(&key) {
+        return Doc {
+            hits,
+            ms: 0,
+            requests: 0,
+        };
+    }
+    let base = std_base(&item.root)
+        .unwrap_or_else(|| format!("https://docs.rs/{root}/latest/{root}/", root = item.root));
+    let index = item.index_url(&base);
+    let mut doc = Doc {
+        hits: Vec::new(),
+        ms: 0,
+        requests: 1,
+    };
+    let out = match tokio::time::timeout(
+        budget,
+        fetcher.fetch_once_via(&index, &[], None, false, None),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        _ => {
+            doc.ms = started.elapsed().as_millis() as u64;
+            return doc;
+        }
+    };
+    if out.status != 200 {
+        doc.ms = started.elapsed().as_millis() as u64;
+        return doc;
+    }
+    let page = String::from_utf8_lossy(&out.body);
+    let Some(found) = find_item(&page, &item.name) else {
+        doc.ms = started.elapsed().as_millis() as u64;
+        return doc;
+    };
+    // Relative hrefs resolve against the page's FINAL url: docs.rs redirects
+    // `latest` to a concrete version, and a href joined against the pre-redirect
+    // base lands on another item's page or a 404.
+    let Ok(base_url) = url::Url::parse(&out.url) else {
+        doc.ms = started.elapsed().as_millis() as u64;
+        return doc;
+    };
+    let Ok(page_url) = base_url.join(&found.href) else {
+        doc.ms = started.elapsed().as_millis() as u64;
+        return doc;
+    };
+    let title = format!("{} in {} - Rust", found.label, item.root);
+    // The snippet is the sentence the docs themselves write beside the item.
+    // The index's `title` attribute (`fn std::mem::take`) is the honest
+    // fallback, and neither is invented.
+    let snippet = found
+        .description
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| {
+            let attr = found.title_attr.trim();
+            (!attr.is_empty()).then(|| attr.to_string())
+        })
+        .unwrap_or_else(|| format!("{} · {} documentation", found.label, item.root));
+    doc.hits.push(Hit {
+        title,
+        url: page_url.to_string(),
+        snippet: super::evidence::cut(&snippet, 220),
+        rank: 0,
+        published: None,
+    });
+    cache_put(&key, &doc.hits);
+    doc.ms = started.elapsed().as_millis() as u64;
+    doc
+}
+
+/// The anchor that names `item` on a docs page.
+struct DocLink {
+    href: String,
+    /// The link's own text, `!` trimmed: `izip` for `macro.izip.html`.
+    label: String,
+    /// The anchor's `title` attribute, `fn std::mem::take`.
+    title_attr: String,
+    /// The docs' own sentence about the item, when the index page carries one
+    /// (a rustdoc item table puts it in the `<dd>` after the link).
+    description: Option<String>,
+}
+
+/// Find the item's anchor: its visible text first (`izip`, `take`, `Value`),
+/// then the file stem of its href (`macro.izip.html` → `izip`), because a
+/// rustdoc index may label a link differently from the item's name.
+fn find_item(page: &str, item: &str) -> Option<DocLink> {
+    let want = item.trim().trim_end_matches('!').to_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    let doc = scraper::Html::parse_document(page);
+    let Ok(sel) = scraper::Selector::parse("a[href]") else {
+        return None;
+    };
+    let mut by_href: Option<DocLink> = None;
+    for el in doc.select(&sel) {
+        let Some(href) = el.value().attr("href") else {
+            continue;
+        };
+        // Only links this module owns: `../other/index.html` is another page's
+        // item, and `#…`/`https://…` are not items of this module.
+        if href.contains("://") || href.starts_with('#') || href.starts_with("..") {
+            continue;
+        }
+        let text = el.text().collect::<String>();
+        let label = text.trim().trim_end_matches('!').trim().to_string();
+        // The anchor's text is the item's name: rustdoc writes `<a>izip</a>`
+        // and an inline `<code>` never splits it (`text()` walks the subtree).
+        if label.to_lowercase() == want {
+            return Some(DocLink {
+                href: href.to_string(),
+                label,
+                title_attr: el.value().attr("title").unwrap_or("").to_string(),
+                description: description_after(page, href),
+            });
+        }
+        if by_href.is_none()
+            && href_file_stem(href).is_some_and(|stem| stem.eq_ignore_ascii_case(&want))
+        {
+            by_href = Some(DocLink {
+                href: href.to_string(),
+                label: if label.is_empty() {
+                    item.to_string()
+                } else {
+                    label
+                },
+                title_attr: el.value().attr("title").unwrap_or("").to_string(),
+                description: description_after(page, href),
+            });
+        }
+    }
+    by_href
+}
+
+/// `fn.take.html` → `take`; `macro.izip.html` → `izip`.
+fn href_file_stem(href: &str) -> Option<&str> {
+    let file = href.rsplit('/').next()?;
+    let stem = file.strip_suffix(".html")?;
+    stem.split_once('.').map(|(_, name)| name).or(Some(stem))
+}
+
+/// The sentence the docs write about an item on its module's index page: the
+/// `<dd>` that follows the link in a rustdoc item table. Nothing is invented —
+/// a page that carries no sentence (the standard library lists functions in
+/// prose) yields none, and the caller falls back to the link's own title.
+fn description_after(page: &str, href: &str) -> Option<String> {
+    let needle = format!("href=\"{href}\"");
+    let at = page.find(&needle)?;
+    let rest = &page[at + needle.len()..];
+    // The `<dd>` must belong to this row: one far away is another item's.
+    let dd = rest.find("<dd")?;
+    if dd > 160 {
+        return None;
+    }
+    let rest = &rest[dd..];
+    let body = &rest[rest.find('>')? + 1..];
+    let text = fragment_text(&body[..body.find("</dd>")?]);
+    (!text.is_empty()).then_some(text)
+}
+
+/// The visible text of an HTML fragment, entities decoded and whitespace
+/// collapsed.
+fn fragment_text(html: &str) -> String {
+    let doc = scraper::Html::parse_fragment(html);
+    doc.root_element()
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the documentation lane ──────────────────────────
+
+    fn item_of(query: &str) -> Option<Item> {
+        item(&crate::search::query::QueryFacts::new(query))
+    }
+
+    #[test]
+    fn a_path_identifier_names_its_owner_and_its_item() {
+        assert_eq!(
+            item_of("itertools::izip"),
+            Some(Item {
+                root: "itertools".into(),
+                module: vec![],
+                name: "izip".into()
+            })
+        );
+        assert_eq!(
+            item_of("std::mem::take"),
+            Some(Item {
+                root: "std".into(),
+                module: vec!["mem".into()],
+                name: "take".into()
+            })
+        );
+        assert_eq!(
+            item_of("#[tokio::main]"),
+            Some(Item {
+                root: "tokio".into(),
+                module: vec![],
+                name: "main".into()
+            })
+        );
+        assert_eq!(
+            item_of("serde_json::Value"),
+            Some(Item {
+                root: "serde_json".into(),
+                module: vec![],
+                name: "Value".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_bare_name_has_no_owner_to_ask() {
+        // `select!` may be any crate's macro: a guessed owner is a wrong answer
+        // with a confident title, so the fan-out answers it instead.
+        assert!(item_of("select!").is_none());
+        // A scoped package is one name, not an owner and an item.
+        assert!(item_of("@types/node").is_none());
+        // A version is not a namespace path.
+        assert!(item_of("v1.2.3").is_none());
+        // Two words are a topic.
+        assert!(item_of("ngOnDestroy lifecycle hook").is_none());
+    }
+
+    #[test]
+    fn the_item_is_found_by_its_label_and_read_with_its_description() {
+        let page = r#"<dl class="item-table">
+            <dt><a class="macro" href="macro.iproduct.html" title="macro itertools::iproduct">iproduct</a></dt>
+            <dd>Create an iterator over the cartesian product of iterators.</dd>
+            <dt><a class="macro" href="macro.izip.html" title="macro itertools::izip">izip</a></dt>
+            <dd>Create an iterator running multiple iterators in lockstep.</dd>
+        </dl>"#;
+        let found = find_item(page, "izip").expect("the item");
+        assert_eq!(found.href, "macro.izip.html");
+        assert_eq!(found.label, "izip");
+        assert_eq!(found.title_attr, "macro itertools::izip");
+        assert_eq!(
+            found.description.as_deref(),
+            Some("Create an iterator running multiple iterators in lockstep.")
+        );
+    }
+
+    #[test]
+    fn the_item_is_found_by_its_file_stem_when_the_label_differs() {
+        // rustdoc labels a link `<code>take</code>` in prose; the href is the
+        // item's identity, so the stem answers when the text does not.
+        let page = r#"<p><a href="fn.take.html" title="fn std::mem::take"><code>take</code></a> is safe.</p>"#;
+        let found = find_item(page, "take").expect("the item");
+        assert_eq!(found.href, "fn.take.html");
+        // No item-table row: no invented description.
+        assert!(found.description.is_none());
+    }
+
+    #[test]
+    fn an_item_that_is_not_on_the_page_is_not_an_answer() {
+        let page = r#"<a href="fn.other.html">other</a>"#;
+        assert!(find_item(page, "izip").is_none());
+        // Another module's item is not this module's item.
+        let page = r#"<a href="../other/fn.izip.html">izip</a>"#;
+        assert!(find_item(page, "izip").is_none());
+    }
+
+    #[test]
+    fn the_language_docs_have_a_base_and_a_crate_does_not() {
+        assert_eq!(
+            std_base("std").as_deref(),
+            Some("https://doc.rust-lang.org/std/")
+        );
+        assert!(std_base("itertools").is_none());
+    }
+
+    #[test]
+    fn the_index_url_is_the_module_page() {
+        let item = Item {
+            root: "std".into(),
+            module: vec!["mem".into()],
+            name: "take".into(),
+        };
+        assert_eq!(
+            item.index_url("https://doc.rust-lang.org/std/"),
+            "https://doc.rust-lang.org/std/mem/index.html"
+        );
+        assert_eq!(item.path(), "std::mem::take");
+    }
 
     #[test]
     fn a_named_ecosystem_asks_one_registry() {
