@@ -69,14 +69,12 @@ semver = "1"
 # Agent CLI: spec-driven command generation (builder API, no derive).
 clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
 psl = { version = "=2.1.246" }
-# OCR/rerank support deps. `ort` itself goes ONLY in the per-target section
+# OCR support deps. `ort` itself goes ONLY in the per-target section
 # below, never here: Cargo unions features across every matching target
 # section, so declaring it in more than one place is how `load-dynamic` once
 # leaked onto macOS and silently stripped ONNX from those builds (the 3.3.0
 # bug — full story in src/onnx.rs). One section, one feature set, since #316.
 tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
-ndarray = { version = "0.17", optional = true }
-num_cpus = { version = "1.17", optional = true }
 
 # Every ONNX target dlopen's Microsoft's shared library at runtime: the
 # prebuilt static archives run unguarded AVX in C++ global constructors and
@@ -90,15 +88,15 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 
 [features]
 # No default features — the core tool (fetch, search, crawl, PDF)
-# works standalone. OCR and semantic reranking pull in ONNX Runtime,
-# a heavy C++ dependency whose static global constructors can deadlock
-# on some platforms (notably aarch64 Linux, see issue #9). `http` adds the
-# axum HTTP transport. CI and release builds pick features per target: the
-# full `--features ocr,rerank,http` where supported, fewer or none elsewhere
-# (see the matrices in .github/workflows/ci.yml).
+# works standalone. OCR pulls in ONNX Runtime, a heavy C++ dependency whose
+# static global constructors can deadlock on some platforms (notably aarch64
+# Linux, see issue #9). `http` adds the axum HTTP transport. Search never uses
+# ONNX and never loads a model: it is pure Rust, and OCR is its only consumer
+# (5.3.0 §8). CI and release builds pick features per target: the full
+# `--features ocr,http` where supported, fewer or none elsewhere (see the
+# matrices in .github/workflows/ci.yml).
 default = []
-ocr = ["dep:oar-ocr", "dep:image", "reqwest/blocking"]
-rerank = ["dep:ort", "dep:tokenizers", "dep:ndarray", "dep:num_cpus", "reqwest/blocking"]
+ocr = ["dep:oar-ocr", "dep:image", "dep:ort", "dep:tokenizers", "reqwest/blocking"]
 http = ["dep:axum", "dep:tower-http"]
 
 [target.'cfg(windows)'.dependencies]

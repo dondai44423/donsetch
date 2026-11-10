@@ -98,7 +98,7 @@ undo: fix forward and push, and the same version is tried again. One failed job
 Linux-only changes regularly broke Windows CI in `cfg`-gated code that never
 compiled locally. `just win-check` type-checks the whole crate for
 `x86_64-pc-windows-gnu` without linking — both ends of the feature matrix
-(full `ocr,rerank,http` and `--no-default-features`), all targets,
+(full `ocr,http` and `--no-default-features`), all targets,
 `-Dwarnings` — so those breaks surface before the push. It is not part of
 `just all` because it needs a cross toolchain on top of the normal build
 prerequisites (NASM, CMake and libclang are already required above). On
@@ -120,7 +120,7 @@ Per recipe:
   gcc/g++), `nasm` + `cmake` (BoringSSL build), `libclang-dev`
   (bindgen for boring-sys), and the `x86_64-pc-windows-gnu` rustup
   target. Run this one first; it is the cheaper half.
-- **`win-check-full`** (`ocr,rerank,http`): all of the above plus
+- **`win-check-full`** (`ocr,http`): all of the above plus
   `pkg-config` — the ort binary downloader builds a host-side
   `openssl-sys`, which needs pkg-config to find the system OpenSSL
   headers (`libssl-dev`, usually already present).

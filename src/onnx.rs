@@ -144,19 +144,19 @@
 
 #[cfg(all(
     any(target_os = "linux", target_os = "windows", target_os = "macos"),
-    any(feature = "ocr", feature = "rerank")
+    feature = "ocr"
 ))]
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "ocr", feature = "rerank"))]
+#[cfg(feature = "ocr")]
 use std::sync::OnceLock;
-#[cfg(any(feature = "ocr", feature = "rerank"))]
+#[cfg(feature = "ocr")]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(feature = "ocr", feature = "rerank"))]
+#[cfg(feature = "ocr")]
 use std::time::Duration;
 /// Message when an init attempt did not finish within
 /// [`ONNX_INIT_TIMEOUT_SECS`]. Kept as a stable, actionable line: the
 /// user can still run without OCR/rerank.
-pub const ONNX_HUNG_MSG: &str = "ONNX Runtime initialization hung (known upstream loader deadlock); OCR and rerank are disabled for this run. Fetch, PDF, crawl and search all continue to work normally.";
+pub const ONNX_HUNG_MSG: &str = "ONNX Runtime initialization hung (known upstream loader deadlock); OCR is disabled for this run. Fetch, PDF, crawl and search all continue to work normally.";
 
 /// How long the dedicated ONNX init thread may take before we
 /// declare the loader deadlocked and fail fast.
@@ -164,22 +164,21 @@ pub const ONNX_INIT_TIMEOUT_SECS: u64 = 15;
 
 /// Error when no ONNX Runtime library is found beside the binary or in
 /// the cache fallback.
-pub const ONNX_NOT_FOUND_MSG: &str =
-    "ONNX Runtime shared library not found. OCR and rerank are disabled.";
+pub const ONNX_NOT_FOUND_MSG: &str = "ONNX Runtime shared library not found. OCR is disabled.";
 
 /// Ensure ONNX Runtime is loaded and initialized.
 ///
 /// Returns `Ok(())` if ONNX is ready for use, or an `Err` with a
-/// human-readable message explaining why OCR/rerank is unavailable.
+/// human-readable message explaining why OCR is unavailable.
 ///
 /// Safe to call multiple times: the first call loads+inits, all
 /// subsequent calls return immediately.
 pub fn ensure_loaded() -> Result<(), String> {
-    #[cfg(not(any(feature = "ocr", feature = "rerank")))]
+    #[cfg(not(feature = "ocr"))]
     {
-        Err("not compiled with OCR/rerank support".to_string())
+        Err("not compiled with OCR support".to_string())
     }
-    #[cfg(any(feature = "ocr", feature = "rerank"))]
+    #[cfg(feature = "ocr")]
     {
         static STATE: OnceLock<Result<(), String>> = OnceLock::new();
         static HUNG: AtomicBool = AtomicBool::new(false);
@@ -221,7 +220,7 @@ pub fn ensure_loaded() -> Result<(), String> {
 /// `None` means the wait expired: the thread is left running, since a
 /// thread blocked inside the loader cannot be stopped. A thread that
 /// panics or cannot be spawned yields `Some(Err(..))`.
-#[cfg(any(feature = "ocr", feature = "rerank"))]
+#[cfg(feature = "ocr")]
 fn init_within<F>(init: F, timeout: Duration) -> Option<Result<(), String>>
 where
     F: FnOnce() -> Result<(), String> + Send + 'static,
@@ -249,7 +248,7 @@ where
 
 #[cfg(all(
     any(target_os = "linux", target_os = "windows", target_os = "macos"),
-    any(feature = "ocr", feature = "rerank")
+    feature = "ocr"
 ))]
 fn load_and_init() -> Result<(), String> {
     // No AVX gate here: see "Why there is no AVX gate" at the top.
@@ -287,7 +286,7 @@ fn load_and_init() -> Result<(), String> {
 /// [`init_within`].
 #[cfg(all(
     any(target_os = "linux", target_os = "windows", target_os = "macos"),
-    any(feature = "ocr", feature = "rerank")
+    feature = "ocr"
 ))]
 fn load_and_init_from(lib_path: &Path) -> Result<(), String> {
     // 3. Open the library ourselves first, so a library that cannot be
@@ -345,7 +344,7 @@ fn load_and_init_from(lib_path: &Path) -> Result<(), String> {
 /// 2. `cache_dir()/onnx/` (fallback for relocatable installs).
 #[cfg(all(
     any(target_os = "linux", target_os = "windows", target_os = "macos"),
-    any(feature = "ocr", feature = "rerank")
+    feature = "ocr"
 ))]
 fn find_shared_lib() -> Option<PathBuf> {
     let lib_name = shared_lib_name();
@@ -370,7 +369,7 @@ fn find_shared_lib() -> Option<PathBuf> {
 /// The runtime's file name beside the binary on the dlopen targets.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows", target_os = "macos"),
-    any(feature = "ocr", feature = "rerank")
+    feature = "ocr"
 ))]
 pub(crate) fn shared_lib_name() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -384,19 +383,19 @@ pub(crate) fn shared_lib_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(target_os = "linux", any(feature = "ocr", feature = "rerank")))]
+    #[cfg(all(target_os = "linux", feature = "ocr"))]
     #[test]
     fn shared_lib_name_is_so_on_linux() {
         assert_eq!(super::shared_lib_name(), "libonnxruntime.so");
     }
 
-    #[cfg(all(target_os = "windows", any(feature = "ocr", feature = "rerank")))]
+    #[cfg(all(target_os = "windows", feature = "ocr"))]
     #[test]
     fn shared_lib_name_is_dll_on_windows() {
         assert_eq!(super::shared_lib_name(), "onnxruntime.dll");
     }
 
-    #[cfg(all(target_os = "macos", any(feature = "ocr", feature = "rerank")))]
+    #[cfg(all(target_os = "macos", feature = "ocr"))]
     #[test]
     fn shared_lib_name_is_dylib_on_macos() {
         assert_eq!(super::shared_lib_name(), "libonnxruntime.dylib");
@@ -410,7 +409,7 @@ mod tests {
     /// payload fails at merge time, not at release time. Non-AVX
     /// Linux hosts skip it: they can't run ONNX by design (their
     /// builds must still pass).
-    #[cfg(any(feature = "ocr", feature = "rerank"))]
+    #[cfg(feature = "ocr")]
     #[test]
     fn onnx_payload_probe_initializes() {
         super::ensure_loaded().expect("ONNX Runtime failed to initialize");
@@ -424,7 +423,7 @@ mod tests {
     /// tests cover a failing load.
     #[cfg(all(
         any(target_os = "linux", target_os = "windows", target_os = "macos"),
-        any(feature = "ocr", feature = "rerank")
+        feature = "ocr"
     ))]
     #[test]
     fn a_runtime_that_cannot_load_fails_at_once_with_the_loader_error() {
@@ -453,7 +452,7 @@ mod tests {
     /// own text followed by the loader's message.
     #[cfg(all(
         any(target_os = "linux", target_os = "windows", target_os = "macos"),
-        any(feature = "ocr", feature = "rerank")
+        feature = "ocr"
     ))]
     fn assert_loader_error(outcome: Option<Result<(), String>>, lib: &std::path::Path) {
         let prefix = format!("Failed to load ONNX Runtime from {}: ", lib.display());
@@ -480,7 +479,7 @@ mod tests {
     /// and `ensure_loaded` cannot both succeed.
     #[cfg(all(
         any(target_os = "linux", target_os = "windows", target_os = "macos"),
-        any(feature = "ocr", feature = "rerank")
+        feature = "ocr"
     ))]
     #[test]
     fn a_runtime_whose_dependency_is_missing_fails_at_once_with_the_loader_error() {
@@ -501,7 +500,7 @@ mod tests {
     /// loader's error, on every host.
     #[cfg(all(
         any(target_os = "linux", target_os = "windows", target_os = "macos"),
-        any(feature = "ocr", feature = "rerank")
+        feature = "ocr"
     ))]
     #[test]
     fn a_file_that_is_not_a_library_fails_at_once_with_the_loader_error() {
@@ -519,7 +518,7 @@ mod tests {
     }
 
     /// The timeout guard still reports an init that really blocks.
-    #[cfg(any(feature = "ocr", feature = "rerank"))]
+    #[cfg(feature = "ocr")]
     #[test]
     fn an_init_that_blocks_is_reported_when_the_wait_expires() {
         let wait = std::time::Duration::from_millis(300);

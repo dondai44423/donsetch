@@ -16,7 +16,6 @@ const RRF_K: f64 = 60.0;
 /// fraction. Agreement between different indexes is the one signal here that
 /// text matching cannot fake.
 const CONSENSUS_MULT: f64 = 0.5;
-const MAX_PER_DOMAIN: usize = 2;
 /// Vertical-only hits rank below web-engine consensus:
 /// a GitHub/HN/wiki hit with no engine corroboration is
 /// a weaker signal than a URL three engines agree on.
@@ -179,13 +178,9 @@ fn collapse_ws(s: &str) -> String {
 /// multi-MiB title from any provider.
 const MAX_TITLE_CHARS: usize = 512;
 
-/// How many candidates the cross-encoder scores. 24 is past the point where a
-/// tie-break can matter: the answer is in the head of the list or it is not.
-const RERANK_DEPTH: usize = 24;
-
 /// No snippet may exceed this, whatever the source. The render cuts to 180 and
-/// the cross-encoder batches every candidate to the longest snippet it is given,
-/// so one unbounded description costs seconds of CPU on every search.
+/// every candidate is batched to the longest snippet it is given, so one
+/// unbounded description costs work on every search.
 const MAX_SNIPPET_CHARS: usize = 600;
 
 fn title_of(s: &str) -> String {
@@ -202,50 +197,23 @@ pub fn merge(
     families: &Families,
     max_results: usize,
 ) -> Vec<Merged> {
-    merge_inner(
-        per_engine,
-        query,
-        intent,
-        trust,
-        families,
-        max_results,
-        true,
-    )
+    merge_inner(per_engine, query, intent, trust, families, max_results)
 }
 
-/// Complete consensus/lexical ranking when the semantic worker exceeds the caller budget.
-#[cfg(feature = "rerank")]
-pub(crate) fn merge_lexical(
-    per_engine: &[(String, Vec<Hit>)],
-    query: &str,
-    intent: Intent,
-    trust: &HashMap<String, f64>,
-    families: &Families,
-    max_results: usize,
-) -> Vec<Merged> {
-    merge_inner(
-        per_engine,
-        query,
-        intent,
-        trust,
-        families,
-        max_results,
-        false,
-    )
-}
-
-/// Fusion over measured independence, nothing else.
+/// Fusion over measured independence, and nothing else *in this layer*.
 ///
-/// A URL's score is the best rank-decayed vote of each independent family that
-/// returned it, lifted a little for every extra family. There is no text
-/// scoring of titles and snippets and no domain table. Measured on a 40-query
-/// gold set with the sources' own results held fixed, BM25 over titles, a domain
-/// prior and an authority multiplier took hit@1 from 0.62 down to 0.17: the
-/// additive terms were ten to twenty times the size of the rank signal and
-/// promoted exactly the pages a search engine had already learned to bury (SEO
-/// restatements of the query). What survives is a bounded coverage penalty for
-/// wrong versions and mangled compound terms, and a freshness lift for dated
-/// news items.
+/// A URL's score here is the best rank-decayed vote of each independent family
+/// that returned it, lifted a little for every extra family. Text
+/// arrives one layer up, in [`super::fuse`], which blends BM25+ over the merged
+/// candidates with this vote — the vote knows nothing about text on purpose.
+///
+/// Measured on a 40-query gold set with the sources' own results held fixed: a
+/// domain prior and an authority multiplier took hit@1 from 0.62 down to 0.17,
+/// because the additive terms were ten to twenty times the size of the rank
+/// signal and promoted exactly the pages a search engine had already learned to
+/// bury (SEO restatements of the query). What survives here is a bounded
+/// coverage penalty for wrong versions and mangled compound terms, and a
+/// freshness lift for dated news items.
 fn merge_inner(
     per_engine: &[(String, Vec<Hit>)],
     query: &str,
@@ -253,7 +221,6 @@ fn merge_inner(
     trust: &HashMap<String, f64>,
     families: &Families,
     max_results: usize,
-    semantic: bool,
 ) -> Vec<Merged> {
     // Group by normalized URL. RRF mass is counted PER MEASURED FAMILY, not per
     // engine: sources that return the same results are one opinion, so a farm
@@ -400,15 +367,10 @@ fn merge_inner(
     // (github, hn, wikipedia) with no general web engine
     // corroboration is a weaker signal. The vertical found it
     // by keyword match; general engines not surfacing it means
-    // it's probably tangential. Applied after BM25+prior so
-    // it affects the pre-rerank score that feeds the rerank
-    // blend : the 60% RRF weight keeps it below consensus
-    // results even when the cross-encoder scores it high.
-    // The `authoritative` flag already gives full RRF weight
-    // (no VERTICAL_WEIGHT reduction) : that's enough of a
-    // boost. The penalty for zero general-engine corroboration
-    // applies equally: if no SERP found the Wikipedia article,
-    // it's probably the wrong one (e.g. Linearizability for
+    // it's probably tangential. The `authoritative` flag already gives full RRF
+    // weight (no VERTICAL_WEIGHT reduction), and the penalty for zero
+    // general-engine corroboration applies equally: if no SERP found the
+    // Wikipedia article, it's probably the wrong one (e.g. Linearizability for
     // a CRDT query).
     for r in &mut results {
         let has_general = r.sources.iter().any(|(e, _)| !is_vertical(e));
@@ -417,25 +379,11 @@ fn merge_inner(
         }
     }
 
-    // Cross-encoder semantic reranking: re-score by semantic
-    // relevance (query ↔ title+snippet through full attention).
-    // Skipped gracefully if model unavailable or feature disabled.
-    if semantic && crate::config::cfg().search.rerank {
-        // The cross-encoder is a tie-breaker over the strongest candidates, not
-        // a second retrieval: score the head of the lexical blend and leave the
-        // tail alone, so its cost is bounded by a constant, not by the merge.
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
-        let depth = results.len().min(RERANK_DEPTH);
-        crate::search::rerank::rerank(query, &mut results[..depth]);
-    }
-
     // Entity coverage penalty: penalize results that miss
     // key query entities (compound terms like "B-tree", wrong
     // version numbers like "5.5" when the query says "5.2").
-    // Sits after rerank so the cross-encoder can still rescue
-    // semantically-relevant results, but coverage gaps can't
-    // be fully overridden : "binary tree" ≠ "B-tree" no matter
-    // how similar the cross-encoder thinks they are.
+    // Coverage gaps cannot be overridden by lexical evidence:
+    // "binary tree" ≠ "B-tree" no matter how well the words match.
     crate::search::coverage::penalize(query, &mut results);
 
     // Dated news items rank fresh ones up and stale ones down; nothing else
@@ -473,12 +421,42 @@ fn merge_inner(
         };
     }
 
+    // The evidence, then the tie break. The vote is what independent indexes
+    // agree on; the lexical score is what the answers themselves say about the
+    // query. The vote leads and the evidence may move a candidate by at most the
+    // tie window — an even blend re-promoted SEO restatements of the query over
+    // the pages three indexes already rank well. Tiers still sort first: a
+    // resolver's record is proof the query named the page.
+    {
+        let vote: Vec<f64> = results.iter().map(|r| r.score).collect();
+        let evidence = super::fuse::reweight(&facts, &results);
+        for (r, fused) in results.iter_mut().zip(super::fuse::fuse(
+            &vote,
+            &evidence,
+            crate::config::cfg().search.tie_window,
+        )) {
+            r.score = fused;
+        }
+    }
+
+    // The learned ranker, when one is installed: the same candidates, scored by
+    // the trained linear model over the eighteen features instead of the fusion.
+    // `trained()` is false until `scripts/train_rank.py` writes weights that beat
+    // the fusion on held-out rows, so this branch is dead in a shipped build that
+    // never proved one.
+    if super::rank_weights::trained() {
+        let weights = &super::rank_weights::WEIGHTS;
+        let model = super::ltr::features(&facts, &results, trust);
+        for (r, x) in results.iter_mut().zip(&model) {
+            r.score = super::ltr::score(weights, x);
+        }
+    }
+
     results.sort_by(|a, b| {
         a.tier
             .cmp(&b.tier)
             .then_with(|| b.score.total_cmp(&a.score))
     });
-
     // Syndicated content dedup: same article republished under
     // different local TV/radio sites (fox43, localmemphis, etc.)
     // appears as separate hits with identical titles. Collapse
@@ -494,28 +472,13 @@ fn merge_inner(
     }
     results = deduped;
 
-    // Diversity cap: max MAX_PER_DOMAIN per domain.
-    let mut domain_count: HashMap<String, usize> = HashMap::new();
-    let mut diverse = Vec::with_capacity(max_results);
-    let mut overflow = Vec::new();
-    for r in results {
-        let host = host_of(&r.url);
-        let c = domain_count.entry(host).or_insert(0);
-        if *c < MAX_PER_DOMAIN {
-            *c += 1;
-            diverse.push(r);
-        } else {
-            overflow.push(r);
-        }
-        if diverse.len() >= max_results {
-            break;
-        }
-    }
-    // A host past its cap fills an empty slot only with a page that is itself
-    // about the query: its own title and URL cover it, not a snippet that
-    // mentions it. Filling with whatever was left put the subject's father and
-    // a mascot page into "who is Linus Torvalds" as the third and fourth
-    // Wikipedia rows; a shorter list costs the reader less.
+    // Diversity: two per host, one per canonical page, in fused order. A host
+    // past its cap fills an empty slot only with a page that is itself about
+    // the query: its own title and URL cover it, not a snippet that mentions
+    // it. Filling with whatever was left put the subject's father and a mascot
+    // page into "who is Linus Torvalds" as the third and fourth Wikipedia rows;
+    // a shorter list costs the reader less.
+    let (mut diverse, overflow) = super::fuse::diversify(results, max_results);
     if diverse.len() < max_results {
         let room = max_results - diverse.len();
         diverse.extend(

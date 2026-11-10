@@ -681,6 +681,13 @@ impl QueryFacts {
         self.terms.iter().map(|t| t.text.as_str())
     }
 
+    /// The terms with their weights: a quoted phrase counts for more than a
+    /// word. BM25+ and RM3 read this, so the query's own emphasis survives into
+    /// the score instead of being flattened into a bag of words.
+    pub fn weighted_terms(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.terms.iter().map(|t| (t.text.as_str(), t.weight))
+    }
+
     pub fn anchors(&self) -> &[String] {
         &self.anchors
     }
@@ -915,6 +922,12 @@ fn bigrams(run: &str) -> Vec<String> {
         .windows(2)
         .map(|w| w.iter().collect())
         .collect::<Vec<String>>()
+}
+
+/// Whether a word is English sentence furniture: never a term on its own, and
+/// never an RM3 expansion term either.
+pub(crate) fn is_stop_word(word: &str) -> bool {
+    STOP.contains(&word)
 }
 
 /// Does `term` occur in `text`? Latin terms are whole words, with a prefix

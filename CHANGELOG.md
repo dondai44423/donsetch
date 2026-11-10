@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Search carries no model.** The `rerank` feature is gone: no cross-encoder, no 23 MB download
+  and no ONNX in the search path (`ort` stays for OCR alone). `search.rerank*` config keys are
+  accepted as deprecated no-ops for one release, and the envelope's `reranked` is always `false`.
+- **Operators are read once.** `intitle:`/`filetype:`/`site:` come from the query's operator parse
+  and never enter the text as terms — `intitle:"Attention Is All You Need" arxiv` returned nothing
+  because no page contains the word "intitle". A quoted span is one phrase, matched as a run of
+  words.
+
+### Added
+
+- **A name is answered by its documentation.** `itertools::izip`, `#[tokio::main]`,
+  `std::mem::take` and `serde_json::Value` ask the module index page of the crate that owns them
+  and read the item's own href — `izip` is a macro, `Value` a struct, `take` a function, and a
+  guessed URL is a 404 returned as an answer. One request, cached for a week.
+- **`search-bench --features-out`** writes the candidate set with its labels and the eighteen
+  ranking features: the training input for `scripts/train_rank.py`, whose model is gated on
+  held-out MRR against the fusion it would replace.
+
+### Fixed
+
+- **An engine's answer is judged by the lane veto.** The encyclopedia/video and bare-front-door
+  vetoes were never called, so a dictionary page could answer `select!`.
+- **An operator query merges deeper** (40 candidates, not 12), so a title or type filter has
+  something to keep after it runs.
+
 ## [5.2.1] - 2026-11-10
 
 Search that answers on the first call, an EC2 instance price list, and a scorecard that

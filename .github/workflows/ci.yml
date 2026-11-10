@@ -148,9 +148,9 @@ jobs:
           fi
 
           # The test matrix: Linux always; the other two when asked for.
-          tests='[{"name":"linux-x86_64","os":"ubuntu-latest","features":"--features ocr,rerank,http","suite":"full"}'
+          tests='[{"name":"linux-x86_64","os":"ubuntu-latest","features":"--features ocr,http","suite":"full"}'
           if [ "$platforms" = true ]; then
-            tests="$tests"',{"name":"macos-arm64","os":"macos-latest","features":"--features ocr,rerank","suite":"platform"}'
+            tests="$tests"',{"name":"macos-arm64","os":"macos-latest","features":"--features ocr","suite":"platform"}'
             tests="$tests"',{"name":"windows-x86_64","os":"windows-latest","features":"","suite":"platform"}'
           fi
           tests="$tests]"
@@ -188,7 +188,7 @@ jobs:
       # unconditionally only breaks the other build (the cfg-twin class).
       - name: Clippy (full features)
         run: |
-          clippy() { cargo clippy --profile fast --locked --workspace --all-targets --features ocr,rerank,http -- -Dwarnings; }
+          clippy() { cargo clippy --profile fast --locked --workspace --all-targets --features ocr,http -- -Dwarnings; }
           clippy || { echo "::warning::first compile failed; retrying once (download outage?)"; sleep 45; clippy; }
       - name: Clippy (no features)
         run: cargo clippy --profile fast --locked --workspace --all-targets --no-default-features -- -Dwarnings
@@ -277,12 +277,12 @@ jobs:
             # every distro from 22.04 up. A newer builder leaks its glibc
             # requirement into the artifact (issue #93); scripts/gates.sh checks.
             os: ubuntu-22.04
-            features: --features ocr,rerank,http
+            features: --features ocr,http
             rustflags: -C target-cpu=x86-64
             cache: 'false'      # cold is 5-8 minutes; not worth 1.3 GB of the pool
           - name: linux-arm64
             os: ubuntu-22.04-arm
-            # PDF is in; OCR and rerank are off: the official ONNX aarch64
+            # PDF is in; OCR is off: the official ONNX aarch64
             # prebuilt deadlocks at dlopen on native arm64. No linker flag on
             # purpose: build.rs links PDFium with the toolchain's own rust-lld,
             # because the runner's apt lld silently skips PDFium's CREL
@@ -292,17 +292,17 @@ jobs:
             cache: 'false'
           - name: darwin-arm64
             os: macos-latest
-            features: --features ocr,rerank,http
+            features: --features ocr,http
             rustflags: ''
             cache: 'true'       # cold is 12-14 minutes
           - name: darwin-x64
             os: macos-15-intel
-            features: --features ocr,rerank,http
+            features: --features ocr,http
             rustflags: ''
             cache: 'true'       # cold is 15-25 minutes
           - name: win32-x64
             os: windows-latest
-            features: --features ocr,rerank,http
+            features: --features ocr,http
             rustflags: ''
             cache: 'true'       # cold is 16 minutes
     steps:
@@ -474,7 +474,7 @@ jobs:
           tool: nextest
       - name: Heavy set
         run: >-
-          cargo nextest run --profile ci --cargo-profile dist-thin --locked --features ocr,rerank,http --workspace
+          cargo nextest run --profile ci --cargo-profile dist-thin --locked --features ocr,http --workspace
           --ignore-default-filter --no-fail-fast
           -E 'test(soak) | test(corpus) | test(landmark) | test(pdf::tests::progit_book) | test(pdf::tests::smoke_scanned_detection) | test(pdf::tests::pdf_spec_loads) | test(search::tests::stealth_v3_preflight_batch_obeys_a_global_ceiling)'
       - uses: ./.github/actions/save-cache

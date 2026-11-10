@@ -12,11 +12,13 @@ pub mod egress;
 pub mod engines;
 pub mod evidence;
 pub mod families;
+pub mod fuse;
 pub mod instant;
 pub mod intent;
+pub mod ltr;
 pub mod query;
 pub mod rank;
-pub mod rerank;
+pub mod rank_weights;
 pub mod verticals;
 
 mod authority;
@@ -514,29 +516,6 @@ pub struct Searcher {
     families: Mutex<families::Families>,
 }
 
-#[cfg(feature = "rerank")]
-/// Run synchronous ranking outside Tokio's async worker set.
-///
-/// Semantic reranking can enter ONNX inference and wait on the shared session
-/// mutex. The ranking API stays synchronous, so the blocking pool is the narrow
-/// boundary that keeps unrelated async work progressing.
-async fn run_blocking_ranking<F, T>(job: F) -> Result<Option<T>, FetchError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    let budget = stage_budget(Duration::from_secs(30), Duration::from_millis(500));
-    if budget.is_zero() {
-        return Ok(None);
-    }
-    match tokio::time::timeout(budget, tokio::task::spawn_blocking(job)).await {
-        Ok(result) => result
-            .map(Some)
-            .map_err(|e| FetchError::Http(format!("search: ranking worker failed: {e}"))),
-        Err(_) => Ok(None),
-    }
-}
-
 // v3 F1: search→fetch warm handoff store : filled by enrichment, drained
 // by the fetch tool. Implementation + the enrichment pass live in
 // `search::enrich`.
@@ -567,7 +546,9 @@ pub struct SearchOutcome {
     pub elapsed: Duration,
     /// BYOK provider name (None = local search).
     pub provider: Option<String>,
-    /// Cross-encoder reranking applied (feature on + model loaded).
+    /// Deprecated and always false: search has no cross-encoder, no ONNX and no
+    /// model in its path (§8). The field stays in the envelope for one release
+    /// so a caller that reads it does not break.
     pub reranked: bool,
     /// C5: byte-derived featured snippet / instant / knowledge.
     /// Never merged into `results`. None when absent.
@@ -1060,7 +1041,7 @@ impl Searcher {
                         cached: true,
                         elapsed: started.elapsed(),
                         provider: None,
-                        reranked: crate::search::rerank::loaded(),
+                        reranked: false,
                         // Instant is not cached: a stale featured
                         // snippet presented as fresh would lie.
                         instant: None,
@@ -1124,7 +1105,7 @@ impl Searcher {
                 cached: true,
                 elapsed: started.elapsed(),
                 provider: None,
-                reranked: crate::search::rerank::loaded(),
+                reranked: false,
                 // Instant is not cached: a stale featured
                 // snippet presented as fresh would lie.
                 instant: None,
@@ -1938,27 +1919,19 @@ impl Searcher {
         // max_results for the response. Without this, a first
         // search with max=2 caches only 2 results, and a later
         // search with max=10 returns the stale 2 from cache.
-        // With semantic reranking enabled, merge includes synchronous ONNX
-        // inference. Core builds keep the existing inline fast path below.
-        #[cfg(feature = "rerank")]
-        let (mut results, ranking_finished) = {
-            let fallback =
-                rank::merge_lexical(&per_engine, query, intent, &trust, &families_now, 12);
-            let query = query.to_string();
-            let families_job = families_now.clone();
-            match run_blocking_ranking(move || {
-                rank::merge(&per_engine, &query, intent, &trust, &families_job, 12)
-            })
-            .await?
-            {
-                Some(results) => (results, true),
-                None => (fallback, false),
-            }
-        };
-        #[cfg(not(feature = "rerank"))]
-        let ranking_finished = true;
-        #[cfg(not(feature = "rerank"))]
-        let mut results = rank::merge(&per_engine, query, intent, &trust, &families_now, 12);
+        // A query with an operator filters its own answer after the merge, so it
+        // needs a deeper pool: the twelve a plain query needs can be emptied by a
+        // title filter (measured: `intitle:"Attention Is All You Need" arxiv` came
+        // back empty while three lanes had answered — the paper sat beyond slot 12).
+        let merge_depth = if compiled.has_operators() { 40 } else { 12 };
+        let mut results = rank::merge(
+            &per_engine,
+            query,
+            intent,
+            &trust,
+            &families_now,
+            merge_depth,
+        );
         // B3: learned host quality nudge. After merge (and its
         // diversity cap) so it only reorders survivors with a
         // small weight; consensus still dominates.
@@ -2028,41 +2001,14 @@ impl Searcher {
         }
         let filters_ms = filters_t.elapsed().as_millis();
 
-        // Post-enrichment top-up: the cross-encoder now sees the
-        // real page titles/descriptions on the top slice, not the
-        // SERP fragments. Bounded additive nudge, then re-sort.
-        // DONSEEK_NO_TOPUP is the A/B kill switch for benching.
-        #[cfg(feature = "rerank")]
-        let topup_ms: u128 = {
-            if crate::config::cfg().search.rerank
-                && crate::config::cfg().search.rerank_topup
-                && !stage_budget(Duration::from_secs(1), Duration::from_millis(500)).is_zero()
-            {
-                let t = std::time::Instant::now();
-                let q = query.to_string();
-                let mut owned = results.clone();
-                let r = run_blocking_ranking(move || {
-                    crate::search::rerank::topup(&q, &mut owned, 8);
-                    owned
-                });
-                if let Some(ranked) = r.await? {
-                    results = ranked;
-                }
-                t.elapsed().as_millis()
-            } else {
-                0
-            }
-        };
-        // Without the rerank feature the stage is a no-op: report a
-        // flat zero so stage_ms stays schema-stable on all feature
-        // halves of the build matrix.
-        #[cfg(not(feature = "rerank"))]
+        // No cross-encoder stage: search carries no model (5.3.0 §8). The
+        // stage is reported flat so `stage_ms` stays schema-stable.
         let topup_ms: u128 = 0;
         // Poisoning guard: a merge built while engines
         // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
         let content_lanes = report.iter().filter(|r| r.status == "ok").count();
-        let cacheable = ranking_finished && content_lanes >= 2 && total >= 8;
+        let cacheable = content_lanes >= 2 && total >= 8;
         if cacheable {
             let snapshot = {
                 let mut cache = self
@@ -2128,7 +2074,7 @@ impl Searcher {
             cached: false,
             elapsed: started.elapsed(),
             provider: None,
-            reranked: ranking_finished && crate::search::rerank::loaded(),
+            reranked: false,
             instant,
             stage_ms: stages,
         })
@@ -3463,52 +3409,6 @@ mod tests {
         }
         unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(feature = "rerank")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocking_ranking_keeps_the_async_executor_responsive() {
-        let (tick_sender, tick_receiver) = std::sync::mpsc::channel();
-
-        let (worker_result, ()) = tokio::join!(
-            run_blocking_ranking(move || tick_receiver.recv_timeout(Duration::from_secs(1))),
-            async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                tick_sender.send(()).expect("blocking worker should wait");
-            }
-        );
-
-        assert!(
-            worker_result
-                .expect("blocking job should join")
-                .expect("job completed within budget")
-                .is_ok()
-        );
-    }
-
-    #[cfg(feature = "rerank")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn report_audit_semantic_deadline_retains_lexical_evidence() {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
-        let result = SEARCH_DEADLINE
-            .scope(Some(deadline), async {
-                let (ranked, started) = tokio::join!(
-                    run_blocking_ranking(move || {
-                        started_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                        "semantic evidence"
-                    }),
-                    started_rx,
-                );
-                started.unwrap();
-                ranked.unwrap().unwrap_or("retrieved lexical evidence")
-            })
-            .await;
-        release_tx.send(()).unwrap();
-        assert_eq!(result, "retrieved lexical evidence");
-        assert!(tokio::time::Instant::now() < deadline);
     }
 
     #[test]

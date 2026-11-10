@@ -289,9 +289,9 @@ fn main() {
     // ONNX Runtime is now dynamically loaded (ort load-dynamic).
     // The C++ global constructor deadlock that affected aarch64
     // with static linking no longer occurs at process start.
-    // ONNX is dlopen'd at runtime only when OCR/rerank is used.
+    // ONNX is dlopen'd at runtime only when OCR is used.
     // The aarch64 ONNX prebuilt is not available from pyke, so
-    // aarch64 builds simply lack OCR/rerank (reported at runtime).
+    // aarch64 builds simply lack OCR (reported at runtime).
 
     // ── ONNX Runtime shared library (dynamic loading) ────────
     //
@@ -304,9 +304,8 @@ fn main() {
     // linked. Instead, we build a shared library (.so/.dylib/.dll)
     // from the prebuilt static archive at build time, and dlopen it
     // at runtime after an AVX check. Non-AVX CPUs get a working binary
-    // (minus OCR/rerank) instead of SIGILL.
-    let has_onnx =
-        env::var_os("CARGO_FEATURE_OCR").is_some() || env::var_os("CARGO_FEATURE_RERANK").is_some();
+    // (minus OCR) instead of SIGILL.
+    let has_onnx = env::var_os("CARGO_FEATURE_OCR").is_some();
     if has_onnx {
         if let Some(info) = onnx_target_info(&os, &arch) {
             // Every ONNX target fetches Microsoft's shared library
@@ -317,9 +316,7 @@ fn main() {
             // Anything without a pinned prebuilt (aarch64 Linux's
             // loader deadlocks; Android is unsupported): the
             // features compile and report unavailable at runtime.
-            eprintln!(
-                "donsetch build: OCR/rerank enabled, no pinned ONNX prebuilt for {os}-{arch}"
-            );
+            eprintln!("donsetch build: OCR enabled, no pinned ONNX prebuilt for {os}-{arch}");
         }
     }
 
@@ -696,7 +693,7 @@ fn fetch_pdfium(os: &str, arch: &str, vendored: &Path) {
 /// Linux/Windows (the prebuilt shared library; built against older
 /// glibc than the pyke archive relink we used before, GLIBC_2.27 max
 /// required vs 2.38, and free of `__isoc23_*`/2.38-only imports, so
-/// OCR/rerank work on every distro from Ubuntu 18.04 onward), and
+/// OCR work on every distro from Ubuntu 18.04 onward), and
 /// v1.23.2 for macOS (#316: the last Developer-ID-signed macOS build;
 /// 1.24.2+ mac tarballs are ad-hoc signed and raise the minimum to
 /// macOS 14, while 1.23.2 asks 13.4). SHA256 pins verified at download.
@@ -769,7 +766,7 @@ fn onnx_target_info(os: &str, arch: &str) -> Option<OnnxTarget> {
         // aarch64 (proven by the CI payload probe timing out at its
         // exact 15s guard in the v3.4.2 arm64 experiment). Same
         // family as pykeio/ort #579. ARM64 therefore ships without
-        // OCR/rerank (doctor reports "not compiled"; the honest
+        // OCR (doctor reports "not compiled"; the honest
         // guard message explains it where relevant).
         _ => return None,
     };

@@ -493,6 +493,9 @@ pub struct Options {
     /// Re-rank the candidates saved in these bench files with the current code,
     /// offline, instead of searching the web.
     pub replay: Vec<PathBuf>,
+    /// Write one JSON line per row: the candidate set with its labels and the
+    /// eighteen ranking features. What `scripts/train_rank.py` trains on.
+    pub features_out: Option<PathBuf>,
     pub verbose: bool,
 }
 
@@ -517,6 +520,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         gap: Duration::ZERO,
         bin: None,
         replay: Vec::new(),
+        features_out: None,
         verbose: false,
     };
     let mut i = 0;
@@ -563,6 +567,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             "--bin" => o.bin = Some(PathBuf::from(value(&mut i)?)),
             "--out" => o.out = Some(PathBuf::from(value(&mut i)?)),
             "--replay" => o.replay.push(PathBuf::from(value(&mut i)?)),
+            "--features-out" => o.features_out = Some(PathBuf::from(value(&mut i)?)),
             "-v" | "--verbose" => o.verbose = true,
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
@@ -804,6 +809,13 @@ async fn in_process_row(searcher: &Searcher, opts: &Options, q: &BenchQuery) -> 
         Err(e) => (Vec::new(), format!("error: {e}")),
     };
     let judged = judge(q, &answers);
+    // The training dump: what the ranker was offered, what each candidate's
+    // features are, and which one the row's answer key says is right.
+    if let Some(path) = &opts.features_out
+        && let Ok(outcome) = &outcome
+    {
+        write_features(path, q, &outcome.results);
+    }
     let redirects = answers
         .iter()
         .filter(|r| super::contract::url_class(&r.url) != super::contract::UrlClass::Page)
@@ -1294,6 +1306,74 @@ impl SnippetTally {
             self.old_clean_end as f64 / n,
             self.new_clean_end as f64 / n,
         )
+    }
+}
+
+/// The page a candidate is, for training: `2` when its URL matches one of the
+/// row's gold patterns, `1` when it is on the same host as one, `0` otherwise.
+/// A `must_not` candidate is not a training example at all — the ranker is never
+/// asked to choose it.
+fn label_of(q: &BenchQuery, url: &str) -> Option<u8> {
+    if q.must_not_re().iter().any(|re| re.is_match(url)) {
+        return None;
+    }
+    if q.gold_re().iter().any(|re| re.is_match(url)) {
+        return Some(2);
+    }
+    let host = super::rank::host_of(url);
+    let same = q
+        .gold
+        .iter()
+        .filter_map(|pattern| gold_host(pattern))
+        .any(|gold| gold == host);
+    Some(u8::from(same))
+}
+
+/// The host a gold pattern is anchored on: `docs\.rs/tokio[^ ]*` → `docs.rs`.
+/// A pattern that names no host (`^arxiv`) yields none, and is just not used for
+/// the same-host label.
+fn gold_host(pattern: &str) -> Option<String> {
+    let head = pattern.split('/').next()?;
+    let cleaned: String = head
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .collect();
+    let cleaned = cleaned.trim_start_matches("www.").to_string();
+    let looks_like_host = cleaned.contains('.') && !cleaned.starts_with('.');
+    looks_like_host.then_some(cleaned)
+}
+
+/// Append one row's training example: the candidates the ranker was given, their
+/// features, and the label the row's answer key gives each of them.
+fn write_features(path: &std::path::Path, q: &BenchQuery, results: &[super::rank::Merged]) {
+    use std::io::Write;
+    let facts = super::query::QueryFacts::new(&q.query);
+    let trust = std::collections::HashMap::new();
+    let features = super::ltr::features(&facts, results, &trust);
+    let candidates: Vec<serde_json::Value> = results
+        .iter()
+        .zip(&features)
+        .filter_map(|(r, x)| {
+            let label = label_of(q, &r.url)?;
+            Some(json!({ "url": r.url, "label": label, "x": x.to_vec() }))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let line = json!({
+        "id": q.id,
+        "set": q.set,
+        "shape": q.shape,
+        "query": q.query,
+        "candidates": candidates,
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 

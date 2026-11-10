@@ -65,7 +65,7 @@
 #   RELEASE_MIRROR=http://127.0.0.1:18777/v8 just bin
 # Absolute, so a recipe that cd's first (fuzz) can still use it.
 budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
-feat := "--features ocr,rerank,http"
+feat := "--features ocr,http"
 
 # Storage guard: one implementation, four entry points (scripts/guard.sh):
 # `just guard`/`just all`/pre-push measure and reclaim at the ceiling,

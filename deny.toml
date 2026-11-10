@@ -6,7 +6,7 @@
 
 [graph]
 # Check all feature combinations that matter: the default core
-# build and the full ocr+rerank build.
+# build and the full ocr build.
 all-features = true
 
 [advisories]

@@ -12,17 +12,6 @@ use super::language::{self, LanguageInfo};
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
-/// Max blocks for semantic rescue when the lexical query has no hits.
-/// Larger pages keep the honest full-content fallback instead of paying
-/// cross-encoder inference over a reference manual.
-const SEMANTIC_MAX_BLOCKS: usize = 8;
-
-/// Cross-encoder relevance threshold (sigmoid output [0,1]).
-/// Blocks scoring above this are kept even if BM25 missed them.
-/// 0.3 catches semantically relevant blocks while filtering
-/// out navigation, boilerplate, and unrelated sections.
-const XENC_THRESHOLD: f64 = 0.3;
-
 // ── Stopwords ────────────────────────────────────────────────
 
 const STOP_EN: &[&str] = &[
@@ -1095,7 +1084,9 @@ fn expand_breadcrumbs(blocks: &[Block], kept: &mut Vec<usize>, kept_set: &mut Ha
     }
 }
 
-/// Keep CPU-heavy optional inference off multi-thread Tokio workers.
+/// Keep CPU-heavy optional inference off multi-thread Tokio workers. Used by
+/// tests only now: search has no inference to offload (5.3.0 §8).
+#[cfg(test)]
 fn offload_inference<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'static) -> R {
     use tokio::runtime::RuntimeFlavor;
     if let Ok(handle) = tokio::runtime::Handle::try_current()
@@ -1104,11 +1095,6 @@ fn offload_inference<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'stati
         return tokio::task::block_in_place(work);
     }
     work()
-}
-
-fn xenc_scores(query: &str, docs: Vec<(String, String)>) -> Option<Vec<f64>> {
-    let q = query.to_string();
-    offload_inference(move || crate::search::rerank::cross_encoder_scores(&q, &docs))
 }
 
 /// Select lexical evidence with real heading ancestry and source order.
@@ -1129,25 +1115,9 @@ pub fn filter_semantic<'a>(
     let max_bm25 = scores.iter().cloned().fold(0.0f64, f64::max);
 
     if max_bm25 <= 0.0 {
-        // BM25 found nothing. Try cross-encoder rescue.
-        if blocks.len() <= SEMANTIC_MAX_BLOCKS && crate::search::rerank::is_model_cached() {
-            let docs: Vec<(String, String)> = blocks
-                .iter()
-                .map(|b| (b.body_text(), String::new()))
-                .collect();
-            if let Some(xenc_scores) = xenc_scores(query, docs) {
-                let xenc_max = xenc_scores.iter().cloned().fold(0.0f64, f64::max);
-                if xenc_max >= XENC_THRESHOLD {
-                    let mut kept = select_sections_core(blocks, &xenc_scores, XENC_THRESHOLD);
-                    if !kept.is_empty() {
-                        let mut kept_set: HashSet<usize> = kept.iter().copied().collect();
-                        expand_breadcrumbs(blocks, &mut kept, &mut kept_set);
-                        kept.sort_unstable();
-                        return (kept.into_iter().map(|i| &blocks[i]).collect(), false);
-                    }
-                }
-            }
-        }
+        // Nothing lexical matched. There is no semantic rescue any more:
+        // search carries no model and no ONNX (5.3.0 §8), so the honest answer
+        // is the whole page and the caller's own fetch.
         return (blocks.iter().collect(), true); // fell_back
     }
 

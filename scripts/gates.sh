@@ -46,7 +46,7 @@ NEED=15000000
 EXPECT="shared library present"
 case "$platform" in
     linux-x64)    LIB=libonnxruntime.so ;;
-    # PDF (core) is in; OCR and rerank are off: the official ONNX aarch64
+    # PDF (core) is in; OCR is off: the official ONNX aarch64
     # prebuilt deadlocks at dlopen on native arm64.
     linux-arm64)  EXPECT="not compiled"; NEED=6000000 ;;
     darwin-arm64) LIB=libonnxruntime.dylib; NEED=12000000 ;;

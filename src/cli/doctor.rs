@@ -376,8 +376,8 @@ pub async fn run(args: &[String]) {
     // 11. OCR models.
     report!("OCR models", check_ocr_models());
 
-    // 12. Rerank model.
-    report!("Rerank model", check_rerank_model());
+    // 12. Search model: a positive assertion that the search path carries none.
+    report!("Search model", check_search_model());
 
     // 13. ONNX Runtime / AVX.
     report!("ONNX Runtime", check_onnx());
@@ -1174,37 +1174,10 @@ fn check_state_permissions() -> CheckResult {
     }
 }
 
-/// Cross-encoder rerank model cache (semantic search reranking
-/// + focus filter). Missing = downloads on first search.
-fn check_rerank_model() -> CheckResult {
-    #[cfg(not(feature = "rerank"))]
-    {
-        CheckResult::Warn("not compiled (build with --features rerank to enable)".into())
-    }
-    #[cfg(feature = "rerank")]
-    {
-        let dir = paths::cache_dir().join("rerank");
-        if !dir.exists() {
-            return CheckResult::Warn("not cached (downloads on first search)".into());
-        }
-        let models = std::fs::read_dir(&dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .is_some_and(|ext| ext == "onnx" || ext == "json" || ext == "txt")
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        if models > 0 {
-            CheckResult::Pass(format!("{models} model files cached"))
-        } else {
-            CheckResult::Warn("not cached (downloads on first search)".into())
-        }
-    }
+/// Search carries no model (5.3.0 §8): no weights, no download, no ONNX, so
+/// there is nothing to fetch and nothing to check.
+fn check_search_model() -> CheckResult {
+    CheckResult::Pass("not used: search runs no model".into())
 }
 
 // Probe only a newly created file owned by this check. A fixed filename can
@@ -1246,7 +1219,6 @@ fn check_cache_dir() -> CheckResult {
             // < 1MB after cookie filtering.
             let ghost_state = dir.join("ghost-state.json");
             let ocr = dir.join("ocr");
-            let rerank = dir.join("rerank");
             let search_cache = dir.join("search-cache.json");
 
             let parts = [
@@ -1259,14 +1231,6 @@ fn check_cache_dir() -> CheckResult {
                     },
                 ),
                 ("ocr-models", if ocr.exists() { dir_size(&ocr) } else { 0 }),
-                (
-                    "rerank-models",
-                    if rerank.exists() {
-                        dir_size(&rerank)
-                    } else {
-                        0
-                    },
-                ),
                 (
                     "search-cache",
                     if search_cache.exists() {
@@ -1363,11 +1327,11 @@ fn check_ocr_models() -> CheckResult {
 }
 
 fn check_onnx() -> CheckResult {
-    #[cfg(not(any(feature = "ocr", feature = "rerank")))]
+    #[cfg(not(feature = "ocr"))]
     {
-        CheckResult::Warn("not compiled (build with --features ocr,rerank to enable)".into())
+        CheckResult::Warn("not compiled (build with --features ocr to enable)".into())
     }
-    #[cfg(any(feature = "ocr", feature = "rerank"))]
+    #[cfg(feature = "ocr")]
     {
         // Real probe, not a cfg constant: initialize the ONNX
         // environment and surface the result. A build whose runtime
@@ -1416,7 +1380,7 @@ fn check_onnx() -> CheckResult {
 /// The ONNX Runtime check's verdict on a load `outcome`, with `cpu`
 /// leading the line. A runtime that is not found is a warning; any
 /// other load error fails the check with that error's own text.
-#[cfg(any(feature = "ocr", feature = "rerank"))]
+#[cfg(feature = "ocr")]
 fn onnx_probe_verdict(cpu: &str, outcome: Result<(), String>) -> CheckResult {
     match outcome {
         Ok(()) => CheckResult::Pass(format!("{cpu}, shared library present")),
@@ -2982,7 +2946,7 @@ mod bright_probe_tests {
     }
 }
 
-#[cfg(all(test, any(feature = "ocr", feature = "rerank")))]
+#[cfg(all(test, feature = "ocr"))]
 mod onnx_verdict_tests {
     use super::{CheckResult, onnx_probe_verdict};
 

@@ -415,7 +415,7 @@ async fn route_help(cmd: &str) {
             println!("Usage: donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]");
             println!();
             println!("  Health checks: binary, network, TLS, browser, browser launch,");
-            println!("  auth profile, cache, permissions, PDFium, OCR models, rerank model,");
+            println!("  auth profile, cache, permissions, PDFium, OCR models,");
             println!("  egress lanes, local rules.");
             println!("  Auto-fixes what it can. Reports issues with instructions.");
             println!("  --deep     live egress-lane and provider probes");
