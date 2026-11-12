@@ -1,8 +1,9 @@
-# Publish the npm wrapper package. The CI pipeline calls this as its last job
-# (workflow_call) once it has published the GitHub release; it also runs when a
-# release is published by hand in the GitHub UI, and manually (workflow_dispatch)
-# to retry or to prove the credential. A release created by the pipeline's own
-# token raises no `release` event, which is why the pipeline calls this directly.
+# Publish the npm wrapper package. Runs as its own workflow: ci.yml's release job
+# dispatches it (`gh workflow run`) once the GitHub release exists, so a registry
+# or credential failure here reddens only this run. It also runs when a release is
+# published by hand in the GitHub UI, and manually (workflow_dispatch) to retry or
+# to prove the credential. A release created by the pipeline's own token raises no
+# `release` event, which is why the pipeline dispatches it.
 #
 # History (2026-09-15): v4.0.0 and v4.1.0 shipped to GitHub releases
 # but npm stayed on 3.6.7 because publishing was a manual step nobody
@@ -17,10 +18,11 @@
 # - If the version is already on the registry the publish is skipped
 #   (re-publishing the same version is an npm error).
 #
-# Auth: the NPM_TOKEN secret, a granular write token for `donsetch` (it
-# expires; renew it on npmjs.com and `gh secret set NPM_TOKEN`). npm prefers
-# trusted publishing (OIDC) when npmjs.com trusts this workflow, which is why
-# the job keeps `id-token: write` and npm >= 11.5.1.
+# Auth: trusted publishing (OIDC) once npmjs.com trusts this workflow — one
+# GitHub Actions trusted publisher for repo dondai44423/donsetch, workflow
+# `npm-publish.yml`, "Allow npm publish" ticked. npm tries OIDC before any token
+# and falls back to the NPM_TOKEN secret only while that publisher is absent, so
+# `id-token: write` and npm >= 11.5.1 stay.
 
 name: npm publish
 
@@ -29,12 +31,6 @@ permissions:
   id-token: write
 
 on:
-  workflow_call:
-    inputs:
-      tag:
-        description: Release tag to publish
-        required: true
-        type: string
   release:
     # `released` is a normal release; publishing a beta or rc draft fires
     # `prereleased` instead, so without this line no prerelease ever reached

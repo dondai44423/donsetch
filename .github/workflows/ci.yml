@@ -8,7 +8,7 @@
 #             every release and nightly run.
 #   build     the five shipped binaries (`dist-thin`), each gated by
 #             scripts/gates.sh and packaged. Release commits and nightly only.
-#   publish   tag + GitHub release from those exact artifacts, then npm.
+#   publish   tag + GitHub release; then dispatches npm as its own run.
 #   gate      the one required status check: green when nothing failed.
 #
 # A RELEASE is a push to master whose Cargo.toml version has no tag yet. That is
@@ -18,7 +18,8 @@
 # publishes are the ones it gated: nothing is rebuilt between "tested" and
 # "shipped". A red run publishes nothing and leaves nothing to undo; fix forward
 # and push again and the same version is tried again. One failed job re-runs
-# alone (`gh run rerun <id> --failed`), including the npm step.
+# alone (`gh run rerun <id> --failed`); the npm run retries on its own
+# (`gh workflow run npm-publish.yml -f tag=v<version>`).
 #
 # WHY IT IS SHAPED THIS WAY (the numbers are from the runs of 2026-11-08):
 #   * Tests ran on release opts and the product crate compiled three times per
@@ -364,7 +365,7 @@ jobs:
           key: ${{ steps.setup.outputs.cache-key }}
           profile: dist-thin
 
-  # ── Tag + release + npm, from the artifacts that were just gated ───────────
+  # ── Tag + release, from the artifacts that were just gated ─────────────────
   publish:
     needs: [plan, lint, test, build]
     if: >-
@@ -374,6 +375,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      # Dispatch only. npm is a separate workflow run, so a registry or
+      # credential failure cannot redden a release that already shipped.
+      actions: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -419,16 +423,14 @@ jobs:
             gh release create "$tag" artifacts/donsetch-*.tar.gz artifacts/donsetch-*.sha256 \
               --target "$GITHUB_SHA" --title "$tag" --notes-file RELEASE_BODY.md $pre
           fi
-
-  npm:
-    needs: [plan, publish]
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/npm-publish.yml
-    with:
-      tag: v${{ needs.plan.outputs.version }}
-    secrets: inherit
+      # Its own run, not a job of this one. `workflow_dispatch` is the one event
+      # GITHUB_TOKEN may raise, and a top-level run gets its own conclusion: the
+      # release above is already published, and a red npm run stays red alone.
+      - name: Dispatch the npm publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.plan.outputs.version }}
+        run: gh workflow run npm-publish.yml -R "$GITHUB_REPOSITORY" -f tag="$TAG"
 
   # ── The one required check ─────────────────────────────────────────────────
   gate:

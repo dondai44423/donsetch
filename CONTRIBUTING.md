@@ -88,10 +88,13 @@ release to the pipeline: it runs the suite on Linux, Windows and macOS, builds
 the five binaries and runs `scripts/gates.sh` on each (size, ONNX payload,
 version, glibc 2.35 baseline, non-AVX CPU) while that happens, and only when
 everything is green creates the tag and the GitHub release from those exact
-binaries and publishes npm. A red run publishes nothing and leaves nothing to
-undo: fix forward and push, and the same version is tried again. One failed job
-(the npm step, say) re-runs alone with `gh run rerun <id> --failed`. Progress:
-`just runs`.
+binaries. A red run publishes nothing and leaves nothing to undo: fix forward and
+push, and the same version is tried again. One failed job re-runs alone with
+`gh run rerun <id> --failed`. Progress: `just runs`.
+
+npm is dispatched as its own workflow run once the release exists, so a registry
+or credential failure there never reddens the release; retry it with
+`gh workflow run npm-publish.yml -f tag=v<version>`.
 
 ### Verifying Windows compilation from Linux
 
