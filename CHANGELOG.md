@@ -5,7 +5,24 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [5.3.0] - 2026-11-12
+
+Search as the fetch layer's sibling: a query is classified before anything runs, results are
+admitted by veto rather than by a coverage test, and the ranking is fused per index family, with a
+learned order for code, how-to and shopping queries. No model, no download and no browser in the
+search path.
+
+Measured here against the shipped 5.2.1 build on the same 220-row corpus (109 held rows, runs an
+hour apart): **held hit@3 76.15% → 82.6%** on a clean run, 78.0% pooled over two runs (the first had
+two sources rested out), p50 1.74 s, first-call zero-rate 0.46%, junk@5 0%. A 20-query live set
+answered 20 of 20 (cold p50 1.81 s, warm 0.80 s), and on a head-to-head set the first-party page now
+outranks aggregators and vendor blogs for reference queries where 5.2.1 returned them —
+`postgres vacuum full vs analyze` gives postgresql.org three times out of three, `anthropic claude api
+pricing` gives Anthropic's own pages, `typescript satisfies operator` puts the handbook first.
+
+**Not measured:** the Exa fast and TinyFish comparisons, their blinded fact reviews, and the
+SearXNG/4get local comparison. There is no peer key and no local instance on the build machine, so
+this release claims no cloud number and no peer table.
 
 ### Changed
 
