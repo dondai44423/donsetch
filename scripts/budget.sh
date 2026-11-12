@@ -2,8 +2,8 @@
 # The resource budget wrapper. Every build/test/fuzz command in this repo
 # goes through it (Justfile recipes, .githooks/pre-push, scripts/gates.sh).
 #
-# status.md mechanic 5: this box is Dondai's live desktop (16 threads /
-# 7.6 GB), not a build farm. The ceiling is a quarter of the cores AND a
+# status.md mechanic 5: this box is Dondai's live desktop (8 threads /
+# 31 GB), not a build farm. The ceiling is half the cores AND a
 # bounded share of RAM, because a `-j` flag bounds neither:
 #
 #   * rustc runs its own codegen threads (the ci profile asks for 256
@@ -15,7 +15,7 @@
 #
 # So the cap is MECHANICAL, not aspirational: the whole command tree is
 # pinned to a core subset with taskset (however many threads the tools
-# spawn, they share a quarter of the machine), niced and ionice-idle so
+# spawn, they share that half of the machine), niced and ionice-idle so
 # the live session wins every contention, and the job-count variables are
 # exported so nested build systems stay in the same budget.
 #
@@ -23,12 +23,12 @@
 # three concurrent rustc held ~2.4 GB and pushed the box to 3.6 GB of
 # swap with the browser running at 10 fps. A memory-shaped box does not
 # stall, it swaps. So the job count is also bounded by what RAM is
-# available RIGHT NOW: one job per ~1.2 GB, after reserving 1.5 GB for
+# available RIGHT NOW: one job per ~700 MB, after reserving 1 GB for
 # the session and the OS.
 #
 #   BG_JOBS=<n>    job count for cargo/cmake/make (default: the min of
-#                  the core quarter and the RAM budget)
-#   BG_CORES=<set> cores to pin to, taskset syntax (default: first quarter)
+#                  half the cores and the RAM budget)
+#   BG_CORES=<set> cores to pin to, taskset syntax (default: first half)
 #
 # Both are escapes for a known-idle box, not the default.
 set -eu

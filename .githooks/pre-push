@@ -18,7 +18,7 @@ cd "$(git rev-parse --show-toplevel)"
 # CPU citizenship (status.md mechanic 5): the checks below are cargo
 # commands, so they ride the SAME budget wrapper as the Justfile
 # recipes. The wrapper is the cap: the whole process tree is pinned to a
-# quarter of the cores, niced and ionice-idle, and the job caps are
+# half the cores, niced and ionice-idle, and the job caps are
 # exported into build scripts. A bare `nice cargo ...` here was the old
 # "looks capped" form that still let rustc codegen threads and
 # boring-sys's make -j$(nproc) take every core.

@@ -49,8 +49,8 @@
 # A hung test is caught by nextest's own per-test slow-timeout; a long
 # COLD build is caught by the CI step timeout.
 #
-# CPU + MEMORY citizenship: this box is the operator's desktop (16 threads,
-# 7.6 GB RAM, a live session next to every compile). Every cargo/build/fuzz
+# CPU + MEMORY citizenship: this box is the operator's desktop (8 threads,
+# 31 GB RAM, a live session next to every compile). Every cargo/build/fuzz
 # command below runs through scripts/budget.sh, which pins the whole process
 # TREE to half the cores with taskset, exports the job caps into nested build
 # systems (cmake, make, nasm), and bounds the job count by MemAvailable right
@@ -247,7 +247,7 @@ loop-report:
     echo "== just t mcp::supervisor (warm)"
     s=$(date +%s); just t mcp::supervisor >/dev/null 2>&1; echo "   $(( $(date +%s) - s ))s"
     echo "== sccache"
-    sccache --show-stats 2>/dev/null | grep -E 'cache hits|compile requests|Cache size' || echo "   (sccache not installed: rust-sccache in the Void repos)"
+    sccache --show-stats 2>/dev/null | grep -E 'cache hits|compile requests|Cache size' || echo "   (sccache not installed: pacman -S sccache, or rust-sccache on Void)"
 
 # Live smoke: payload, normal site, walled site, search.
 smoke: bin
