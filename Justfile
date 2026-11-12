@@ -20,8 +20,9 @@
 #
 # SHIPPING IS ONE COMMAND. `just ship <version>` bumps the manifests and pushes
 # the release commit; the CI pipeline then tests it on five platforms, builds
-# and gates the shipped binaries, tags, publishes the GitHub release and npm,
-# and stops on the first red. Nothing runs on this machine, nothing waits here.
+# and gates the shipped binaries, tags and publishes the GitHub release, then
+# dispatches npm as its own run. It stops on the first red. Nothing runs on this
+# machine, nothing waits here.
 #
 #   just check        compile-check, full feature set, fast profile
 #   just t <expr>     scoped tests, fast profile (`just t crawl::frontier`)
@@ -299,9 +300,9 @@ fuzz target:
 # Cargo.toml version has no tag yet). The pipeline then runs the suite on
 # Linux, Windows and macOS, builds and gates the five shipped binaries in
 # parallel with it, and only when every one is green creates the tag and the
-# GitHub release and publishes npm. A red run publishes nothing: fix forward
-# and push again, the same version is simply tried again. Nothing to wait on
-# here and no state to roll back; `just runs` shows how far it got, and a
+# GitHub release and dispatches npm as its own run. A red run publishes nothing:
+# fix forward and push again, the same version is simply tried again. Nothing to
+# wait on here and no state to roll back; `just runs` shows how far it got, and a
 # single failed job is re-run with `gh run rerun <id> --failed`.
 ship version:
     #!/usr/bin/env bash
@@ -329,7 +330,7 @@ ship version:
         git commit -q -m "chore(release): {{version}}"
     fi
     git push -q origin HEAD
-    echo "ship: v{{version}} pushed. CI tests, builds, tags, publishes and runs npm."
+    echo "ship: v{{version}} pushed. CI tests, builds, tags and publishes the release; npm follows."
     echo "      progress: just runs      watch live: gh run watch"
 
 # One status call: the pipeline's latest runs, the newest release and the npm

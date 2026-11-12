@@ -160,8 +160,9 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
 - The version is bumped by the maintainer at release time. Do not touch it
   in a PR. A release is `just ship <version>`: it bumps the manifests and
   pushes the release commit, and the CI pipeline (`.github/workflows/ci.yml`)
-  tests it, builds and gates the five binaries, tags, publishes the GitHub
-  release and runs npm, stopping at the first red. Do not hand-run those steps,
-  and do not tag by hand: the pipeline tags the commit it tested.
+  tests it, builds and gates the five binaries, tags and publishes the GitHub
+  release, stopping at the first red. npm is dispatched afterwards as its own
+  workflow run, so a registry failure cannot fail a release. Do not hand-run
+  those steps, and do not tag by hand: the pipeline tags the commit it tested.
 - Commit messages follow Conventional Commits. Do not append tool or
   session trailers.
