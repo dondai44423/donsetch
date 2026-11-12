@@ -827,8 +827,7 @@ pub(crate) fn passage_tokens(text: &str, lang: &LanguageInfo) -> Vec<String> {
 
 /// Compute BM25 scores for each block against the query.
 /// Returns a vector of scores (one per block, 0.0 = no match).
-/// Used by both `filter` (BM25-only) and `filter_semantic`
-/// (BM25 + cross-encoder union).
+/// Shared by the baseline and section-aware lexical filters.
 fn bm25_scores(blocks: &[Block], query: &str, lang: &LanguageInfo) -> Vec<f64> {
     let qterms = passage_tokens(query, lang);
     let docs: Vec<Vec<String>> = blocks
@@ -905,9 +904,8 @@ pub(crate) fn bm25_rank(docs: &[Vec<String>], mut qterms: Vec<String>) -> Vec<f6
 /// returned the full page : the CALLER must signal this,
 /// or the agent mistakes full content for focus matches.
 ///
-/// BM25-only version. Production code uses `filter_semantic`
-/// (BM25 + cross-encoder union). This function is kept for
-/// tests and as a pure-BM25 baseline.
+/// Production uses the section-aware lexical `filter_semantic`. This simpler
+/// version remains a baseline for tests.
 #[allow(dead_code)]
 pub fn filter<'a>(blocks: &'a [Block], query: &str, lang: &LanguageInfo) -> (Vec<&'a Block>, bool) {
     let qterms = tokenize(query, lang);
@@ -1098,8 +1096,8 @@ fn offload_inference<R: Send + 'static>(work: impl FnOnce() -> R + Send + 'stati
 }
 
 /// Select lexical evidence with real heading ancestry and source order.
-/// A cached cross-encoder may rescue a lexical miss on a small page; inference
-/// never downloads a model. The boolean signals a full-content miss fallback.
+/// No model is loaded or downloaded. The boolean signals a full-content miss
+/// fallback.
 pub fn filter_semantic<'a>(
     blocks: &'a [Block],
     query: &str,
@@ -1722,10 +1720,7 @@ mod tests {
     }
 
     // ── filter_semantic tests ──
-    // These tests assert properties that hold regardless of
-    // whether the cross-encoder model is cached. filter_semantic
-    // is a union (BM25 ∪ cross-encoder), so it always keeps at
-    // least the BM25 matches.
+    // The section-aware lexical filter retains direct matches and their context.
 
     #[test]
     fn filter_semantic_empty_query() {
@@ -1750,8 +1745,8 @@ mod tests {
 
     #[test]
     fn filter_semantic_union_property() {
-        // filter_semantic is a union: it keeps at least every
-        // block that filter (BM25-only) keeps.
+        // On these unsectioned paragraphs, section selection retains the
+        // baseline lexical matches.
         let blocks = vec![
             para("Machine learning is a subset of artificial intelligence"),
             para("The weather is nice today"),

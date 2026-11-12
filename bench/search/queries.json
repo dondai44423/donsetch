@@ -140,7 +140,9 @@
       "answer_key": [
         "Lovelace"
       ],
-      "must_not": [],
+      "must_not": [
+        "shopping\\.yahoo\\.com/(gift-ideas|guides)/?$|finance\\.yahoo\\.com/(portfolios|community|personal-finance)/?$|finance\\.yahoo\\.com/research-hub/(screener/)?$|finance\\.yahoo\\.com/about/promos/gold/alphaspace/?$|sports\\.yahoo\\.com/(soccer/world-cup|college-football|college-basketball|newsletters/yahoo-sports-am)/?$|yahoo\\.uservoice\\.com|advertising\\.yahoo\\.com"
+      ],
       "expect": "answer"
     },
     {
@@ -239,7 +241,9 @@
       "answer_key": [
         "attention is all you need"
       ],
-      "must_not": [],
+      "must_not": [
+        "shopping\\.yahoo\\.com/(gift-ideas|guides)/?$|finance\\.yahoo\\.com/(portfolios|community|personal-finance)/?$|finance\\.yahoo\\.com/research-hub/(screener/)?$|finance\\.yahoo\\.com/about/promos/gold/alphaspace/?$|sports\\.yahoo\\.com/(soccer/world-cup|college-football|college-basketball|newsletters/yahoo-sports-am)/?$|yahoo\\.uservoice\\.com|advertising\\.yahoo\\.com"
+      ],
       "expect": "answer"
     },
     {
@@ -342,7 +346,9 @@
       "answer_key": [
         "federal reserve"
       ],
-      "must_not": [],
+      "must_not": [
+        "shopping\\.yahoo\\.com/(gift-ideas|guides)/?$|finance\\.yahoo\\.com/(portfolios|community|personal-finance)/?$|finance\\.yahoo\\.com/research-hub/(screener/)?$|finance\\.yahoo\\.com/about/promos/gold/alphaspace/?$|sports\\.yahoo\\.com/(soccer/world-cup|college-football|college-basketball|newsletters/yahoo-sports-am)/?$|yahoo\\.uservoice\\.com|advertising\\.yahoo\\.com"
+      ],
       "expect": "answer",
       "window": "60d"
     },
@@ -373,7 +379,9 @@
       "answer_key": [
         "Apple"
       ],
-      "must_not": [],
+      "must_not": [
+        "shopping\\.yahoo\\.com/(gift-ideas|guides)/?$|finance\\.yahoo\\.com/(portfolios|community|personal-finance)/?$|finance\\.yahoo\\.com/research-hub/(screener/)?$|finance\\.yahoo\\.com/about/promos/gold/alphaspace/?$|sports\\.yahoo\\.com/(soccer/world-cup|college-football|college-basketball|newsletters/yahoo-sports-am)/?$|yahoo\\.uservoice\\.com|advertising\\.yahoo\\.com"
+      ],
       "expect": "answer",
       "window": "120d"
     },
@@ -2454,13 +2462,15 @@
       "set": "gold",
       "query": "sony wh-1000xm6 price",
       "gold": [
-        "sony\\.com/[^ ]*wh-1000xm6",
-        "sony\\.co\\.uk/[^ ]*wh-1000xm6"
+        "sony\\.com/[^ ]*wh-?1000xm6",
+        "sony\\.co\\.uk/[^ ]*wh-?1000xm6"
       ],
       "answer_key": [
         "WH-1000XM6"
       ],
-      "must_not": [],
+      "must_not": [
+        "shopping\\.yahoo\\.com/(gift-ideas|guides)/?$|finance\\.yahoo\\.com/(portfolios|community|personal-finance)/?$|finance\\.yahoo\\.com/research-hub/(screener/)?$|finance\\.yahoo\\.com/about/promos/gold/alphaspace/?$|sports\\.yahoo\\.com/(soccer/world-cup|college-football|college-basketball|newsletters/yahoo-sports-am)/?$|yahoo\\.uservoice\\.com|advertising\\.yahoo\\.com"
+      ],
       "expect": "answer"
     },
     {
@@ -2701,7 +2711,9 @@
       "answer_key": [
         "人口"
       ],
-      "must_not": [],
+      "must_not": [
+        "shopping\\.yahoo\\.com/(gift-ideas|guides)/?$|finance\\.yahoo\\.com/(portfolios|community|personal-finance)/?$|finance\\.yahoo\\.com/research-hub/(screener/)?$|finance\\.yahoo\\.com/about/promos/gold/alphaspace/?$|sports\\.yahoo\\.com/(soccer/world-cup|college-football|college-basketball|newsletters/yahoo-sports-am)/?$|yahoo\\.uservoice\\.com|advertising\\.yahoo\\.com"
+      ],
       "expect": "answer",
       "lang": "zh"
     },
@@ -3259,6 +3271,99 @@
         "operator<<"
       ],
       "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c-c-single-junk",
+      "shape": "code",
+      "set": "gold",
+      "query": "OpenCode release notes",
+      "gold": [
+        "(?:opencode\\.ai|github\\.com/(?:anomalyco|sst)/opencode)"
+      ],
+      "answer_key": [
+        "OpenCode"
+      ],
+      "must_not": [
+        "github\\.com/(?:silverbulletmd/silverbullet|microsoft/markitdown|charmbracelet/crush)"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "c-c-negphrase",
+      "shape": "operator",
+      "set": "gold",
+      "query": "jaguar -\"car review\"",
+      "gold": [
+        "en\\.wikipedia\\.org/wiki/Jaguar(?:$|[?#])"
+      ],
+      "answer_key": [
+        "jaguar"
+      ],
+      "must_not": [
+        "car[ /-]+review"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "c-c-negboundary",
+      "shape": "operator",
+      "set": "gold",
+      "query": "red carpet -car",
+      "gold": [
+        "en\\.wikipedia\\.org/wiki/Red_carpet"
+      ],
+      "answer_key": [
+        "carpet"
+      ],
+      "must_not": [
+        "/Car(?:$|[/?#])"
+      ],
+      "expect": "answer"
+    },
+    {
+      "id": "c-c-held-pathlib",
+      "shape": "operator",
+      "set": "held",
+      "query": "site:docs.python.org/3/library pathlib Path.resolve",
+      "gold": [
+        "docs\\.python\\.org/3/library/pathlib"
+      ],
+      "answer_key": [
+        "resolve"
+      ],
+      "must_not": [],
+      "expect": "answer",
+      "only_host": "docs.python.org"
+    },
+    {
+      "id": "c-c-held-worktree",
+      "shape": "code",
+      "set": "held",
+      "query": "git worktree prune expire now",
+      "gold": [
+        "git-scm\\.com/docs/git-worktree"
+      ],
+      "answer_key": [
+        "prune"
+      ],
+      "must_not": [],
+      "expect": "answer"
+    },
+    {
+      "id": "c-c-held-crate",
+      "shape": "identifier",
+      "set": "held",
+      "query": "bytes::BytesMut",
+      "gold": [
+        "docs\\.rs/bytes/[^ ]*BytesMut"
+      ],
+      "answer_key": [
+        "BytesMut"
+      ],
+      "must_not": [
+        "wikipedia\\.org"
+      ],
       "expect": "answer"
     }
   ]

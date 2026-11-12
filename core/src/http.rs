@@ -153,6 +153,10 @@ pub enum Hop {
 /// Consulted with (the URL that redirected, the absolute URL it names) before
 /// every hop is dialed. It runs outside the wire's runtime, so it may block.
 pub type HopGuard = Arc<dyn Fn(&str, &str) -> Hop + Send + Sync>;
+/// Called with the next exchange's URL before it is sent; false refuses it.
+pub type RequestStart = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// Called with a response's status, URL and headers before reading its body.
+pub type ResponseHead = Arc<dyn Fn(u16, &str, &[(String, String)]) + Send + Sync>;
 
 /// The caller's rules for the requests of one fetch.
 #[derive(Clone)]
@@ -160,6 +164,11 @@ pub struct Policy {
     /// Follow redirects (each hop asked of `hop` first); off returns the 3xx.
     pub follow: bool,
     pub hop: Option<HopGuard>,
+    /// Called when each HTTP exchange starts, including redirect hops. False
+    /// stops before sending, so callers can count and bound physical requests.
+    pub request_start: Option<RequestStart>,
+    /// Observes status and headers before the body is read or rejected.
+    pub response_head: Option<ResponseHead>,
     /// Headers every navigation of this fetch carries over the identity's own
     /// (a link's `referer` and `sec-fetch-site`). Never sent on a subresource.
     pub navigation: Vec<(String, String)>,
@@ -175,6 +184,14 @@ impl std::fmt::Debug for Policy {
         f.debug_struct("Policy")
             .field("follow", &self.follow)
             .field("hop", &self.hop.as_ref().map(|_| "guard"))
+            .field(
+                "request_start",
+                &self.request_start.as_ref().map(|_| "guard"),
+            )
+            .field(
+                "response_head",
+                &self.response_head.as_ref().map(|_| "observer"),
+            )
             .field("navigation", &self.navigation)
             .field("request_max", &self.request_max)
             .field("cancel", &self.cancel)
@@ -240,6 +257,8 @@ impl Default for Policy {
         Self {
             follow: true,
             hop: None,
+            request_start: None,
+            response_head: None,
             navigation: Vec::new(),
             request_max: REQUEST_MAX,
             cancel: None,
@@ -987,7 +1006,22 @@ impl Wire {
         let budget = budget.max(timeout);
         let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let progress = std::sync::Arc::clone(&received);
+        let request_start = self
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .request_start
+            .clone();
+        let response_head = self
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .response_head
+            .clone();
         let exchange = async move {
+            if request_start.is_some_and(|start| !start(url)) {
+                return Err("budget: request ceiling reached".to_string());
+            }
             let response = tokio::time::timeout(timeout, request.send())
                 .await
                 .map_err(|_| "timeout: operation timed out".to_string())?
@@ -1026,6 +1060,9 @@ impl Wire {
                         .map(|value| (name.as_str().to_string(), value.to_string()))
                 })
                 .collect();
+            if let Some(observe) = response_head {
+                observe(status, &url, &headers);
+            }
             // Every body is read incrementally against a cap, so a server cannot
             // fill memory inside the timeout; the document path's cap is the
             // product's (64 MiB), the engine's is its envelope's.

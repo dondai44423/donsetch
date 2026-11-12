@@ -209,7 +209,15 @@ fn status_browser_warning_names_only_what_uses_the_browser() {
 #[test]
 fn the_two_help_routes_cannot_drift() {
     let sb = Sandbox::new("help-routes");
-    for cmd in ["proxy", "keys", "status", "doctor", "adapters", "rules"] {
+    for cmd in [
+        "proxy",
+        "keys",
+        "status",
+        "doctor",
+        "adapters",
+        "rules",
+        "search-bench",
+    ] {
         let routed = sb.run(&["help", cmd]);
         let direct = sb.run(&[cmd, "--help"]);
         assert_eq!(routed.status.code(), Some(0), "help {cmd}");

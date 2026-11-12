@@ -177,7 +177,7 @@ pub fn source_states(report: &[super::EngineReport]) -> Vec<SourceLine> {
 /// How much a status says about a source, from "we never asked" to "it refused".
 pub(crate) fn rank_state(status: &str) -> u8 {
     match status.split(':').next().unwrap_or(status) {
-        "not-asked" | "pacing-timeout" => 0,
+        "not-asked" | "pacing-timeout" | "budget-skipped" => 0,
         "rested" => 1,
         "paced" => 1,
         "late" => 2,
@@ -201,7 +201,7 @@ fn state_word(status: &str) -> &'static str {
         "off-query" => "off",
         "rested" | "rate-limited" => "rested",
         "paced" => "paced",
-        "not-asked" | "pacing-timeout" => "not asked",
+        "not-asked" | "pacing-timeout" | "budget-skipped" => "not asked",
         "late" => "late",
         _ => "failed",
     }
@@ -238,12 +238,13 @@ pub fn render_markdown(
             ans.url
         ));
     }
+    let snippets = evidence_snippets(&out.results);
     for (i, r) in out.results.iter().enumerate() {
         let host = rank::host_of(&r.url);
         md.push_str(&format!("{}. **{}** : {}\n", i + 1, r.title, host));
         if !r.snippet.is_empty() {
-            let snip = clip_snippet(&r.snippet, snippet_limit(i, r));
-            md.push_str(&format!("   {snip}\n"));
+            let snip = &snippets[i];
+            md.push_str(&format!("   {}\n", snip.replace('\n', "\n   ")));
         }
         // v3 handles: a random S-handle replaces the
         // raw URL, saving 80+ tokens per result.
@@ -258,7 +259,7 @@ pub fn render_markdown(
                 }
             }
             _ => {
-                md.push_str(&format!("   {}\n", r.url));
+                md.push_str(&format!("   {}\n", evidence_url(&r.url)));
             }
         }
         // Provenance, text-side. Which engines returned a URL is the
@@ -348,12 +349,130 @@ fn display_title(title: &str, host: &str) -> String {
 /// What the snippet of the result at `position` (0-based) may show: a passage
 /// read from the page, or one of the lead results, takes the passage budget;
 /// the rest the snippet budget.
-fn snippet_limit(position: usize, result: &super::rank::Merged) -> usize {
+pub(super) fn snippet_limit(position: usize, result: &super::rank::Merged) -> usize {
     if result.from_page {
         super::evidence::PASSAGE_CHARS
     } else {
         super::evidence::budget(position)
     }
+}
+
+/// A readable URL with the same parsed destination. Only encoded Unicode
+/// letters and digits are expanded; reserved delimiters and escapes stay put.
+pub fn evidence_url(raw: &str) -> String {
+    let Ok(original) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    if !matches!(original.scheme(), "http" | "https") {
+        return raw.to_string();
+    }
+    let Some(authority) = raw.find("://").map(|at| at + 3) else {
+        return raw.to_string();
+    };
+    let start = raw[authority..]
+        .find(['/', '?', '#'])
+        .map_or(raw.len(), |at| authority + at);
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&raw[..start]);
+    let mut i = start;
+    while i < bytes.len() {
+        let decoded = (|| {
+            let byte = |at: usize| {
+                if bytes.get(at) != Some(&b'%') {
+                    return None;
+                }
+                let hex = std::str::from_utf8(bytes.get(at + 1..at + 3)?).ok()?;
+                u8::from_str_radix(hex, 16).ok()
+            };
+            let first = byte(i)?;
+            let width = match first {
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => return None,
+            };
+            let mut buf = [0u8; 4];
+            for (n, slot) in buf[..width].iter_mut().enumerate() {
+                *slot = byte(i + n * 3)?;
+            }
+            let c = std::str::from_utf8(&buf[..width]).ok()?.chars().next()?;
+            c.is_alphanumeric().then_some((c, width * 3))
+        })();
+        if let Some((c, len)) = decoded {
+            out.push(c);
+            i += len;
+        } else {
+            let c = raw[i..].chars().next().expect("character boundary");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    if url::Url::parse(&out).ok().as_ref() == Some(&original) {
+        out
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Share a 1,600-byte snippet envelope across the visible answer. Character
+/// ceilings still apply, and the lead results receive the larger share. This
+/// limits multibyte text without a runtime tokenizer; the release gate also
+/// measures the complete evidence with its real tokenizer.
+pub(super) fn evidence_snippets(results: &[super::rank::Merged]) -> Vec<String> {
+    let snippets: Vec<String> = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let date = r
+                .published
+                .as_deref()
+                .and_then(|raw| raw.get(..10))
+                .filter(|date| super::contract::day_of(date).is_some());
+            let text = match date {
+                Some(date) if !r.snippet.starts_with(date) => format!("{date} · {}", r.snippet),
+                _ => r.snippet.clone(),
+            };
+            clip_snippet(&text, snippet_limit(i, r))
+        })
+        .collect();
+    let mut remaining = 1600usize;
+    let mut sizes = vec![0usize; snippets.len()];
+    loop {
+        let active: Vec<usize> = (0..snippets.len())
+            .filter(|&i| sizes[i] < snippets[i].len())
+            .collect();
+        if active.is_empty() || remaining == 0 {
+            break;
+        }
+        let weight: usize = active.iter().map(|&i| snippet_limit(i, &results[i])).sum();
+        let allowance = remaining;
+        for i in active {
+            let share = (allowance * snippet_limit(i, &results[i]) / weight)
+                .max(1)
+                .min(remaining)
+                .min(snippets[i].len() - sizes[i]);
+            sizes[i] += share;
+            remaining -= share;
+        }
+    }
+    snippets
+        .into_iter()
+        .zip(sizes)
+        .map(|(s, bytes)| {
+            if s.len() <= bytes {
+                return s;
+            }
+            if bytes < '…'.len_utf8() {
+                return String::new();
+            }
+            let mut end = bytes - '…'.len_utf8();
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            clip_snippet(&s, s[..end].chars().count())
+        })
+        .collect()
 }
 
 /// One result on the compact surface: a line naming it (handle, title, host,
@@ -390,7 +509,7 @@ pub(super) fn compact_row(
         if result.from_page {
             row.push_str("page: ");
         }
-        row.push_str(&clip_snippet(&result.snippet, limit));
+        row.push_str(&clip_snippet(&result.snippet, limit).replace('\n', "\n   "));
         row.push('\n');
     }
     row
@@ -425,13 +544,17 @@ pub fn render_compact_markdown(
         ));
     }
 
-    for (index, result) in out.results.iter().enumerate() {
+    let snippets = evidence_snippets(&out.results);
+    for (index, original) in out.results.iter().enumerate() {
+        let mut result = original.clone();
+        result.snippet.clone_from(&snippets[index]);
+        let readable_url = evidence_url(&result.url);
         let reference = handles
             .and_then(|items| items.get(index))
             .map(String::as_str)
-            .unwrap_or(&result.url);
+            .unwrap_or(&readable_url);
         let hint = hints.get(index).and_then(|hint| hint.as_deref());
-        markdown.push_str(&compact_row(index + 1, reference, result, hint));
+        markdown.push_str(&compact_row(index + 1, reference, &result, hint));
     }
 
     if out.results.is_empty() {
@@ -447,12 +570,13 @@ pub fn render_compact_markdown(
 /// pass through, anything else is a proxy chain.
 fn egress_label(raw: &str) -> String {
     match raw {
-        "direct" | "byok" => raw.to_string(),
+        "direct" | "byok" | "cache" => raw.to_string(),
         _ => "proxy".to_string(),
     }
 }
 
 pub fn render_meta(out: &SearchOutcome) -> Value {
+    let snippets = evidence_snippets(&out.results);
     // What a caller should know without reading the census: whether the list is
     // an answer, and what to do when it is not. `ok` stays true for an empty
     // answer ("nothing found" is a result), so these three fields carry the
@@ -463,13 +587,13 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
         .filter(|r| matches!(r.status.as_str(), "ok" | "cached" | "thin"))
         .count();
     let underfilled = out.results.len() < 3;
-    let degraded = answered < 2;
+    let degraded = out.quality.degraded();
     let next_action = if out.results.is_empty() {
         Some("retry once: no source answered inside the budget; the second call usually lands them")
     } else if underfilled {
         Some("retry once, or rephrase: fewer results than a list to choose from")
     } else if degraded {
-        Some("one source answered; a retry asks for independent confirmation")
+        Some("limited independent evidence; retry for confirmation")
     } else {
         None
     };
@@ -485,6 +609,10 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
     json!({
         "intent": format!("{:?}", out.intent),
         "cached": out.cached,
+        "requests": out.requests,
+        "confidence": out.quality.confidence,
+        "cache_age_ms": out.cache_age.map(|age| age.as_millis() as u64),
+        "independent_families": out.quality.families,
         "elapsed_ms": out.elapsed.as_millis() as u64,
         "stage_ms": if out.stage_ms.is_empty() {
             serde_json::Value::Null
@@ -506,9 +634,9 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
         "degraded": degraded,
         "answered_sources": answered,
         "next_action": next_action,
-        "rerank": if out.reranked { "on" } else { "off (RRF+BM25 fallback)" },
+        "rerank": if out.reranked { "on" } else { "off (no runtime model)" },
         "instant": instant,
-        "results": out.results.iter().map(|r| {
+        "results": out.results.iter().enumerate().map(|(position, r)| {
             // Named sources (deduped: an engine surfacing a URL at
             // two ranks is one opinion for the list, exactly like
             // the markdown surface). Values stay engine names.
@@ -520,8 +648,8 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
             }
             json!({
                 "title": r.title,
-                "url": r.url,
-                "snippet": r.snippet.chars().take(300).collect::<String>(),
+                "url": evidence_url(&r.url),
+                "snippet": snippets[position],
                 "score": (r.score * 1000.0).round() / 1000.0,
                 "consensus": rank::family_count(r),
                 "engines": seen_engines,
@@ -530,7 +658,7 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
         "engines": out.report.iter().map(|r| {
             let mut report = json!({
                 "engine": r.engine, "status": r.status, "hits": r.hits, "ms": r.ms,
-                "egress": egress_label(&r.egress),
+                "egress": egress_label(&r.egress), "cache_age_ms": r.cache_age_ms, "requests": r.requests,
             });
             if let Some(profile) = &r.profile { report["profile"] = json!(profile); }
             report
@@ -619,7 +747,30 @@ mod tests {
     }
 
     #[test]
-    fn the_lead_results_carry_more_evidence_and_the_answer_stays_in_budget() {
+    fn readable_evidence_urls_preserve_destinations_and_reserved_escapes() {
+        let raw =
+            "https://example.com/%E4%B8%AD%E6%96%87/%2F?q=%E6%97%A5%E6%9C%AC%26x%3Dy%25#%E7%AB%A0";
+        let readable = evidence_url(raw);
+        assert_eq!(
+            readable,
+            "https://example.com/中文/%2F?q=日本%26x%3Dy%25#章"
+        );
+        assert_eq!(
+            url::Url::parse(raw).unwrap(),
+            url::Url::parse(&readable).unwrap()
+        );
+        for unchanged in [
+            "https://example.com/a%2Fb?q=a%20b%25",
+            "https://example.com/%E2%80%AEabc",
+            "https://example.com/%FF",
+            "not a URL",
+        ] {
+            assert_eq!(evidence_url(unchanged), unchanged);
+        }
+    }
+
+    #[test]
+    fn the_lead_results_carry_more_evidence_and_the_surface_is_bounded() {
         let long = "evidence ".repeat(80);
         let row = |n| {
             compact_row(
@@ -635,9 +786,9 @@ mod tests {
             row(3).len(),
             row(4).len()
         );
-        // The worst case the surface can show: twelve results, every snippet
-        // at its cap and a long title. Four characters to a token, generously,
-        // the whole list stays inside the 1,500-token evidence budget.
+        // Exercise twelve capped snippets and long titles. This checks the
+        // character envelope only; real tokenizer counts belong in the live
+        // evidence audit, because scripts do not share a chars/token ratio.
         let title = "A long result title that names the page and then some more ".repeat(2);
         let out = SearchOutcome {
             results: (0..12)
@@ -652,14 +803,51 @@ mod tests {
             intent: crate::search::intent::Intent::Web,
             report: Vec::new(),
             cached: false,
+            quality: Default::default(),
+            cache_age: None,
             elapsed: std::time::Duration::ZERO,
             provider: None,
             reranked: false,
             instant: None,
+            requests: None,
             stage_ms: Vec::new(),
         };
         let md = render_compact_markdown(&out, "", None, &[]);
-        let tokens = md.chars().count() / 4;
-        assert!(tokens <= 1_500, "{tokens} tokens");
+        assert!(md.chars().count() <= 6_000, "unbounded evidence surface");
+        for text in [
+            "日本語の根拠を表示します。 ".repeat(80),
+            "🦀 Unicode evidence. ".repeat(80),
+        ] {
+            let mut unicode = out.clone();
+            for r in &mut unicode.results {
+                r.snippet.clone_from(&text);
+            }
+            let visible = evidence_snippets(&unicode.results);
+            assert!(visible.iter().map(String::len).sum::<usize>() <= 1600);
+            assert!(visible[0].len() > visible[3].len());
+            let meta = render_meta(&unicode);
+            for (i, snippet) in visible.iter().enumerate() {
+                assert_eq!(meta["results"][i]["snippet"], *snippet);
+            }
+        }
+        let brief = vec![result("T", "https://example.com", "A complete factual claim."); 5];
+        assert!(
+            evidence_snippets(&brief)
+                .iter()
+                .all(|s| s == "A complete factual claim.")
+        );
+        let mut dated = out.clone();
+        dated.results.truncate(1);
+        dated.results[0].published = Some("2026-11-11T12:00:00Z".into());
+        dated.results[0].snippet = "A dated event actually happened.".into();
+        let shown = evidence_snippets(&dated.results);
+        assert_eq!(shown[0], "2026-11-11 · A dated event actually happened.");
+        assert!(render_compact_markdown(&dated, "", None, &[]).contains(&shown[0]));
+        assert_eq!(render_meta(&dated)["results"][0]["snippet"], shown[0]);
+        dated.results[0].published = Some("not a date".into());
+        assert_eq!(
+            evidence_snippets(&dated.results)[0],
+            "A dated event actually happened."
+        );
     }
 }

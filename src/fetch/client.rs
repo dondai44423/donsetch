@@ -269,6 +269,7 @@ impl Fetcher {
                 referer: None,
                 class: RequestClass::Navigation,
                 user_agent: Some(user_agent),
+                identity: None,
             })
             .await
     }
@@ -296,6 +297,26 @@ impl Fetcher {
         .await
     }
 
+    /// One cookie-less search retry using another measured client class.
+    pub(crate) async fn search_challenge_retry(
+        &self,
+        url: &str,
+        proxy: Option<&proxy::Proxy>,
+    ) -> Result<FetchOutcome, FetchError> {
+        self.v5
+            .once(crate::fetch::core::OneShot {
+                url,
+                conditional: &[],
+                proxy,
+                use_jar: false,
+                referer: None,
+                class: RequestClass::Navigation,
+                user_agent: None,
+                identity: Some("firefox"),
+            })
+            .await
+    }
+
     /// Class-aware variant: subresource reads carry the
     /// per-class header set on the wire.
     pub async fn fetch_once_via_class(
@@ -316,6 +337,7 @@ impl Fetcher {
                 referer,
                 class,
                 user_agent: None,
+                identity: None,
             })
             .await
     }

@@ -24,13 +24,16 @@ pub mod verticals;
 
 mod authority;
 mod contract;
+mod cse;
 mod enrich;
-mod ledger;
+mod lane_cache;
+pub(crate) mod ledger;
 mod locale;
 mod news;
 mod persist;
-mod quality;
+pub mod quality;
 mod render;
+mod schedule;
 pub(crate) use render::rank_state;
 mod resolve;
 mod tasks;
@@ -41,7 +44,8 @@ pub use persist::load_quality_for_status as persist_load_quality_for_status;
 pub use persist::outcome_class;
 
 pub use render::{
-    SourceLine, census, render_compact_markdown, render_markdown, render_meta, source_states,
+    SourceLine, census, evidence_url, render_compact_markdown, render_markdown, render_meta,
+    source_states,
 };
 
 use enrich::PrewarmCache;
@@ -84,15 +88,6 @@ const FANOUT_LATE_MARK: Duration = Duration::from_millis(600);
 /// call reports the lane instead of spending that wait.
 const PACE_WAIT_MAX: Duration = Duration::from_millis(1200);
 
-/// The merge is thin below this: fewer than three answering sources, or fewer
-/// items than a ranking can be built from. A thin merge gets one bounded second
-/// ask (measured: it is where most of the recall lives on a bad minute).
-const THIN_LANES: usize = 3;
-const THIN_ITEMS: usize = 15;
-
-/// How long a second ask may take, and only ever inside the hard mark.
-const SECOND_ASK: Duration = Duration::from_millis(1500);
-
 /// A lane's own ceiling: the mark plus a grace for the request already on the
 /// wire. Dropping a lane's future does NOT stop its blocking fetch, and the
 /// process waits for it at exit — measured: a 1.2 s answer with a 4.9 s wall
@@ -128,32 +123,56 @@ fn answered(outcomes: &[(String, EngineResult)]) -> (usize, usize) {
         })
 }
 
-/// A status a second ask can plausibly change: the source misbehaved, rather
-/// than the query being dry or the operator's config saying no.
-fn worth_second_ask(status: &str) -> bool {
-    // A CAPTCHA or a 429 is the source asking us to stop: the ledger rests the
-    // lane, and asking again inside the same call is the rotation the design
-    // refuses (search waits, it does not rotate to beat a limit).
-    !matches!(
-        status,
-        "no-results" | "pacing-timeout" | "late" | "empty-parse"
-    ) && !status.starts_with("invalid-config")
-        && !status.starts_with("rate-limited")
-        // A wall that asks a human, a login or a limit is the source asking us
-        // to stop; a bare refusal (403) is one a different lane can clear.
-        && ![
-            "blocked:captcha",
-            "blocked:challenge",
-            "blocked:login",
-            "blocked:paywall",
-            "blocked:429",
-        ]
-        .iter()
-        .any(|wall| status.starts_with(wall))
-}
-
 tokio::task_local! {
     pub(crate) static SEARCH_DEADLINE: Option<tokio::time::Instant>;
+    static API_LEDGER: Arc<Mutex<ledger::Ledger>>;
+    static EARLY_PAGE: Arc<Mutex<Option<tokio::sync::oneshot::Sender<engines::Hit>>>>;
+    static EARLY_ALLOWANCE: Arc<tasks::RequestAllowance>;
+}
+
+fn offer_early_page(source: &str, result: &EngineResult) {
+    if rank::is_vertical(engine_name(source)) {
+        return;
+    }
+    let Ok(answer) = result else {
+        return;
+    };
+    if !answer.class.credits() {
+        return;
+    }
+    let Some(hit) = answer.hits.first() else {
+        return;
+    };
+    let _ = EARLY_PAGE.try_with(|slot| {
+        let mut slot = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some()
+            && EARLY_ALLOWANCE
+                .try_with(|allowance| allowance.take_optional())
+                .unwrap_or(false)
+            && let Some(sender) = slot.take()
+        {
+            let _ = sender.send(hit.clone());
+        }
+    });
+}
+
+// A successful API response may publish a wait in its JSON body. Keep the
+// current answer, but apply that wait before another source request can start.
+pub(crate) fn record_api_rest(raw: &str, wait: Duration) {
+    let _ = API_LEDGER.try_with(|ledger| {
+        let mut ledger = ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(url) = url::Url::parse(raw) {
+            ledger.record_origin(
+                &url.origin().ascii_serialization(),
+                ledger::Outcome::Throttled,
+                Some(wait.as_secs().max(1)),
+            );
+        }
+    });
 }
 
 pub(crate) fn stage_budget(cap: Duration, reserve: Duration) -> Duration {
@@ -234,11 +253,17 @@ fn current_year() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() / 86_400)
         .unwrap_or(0) as i64;
+    calendar_year(days)
+}
+
+fn calendar_year(days: i64) -> i64 {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    era * 400 + yoe + 1
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    era * 400 + yoe + i64::from(mp >= 10)
 }
 
 /// Normalize a query for cache and single-flight keys. Casing,
@@ -261,6 +286,12 @@ fn norm_query(q: &str) -> String {
             .collect()
     }
     let compiled = query::compile(q);
+    if query::QueryFacts::new(q).is_identifier() {
+        return format!(
+            "identifier:{}",
+            q.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
     let mut key: Vec<String> = Vec::new();
     // Odd segments are inside double quotes; an unterminated quote
     // runs to the end of the query.
@@ -411,10 +442,36 @@ pub(crate) fn source_state(trust: f64, failure: Option<(u32, Duration)>) -> Sour
     }
 }
 
+fn fresh_family_lists(
+    per_engine: &[(String, Vec<engines::Hit>)],
+    reports: &[EngineReport],
+    comparable: &std::collections::HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    per_engine
+        .iter()
+        .filter(|(name, _)| {
+            !rank::is_vertical(name)
+                && comparable.contains(name)
+                && reports.iter().any(|report| {
+                    report.engine == *name
+                        && report.cache_age_ms.is_none()
+                        && matches!(report.status.as_str(), "ok" | "thin")
+                })
+        })
+        .map(|(name, hits)| {
+            (
+                egress::health_key(name).to_string(),
+                hits.iter().map(|hit| rank::norm_key(&hit.url)).collect(),
+            )
+        })
+        .collect()
+}
+
 /// Is the answer settled before the mark?
 ///
-/// Only when independent families already agree on a top-3 URL: then a further
-/// opinion cannot reorder the list. A plain item count is NOT enough — measured:
+/// Independent families must already agree on a top-3 URL. A later opinion can
+/// still change the order; the paired quality gate measures that tradeoff.
+/// A plain item count is not enough — measured:
 /// committing at two fat lanes (30 items between them) cut the contributing
 /// lanes from 4.3 to 1.4 per query and doubled the misses, because consensus is
 /// what the ranking is built on and two engines are one opinion plus one.
@@ -426,37 +483,52 @@ fn enough_answered(
     early && outcomes.len() >= 2 && early_consensus_enough(outcomes, families)
 }
 
-/// C4: enough independent families already agree on a top-3 URL
-/// that waiting for the stragglers cannot change the answer.
+/// Whether two sources supply measured independent opinions.
+fn independent_pair(a: &str, b: &str, families: &families::Families) -> bool {
+    let a = egress::health_key(engine_name(a));
+    let b = egress::health_key(engine_name(b));
+    rank::family_name(families, a) != rank::family_name(families, b)
+        && (rank::is_vertical(a) || rank::is_vertical(b) || families.overlap(a, b).is_some())
+}
+
+/// C4: full, measured independent answers share a top-three URL.
 fn early_consensus_enough(
     outcomes: &[(String, EngineResult)],
     families: &families::Families,
 ) -> bool {
-    use std::collections::{HashMap, HashSet};
-    let mut url_families: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut families_ok: HashSet<String> = HashSet::new();
+    let mut url_sources: HashMap<String, Vec<&str>> = HashMap::new();
     for (label, result) in outcomes {
         let Ok(answer) = result else {
             continue;
         };
-        let fam = rank::family_name(families, engine_name(label));
-        families_ok.insert(fam.clone());
+        if !answer.class.credits() {
+            continue;
+        }
         for h in answer.hits.iter().take(3) {
-            url_families
+            url_sources
                 .entry(rank::norm_key(&h.url))
                 .or_default()
-                .insert(fam.clone());
+                .push(label);
         }
     }
-    families_ok.len() >= 2 && url_families.values().any(|fams| fams.len() >= 2)
+    url_sources.values().any(|sources| {
+        sources.iter().enumerate().any(|(i, a)| {
+            sources[i + 1..]
+                .iter()
+                .any(|b| independent_pair(a, b, families))
+        })
+    })
 }
 
 pub struct Searcher {
     fetcher: Fetcher,
+    lane_cache: Mutex<lane_cache::LaneCache>,
+    last_requests: std::sync::atomic::AtomicUsize,
     /// Shared with crawl + fetch (v4 A2): one health world for
     /// every proxied path. Clone of the daemon's Arc.
     pool: std::sync::Arc<EgressPool>,
     google: engines::google_wml::ProfileSelector,
+    cse: cse::Client,
     /// engine -> trust EWMA (1.0 seed; 0.2..2.0 clamp).
     /// Persisted to disk: an engine that learned "this walled me"
     /// keeps that memory across daemon restarts instead of
@@ -474,7 +546,7 @@ pub struct Searcher {
     /// Stores up to 12 results; reads truncate to the
     /// requested max so max_results variants share entries.
     #[allow(clippy::type_complexity)]
-    cache: Mutex<HashMap<String, (Instant, Vec<Merged>, usize, Vec<EngineReport>)>>,
+    cache: Mutex<persist::CacheMap>,
     /// Chronic-failure quarantine: engine -> (consecutive
     /// failures, last failure). 3 strikes across any
     /// egresses = benched for QUARANTINE_TTL so a walled
@@ -485,12 +557,14 @@ pub struct Searcher {
     failures: Mutex<HashMap<String, (u32, Instant)>>,
     /// The lane ledger: per (source, lane) standing, shared across calls and
     /// processes. Loaded once, written back when a search taught it something.
-    ledger: Mutex<ledger::Ledger>,
+    ledger: Arc<Mutex<ledger::Ledger>>,
     /// Single-flight: two identical in-flight queries spend
     /// egress budget ONCE : the follower awaits the
     /// leader's result. Stampedes are an agent reality
     /// (parallel tool calls love the same query).
-    inflight: Mutex<std::collections::HashSet<String>>,
+    inflight: Mutex<HashMap<String, std::sync::Arc<LocalFlight>>>,
+    /// Identical complete calls share evidence reads as well as retrieval.
+    pipelines: Mutex<HashMap<String, std::sync::Arc<LocalFlight>>>,
     /// BYOK single-flight: a metered provider is not re-billed by a
     /// concurrent identical query (the local fan-out has `inflight`
     /// for the same reason). Keyed on the byok cache key.
@@ -524,6 +598,8 @@ pub struct Searcher {
 /// Per-engine outcome for honest reporting.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_age_ms: Option<u64>,
     pub engine: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -533,7 +609,7 @@ pub struct EngineReport {
     /// Which lane carried it (observability for the
     /// governor's routing decisions).
     pub egress: String,
-    /// Outbound requests this lane spent (a feed refresh can be two).
+    /// Physical exchanges this call started for the lane; reused data costs zero.
     #[serde(default)]
     pub requests: usize,
 }
@@ -544,6 +620,8 @@ pub struct SearchOutcome {
     pub intent: Intent,
     pub report: Vec<EngineReport>,
     pub cached: bool,
+    pub quality: quality::Assessment,
+    pub cache_age: Option<Duration>,
     pub elapsed: Duration,
     /// BYOK provider name (None = local search).
     pub provider: Option<String>,
@@ -554,9 +632,52 @@ pub struct SearchOutcome {
     /// C5: byte-derived featured snippet / instant / knowledge.
     /// Never merged into `results`. None when absent.
     pub instant: Option<instant::InstantAnswer>,
+    /// Physical HTTP exchanges for this local call, including page reads.
+    /// None when a provider path has no complete measurement.
+    pub requests: Option<usize>,
     /// Post-fan-out phase timings for the search-debug meta:
     /// (stage, ms). Empty for the cache/BYOK paths.
     pub stage_ms: Vec<(&'static str, u128)>,
+}
+
+pub(crate) fn origin_policy(
+    ledger: Arc<Mutex<ledger::Ledger>>,
+) -> (crate::fetch::core::OriginGuard, donsetch_core::ResponseHead) {
+    let gate = Arc::clone(&ledger);
+    let guard = Arc::new(move |raw: &str| {
+        let origin = url::Url::parse(raw).ok()?.origin().ascii_serialization();
+        gate.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .origin_rest(&origin)
+    });
+    let observe = Arc::new(
+        move |status: u16, raw: &str, headers: &[(String, String)]| {
+            let Ok(url) = url::Url::parse(raw) else {
+                return;
+            };
+            let exhausted = status == 200
+                && headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("x-ratelimit-remaining") && value.trim() == "0"
+                });
+            let wait = verticals::throttle("", if exhausted { 403 } else { status }, headers, &[]);
+            let outcome = if wait.is_some() {
+                ledger::Outcome::Throttled
+            } else if matches!(status, 401 | 403) {
+                ledger::Outcome::Blocked
+            } else {
+                return;
+            };
+            ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_origin(
+                    &url.origin().ascii_serialization(),
+                    outcome,
+                    wait.map(|d| d.as_secs()),
+                );
+        },
+    );
+    (guard, observe)
 }
 
 impl Searcher {
@@ -571,13 +692,17 @@ impl Searcher {
             fetcher,
             pool,
             google: engines::google_wml::ProfileSelector::from_env(),
+            cse: cse::Client::load(),
             trust: Mutex::new(trust),
             trust_intent: Mutex::new(trust_intent),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
             cache: Mutex::new(load_cache_disk()),
+            lane_cache: Mutex::new(lane_cache::LaneCache::load()),
+            last_requests: std::sync::atomic::AtomicUsize::new(0),
             failures: Mutex::new(failures),
-            ledger: Mutex::new(ledger::Ledger::load()),
-            inflight: Mutex::new(std::collections::HashSet::new()),
+            ledger: Arc::new(Mutex::new(ledger::Ledger::load())),
+            inflight: Mutex::new(HashMap::new()),
+            pipelines: Mutex::new(HashMap::new()),
             byok_inflight: Mutex::new(std::collections::HashSet::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
             quality: Mutex::new(load_quality_disk()),
@@ -702,7 +827,7 @@ impl Searcher {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (at, cached, _total, report) = cache.get(&key)?;
+        let (at, cached, _total, report, quality) = cache.get(&key)?;
         if at.elapsed() >= cache_ttl(intent, query) {
             return None;
         }
@@ -721,12 +846,15 @@ impl Searcher {
             intent,
             report: report.clone(),
             cached: true,
+            quality: *quality,
+            cache_age: Some(at.elapsed()),
             elapsed: t0.elapsed(),
             provider,
             reranked: false,
             // BYOK providers do not surface a byte-derived SERP
             // instant layer; keep the slot honest.
             instant: None,
+            requests: None,
             stage_ms: Vec::new(),
         })
     }
@@ -792,14 +920,23 @@ impl Searcher {
         if cache.len() >= 500
             && let Some(oldest) = cache
                 .iter()
-                .max_by_key(|(_, (at, _, _, _))| at.elapsed())
+                .max_by_key(|(_, (at, _, _, _, _))| at.elapsed())
                 .map(|(k, _)| k.clone())
         {
             cache.remove(&oldest);
         }
         let results: Vec<Merged> = out.results.iter().take(12).cloned().collect();
         let total = results.len();
-        cache.insert(key, (Instant::now(), results, total, out.report.clone()));
+        cache.insert(
+            key,
+            (
+                Instant::now(),
+                results,
+                total,
+                out.report.clone(),
+                out.quality,
+            ),
+        );
         save_cache_disk(&cache);
     }
 
@@ -874,18 +1011,6 @@ impl Searcher {
         matches!(f.get(engine), Some(&(n, at)) if n >= 3 && at.elapsed() < QUARANTINE_TTL)
     }
 
-    /// Bench a source that asked for time. Same clock and same persistence as
-    /// the chronic-failure bench, but it touches neither trust nor egress
-    /// health: a throttle is the source working as published.
-    fn rest(&self, engine: &str) {
-        self.failures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(engine.to_string(), (3, Instant::now()));
-        self.health_dirty
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
     fn record_outcome(&self, engine: &str, ok: bool) {
         // A source whose trust has already reached the floor is not on a
         // probation it can fail three times: it benches on the next failure.
@@ -923,20 +1048,38 @@ impl Searcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.lane_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Ask a first-party interface directly, outside the search path: the oracle
     /// a canary is judged against. Bounded, and a failure is just a failure.
     pub async fn first_party(&self, vertical: &str, query: &str) -> Vec<engines::Hit> {
         const ORACLE_BUDGET: Duration = Duration::from_secs(8);
-        tokio::time::timeout(
+        let (guard, observe) = origin_policy(Arc::clone(&self.ledger));
+        let work = tokio::time::timeout(
             ORACLE_BUDGET,
             verticals::run(&self.fetcher, vertical, query, None, None),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default()
+        );
+        let result = API_LEDGER
+            .scope(
+                Arc::clone(&self.ledger),
+                crate::fetch::core::REQUEST_ORIGIN_GUARD.scope(
+                    guard,
+                    crate::fetch::core::REQUEST_RESPONSE.scope(observe, work),
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .save_if_dirty();
+        result
     }
 
     /// Every source this process knows about and what it currently means for the
@@ -958,20 +1101,61 @@ impl Searcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let mut names: Vec<&String> = trust.keys().chain(failures.keys()).collect();
+        let mut names: Vec<String> = trust.keys().chain(failures.keys()).cloned().collect();
+        for intent in [
+            Intent::Web,
+            Intent::Code,
+            Intent::News,
+            Intent::Paper,
+            Intent::Entity,
+        ] {
+            names.extend(
+                intent::engines_for(intent)
+                    .iter()
+                    .map(|name| name.to_string()),
+            );
+        }
+        names.extend(
+            [
+                "registry",
+                "docs",
+                "wikipedia",
+                "github",
+                "stackexchange",
+                "mdn",
+                "hn",
+                "arxiv",
+                "openalex",
+                "europepmc",
+                "bing-news",
+                "feed",
+                "gdelt",
+            ]
+            .map(str::to_string),
+        );
         names.sort();
         names.dedup();
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         names
             .into_iter()
             .map(|name| {
-                let t = trust.get(name).copied().unwrap_or(1.0);
-                let f = failures.get(name).map(|(n, at)| (*n, at.elapsed()));
+                let health_key = engine_health_key(&name);
+                let t = trust.get(health_key).copied().unwrap_or(1.0);
+                let f = failures.get(health_key).map(|(n, at)| (*n, at.elapsed()));
+                let state = match ledger.ready(&ledger::key(lane_source(&name), lane_of(&name))) {
+                    ledger::State::Rested(secs) => SourceState::Benched(Duration::from_secs(secs)),
+                    _ if !trust.contains_key(health_key) && f.is_none() => SourceState::Suspect,
+                    _ => source_state(t, f),
+                };
                 SourceHealth {
-                    name: name.clone(),
+                    family: rank::family_name(&families, &name),
+                    name,
                     trust: t,
                     strikes: f.map_or(0, |(n, _)| n),
-                    state: source_state(t, f),
-                    family: families.family_of(name),
+                    state,
                 }
             })
             .collect()
@@ -1013,6 +1197,161 @@ impl Searcher {
         max_results: usize,
         forced_intent: Option<Intent>,
     ) -> Result<SearchOutcome, FetchError> {
+        self.search_with_read(query, max_results, forced_intent, 0)
+            .await
+    }
+
+    /// Search and its bounded evidence reads share accounting and origin rests.
+    /// Default snippet repair uses the remaining search allowance; an explicit
+    /// read grants at most three additional physical exchanges.
+    pub async fn search_with_read(
+        &self,
+        query: &str,
+        max_results: usize,
+        forced_intent: Option<Intent>,
+        read: usize,
+    ) -> Result<SearchOutcome, FetchError> {
+        let started = Instant::now();
+        let read = read.min(3);
+        let max_results = max_results.clamp(1, 12);
+        if let Some(problem) = validate_query(query) {
+            self.last_requests
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            return Err(FetchError::Http(format!("search: {problem}")));
+        }
+        // Acquisition still shares across result/read limits. The complete
+        // pipeline shares only equivalent requests, so a one-result caller
+        // never pays for page reads requested by a twelve-result caller.
+        let key = format!(
+            "{}|{}|read={read}|max={max_results}",
+            norm_query(&query::normalize(query)),
+            forced_intent
+                .unwrap_or_else(|| intent::detect(query))
+                .code()
+        );
+        let flight = loop {
+            let (leader, flight) = {
+                let mut map = self
+                    .pipelines
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match map.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let flight = Arc::new(LocalFlight::default());
+                        entry.insert(Arc::clone(&flight));
+                        (true, flight)
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (false, Arc::clone(entry.get()))
+                    }
+                }
+            };
+            if leader {
+                break flight;
+            }
+            loop {
+                if let Some(mut answer) = flight
+                    .answer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                {
+                    answer.requests = Some(0); // this caller started no exchange
+                    for report in &mut answer.report {
+                        report.requests = 0;
+                        report.ms = 0;
+                    }
+                    answer.elapsed = started.elapsed();
+                    self.last_requests
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(answer);
+                }
+                if flight.done.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                if started.elapsed() >= Duration::from_secs(12) {
+                    self.last_requests
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    return Err(FetchError::Timeout);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let _pipeline_guard = LocalFlightGuard {
+            map: &self.pipelines,
+            key,
+            flight: Arc::clone(&flight),
+        };
+        let limit = crate::config::cfg().search.request_budget;
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (guard, observe) = origin_policy(Arc::clone(&self.ledger));
+        let pipeline = async {
+            let (mut out, attempted) = self
+                .with_early_evidence(
+                    query,
+                    read == 0,
+                    started,
+                    crate::fetch::core::REQUEST_LIMIT.scope(
+                        limit,
+                        self.search_counted(query, max_results, forced_intent),
+                    ),
+                )
+                .await?;
+            if read > 0 {
+                self.read_results(&mut out.results, query, read).await;
+            }
+            // Cold documents took 0.8–1.3 s in native witnesses; 450 ms spent
+            // requests without yielding evidence. Use the remaining 2.2 s call
+            // envelope, not an extra wait after an already-slow search.
+            let repair_time = Duration::from_millis(2200)
+                .saturating_sub(started.elapsed())
+                .min(Duration::from_millis(1500));
+            self.repair_default_snippets(&mut out.results, query, read, repair_time, &attempted)
+                .await;
+            self.ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .save_if_dirty();
+            out.elapsed = started.elapsed();
+            Ok::<_, FetchError>(out)
+        };
+        let work = crate::fetch::core::REQUEST_COUNT.scope(
+            Arc::clone(&count),
+            crate::fetch::core::REQUEST_LIMIT.scope(limit.saturating_add(read), pipeline),
+        );
+        let mut outcome = crate::fetch::core::REQUEST_ORIGIN_GUARD
+            .scope(
+                guard,
+                crate::fetch::core::REQUEST_RESPONSE
+                    .scope(observe, API_LEDGER.scope(Arc::clone(&self.ledger), work)),
+            )
+            .await;
+        let requests = count.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_requests
+            .store(requests, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(out) = &mut outcome {
+            out.requests = Some(requests);
+            *flight
+                .answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out.clone());
+        }
+        outcome
+    }
+
+    /// Physical HTTP exchanges started by the last completed local call, including
+    /// failures and cancelled lanes. Concurrent calls may replace this receipt.
+    pub fn last_request_count(&self) -> usize {
+        self.last_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn search_counted(
+        &self,
+        query: &str,
+        max_results: usize,
+        forced_intent: Option<Intent>,
+    ) -> Result<SearchOutcome, FetchError> {
         let started = Instant::now();
         // The merge holds at most 12; asking for more is asking for what the
         // cache cannot hold, and zero results is not a search.
@@ -1028,56 +1367,65 @@ impl Searcher {
         // the cache, so a query run once at max=2 and again at
         // max=10 shares one fan-out instead of paying two.
         let sf_key = format!("{}|{}", norm_query(query), intent_probe.code());
-        let leader = {
-            let mut m = self
-                .inflight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            m.insert(sf_key.clone())
-        };
-        if !leader {
-            // Follower: poll for the leader's cache write.
-            // The leader publishes into the query cache on
-            // completion, so followers read it from there.
-            for _ in 0..120 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let hit = self
-                    .cache
+        let flight = loop {
+            let (leader, flight) = {
+                let mut map = self
+                    .inflight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match map.entry(sf_key.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let flight = std::sync::Arc::new(LocalFlight::default());
+                        entry.insert(std::sync::Arc::clone(&flight));
+                        (true, flight)
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (false, std::sync::Arc::clone(entry.get()))
+                    }
+                }
+            };
+            if leader {
+                break flight;
+            }
+            // Share this call's fresh answer, even when its confidence forbids
+            // caching. Only callers already waiting on this flight can see it.
+            loop {
+                if let Some(mut answer) = flight
+                    .answer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&format!("{}|{}", norm_query(query), intent_probe.code()))
-                    .cloned();
-                if let Some((at, cached, _total, reports)) = hit
-                    && at.elapsed() < cache_ttl(intent_probe, query)
+                    .clone()
                 {
-                    let mut results = cached.iter().take(max_results).cloned().collect();
-                    site_filter(query, &mut results);
-                    query::intitle_filter(query, &mut results);
-                    query::filetype_filter(query, &mut results);
-                    return Ok(SearchOutcome {
-                        results,
-                        intent: intent_probe,
-                        report: reports,
-                        cached: true,
-                        elapsed: started.elapsed(),
-                        provider: None,
-                        reranked: false,
-                        // Instant is not cached: a stale featured
-                        // snippet presented as fresh would lie.
-                        instant: None,
-                        stage_ms: Vec::new(),
-                    });
+                    answer.results.truncate(max_results);
+                    for report in &mut answer.report {
+                        report.requests = 0;
+                        report.ms = 0;
+                    }
+                    answer.elapsed = started.elapsed();
+                    return Ok(answer);
                 }
+                if flight.done.load(std::sync::atomic::Ordering::Acquire) {
+                    break; // Failed/cancelled leader: elect one replacement.
+                }
+                if started.elapsed() >= Duration::from_secs(12) {
+                    return Err(FetchError::Timeout);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // Leader died or timed out : compute ourselves.
-        }
-        let _inflight_guard = InflightGuard {
+        };
+        let _inflight_guard = LocalFlightGuard {
             map: &self.inflight,
             key: sf_key,
+            flight: std::sync::Arc::clone(&flight),
         };
-        let outcome = self
-            .search_inner(query, max_results, forced_intent, started)
-            .await;
+        let mut outcome = self.search_inner(query, 12, forced_intent, started).await;
+        if let Ok(answer) = &mut outcome {
+            *flight
+                .answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answer.clone());
+            answer.results.truncate(max_results);
+        }
         // The ledger learned something: rest a lane, or walk it back.
         self.ledger
             .lock()
@@ -1107,12 +1455,13 @@ impl Searcher {
         let locale = locale::detect(query);
         let cache_key = format!("{}|{}", norm_query(query), intent.code());
 
-        if let Some((at, cached, _total, reports)) = self
+        if let Some((at, cached, _total, reports, quality)) = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&cache_key)
             && at.elapsed() < cache_ttl(intent, query)
+            && quality.confidence == quality::Confidence::High
         {
             let mut results = cached.iter().take(max_results).cloned().collect();
             site_filter(query, &mut results);
@@ -1121,14 +1470,34 @@ impl Searcher {
             return Ok(SearchOutcome {
                 results,
                 intent,
-                report: reports.clone(),
+                report: reports
+                    .iter()
+                    .cloned()
+                    .map(|mut report| {
+                        report.requests = 0;
+                        report.ms = 0;
+                        if matches!(report.status.as_str(), "ok" | "cached" | "thin") {
+                            report.status = "cached".into();
+                            report.cache_age_ms = Some(
+                                report
+                                    .cache_age_ms
+                                    .unwrap_or(0)
+                                    .saturating_add(at.elapsed().as_millis() as u64),
+                            );
+                        }
+                        report
+                    })
+                    .collect(),
                 cached: true,
+                quality: *quality,
+                cache_age: Some(at.elapsed()),
                 elapsed: started.elapsed(),
                 provider: None,
                 reranked: false,
                 // Instant is not cached: a stale featured
                 // snippet presented as fresh would lie.
                 instant: None,
+                requests: None,
                 stage_ms: Vec::new(),
             });
         }
@@ -1165,16 +1534,15 @@ impl Searcher {
 
         // Fan out: engines each get their own egress
         // (spreading is the anti-rate-limit move).
+        let query_facts = query::QueryFacts::new(query);
+        let engine_allowance = Arc::new(tasks::RequestAllowance::new(0));
         let mut futures: Vec<(String, TaskFut)> = Vec::new();
+        let mut request_costs = HashMap::new();
         // A lane the ledger rests, or the budget cannot afford, is reported
         // rather than silently dropped: the census says which, and why.
         let mut skipped: Vec<(String, EngineResult)> = Vec::new();
         let budget = crate::config::cfg().search.request_budget;
         let mut used_egresses: Vec<String> = Vec::new();
-        let mut queries: Vec<String> = vec![query.to_string()];
-        if let Some(v) = intent::variant(query) {
-            queries.push(v);
-        }
         // Engines get the original query; the recall variant
         // goes only to the first two engines (top trust).
         let benched =
@@ -1235,13 +1603,7 @@ impl Searcher {
             .iter()
             .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
             .collect();
-        // Recall variants spend lanes : only when the
-        // governor did NOT cut the roster (healthy pool).
-        if queries.len() > 1 && self.pool.stress() < 0.15 {
-            for e in live.iter().take(2) {
-                assignments.push((e.to_string(), queries[1].clone()));
-            }
-        }
+        let mut priority_sources = vec!["google-cse".to_string()];
         // Authority cannot lift a source absent from the candidate pool.
         // Two scoped recalls join the initial wave, on an engine that honors
         // site:, only while the pool is healthy. Results still need ranking.
@@ -1255,10 +1617,12 @@ impl Searcher {
                 .or_else(|| live.iter().find(|e| matches!(**e, "bing" | "ddg_html")))
                 .copied()
                 .or_else(|| live.contains(&"ddg").then_some("ddg_html"));
-            if let Some(engine) = engine {
-                for q in authority::official_queries(&compiled) {
-                    assignments.push((engine.to_string(), q));
-                }
+            if let Some(engine) = engine
+                && let Some(scoped) = authority::official_queries(&compiled).into_iter().next()
+                && let Some(assignment) = assignments.iter_mut().find(|(name, _)| name == engine)
+            {
+                assignment.1 = scoped;
+                priority_sources.push(engine.to_string());
             }
         }
 
@@ -1271,32 +1635,72 @@ impl Searcher {
         //
         // We only exclude proxy egresses from reuse : direct
         // is shared, not exclusive.
+        // An official recall asks a different question. It cannot teach index
+        // independence against a peer's broad query; neither can a cache replay.
+        let comparable: std::collections::HashSet<String> = if compiled.has_operators() {
+            Default::default()
+        } else {
+            assignments
+                .iter()
+                .filter(|(engine, q)| *q == query::for_engine(&compiled, engine))
+                .map(|(engine, _)| engine_name(engine).to_string())
+                .collect()
+        };
         let context = tasks::EngineContext {
             fetcher: &self.fetcher,
             pool: self.pool.as_ref(),
             google: &self.google,
+            cse: &self.cse,
             locale,
+            requests: &engine_allowance,
+            facts: Some(&query_facts),
         };
         for (engine, q, eg) in assign_egresses(self.pool.as_ref(), assignments, &mut used_egresses)
         {
             let name = engine_name(&engine).to_string();
-            let Some(pace) = self.plan_lane(&name, &mut skipped) else {
+            let cached = self
+                .lane_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&name, &q, intent);
+            let pace = if cached {
+                Some(Duration::ZERO)
+            } else {
+                self.plan_lane(&name, &mut skipped)
+            };
+            let Some(pace) = pace else {
                 continue;
             };
+            request_costs.insert(
+                name.clone(),
+                if cached {
+                    0
+                } else if name == "google-cse" {
+                    self.cse.request_cost(eg.proxy.as_ref())
+                } else {
+                    1
+                },
+            );
             futures.push((
-                name,
-                paced(
-                    pace,
-                    Box::pin(tasks::engine_task_with_budget(
-                        engine,
-                        q,
-                        eg.id,
-                        eg.proxy,
-                        context,
-                        lane_budget(),
-                        None,
-                    )),
-                ),
+                name.clone(),
+                Box::pin(lane_cache::run(
+                    &self.lane_cache,
+                    name.clone(),
+                    q.clone(),
+                    intent,
+                    paced(
+                        pace,
+                        Box::pin(tasks::engine_task_with_budget(
+                            engine,
+                            q,
+                            eg.id,
+                            eg.proxy,
+                            context,
+                            lane_budget(),
+                            None,
+                        )),
+                    ),
+                )),
             ));
         }
         // Verticals: direct, friendly APIs.
@@ -1306,22 +1710,45 @@ impl Searcher {
             .collect();
         let mut vfuts: Vec<(String, TaskFut)> = Vec::new();
         for v in verticals {
-            let Some(pace) = self.plan_lane(v, &mut skipped) else {
+            if verticals::endpoint_in(v, query, locale).is_none() {
+                skipped.push((
+                    v.to_string(),
+                    Err(("not-asked".into(), "no-interface".into(), false)),
+                ));
+                continue;
+            }
+            let pace = if self
+                .lane_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(v, query, intent)
+            {
+                Some(Duration::ZERO)
+            } else {
+                self.plan_lane(v, &mut skipped)
+            };
+            let Some(pace) = pace else {
                 continue;
             };
             vfuts.push((
                 engine_name(v).to_string(),
-                paced(
-                    pace,
-                    Box::pin(vertical_task(
-                        v.to_string(),
-                        query.to_string(),
-                        &self.fetcher,
-                        None,
-                        lane_budget(),
-                        locale,
-                    )),
-                ),
+                Box::pin(lane_cache::run(
+                    &self.lane_cache,
+                    v.to_string(),
+                    query.to_string(),
+                    intent,
+                    paced(
+                        pace,
+                        Box::pin(vertical_task(
+                            v.to_string(),
+                            query.to_string(),
+                            &self.fetcher,
+                            None,
+                            lane_budget(),
+                            locale,
+                        )),
+                    ),
+                )),
             ));
         }
         if matches!(intent, Intent::Code | Intent::Paper | Intent::Entity) {
@@ -1347,6 +1774,7 @@ impl Searcher {
                     pace,
                     Box::pin(tasks::docs_task(
                         item,
+                        query.to_string(),
                         &self.fetcher,
                         Duration::from_millis(900),
                     )),
@@ -1450,10 +1878,22 @@ impl Searcher {
             let is_news = |name: &str| matches!(name, "bing-news" | "feed" | "gdelt");
             futures.sort_by_key(|(name, _)| !is_news(name));
         }
+        if query.split_whitespace().count() == 1
+            && futures.iter().any(|(name, _)| name == "registry")
+        {
+            futures.sort_by_key(|(name, _)| name != "registry");
+            priority_sources.push("registry".into());
+        }
+        if futures.iter().any(|(name, _)| name == "docs") {
+            futures.sort_by_key(|(name, _)| name != "docs");
+            priority_sources.push("docs".into());
+        }
         let mut kept: Vec<(String, TaskFut)> = Vec::with_capacity(futures.len());
         let (mut engines_kept, mut verticals_kept, mut news_kept, mut guesses_kept) =
             (0usize, 0usize, 0usize, 0usize);
         let mut spent = 0usize;
+        let mut first_party_reserved = 0usize;
+        let mut initial_requests = Vec::new();
         for (name, fut) in futures.drain(..) {
             let class = if matches!(name.as_str(), "bing-news" | "feed" | "gdelt") {
                 2
@@ -1464,9 +1904,13 @@ impl Searcher {
             } else {
                 0
             };
-            // bing may spend a second request on its structured fallback; the
-            // budget counts the ceiling, not the hope.
-            let cost = if name == "bing" { 2 } else { 1 };
+            // Reserve mandatory first exchanges, including Google's cold
+            // bootstrap. Optional retries cannot consume another lane's start.
+            let cost = match name.as_str() {
+                "feed" | "arxiv" | "docs" => 2,
+                "registry" | "registry-any" => 3,
+                _ => request_costs.get(&name).copied().unwrap_or(1),
+            };
             // A paper query needs its three indexes; everything else is better
             // served by another general index than by a third vertical.
             let vert_cap = if intent == Intent::Paper { 3 } else { 2 };
@@ -1484,246 +1928,58 @@ impl Searcher {
                     _ => guesses_kept += 1,
                 }
                 spent += cost;
+                if class != 0 {
+                    first_party_reserved += cost;
+                } else {
+                    initial_requests.push((name.clone(), cost));
+                }
                 kept.push((name, fut));
             } else {
                 skipped.push((name, Err(("not-asked".into(), "budget".into(), false))));
             }
         }
-        let futures = kept;
-
-        // ── One budget, raced ──
-        //
-        // The call commits to what has answered by the soft mark and cancels the
-        // rest. A source that misses it is reported `late`: never waited on, never
-        // retried inside the call. Recovery is the state's job on the next call,
-        // through a different lane, so one slow or walled source costs this query
-        // nothing but its own absence.
-        // Two marks, not one. The soft mark commits to an answer that is already
-        // good; the hard mark bounds the wait when the sources are slow. A single
-        // fixed mark measured on this network turned a slow minute into lost
-        // answers (hit@5 0.53 against 0.68), because it cut the sources that
-        // would have answered.
-        let started_at = tokio::time::Instant::now();
-        let soft_deadline = started_at + stage_budget(FANOUT_SOFT_MARK, Duration::from_millis(300));
-        let hard_deadline = started_at + stage_budget(FANOUT_HARD_MARK, Duration::from_millis(200));
-        let mut outstanding: std::collections::HashMap<String, usize> = Default::default();
-        for (name, _) in &futures {
-            *outstanding.entry(name.clone()).or_insert(0) += 1;
-        }
-        use futures_util::StreamExt as _;
-        let mut futs: futures_util::stream::FuturesUnordered<_> = futures
+        let futures: Vec<(String, TaskFut<'_>)> = kept
             .into_iter()
-            .map(|(name, fut)| {
-                Box::pin(async move { (name, fut.await) })
-                    as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<Output = (String, (String, EngineResult))>
-                                + Send,
-                        >,
-                    >
+            .map(|(name, future)| {
+                let counter = engine_allowance.counter(&name);
+                let allowance = &engine_allowance;
+                let source = name.clone();
+                let measured: TaskFut<'_> = Box::pin(async move {
+                    let (label, mut result) = crate::fetch::core::REQUEST_SOURCE_COUNT
+                        .scope(std::sync::Arc::clone(&counter), future)
+                        .await;
+                    allowance.release(&source);
+                    if let Ok(answer) = &mut result {
+                        answer.requests = counter.load(std::sync::atomic::Ordering::Relaxed);
+                    }
+                    (label, result)
+                });
+                (name, measured)
             })
             .collect();
-        let early = crate::config::cfg().search.search_early;
+        engine_allowance.plan(
+            budget.saturating_sub(first_party_reserved),
+            initial_requests,
+        );
+
         let known_families = self
             .families
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let mut outcomes: Vec<(String, EngineResult)> = skipped;
-        // A news query's answer is the wire: committing on consensus before the
-        // news lanes report drops the record the query asked for. They get a
-        // bounded head start past the soft mark; then the call commits anyway.
-        let news_deadline = tokio::time::Instant::now() + Duration::from_millis(1800);
-        let news_wanted = news::wants_news(query, intent);
-        loop {
-            let news_pending = news_wanted
-                && ["bing-news", "feed", "gdelt"]
-                    .iter()
-                    .any(|lane| outstanding.get(*lane).copied().unwrap_or(0) > 0);
-            let now = tokio::time::Instant::now();
-            if enough_answered(&outcomes, early, &known_families)
-                && (!news_pending || now >= news_deadline)
-            {
-                break;
-            }
-            // The soft mark only ends the wait when the answer is already
-            // settled (independent families agree). A count of items is not
-            // agreement: measured, stopping at two fat lanes cut contributing
-            // sources from 3.5 to 1.8 per query and cost ranking quality, because
-            // the third source was 200 ms behind, not absent.
-            let now = tokio::time::Instant::now();
-            if now >= hard_deadline {
-                break;
-            }
-            // Until the soft mark, then a short late mark (a news query waits
-            // for its wire, a call with nothing usable yet keeps the hard
-            // budget). Past that, the call commits to what has answered: a
-            // straggler at 2.7 s is not worth 1.5 s of everyone's wall clock.
-            let until = if now < soft_deadline {
-                soft_deadline
-            } else {
-                let (_, items) = answered(&outcomes);
-                let deadline = if items == 0 {
-                    hard_deadline
-                } else if news_pending {
-                    news_deadline.min(hard_deadline)
-                } else {
-                    soft_deadline + FANOUT_LATE_MARK
-                };
-                if now >= deadline {
-                    break;
-                }
-                deadline
-            };
-            match tokio::time::timeout_at(until, futs.next()).await {
-                Ok(Some((name, (label, result)))) => {
-                    if let Some(n) = outstanding.get_mut(&name) {
-                        *n = n.saturating_sub(1);
-                    }
-                    outcomes.push((label, result));
-                }
-                // Every lane answered.
-                Ok(None) => break,
-                // The mark passed with lanes still running: they are late.
-                Err(_) => break,
-            }
-        }
-        // ── One bounded second ask ──
-        //
-        // A thin merge gets one more attempt from the sources that misbehaved,
-        // through a different lane, inside the hard mark. Never a third ask, and
-        // never when the first wave already answered well: recovery is still the
-        // state's job across calls, this only rescues a query where two thirds
-        // of the sources were walled at once.
-        let (lanes, items) = answered(&outcomes);
-        if (lanes < THIN_LANES || items < THIN_ITEMS) && tokio::time::Instant::now() < hard_deadline
-        {
-            let mut asked: std::collections::HashSet<String> = Default::default();
-            let mut retry: Vec<(String, TaskFut)> = Vec::new();
-            for (label, result) in &outcomes {
-                let Err((status, _, engine_lane)) = result else {
-                    continue;
-                };
-                if !*engine_lane || !worth_second_ask(status) {
-                    continue;
-                }
-                let engine = engine_name(label).to_string();
-                if !asked.insert(engine.clone()) {
-                    continue;
-                }
-                if outcomes
-                    .iter()
-                    .any(|(l, r)| engine_name(l) == engine && r.is_ok())
-                {
-                    continue;
-                }
-                let Some(eg) = self.pool.pick(&engine, &used_egresses, true) else {
-                    continue;
-                };
-                let budget = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
-                retry.push((
-                    engine.clone(),
-                    Box::pin(tasks::engine_task_with_budget(
-                        engine,
-                        query.to_string(),
-                        eg.id,
-                        eg.proxy,
-                        context,
-                        budget.min(SECOND_ASK),
-                        None,
-                    )),
-                ));
-            }
-            if !retry.is_empty() {
-                let secs: futures_util::stream::FuturesUnordered<_> = retry
-                    .into_iter()
-                    .map(|(name, fut)| {
-                        Box::pin(async move { (name, fut.await) })
-                            as std::pin::Pin<
-                                Box<
-                                    dyn std::future::Future<
-                                            Output = (String, (String, EngineResult)),
-                                        > + Send,
-                                >,
-                            >
-                    })
-                    .collect();
-                let left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if let Ok(done) =
-                    tokio::time::timeout(left, futures_util::future::join_all(secs)).await
-                {
-                    for (name, outcome) in done {
-                        if let Some(n) = outstanding.get_mut(&name) {
-                            *n = n.saturating_sub(1);
-                        }
-                        outcomes.push(outcome);
-                    }
-                }
-            }
-        }
-
-        // A call with nothing yet gives the lanes the scheduler cut one more ask
-        // inside the hard mark: a straggler is slow, not absent, and an empty
-        // answer is the one outcome a caller cannot use. This is not a rotation
-        // around a limit — a lane that refused was rested by the ledger and is
-        // not outstanding here.
-        if answered(&outcomes).1 == 0 && tokio::time::Instant::now() < hard_deadline {
-            let mut rescue: Vec<(String, TaskFut)> = Vec::new();
-            for (name, pending) in &outstanding {
-                if *pending == 0 || !engines.contains(&name.as_str()) {
-                    continue;
-                }
-                let Some(eg) = self.pool.pick(name, &used_egresses, true) else {
-                    continue;
-                };
-                let budget = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
-                rescue.push((
-                    name.clone(),
-                    Box::pin(tasks::engine_task_with_budget(
-                        name.clone(),
-                        query.to_string(),
-                        eg.id,
-                        eg.proxy,
-                        context,
-                        budget.min(SECOND_ASK),
-                        None,
-                    )),
-                ));
-            }
-            if !rescue.is_empty() {
-                let secs: futures_util::stream::FuturesUnordered<_> = rescue
-                    .into_iter()
-                    .map(|(name, fut)| {
-                        Box::pin(async move { (name, fut.await) })
-                            as std::pin::Pin<
-                                Box<
-                                    dyn std::future::Future<
-                                            Output = (String, (String, EngineResult)),
-                                        > + Send,
-                                >,
-                            >
-                    })
-                    .collect();
-                let left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if let Ok(done) =
-                    tokio::time::timeout(left, futures_util::future::join_all(secs)).await
-                {
-                    for (name, outcome) in done {
-                        if let Some(n) = outstanding.get_mut(&name) {
-                            *n = n.saturating_sub(1);
-                        }
-                        outcomes.push(outcome);
-                    }
-                }
-            }
-        }
-
-        let mut late: Vec<String> = outstanding
-            .into_iter()
-            .filter(|(_, n)| *n > 0)
-            .map(|(name, _)| name)
-            .collect();
-        late.sort();
+        let (outcomes, late) = EARLY_ALLOWANCE
+            .scope(
+                Arc::clone(&engine_allowance),
+                schedule::run(
+                    futures,
+                    skipped,
+                    &known_families,
+                    crate::config::cfg().search.search_early,
+                    news::wants_news(query, intent),
+                    &priority_sources,
+                ),
+            )
+            .await;
 
         let mut per_engine: Vec<(String, Vec<engines::Hit>)> = Vec::new();
         let mut report = Vec::new();
@@ -1741,8 +1997,10 @@ impl Searcher {
             match outcome {
                 Ok(answer) => {
                     let base = engine_health_key(&engine);
-                    self.record_lane(&engine, "ok");
-                    if answer.class.credits() {
+                    if answer.cache_age.is_none() {
+                        self.record_lane(&engine, "ok");
+                    }
+                    if answer.class.credits() && answer.cache_age.is_none() {
                         // A real answer: the only branch that earns the source,
                         // the lane and the profile selector any credit.
                         self.record_outcome(base, true);
@@ -1763,14 +2021,20 @@ impl Searcher {
                         // The block is a convenience, never a hole in the URL
                         // contract: unwrap it and keep it only if it is a page.
                         ans.url = contract::canonical_url(&ans.url);
-                        if contract::url_class(&ans.url) == contract::UrlClass::Page {
+                        if ans.permitted(&query_facts) {
                             instant = Some(ans);
                         }
                     }
                     report.push(EngineReport {
+                        cache_age_ms: answer.cache_age.map(|age| age.as_millis() as u64),
                         engine: engine.clone(),
                         profile: profile.clone(),
-                        status: answer.class.status().into(),
+                        status: if answer.cache_age.is_some() {
+                            "cached"
+                        } else {
+                            answer.class.status()
+                        }
+                        .into(),
                         hits: answer.items,
                         ms: answer.ms,
                         egress: answer.egress.clone(),
@@ -1788,11 +2052,9 @@ impl Searcher {
                     // or distrust the engine over them.
                     if is_engine_fault(&status) {
                         self.record_outcome(base, false);
-                    } else if status.starts_with("rate-limited") {
-                        // The source published a limit: it is rested, not
-                        // distrusted, and probed again when the rest lapses.
-                        self.rest(base);
                     }
+                    // The ledger above owns Retry-After. A throttle must not
+                    // also create a fixed ten-minute transport quarantine.
                     if was_engine {
                         if status.starts_with("dead") {
                             self.pool.report_dead(&egress_id);
@@ -1809,16 +2071,21 @@ impl Searcher {
                     // back; a lane the plan never asked spent none.
                     let asked = !matches!(
                         status.split(':').next().unwrap_or(&status),
-                        "rested" | "not-asked" | "pacing-timeout"
+                        "rested" | "not-asked" | "pacing-timeout" | "budget-skipped"
                     );
                     report.push(EngineReport {
+                        cache_age_ms: None,
+                        requests: if was_engine {
+                            engine_allowance.spent(&engine)
+                        } else {
+                            usize::from(asked)
+                        },
                         engine,
                         profile,
                         status,
                         hits: 0,
                         ms: 0,
                         egress: egress_id,
-                        requests: usize::from(asked),
                     });
                 }
             }
@@ -1839,13 +2106,14 @@ impl Searcher {
             // the ledger rests it briefly so the next search does not wait on it.
             self.record_lane(&name, "late");
             report.push(EngineReport {
+                cache_age_ms: None,
+                requests: engine_allowance.spent(&name),
                 engine: name,
                 profile: None,
                 status: "late".into(),
                 hits: 0,
                 ms: 0,
                 egress: "-".into(),
-                requests: 0,
             });
         }
 
@@ -1908,20 +2176,14 @@ impl Searcher {
             );
         }
 
+        let native_lang = locale::evidence_language(query);
+        retain_native_script(&mut per_engine, native_lang);
+
         let total = rank::merged_total(&per_engine);
         // What each general source returned teaches the independence graph, and
         // this query is ranked with what it just learned.
         let families_now = {
-            let lists: Vec<(String, Vec<String>)> = per_engine
-                .iter()
-                .filter(|(name, _)| !rank::is_vertical(name))
-                .map(|(name, hits)| {
-                    (
-                        egress::health_key(name).to_string(),
-                        hits.iter().map(|h| rank::norm_key(&h.url)).collect(),
-                    )
-                })
-                .collect();
+            let lists = fresh_family_lists(&per_engine, &report, &comparable);
             let mut guard = self
                 .families
                 .lock()
@@ -1940,22 +2202,22 @@ impl Searcher {
         // title filter (measured: `intitle:"Attention Is All You Need" arxiv` came
         // back empty while three lanes had answered — the paper sat beyond slot 12).
         let merge_depth = if compiled.has_operators() { 40 } else { 12 };
-        let input = rank::MergeInput {
+        let mut input = rank::MergeInput {
             per_engine,
             query: query.to_string(),
             intent,
             trust,
             families: families_now,
             depth: merge_depth,
+            post_adjustments: HashMap::new(),
         };
         let mut results = input.merge();
-        *self
-            .last_merge
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
-        // B3: learned host quality nudge. After merge (and its
-        // diversity cap) so it only reorders survivors with a
-        // small weight; consensus still dominates.
+        let base_scores: HashMap<_, _> = results
+            .iter()
+            .map(|r| (rank::norm_key(&r.url), r.score))
+            .collect();
+        // Compatibility hook: historical host quality no longer changes the
+        // evidence-ranked order (5.3.0 §14).
         {
             let quality = self
                 .quality
@@ -1996,6 +2258,23 @@ impl Searcher {
             .await;
         }
         let enrich_ms = enrich_t.elapsed().as_millis();
+        results.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
+        input.post_adjustments = results
+            .iter()
+            .filter_map(|r| {
+                let key = rank::norm_key(&r.url);
+                let delta = r.score - base_scores.get(&key).copied().unwrap_or(r.score);
+                (delta != 0.0).then_some((key, delta))
+            })
+            .collect();
+        *self
+            .last_merge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
 
         // ── site:/intitle:/filetype: post-merge enforcement:
         // engines don't strictly respect operators : some results
@@ -2028,8 +2307,16 @@ impl Searcher {
         // Poisoning guard: a merge built while engines
         // were down must NOT persist for 30 minutes :
         // degraded-period results expire with the moment.
-        let content_lanes = report.iter().filter(|r| r.status == "ok").count();
-        let cacheable = content_lanes >= 2 && total >= 8;
+        let quality = quality::assess(
+            query,
+            &results,
+            &report,
+            &self
+                .families
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let cacheable = quality.confidence == quality::Confidence::High;
         if cacheable {
             let snapshot = {
                 let mut cache = self
@@ -2040,7 +2327,7 @@ impl Searcher {
                 if cache.len() >= 500
                     && let Some(oldest) = cache
                         .iter()
-                        .max_by_key(|(_, (at, _, _, _))| at.elapsed())
+                        .max_by_key(|(_, (at, _, _, _, _))| at.elapsed())
                         .map(|(k, _)| k.clone())
                 {
                     cache.remove(&oldest);
@@ -2052,6 +2339,7 @@ impl Searcher {
                         results.iter().take(12).cloned().collect(),
                         total,
                         report.clone(),
+                        quality,
                     ),
                 );
                 cache.clone()
@@ -2062,6 +2350,11 @@ impl Searcher {
             };
             save_cache_disk(&snapshot);
         }
+
+        self.lane_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .save();
 
         // Persist learned engine health once per search (single
         // small write; failures inside the loop are already
@@ -2093,10 +2386,13 @@ impl Searcher {
             intent,
             report,
             cached: false,
+            quality,
+            cache_age: None,
             elapsed: started.elapsed(),
             provider: None,
             reranked: false,
             instant,
+            requests: None,
             stage_ms: stages,
         })
     }
@@ -2119,6 +2415,7 @@ impl Searcher {
             trust: HashMap::new(),
             families: families::Families::default(),
             depth: 12,
+            post_adjustments: HashMap::new(),
         };
         let results = input.merge();
         *self
@@ -2126,23 +2423,40 @@ impl Searcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
         let report = vec![EngineReport {
+            cache_age_ms: resolved.cache_age.map(|age| age.as_millis() as u64),
             engine: "registry".into(),
             profile: Some(resolved.label),
-            status: "ok".into(),
+            status: if resolved.cache_age.is_some() {
+                "cached"
+            } else {
+                "ok"
+            }
+            .into(),
             hits: resolved.hits.len(),
             ms: resolved.ms,
-            egress: "direct".into(),
-            requests: resolved.requests,
+            egress: if resolved.cache_age.is_some() {
+                "cache"
+            } else {
+                "direct"
+            }
+            .into(),
+            requests: crate::fetch::core::REQUEST_COUNT
+                .try_with(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(resolved.requests),
         }];
+        let quality = quality::assess(query, &results, &report, &families::Families::default());
         SearchOutcome {
             results: results.into_iter().take(max_results).collect(),
             intent,
             report,
             cached: false,
+            quality,
+            cache_age: None,
             elapsed: started.elapsed(),
             provider: None,
             reranked: false,
             instant: None,
+            requests: None,
             stage_ms: vec![("resolve", resolved.ms as u128)],
         }
     }
@@ -2193,6 +2507,33 @@ impl Searcher {
         let low = trust.values().filter(|&&t| t < 0.5).count()
             + trust_i.values().filter(|&&t| t < 0.5).count();
         (trust.len(), trust_i.len(), low + failures.len())
+    }
+
+    /// Local health facts without a search, network request or model loader.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let high = cache
+            .values()
+            .filter(|(_, _, _, _, q)| q.confidence == quality::Confidence::High)
+            .count();
+        let (lanes, fresh) = self
+            .lane_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counts();
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let states: Vec<_> = intent::engines_for(Intent::Web).iter().map(|source| {
+            serde_json::json!({"source": source, "standing": format!("{:?}", ledger.ready(&ledger::key(source, "serp")))})
+        }).collect();
+        serde_json::json!({"runtime_model": false, "model_download": false,
+            "cache": {"merged": cache.len(), "high": high, "lanes": lanes, "fresh_lanes": fresh},
+            "ledger": states, "egress": self.pool.lane_summary().len()})
     }
 
     /// B3: record one enrich/prefetch outcome for a host.
@@ -2301,11 +2642,6 @@ fn engine_health_key(engine: &str) -> &str {
     egress::health_key(engine)
 }
 
-/// Governor: fan-out width under stress. Healthy pool →
-/// all engines; stressed → shrink appetite (you can't be
-/// rate-limited if you never exceed the rate); starved →
-/// top engine + verticals. Consensus survives at width 2
-/// by construction (two independent index families).
 /// Reject a query no endpoint would answer, before any egress is spent.
 pub(crate) fn validate_query(query: &str) -> Option<String> {
     let t = query.trim();
@@ -2321,14 +2657,9 @@ pub(crate) fn validate_query(query: &str) -> Option<String> {
     None
 }
 
-/// How many engines a stressed pool still asks. Never fewer than two: rank
-/// mass is agreement between independent families, and one engine cannot
-/// agree with anything. A single engine's own failures are the ledger's to
-/// rest, lane by lane.
+/// Healthy pools retain the available roster; stressed pools keep at most
+/// three endpoints. Confidence measures independence separately from that count.
 fn width_for_stress(stress: f64, available: usize) -> usize {
-    // Below the healthy mark every lane is asked. Above it the roster narrows
-    // to three, never fewer: three independent families are what a ranking is
-    // built from, and a two-lane merge is a coin toss presented as an answer.
     if stress < 0.15 {
         available
     } else {
@@ -2381,6 +2712,52 @@ pub(crate) fn site_filter(query: &str, results: &mut Vec<Merged>) {
     });
 }
 
+fn retain_native_script(per_engine: &mut Vec<(String, Vec<engines::Hit>)>, lang: Option<&str>) {
+    let Some(lang) = lang else { return };
+    if !per_engine
+        .iter()
+        .flat_map(|(_, hits)| hits)
+        .any(|h| locale::native(lang, &h.title, &h.snippet))
+    {
+        return;
+    }
+    for (_, hits) in per_engine.iter_mut() {
+        hits.retain(|h| locale::native(lang, &h.title, &h.snippet));
+    }
+    per_engine.retain(|(_, hits)| !hits.is_empty());
+}
+
+/// A fresh answer shared only with callers waiting on the same request.
+#[derive(Default)]
+struct LocalFlight {
+    answer: Mutex<Option<SearchOutcome>>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+struct LocalFlightGuard<'a> {
+    map: &'a Mutex<HashMap<String, std::sync::Arc<LocalFlight>>>,
+    key: String,
+    flight: std::sync::Arc<LocalFlight>,
+}
+
+impl Drop for LocalFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map
+            .get(&self.key)
+            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry, &self.flight))
+        {
+            map.remove(&self.key);
+        }
+        self.flight
+            .done
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Removes the inflight key when the leader finishes
 /// (success or failure) so the set never grows unbounded.
 struct InflightGuard<'a> {
@@ -2401,6 +2778,347 @@ impl Drop for InflightGuard<'_> {
 mod tests {
     use super::render::clip_snippet;
     use super::*;
+
+    // nextest isolates the installed process configuration and native cache.
+    #[tokio::test]
+    async fn default_repair_and_explicit_reads_report_and_obey_their_physical_budget() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.fetch.allow_private_egress = true;
+        config.state.no_disk_state = true;
+        config.search.request_budget = 1;
+        crate::config::install(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let log = Arc::clone(&seen);
+        let slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pause = Arc::clone(&slow);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = Arc::clone(&log);
+                let pause = Arc::clone(&pause);
+                tokio::spawn(async move {
+                    let mut head = [0u8; 8192];
+                    if stream.read(&mut head).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    log.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if pause.load(std::sync::atomic::Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    let body = format!("<html><head><title>Orion calibration</title></head><body><article><p>{}</p></article></body></html>", "Orion calibration establishes the sensor value as 42 before the measurement begins. ".repeat(8));
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let searcher = Searcher::new(
+            Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap(),
+            EgressPool::new(Vec::new()),
+        );
+        let query = "Orion calibration";
+        let results = (0..2)
+            .map(|i| {
+                let mut r = merged(&format!("http://{address}/page-{i}"));
+                if i == 0 {
+                    r.snippet = "This guide explains Orion calibration and how to establish a sensor value before measurement.".into();
+                } else {
+                    r.snippet = "Orion calibration measures sensor response before the observation begins.".into();
+                }
+                r
+            })
+            .collect();
+        searcher.cache.lock().unwrap().insert(
+            format!("{}|{}", norm_query(query), Intent::Web.code()),
+            (
+                Instant::now(),
+                results,
+                2,
+                vec![EngineReport {
+                    engine: "bing".into(),
+                    profile: None,
+                    status: "ok".into(),
+                    hits: 2,
+                    ms: 10,
+                    egress: "direct".into(),
+                    cache_age_ms: None,
+                    requests: 1,
+                }],
+                quality::Assessment {
+                    confidence: quality::Confidence::High,
+                    families: 2,
+                    agreement: 2,
+                    junk_ratio: 0.0,
+                    coverage: 1.0,
+                },
+            ),
+        );
+        let default = searcher.search(query, 2, Some(Intent::Web)).await.unwrap();
+        assert_eq!(default.requests, Some(1));
+        assert_eq!(
+            default.report[0].requests, 0,
+            "cached provenance is not a new engine request"
+        );
+        assert_eq!(default.report[0].status, "cached");
+        assert!(default.report[0].cache_age_ms.is_some());
+        assert_eq!(default.results.iter().filter(|r| r.from_page).count(), 1);
+        assert!(default.results[0].from_page && default.results[0].snippet.contains("42"));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let explicit = searcher
+            .search_with_read(query, 2, Some(Intent::Web), 2)
+            .await
+            .unwrap();
+        assert_eq!(explicit.requests, Some(2));
+        assert!(
+            explicit
+                .results
+                .iter()
+                .all(|r| r.from_page && r.snippet.contains("42"))
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 3);
+        let (a, b) = tokio::join!(
+            searcher.search(query, 2, Some(Intent::Web)),
+            searcher.search(query, 2, Some(Intent::Web))
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            a.requests.unwrap() + b.requests.unwrap(),
+            1,
+            "identical callers share the repair request"
+        );
+        assert!(a.results[0].from_page && b.results[0].from_page);
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 4);
+        let (a, b) = tokio::join!(
+            searcher.search_with_read(query, 2, Some(Intent::Web), 2),
+            searcher.search_with_read(query, 2, Some(Intent::Web), 2)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            a.requests.unwrap() + b.requests.unwrap(),
+            2,
+            "explicit page reads are shared too"
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 6);
+        let (a, b) = tokio::join!(
+            searcher.search(query, 2, Some(Intent::Web)),
+            searcher.search_with_read(query, 2, Some(Intent::Web), 1)
+        );
+        assert_eq!(
+            a.unwrap().requests.unwrap() + b.unwrap().requests.unwrap(),
+            2,
+            "different evidence requests keep their own page reads"
+        );
+        let (a, b) = tokio::join!(
+            searcher.search(query, 1, Some(Intent::Web)),
+            searcher.search(query, 2, Some(Intent::Web))
+        );
+        assert_eq!((a.unwrap().results.len(), b.unwrap().results.len()), (1, 2));
+        slow.store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(40),
+                searcher.search(query, 2, Some(Intent::Web))
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            searcher.pipelines.lock().unwrap().is_empty(),
+            "cancelling a leader releases its complete-call flight"
+        );
+        assert!(searcher.inflight.lock().unwrap().is_empty());
+        slow.store(false, std::sync::atomic::Ordering::Release);
+        let recovered = searcher.search(query, 2, Some(Intent::Web)).await.unwrap();
+        assert!(recovered.results[0].from_page && recovered.results[0].snippet.contains("42"));
+        let expired = SEARCH_DEADLINE
+            .scope(
+                Some(tokio::time::Instant::now()),
+                searcher.search(query, 2, Some(Intent::Web)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            expired.requests,
+            Some(0),
+            "an exhausted evidence deadline starts no exchange"
+        );
+        assert!(expired.results.iter().all(|r| !r.from_page));
+
+        // The read starts while acquisition still waits on another index,
+        // shares its physical ceiling, and changes no final ranking decision.
+        slow.store(true, std::sync::atomic::Ordering::Release);
+        let mut planned = default.clone();
+        planned.results[0].from_page = false;
+        planned.results[0].snippet =
+            "2 days ago - Learn how to perform Orion calibration in this guide.".into();
+        planned.results[0].score = 777.0;
+        let first = engines::Hit {
+            title: planned.results[0].title.clone(),
+            url: planned.results[0].url.clone(),
+            snippet: "3 days ago - Learn how to perform Orion calibration in this guide.".into(),
+            rank: 0,
+            published: None,
+        };
+        let make_answer = |class| {
+            Ok(tasks::LaneAnswer {
+                hits: vec![first.clone()],
+                items: 1,
+                ms: 0,
+                egress: "direct".into(),
+                engine_lane: true,
+                instant: None,
+                class,
+                requests: 0,
+                cache_age: None,
+            })
+        };
+        let before = seen.load(std::sync::atomic::Ordering::Relaxed);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let work = async {
+            offer_early_page("bing", &make_answer(engines::AnswerClass::Thin));
+            assert!(
+                EARLY_PAGE.with(|slot| slot.lock().unwrap().is_some()),
+                "a thin list cannot start the read"
+            );
+            offer_early_page("bing", &make_answer(engines::AnswerClass::Answered));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                seen.load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "page read overlaps acquisition"
+            );
+            Ok(planned.clone())
+        };
+        let (overlapped, attempted) = crate::fetch::core::REQUEST_COUNT
+            .scope(
+                Arc::clone(&count),
+                crate::fetch::core::REQUEST_LIMIT.scope(
+                    1,
+                    searcher.with_early_evidence(
+                        "how to perform Orion calibration",
+                        true,
+                        Instant::now(),
+                        EARLY_ALLOWANCE.scope(Arc::new(tasks::RequestAllowance::new(1)), work),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(attempted, vec![first.url.clone()]);
+        assert!(overlapped.results[0].from_page && overlapped.results[0].snippet.contains("42"));
+        assert!(overlapped.results[0].snippet.starts_with("3 days ago - "));
+        assert_eq!(overlapped.results[0].snippet.matches("days ago").count(), 1);
+        assert_eq!(overlapped.results[0].score, 777.0);
+        slow.store(false, std::sync::atomic::Ordering::Release);
+        let mut after = overlapped.results.clone();
+        searcher
+            .repair_default_snippets(
+                &mut after,
+                "how to perform Orion calibration",
+                0,
+                Duration::from_millis(200),
+                &attempted,
+            )
+            .await;
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "no duplicate read after an overlapping success"
+        );
+        let no_hint = tokio::time::timeout(
+            Duration::from_millis(200),
+            searcher.with_early_evidence(
+                "how to perform Orion calibration",
+                true,
+                Instant::now(),
+                async { Ok(planned.clone()) },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            no_hint.1.is_empty(),
+            "closing acquisition also closes an unused hint"
+        );
+        let reserved = Arc::new(tasks::RequestAllowance::new(0));
+        reserved.plan(1, vec![("ddg".into(), 1)]);
+        let before_blocked = seen.load(std::sync::atomic::Ordering::Relaxed);
+        let blocked = searcher
+            .with_early_evidence(
+                "how to perform Orion calibration",
+                true,
+                Instant::now(),
+                EARLY_ALLOWANCE.scope(Arc::clone(&reserved), async {
+                    offer_early_page("bing", &make_answer(engines::AnswerClass::Answered));
+                    Ok(planned.clone())
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            blocked.1.is_empty(),
+            "a page cannot use another source's reserved start"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            before_blocked
+        );
+        assert!(reserved.take("ddg"));
+        let missing = searcher
+            .with_early_evidence(
+                "how to perform Orion calibration",
+                true,
+                Instant::now(),
+                EARLY_ALLOWANCE.scope(Arc::new(tasks::RequestAllowance::new(1)), async {
+                    offer_early_page("bing", &make_answer(engines::AnswerClass::Answered));
+                    let mut out = planned.clone();
+                    out.results.clear();
+                    Ok(out)
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            missing.0.results.is_empty(),
+            "a preview cannot insert a result the final ranking discarded"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn native_evidence_takes_precedence_without_erasing_a_useful_foreign_fallback() {
+        let hit = |title: &str| engines::Hit {
+            title: title.into(),
+            url: "https://example.com/page".into(),
+            snippet: String::new(),
+            rank: 0,
+            published: None,
+        };
+        let mut lists = vec![
+            ("one".into(), vec![hit("Tokyo weather"), hit("東京の天気")]),
+            ("two".into(), vec![hit("English-only title")]),
+        ];
+        let unchanged = lists.clone();
+        retain_native_script(&mut lists, None);
+        assert_eq!(lists.len(), unchanged.len());
+        retain_native_script(&mut lists, Some("ja"));
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].1.len(), 1);
+        assert_eq!(lists[0].1[0].title, "東京の天気");
+        retain_native_script(&mut lists, Some("ko"));
+        assert_eq!(
+            lists.len(),
+            1,
+            "a missing native source must not erase the only available page"
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum ProbeCase {
@@ -2660,6 +3378,33 @@ mod tests {
     /// restart, once its window lapses and it answers again.
     // Depends on nextest's process-per-test isolation (DONSETCH_CACHE_DIR).
     #[test]
+    fn source_health_includes_unmeasured_sources_and_the_ledgers_rest() {
+        let s = test_searcher();
+        let initial = s.health_report();
+        assert!(
+            initial
+                .iter()
+                .any(|row| row.name == "google-cse" && row.state == SourceState::Suspect)
+        );
+        s.record_lane("google-cse", "rate-limited:120");
+        assert!(s.health_report().iter().any(|row| row.name == "google-cse" && matches!(row.state, SourceState::Benched(_))));
+        assert!(
+            s.health_report()
+                .iter()
+                .any(|row| row.name == "yahoo" && row.state == SourceState::Suspect)
+        );
+    }
+
+    #[test]
+    fn the_calendar_year_changes_in_january_not_march() {
+        assert_eq!(calendar_year(0), 1970);
+        assert_eq!(calendar_year(20_758), 2026); // 2026-11-01
+        assert_eq!(calendar_year(10_956), 1999); // 1999-12-31
+        assert_eq!(calendar_year(10_957), 2000); // 2000-01-01
+        assert_eq!(calendar_year(11_017), 2000); // 2000-03-01
+    }
+
+    #[test]
     fn a_decayed_source_is_benched_within_five_calls_and_returns_unattended() {
         let s = test_searcher();
         let mut calls = 0;
@@ -2713,9 +3458,29 @@ mod tests {
 
     // Depends on nextest's process-per-test isolation: test_searcher sets the
     // process-wide DONSETCH_CACHE_DIR.
-    #[test]
-    fn a_throttled_source_is_rested_without_losing_trust() {
+    #[tokio::test]
+    async fn a_throttled_source_is_rested_without_losing_trust() {
         let s = test_searcher();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::fetch::core::REQUEST_COUNT
+            .scope(
+                Arc::clone(&count),
+                API_LEDGER.scope(Arc::clone(&s.ledger), async {
+                    record_api_rest(
+                        "https://api.stackexchange.com/2.3/search/advanced",
+                        Duration::from_secs(120),
+                    );
+                    // An oracle/canary uses the same wait and must not spend a request.
+                    assert!(s.first_party("stackexchange", "nginx").await.is_empty());
+                }),
+            )
+            .await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            ledger::Ledger::load()
+                .origin_rest("https://api.stackexchange.com")
+                .is_some()
+        );
         let trust_before = s
             .trust
             .lock()
@@ -2723,12 +3488,26 @@ mod tests {
             .get("stackexchange")
             .copied();
         assert!(!s.quarantined("stackexchange"));
-        s.rest("stackexchange");
+        s.record_lane("stackexchange", "rate-limited:120");
+        let mut skipped = Vec::new();
+        assert!(s.plan_lane("stackexchange", &mut skipped).is_none());
         assert!(
-            s.quarantined("stackexchange"),
-            "a throttled source sits out"
+            !s.quarantined("stackexchange"),
+            "the published wait is not a ten-minute transport failure"
         );
-        assert!(!s.quarantined("github"), "only the throttled source");
+        let state = s
+            .ledger
+            .lock()
+            .unwrap()
+            .ready(&ledger::key("stackexchange", "api"));
+        assert!(
+            matches!(state, ledger::State::Rested(119..=120)),
+            "{state:?}"
+        );
+        assert!(
+            s.plan_lane("github", &mut skipped).is_some(),
+            "only the throttled source rests"
+        );
         let trust_after = s
             .trust
             .lock()
@@ -2780,6 +3559,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let report = vec![EngineReport {
+            cache_age_ms: None,
             engine: provider.to_string(),
             profile: None,
             status: "ok".into(),
@@ -2793,10 +3573,13 @@ mod tests {
             intent: Intent::Web,
             report,
             cached: false,
+            quality: Default::default(),
+            cache_age: None,
             elapsed: Duration::ZERO,
             provider: Some(provider.to_string()),
             reranked: false,
             instant: None,
+            requests: None,
             stage_ms: Vec::new(),
         }
     }
@@ -2910,10 +3693,19 @@ mod tests {
     /// Store a local-path entry the way `search_inner` keys it.
     fn seed_local_cache(s: &Searcher, query: &str, url: &str) {
         let key = format!("{}|{}", norm_query(query), Intent::Web.code());
-        s.cache
-            .lock()
-            .unwrap()
-            .insert(key, (Instant::now(), vec![merged(url)], 12, Vec::new()));
+        s.cache.lock().unwrap().insert(
+            key,
+            (
+                Instant::now(),
+                vec![merged(url)],
+                12,
+                Vec::new(),
+                quality::Assessment {
+                    confidence: quality::Confidence::High,
+                    ..Default::default()
+                },
+            ),
+        );
     }
 
     #[tokio::test]
@@ -2943,16 +3735,47 @@ mod tests {
         // A "jaguar car" leader is in flight. A follower polls for its
         // cache write for up to 12 s before running on its own.
         let leader = format!("{}|{}", norm_query("jaguar car"), Intent::Web.code());
-        s.inflight.lock().unwrap().insert(leader);
+        let flight = std::sync::Arc::new(LocalFlight::default());
+        s.inflight
+            .lock()
+            .unwrap()
+            .insert(leader, std::sync::Arc::clone(&flight));
         // Negative: an identical query joins the flight and is served
         // what the leader publishes.
         let (joined, ()) = tokio::join!(s.search("jaguar car", 5, Some(Intent::Web)), async {
             tokio::time::sleep(Duration::from_millis(300)).await;
             seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
+            let mut answer = s
+                .search_inner("jaguar car", 12, Some(Intent::Web), Instant::now())
+                .await
+                .unwrap();
+            // Concurrent callers may share a fresh weak answer, while later
+            // callers must not read it from the merged cache.
+            answer.cached = false;
+            answer.quality.confidence = quality::Confidence::Low;
+            answer.results[0].snippet =
+                "A detailed jaguar car review with independent road test results.".into();
+            answer.report = vec![EngineReport {
+                engine: "bing".into(),
+                profile: None,
+                status: "ok".into(),
+                hits: 1,
+                ms: 10,
+                egress: "direct".into(),
+                cache_age_ms: None,
+                requests: 1,
+            }];
+            *flight.answer.lock().unwrap() = Some(answer);
         });
         let joined = joined.expect("a follower is served the leader's results");
-        assert!(joined.cached);
+        assert!(!joined.cached);
+        assert_eq!(joined.quality.confidence, quality::Confidence::Low);
         assert_eq!(joined.results[0].url, JAGUAR_REVIEW);
+        assert_eq!(joined.requests, Some(0));
+        assert_eq!(
+            joined.report[0].requests, 0,
+            "shared provenance is not another exchange"
+        );
         // Drop the published entry: only the flight can hold the next
         // query back now.
         s.cache.lock().unwrap().clear();
@@ -3066,6 +3889,7 @@ mod tests {
                     instant: None,
                     class: crate::search::engines::AnswerClass::Answered,
                     requests: 1,
+                    cache_age: None,
                 }),
             )
         };
@@ -3081,8 +3905,8 @@ mod tests {
         // Failures and off-query answers contribute nothing.
         assert_eq!(answered(&[dead("bing"), dead("ddg"), lane(2)]), (1, 2));
         // A thin merge earns one second ask; a fat one does not.
-        assert!(answered(&[lane(4), lane(3)]).1 < THIN_ITEMS);
-        assert!(answered(&[lane(10), lane(3)]).0 < THIN_LANES);
+        assert_eq!(answered(&[lane(4), lane(3)]).1, 7);
+        assert_eq!(answered(&[lane(10), lane(3)]).0, 2);
     }
 
     #[test]
@@ -3106,6 +3930,7 @@ mod tests {
                     instant: None,
                     class: crate::search::engines::AnswerClass::Answered,
                     requests: 1,
+                    cache_age: None,
                 }),
             )
         };
@@ -3206,25 +4031,6 @@ mod tests {
     // drifted out of sync before (bump_trust used to fire on
     // "dead-proxy"/"auth-fail" too, eroding trust for infra failures
     // the engine had nothing to do with).
-    #[test]
-    fn is_engine_fault_excludes_infra_and_no_results() {
-        assert!(!is_engine_fault("dead-proxy"));
-        assert!(!is_engine_fault("auth-fail"));
-        assert!(!is_engine_fault("no-results"));
-        assert!(!is_engine_fault("invalid-config"));
-        assert!(!is_engine_fault("rate-limited:900"));
-        assert!(!worth_second_ask("rate-limited:900"));
-        assert!(!worth_second_ask("blocked:captcha"));
-        assert!(!worth_second_ask("blocked:429"));
-        assert!(worth_second_ask("blocked:403"));
-        assert!(worth_second_ask("timeout"));
-        assert!(is_engine_fault("blocked:403"));
-        assert!(is_engine_fault("blocked:captcha"));
-        assert!(is_engine_fault("empty-parse"));
-        assert!(is_engine_fault("timeout"));
-        assert!(is_engine_fault("no-url"));
-        assert!(is_engine_fault("net"));
-    }
 
     #[test]
     fn mojeek_empty_parse_burns_trust_harder() {
@@ -3265,16 +4071,53 @@ mod tests {
                     instant: None,
                     class: crate::search::engines::AnswerClass::Answered,
                     requests: 1,
+                    cache_age: None,
                 }),
             )
         };
-        // Two families that share a top-3 URL: agreement, commit.
+        // Two names sharing a top-3 URL are not yet independent evidence.
         let two = vec![
             ok("brave", &["https://a.com/x", "https://b.com/y"]),
             ok("bing", &["https://a.com/x", "https://b.com/y"]),
         ];
-        let fam = families::Families::default();
+        let mut fam = families::Families::default();
+        assert!(!early_consensus_enough(&two, &fam));
+        let lists: Vec<_> = ["brave", "bing"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    (0..5)
+                        .map(|i| format!("https://{name}.example/{i}"))
+                        .collect(),
+                )
+            })
+            .collect();
+        for _ in 0..3 {
+            fam.observe(&lists);
+        }
         assert!(early_consensus_enough(&two, &fam));
+        let duplicate = vec![
+            ok("bing", &["https://a.com/x"]),
+            ok("bing@recall", &["https://a.com/x"]),
+        ];
+        assert!(!early_consensus_enough(&duplicate, &fam));
+        let owned = vec![
+            ok("bing", &["https://a.com/x"]),
+            ok("stackexchange", &["https://a.com/x"]),
+        ];
+        assert!(early_consensus_enough(&owned, &Default::default()));
+        let mut thin = vec![
+            ok("brave", &["https://a.com/x", "https://b.com/y"]),
+            ok("bing", &["https://a.com/x", "https://b.com/y"]),
+        ];
+        for (_, answer) in &mut thin {
+            answer.as_mut().unwrap().class = engines::AnswerClass::Thin;
+        }
+        assert!(
+            !early_consensus_enough(&thin, &fam),
+            "thin fallback agreement must keep listening for a full answer"
+        );
         // Three families but no shared top-3 URL: no agreement, keep waiting.
         let disjoint = vec![
             ok("brave", &["https://a.com/x"]),
@@ -3433,6 +4276,55 @@ mod tests {
     }
 
     #[test]
+    fn cached_or_scoped_lists_cannot_manufacture_independence_samples() {
+        let hits: Vec<_> = (0..5)
+            .map(|i| engines::Hit {
+                title: "A page".into(),
+                url: format!("https://example.com/{i}"),
+                snippet: "An answer".into(),
+                rank: i,
+                published: None,
+            })
+            .collect();
+        let sources = vec![("bing".into(), hits.clone()), ("yahoo".into(), hits)];
+        let mut reports: Vec<_> = ["bing", "yahoo"]
+            .into_iter()
+            .map(|engine| EngineReport {
+                engine: engine.into(),
+                status: "ok".into(),
+                hits: 5,
+                ms: 1,
+                egress: "direct".into(),
+                requests: 1,
+                profile: None,
+                cache_age_ms: None,
+            })
+            .collect();
+        let comparable = ["bing".into(), "yahoo".into()].into();
+        let mut families = families::Families::default();
+        for _ in 0..2 {
+            families.observe(&fresh_family_lists(&sources, &reports, &comparable));
+        }
+        reports[1].cache_age_ms = Some(1000);
+        reports[1].status = "cached".into();
+        families.observe(&fresh_family_lists(&sources, &reports, &comparable));
+        assert!(families.overlap("bing", "yahoo").is_none());
+        reports[1].cache_age_ms = None;
+        reports[1].status = "ok".into();
+        families.observe(&fresh_family_lists(
+            &sources,
+            &reports,
+            &["bing".into()].into(),
+        ));
+        assert!(
+            families.overlap("bing", "yahoo").is_none(),
+            "scoped recall is not a matching query"
+        );
+        families.observe(&fresh_family_lists(&sources, &reports, &comparable));
+        assert_eq!(families.count(["bing", "yahoo"]), 1);
+    }
+
+    #[test]
     fn governor_shrinks_width_under_stress() {
         assert_eq!(width_for_stress(0.05, 4), 4);
         assert_eq!(width_for_stress(0.30, 4), 3);
@@ -3480,8 +4372,12 @@ mod tests {
         ] {
             assert_eq!(norm_query(a), norm_query(b), "{a:?} vs {b:?}");
         }
-        // An operator keeps each pair apart.
+        // Operators and code syntax keep different questions apart.
         for (a, b) in [
+            ("select!", "select"),
+            ("std::mem::take", "std mem take"),
+            ("camelCase", "camelcase"),
+            ("foo_bar", "foo bar"),
             ("jaguar car", "jaguar -car"),
             ("rust async", "\"rust async\""),
             ("c tutorial", "c# tutorial"),
@@ -3511,6 +4407,10 @@ mod tests {
                 vec![merged("https://tokio.rs/")],
                 12,
                 Vec::new(),
+                quality::Assessment {
+                    confidence: quality::Confidence::High,
+                    ..Default::default()
+                },
             ),
         );
         persist::save_cache_disk(&map);
@@ -3694,10 +4594,13 @@ mod tests {
             intent: Intent::Web,
             report: Vec::new(),
             cached: false,
+            quality: Default::default(),
+            cache_age: None,
             elapsed: Duration::from_millis(10),
             provider: None,
             reranked: false,
             instant: None,
+            requests: None,
             stage_ms: Vec::new(),
         }
     }
@@ -3724,6 +4627,7 @@ mod tests {
         let mut search = outcome(vec![result]);
         search.report = vec![
             EngineReport {
+                cache_age_ms: None,
                 engine: "bing".into(),
                 profile: None,
                 status: "ok".into(),
@@ -3733,6 +4637,7 @@ mod tests {
                 requests: 0,
             },
             EngineReport {
+                cache_age_ms: None,
                 engine: "ddg".into(),
                 profile: None,
                 status: "blocked:403".into(),

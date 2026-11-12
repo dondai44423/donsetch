@@ -9,13 +9,13 @@ junk count and latency.
     python3 bench/compare.py before.json after.json [--json out.json]
 
 Exit code 0 when no shape regresses and nothing violated a must_not; 1 when a
-shape regresses on hit@3 or accuracy; 2 when the artifacts cannot be compared.
+shape regresses on hit@3; 2 when the artifacts cannot be compared.
 A regression is reported, never silently tolerated: the point of a "before" file
 is to lose against.
 """
 import json
 import sys
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 # The gate's own clause: a shape may not lose more than this on hit@3.
 REGRESSION = 0.02
@@ -33,8 +33,14 @@ def load(path):
         "runs": doc.get("runs"),
         "started": doc.get("run_started_unix") or [],
         "rows": len(rows),
+        "hash": doc.get("queries_sha256"),
     }
-    return meta, {r["id"]: r for r in rows}
+    occurrences = Counter()
+    indexed = {}
+    for row in rows:
+        occurrences[row["id"]] += 1
+        indexed[f"{row['id']}#{occurrences[row['id']]}"] = row
+    return meta, indexed
 
 
 def rate(rows, pred, of=None):
@@ -59,7 +65,7 @@ def shape_stats(rows):
         "hit3": rate(ans, lambda r: r.get("hit") and r["hit"] <= 3),
         "hit5": rate(ans, lambda r: r.get("hit") and r["hit"] <= 5),
         "mrr": mrr(ans),
-        "accuracy": rate(ans, lambda r: r.get("key_at") and r["key_at"] <= 5),
+        "key_coverage": rate(ans, lambda r: r.get("key_at") and r["key_at"] <= 5),
         "zero": rate(ans, lambda r: not r.get("urls")),
         "junk5": rate(rows, lambda r: r.get("junk5", 0) > 0),
         "p50": percentile([r.get("ms", 0) for r in rows], 0.5),
@@ -79,6 +85,8 @@ def main(argv):
         raise SystemExit(__doc__)
     before_meta, before = load(argv[1])
     after_meta, after = load(argv[2])
+    if before_meta['hash'] != after_meta['hash'] or not before_meta['hash']:
+        raise SystemExit("artifacts have different or absent corpus hashes")
     out_path = None
     if "--json" in argv:
         out_path = argv[argv.index("--json") + 1]
@@ -99,9 +107,10 @@ def main(argv):
     if only_before or only_after:
         print(f"!! rows only in before: {only_before}")
         print(f"!! rows only in after: {only_after}")
+        return 2
 
     head = (f"{'shape':<12}{'n':>4}  {'hit@1':>13} {'hit@3':>13} "
-            f"{'MRR':>13} {'acc':>13} {'zero':>13} {'junk5':>11}")
+            f"{'MRR':>13} {'key coverage':>13} {'zero':>13} {'junk5':>11}")
     print()
     print(head)
     print(f"{'':<12}{'':>4}  {'before→after':>13} {'before→after':>13} "
@@ -122,7 +131,7 @@ def main(argv):
               f"{b['hit1']:>5.2f}→{a['hit1']:<5.2f} "
               f"{b['hit3']:>5.2f}→{a['hit3']:<5.2f} "
               f"{b['mrr']:>5.3f}→{a['mrr']:<5.3f} "
-              f"{b['accuracy']:>5.2f}→{a['accuracy']:<5.2f} "
+              f"{b['key_coverage']:>5.2f}→{a['key_coverage']:<5.2f} "
               f"{b['zero']:>5.2f}→{a['zero']:<5.2f} "
               f"{b['junk5']:>4.2f}→{a['junk5']:<4.2f}{flag}")
 

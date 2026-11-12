@@ -16,13 +16,36 @@ use super::rank::Merged;
 /// cached with the results so a cache hit still carries engine
 /// evidence (#164: cache hits used to return an empty report,
 /// hiding whether the answer was fresh consensus or stale cache).
-pub(crate) type CacheMap = HashMap<String, (Instant, Vec<Merged>, usize, Vec<EngineReport>)>;
+pub(crate) type CacheMap = HashMap<
+    String,
+    (
+        Instant,
+        Vec<Merged>,
+        usize,
+        Vec<EngineReport>,
+        super::quality::Assessment,
+    ),
+>;
 
 /// On-disk cache entry: (key, written-at Unix seconds, results,
 /// merge total, engine reports). Owned form for load, borrowed form
 /// for save.
-type DiskEntry = (String, u64, Vec<Merged>, usize, Vec<EngineReport>);
-type DiskEntryRef<'a> = (String, u64, Vec<Merged>, usize, &'a [EngineReport]);
+type DiskEntry = (
+    String,
+    u64,
+    Vec<Merged>,
+    usize,
+    Vec<EngineReport>,
+    super::quality::Assessment,
+);
+type DiskEntryRef<'a> = (
+    String,
+    u64,
+    Vec<Merged>,
+    usize,
+    &'a [EngineReport],
+    super::quality::Assessment,
+);
 
 /// Disk cache path (ghost-state pattern).
 fn cache_path() -> Option<std::path::PathBuf> {
@@ -31,6 +54,9 @@ fn cache_path() -> Option<std::path::PathBuf> {
 }
 
 fn dirs_cache() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     let dir = crate::paths::cache_dir();
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
@@ -45,13 +71,14 @@ pub(crate) fn save_cache_disk(cache: &CacheMap) {
     let now_wall = SystemTime::now();
     let entries: Vec<DiskEntryRef> = cache
         .iter()
-        .map(|(k, (at, r, t, rep))| {
+        .map(|(k, (at, r, t, rep, quality))| {
             (
                 k.clone(),
                 written_unix(now_wall, now.saturating_duration_since(*at)),
                 r.clone(),
                 *t,
                 rep.as_slice(),
+                *quality,
             )
         })
         .collect();
@@ -79,7 +106,7 @@ pub(crate) fn load_cache_disk() -> CacheMap {
         return map;
     };
     let now_wall = now_unix();
-    for (key, written, results, total, reports) in entries {
+    for (key, written, results, total, reports, quality) in entries {
         // TTL is intent + recency keyed (the query text
         // is the key's first segment). Keys carry a stable u8
         // intent code; pre-code entries carry the Debug string and
@@ -96,6 +123,9 @@ pub(crate) fn load_cache_disk() -> CacheMap {
                 _ => Intent::Web,
             }
         };
+        if !key.starts_with("byok|") && quality.confidence != super::quality::Confidence::High {
+            continue;
+        }
         let ttl = cache_ttl(intent, qpart);
         // A write time ahead of the clock (the clock was set back)
         // gives no usable age: drop rather than serve as fresh.
@@ -106,7 +136,7 @@ pub(crate) fn load_cache_disk() -> CacheMap {
             && age < ttl
             && let Some(at) = Instant::now().checked_sub(age)
         {
-            map.insert(key, (at, results, total, reports));
+            map.insert(key, (at, results, total, reports, quality));
         }
     }
     map
@@ -130,6 +160,9 @@ pub fn load_for_status() -> HealthSnapshot {
 /// skips its fan-out slot immediately after a crash instead of
 /// being re-paid three times from zero.
 fn health_path() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     Some(crate::paths::cache_dir().join("search-trust.json"))
 }
 
@@ -305,10 +338,10 @@ const QUALITY_DISK_VERSION: u32 = 1;
 const QUALITY_CAP: usize = 2_000;
 const QUALITY_TTL_SECS: u64 = 30 * 86_400;
 const QUALITY_MIN_SAMPLES: u32 = 3;
-/// Capped small: consensus / BM25 / static prior stay dominant.
-const QUALITY_WEIGHT: f64 = 0.08;
-
 fn quality_path() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     Some(crate::paths::cache_dir().join("search-quality.json"))
 }
 
@@ -431,25 +464,9 @@ pub(crate) fn observe_quality(map: &mut QualityMap, host: &str, ok: bool) {
     }
 }
 
-/// B3 rank nudge: a small multiplier from how often a host's pages read
-/// cleanly, applied to the merged list. Kill switch: `search.quality_prior=false`.
-pub(crate) fn apply_quality_prior(results: &mut [Merged], quality: &QualityMap) {
-    if !crate::config::cfg().search.quality_prior {
-        return;
-    }
-    for r in results.iter_mut() {
-        let host = super::rank::host_of(&r.url);
-        let key = quality_host_key(&host);
-        let Some(q) = quality.get(&key) else {
-            continue;
-        };
-        if q.samples < QUALITY_MIN_SAMPLES {
-            continue;
-        }
-        let learned = ((q.ewma as f64 - 0.5) * 2.0).clamp(-1.0, 1.0);
-        r.score += QUALITY_WEIGHT * learned;
-    }
-}
+/// Compatibility hook for the retired host-quality prior. The new ranker uses
+/// query evidence; historical host scores never change its order.
+pub(crate) fn apply_quality_prior(_results: &mut [Merged], _quality: &QualityMap) {}
 
 // ────────────────────────── B4 agent-outcome feedback ──────────────────────────
 
@@ -478,6 +495,9 @@ const OUTCOME_MIN_SAMPLES: u32 = 2;
 const OUTCOME_WEIGHT: f64 = 0.05;
 
 fn outcome_path() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     Some(crate::paths::cache_dir().join("outcome-feedback.json"))
 }
 
@@ -649,6 +669,25 @@ mod tests {
         }
     }
 
+    // Cache files use nextest's per-process root.
+    #[test]
+    fn a_low_confidence_local_answer_never_loads_as_a_cache_hit() {
+        let key = format!("tokio runtime|{}", Intent::Web.code());
+        let mut cache = CacheMap::new();
+        cache.insert(
+            key,
+            (
+                Instant::now(),
+                vec![merged("https://tokio.rs/guide", 1.0)],
+                20,
+                Vec::new(),
+                super::super::quality::Assessment::default(),
+            ),
+        );
+        save_cache_disk(&cache);
+        assert!(load_cache_disk().is_empty());
+    }
+
     #[test]
     fn observe_quality_moves_ewma_toward_target() {
         let mut map = QualityMap::new();
@@ -674,9 +713,9 @@ mod tests {
     }
 
     #[test]
-    fn quality_prior_nudges_only_after_min_samples() {
+    fn historical_host_quality_cannot_change_search_scores() {
         let dir = isolate_cache("nudge");
-        // Config is process-global; defaults have quality_prior=true.
+        // Old config files may still set quality_prior=true; it is a no-op.
         let mut map = QualityMap::new();
         map.insert("hot.example".into(), quality_for(0.95, 3));
         map.insert("cold.example".into(), quality_for(0.05, 3));
@@ -690,24 +729,8 @@ mod tests {
         ];
         apply_quality_prior(&mut results, &map);
         assert!(
-            results[0].score > 1.0,
-            "proven-good host must gain, got {}",
-            results[0].score
-        );
-        assert!(
-            results[1].score < 1.0,
-            "proven-dead host must lose, got {}",
-            results[1].score
-        );
-        assert!(
-            (results[2].score - 1.0).abs() < 1e-9,
-            "single-sample host must stay neutral, got {}",
-            results[2].score
-        );
-        assert!(
-            (results[3].score - 1.0).abs() < 1e-9,
-            "unknown host must stay neutral, got {}",
-            results[3].score
+            results.iter().all(|r| r.score == 1.0),
+            "legacy host history must leave every score untouched"
         );
         clean_isolate(dir);
     }
@@ -914,6 +937,10 @@ mod tests {
                     vec![merged("https://tokio.rs/", 1.0)],
                     12,
                     Vec::new(),
+                    super::super::quality::Assessment {
+                        confidence: super::super::quality::Confidence::High,
+                        ..Default::default()
+                    },
                 ),
             );
         }
@@ -1005,7 +1032,7 @@ mod tests {
         // the 30-minute Web TTL.
         backdate(&cache_path().unwrap(), 360, cache_times);
         let loaded = load_cache_disk();
-        let (at, results, _, _) = loaded
+        let (at, results, _, _, _) = loaded
             .get(&web)
             .expect("a Web entry 6 minutes old must still load");
         assert_eq!(results[0].url, "https://tokio.rs/");

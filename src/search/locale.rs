@@ -71,6 +71,16 @@ pub fn script(c: char) -> Script {
 
 /// The query's language, when it is not the default (Latin script).
 pub fn detect(query: &str) -> Option<Locale> {
+    // A language named in the query is an answer-language intent, not a topic
+    // word. `React 中国語 ドキュメント` asks for Chinese documentation even
+    // though the sentence is Japanese; the name wins over the kana signal.
+    // The list is deliberately small and script-bound: a Latin query that
+    // mentions "Chinese food" keeps the Latin default.
+    if !latin_query(query)
+        && let Some(locale) = language_name(query)
+    {
+        return Some(locale);
+    }
     let (mut kana, mut hangul) = (0usize, 0usize);
     let mut only = None;
     for c in query.chars() {
@@ -137,6 +147,57 @@ pub fn detect(query: &str) -> Option<Locale> {
     only
 }
 
+/// A language name written in its own script. Small on purpose: this routes a
+/// query that names its answer language, it does not translate a topic.
+fn language_name(query: &str) -> Option<Locale> {
+    const NAMES: &[(&str, &str, &str)] = &[
+        ("中国語", "zh", "CN"),
+        ("中文", "zh", "CN"),
+        ("汉语", "zh", "CN"),
+        ("漢語", "zh", "CN"),
+        ("普通话", "zh", "CN"),
+        ("普通話", "zh", "CN"),
+        ("日本語", "ja", "JP"),
+        ("日语", "ja", "JP"),
+        ("日語", "ja", "JP"),
+        ("한국어", "ko", "KR"),
+        ("韩国语", "ko", "KR"),
+        ("韓国語", "ko", "KR"),
+        ("русский", "ru", "RU"),
+        ("ロシア語", "ru", "RU"),
+        ("俄语", "ru", "RU"),
+        ("俄語", "ru", "RU"),
+        ("العربية", "ar", "EG"),
+        ("עברית", "he", "IL"),
+        ("ไทย", "th", "TH"),
+        ("हिन्दी", "hi", "IN"),
+        ("ελληνικά", "el", "GR"),
+    ];
+    NAMES
+        .iter()
+        .find(|(name, _, _)| query.contains(name))
+        .map(|(_, lang, region)| Locale { lang, region })
+}
+
+/// Whether the unspecified-locale Latin default applies. Han-only text has
+/// no inferred market, but must not therefore inherit an English one.
+pub fn latin_query(query: &str) -> bool {
+    query
+        .chars()
+        .all(|c| matches!(script(c), Script::Latin | Script::Other))
+}
+
+/// The script required of returned evidence. `zh` here means Han script only;
+/// it never assigns a Chinese market to an ambiguous kanji-only query.
+pub fn evidence_language(query: &str) -> Option<&'static str> {
+    detect(query).map(|locale| locale.lang).or_else(|| {
+        query
+            .chars()
+            .any(|c| script(c) == Script::Han)
+            .then_some("zh")
+    })
+}
+
 /// The scripts a language is written in.
 fn scripts_of(lang: &str) -> &'static [Script] {
     match lang {
@@ -201,6 +262,9 @@ mod tests {
         // market from it would send the query to the wrong sources.
         assert_eq!(detect("地震速報"), None);
         assert_eq!(detect("東京 地震 速報"), None);
+        assert!(!latin_query("東京 地震 速報"));
+        assert!(!latin_query("docker 中国 教程"));
+        assert!(latin_query("Rust ownership 2026"));
     }
 
     #[test]
@@ -250,5 +314,22 @@ mod tests {
             .kl(),
             "kr-ko"
         );
+    }
+
+    #[test]
+    fn a_named_language_routes_the_answer_script() {
+        // The sentence is Japanese but the answer is asked for in Chinese.
+        assert_eq!(
+            detect("React 中国語 ドキュメント").map(|l| l.lang),
+            Some("zh")
+        );
+        assert_eq!(detect("React 中文 文档").map(|l| l.lang), Some("zh"));
+        assert_eq!(detect("日本語 ドキュメント").map(|l| l.lang), Some("ja"));
+        assert_eq!(detect("한국어 문서").map(|l| l.lang), Some("ko"));
+        // A Latin query about a language is a topic, not an answer-language
+        // request: it keeps the Latin default.
+        assert_eq!(detect("chinese food").map(|l| l.lang), None);
+        // Han without a language name stays ambiguous.
+        assert_eq!(detect("中国 人口 統計").map(|l| l.lang), None);
     }
 }

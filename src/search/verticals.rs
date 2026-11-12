@@ -1,6 +1,5 @@
-//! Verticals : keyless JSON APIs with near-100%
-//! reliability. They feed the SAME merge as web engines:
-//! a GitHub repo that also ranks in Brave gets consensus.
+//! Native first-party JSON and Atom interfaces. Their records enter the same
+//! merge as web results; refusals keep their own status and retry window.
 
 use std::time::Duration;
 
@@ -28,12 +27,26 @@ impl From<FetchError> for VerticalError {
 
 /// How long to rest a throttled source when it did not say.
 const DEFAULT_REST: Duration = Duration::from_secs(900);
-/// A source that asks for longer than this is rested this long and re-probed:
-/// a stale daily quota should not bench it for a day on one reading.
-const MAX_REST: Duration = Duration::from_secs(3600);
+
+// Generated once with /filters/create (base=none). The immutable filter asks
+// for question title/link/score/count/accepted-id, nested answer HTML/id/
+// accepted/score, and wrapper items/errors/backoff/quota/has_more. No runtime
+// filter creation and no second request for the answers.
+// Contract: https://api.stackexchange.com/docs/filters and /docs/types/question.
+const STACKEXCHANGE_FILTER: &str = "!T.hvPg9V1MIOeLCRH7WlQGxp-JkkGy";
 
 fn q(query: &str) -> String {
     url::form_urlencoded::byte_serialize(query.as_bytes()).collect()
+}
+
+/// Only caller-supplied search text reaches an API. Web operators are enforced
+/// on candidates, and an intitle value remains searchable text.
+fn api_query(raw: &str) -> String {
+    let c = super::query::compile(raw);
+    match c.intitle {
+        Some(title) => format!("{} {}", c.text, title).trim().to_string(),
+        None => c.text,
+    }
 }
 
 pub fn endpoint(vertical: &str, raw: &str) -> Option<String> {
@@ -47,23 +60,25 @@ pub fn endpoint_in(
     raw: &str,
     locale: Option<super::locale::Locale>,
 ) -> Option<String> {
+    let text = api_query(raw);
+    let raw = text.as_str();
     let query = q(raw);
     let wiki = locale.map(|l| l.lang).unwrap_or("en");
     match vertical {
         "wikipedia" => Some(format!(
-            "https://{wiki}.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json&srlimit=5"
+            "https://{wiki}.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch={query}&gsrlimit=5&gsrnamespace=0&prop=extracts%7Cinfo&inprop=url&exintro=1&explaintext=1&exchars=1000&exlimit=5&format=json&formatversion=2"
         )),
         "hn" => Some(format!(
             "https://hn.algolia.com/api/v1/search?query={query}&hitsPerPage=5"
         )),
         "stackexchange" => Some(format!(
-            "https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q={query}&site=stackoverflow&pagesize=5"
+            "https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q={query}&site=stackoverflow&pagesize=5&filter={STACKEXCHANGE_FILTER}"
         )),
         "mdn" => Some(format!(
             "https://developer.mozilla.org/api/v1/search?q={query}"
         )),
         "github" => {
-            let lower = query.to_lowercase().replace('+', " ");
+            let lower = raw.to_lowercase();
             let words = lower.split_whitespace().count();
             let errorish = [
                 "error",
@@ -164,6 +179,8 @@ pub async fn run(
     proxy: Option<&crate::egress::proxy::Proxy>,
     locale: Option<super::locale::Locale>,
 ) -> Result<Vec<Hit>, VerticalError> {
+    let text = api_query(query);
+    let query = text.as_str();
     let Some(url) = endpoint_in(vertical, query, locale) else {
         return Ok(Vec::new());
     };
@@ -171,6 +188,7 @@ pub async fn run(
         .fetch_once_via(&url, &[], proxy, false, None)
         .await?;
     if let Some(rest) = throttle(vertical, out.status, &out.headers, &out.body) {
+        super::record_api_rest(&url, rest);
         return Err(VerticalError::Throttled(rest));
     }
     if out.status != 200 {
@@ -180,7 +198,14 @@ pub async fn run(
         ))));
     }
     let body = String::from_utf8_lossy(&out.body);
-    let hits = parse_in(vertical, &body, locale);
+    let hits = if vertical == "stackexchange" {
+        let data = stackexchange_data(&body, &url)?;
+        parse_stackexchange(&data, Some(query))
+    } else if vertical == "wikipedia" {
+        wikipedia_response(&body, locale)?
+    } else {
+        parse_in(vertical, &body, locale)
+    };
     if vertical == "arxiv" && title_terms(query).is_some() {
         // The title lookup is an exact-ish contract: it is credited only for
         // returned titles that cover the query. When none does, the query was
@@ -367,12 +392,25 @@ pub(crate) fn throttle(
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.trim().to_string())
     };
-    let clamp = |d: Duration| d.clamp(Duration::from_secs(60), MAX_REST);
+    if matches!(status, 403 | 429 | 503)
+        && let Some(value) = header("retry-after")
+    {
+        let wait = value
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+            .or_else(|| {
+                httpdate::parse_http_date(&value).ok().map(|date| {
+                    date.duration_since(std::time::SystemTime::now())
+                        .unwrap_or_default()
+                })
+            });
+        if let Some(wait) = wait {
+            return Some(wait.max(Duration::from_secs(1)));
+        }
+    }
     if status == 429 {
-        let wait = header("retry-after")
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(DEFAULT_REST, Duration::from_secs);
-        return Some(clamp(wait));
+        return Some(DEFAULT_REST);
     }
     if status == 403 && header("x-ratelimit-remaining").as_deref() == Some("0") {
         let wait = header("x-ratelimit-reset")
@@ -385,9 +423,9 @@ pub(crate) fn throttle(
                 Some(Duration::from_secs(reset.saturating_sub(now)))
             })
             .unwrap_or(DEFAULT_REST);
-        return Some(clamp(wait));
+        return Some(wait.max(Duration::from_secs(1)));
     }
-    if vertical == "stackexchange" && status == 400 {
+    if vertical == "stackexchange" && matches!(status, 200 | 400) {
         let v: Value = serde_json::from_slice(body).ok()?;
         let throttled = v["error_id"].as_i64() == Some(502)
             || v["error_name"].as_str() == Some("throttle_violation");
@@ -403,10 +441,114 @@ pub(crate) fn throttle(
                         .and_then(|(n, _)| n.parse::<u64>().ok())
                 })
                 .map_or(DEFAULT_REST, Duration::from_secs);
-            return Some(clamp(wait));
+            return Some(wait.max(Duration::from_secs(1)));
         }
     }
     None
+}
+
+fn stackexchange_data(body: &str, request_url: &str) -> Result<Value, VerticalError> {
+    let fail = || {
+        VerticalError::Fetch(FetchError::Http(
+            "stackexchange: invalid API response".into(),
+        ))
+    };
+    let data: Value = serde_json::from_str(body).map_err(|_| fail())?;
+    if let Some(wait) = stackexchange_wait(&data) {
+        super::record_api_rest(request_url, wait);
+    }
+    if data.get("error_id").is_some() || !data["items"].is_array() {
+        return Err(fail());
+    }
+    Ok(data)
+}
+
+/// A 200 response can contain usable records and publish a wait for future
+/// requests. Without a supplied reset time, an exhausted daily quota rests for
+/// one full day; do not guess the source's reset timezone.
+fn stackexchange_wait(data: &Value) -> Option<Duration> {
+    let backoff = data["backoff"].as_u64().filter(|n| *n > 0);
+    let exhausted = (data["quota_remaining"].as_u64() == Some(0)).then_some(86_400);
+    backoff
+        .into_iter()
+        .chain(exhausted)
+        .max()
+        .map(Duration::from_secs)
+}
+
+fn parse_stackexchange(data: &Value, query: Option<&str>) -> Vec<Hit> {
+    let Some(items) = data["items"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .take(5)
+        .enumerate()
+        .filter_map(|(rank, item)| {
+            let title = super::engines::decode_xml(item["title"].as_str()?);
+            let url = item["link"].as_str()?.to_string();
+            let score = item["score"].as_i64().unwrap_or(0);
+            let count = item["answer_count"].as_u64().unwrap_or(0);
+            let accepted_id = item["accepted_answer_id"].as_u64();
+            let accepted = |a: &Value| {
+                a["is_accepted"].as_bool() == Some(true)
+                    || accepted_id.is_some_and(|id| a["answer_id"].as_u64() == Some(id))
+            };
+            let answer = item["answers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|a| a["body"].as_str().is_some_and(|s| !s.trim().is_empty()))
+                .filter(|a| accepted(a) || a["score"].as_i64().unwrap_or(0) >= 0)
+                .max_by_key(|a| (accepted(a), a["score"].as_i64().unwrap_or(0)));
+            let snippet = answer
+                .and_then(|a| {
+                    let html = a["body"].as_str()?;
+                    let options = crate::extract::ExtractOptions {
+                        max_chars: Some(64_000),
+                        ..Default::default()
+                    };
+                    let markdown =
+                        crate::extract::extract(html.as_bytes(), "text/html", &url, &options)
+                            .ok()?
+                            .markdown;
+                    // The supplied question title is the real context of its answer.
+                    let document = format!("# {title}\n\n{markdown}");
+                    let label = if accepted(a) {
+                        "Accepted answer"
+                    } else {
+                        "Answer"
+                    };
+                    let budget = super::evidence::PASSAGE_CHARS.saturating_sub(label.len() + 2);
+                    let passage =
+                        super::evidence::passage(query.unwrap_or(&title), &document, budget)
+                            .unwrap_or_else(|| {
+                                super::evidence::cut(
+                                    &markdown.split_whitespace().collect::<Vec<_>>().join(" "),
+                                    budget,
+                                )
+                            });
+                    (!passage.is_empty()).then(|| format!("{label}: {passage}"))
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "Stack Overflow: score {score}, {count} answers{}",
+                        if accepted_id.is_some() {
+                            ", accepted answer"
+                        } else {
+                            ""
+                        }
+                    )
+                });
+            Some(Hit {
+                title,
+                url,
+                snippet,
+                rank,
+                published: None,
+            })
+        })
+        .collect()
 }
 
 /// Body → hits router, shared by run() and tests.
@@ -436,6 +578,68 @@ pub fn rss_date_to_iso(date: &str) -> Option<String> {
     Some(format!("{}-{:02}-{}", parts[3], month + 1, parts[1]))
 }
 
+fn wikipedia_response(
+    body: &str,
+    locale: Option<super::locale::Locale>,
+) -> Result<Vec<Hit>, VerticalError> {
+    let fail = || VerticalError::Fetch(FetchError::Http("wikipedia: invalid API response".into()));
+    let data: Value = serde_json::from_str(body).map_err(|_| fail())?;
+    if data.get("error").is_some() {
+        return Err(fail());
+    }
+    if data["query"]["pages"].is_array() {
+        return Ok(parse_wikipedia_pages(&data));
+    }
+    if data["query"]["search"].is_array() {
+        return Ok(parse_json("wikipedia", body, locale));
+    }
+    if data.get("batchcomplete").is_some() && data.get("query").is_none() {
+        return Ok(Vec::new());
+    }
+    Err(fail())
+}
+
+fn parse_wikipedia_pages(data: &Value) -> Vec<Hit> {
+    let Some(pages) = data["query"]["pages"].as_array() else {
+        return Vec::new();
+    };
+    let mut pages: Vec<_> = pages
+        .iter()
+        .filter(|p| {
+            !p["missing"].as_bool().unwrap_or(false) && !p["invalid"].as_bool().unwrap_or(false)
+        })
+        .collect();
+    pages.sort_by_key(|p| p["index"].as_i64().unwrap_or(i64::MAX));
+    pages
+        .into_iter()
+        .filter_map(|page| {
+            let title = page["title"].as_str()?.trim();
+            let url = page["fullurl"].as_str()?;
+            let parsed = url::Url::parse(url).ok()?;
+            let host = parsed.host_str()?;
+            if title.is_empty()
+                || !matches!(parsed.scheme(), "https" | "http")
+                || !host.ends_with(".wikipedia.org")
+            {
+                return None;
+            }
+            Some(Hit {
+                title: title.to_string(),
+                url: url.to_string(),
+                snippet: page["extract"].as_str().unwrap_or_default().to_string(),
+                rank: 0,
+                published: None,
+            })
+        })
+        .take(5)
+        .enumerate()
+        .map(|(rank, mut hit)| {
+            hit.rank = rank;
+            hit
+        })
+        .collect()
+}
+
 fn parse_json(vertical: &str, body: &str, locale: Option<super::locale::Locale>) -> Vec<Hit> {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return Vec::new();
@@ -445,6 +649,8 @@ fn parse_json(vertical: &str, body: &str, locale: Option<super::locale::Locale>)
         "europepmc" => parse_europepmc(&v),
         "crates" => parse_crates(&v),
         "npm" => parse_npm(&v),
+        "wikipedia" if v["query"]["pages"].is_array() => parse_wikipedia_pages(&v),
+        // Old captured list-search responses remain readable for replay.
         "wikipedia" => v["query"]["search"]
             .as_array()
             .map(|a| {
@@ -521,29 +727,7 @@ fn parse_json(vertical: &str, body: &str, locale: Option<super::locale::Locale>)
                     .collect()
             })
             .unwrap_or_default(),
-        "stackexchange" => v["items"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .enumerate()
-                    .map(|(rank, it)| {
-                        let score = it["score"].as_i64().unwrap_or(0);
-                        let answers = it["answer_count"].as_i64().unwrap_or(0);
-                        let answered = it["is_answered"].as_bool().unwrap_or(false);
-                        Hit {
-                            title: it["title"].as_str().unwrap_or("").to_string(),
-                            url: it["link"].as_str().unwrap_or("").to_string(),
-                            snippet: format!(
-                                "Stack Overflow: score {score}, {answers} answers{}",
-                                if answered { ", accepted answer" } else { "" }
-                            ),
-                            rank,
-                            published: None,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        "stackexchange" => parse_stackexchange(&v, None),
         "mdn" => v["documents"]
             .as_array()
             .map(|a| {
@@ -774,15 +958,170 @@ fn strip_tags(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn wikipedia_extracts_keep_the_api_order_facts_and_canonical_destinations() {
+        let body = r#"{"batchcomplete":true,"query":{"pages":[
+            {"title":"Second","index":2,"fullurl":"https://en.wikipedia.org/wiki/Actual_second","extract":"A second authentic introductory paragraph."},
+            {"title":"First","index":1,"missing":false,"fullurl":"https://en.wikipedia.org/wiki/Canonical_first","extract":"The answering fact, from the page's introductory text."},
+            {"title":"Missing","index":0,"missing":true,"fullurl":"https://en.wikipedia.org/wiki/Missing"},
+            {"title":"Bad destination","index":3,"fullurl":"https://wikipedia.org.evil.invalid/page"}
+        ]}}"#;
+        let hits = wikipedia_response(body, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "First");
+        assert_eq!(hits[0].url, "https://en.wikipedia.org/wiki/Canonical_first");
+        assert!(hits[0].snippet.contains("answering fact"));
+        assert_eq!(hits[0].rank, 0);
+        assert_eq!(hits[1].rank, 1);
+        assert!(
+            wikipedia_response(r#"{"batchcomplete":true}"#, None)
+                .unwrap()
+                .is_empty()
+        );
+        for invalid in [
+            "not JSON",
+            r#"{"error":{"code":"maxlag"}}"#,
+            r#"{"unexpected":"schema"}"#,
+        ] {
+            assert!(wikipedia_response(invalid, None).is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "native public Wikipedia contract witness; requires network and explicit output path"]
+    async fn wikipedia_extract_contract_live_witness() {
+        let path =
+            std::env::var_os("DSB_SOURCE_WITNESS").expect("set an absolute witness output path");
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answer = crate::fetch::core::REQUEST_COUNT
+            .scope(
+                std::sync::Arc::clone(&count),
+                crate::fetch::core::REQUEST_LIMIT.scope(
+                    2,
+                    run(&fetcher, "wikipedia", "quantum entanglement", None, None),
+                ),
+            )
+            .await;
+        let mut receipt = serde_json::json!({"source":"wikipedia", "query":"quantum entanglement", "at_unix":super::super::bench::now_unix(), "requests":count.load(std::sync::atomic::Ordering::Relaxed)});
+        match answer {
+            Ok(hits) => {
+                receipt["status"] = "ok".into();
+                receipt["hits"] = serde_json::to_value(hits).unwrap();
+            }
+            Err(VerticalError::Throttled(wait)) => {
+                receipt["status"] = format!("rate-limited:{}", wait.as_secs()).into()
+            }
+            Err(_) => receipt["status"] = "failed".into(),
+        }
+        crate::config::write_private(
+            std::path::Path::new(&path),
+            &serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn secs(s: u64) -> Option<Duration> {
         Some(Duration::from_secs(s))
     }
 
     #[test]
+    fn web_operators_do_not_become_api_search_terms() {
+        let q = r#"intitle:"Attention Is All You Need" arxiv site:arxiv.org filetype:pdf"#;
+        assert_eq!(api_query(q), "arxiv Attention Is All You Need");
+        let url = endpoint("openalex", q).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let search = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "search")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(search, "arxiv Attention Is All You Need");
+        assert!(!endpoint("arxiv", q).unwrap().contains("ti:intitle"));
+        assert_eq!(api_query("rust ownership"), "rust ownership");
+        assert!(
+            endpoint("github", "how to install nodejs with nvm on linux").is_none(),
+            "classify the original words, not one URL-encoded token"
+        );
+        assert!(
+            endpoint("github", "rust async runtime library")
+                .unwrap()
+                .contains("/search/repositories?")
+        );
+        assert!(
+            endpoint("github", "python TypeError cannot read property")
+                .unwrap()
+                .contains("/search/issues?")
+        );
+    }
+
+    #[test]
     fn stack_exchange_quota_is_a_throttle_with_its_own_wait() {
+        let request_url = "https://api.stackexchange.com/2.3/search/advanced";
         let body = br#"{"error_id":502,"error_message":"too many requests from this IP, more requests available in 78310 seconds","error_name":"throttle_violation"}"#;
-        // Clamped: a day-long wait rests the source an hour and is re-read then.
-        assert_eq!(throttle("stackexchange", 400, &[], body), secs(3600));
+        // The origin's full published wait is binding, even beyond one hour.
+        assert_eq!(throttle("stackexchange", 400, &[], body), secs(78310));
+        assert_eq!(throttle("stackexchange", 200, &[], body), secs(78310));
+        assert_eq!(
+            stackexchange_wait(&serde_json::json!({"items":[],"backoff":120,"quota_remaining":42})),
+            secs(120)
+        );
+        assert_eq!(
+            stackexchange_wait(&serde_json::json!({"items":[],"backoff":0,"quota_remaining":42})),
+            None
+        );
+        let exhausted =
+            stackexchange_wait(&serde_json::json!({"items":[],"quota_remaining":0})).unwrap();
+        assert_eq!(exhausted, Duration::from_secs(86_400));
+        let data = stackexchange_data(r#"{"items":[
+          {"title":"Nginx &quot;upstream closed&quot;", "link":"https://stackoverflow.com/questions/30470448/nginx", "score":22,"answer_count":2,"accepted_answer_id":7,
+           "answers":[{"answer_id":8,"score":100,"body":"<p>This popular alternative must not replace the accepted answer.</p>"},
+                      {"answer_id":7,"is_accepted":true,"score":8,"body":"<p>Point the app.sock under upstream django and django.sock under location /ws/.</p>"}]},
+          {"title":"No accepted answer","link":"https://stackoverflow.com/questions/3/test","is_answered":true,"answer_count":1,
+           "answers":[{"answer_id":9,"score":0,"body":"<p>Use proxy_read_timeout 300s and proxy_connect_timeout 75s.</p>"}]},
+          {"title":"No usable answer","link":"https://stackoverflow.com/questions/4/test","is_answered":true,"answer_count":1,
+           "answers":[{"answer_id":10,"score":-5,"body":"<p>An unaccepted, downvoted guess.</p>"}]},
+          {"title":"Orion timeouts","link":"https://stackoverflow.com/questions/5/test","accepted_answer_id":11,"answer_count":1,
+           "answers":[{"answer_id":11,"score":8,"body":"<pre><code>orion:\n    timeout: 42\n    retries: 3\n</code></pre>"}]}
+        ],"quota_remaining":42}"#, request_url).unwrap();
+        let hits = parse_stackexchange(&data, Some("nginx upstream header"));
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].title, "Nginx \"upstream closed\"");
+        assert!(hits[0].snippet.starts_with("Accepted answer:"));
+        assert!(hits[0].snippet.contains("app.sock"));
+        assert!(!hits[0].snippet.contains("popular alternative"));
+        assert!(hits[1].snippet.starts_with("Answer:"));
+        assert!(hits[1].snippet.contains("proxy_read_timeout"));
+        assert!(
+            !hits[2].snippet.contains("accepted answer"),
+            "is_answered does not prove acceptance"
+        );
+        assert!(!hits[2].snippet.contains("downvoted guess"));
+        let code = parse_stackexchange(&data, Some("how to set Orion timeout"));
+        assert!(
+            code[3].snippet.contains("\n    timeout: 42"),
+            "{}",
+            code[3].snippet
+        );
+        assert!(code[3].snippet.contains("\n    retries: 3"));
+        assert!(
+            hits.iter()
+                .all(|h| h.snippet.chars().count() <= super::super::evidence::PASSAGE_CHARS)
+        );
+        for invalid in [
+            "not JSON",
+            r#"{"error_id":400,"items":[]}"#,
+            r#"{"unexpected":[]}"#,
+        ] {
+            assert!(stackexchange_data(invalid, request_url).is_err());
+        }
+        assert!(stackexchange_data(r#"{"items":[]}"#, request_url).is_ok());
+        assert!(
+            endpoint("stackexchange", "nginx")
+                .unwrap()
+                .contains(STACKEXCHANGE_FILTER)
+        );
         let short = br#"{"error_id":502,"error_message":"Please wait 120 seconds","error_name":"throttle_violation"}"#;
         assert_eq!(throttle("stackexchange", 400, &[], short), secs(120));
         let unreadable = br#"{"error_id":502,"error_name":"throttle_violation"}"#;
@@ -812,8 +1151,19 @@ mod tests {
         assert_eq!(throttle("openalex", 429, &[], b""), secs(900));
         assert_eq!(
             throttle("openalex", 429, &h("retry-after", "5"), b""),
-            secs(60)
+            secs(5)
         );
+        assert_eq!(
+            throttle("openalex", 429, &h("retry-after", "86400"), b""),
+            secs(86400)
+        );
+        let future =
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(7200));
+        let wait = throttle("openalex", 503, &h("retry-after", &future), b"")
+            .unwrap()
+            .as_secs();
+        assert!((7198..=7200).contains(&wait), "{wait}");
+        assert_eq!(throttle("openalex", 503, &[], b""), None);
         assert_eq!(
             throttle("github", 403, &h("x-ratelimit-remaining", "0"), b""),
             secs(900)

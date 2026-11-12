@@ -81,6 +81,50 @@ const ONCE_IDENTITY: &str = "chrome-local";
 /// metadata to contradict the agent string.
 const LEGACY_IDENTITY: &str = "plain";
 
+tokio::task_local! {
+    /// Caller-owned accounting for HTTP exchanges, including redirects.
+    pub(crate) static REQUEST_COUNT: Arc<std::sync::atomic::AtomicUsize>;
+    pub(crate) static REQUEST_LIMIT: usize;
+    pub(crate) static REQUEST_SOURCE_COUNT: Arc<std::sync::atomic::AtomicUsize>;
+    pub(crate) static REQUEST_ORIGIN_GUARD: OriginGuard;
+    pub(crate) static REQUEST_RESPONSE: donsetch_core::ResponseHead;
+}
+
+pub(crate) type OriginGuard = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
+
+fn request_start(refusal: Arc<Mutex<Option<FetchError>>>) -> Option<donsetch_core::RequestStart> {
+    let total = REQUEST_COUNT.try_with(Arc::clone).ok();
+    let source = REQUEST_SOURCE_COUNT.try_with(Arc::clone).ok();
+    let limit = REQUEST_LIMIT.try_with(|limit| *limit).unwrap_or(usize::MAX);
+    let guard = REQUEST_ORIGIN_GUARD.try_with(Arc::clone).ok();
+    if total.is_none() && source.is_none() && guard.is_none() {
+        return None;
+    }
+    Some(Arc::new(move |url: &str| {
+        use std::sync::atomic::Ordering;
+        if let Some(wait) = guard.as_ref().and_then(|guard| guard(url)) {
+            *refusal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(FetchError::Http(format!("rested:{wait}")));
+            return false;
+        }
+        if let Some(total) = &total
+            && total
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    (used < limit).then(|| used + 1)
+                })
+                .is_err()
+        {
+            return false;
+        }
+        if let Some(source) = &source {
+            source.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }))
+}
+
 pub struct CoreFetcher {
     session: Arc<donsetch_core::Session>,
 }
@@ -117,6 +161,8 @@ pub struct OneShot<'a> {
     pub class: RequestClass,
     /// A request-local legacy client, by its User-Agent.
     pub user_agent: Option<&'a str>,
+    /// An internal measured portfolio identity for a single challenge retry.
+    pub identity: Option<&'static str>,
 }
 
 impl CoreFetcher {
@@ -151,6 +197,8 @@ impl CoreFetcher {
         let cancel = donsetch_core::Cancel::new();
         request.policy = donsetch_core::Policy {
             hop: Some(hop_guard(Arc::clone(&refusal), document.gate, direct)),
+            request_start: request_start(Arc::clone(&refusal)),
+            response_head: REQUEST_RESPONSE.try_with(Arc::clone).ok(),
             navigation: navigation_headers(document.referer, document.url),
             cancel: Some(cancel.clone()),
             ..donsetch_core::Policy::default()
@@ -193,6 +241,7 @@ impl CoreFetcher {
                         referer: Some(referer),
                         class: RequestClass::Fetch,
                         user_agent: None,
+                        identity: None,
                     })
                     .await
                     .ok()
@@ -230,6 +279,7 @@ impl CoreFetcher {
                     referer: Some(referer),
                     class: RequestClass::Fetch,
                     user_agent: None,
+                    identity: None,
                 }),
             )
             .await;
@@ -321,7 +371,7 @@ impl CoreFetcher {
                 if shot.user_agent.is_some() {
                     LEGACY_IDENTITY
                 } else {
-                    ONCE_IDENTITY
+                    shot.identity.unwrap_or(ONCE_IDENTITY)
                 }
                 .to_string(),
             ),
@@ -330,9 +380,11 @@ impl CoreFetcher {
             headers,
             cookies: shot.use_jar,
             timeout: ONCE_TIMEOUT,
-            cap: None,
+            cap: REQUEST_COUNT.try_with(|_| 3 << 20).ok(),
             policy: donsetch_core::Policy {
                 hop: Some(hop_guard(Arc::clone(&refusal), None, direct)),
+                request_start: request_start(Arc::clone(&refusal)),
+                response_head: REQUEST_RESPONSE.try_with(Arc::clone).ok(),
                 request_max: Duration::MAX,
                 cancel: Some(cancel.clone()),
                 ..donsetch_core::Policy::default()
@@ -534,7 +586,7 @@ fn navigation_headers(referer: Option<&str>, target: &str) -> Vec<(String, Strin
 /// A failure's typed error: the refusal the hop guard recorded, or the class
 /// v5 named in the message's prefix.
 fn refused_or(raw: String, refusal: &Mutex<Option<FetchError>>) -> FetchError {
-    if raw.starts_with("denied:")
+    if (raw.starts_with("denied:") || raw.starts_with("budget:"))
         && let Some(error) = refusal.lock().unwrap_or_else(|p| p.into_inner()).take()
     {
         return error;
@@ -1188,6 +1240,76 @@ mod tests {
             .fetch_once_via(url, &[], Some(proxy), false, None)
             .await;
         [document, once].map(|result| result.map(|out| out.status))
+    }
+
+    // nextest isolates the installed process configuration.
+    #[tokio::test]
+    async fn search_request_budget_counts_redirects_and_stops_before_an_extra_request() {
+        loopback_config();
+        let reply = b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (port, log, task) = reply_server(reply).await;
+        let fetcher =
+            crate::fetch::client::Fetcher::new(crate::profile::BrowserProfile::host_default())
+                .unwrap();
+        for limit in [2, 0] {
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let source = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let before = log.lock().unwrap().len();
+            let result = REQUEST_COUNT
+                .scope(
+                    Arc::clone(&count),
+                    REQUEST_LIMIT.scope(
+                        limit,
+                        REQUEST_SOURCE_COUNT.scope(
+                            Arc::clone(&source),
+                            fetcher.fetch_once_via(
+                                &format!("http://127.0.0.1:{port}/start"),
+                                &[],
+                                None,
+                                false,
+                                None,
+                            ),
+                        ),
+                    ),
+                )
+                .await;
+            assert!(
+                matches!(&result, Err(FetchError::Http(message)) if message.contains("budget: request ceiling reached")),
+                "{:?}",
+                result.err()
+            );
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), limit);
+            assert_eq!(source.load(std::sync::atomic::Ordering::Relaxed), limit);
+            assert_eq!(log.lock().unwrap().len() - before, limit);
+        }
+        task.abort();
+    }
+
+    // nextest isolates the installed process configuration and cache root.
+    #[tokio::test]
+    async fn search_origin_rest_applies_to_other_paths_but_not_other_origins() {
+        loopback_config();
+        let (port, log, task) = reply_server(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 900\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()).await;
+        let (other_port, other_log, other_task) = http_server("Another origin").await;
+        let ledger = Arc::new(Mutex::new(crate::search::ledger::Ledger::load()));
+        let (guard, observe) = crate::search::origin_policy(ledger);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetcher = Fetcher::new(BrowserProfile::host_default()).unwrap();
+        REQUEST_COUNT.scope(Arc::clone(&count), REQUEST_ORIGIN_GUARD.scope(guard, REQUEST_RESPONSE.scope(observe, async {
+            let url = format!("http://127.0.0.1:{port}/first");
+            let first = fetcher.fetch_once_via(&url, &[], None, false, None).await.unwrap();
+            assert_eq!(first.status, 429);
+            let second = fetcher.fetch_once_via(&url.replace("/first", "/different"), &[], None, false, None).await;
+            assert!(matches!(&second, Err(FetchError::Http(message)) if message.starts_with("rested:")), "{:?}", second.err());
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let other = fetcher.fetch_once_via(&format!("http://127.0.0.1:{other_port}/page"), &[], None, false, None).await.unwrap();
+            assert_eq!(other.status, 200);
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }))).await;
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(other_log.lock().unwrap().len(), 1);
+        task.abort();
+        other_task.abort();
     }
 
     /// A SOCKS5 proxy whose password holds a '/', '#' or '?' is handed to v5

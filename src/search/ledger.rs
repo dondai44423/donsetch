@@ -17,9 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LEDGER_VERSION: u32 = 1;
 /// First rest after a misbehaving lane.
 const REST_BASE: u64 = 45;
-/// A lane is never rested longer than this, however badly it failed.
+/// The cap on our own failure backoff; a published Retry-After may be longer.
 const REST_CAP: u64 = 600;
-/// A throttled lane rests at least this long, even without `Retry-After`.
+/// The fallback when a throttled source publishes no Retry-After.
 const THROTTLE_BASE: u64 = 60;
 
 /// Whether a lane may be asked right now.
@@ -48,6 +48,29 @@ pub enum Outcome {
     Throttled,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+enum RestCause {
+    Backoff,
+    // Older ledgers did not distinguish a refusal from a failure backoff.
+    // Preserve an active unknown wait rather than accidentally erasing a 429.
+    #[default]
+    Legacy,
+    Refusal,
+    RetryAfter,
+}
+
 /// One lane's standing. Times are wall-clock, so a rest survives a restart.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Lane {
@@ -57,6 +80,8 @@ pub struct Lane {
     /// The window the current rest was set from (doubles per failure).
     #[serde(default)]
     rest_secs: u64,
+    #[serde(default)]
+    rest_cause: RestCause,
     /// Consecutive transport failures; an answer resets it.
     #[serde(default)]
     fails: u32,
@@ -67,6 +92,9 @@ pub struct Lane {
     refilled: u64,
     #[serde(default)]
     last_ok: u64,
+    /// Receipt ordering across writers; old ledgers start without an order.
+    #[serde(default)]
+    updated_ms: u64,
 }
 
 impl Lane {
@@ -75,10 +103,12 @@ impl Lane {
         Self {
             rest_until: 0,
             rest_secs: 0,
+            rest_cause: RestCause::Backoff,
             fails: 0,
             tokens: burst,
             refilled: now(),
             last_ok: 0,
+            updated_ms: 0,
         }
     }
 }
@@ -112,6 +142,11 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+fn prune_expired_origins(lanes: &mut BTreeMap<String, Lane>) {
+    let t = now();
+    lanes.retain(|key, lane| !key.starts_with("origin:") || lane.rest_until > t);
+}
+
 /// The ledger key: the source and the lane inside it.
 pub fn key(source: &str, lane: &str) -> String {
     format!("{source}|{lane}")
@@ -137,7 +172,7 @@ pub fn classify(status: &str) -> Option<Outcome> {
         "http-status" | "blocked" | "captcha" | "forbidden" | "auth-fail" => Some(Outcome::Blocked),
         // The scheduler cut the lane, or the plan never asked it: neither is
         // evidence about the source.
-        "rested" | "not-asked" | "pacing-timeout" | "skipped" | "late" => None,
+        "rested" | "not-asked" | "pacing-timeout" | "budget-skipped" | "skipped" | "late" => None,
         _ => Some(Outcome::Failed),
     }
 }
@@ -172,12 +207,13 @@ impl Ledger {
         let disk = std::fs::read(&path)
             .ok()
             .and_then(|raw| serde_json::from_slice::<Disk>(&raw).ok());
-        let lanes = match disk {
+        let mut lanes = match disk {
             Some(disk) if disk.version == LEDGER_VERSION => disk.lanes,
             // A file from another version is not trusted to mean the same
             // thing: drop it rather than rest healthy lanes on a guess.
             _ => BTreeMap::new(),
         };
+        prune_expired_origins(&mut lanes);
         Self {
             lanes,
             dirty: false,
@@ -207,6 +243,24 @@ impl Ledger {
         State::Ready
     }
 
+    /// A known origin's rest, without creating a pacing bucket for every URL.
+    pub(crate) fn origin_rest(&mut self, origin: &str) -> Option<u64> {
+        let key = format!("origin:{origin}|http");
+        let until = self.lanes.get(&key)?.rest_until;
+        let left = until.saturating_sub(now());
+        if left > 0 {
+            return Some(left);
+        }
+        self.lanes.remove(&key);
+        self.dirty = true;
+        None
+    }
+
+    pub(crate) fn record_origin(&mut self, origin: &str, outcome: Outcome, retry: Option<u64>) {
+        prune_expired_origins(&mut self.lanes);
+        self.record(&format!("origin:{origin}|http"), outcome, retry);
+    }
+
     /// Record what the lane's request amounted to.
     pub fn record(&mut self, key: &str, outcome: Outcome, retry: Option<u64>) {
         let t = now();
@@ -215,24 +269,36 @@ impl Ledger {
             .lanes
             .entry(key.to_string())
             .or_insert_with(|| Lane::for_key(key));
+        let receipt_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        lane.updated_ms = receipt_ms.max(lane.updated_ms.saturating_add(1));
         // A request was spent, whatever it returned.
         let elapsed = t.saturating_sub(lane.refilled) as f64;
         lane.tokens = (lane.tokens + elapsed * rate).min(burst) - 1.0;
         lane.refilled = t;
+        let published = (lane.rest_cause != RestCause::Backoff && lane.rest_until > t).then_some((
+            lane.rest_until,
+            lane.rest_secs,
+            lane.rest_cause,
+        ));
         match outcome {
             Outcome::Answered => {
                 lane.fails = 0;
-                lane.rest_secs = 0;
-                lane.rest_until = 0;
+                if lane.rest_cause == RestCause::Backoff || lane.rest_until <= t {
+                    lane.rest_secs = 0;
+                    lane.rest_until = 0;
+                    lane.rest_cause = RestCause::Backoff;
+                }
                 lane.last_ok = t;
             }
             Outcome::Throttled => {
                 lane.fails = lane.fails.saturating_add(1);
-                let wait = retry
-                    .unwrap_or(THROTTLE_BASE)
-                    .clamp(THROTTLE_BASE, REST_CAP);
+                let wait = retry.filter(|secs| *secs > 0).unwrap_or(THROTTLE_BASE);
                 lane.rest_secs = wait;
-                lane.rest_until = t + wait;
+                lane.rest_until = t.saturating_add(wait);
+                lane.rest_cause = RestCause::RetryAfter;
             }
             Outcome::Failed => {
                 // A hiccup, not a verdict: a net blip gets one more chance
@@ -242,7 +308,8 @@ impl Ledger {
                     let shift = lane.fails.saturating_sub(2).min(5);
                     let wait = (REST_BASE << shift).min(REST_CAP);
                     lane.rest_secs = wait;
-                    lane.rest_until = t + wait;
+                    lane.rest_until = t.saturating_add(wait);
+                    lane.rest_cause = RestCause::Backoff;
                 }
             }
             Outcome::Blocked => {
@@ -251,21 +318,30 @@ impl Ledger {
                 let shift = lane.fails.saturating_sub(1).min(5);
                 let wait = (REST_BASE << shift).min(REST_CAP);
                 lane.rest_secs = wait;
-                lane.rest_until = t + wait;
+                lane.rest_until = t.saturating_add(wait);
+                lane.rest_cause = RestCause::Refusal;
             }
+        }
+        if let Some((until, secs, cause)) = published
+            && (until > lane.rest_until || (until == lane.rest_until && lane.rest_cause < cause))
+        {
+            lane.rest_until = until;
+            lane.rest_secs = secs;
+            lane.rest_cause = cause;
         }
         self.dirty = true;
     }
 
-    /// Write the ledger back, merging what other processes learned meanwhile:
-    /// the stricter rest, the later success and the more depleted bucket win, so
-    /// two searches in parallel cannot undo each other's lesson.
+    /// Merge concurrent receipts: preserve explicit refusals, let newer
+    /// successes clear failure backoff, and compare refilled token balances.
     pub fn save_if_dirty(&mut self) {
         if !self.dirty {
             return;
         }
-        self.dirty = false;
-        let Some(path) = path() else { return };
+        let Some(path) = path() else {
+            self.dirty = false;
+            return;
+        };
         let Some(_guard) = WriteLock::acquire() else {
             return;
         };
@@ -282,19 +358,12 @@ impl Ledger {
                     merged.insert(key.clone(), mine.clone());
                 }
                 Some(theirs) => {
-                    if mine.rest_until > theirs.rest_until {
-                        theirs.rest_until = mine.rest_until;
-                        theirs.rest_secs = mine.rest_secs;
-                    }
-                    theirs.fails = theirs.fails.max(mine.fails);
-                    theirs.last_ok = theirs.last_ok.max(mine.last_ok);
-                    if mine.tokens < theirs.tokens {
-                        theirs.tokens = mine.tokens;
-                        theirs.refilled = mine.refilled;
-                    }
+                    *theirs = merge_lane(key, mine, theirs);
                 }
             }
         }
+        // Merging an older writer must not resurrect expired per-page origins.
+        prune_expired_origins(&mut merged);
         let disk = Disk {
             version: LEDGER_VERSION,
             lanes: merged,
@@ -303,8 +372,10 @@ impl Ledger {
             return;
         };
         let tmp = path.with_extension("tmp");
-        if crate::config::write_private(&tmp, json.as_bytes()).is_ok() {
-            let _ = std::fs::rename(tmp, path);
+        if crate::config::write_private(&tmp, json.as_bytes()).is_ok()
+            && std::fs::rename(tmp, path).is_ok()
+        {
+            self.dirty = false;
         }
     }
 
@@ -315,6 +386,46 @@ impl Ledger {
     }
 }
 
+fn merge_lane(key: &str, mine: &Lane, theirs: &Lane) -> Lane {
+    let t = now();
+    let mut merged = if mine.updated_ms > theirs.updated_ms {
+        mine.clone()
+    } else {
+        theirs.clone()
+    };
+    if mine.updated_ms == theirs.updated_ms {
+        // Concurrent or legacy receipts have no reliable ordering.
+        merged.fails = mine.fails.max(theirs.fails);
+        if mine.rest_until > merged.rest_until {
+            merged.rest_until = mine.rest_until;
+            merged.rest_secs = mine.rest_secs;
+            merged.rest_cause = mine.rest_cause;
+        }
+    }
+    // A late success may clear our own backoff, never an origin's refusal.
+    for receipt in [mine, theirs] {
+        if receipt.rest_cause != RestCause::Backoff
+            && receipt.rest_until > t
+            && (receipt.rest_until > merged.rest_until
+                || (receipt.rest_until == merged.rest_until
+                    && receipt.rest_cause > merged.rest_cause))
+        {
+            merged.rest_until = receipt.rest_until;
+            merged.rest_secs = receipt.rest_secs;
+            merged.rest_cause = receipt.rest_cause;
+        }
+    }
+    merged.last_ok = mine.last_ok.max(theirs.last_ok);
+    // Token debts from different seconds must first be refilled to the same
+    // instant. Comparing raw balances resurrected old debt or old burst room.
+    let (rate, burst) = policy(source_of(key));
+    let available =
+        |lane: &Lane| (lane.tokens + t.saturating_sub(lane.refilled) as f64 * rate).min(burst);
+    merged.tokens = available(mine).min(available(theirs));
+    merged.refilled = t;
+    merged
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Disk {
     version: u32,
@@ -322,51 +433,220 @@ struct Disk {
     lanes: BTreeMap<String, Lane>,
 }
 
+/// Seed a cold measurement with unexpired refusals, without carrying answers,
+/// trust, token consumption or transport-failure backoff into it.
+pub(crate) fn carry_refusals(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    fn read(path: &std::path::Path) -> Result<Disk, String> {
+        match std::fs::read(path) {
+            Ok(raw) => serde_json::from_slice::<Disk>(&raw)
+                .map_err(|error| format!("cannot read refusal ledger {}: {error}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Disk {
+                version: LEDGER_VERSION,
+                lanes: BTreeMap::new(),
+            }),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let _guard = WriteLock::at_wait(
+        &to.with_extension("lock"),
+        std::time::Duration::from_millis(500),
+    )
+    .ok_or_else(|| format!("cannot lock refusal ledger {}", to.display()))?;
+    let source = read(from)?;
+    let mut target = read(to)?;
+    if source.version != LEDGER_VERSION || target.version != LEDGER_VERSION {
+        return Err("cannot carry refusals from an unknown ledger version".into());
+    }
+    let t = now();
+    for (key, lane) in source.lanes {
+        if lane.rest_until <= t || lane.rest_cause == RestCause::Backoff {
+            continue;
+        }
+        let entry = target
+            .lanes
+            .entry(key.clone())
+            .or_insert_with(|| Lane::for_key(&key));
+        if lane.rest_until > entry.rest_until {
+            entry.rest_until = lane.rest_until;
+            entry.rest_secs = lane.rest_secs;
+            entry.rest_cause = lane.rest_cause;
+        }
+    }
+    prune_expired_origins(&mut target.lanes);
+    let json = serde_json::to_vec(&target).map_err(|error| error.to_string())?;
+    let tmp = to.with_extension(format!("{}.tmp", std::process::id()));
+    crate::config::write_private(&tmp, &json).map_err(|error| error.to_string())?;
+    std::fs::rename(tmp, to).map_err(|error| error.to_string())
+}
+
+/// Preserve a published wait reported by an older measured binary whose disk
+/// format did not distinguish refusals from transport backoff.
+pub(crate) fn carry_report_refusals(
+    path: &std::path::Path,
+    reports: &[super::EngineReport],
+) -> Result<(), String> {
+    let disk = match std::fs::read(path) {
+        Ok(raw) => serde_json::from_slice::<Disk>(&raw).map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Disk {
+            version: LEDGER_VERSION,
+            lanes: BTreeMap::new(),
+        },
+        Err(error) => return Err(error.to_string()),
+    };
+    if disk.version != LEDGER_VERSION {
+        return Err("unknown measured ledger version".into());
+    }
+    let mut ledger = Ledger {
+        lanes: disk.lanes,
+        dirty: false,
+    };
+    for report in reports {
+        let Some(outcome @ (Outcome::Blocked | Outcome::Throttled)) = classify(&report.status)
+        else {
+            continue;
+        };
+        let key = key(
+            super::lane_source(&report.engine),
+            super::lane_of(&report.engine),
+        );
+        ledger.record(&key, outcome, retry_after(&report.status));
+    }
+    let json = serde_json::to_vec(&Disk {
+        version: LEDGER_VERSION,
+        lanes: ledger.lanes,
+    })
+    .map_err(|error| error.to_string())?;
+    crate::config::write_private(path, &json).map_err(|error| error.to_string())
+}
+
 fn path() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     let dir = crate::paths::cache_dir();
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("search-ledger.json"))
 }
 
-/// Cross-process serialization for the ledger file: a blocking flock the kernel
-/// releases on crash. Best effort, like every other state write.
+/// Cross-process serialization without blocking the search on another writer.
+/// The kernel releases this lock on crash; a missed write remains dirty.
 struct WriteLock {
     #[allow(dead_code)] // RAII: held for the lock, never read
     file: std::fs::File,
 }
 
 impl WriteLock {
-    fn acquire() -> Option<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let path = crate::paths::cache_dir().join("search-ledger.lock");
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .ok()?;
-            loop {
-                let got = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-                if got == 0 {
-                    return Some(Self { file });
-                }
-                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                    return None;
-                }
+    fn at_wait(path: &std::path::Path, budget: std::time::Duration) -> Option<Self> {
+        let until = std::time::Instant::now() + budget;
+        loop {
+            if let Some(guard) = Self::at(path) {
+                return Some(guard);
             }
+            if std::time::Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        #[cfg(not(unix))]
-        {
-            None
-        }
+    }
+
+    fn acquire() -> Option<Self> {
+        Self::at(&crate::paths::cache_dir().join("search-ledger.lock"))
+    }
+
+    fn at(path: &std::path::Path) -> Option<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        file.try_lock().ok()?;
+        Some(Self { file })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_measurements_carry_refusals_without_carrying_failure_or_trust_history() {
+        let dir =
+            std::env::temp_dir().join(format!("donsetch-refusal-carry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.json");
+        let target = dir.join("target.json");
+        let t = now();
+        let lanes = [
+            ("quota", RestCause::RetryAfter, t + 900),
+            ("block", RestCause::Refusal, t + 45),
+            ("legacy", RestCause::Legacy, t + 45),
+            ("expired", RestCause::RetryAfter, t.saturating_sub(1)),
+            ("timeout", RestCause::Backoff, t + 45),
+        ]
+        .into_iter()
+        .map(|(key, cause, until)| {
+            let mut lane = Lane::for_key(key);
+            lane.rest_cause = cause;
+            lane.rest_until = until;
+            lane.rest_secs = 900;
+            lane.tokens = -10.0;
+            lane.fails = 8;
+            (key.to_string(), lane)
+        })
+        .collect();
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&Disk {
+                version: LEDGER_VERSION,
+                lanes,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        carry_refusals(&source, &target).unwrap();
+        let copied: Disk = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(copied.lanes.len(), 3);
+        assert_eq!(copied.lanes["quota"].rest_until, t + 900);
+        assert_eq!(copied.lanes["quota"].tokens, 2.0);
+        assert_eq!(copied.lanes["quota"].fails, 0);
+        assert!(!copied.lanes.contains_key("expired"));
+        assert!(!copied.lanes.contains_key("timeout"));
+        let workers: Vec<_> = (0..4)
+            .map(|i| {
+                let file = dir.join(format!("source-{i}.json"));
+                let mut lane = Lane::for_key("new");
+                lane.rest_cause = RestCause::RetryAfter;
+                lane.rest_until = t + 900;
+                lane.rest_secs = 900;
+                std::fs::write(
+                    &file,
+                    serde_json::to_vec(&Disk {
+                        version: LEDGER_VERSION,
+                        lanes: BTreeMap::from([(format!("new-{i}"), lane)]),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                let target = target.clone();
+                std::thread::spawn(move || carry_refusals(&file, &target).unwrap())
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let merged: Disk = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(
+            merged.lanes.len(),
+            7,
+            "concurrent cold groups retain every source's refusal"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_failed_lane_rests_and_the_next_failure_rests_it_longer() {
@@ -398,8 +678,10 @@ mod tests {
             dirty: false,
         };
         let k = key("bing", "serp");
-        l.record(&k, Outcome::Blocked, None);
-        l.record(&k, Outcome::Blocked, None);
+        // A successful request clears transport-failure backoff. Explicit
+        // refusal windows are preserved even if an in-flight request succeeds.
+        l.record(&k, Outcome::Failed, None);
+        l.record(&k, Outcome::Failed, None);
         assert!(l.lane(&k).unwrap().fails >= 2);
         l.record(&k, Outcome::Answered, None);
         let lane = l.lane(&k).unwrap();
@@ -414,11 +696,25 @@ mod tests {
             dirty: false,
         };
         let k = key("crates", "registry");
-        l.record(&k, Outcome::Throttled, Some(120));
-        match l.ready(&k) {
-            State::Rested(secs) => assert!((110..=120).contains(&secs), "{secs}"),
-            State::Paced(wait) => panic!("a throttle must rest the lane, not pace {wait}s"),
-            State::Ready => panic!("a 429 must rest the lane"),
+        for wait in [1, 120, 900, u64::MAX] {
+            let before = now();
+            l.record(&k, Outcome::Throttled, Some(wait));
+            let after = now();
+            let lane = l.lane(&k).unwrap();
+            assert_eq!(lane.rest_secs, wait);
+            assert!(
+                lane.rest_until >= before.saturating_add(wait)
+                    && lane.rest_until <= after.saturating_add(wait)
+            );
+            if wait >= 120 {
+                for later in [Outcome::Answered, Outcome::Failed, Outcome::Blocked] {
+                    l.record(&k, later, None);
+                }
+                assert!(
+                    matches!(l.ready(&k), State::Rested(_)),
+                    "a 429 must rest the lane"
+                );
+            }
         }
     }
 
@@ -467,16 +763,96 @@ mod tests {
         let mut a = Ledger::load();
         a.record(&key("brave", "serp"), Outcome::Blocked, None);
         a.save_if_dirty();
+        assert!(!a.dirty);
+        let expired = "origin:https://expired.example|http";
+        let mut old_disk: Disk =
+            serde_json::from_slice(&std::fs::read(path().unwrap()).unwrap()).unwrap();
+        let old_origin = Lane {
+            rest_until: now().saturating_sub(1),
+            rest_cause: RestCause::RetryAfter,
+            ..Lane::default()
+        };
+        old_disk.lanes.insert(expired.into(), old_origin);
+        std::fs::write(path().unwrap(), serde_json::to_vec(&old_disk).unwrap()).unwrap();
+        assert!(Ledger::load().lane(expired).is_none());
+        let held = WriteLock::acquire().unwrap();
+        a.record(&key("yahoo", "serp"), Outcome::Throttled, Some(900));
+        let start = std::time::Instant::now();
+        a.save_if_dirty();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            a.dirty,
+            "a busy writer must not lose a refusal or stall search"
+        );
+        drop(held);
+        a.save_if_dirty();
+        assert!(!a.dirty);
+        let saved: Disk = serde_json::from_slice(&std::fs::read(path().unwrap()).unwrap()).unwrap();
+        assert!(
+            !saved.lanes.contains_key(expired),
+            "a disk merge must prune expired origins"
+        );
+        // A failed write keeps the outstanding refusal dirty so a later call
+        // retries persistence instead of silently forgetting its published wait.
+        a.record(&key("google-cse", "serp"), Outcome::Throttled, Some(900));
+        let tmp = path().unwrap().with_extension("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        a.save_if_dirty();
+        assert!(a.dirty);
+        std::fs::remove_dir(&tmp).unwrap();
+        a.save_if_dirty();
+        assert!(!a.dirty);
+        assert!(matches!(
+            Ledger::load().ready(&key("google-cse", "serp")),
+            State::Rested(890..=900)
+        ));
 
         let mut b = Ledger::load();
         // The second process saw a longer rest from the first; it must not
         // shorten it when it writes its own answer for another lane.
         b.record(&key("bing", "serp"), Outcome::Answered, None);
+        b.record(&key("brave", "serp"), Outcome::Answered, None);
+        assert!(
+            matches!(b.ready(&key("brave", "serp")), State::Rested(_)),
+            "an in-flight success cannot cancel a refusal"
+        );
         b.save_if_dirty();
 
         let c = Ledger::load();
         assert!(matches!(c.lane(&key("brave", "serp")), Some(l) if l.rest_until > 0));
         assert!(c.lane(&key("bing", "serp")).is_some());
+
+        let recovering = key("recovering", "serp");
+        let mut failed = Ledger::load();
+        failed.record(&recovering, Outcome::Failed, None);
+        failed.record(&recovering, Outcome::Failed, None);
+        failed.save_if_dirty();
+        let mut stale = Ledger::load();
+        let mut healthy = Ledger::load();
+        healthy.record(&recovering, Outcome::Answered, None);
+        healthy.save_if_dirty();
+        // An unrelated write by an old process cannot restore the cleared
+        // failure streak or backoff after a newer successful request.
+        stale.record(&key("other", "serp"), Outcome::Answered, None);
+        stale.save_if_dirty();
+        let healed = Ledger::load();
+        assert_eq!(healed.lane(&recovering).unwrap().fails, 0);
+        assert_eq!(healed.lane(&recovering).unwrap().rest_until, 0);
+
+        let old = Lane {
+            tokens: -10.0,
+            refilled: now().saturating_sub(100),
+            ..Lane::default()
+        };
+        let current = Lane {
+            tokens: 1.0,
+            updated_ms: 1,
+            ..Lane::default()
+        };
+        assert!(
+            (1.0..=2.0).contains(&merge_lane("bing|serp", &current, &old).tokens),
+            "a stale depleted balance must be refilled before merging"
+        );
         unsafe { std::env::remove_var("DONSETCH_CACHE_DIR") };
     }
 }

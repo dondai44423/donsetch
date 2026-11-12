@@ -10,7 +10,7 @@ use scraper::{Html, Selector};
 pub mod google_wml;
 
 /// One raw hit from one engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
     pub title: String,
     pub url: String,
@@ -196,6 +196,8 @@ pub(crate) fn is_serp_url(url: &str) -> bool {
         "duckduckgo.com/",
         "www.mojeek.com/search",
         "mojeek.com/search",
+        "yandex.com/search",
+        "yandex.ru/search",
         // Vertical SERPs
         "www.google.com/scholar",
         "scholar.google.com/",
@@ -234,6 +236,7 @@ pub fn parse_with_instant(
         "ddg_html" => parse_ddg(&doc),
         "mojeek" => parse_mojeek(&doc),
         "yahoo" => parse_yahoo(&doc),
+        "yandex" => parse_yandex(&doc),
         _ => Vec::new(),
     };
     // Filter out SERP URLs that leaked through parsers (e.g.
@@ -397,6 +400,41 @@ fn parse_ddg_lite(doc: &Html) -> Vec<Hit> {
     hits
 }
 
+fn parse_yandex(doc: &Html) -> Vec<Hit> {
+    let items = sel("li.serp-item");
+    let link = sel("h3 a.b-serp-item__title-link");
+    let cap = sel(".b-serp-item__text");
+    let mut hits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in doc.select(&items) {
+        let Some(a) = item.select(&link).next() else {
+            continue;
+        };
+        let href = a.value().attr("href").unwrap_or_default();
+        let Ok(url) = url::Url::parse(href) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || is_serp_url(href)
+            || !seen.insert(super::rank::norm_key(href))
+        {
+            continue;
+        }
+        let title = text(a);
+        if title.trim().is_empty() {
+            continue;
+        }
+        hits.push(Hit {
+            title,
+            url: href.to_string(),
+            snippet: item.select(&cap).next().map(text).unwrap_or_default(),
+            rank: hits.len(),
+            published: None,
+        });
+    }
+    hits
+}
+
 fn parse_mojeek(doc: &Html) -> Vec<Hit> {
     // Mojeek: <li><a class="ob">breadcrumb</a>
     //         <h2><a class="title" href>real title</a></h2>
@@ -514,7 +552,8 @@ fn parse_yahoo(doc: &Html) -> Vec<Hit> {
     let h3 = sel("h3");
     let a_gen = sel("a[href]");
     let mut hits = Vec::new();
-    for (rank, item) in doc.select(&items).enumerate() {
+    let mut seen = std::collections::HashSet::new();
+    for item in doc.select(&items) {
         let Some(a) = item
             .select(&link)
             .next()
@@ -533,12 +572,14 @@ fn parse_yahoo(doc: &Html) -> Vec<Hit> {
         let heading = item.select(&h3).next().map(text).unwrap_or_default();
         let title = if heading.is_empty() { text(a) } else { heading };
         let snippet = item.select(&cap).next().map(text).unwrap_or_default();
-        if !title.is_empty() {
+        // Layout fallbacks can select both a result and its nested title.
+        // Count the organic page once, before assigning its source rank.
+        if !title.is_empty() && seen.insert(super::rank::norm_key(&url)) {
             hits.push(Hit {
                 title,
                 url,
                 snippet,
-                rank,
+                rank: hits.len(),
                 published: None,
             });
         }
@@ -570,6 +611,12 @@ pub fn serp_url_in(
         "ddg_html" => Some(format!("https://html.duckduckgo.com/html/?q={q}")),
         "mojeek" => Some(format!("https://www.mojeek.com/search?q={q}")),
         "yahoo" => Some(format!("https://search.yahoo.com/search?p={q}")),
+        // Native HTML contract: the same public site-search interface whose
+        // form/OpenSearch names web=1. Fixed interface parameters are documented
+        // by SearXNG's yandex engine; accepted same-egress witness in C's bench.
+        "yandex" => Some(format!(
+            "https://yandex.com/search/site/?text={q}&tmpl_version=releases&web=1&frame=1&searchid=3131712"
+        )),
         // The same index as `bing`, through the one interface it publishes
         // as data rather than layout: RSS 2.0, ten items, no pagination and
         // no `site:` support. Used as bing's fallback, never as a 7th slot.
@@ -581,10 +628,18 @@ pub fn serp_url_in(
             "bing" | "bing_rss" => format!("&setlang={}&cc={}", l.lang, l.region),
             "ddg" | "ddg_lite" | "ddg_html" => format!("&kl={}", l.kl()),
             "yahoo" => format!("&vl=lang_{}", l.lang),
+            "yandex"
+                if matches!(
+                    l.lang,
+                    "en" | "ru" | "be" | "fr" | "de" | "id" | "kk" | "tt" | "tr" | "uk"
+                ) =>
+            {
+                format!("&lang={}", l.lang)
+            }
             _ => String::new(),
         };
         url.push_str(&extra);
-    } else {
+    } else if super::locale::latin_query(query) {
         // A Latin query names no language, but the source still has to pick a
         // market: without one, Bing answered this egress's own locale (a Nepali
         // result page for an English query, which then looked off-query and
@@ -594,6 +649,7 @@ pub fn serp_url_in(
             "bing" | "bing_rss" => "&setlang=en&cc=us",
             "ddg" | "ddg_lite" | "ddg_html" => "&kl=us-en",
             "yahoo" => "&vl=lang_en",
+            "yandex" => "&lang=en",
             _ => "",
         };
         url.push_str(extra);
@@ -648,7 +704,7 @@ pub fn format(engine: &str) -> Format {
 /// engaged no query term at all. A status-code health model scores that as 95%
 /// healthy; this one scores it as the failure it is, and keeps the items out of
 /// the merge so one bot-page cannot pollute a query's ranking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AnswerClass {
     /// The answer is real and full: its items may rank, and the source earns
     /// trust.
@@ -741,6 +797,27 @@ pub fn shape_extract(html: &str, page_url: &str) -> Vec<Hit> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<Hit> = Vec::new();
     for anchor in doc.select(&anchors) {
+        // A menu of outbound links has the same repeated-link shape as a
+        // result list. Semantic navigation and hidden subtrees are not results,
+        // even when they link off the search host or use its redirect wrapper.
+        if std::iter::once(anchor)
+            .chain(anchor.ancestors().filter_map(ElementRef::wrap))
+            .any(|el| {
+                matches!(el.value().name(), "nav" | "footer")
+                    || el.value().attr("role").is_some_and(|role| {
+                        role.split_ascii_whitespace()
+                            .any(|role| matches!(role, "navigation" | "banner" | "contentinfo"))
+                    })
+                    || el.value().attr("hidden").is_some()
+                    || el.value().attr("inert").is_some()
+                    || el
+                        .value()
+                        .attr("aria-hidden")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            })
+        {
+            continue;
+        }
         if out.len() >= MAX_SHAPED {
             break;
         }
@@ -970,7 +1047,7 @@ fn atom_link(item: &str) -> Option<String> {
     Some(decode_xml(href.split('"').next()?))
 }
 
-fn decode_xml(raw: &str) -> String {
+pub(crate) fn decode_xml(raw: &str) -> String {
     let raw = raw.trim();
     let raw = raw
         .strip_prefix("<![CDATA[")
@@ -1065,6 +1142,38 @@ mod tests {
         assert!(!is_serp_url(
             "https://en.wikipedia.org/wiki/Rust_(programming_language)"
         ));
+    }
+
+    #[test]
+    fn yandex_contract_reads_real_titles_and_dense_ranks_without_market_guessing() {
+        // Reduced from the accepted native /search/site witness. Its page title
+        // said "no results" even though its actual list carried ten records.
+        let html = r#"<html><title>There are no search results</title><ul>
+          <li class="serp-item"><a href="/next">Next</a></li>
+          <li class="serp-item"><h3 class="b-serp-item__title"><a class="b-serp-item__title-link" href="https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html"><span>What is Ownership?</span></a></h3><div class="b-serp-item__text">Rust uses a system of <b>ownership</b>.</div></li>
+          <li class="serp-item"><h3><a class="b-serp-item__title-link" href="https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html">Duplicate</a></h3></li>
+          <li class="serp-item"><h3><a class="b-serp-item__title-link" href="https://example.com/rust">Another guide</a></h3><div class="b-serp-item__text">An independent ownership explanation.</div></li>
+          <li class="serp-item"><h3><a class="b-serp-item__title-link" href="javascript:void(0)">Not a page</a></h3></li>
+        </ul></html>"#;
+        let hits = parse("yandex", html);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "What is Ownership?");
+        assert_eq!(hits[0].snippet, "Rust uses a system of ownership.");
+        assert_eq!(hits.iter().map(|h| h.rank).collect::<Vec<_>>(), vec![0, 1]);
+        for engine in ["bing", "ddg", "yahoo", "yandex"] {
+            let han = serp_url_in(engine, "東京 地震 速報", None).unwrap();
+            assert!(
+                !han.contains("lang_en")
+                    && !han.contains("kl=us-en")
+                    && !han.contains("setlang=en")
+                    && !han.contains("lang=en")
+            );
+        }
+        assert!(
+            serp_url("yandex", "rust ownership")
+                .unwrap()
+                .contains("web=1")
+        );
     }
 
     #[test]
@@ -1223,19 +1332,25 @@ mod tests {
     fn yahoo_extracts_heading_instead_of_outer_link_breadcrumb() {
         let html = r#"
         <html><body>
-          <div class="compTitle options-toggle">
+          <div class="algo"><div class="compTitle options-toggle">
             <a data-matarget="algo" href="https://example.com/ownership">
               <div><span>Example</span>https://example.com › ownership</div>
               <h3 class="title"><span>Understanding Ownership</span></h3>
             </a>
             <div class="compText"><p>A focused explanation.</p></div>
-          </div>
+          </div></div>
+          <div class="algo"><div class="compTitle">
+            <h3><a href="https://example.com/borrowing">Borrowing</a></h3>
+          </div><p>A second distinct page.</p></div>
         </body></html>
         "#;
         let hits = parse("yahoo", html);
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "Understanding Ownership");
         assert!(!hits[0].title.contains("https://"));
+        assert_eq!(hits[0].rank, 0);
+        assert_eq!(hits[1].rank, 1);
+        assert_eq!(hits[0].snippet, "A focused explanation.");
     }
 }
 
@@ -1399,6 +1514,23 @@ mod structured_answer_tests {
         );
         // Navigation on the SERP's own host is never a result.
         assert!(one.iter().all(|h| !h.url.contains("example-search.test")));
+        // Reduced from an accepted Yahoo response: its cross-site navigation
+        // used the same redirect wrappers as organic records. A title-only
+        // real result must still survive, including inside an article header.
+        let chrome = r#"<nav aria-label="Yahoo sites"><div><ul>
+            <li><a href="https://r.search.yahoo.com/;RU=https%3a%2f%2fshopping.yahoo.com%2fgift-ideas%2f/RK=2">Gift ideas</a></li>
+            <li><a href="https://finance.yahoo.com/portfolios/">My portfolio</a></li>
+            </ul></div></nav>
+            <div role="contentinfo"><ul><li><a href="https://yahoo.uservoice.com/forums/193847-search">Suggestions</a></li></ul></div>
+            <div role="navigation"><h3><a href="https://menu.example/">An external menu</a></h3><p>A description of the navigation link.</p></div>
+            <footer><a href="https://footer.example/">A footer destination</a></footer>
+            <div hidden><a href="https://hidden.example/">A hidden destination</a></div>
+            <div aria-hidden="true"><a href="https://aria.example/">An invisible destination</a></div>
+            <main><article><header><h3><a href="https://record.example/">A sparse real record</a></h3></header></article></main>"#;
+        let hits = shape_extract(chrome, "https://search.yahoo.com/search?p=x");
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert_eq!(hits[0].url, "https://record.example/");
+        assert_eq!(hits[0].title, "A sparse real record");
     }
 
     #[test]

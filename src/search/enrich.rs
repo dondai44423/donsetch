@@ -82,6 +82,66 @@ impl PrewarmCache {
 }
 
 impl Searcher {
+    /// Overlap one procedural evidence read with the remaining index requests.
+    /// The final ranking is unchanged; only a retained URL may use the excerpt.
+    pub(super) async fn with_early_evidence<F>(
+        &self,
+        query: &str,
+        enabled: bool,
+        started: Instant,
+        work: F,
+    ) -> Result<(super::SearchOutcome, Vec<String>), FetchError>
+    where
+        F: std::future::Future<Output = Result<super::SearchOutcome, FetchError>>,
+    {
+        if !enabled || super::query::QueryFacts::new(query).shape() != super::query::Shape::HowTo {
+            return work.await.map(|out| (out, Vec::new()));
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+        let read = async {
+            let hit: super::engines::Hit = receiver.await.ok()?;
+            let remaining = Duration::from_millis(2200)
+                .saturating_sub(started.elapsed())
+                .min(Duration::from_millis(1500));
+            if remaining.is_zero() {
+                return None;
+            }
+            let mut candidate = vec![Merged {
+                title: hit.title,
+                url: hit.url,
+                snippet: hit.snippet,
+                sources: Vec::new(),
+                score: 0.0,
+                published: hit.published,
+                families: 0,
+                from_page: false,
+                tier: 1,
+            }];
+            self.read_at(&mut candidate, query, vec![0], remaining)
+                .await;
+            candidate.pop()
+        };
+        let (out, preview) = tokio::join!(super::EARLY_PAGE.scope(slot, work), read);
+        let mut out = out?;
+        let mut attempted = Vec::new();
+        if let Some(preview) = preview {
+            attempted.push(preview.url.clone());
+            if preview.from_page
+                && let Some(result) = out
+                    .results
+                    .iter_mut()
+                    .find(|r| super::rank::norm_key(&r.url) == super::rank::norm_key(&preview.url))
+            {
+                // The read already retained its source's displayed date. Do
+                // not prepend a different index's date to that same excerpt.
+                result.snippet = preview.snippet;
+                result.from_page = true;
+            }
+        }
+        Ok((out, attempted))
+    }
+
     /// Enrich top results by prefetching destination pages.
     ///
     /// Extracts real <title> and <meta name="description">
@@ -152,7 +212,7 @@ impl Searcher {
                     // alive page. Demoting it as dead would punish
                     // anything slow, so stay neutral.
                     Err(_) => (i, None, Some(String::new()), QualityObs::Neutral),
-                    Ok(Err(e)) if slow_not_dead(&e) => {
+                    Ok(Err(e)) if neutral_failure(&e) => {
                         (i, None, Some(String::new()), QualityObs::Neutral)
                     }
                     // A local rule refused the host: the same shape a bot
@@ -298,7 +358,11 @@ impl Searcher {
         self.save_quality_if_dirty();
 
         // Re-sort after enrichment (dead links demoted).
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        results.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
     }
 
     /// `read: k`: fetch the top `k` results in parallel inside the call's
@@ -309,33 +373,110 @@ impl Searcher {
     /// parked for the follow-up `web_fetch` unless prewarm is switched off.
     pub async fn read_results(&self, results: &mut [Merged], query: &str, k: usize) {
         let n = results.len().min(k.min(READ_MAX));
-        self.read_at(results, query, (0..n).collect()).await;
+        self.read_at(results, query, (0..n).collect(), Duration::from_secs(4))
+            .await;
     }
 
-    /// Repair the top three's stub snippets (empty, a few words, a redirect
-    /// notice) by reading those pages, inside what `read` left of the same
-    /// three-page budget: `already` is how many `read` asked for. A result whose
-    /// snippet says something is never fetched, so a search whose sources sent
-    /// real text pays nothing (measured: no top-5 result in 1,667 had an empty
-    /// snippet).
+    /// Repair stubs and a procedural/promising result. An unreadable guide may
+    /// fall back to one independent publisher within the same shared budgets.
+    pub(super) async fn repair_default_snippets(
+        &self,
+        results: &mut [Merged],
+        query: &str,
+        already: usize,
+        timeout: Duration,
+        attempted: &[String],
+    ) {
+        let remaining_pages = READ_MAX.saturating_sub(already + attempted.len());
+        if remaining_pages == 0 {
+            return;
+        }
+        let allow_guide = already == 0 && !results.iter().take(READ_MAX).any(|r| r.from_page);
+        let howto = allow_guide
+            && super::query::QueryFacts::new(query).shape() == super::query::Shape::HowTo;
+        let available = |i: usize| {
+            !attempted
+                .iter()
+                .any(|url| same_publisher(url, &results[i].url))
+        };
+        let mut indices: Vec<usize> = (already..results.len().min(READ_MAX))
+            .filter(|&i| {
+                available(i)
+                    && !results[i].from_page
+                    && super::evidence::is_stub(&results[i].snippet)
+            })
+            .take(remaining_pages)
+            .collect();
+        let guide = (already..results.len().min(READ_MAX)).find(|&i| {
+            allow_guide
+                && indices.len() < remaining_pages
+                && available(i)
+                && !results[i].from_page
+                && !indices.contains(&i)
+                && (howto || super::evidence::is_teaser(&results[i].snippet))
+        });
+        if let Some(i) = guide {
+            indices.push(i);
+        }
+        indices.sort_unstable();
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.read_at(results, query, indices.clone(), timeout).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if guide.is_none()
+            || remaining.is_zero()
+            || indices.len() >= remaining_pages
+            || indices.iter().any(|&i| results[i].from_page)
+        {
+            return;
+        }
+        // A blocked publisher must not monopolize the evidence attempt. Try one
+        // other ranked publisher, never an alternate endpoint of the same site,
+        // inside the original deadline and the remaining page/HTTP allowance.
+        let tried: Vec<_> = indices
+            .iter()
+            .map(|&i| results[i].url.as_str())
+            .chain(attempted.iter().map(String::as_str))
+            .collect();
+        if let Some(i) = (already..results.len().min(READ_MAX)).find(|&i| {
+            let host = super::rank::host_of(&results[i].url);
+            !indices.contains(&i)
+                && !results[i].from_page
+                && !host.is_empty()
+                && !tried.iter().any(|url| same_publisher(url, &results[i].url))
+        }) {
+            self.read_at(results, query, vec![i], remaining).await;
+        }
+    }
+
+    /// Repair provider stubs inside the explicit read's remaining page budget.
     pub async fn repair_snippets(&self, results: &mut [Merged], query: &str, already: usize) {
-        let stubs: Vec<usize> = (already..results.len().min(READ_MAX))
+        let stubs = (already..results.len().min(READ_MAX))
             .filter(|&i| !results[i].from_page && super::evidence::is_stub(&results[i].snippet))
             .collect();
-        self.read_at(results, query, stubs).await;
+        self.read_at(results, query, stubs, Duration::from_secs(4))
+            .await;
     }
 
     /// Fetch the results at `indices` in parallel inside the call's budget and
     /// replace each teaser with the page's passage that answers the query.
-    async fn read_at(&self, results: &mut [Merged], query: &str, indices: Vec<usize>) {
-        const READ_TIMEOUT: Duration = Duration::from_secs(4);
+    async fn read_at(
+        &self,
+        results: &mut [Merged],
+        query: &str,
+        indices: Vec<usize>,
+        timeout: Duration,
+    ) {
         /// Share of the query's topic words a passage must hold to be shown.
         const READ_MIN_COVER: f64 = 0.4;
         if indices.is_empty() {
             return;
         }
         let park = crate::config::cfg().fetch.prewarm;
-        let budget = super::stage_budget(READ_TIMEOUT, Duration::from_millis(100));
+        let budget = super::stage_budget(timeout, Duration::from_millis(100));
+        if budget.is_zero() {
+            return;
+        }
+        let facts = super::query::QueryFacts::new(query);
         let fetcher = &self.fetcher;
         let sink = self.prewarms.clone();
         let mut set: futures_util::stream::FuturesUnordered<_> = indices
@@ -343,6 +484,8 @@ impl Searcher {
             .filter_map(|i| results.get(i).map(|r| (i, r)))
             .map(|(i, r)| {
                 let url = r.url.clone();
+                let title = r.title.clone();
+                let facts = &facts;
                 let sink = sink.clone();
                 let query = query.to_string();
                 async move {
@@ -356,6 +499,9 @@ impl Searcher {
                     if o.status >= 400 || !matches!(o.verdict, Verdict::ContentOk) {
                         return None;
                     }
+                    if !super::query::permits(facts.compiled(), &title, &o.url) {
+                        return None;
+                    }
                     let ct = o
                         .headers
                         .iter()
@@ -367,12 +513,16 @@ impl Searcher {
                         return None;
                     }
                     let body = o.body.clone();
-                    let page_url = url.clone();
+                    let final_url = o.url.clone();
+                    let page_url = final_url.clone();
                     let q = query.clone();
                     let passage = tokio::task::spawn_blocking(move || {
                         let opts = crate::extract::ExtractOptions {
-                            focus: Some(q.clone()),
-                            max_chars: Some(2_000),
+                            // Selection sees deeper instructions too; only the
+                            // chosen passage reaches the 320-character reply.
+                            // Do not pre-filter by query words: Ingredients or
+                            // Commands sections often do not repeat the topic.
+                            max_chars: Some(64_000),
                             ..Default::default()
                         };
                         let ex = crate::extract::extract(&body, &ct, &page_url, &opts).ok()?;
@@ -386,7 +536,21 @@ impl Searcher {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .put(&url, o);
                     }
-                    passage.map(|p| (i, p))
+                    passage
+                        .filter(|p| {
+                            super::contract::veto(
+                                facts,
+                                &super::engines::Hit {
+                                    title: title.clone(),
+                                    url: final_url.clone(),
+                                    snippet: p.clone(),
+                                    rank: i,
+                                    published: None,
+                                },
+                            )
+                            .is_none()
+                        })
+                        .map(|p| (i, p))
                 }
             })
             .collect();
@@ -397,13 +561,19 @@ impl Searcher {
             if let Some((i, passage)) = done
                 && let Some(r) = results.get_mut(i)
             {
-                // A passage replaces the teaser only when it speaks to the query
-                // at least as well as the teaser does, and to a real share of it:
-                // the first paragraph that mentions one word is not an answer.
+                // Instructions need not repeat all the words in an introduction.
+                // A procedural code/list passage can replace it with less
+                // overlap; every replacement still keeps the coverage floor.
                 let after = super::evidence::coverage(query, &passage);
-                if after >= READ_MIN_COVER && after >= super::evidence::coverage(query, &r.snippet)
+                let instructions =
+                    facts.shape() == super::query::Shape::HowTo && passage.contains('\n');
+                if after >= READ_MIN_COVER
+                    && (super::evidence::is_stub(&r.snippet)
+                        || super::evidence::is_teaser(&r.snippet)
+                        || instructions
+                        || after >= super::evidence::coverage(query, &r.snippet))
                 {
-                    r.snippet = passage;
+                    r.snippet = super::evidence::dated_passage(&r.snippet, &passage);
                     r.from_page = true;
                 }
             }
@@ -428,6 +598,14 @@ impl Searcher {
             this.enrich_results(&mut owned).await;
         });
     }
+}
+
+fn same_publisher(a: &str, b: &str) -> bool {
+    let a = super::rank::host_of(a);
+    let b = super::rank::host_of(b);
+    !a.is_empty()
+        && !b.is_empty()
+        && (a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}")))
 }
 
 /// Extract <title> from raw HTML.
@@ -458,11 +636,11 @@ fn extract_description(html: &str) -> Option<String> {
 /// resolver timeout out of `Timeout` into `DnsTimeout`, and this leg
 /// still matched `Timeout` alone, so a 5s resolver blip during enrich
 /// demoted a live result 50% and marked its host's quality down.
-fn slow_not_dead(e: &FetchError) -> bool {
+fn neutral_failure(e: &FetchError) -> bool {
     matches!(
         e,
         FetchError::Timeout | FetchError::SlowTransfer(_) | FetchError::DnsTimeout(_)
-    )
+    ) || matches!(e, FetchError::Http(status) if status.starts_with("budget:") || status.starts_with("rested:"))
 }
 
 #[cfg(test)]
@@ -471,13 +649,17 @@ mod tests {
     use crate::profile::BrowserProfile;
 
     #[test]
-    fn a_resolver_timeout_is_slow_not_dead() {
-        assert!(slow_not_dead(&FetchError::Timeout));
-        assert!(slow_not_dead(&FetchError::DnsTimeout(
+    fn a_resolver_timeout_is_neutral_failure() {
+        assert!(neutral_failure(&FetchError::Timeout));
+        assert!(neutral_failure(&FetchError::DnsTimeout(
             "the resolver did not answer within 5s".into()
         )));
-        assert!(!slow_not_dead(&FetchError::Dns("no such host".into())));
-        assert!(!slow_not_dead(&FetchError::Http(
+        assert!(neutral_failure(&FetchError::Http(
+            "budget: request ceiling reached".into()
+        )));
+        assert!(neutral_failure(&FetchError::Http("rested:900".into())));
+        assert!(!neutral_failure(&FetchError::Dns("no such host".into())));
+        assert!(!neutral_failure(&FetchError::Http(
             "connection refused".into()
         )));
     }
@@ -490,6 +672,8 @@ mod tests {
     enum RigMode {
         /// 200 + Set-Cookie + a real body.
         Reach,
+        /// Actual instructions follow more than 2,000 bytes of topical prose.
+        Instructions,
         /// 403 + cf-mitigated: challenge (a wall).
         Wall,
         /// 404 (a dead link).
@@ -516,9 +700,16 @@ mod tests {
                 }
                 raw.push_str(&line);
             }
-            let body = "<html><head><title>hop-ok</title></head><body>preload-tempitle text description for the wire merge of curiosity.</body></html>";
+            let body = if matches!(&mode, RigMode::Instructions) {
+                let background = (0..40).map(|i| format!("<p>Orion sensor calibration background {i} describes the apparatus and why accurate measurements matter before proceeding to the actual installation procedure.</p>")).collect::<String>();
+                format!(
+                    "<html><head><title>How to calibrate Orion sensor</title></head><body><article><h1>How to calibrate Orion sensor</h1><p>Learn how to calibrate the Orion sensor in this guide.</p>{background}<h2>Commands</h2><pre><code>toolctl --zero 42\ntoolctl --verify</code></pre></article></body></html>"
+                )
+            } else {
+                "<html><head><title>hop-ok</title></head><body>preload-tempitle text description for the wire merge of curiosity.</body></html>".to_string()
+            };
             let head = match mode {
-                RigMode::Reach => format!(
+                RigMode::Reach | RigMode::Instructions => format!(
                     "HTTP/1.1 200 OK\r\nSet-Cookie: uid=fleet9; Path=/; Max-Age=86400\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 ),
@@ -680,6 +871,24 @@ mod tests {
                 .is_some(),
             "the body is parked for the follow-up fetch"
         );
+        let (port, _) = serve(RigMode::Instructions);
+        let mut deep = vec![merged(
+            &format!("http://127.0.0.1:{port}/instructions"),
+            "serp",
+        )];
+        deep[0].snippet = "Calibrate Orion sensor safely remotely using proven principles and background information.".into();
+        searcher
+            .read_results(
+                &mut deep,
+                "how to calibrate Orion sensor safely remotely",
+                1,
+            )
+            .await;
+        assert!(
+            deep[0].from_page && deep[0].snippet.contains("--zero 42\ntoolctl --verify"),
+            "{}",
+            deep[0].snippet
+        );
     }
 
     /// A page that does not speak to the query, a wall, a dead link and `k` = 0
@@ -694,6 +903,17 @@ mod tests {
             .read_results(&mut off, "kubernetes ingress controller", 1)
             .await;
         assert_eq!((off[0].snippet.as_str(), off[0].from_page), ("serp", false));
+
+        let (port, _rx) = serve(RigMode::Reach);
+        let mut excluded = teased(port);
+        searcher
+            .read_results(&mut excluded, "wire merge -curiosity", 1)
+            .await;
+        assert_eq!(
+            (excluded[0].snippet.as_str(), excluded[0].from_page),
+            ("serp", false),
+            "a page read must not introduce an excluded term"
+        );
 
         for mode in [RigMode::Wall, RigMode::Dead] {
             let (port, _rx) = serve(mode);
@@ -714,6 +934,42 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(500)).is_err(),
             "read 0 makes no request"
         );
+        for independent_publisher in [false, true] {
+            let (blocked, _) = serve(RigMode::Wall);
+            let (alternative, received) = serve(RigMode::Reach);
+            let mut first = merged(&format!("http://127.0.0.1:{blocked}/guide"), "First guide");
+            first.snippet = "Learn how to wire merge curiosity in this guide.".into();
+            let host = if independent_publisher {
+                "localhost"
+            } else {
+                "127.0.0.1"
+            };
+            let mut second = merged(
+                &format!("http://{host}:{alternative}/article"),
+                "Other article",
+            );
+            second.snippet = "A separate page with a useful description of the technique.".into();
+            let mut results = vec![first, second];
+            searcher
+                .repair_default_snippets(
+                    &mut results,
+                    "wire merge curiosity",
+                    0,
+                    Duration::from_secs(2),
+                    &[],
+                )
+                .await;
+            assert!(!results[0].from_page);
+            assert_eq!(
+                results[1].from_page, independent_publisher,
+                "only another publisher may supply fallback evidence"
+            );
+            assert_eq!(
+                received.try_recv().is_ok(),
+                independent_publisher,
+                "a refusal never triggers another endpoint on that publisher"
+            );
+        }
     }
 
     /// Dead links (404) are honestly demoted 50%, and nothing gets

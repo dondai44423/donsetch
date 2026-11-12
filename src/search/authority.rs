@@ -35,6 +35,7 @@ const OFFICIAL: &[(&[&str], &[&str])] = &[
     (&["python"], &["docs.python.org", "pypi.org"]),
     (&["javascript"], &["developer.mozilla.org"]),
     (&["typescript"], &["typescriptlang.org"]),
+    (&["nvm"], &["github.com/nvm-sh/nvm"]),
     (&["nodejs"], &["nodejs.org"]),
     (&["node", "js"], &["nodejs.org"]),
     (&["node", "javascript"], &["nodejs.org"]),
@@ -118,7 +119,10 @@ const OFFICIAL: &[(&[&str], &[&str])] = &[
     (&["grafana"], &["grafana.com"]),
     (&["jenkins"], &["jenkins.io"]),
     (&["gitlab"], &["docs.gitlab.com"]),
-    (&["systemd"], &["systemd.io"]),
+    (
+        &["systemd"],
+        &["freedesktop.org/software/systemd/man", "systemd.io"],
+    ),
     (&["nginx", "ingress"], &["kubernetes.io", "docs.docker.com"]),
     // ── Cloud & platforms ──
     (&["aws"], &["aws.amazon.com", "docs.aws.amazon.com"]),
@@ -372,6 +376,16 @@ mod tests {
         assert!(
             official_queries(&super::super::query::compile(
                 "rust ownership site:example.com"
+            ))
+            .is_empty()
+        );
+        let manual = official_queries(&super::super::query::compile(
+            "systemd service restart on failure with backoff",
+        ));
+        assert!(manual[0].ends_with("site:freedesktop.org/software/systemd/man"));
+        assert!(
+            official_queries(&super::super::query::compile(
+                "service restart site:example.com"
             ))
             .is_empty()
         );

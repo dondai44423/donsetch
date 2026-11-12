@@ -10,21 +10,113 @@
 //!
 //! Here admission is a **veto list** ([`contract::veto`]): a wrapper, a SERP, a
 //! tracking URL, a negated term. Everything else enters the pool with a score.
-//! The set is then classified once, and only three things can make it junk:
+//! The set is then classified once, and the evidence that can make it junk is:
 //!
 //! 1. its mean relevance is near zero, **and**
-//! 2. it shares no rare term with the query, **and**
-//! 3. the query names an entity.
+//! 2. it shares no rare term with the query.
 //!
-//! All three, together. A ten-item set on a long topical query is never
-//! discarded wholesale, because a long topical query has no single entity to be
-//! off — which is exactly the failure the old rule could not see.
+//! Shared rare terms protect a long topical answer from wholesale rejection.
 
 use std::collections::HashSet;
 
 use super::contract;
 use super::engines::{AnswerClass, Hit};
 use super::query::{QueryFacts, matches};
+
+/// Retrieval confidence, not a claim that a page's assertions are true.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    High,
+    Medium,
+    #[default]
+    Low,
+}
+
+/// Evidence behind a finished answer's confidence. Saved with cached answers.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct Assessment {
+    pub confidence: Confidence,
+    pub families: usize,
+    pub agreement: usize,
+    pub junk_ratio: f64,
+    pub coverage: f64,
+}
+
+impl Assessment {
+    pub fn degraded(self) -> bool {
+        self.confidence == Confidence::Low || self.families < 2 || self.junk_ratio > 0.2
+    }
+}
+
+/// Judge the returned evidence using the same independence graph as ranking.
+/// Duplicate endpoints in a family never count as independent confirmation.
+pub(crate) fn assess(
+    query: &str,
+    results: &[super::rank::Merged],
+    reports: &[super::EngineReport],
+    families: &super::families::Families,
+) -> Assessment {
+    let facts = QueryFacts::new(query);
+    let independent: HashSet<_> = results
+        .iter()
+        .flat_map(|r| &r.sources)
+        .map(|(source, _)| super::rank::family_name(families, source))
+        .collect();
+    let agreement = results
+        .iter()
+        .take(3)
+        .map(|r| r.families)
+        .max()
+        .unwrap_or(0);
+    // Unmeasured endpoints start as separate ranking clusters, but that is
+    // not yet proof of independent agreement. High confidence needs a pair
+    // actually observed to be distinct, or a first-party interface.
+    let measured_agreement = results.iter().take(3).any(|result| {
+        result.sources.iter().enumerate().any(|(i, (a, _))| {
+            result.sources[i + 1..]
+                .iter()
+                .any(|(b, _)| super::independent_pair(a, b, families))
+        })
+    });
+    let attempted = reports
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "ok" | "cached" | "thin" | "off-query"))
+        .count();
+    let junk = reports.iter().filter(|r| r.status == "off-query").count();
+    let junk_ratio = junk as f64 / attempted.max(1) as f64;
+    let coverage = results
+        .iter()
+        .take(3)
+        .map(|r| facts.coverage(&format!("{} {} {}", r.title, r.snippet, r.url)))
+        .sum::<f64>()
+        / results.len().clamp(1, 3) as f64;
+    let foreign = super::locale::evidence_language(query).is_some_and(|lang| {
+        results
+            .iter()
+            .take(3)
+            .any(|r| !super::locale::native(lang, &r.title, &r.snippet))
+    });
+    let confidence = if results.is_empty() || foreign || coverage < 0.15 || junk_ratio > 0.5 {
+        Confidence::Low
+    } else if independent.len() >= 2
+        && measured_agreement
+        && agreement >= 2
+        && coverage >= 0.45
+        && junk_ratio <= 0.2
+    {
+        Confidence::High
+    } else {
+        Confidence::Medium
+    };
+    Assessment {
+        confidence,
+        families: independent.len(),
+        agreement,
+        junk_ratio,
+        coverage,
+    }
+}
 
 /// Mean relevance below which a set with no shared rare term is answering a
 /// different question. Calibrated against the receipt in `design/search.md` §1:
@@ -120,7 +212,20 @@ pub fn judge(facts: &QueryFacts, hits: Vec<Hit>) -> Judgement {
     };
     let rare_shared = has_rare_term(facts, &kept);
 
-    let class = classify(items, &kept, mean, rare_shared);
+    // An answer in a different script cannot prove another topic by lexical
+    // absence alone (東京の天気 -> Tokyo weather). Keep that fallback
+    // thin; it has no evidence for high confidence or caching.
+    let foreign = !kept.is_empty()
+        && super::locale::evidence_language(&facts.compiled().text).is_some_and(|lang| {
+            !kept
+                .iter()
+                .any(|h| super::locale::native(lang, &h.title, &h.snippet))
+        });
+    let class = if foreign {
+        AnswerClass::Thin
+    } else {
+        classify(items, &kept, mean, rare_shared)
+    };
     // A junk set contributes nothing, by construction: `kept` is exactly what may
     // enter the merge, so no caller can merge it by forgetting to check the
     // class. `items` still reports what the source returned.
@@ -145,9 +250,6 @@ fn classify(items: usize, kept: &[Hit], mean: f64, rare_shared: bool) -> AnswerC
             AnswerClass::Thin
         };
     }
-    if items < THIN_ITEMS || kept.len() < THIN_ITEMS {
-        return AnswerClass::Thin;
-    }
     // Provably another topic: no item shares a rare term with the query and the
     // set's mean relevance is near zero. §4 wrote this with a third condition —
     // "and the query names an entity" — to protect a long topical query from
@@ -162,7 +264,7 @@ fn classify(items: usize, kept: &[Hit], mean: f64, rare_shared: bool) -> AnswerC
     if mean < JUNK_MEAN && !rare_shared {
         return AnswerClass::Junk;
     }
-    if mean < THIN_MEAN {
+    if items < THIN_ITEMS || kept.len() < THIN_ITEMS || mean < THIN_MEAN {
         return AnswerClass::Thin;
     }
     AnswerClass::Answered
@@ -250,6 +352,78 @@ mod tests {
 
     fn hits(rows: &[(&str, &str)]) -> Vec<Hit> {
         rows.iter().map(|(t, u)| hit(t, u)).collect()
+    }
+
+    #[test]
+    fn confidence_requires_independent_agreement_and_query_evidence() {
+        use super::super::rank::Merged;
+        let mut result = Merged {
+            title: "Tokio runtime".into(),
+            url: "https://tokio.rs/guide".into(),
+            snippet: "Tokio runtime guide".into(),
+            sources: vec![("bing".into(), 1), ("yahoo".into(), 1)],
+            score: 1.0,
+            published: None,
+            families: 1,
+            from_page: false,
+            tier: 0,
+        };
+        let mut families = super::super::families::Families::default();
+        let urls: Vec<String> = (0..5).map(|n| format!("https://tokio.rs/{n}")).collect();
+        for _ in 0..3 {
+            families.observe(&[
+                ("bing".into(), urls.clone()),
+                ("yahoo".into(), urls.clone()),
+            ]);
+        }
+        let grade = assess("tokio runtime", &[result.clone()], &[], &families);
+        assert_ne!(grade.confidence, Confidence::High);
+        assert!(grade.degraded());
+        result.sources.push(("brave".into(), 1));
+        result.families = 2;
+        let grade = assess("tokio runtime", &[result.clone()], &[], &families);
+        assert_eq!(
+            grade.confidence,
+            Confidence::Medium,
+            "an unmeasured endpoint is not independent evidence yet"
+        );
+        let other: Vec<String> = (40..45).map(|n| format!("https://tokio.rs/{n}")).collect();
+        for _ in 0..3 {
+            families.observe(&[
+                ("bing".into(), urls.clone()),
+                ("brave".into(), other.clone()),
+            ]);
+        }
+        let grade = assess("tokio runtime", &[result.clone()], &[], &families);
+        assert_eq!(grade.confidence, Confidence::High);
+        assert!(!grade.degraded());
+        let foreign = assess("tokio runtime 日本語", &[result.clone()], &[], &families);
+        assert_eq!(foreign.confidence, Confidence::Low);
+        assert!(foreign.degraded());
+        let report = |status: &str| super::super::EngineReport {
+            engine: "test".into(),
+            profile: None,
+            status: status.into(),
+            hits: 1,
+            ms: 0,
+            egress: "direct".into(),
+            requests: 0,
+            cache_age_ms: None,
+        };
+        let reports = [report("cached"), report("off-query")];
+        assert_eq!(
+            assess("tokio runtime", &[result.clone()], &reports, &families).junk_ratio,
+            0.5
+        );
+        let empty = assess("tokio runtime", &[], &[], &families);
+        assert_eq!(empty.confidence, Confidence::Low);
+        result.title = "Holiday gift guide".into();
+        result.snippet = "Winter shopping".into();
+        result.url = "https://example.com/gifts".into();
+        assert_eq!(
+            assess("tokio runtime", &[result], &[], &families).confidence,
+            Confidence::Low
+        );
     }
 
     #[test]
@@ -344,13 +518,15 @@ mod tests {
     }
 
     #[test]
-    fn a_short_set_is_thin_not_junk() {
+    fn a_short_wrong_topic_is_junk_and_a_short_real_answer_is_thin() {
         let facts = QueryFacts::new("OpenCode release notes");
         let rows = hits(&[(
             "charmbracelet/crush",
             "https://github.com/charmbracelet/crush",
         )]);
-        assert_eq!(judge(&facts, rows).class, AnswerClass::Thin);
+        assert_eq!(judge(&facts, rows).class, AnswerClass::Junk);
+        let real = hits(&[("OpenCode release notes", "https://opencode.ai/changelog")]);
+        assert_eq!(judge(&facts, real).class, AnswerClass::Thin);
     }
 
     #[test]

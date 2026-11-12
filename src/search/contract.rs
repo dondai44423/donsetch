@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::engines::{Hit, is_serp_url};
-use super::query::{QueryFacts, matches};
+use super::query::QueryFacts;
 
 /// What a URL is, before anything else is judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +272,8 @@ pub fn package_scope_named(facts: &QueryFacts, raw: &str) -> bool {
 /// contains a term the query excluded — never a guess about the query's topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Veto {
+    /// A URL/title outside the caller's explicit operators.
+    Constraint,
     /// A redirector or a SERP: a link to the answer, or a page of links.
     Shape,
     /// Not http(s) at all, or a decode that produced a replacement character.
@@ -325,15 +327,42 @@ pub fn veto(facts: &QueryFacts, hit: &Hit) -> Option<Veto> {
         UrlClass::Invalid => return Some(Veto::Invalid),
         UrlClass::Redirect | UrlClass::Serp => return Some(Veto::Shape),
     }
+    if !super::query::permits(facts.compiled(), &hit.title, &hit.url) {
+        return Some(Veto::Constraint);
+    }
     let text = format!("{} {} {}", hit.title, hit.snippet, hit.url);
-    if facts
-        .negated()
-        .iter()
-        .any(|n| matches(n, &text) || text.to_lowercase().contains(n))
-    {
+    if facts.negated().iter().any(|n| excluded(n, &text)) {
         return Some(Veto::Negative);
     }
     None
+}
+
+fn excluded(needle: &str, text: &str) -> bool {
+    let text = text
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if needle.chars().any(super::query::is_cjk) {
+        return text.contains(needle);
+    }
+    if needle.contains(char::is_whitespace) {
+        // Phrase words keep their order across URL separators and punctuation.
+        // A simple English plural of the final word is the same exclusion:
+        // `-"car review"` must also reject `car-reviews`. No arbitrary prefix
+        // stemming: `reviewer` and `carpet` remain different words.
+        let plural = needle.split_whitespace().next_back().is_some_and(|word| {
+            word.len() >= 3 && word.bytes().all(|c| c.is_ascii_alphabetic()) && !word.ends_with('s')
+        });
+        return super::query::matches(needle, &text)
+            || (plural && super::query::matches(&format!("{needle}s"), &text));
+    }
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '+' | '#');
+    text.match_indices(needle).any(|(at, _)| {
+        let end = at + needle.len();
+        !text[..at].chars().next_back().is_some_and(word)
+            && !text[end..].chars().next().is_some_and(word)
+    })
 }
 
 /// The veto list as it applies to a **search engine's** answer.
@@ -704,6 +733,59 @@ mod tests {
             snippet: String::new(),
             rank: 1,
             published: None,
+        }
+    }
+
+    #[test]
+    fn exclusions_preserve_phrases_and_word_boundaries() {
+        let phrase = QueryFacts::new(r#"jaguar -"car review""#);
+        assert_eq!(phrase.negated(), &["car review"]);
+        assert!(!phrase.terms().any(|t| t == "review"));
+        assert!(excluded("car review", "A CAR  REVIEW."));
+        assert!(excluded("car review", "Jaguar car reviews"));
+        assert!(excluded(
+            "car review",
+            "https://www.topgear.com/car-reviews/find/make/jaguar"
+        ));
+        assert!(excluded("car review", "https://example.com/car/review"));
+        assert!(!excluded("car review", "a scar review"));
+        assert!(!excluded("car review", "a car reviewer"));
+        assert!(!excluded("car review", "a carpet review"));
+        assert!(crate::search::query::matches("car review", "car-review"));
+        assert!(!crate::search::query::matches("car review", "scar review"));
+        assert!(!excluded("car review", "A review of a car"));
+        assert!(excluded("car", "a car."));
+        assert!(!excluded("car", "red carpet"));
+        assert!(excluded("猫", "猫について"));
+    }
+
+    #[test]
+    fn explicit_operators_are_enforced_before_a_candidate_can_vote() {
+        let facts = QueryFacts::new("runtime site:github.com/tokio-rs intitle:tokio filetype:pdf");
+        let candidate = |title: &str, url: &str| Hit {
+            title: title.into(),
+            url: url.into(),
+            snippet: String::new(),
+            rank: 1,
+            published: None,
+        };
+        assert_eq!(
+            veto(
+                &facts,
+                &candidate("tokio runtime", "https://github.com/tokio-rs/tokio")
+            ),
+            None
+        );
+        for (title, url) in [
+            ("tokio runtime", "https://github.com/other/tokio"),
+            ("tokio runtime", "https://gitlab.com/tokio-rs/tokio"),
+            ("other runtime", "https://github.com/tokio-rs/tokio"),
+            (
+                "tokio runtime",
+                "https://github.com/tokio-rs/tokio/guide.html",
+            ),
+        ] {
+            assert_eq!(veto(&facts, &candidate(title, url)), Some(Veto::Constraint));
         }
     }
 

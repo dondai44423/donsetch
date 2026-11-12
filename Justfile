@@ -267,6 +267,10 @@ bench *args: bin-dist
 bench-smoke *args: bin-dist
     target/dist-thin/donsetch search-bench --set all --smoke {{args}}
 
+# Same fixed 100-query comparison against a local JSON endpoint.
+bench-against provider endpoint: bin-dist
+    python3 bench/headtohead.py --include donsetch {{provider}} --endpoint {{endpoint}} --out bench/results/local-{{provider}}.json
+
 # Retrain the ranker from saved bench artifacts: their candidate pools are
 # replayed through this build, dumped with their features, and trained on the
 # gold rows; scripts/train_rank.py writes src/search/rank_weights.rs only when

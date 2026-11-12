@@ -77,7 +77,7 @@ pub struct Merged {
 /// www-less, trailing-slash-less, lowercase host.
 pub fn norm_key(raw: &str) -> String {
     let Ok(u) = url::Url::parse(raw) else {
-        return raw.to_lowercase();
+        return raw.to_string();
     };
     let host = u
         .host_str()
@@ -109,7 +109,7 @@ pub fn norm_key(raw: &str) -> String {
         .trim_end_matches('/')
         .trim_end_matches("/index.html")
         .trim_end_matches("/index.htm")
-        .to_lowercase();
+        .to_string();
     let query = u
         .query()
         .map(|query| {
@@ -128,7 +128,8 @@ pub fn norm_key(raw: &str) -> String {
             }
         })
         .unwrap_or_default();
-    format!("{host}{path}{query}")
+    let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!("{host}{port}{path}{query}")
 }
 
 fn is_tracking_query_key(key: &str) -> bool {
@@ -205,7 +206,7 @@ pub fn merge(
 /// The exact inputs of one merge. The live search keeps the last one so
 /// `search-bench` can tell a retrieval miss from an ordering miss and
 /// `search --explain` can re-rank the very same candidates.
-#[derive(Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeInput {
     pub per_engine: Vec<(String, Vec<Hit>)>,
     pub query: String,
@@ -213,18 +214,39 @@ pub struct MergeInput {
     pub trust: HashMap<String, f64>,
     pub families: Families,
     pub depth: usize,
+    /// Observed deltas from explicit feedback/page-verification steps. Empty
+    /// for the default pipeline; older captures replay without these steps.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub post_adjustments: HashMap<String, f64>,
 }
 
 impl MergeInput {
     pub fn merge(&self) -> Vec<Merged> {
-        merge(
+        let mut results = merge(
             &self.per_engine,
             &self.query,
             self.intent,
             &self.trust,
             &self.families,
             self.depth,
-        )
+        );
+        self.apply_post_adjustments(&mut results);
+        results
+    }
+
+    pub(crate) fn apply_post_adjustments(&self, results: &mut [Merged]) {
+        for result in results.iter_mut() {
+            result.score += self
+                .post_adjustments
+                .get(&norm_key(&result.url))
+                .copied()
+                .unwrap_or(0.0);
+        }
+        results.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
     }
 }
 
@@ -238,6 +260,7 @@ pub struct Explained {
     pub score: f64,
     pub x: [f64; super::ltr::FEATURES],
     pub parts: Option<[f64; super::ltr::FEATURES]>,
+    pub post_adjustment: f64,
 }
 
 /// The merge, explained: the same pool, order and cut as [`merge`], with each
@@ -264,7 +287,9 @@ pub fn explain(input: &MergeInput) -> Vec<Explained> {
         .iter()
         .map(|m| (norm_key(&m.url), (m.tier, m.score)))
         .collect();
-    finish(candidates, input.depth)
+    let mut results = finish(candidates, input.depth);
+    input.apply_post_adjustments(&mut results);
+    results
         .into_iter()
         .map(|m| {
             let key = norm_key(&m.url);
@@ -272,13 +297,14 @@ pub fn explain(input: &MergeInput) -> Vec<Explained> {
                 .get(&key)
                 .copied()
                 .unwrap_or([0.0; super::ltr::FEATURES]);
-            let (tier, score) = placed.get(&key).copied().unwrap_or((m.tier, m.score));
+            let (tier, _) = placed.get(&key).copied().unwrap_or((m.tier, m.score));
             Explained {
                 url: m.url,
                 tier,
-                score,
+                score: m.score,
                 x,
                 parts: weights.map(|w| super::ltr::contribution(w, &x)),
+                post_adjustment: input.post_adjustments.get(&key).copied().unwrap_or(0.0),
             }
         })
         .collect()
@@ -302,6 +328,9 @@ pub(crate) struct Pool {
     /// Every source's snippet per URL key: the shown one is picked once the
     /// order is settled (`evidence::pick`), so ranking never reads a cut text.
     snippets: HashMap<String, Vec<String>>,
+    /// Answer excerpts already selected from a first-party response. Keep
+    /// their source line breaks instead of treating code as a SERP caption.
+    quotes: HashMap<String, String>,
 }
 
 /// Fusion over measured independence, and nothing else *in this layer*.
@@ -325,6 +354,7 @@ pub(crate) fn pool(
     trust: &HashMap<String, f64>,
     families: &Families,
 ) -> Pool {
+    let facts = super::query::QueryFacts::new(query);
     // Group by normalized URL. RRF mass is counted PER MEASURED FAMILY, not per
     // engine: sources that return the same results are one opinion, so a farm
     // ranked by all of them out-masses nobody (bench round 3: three engines on
@@ -338,6 +368,7 @@ pub(crate) fn pool(
     // Every source's snippet for a URL: the one shown is picked from these once
     // the order is settled (`evidence::pick`), so ranking never reads a cut text.
     let mut snippets: HashMap<String, Vec<String>> = HashMap::new();
+    let mut quotes = HashMap::new();
     let mut family_best: HashMap<(String, String), f64> = HashMap::new();
     let conceptual = super::intent::is_conceptual(query);
     // Sources are read in a fixed order (trust, then name), not the order they
@@ -376,6 +407,9 @@ pub(crate) fn pool(
         // github against hn would destroy their mass).
         let family = family_name(families, engine);
         for hit in hits {
+            if super::contract::veto(&facts, hit).is_some() {
+                continue;
+            }
             // Normalized once per hit: every comparison below is
             // length-based, so mixing raw and collapsed strings
             // would pick winners by whitespace count.
@@ -386,6 +420,14 @@ pub(crate) fn pool(
                 .take(MAX_SNIPPET_CHARS)
                 .collect();
             let key = norm_key(&hit.url);
+            if engine == "stackexchange"
+                && (hit.snippet.starts_with("Accepted answer: ")
+                    || hit.snippet.starts_with("Answer: "))
+            {
+                quotes
+                    .entry(key.clone())
+                    .or_insert_with(|| hit.snippet.chars().take(MAX_SNIPPET_CHARS).collect());
+            }
             if !hit_snippet.is_empty() {
                 let seen = snippets.entry(key.clone()).or_default();
                 if !seen.contains(&hit_snippet) {
@@ -411,6 +453,15 @@ pub(crate) fn pool(
                 from_page: false,
                 tier: 1,
             });
+            // Canonical views share votes, but an explicit format must keep
+            // the matching URL when that view actually appeared in a source.
+            // Never synthesize a PDF address from an abstract-page address.
+            if let Some(format) = &facts.compiled().filetype
+                && super::query::url_filetype(&hit.url).as_ref() == Some(format)
+                && super::query::url_filetype(&entry.url).as_ref() != Some(format)
+            {
+                entry.url = hit.url.clone();
+            }
             // Keep the longest snippet (most informative), skipping redirect
             // stubs. Both sides are already bounded (MAX_SNIPPET_CHARS).
             if hit_snippet.len() > entry.snippet.len() && !hit_snippet.starts_with("Redirecting") {
@@ -499,7 +550,6 @@ pub(crate) fn pool(
     // measured the cost: an npm package called "photosynthesis" took rank 1
     // from the encyclopedia, a GitHub changelog from a release note, and a
     // crates page matched on one word from the crate the query actually named.
-    let facts = super::query::QueryFacts::new(query);
     for r in &mut results {
         let resolved = r
             .sources
@@ -545,6 +595,7 @@ pub(crate) fn pool(
         facts,
         query: query.to_string(),
         snippets,
+        quotes,
     }
 }
 
@@ -575,6 +626,7 @@ pub(crate) fn finish(pool: Pool, max_results: usize) -> Vec<Merged> {
         facts,
         query,
         snippets,
+        quotes,
     } = pool;
     let query = query.as_str();
     // Syndicated content dedup: same article republished under
@@ -610,7 +662,10 @@ pub(crate) fn finish(pool: Pool, max_results: usize) -> Vec<Merged> {
     }
     diverse.truncate(max_results);
     for (position, r) in diverse.iter_mut().enumerate() {
-        if let Some(candidates) = snippets.get(&norm_key(&r.url)) {
+        let key = norm_key(&r.url);
+        if let Some(quote) = quotes.get(&key) {
+            r.snippet = super::evidence::quote(quote, super::evidence::budget(position));
+        } else if let Some(candidates) = snippets.get(&key) {
             r.snippet = super::evidence::pick(query, candidates, super::evidence::budget(position));
         }
     }
@@ -867,29 +922,44 @@ mod tests {
             ),
             ("github".to_string(), vec![hit("https://gh.example/r", 0)]),
         ];
-        let input = MergeInput {
+        let mut input = MergeInput {
             per_engine: per,
             query: "rust async runtime".into(),
             intent: Intent::Code,
             trust: HashMap::new(),
             families: Families::default(),
             depth: 5,
+            post_adjustments: HashMap::new(),
         };
-        let merged: Vec<String> = input.merge().into_iter().map(|m| m.url).collect();
-        let explained = explain(&input);
-        let urls: Vec<String> = explained.iter().map(|e| e.url.clone()).collect();
-        assert_eq!(urls, merged, "the same results, in the same order");
-        assert!(
-            explained
-                .windows(2)
-                .all(|w| (w[0].tier, -w[0].score) <= (w[1].tier, -w[1].score)),
-            "the scores give the order shown"
-        );
-        if let Some(parts) = &explained[0].parts {
-            let total: f64 = parts.iter().sum();
+        let first = input.merge()[0].url.clone();
+        for adjusted in [false, true] {
+            if adjusted {
+                input.post_adjustments.insert(norm_key(&first), -0.25);
+            }
+            let merged: Vec<String> = input.merge().into_iter().map(|m| m.url).collect();
+            let explained = explain(&input);
+            let urls: Vec<String> = explained.iter().map(|e| e.url.clone()).collect();
+            assert_eq!(urls, merged, "the same results, in the same order");
             assert!(
-                (total - explained[0].score).abs() < 1e-9,
-                "shares sum to the score"
+                explained
+                    .windows(2)
+                    .all(|w| (w[0].tier, -w[0].score) <= (w[1].tier, -w[1].score)),
+                "the scores give the order shown"
+            );
+            if let Some(parts) = &explained[0].parts {
+                let total: f64 = parts.iter().sum();
+                assert!(
+                    (total + explained[0].post_adjustment - explained[0].score).abs() < 1e-9,
+                    "shares sum to the score"
+                );
+            }
+            assert_eq!(
+                explained
+                    .iter()
+                    .find(|e| e.url == first)
+                    .unwrap()
+                    .post_adjustment,
+                if adjusted { -0.25 } else { 0.0 }
             );
         }
     }
@@ -1066,6 +1136,20 @@ mod tests {
         let a = norm_key("https://www.docs.rs/ratatui/index.html");
         let b = norm_key("http://docs.rs/ratatui/");
         assert_eq!(a, b);
+        assert_ne!(
+            norm_key("https://example.com:8443/Type"),
+            norm_key("https://example.com/Type")
+        );
+        assert_eq!(
+            norm_key("https://example.com:443/Type"),
+            norm_key("https://example.com/Type")
+        );
+        // HTTP paths and identifiers are case-sensitive; only hosts fold.
+        assert_eq!(norm_key("https://EXAMPLE.com/Type"), "example.com/Type");
+        assert_ne!(
+            norm_key("https://example.com/Type"),
+            norm_key("https://example.com/type")
+        );
     }
 
     #[test]
@@ -1087,6 +1171,57 @@ mod tests {
             "arxiv.org/abs/hep-th/9901001"
         );
         assert_ne!(abs, norm_key("https://example.org/pdf/1706.03762.pdf"));
+        let per = vec![(
+            "bing".into(),
+            vec![
+                hit("https://arxiv.org/abs/1706.03762", 0),
+                hit("https://arxiv.org/pdf/1706.03762.pdf", 1),
+            ],
+        )];
+        let merged = merge(
+            &per,
+            "paper filetype:pdf",
+            Intent::Paper,
+            &HashMap::new(),
+            &Families::default(),
+            12,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].url, "https://arxiv.org/pdf/1706.03762.pdf");
+        let mut extensionless = per.clone();
+        extensionless[0].1[1].url = "https://arxiv.org/pdf/1706.03762".into();
+        let merged = merge(
+            &extensionless,
+            "paper filetype:pdf",
+            Intent::Paper,
+            &HashMap::new(),
+            &Families::default(),
+            12,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].url, "https://arxiv.org/pdf/1706.03762");
+        let ordinary = merge(
+            &per,
+            "paper",
+            Intent::Paper,
+            &HashMap::new(),
+            &Families::default(),
+            12,
+        );
+        assert_eq!(ordinary[0].url, "https://arxiv.org/abs/1706.03762");
+        let abstract_only = vec![(
+            "bing".into(),
+            vec![hit("https://arxiv.org/abs/1706.03762", 0)],
+        )];
+        let unverified = merge(
+            &abstract_only,
+            "paper filetype:pdf",
+            Intent::Paper,
+            &HashMap::new(),
+            &Families::default(),
+            12,
+        );
+        assert_eq!(unverified[0].url, "https://arxiv.org/abs/1706.03762");
     }
 
     #[test]
@@ -1187,6 +1322,22 @@ mod tests {
             out[0].snippet,
             "Starts the process of fetching a resource, returning a promise."
         );
+        let mut answer = hit("https://stackoverflow.com/questions/42/example", 0);
+        answer.title = "Orion configuration".into();
+        answer.snippet =
+            "Accepted answer: Orion configuration:\nserver:\n    timeout: 42\n    retries: 3"
+                .into();
+        let quoted = merge(
+            &[("stackexchange".into(), vec![answer.clone()])],
+            "Orion configuration",
+            Intent::Code,
+            &trust,
+            &Families::default(),
+            12,
+        );
+        assert_eq!(quoted[0].snippet, answer.snippet);
+        assert!(super::super::evidence::quote(&answer.snippet, 55).contains("\nserver:"));
+        assert!(!super::super::evidence::quote(&answer.snippet, 55).contains("timeout: 4"));
     }
 
     #[test]

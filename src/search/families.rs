@@ -1,17 +1,16 @@
 //! Measured independence between sources.
 //!
 //! Two sources are one opinion when their top results are the same results. That
-//! is a fact about this moment's suppliers, not about their names: `ddg`, `yahoo`
-//! and `bing` all serve one index today, and the day one of them switches
-//! supplier a hardcoded table would keep counting a farm three times. So the
+//! is measured from their answers rather than assumed from their names. A
+//! hardcoded supplier table would keep counting duplicates after a change. So the
 //! graph is learned: for every search, the overlap (Jaccard over the top ten
 //! URLs) of each pair of answering sources feeds a running mean, and a pair whose
 //! mean overlap stays above [`LINK_AT`] is one family.
 //!
 //! Until a pair has been seen [`MIN_SAMPLES`] times nothing is linked: unmeasured
-//! sources count as independent. That errs toward trusting agreement, which the
-//! ranker only uses as a mild multiplier, and it corrects itself within a few
-//! searches rather than staying wrong until someone edits a table.
+//! sources remain separate ranking clusters. That errs toward trusting agreement
+//! in the ranker's mild multiplier. Confidence and early stopping require a
+//! measured distinct pair instead of treating those unknown clusters as proof.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -161,7 +160,7 @@ impl Families {
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-const DISK_VERSION: u32 = 1;
+const DISK_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct Disk {
@@ -171,6 +170,9 @@ struct Disk {
 }
 
 fn path() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     let dir = crate::paths::cache_dir();
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("search-families.json"))

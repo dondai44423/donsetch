@@ -155,6 +155,26 @@ def by_shape(rows, scorer, key="shape"):
     return {s: metrics(rs, scorer) for s, rs in sorted(groups.items())}
 
 
+def cross_validated_scores(rows, fold_of, l2):
+    """Out-of-fold scores; preprocessing learns only from that fold's training rows."""
+    if any(row.get("set") != "gold" for row in rows):
+        raise ValueError("cross-validation accepts gold rows only")
+    if len({fold_of[row["id"]] for row in rows}) < 2:
+        raise ValueError("cross-validation needs at least two nonempty folds")
+    scores = {}
+    for k in range(5):
+        train = [row for row in rows if fold_of[row["id"]] != k]
+        X = np.vstack([row["X"] for row in train])
+        mean, std = X.mean(axis=0), X.std(axis=0)
+        std[std < 1e-9] = 1.0
+        w = fit(train, mean, std, l2)
+        scorer = scorer_for(w, mean, std)
+        for i, row in enumerate(rows):
+            if fold_of[row["id"]] == k:
+                scores[i] = scorer(row)
+    return scores
+
+
 def gated(model, shapes):
     """The ranker as shipped: the model on the shapes it ranks, else the fusion."""
     return lambda row: model(row) if row["qshape"] in shapes else fusion(row)
@@ -172,8 +192,10 @@ def main():
     rows = load(args.features)
     gold = [r for r in rows if r["set"] == "gold"]
     held = [r for r in rows if r["set"] == "held"]
-    if len(gold) < 20 or len(held) < 20:
-        print(f"train: gold {len(gold)} / held {len(held)} rows is not a corpus (20 each)", file=sys.stderr)
+    gold_ids = {row["id"] for row in gold}
+    held_ids = {row["id"] for row in held}
+    if len(gold_ids) < 20 or len(held_ids) < 20:
+        print(f"train: gold {len(gold_ids)} / held {len(held_ids)} distinct queries is not a corpus (20 each)", file=sys.stderr)
         return 2
     digest = hashlib.sha256()
     for path in sorted(args.features):
@@ -191,13 +213,7 @@ def main():
     fold_of = {rid: k % 5 for k, rid in enumerate(ids)}
     best = None
     for l2 in L2_GRID:
-        oof = {}
-        for k in range(5):
-            train = [r for r in gold if fold_of[r["id"]] != k]
-            w = fit(train, mean, std, l2)
-            for i, r in enumerate(gold):
-                if fold_of[r["id"]] == k:
-                    oof[i] = scorer_for(w, mean, std)(r)
+        oof = cross_validated_scores(gold, fold_of, l2)
         for i, r in enumerate(gold):
             r["oof"] = oof[i]
         held_out = lambda row: row["oof"]

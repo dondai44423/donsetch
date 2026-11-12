@@ -9,7 +9,7 @@
 //!    learned identity scores and the page cache all change what a call returns.
 //!    A bench that inherits the user's state measures the user's history, so
 //!    `--cold` (the default) gives every shape of every run an empty
-//!    `DONSETCH_CACHE_DIR`; `--one-ledger` runs all shapes of a run from one. Because the
+//!    `DONSETCH_CACHE_DIR`, carrying only active source refusals; `--one-ledger` runs all shapes of a run from one. Because the
 //!    BYOK keys live under that same cache root, a cold run is also keyless by
 //!    construction — "BYOK is off when local is measured" is enforced by the
 //!    filesystem, not by a flag someone can forget.
@@ -53,9 +53,18 @@ pub async fn protocol(opts: &Options, queries: &[BenchQuery]) -> i32 {
         };
     }
     // Cold: one child process per run and shape, each with its own cache
-    // directory, so no learned state, ledger entry or warm page survives from one
-    // measurement into the next.
+    // directory. Published source refusals survive; answers and learned state do not.
     let root = temp_root();
+    let driver = match std::env::current_exe()
+        .map_err(|e| e.to_string())
+        .and_then(|source| snapshot(&source, &root, "driver"))
+    {
+        Ok(path) => path,
+        Err(e) => {
+            crate::diag!("search-bench: {e}");
+            return 1;
+        }
+    };
     let mut runs = Vec::new();
     for i in 0..opts.runs {
         if i > 0 && !opts.gap.is_zero() {
@@ -73,11 +82,14 @@ pub async fn protocol(opts: &Options, queries: &[BenchQuery]) -> i32 {
         };
         for (g, ids) in groups(opts, queries).iter().enumerate() {
             let out = root.join(format!("run-{i}-{g}.json"));
-            match child_run(opts, ids, &out) {
+            match child_run(&driver, opts, ids, &out) {
                 Ok(part) => run.rows.extend(part.rows),
                 Err(e) => {
                     crate::diag!("search-bench: {e}");
-                    let _ = std::fs::remove_dir_all(&root);
+                    crate::diag!(
+                        "search-bench: retained failed run state at {}",
+                        root.display()
+                    );
                     return 1;
                 }
             }
@@ -143,15 +155,63 @@ fn child_args(opts: &Options, ids: &[String], out: &Path) -> Vec<String> {
     a
 }
 
+/// A build/install changing its original path must not change a run halfway
+/// through. Each run tree owns an executable snapshot, including on Windows.
+fn snapshot(source: &Path, root: &Path, name: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let target = root.join(name);
+    std::fs::copy(source, &target)
+        .map_err(|e| format!("cannot snapshot {}: {e}", source.display()))?;
+    Ok(target)
+}
+
+/// Cold measurements ignore the user's file settings. Environment switches
+/// remain explicit experiment inputs and are recorded in the artifact.
+fn cold_command(exe: &Path, cache: &Path) -> Command {
+    let mut command = Command::new(exe);
+    command
+        .env("DONSETCH_CACHE_DIR", cache)
+        .env_remove("DONSETCH_CONFIG")
+        .env("DONSETCH_NO_UPDATE_CHECK", "1")
+        .env("DONSETCH_NO_CONFIG_FILE", "1");
+    command
+}
+
 /// One child run: same binary, empty cache, artifact on disk.
-fn child_run(opts: &Options, ids: &[String], out: &Path) -> Result<Run, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find this executable: {e}"))?;
+fn refusal_journal(opts: &Options) -> PathBuf {
+    opts.out
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("bench/results"))
+        .join("search-refusals.json")
+}
+
+fn seed_refusals(opts: &Options, cache: &Path) -> Result<(), String> {
+    let target = cache.join("search-ledger.json");
+    crate::search::ledger::carry_refusals(
+        &crate::paths::cache_dir().join("search-ledger.json"),
+        &target,
+    )?;
+    crate::search::ledger::carry_refusals(&refusal_journal(opts), &target)
+}
+
+fn save_refusals(opts: &Options, cache: &Path) -> Result<(), String> {
+    crate::search::ledger::carry_refusals(&cache.join("search-ledger.json"), &refusal_journal(opts))
+}
+
+fn child_run(exe: &Path, opts: &Options, ids: &[String], out: &Path) -> Result<Run, String> {
     let cache = out.with_extension("cache");
     std::fs::create_dir_all(&cache)
         .map_err(|e| format!("cannot create {}: {e}", cache.display()))?;
-    let status = Command::new(&exe)
+    seed_refusals(opts, &cache)?;
+    let status = cold_command(exe, &cache)
         .args(child_args(opts, ids, out))
-        .env("DONSETCH_CACHE_DIR", &cache)
         .env(CHILD_ENV, "1")
         .status()
         .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
@@ -162,6 +222,7 @@ fn child_run(opts: &Options, ids: &[String], out: &Path) -> Result<Run, String> 
     if !status.success() && status.code() != Some(3) {
         return Err(format!("child run {} exited with {status}", out.display()));
     }
+    save_refusals(opts, &cache)?;
     read_run(out)
 }
 
@@ -243,6 +304,8 @@ struct CliMeta {
     results: Vec<CliResult>,
     #[serde(default)]
     sources: Vec<CliSource>,
+    #[serde(default)]
+    engines: Vec<crate::search::EngineReport>,
 }
 
 #[derive(serde::Deserialize)]
@@ -269,8 +332,17 @@ struct CliSource {
 const EXTERNAL_DEADLINE_MS: u32 = 30_000;
 
 async fn external(opts: &Options, queries: &[BenchQuery], bin: &Path) -> i32 {
-    let version = bin_version(bin);
+    let source = bin.to_path_buf();
     let root = temp_root();
+    let frozen = match snapshot(bin, &root, "measured") {
+        Ok(path) => path,
+        Err(e) => {
+            crate::diag!("search-bench: {e}");
+            return 1;
+        }
+    };
+    let bin = frozen.as_path();
+    let version = bin_version(bin);
     let mut runs = Vec::new();
     for i in 0..opts.runs {
         if i > 0 && !opts.gap.is_zero() {
@@ -289,11 +361,25 @@ async fn external(opts: &Options, queries: &[BenchQuery], bin: &Path) -> i32 {
                 crate::diag!("search-bench: cannot create {}: {e}", cache.display());
                 return 1;
             }
+            if let Err(error) = seed_refusals(opts, &cache) {
+                crate::diag!("search-bench: {error}");
+                return 1;
+            }
             for (n, q) in queries.iter().filter(|q| ids.contains(&q.id)).enumerate() {
                 if n > 0 || !rows.is_empty() {
                     tokio::time::sleep(opts.pace).await;
                 }
-                rows.push(external_row(bin, &cache, opts, q));
+                let row = external_row(bin, &cache, opts, q);
+                if let Err(error) = crate::search::ledger::carry_report_refusals(
+                    &cache.join("search-ledger.json"),
+                    &row.reports,
+                )
+                .and_then(|()| save_refusals(opts, &cache))
+                {
+                    crate::diag!("search-bench: {error}");
+                    return 1;
+                }
+                rows.push(row);
             }
         }
         runs.push(Run {
@@ -302,8 +388,17 @@ async fn external(opts: &Options, queries: &[BenchQuery], bin: &Path) -> i32 {
             rows,
         });
     }
-    let mode = format!("bin:{}", bin.display());
-    finish(opts, &mode, version.as_deref(), &runs, Some(&root), true)
+    let mode = format!("bin:{}", source.display());
+    let mut measured = opts.clone();
+    measured.bin = Some(frozen.clone());
+    finish(
+        &measured,
+        &mode,
+        version.as_deref(),
+        &runs,
+        Some(&root),
+        true,
+    )
 }
 
 fn bin_version(bin: &Path) -> Option<String> {
@@ -319,20 +414,20 @@ fn external_row(bin: &Path, cache: &Path, opts: &Options, q: &BenchQuery) -> Row
     let t0 = Instant::now();
     let max = opts.max_results.to_string();
     let deadline = EXTERNAL_DEADLINE_MS.to_string();
-    let out = Command::new(bin)
+    let out = cold_command(bin, cache)
         .args([
             "search",
-            q.query.as_str(),
             "--json",
             "--max-results",
             max.as_str(),
             "--deadline-ms",
             deadline.as_str(),
+            "--",
+            q.query.as_str(),
         ])
-        .env("DONSETCH_CACHE_DIR", cache)
         .output();
     let ms = t0.elapsed().as_millis() as u64;
-    let (answers, census) = match out {
+    let (answers, census, reports) = match out {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
             match serde_json::from_str::<CliOut>(&text) {
@@ -354,7 +449,7 @@ fn external_row(bin: &Path, cache: &Path, opts: &Options, q: &BenchQuery) -> Row
                         .map(|s| format!("{} {} {}", s.id, s.items, s.state))
                         .collect::<Vec<_>>()
                         .join(" · ");
-                    (answers, census)
+                    (answers, census, doc.meta.engines)
                 }
                 Err(e) => (
                     Vec::new(),
@@ -362,10 +457,15 @@ fn external_row(bin: &Path, cache: &Path, opts: &Options, q: &BenchQuery) -> Row
                         "unreadable answer: {e}: {}",
                         text.chars().take(120).collect::<String>()
                     ),
+                    Vec::new(),
                 ),
             }
         }
-        Err(e) => (Vec::new(), format!("cannot run {}: {e}", bin.display())),
+        Err(e) => (
+            Vec::new(),
+            format!("cannot run {}: {e}", bin.display()),
+            Vec::new(),
+        ),
     };
     let judged = judge(q, &answers);
     let redirects = answers
@@ -410,6 +510,9 @@ fn external_row(bin: &Path, cache: &Path, opts: &Options, q: &BenchQuery) -> Row
         undated: 0,
         foreign,
         raw: None,
+        evidence: answers,
+        ranking: None,
+        reports,
     };
     if opts.verbose {
         crate::diag!(
@@ -421,4 +524,28 @@ fn external_row(bin: &Path, cache: &Path, opts: &Options, q: &BenchQuery) -> Row
         );
     }
     record
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn replacing_the_build_path_cannot_change_the_measured_executable() {
+        let root = std::env::temp_dir().join(format!("bench-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("build");
+        std::fs::write(&source, b"measured version").unwrap();
+        let frozen = snapshot(&source, &root, "driver").unwrap();
+        std::fs::write(&source, b"later rebuild").unwrap();
+        assert_eq!(std::fs::read(frozen).unwrap(), b"measured version");
+        let command = cold_command(&source, &root);
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env[std::ffi::OsStr::new("DONSETCH_NO_CONFIG_FILE")],
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(env[std::ffi::OsStr::new("DONSETCH_CONFIG")], None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

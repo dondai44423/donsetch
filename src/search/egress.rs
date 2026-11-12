@@ -91,6 +91,8 @@ type DiskDead = (String, u64);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EgressHealthDisk {
+    #[serde(default)]
+    written_unix: u64,
     #[serde(default = "disk_version")]
     version: u32,
     #[serde(default)]
@@ -230,11 +232,26 @@ impl EgressPool {
             return;
         }
         let now = Instant::now();
+        let written = if disk.written_unix > 0 {
+            disk.written_unix
+        } else {
+            std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs())
+        };
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let elapsed = wall.saturating_sub(written);
         let mut pairs = self
             .pairs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (engine, egress, health, remaining) in disk.pairs {
+            let remaining = remaining.saturating_sub(elapsed);
             if remaining == 0 && health_from_str(&health) == Health::Burned {
                 // Expired while the process was down: probation, not burned.
                 pairs.insert(
@@ -264,6 +281,7 @@ impl EgressPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (id, remaining) in disk.dead {
+            let remaining = remaining.saturating_sub(elapsed);
             if remaining > 0 {
                 dead.insert(id, now + Duration::from_secs(remaining.min(86_400)));
             }
@@ -289,6 +307,10 @@ impl EgressPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let disk = EgressHealthDisk {
+            written_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             version: HEALTH_DISK_VERSION,
             pairs: pairs
                 .iter()

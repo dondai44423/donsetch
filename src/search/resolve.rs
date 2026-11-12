@@ -638,6 +638,7 @@ pub struct Resolved {
     pub label: String,
     /// Outbound requests the resolution spent.
     pub requests: usize,
+    pub cache_age: Option<Duration>,
 }
 
 fn cache_key(plan: &Plan) -> String {
@@ -660,7 +661,7 @@ fn proven(chosen: Vec<Found>, package_named: bool) -> Vec<Found> {
         .collect()
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Disk {
     version: u32,
     #[serde(default)]
@@ -672,6 +673,8 @@ struct Entry {
     at: u64,
     #[serde(default)]
     hits: Vec<StoredHit>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,12 +692,23 @@ fn now_secs() -> u64 {
 }
 
 fn path() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     Some(crate::paths::cache_dir().join("search-namespaces.json"))
+}
+
+fn memory_cache() -> &'static std::sync::Mutex<Disk> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Disk>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 fn load_disk() -> Disk {
     let Some(path) = path() else {
-        return Disk::default();
+        return memory_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
     };
     let Ok(bytes) = std::fs::read(&path) else {
         return Disk::default();
@@ -709,7 +723,12 @@ fn load_disk() -> Disk {
 }
 
 fn save_disk(disk: &Disk) {
-    let Some(path) = path() else { return };
+    let Some(path) = path() else {
+        *memory_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = disk.clone();
+        return;
+    };
     let Ok(json) = serde_json::to_vec(disk) else {
         return;
     };
@@ -720,7 +739,7 @@ fn save_disk(disk: &Disk) {
 }
 
 enum Cached {
-    Fresh(Vec<Hit>),
+    Fresh(Vec<Hit>, Duration, Option<String>),
     Negative,
     Miss,
 }
@@ -730,7 +749,9 @@ fn cache_get(key: &str) -> Cached {
     let Some(entry) = disk.entries.get(key) else {
         return Cached::Miss;
     };
-    let age = now_secs().saturating_sub(entry.at);
+    let Some(age) = now_secs().checked_sub(entry.at) else {
+        return Cached::Miss;
+    };
     if entry.hits.is_empty() {
         return if age < NEGATIVE_TTL_SECS {
             Cached::Negative
@@ -754,16 +775,35 @@ fn cache_get(key: &str) -> Cached {
                 published: None,
             })
             .collect(),
+        Duration::from_secs(age),
+        entry.label.clone(),
     )
 }
 
 fn cache_put(key: &str, hits: &[Hit]) {
+    cache_put_owned(key, hits, None);
+}
+
+fn cache_put_owned(key: &str, hits: &[Hit], label: Option<&str>) {
+    if crate::config::cfg().state.no_disk_state {
+        let mut disk = memory_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_entry(&mut disk, key, hits, label);
+        return;
+    }
     let mut disk = load_disk();
+    insert_entry(&mut disk, key, hits, label);
+    save_disk(&disk);
+}
+
+fn insert_entry(disk: &mut Disk, key: &str, hits: &[Hit], label: Option<&str>) {
     disk.version = DISK_VERSION;
     disk.entries.insert(
         key.to_string(),
         Entry {
             at: now_secs(),
+            label: label.map(str::to_string),
             hits: hits
                 .iter()
                 .map(|h| StoredHit {
@@ -785,7 +825,6 @@ fn cache_put(key: &str, hits: &[Hit]) {
         };
         disk.entries.remove(&oldest);
     }
-    save_disk(&disk);
 }
 
 /// What a set of registry answers settles to.
@@ -834,17 +873,19 @@ pub enum Resolution {
 pub async fn run(plan: &Plan, fetcher: &Fetcher, budget: Duration) -> Resolution {
     let key = cache_key(plan);
     match cache_get(&key) {
-        Cached::Fresh(hits) => {
-            let label = plan
-                .ecosystem
-                .map(Ecosystem::label)
-                .unwrap_or("registry")
-                .to_string();
+        Cached::Fresh(hits, age, cached_label) => {
+            let label = cached_label.unwrap_or_else(|| {
+                plan.ecosystem
+                    .map(Ecosystem::label)
+                    .unwrap_or("registry")
+                    .to_string()
+            });
             return Resolution::Hits(Resolved {
                 hits,
                 ms: 0,
                 label,
                 requests: 0,
+                cache_age: Some(age),
             });
         }
         Cached::Negative => return Resolution::Nothing,
@@ -868,7 +909,6 @@ pub async fn run(plan: &Plan, fetcher: &Fetcher, budget: Duration) -> Resolution
         Settled::Unknown => return Resolution::Unknown,
     };
     let hits = to_hits(&chosen);
-    cache_put(&key, &hits);
     let label = chosen
         .first()
         .map(|f| {
@@ -879,11 +919,13 @@ pub async fn run(plan: &Plan, fetcher: &Fetcher, budget: Duration) -> Resolution
             }
         })
         .unwrap_or_else(|| "registry".to_string());
+    cache_put_owned(&key, &hits, Some(&label));
     Resolution::Hits(Resolved {
         hits,
         ms,
         label,
         requests: plan.ask.len(),
+        cache_age: None,
     })
 }
 
@@ -908,6 +950,9 @@ pub struct Item {
 impl Item {
     /// The rustdoc page that lists the owning module's items.
     fn index_url(&self, base: &str) -> String {
+        if self.module == ["*"] {
+            return format!("{base}all.html");
+        }
         let mut path = String::new();
         for segment in &self.module {
             path.push_str(segment);
@@ -951,7 +996,47 @@ fn std_base(root: &str) -> Option<String> {
 /// a guessed owner is a wrong answer wearing a confident title, so the caller's
 /// fan-out answers those instead.
 pub fn item(facts: &super::query::QueryFacts) -> Option<Item> {
-    let (root, mut rest) = facts.identifier_parts()?;
+    let (root, mut rest) = if let Some(parts) = facts.identifier_parts() {
+        parts
+    } else {
+        let words: Vec<_> = facts.compiled().text.split_whitespace().collect();
+        if words.len() != 3 || !words.iter().any(|w| w.eq_ignore_ascii_case("rust")) {
+            return None;
+        }
+        let names: Vec<_> = words
+            .into_iter()
+            .filter(|w| !w.eq_ignore_ascii_case("rust"))
+            .collect();
+        if names.len() != 2
+            || !names[0]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        {
+            return None;
+        }
+        let named_item = names[1];
+        let strong = named_item.contains('_')
+            || named_item.contains("::")
+            || named_item.ends_with('!')
+            || named_item.chars().any(char::is_uppercase);
+        if !strong {
+            return None;
+        }
+        let mut rest: Vec<String> = names[1]
+            .trim_end_matches('!')
+            .split("::")
+            .map(str::to_string)
+            .collect();
+        if rest.iter().any(|part| {
+            part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }) {
+            return None;
+        }
+        if rest.len() == 1 {
+            rest.insert(0, "*".into());
+        }
+        (names[0].to_string(), rest)
+    };
     let name = rest.pop()?;
     Some(Item {
         root,
@@ -966,6 +1051,7 @@ pub struct Doc {
     pub hits: Vec<Hit>,
     pub ms: u64,
     pub requests: usize,
+    pub cache_age: Option<Duration>,
 }
 
 /// Ask the documentation that owns the item.
@@ -978,11 +1064,12 @@ pub struct Doc {
 pub async fn docs(item: &Item, fetcher: &Fetcher, budget: Duration) -> Doc {
     let started = std::time::Instant::now();
     let key = item.key();
-    if let Cached::Fresh(hits) = cache_get(&key) {
+    if let Cached::Fresh(hits, age, _) = cache_get(&key) {
         return Doc {
             hits,
             ms: 0,
             requests: 0,
+            cache_age: Some(age),
         };
     }
     let base = std_base(&item.root)
@@ -992,6 +1079,7 @@ pub async fn docs(item: &Item, fetcher: &Fetcher, budget: Duration) -> Doc {
         hits: Vec::new(),
         ms: 0,
         requests: 1,
+        cache_age: None,
     };
     let out = match tokio::time::timeout(
         budget,
@@ -1025,6 +1113,9 @@ pub async fn docs(item: &Item, fetcher: &Fetcher, budget: Duration) -> Doc {
         doc.ms = started.elapsed().as_millis() as u64;
         return doc;
     };
+    if page_url.origin() != base_url.origin() {
+        return doc;
+    }
     let title = format!("{} in {} - Rust", found.label, item.root);
     // The snippet is the sentence the docs themselves write beside the item.
     // The index's `title` attribute (`fn std::mem::take`) is the honest
@@ -1066,7 +1157,7 @@ struct DocLink {
 /// then the file stem of its href (`macro.izip.html` → `izip`), because a
 /// rustdoc index may label a link differently from the item's name.
 fn find_item(page: &str, item: &str) -> Option<DocLink> {
-    let want = item.trim().trim_end_matches('!').to_lowercase();
+    let want = item.trim().trim_end_matches('!').to_string();
     if want.is_empty() {
         return None;
     }
@@ -1081,14 +1172,23 @@ fn find_item(page: &str, item: &str) -> Option<DocLink> {
         };
         // Only links this module owns: `../other/index.html` is another page's
         // item, and `#…`/`https://…` are not items of this module.
-        if href.contains("://") || href.starts_with('#') || href.starts_with("..") {
+        if href.contains(':') || href.starts_with(['#', '/']) || href.split('/').any(|p| p == "..")
+        {
             continue;
         }
         let text = el.text().collect::<String>();
         let label = text.trim().trim_end_matches('!').trim().to_string();
         // The anchor's text is the item's name: rustdoc writes `<a>izip</a>`
         // and an inline `<code>` never splits it (`text()` walks the subtree).
-        if label.to_lowercase() == want {
+        let owned_file = href_file_stem(href).is_some_and(|stem| stem == want)
+            || href
+                .strip_suffix("/index.html")
+                .and_then(|path| path.rsplit('/').next())
+                .is_some_and(|module| module == want);
+        if !owned_file {
+            continue;
+        }
+        if label == want {
             return Some(DocLink {
                 href: href.to_string(),
                 label,
@@ -1096,9 +1196,7 @@ fn find_item(page: &str, item: &str) -> Option<DocLink> {
                 description: description_after(page, href),
             });
         }
-        if by_href.is_none()
-            && href_file_stem(href).is_some_and(|stem| stem.eq_ignore_ascii_case(&want))
-        {
+        if by_href.is_none() && href_file_stem(href).is_some_and(|stem| stem == want) {
             by_href = Some(DocLink {
                 href: href.to_string(),
                 label: if label.is_empty() {
@@ -1155,12 +1253,97 @@ fn fragment_text(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Requires nextest: configuration and the cache root are process-global.
+    #[test]
+    fn no_disk_state_keeps_namespace_and_search_learning_in_memory() {
+        unsafe { std::env::set_var("DONSETCH_STATE__NO_DISK_STATE", "true") };
+        let temp = crate::paths::cache_dir();
+        assert!(crate::config::cfg().state.no_disk_state);
+        assert!(super::path().is_none());
+        super::cache_put("test", &[]);
+        assert!(
+            matches!(super::cache_get("test"), super::Cached::Negative),
+            "no-disk cache still works in memory"
+        );
+        super::super::families::save(&Default::default());
+        let mut ledger = super::super::ledger::Ledger::load();
+        ledger.record(
+            "bing|serp",
+            super::super::ledger::Outcome::Throttled,
+            Some(60),
+        );
+        ledger.save_if_dirty();
+        assert_eq!(std::fs::read_dir(temp).unwrap().count(), 0);
+    }
+
     use super::*;
+
+    #[test]
+    fn namespace_cache_keeps_owner_and_age_and_rejects_future_entries() {
+        let hit = Hit {
+            title: "Tokio".into(),
+            url: "https://crates.io/crates/tokio".into(),
+            snippet: "An asynchronous runtime".into(),
+            rank: 0,
+            published: None,
+        };
+        cache_put_owned("any?:tokio", &[hit], Some("crates.io"));
+        match cache_get("any?:tokio") {
+            Cached::Fresh(hits, age, label) => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(label.as_deref(), Some("crates.io"));
+                assert!(age < Duration::from_secs(TTL_SECS));
+            }
+            _ => panic!("a proved owner should be replayable"),
+        }
+        let mut disk = load_disk();
+        disk.entries.get_mut("any?:tokio").unwrap().at = now_secs() + 3600;
+        save_disk(&disk);
+        assert!(matches!(cache_get("any?:tokio"), Cached::Miss));
+    }
 
     // ── the documentation lane ──────────────────────────
 
     fn item_of(query: &str) -> Option<Item> {
         item(&crate::search::query::QueryFacts::new(query))
+    }
+
+    #[test]
+    fn a_named_rust_owner_can_use_its_all_items_index_without_guessing_a_module() {
+        let item = item_of("rust tokio spawn_blocking").unwrap();
+        assert_eq!(item.root, "tokio");
+        assert_eq!(
+            item.index_url("https://docs.rs/tokio/latest/tokio/"),
+            "https://docs.rs/tokio/latest/tokio/all.html"
+        );
+        assert!(item.key().contains("::*::"));
+        let page = r#"<a href="task/fn.spawn_blocking.html">task::spawn_blocking</a>"#;
+        assert_eq!(
+            find_item(page, &item.name).unwrap().href,
+            "task/fn.spawn_blocking.html"
+        );
+        assert!(item_of("python tokio spawn_blocking").is_none());
+        assert!(item_of("rust tokio a longer topical query").is_none());
+    }
+
+    #[test]
+    fn documentation_links_are_local_item_files_and_identifier_case_is_exact() {
+        for href in [
+            "//evil.example/fn.take.html",
+            "javascript:take",
+            "other/../fn.take.html",
+            "other-page.html",
+        ] {
+            let page = format!("<a href=\"{href}\">take</a>");
+            assert!(find_item(&page, "take").is_none(), "{href}");
+        }
+        assert!(find_item(r#"<a href="struct.Value.html">Value</a>"#, "value").is_none());
+        assert_eq!(
+            find_item(r#"<a href="value/index.html">value</a>"#, "value")
+                .unwrap()
+                .href,
+            "value/index.html"
+        );
     }
 
     #[test]

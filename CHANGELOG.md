@@ -19,18 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   features — the engines' vote, BM25+ per field, whether the site is the thing the query names,
   agreement, rank, result kind, freshness, RM3 feedback, n-grams, coverage and more — trained
   offline on the bench's `gold` rows. It ranks the query shapes where it beat the engines' vote in
-  training, and shipped because, on the `held` rows it never saw, the right page comes first in
+  training; on the frozen held-out Phase B run, the right page came first in
   61.8% of final answers against 58.2%, with no shape lower. Every other query keeps the vote.
   The weights are compiled in: no download, no runtime, microseconds per search.
   `search.learned_rank = false` ranks every query by the vote.
 - **The top results carry more evidence.** The first three results keep up to 320 characters of
-  the sources' own text, the rest 180, so a 12-result answer stays under 1,500 tokens. A
-  top-three result whose snippet is a stub (under 20 characters, or a redirect notice) is read
-  from its page, with or without `read`, inside the same three-page budget; measured, no top-five
-  result in 1,667 had an empty snippet, so this is a guard that rarely fires.
+  the sources' own text, the rest 180, sharing a 1,600-byte snippet envelope. Readable Unicode URL paths preserve
+  destinations and reserved escapes while reducing encoded URL overhead. Actual token use
+  is measured separately. Automatic keyless repair reads top-three stubs and a procedural result or
+  description promising instructions, with one independent publisher as a fallback. One procedural
+  page read can overlap the remaining index requests; only a retained final URL receives its
+  excerpt. All automatic reads use the remaining time inside a 2.2-second native-call
+  envelope, the three-page budget and the call’s physical-request allowance.
+  Page excerpts retain code line breaks, list actions and table column headers; source dates
+  stay attached to the evidence. Selection examines deeper page content before clipping the
+  reply, rather than stopping at the first 2,000 extracted bytes. Structured instructions can
+  replace keyword-heavy introductions while retaining the relevance floor and all query
+  constraints. Overlapping reads keep one source date.
 - **Search carries no model.** The `rerank` feature is gone: no cross-encoder, no 23 MB download
   and no ONNX in the search path (`ort` stays for OCR alone). `search.rerank*` config keys are
   accepted as deprecated no-ops for one release, and the envelope's `reranked` is always `false`.
+  The legacy `search.quality_prior` switch is also a deprecated no-op: historical host
+  quality no longer changes the evidence-ranked order.
 - **Operators are read once.** `intitle:`/`filetype:`/`site:` come from the query's operator parse
   and never enter the text as terms — `intitle:"Attention Is All You Need" arxiv` returned nothing
   because no page contains the word "intitle". A quoted span is one phrase, matched as a run of
@@ -38,21 +48,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stack Overflow answer text in one request.** A fixed native API filter returns question
+  records and nested answers together. Snippets quote an accepted answer when present, otherwise
+  a non-negative-scored answer; a question merely marked answered is not called accepted.
+  Successful JSON responses can publish backoff or quota exhaustion without losing their
+  current records. Code passes through the existing HTML extractor, and answer excerpts keep
+  their line breaks through merging. Canary requests honor the same origin waits.
+- **Wikipedia evidence from its own pages.** One structured request returns ranked
+  records, canonical article URLs and introductory text. API errors remain errors,
+  so a broken response is not presented as an empty search.
+- **Search confidence and cache age.** Answers carry high/medium/low retrieval confidence
+  from independent sources, agreement and query evidence. Merged answers are cached only at
+  high confidence; per-source caches retain judged answers with source-specific TTLs.
+- **A query that names its answer language is routed to it.** `React 中国語 ドキュメント` asks for
+  Chinese documentation even though the sentence is Japanese; a small script-bound language-name
+  signal (中国語/中文, 日本語, 한국어, русский, …) sets the locale ahead of the kana/hangul guess.
+  A Latin query that mentions a language as a topic keeps the Latin default.
+- **Reproducible comparisons and a release gate.** `bench/headtohead.py` compares equal
+  top-five evidence from DonSeTch, Exa fast, TinyFish and local JSON endpoints. Failed calls
+  stay in the denominator; `bench/release_gate.py` rejects missing or failing evidence. The
+  local-only gate enforces every local clause and records the peer clauses as not measured,
+  never as passed, when no keys or local peer exist.
 - **A name is answered by its documentation.** `itertools::izip`, `#[tokio::main]`,
   `std::mem::take` and `serde_json::Value` ask the module index page of the crate that owns them
   and read the item's own href — `izip` is a macro, `Value` a struct, `take` a function, and a
   guessed URL is a 404 returned as an answer. One request, cached for a week.
+- **A package-named code query asks its own registry before the general code verticals.**
+  `rust reqwest http client` returns `docs.rs/reqwest` and its `Client` page instead of a
+  tutorial, because the registry vertical is scheduled ahead of MDN and GitHub rather than
+  behind them. The record carries the project's own documentation, homepage and source.
 - **`donsetch search --explain <query>`** prints why each result sits where it does: its score
   and the features that moved it, each weight's share of the score, and whether those scores
   reproduce the order the search returned (`--json` for the whole vector).
-- **A search bench that can fail.** `donsetch search-bench` runs 214 rows over 14 shapes, half
-  held out, cold, against any build (`--bin`); each shape runs in its own process so one shape's
-  rate limits never empty the next (`--one-ledger` for one process). `--replay` re-ranks saved
+- **A search bench that can fail.** `donsetch search-bench` runs a corpus over 14 shapes, half
+  held out, cold, against any build (`--bin`); each shape starts in its own process with
+  fresh answers and learning, while active source refusals survive (`--one-ledger` for one
+  process). `--replay` re-ranks saved
   candidate pools offline and `--features-out` dumps them for `just rank-train`, which retrains
   the ranker and writes the weights only when the held-out gate passes.
 
 ### Fixed
 
+- A request for one result no longer reports an underfilled list when one result is returned.
+- Cold Google bootstrap and query costs are planned separately. Initial requests are reserved
+  per source, so optional retries cannot consume the pending hedge’s slot; unused reservations
+  return when a source finishes. Cached engine answers reserve no outgoing requests.
+- Rank-training validation learns feature scales from each training fold alone; validation
+  queries cannot influence that preprocessing. Repeated runs of one query cannot satisfy
+  the minimum training or validation corpus size.
+- GitHub routing classifies the original question before URL encoding. An inapplicable
+  first-party interface reserves no request slot. Overlapping page reads use only unreserved
+  search allowance.
+- Search counts and bounds actual HTTP exchanges, including redirects and default snippet
+  repair. Per-response totals include explicit evidence reads. Source waits keep
+  their full published duration, cover owned APIs, and survive cold benchmark groups.
+- Concurrent identical searches share the complete fresh answer, including page reads,
+  even when low confidence prevents caching. Cancelled calls release their shared state. Cached namespace results retain their owner and age; no-disk mode keeps search
+  learning in memory. Cached or differently scoped lists do not teach source independence.
+- Concurrent ledger saves preserve explicit refusal waits against late successes, refill
+  pacing balances before merging and discard expired origin records.
+- Evidence matching shares the query compiler’s operators and CJK handling; news detection
+  recognizes Russian, Japanese and Korean news markers. Chinese and Japanese sentence
+  endings split excerpts correctly, and words beyond the displayed cut cannot improve its score.
+  Benchmark help prints its usage.
+- PDF filters retain dotted numeric identifiers as unknown formats; canonical merging
+  preserves a matching format URL actually returned by a source, including extensionless arXiv PDFs.
+- URL deduplication preserves path case and non-default ports. Yahoo fallback containers
+  no longer duplicate results, and native Google results use the same zero-based ranks.
+- The Yahoo search fallback no longer treats the page's own navigation as results. A restyled
+  Yahoo page that yields fewer than three parsed records used to hand the generic shape reader
+  its menu (`Gift ideas`, `My portfolio`, `College football`); the reader rejects
+  `nav`/`footer`/`role=navigation|banner|contentinfo`/hidden/inert/aria-hidden subtrees, and six
+  bench rows carry the furniture as `must_not`.
+- Thin result lists and unmeasured source names do not cancel the reserved hedge for another
+  independent answer. Early agreement uses the same measured independence rule as confidence.
+- Preserve pending search requests between wait marks instead of starting duplicates;
+  share pacing between scoped queries and sibling endpoints, and honor 403/429 refusals.
+- Quoted phrases match whole words across punctuation and URL separators. Phrase exclusions
+  include the final word’s simple English plural without arbitrary prefix matches. Title
+  constraints use the same phrase boundaries, retaining literal code punctuation.
+- Enforce URL/title constraints before consensus, preserve quoted exclusions and word
+  boundaries, and keep web operators out of first-party API requests. Page repairs and
+  featured answers enforce the query constraints too.
+- Preserve code-identifier syntax in cache keys; age persisted egress cooldowns across
+  restarts; calculate the calendar year correctly outside January and February.
 - **An engine's answer is judged by the lane veto.** The encyclopedia/video and bare-front-door
   vetoes were never called, so a dictionary page could answer `select!`.
 - **An operator query merges deeper** (40 candidates, not 12), so a title or type filter has

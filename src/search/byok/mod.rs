@@ -400,6 +400,7 @@ impl ByokSearcher {
                             crate::diag!("[byok] {provider} returned 0 results, trying next");
                         }
                         walk.push(EngineReport {
+                            cache_age_ms: None,
                             engine: provider.clone(),
                             profile: None,
                             status: "empty".into(),
@@ -413,6 +414,7 @@ impl ByokSearcher {
                     let results = to_merged(outcome.hits, &provider, max);
                     let mut report = std::mem::take(&mut walk);
                     report.push(EngineReport {
+                        cache_age_ms: None,
                         engine: provider.clone(),
                         profile: None,
                         status: if outcome.degraded {
@@ -425,11 +427,15 @@ impl ByokSearcher {
                         egress: "byok".into(),
                         requests: 0,
                     });
+                    let quality =
+                        super::quality::assess(query, &results, &report, &Default::default());
                     return Ok(SearchOutcome {
                         results,
                         intent,
                         report,
                         cached: false,
+                        quality,
+                        cache_age: None,
                         elapsed: started.elapsed(),
                         provider: Some(provider),
                         // Provider-ranked, not cross-encoder-ranked.
@@ -437,6 +443,7 @@ impl ByokSearcher {
                         // Providers do not expose a byte-derived
                         // SERP instant layer.
                         instant: None,
+                        requests: None,
                         stage_ms: Vec::new(),
                     });
                 }
@@ -457,6 +464,7 @@ impl ByokSearcher {
                     // the transient case, everything else here is an
                     // error the caller can see in `_meta`.
                     walk.push(EngineReport {
+                        cache_age_ms: None,
                         engine: provider.clone(),
                         profile: None,
                         status: match failure.key.to_key_state() {

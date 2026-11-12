@@ -398,6 +398,7 @@ async fn route_help(cmd: &str) {
         "adapters" => cli::adapters::help(),
         "rules" => cli::rules::help(),
         "status" => cli::status::help(),
+        "search-bench" => println!("{}", donsetch::search::bench::USAGE),
         // `proxy`, `keys` and `adapters` carry their own text; routing here
         // means `donsetch help proxy` and `donsetch proxy --help` cannot
         // drift apart again (the copy that used to live here had gone

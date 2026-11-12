@@ -198,6 +198,63 @@ fn a_finished_request_leaves_none_of_its_policy_with_the_session() {
 }
 
 #[test]
+fn the_request_start_guard_counts_redirects_and_can_stop_before_the_next_send() {
+    for limit in [2, 3] {
+        let server = Server::start(|request| match request.path.as_str() {
+            "/a" => Reply::Redirect("/b".into()),
+            "/b" => Reply::Redirect("/c".into()),
+            _ => Reply::ok(page("End")),
+        });
+        let used = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&used);
+        let mut once = Once::new(server.url("/a"));
+        once.policy.request_start = Some(Arc::new(move |_url: &str| {
+            count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < limit).then(|| n + 1)
+                })
+                .is_ok()
+        }));
+        let result = Session::new(false).once(&once);
+        assert_eq!(used.load(Ordering::Relaxed), limit);
+        if limit == 3 {
+            assert_eq!(result.unwrap().status, 200);
+            assert_eq!(server.hits(), vec!["/a", "/b", "/c"]);
+        } else {
+            assert!(
+                matches!(result, Err(ref message) if message.contains("budget: request ceiling reached"))
+            );
+            assert_eq!(server.hits(), vec!["/a", "/b"]);
+        }
+    }
+}
+
+#[test]
+fn response_headers_are_observed_even_when_the_body_exceeds_the_cap() {
+    let server = Server::start(|_| full(429, &[("Retry-After", "900")], &"x".repeat(128)));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = Arc::clone(&seen);
+    let mut once = Once::new(server.url("/quota"));
+    once.cap = Some(1);
+    once.policy.response_head = Some(Arc::new(move |status, url, headers| {
+        capture
+            .lock()
+            .unwrap()
+            .push((status, url.to_string(), headers.to_vec()));
+    }));
+    let result = Session::new(false).once(&once);
+    assert!(matches!(result, Err(ref message) if message.contains("body:")));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, 429);
+    assert_eq!(seen[0].1, server.url("/quota"));
+    assert!(seen[0]
+        .2
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("retry-after") && value == "900"));
+}
+
+#[test]
 fn without_follow_the_redirect_comes_back_and_no_hop_is_dialed() {
     let server = Server::start(|request| match request.path.as_str() {
         "/a" => full(302, &[("Location", "/b"), ("Set-Cookie", "hop=1")], ""),

@@ -1,7 +1,7 @@
 //! Intent detection : routes the query to the right
 //! engines + verticals, and feeds domain priors to rank.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Intent {
     Web,
     Code,
@@ -168,6 +168,9 @@ const NEWS_SIGNALS: &[&str] = &[
     "election",
     "war",
     "stock",
+    "новости",
+    "ニュース",
+    "뉴스",
 ];
 const ENTITY_SIGNALS: &[&str] = &["what is", "who is", "who was", "define", "meaning of"];
 
@@ -215,6 +218,9 @@ fn has_phrase(toks: &[&str], signal: &str) -> bool {
 }
 
 pub fn detect(query: &str) -> Intent {
+    if super::query::QueryFacts::new(query).is_identifier() {
+        return Intent::Code;
+    }
     let q = query.to_lowercase();
     let toks = tokens(&q);
     let score = |signals: &[&str]| signals.iter().filter(|s| has_phrase(&toks, s)).count();
@@ -261,19 +267,20 @@ pub fn detect(query: &str) -> Intent {
 }
 
 /// Engines to fan out per intent. Order = trust prior.
-/// Bing family (bing/ddg/yahoo) + independent indexes
-/// (mojeek/brave/google) for consensus diversity.
+/// Supplier independence is measured from matching query results, not assigned
+/// from the number of named endpoints.
 /// DDG and Brave are PROXY_AVERSE : they prefer the direct
 /// lane because proxy IPs get CAPTCHA'd/429'd.
 pub fn engines_for(intent: Intent) -> &'static [&'static str] {
     match intent {
-        // 3 engines, 3 index families: every lane here answers this egress.
+        // Native accepted contracts. Healthy plans still ask at most four;
+        // Yahoo's scoped documentation recall retains a slot beside Yandex.
         // mojeek is not one of them: it answers our identity with an HTTP 200
         // captcha page, so a slot spent on it is a slot not spent on an answer.
         Intent::Web | Intent::Code | Intent::News | Intent::Entity => {
-            &["bing", "ddg", "yahoo", "brave"]
+            &["google-cse", "bing", "ddg", "yahoo", "brave", "yandex"]
         }
-        Intent::Paper => &["bing", "ddg"],
+        Intent::Paper => &["google-cse", "bing", "ddg", "yandex"],
     }
 }
 
@@ -281,6 +288,10 @@ pub fn engines_for(intent: Intent) -> &'static [&'static str] {
 /// Returns a Vec: code verticals are now query-gated (C6), so the
 /// set is no longer a static slice.
 pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
+    let facts = super::query::QueryFacts::new(query);
+    if facts.is_identifier() || super::resolve::item(&facts).is_some() {
+        return Vec::new();
+    }
     match intent {
         // Official keyless APIs first: near-100% reliable,
         // zero egress budget spent on engines for code.
@@ -292,6 +303,18 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             let q = query.to_lowercase();
             let toks = tokens(&q);
             let mut v = Vec::new();
+            // A package registry answers "which package is this, and what does
+            // its own documentation say" better than any page about it, and the
+            // vertical cap is two: a package-named query asks the registry
+            // before the general code verticals, not after them.
+            if registry_words(&toks, CRATE_WORDS) {
+                v.push("crates");
+            }
+            // `node` is a Node.js query word, but `node_modules` is a path: the
+            // tokenizer cannot tell them apart once it splits on `_`.
+            if registry_words(&toks, NPM_WORDS) && !q.contains("node_modules") {
+                v.push("npm");
+            }
             if so_qaish(&q, &toks) {
                 v.push("stackexchange");
             }
@@ -302,16 +325,6 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             v.push("github");
             if hnish(&q, &toks) {
                 v.push("hn");
-            }
-            // A package registry answers "does a package named X exist and
-            // which one is it" better than any page about it.
-            if registry_words(&toks, CRATE_WORDS) {
-                v.push("crates");
-            }
-            // `node` is a Node.js query word, but `node_modules` is a path: the
-            // tokenizer cannot tell them apart once it splits on `_`.
-            if registry_words(&toks, NPM_WORDS) && !q.contains("node_modules") {
-                v.push("npm");
             }
             v
         }
@@ -593,6 +606,10 @@ mod tests {
         // The real signals still fire as whole words / phrases.
         assert_eq!(detect("breaking news ukraine war"), Intent::News);
         assert_eq!(detect("stock market crash today"), Intent::News);
+        for q in ["новости москвы", "東京 ニュース", "서울 뉴스"] {
+            assert_eq!(detect(q), Intent::News, "{q}");
+        }
+        assert_eq!(detect("новостройки москвы"), Intent::Web);
         assert_eq!(detect("arxiv paper on attention"), Intent::Paper);
         assert_eq!(detect("null pointer in c"), Intent::Code);
         assert_eq!(detect("what is a monad"), Intent::Entity);
@@ -606,6 +623,11 @@ mod tests {
     fn registries_and_the_medical_index_fire_only_on_their_own_vocabulary() {
         let v = |i, q| verticals_for(i, q);
         assert!(v(Intent::Code, "rust tokio crate").contains(&"crates"));
+        assert_eq!(
+            v(Intent::Code, "rust reqwest http client").first(),
+            Some(&"crates"),
+            "a package-named code query asks its registry before MDN/GitHub"
+        );
         assert!(!v(Intent::Code, "python requests package").contains(&"crates"));
         assert!(!v(Intent::Code, "python requests package").contains(&"npm"));
         assert!(v(Intent::Code, "npm express middleware").contains(&"npm"));

@@ -152,7 +152,7 @@ fn compile_all(patterns: &[String]) -> Vec<Regex> {
 
 /// One row's answer, reduced to what the metrics read. Both the in-process and
 /// the external mode produce this, so their numbers are the same numbers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnswerRow {
     pub url: String,
     pub title: String,
@@ -165,8 +165,8 @@ pub struct Judged {
     /// 1-based rank of the first URL any gold pattern matches.
     pub hit: Option<usize>,
     /// 1-based rank of the first result whose title+snippet carries the whole
-    /// answer key: this is the accuracy metric, and it is deliberately stricter
-    /// than a URL match (the caller reads the snippet, not the URL).
+    /// answer-key phrases. This is lexical coverage, not factual accuracy;
+    /// factual extractability requires the separate blinded evidence review.
     pub key_at: Option<usize>,
     /// URLs/titles that matched a `must_not`, in rank order.
     pub violations: Vec<String>,
@@ -258,6 +258,16 @@ pub struct RowRecord {
     pub redirects: usize,
     pub ms: u64,
     pub urls: Vec<String>,
+    /// Exactly the bounded title/snippet evidence used by the judge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<AnswerRow>,
+    /// The actual trust and independence state used for this merge. Old
+    /// raw-only artifacts can be replayed approximately, never as parity proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<super::rank::MergeInput>,
+    /// Per-source status, latency and request counts for diagnosing a miss.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<super::EngineReport>,
     pub domains: usize,
     /// Absent in `--bin` mode: recall is pre-merge knowledge of the searcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -365,7 +375,7 @@ impl Tally {
             / self.n as f64
     }
 
-    /// The answer's own fact is in the evidence, inside the top five.
+    /// Legacy metric: expected answer-key phrases occur in the top-five evidence.
     pub fn accuracy(&self) -> f64 {
         self.rate(
             self.keys
@@ -446,6 +456,7 @@ impl Tally {
             "zero_rate": self.zero_rate(), "zeros": self.zeros,
             "junk5": self.junk5(), "junk5_rows": self.junk5_rows,
             "accuracy": self.accuracy(),
+            "key_coverage": self.accuracy(),
             "refuse": self.refuse, "refuse_ok": self.refuse_ok,
             "refuse_rate": self.refuse_rate(),
             "mean_domains": self.mean_domains(),
@@ -457,7 +468,7 @@ impl Tally {
 
 /// The table header, printed once above the per-shape lines.
 pub const TABLE_HEAD: &str =
-    "shape         n  hit@1 hit@3 hit@5    MRR recall  zero junk5   acc    p50    p95  req   dom";
+    "shape         n  hit@1 hit@3 hit@5    MRR recall  zero junk5   key    p50    p95  req   dom";
 
 /// Aggregate a set of rows into the overall and per-shape tables.
 pub fn summarise(rows: &[RowRecord]) -> (Tally, std::collections::BTreeMap<String, Tally>) {
@@ -470,6 +481,7 @@ pub fn summarise(rows: &[RowRecord]) -> (Tally, std::collections::BTreeMap<Strin
     (all, by_shape)
 }
 
+#[derive(Clone)]
 pub struct Options {
     pub queries: PathBuf,
     pub set: String,
@@ -505,7 +517,7 @@ pub struct Options {
     pub verbose: bool,
 }
 
-const USAGE: &str = "usage: donsetch search-bench [--queries FILE] [--set gold|held|all] \
+pub const USAGE: &str = "usage: donsetch search-bench [--queries FILE] [--set gold|held|all] \
 [--shape SHAPE] [--only ID,ID] [--smoke] [--limit N] [--pace-ms N] [--max-results N] \
 [--runs N] [--gap-min N] [--cold] [--keep-state] [--one-ledger] [--bin PATH] [--out FILE] \
 [--replay FILE]... [--features-out FILE]";
@@ -804,17 +816,23 @@ async fn in_process_row(searcher: &Searcher, opts: &Options, q: &BenchQuery) -> 
     let ms = t0.elapsed().as_millis() as u64;
     let requests = outcome
         .as_ref()
-        .map(|o| o.report.iter().map(|r| r.requests).sum())
-        .unwrap_or(0);
+        .ok()
+        .and_then(|out| out.requests)
+        .unwrap_or_else(|| searcher.last_request_count());
     let raw = searcher.last_raw();
+    let visible = outcome
+        .as_ref()
+        .map(|out| render::evidence_snippets(&out.results))
+        .unwrap_or_default();
     let (answers, census): (Vec<AnswerRow>, String) = match &outcome {
         Ok(o) => (
             o.results
                 .iter()
-                .map(|r| AnswerRow {
-                    url: r.url.clone(),
+                .enumerate()
+                .map(|(position, r)| AnswerRow {
+                    url: render::evidence_url(&r.url),
                     title: r.title.clone(),
-                    snippet: r.snippet.clone(),
+                    snippet: visible[position].clone(),
                 })
                 .collect(),
             render::census(&o.report),
@@ -873,13 +891,23 @@ async fn in_process_row(searcher: &Searcher, opts: &Options, q: &BenchQuery) -> 
         ms,
         urls: answers.iter().map(|r| r.url.clone()).collect(),
         domains: domains(&answers),
-        recall: Some(recalled),
+        recall: outcome
+            .as_ref()
+            .ok()
+            .filter(|o| !o.cached)
+            .map(|_| recalled),
         requests: Some(requests),
         census: census.clone(),
         stale,
         undated,
         foreign,
         raw: Some(raw_json(&raw)),
+        evidence: answers,
+        ranking: searcher.last_merge(),
+        reports: outcome
+            .as_ref()
+            .map(|o| o.report.clone())
+            .unwrap_or_default(),
     };
     if opts.verbose {
         crate::diag!(
@@ -950,6 +978,7 @@ pub fn report(label: &str, runs: &[Run]) {
         crate::diag!("{}", t.line(shape));
     }
     crate::diag!("{}", t_line_all(&all));
+    crate::diag!("key = expected-phrase coverage, not factual accuracy (scored separately).");
     let violations: Vec<String> = rows
         .iter()
         .flat_map(|r| r.violations.iter().cloned())
@@ -1002,8 +1031,24 @@ pub fn artifact(
     json!({
         "tool": "donsetch-search-bench",
         "schema": 2,
+        "accuracy_definition": "legacy-accuracy-field-is-expected-phrase-coverage-not-fact-accuracy",
         "version": env!("CARGO_PKG_VERSION"),
         "mode": mode,
+        "git": option_env!("DONSETCH_GIT_HASH"),
+        "binary_sha256": opts.bin.as_deref().map_or_else(
+            || std::env::current_exe().ok().and_then(|p| corpus_hash(&p)), corpus_hash),
+        "request_accounting": if mode == "in-process" { "http-exchanges-v1" } else { "not-observed" },
+        "cold": opts.cold,
+        "refusal_policy": "preserve-active-source-refusals-v1",
+        "default_pipeline": if mode == "in-process" { "native-search-and-default-repair-v1" } else { "not-observed" },
+        "file_config": if opts.cold || std::env::var("DONSETCH_NO_CONFIG_FILE").as_deref() == Ok("1") { "disabled" } else { "ambient" },
+        "search_env_overrides": std::env::vars_os().filter_map(|(name, _)| {
+            let name = name.to_string_lossy();
+            ((name.starts_with("DONSETCH_") || name.starts_with("DONSEEK_")) && !matches!(name.as_ref(),
+                "DONSETCH_CACHE_DIR" | "DONSETCH_CONFIG" | "DONSETCH_NO_CONFIG_FILE" | "DONSETCH_NO_UPDATE_CHECK" | "DONSETCH_NO_SPONSOR"))
+                .then(|| name.to_string())
+        }).collect::<Vec<_>>(),
+        "gap_s": opts.gap.as_secs(),
         "bin_version": bin_version,
         "queries_file": opts.queries.display().to_string(),
         "queries_sha256": corpus_hash(&opts.queries),
@@ -1077,7 +1122,6 @@ pub async fn run(args: &[String]) -> i32 {
 /// selected set are scored, so tuning on `gold` never reads a `held` row.
 fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
     use super::{evidence, intent, rank};
-    let trust = std::collections::HashMap::new();
     let mut shown = SnippetTally::default();
     let mut all = Tally::default();
     let mut by_shape: std::collections::BTreeMap<String, Tally> = Default::default();
@@ -1110,6 +1154,14 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
             let Some(q) = queries.iter().find(|q| q.id == sq.id) else {
                 continue;
             };
+            let captured = sq.ranking;
+            if captured
+                .as_ref()
+                .is_some_and(|input| input.query != super::query::normalize(&q.query))
+            {
+                crate::diag!("search-bench: saved ranking query differs for {}", q.id);
+                return 2;
+            }
             let gold = q.gold_re();
             let per_engine: Vec<(String, Vec<super::engines::Hit>)> = sq
                 .raw
@@ -1119,6 +1171,9 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
             let recalled = per_engine
                 .iter()
                 .any(|(_, hits)| hits.iter().any(|h| gold.iter().any(|g| g.is_match(&h.url))));
+            let per_engine = captured
+                .as_ref()
+                .map_or(per_engine, |input| input.per_engine.clone());
             let lists: Vec<(String, Vec<String>)> = per_engine
                 .iter()
                 .filter(|(name, _)| !rank::is_vertical(name))
@@ -1129,8 +1184,19 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
                     )
                 })
                 .collect();
-            families.observe(&lists);
-            let intent = intent::detect(&q.query);
+            if captured.is_none() {
+                families.observe(&lists);
+            }
+            let families = captured
+                .as_ref()
+                .map_or_else(|| families.clone(), |input| input.families.clone());
+            let trust = captured
+                .as_ref()
+                .map(|input| input.trust.clone())
+                .unwrap_or_default();
+            let intent = captured
+                .as_ref()
+                .map_or_else(|| intent::detect(&q.query), |input| input.intent);
             if let Some(path) = &opts.features_out {
                 let mut pool = rank::pool(&per_engine, &q.query, intent, &trust, &families);
                 rank::order(&mut pool, None);
@@ -1149,6 +1215,9 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
                 12
             };
             let mut merged = rank::merge(&per_engine, &q.query, intent, &trust, &families, depth);
+            if let Some(input) = &captured {
+                input.apply_post_adjustments(&mut merged);
+            }
             super::site_filter(&q.query, &mut merged);
             super::query::intitle_filter(&q.query, &mut merged);
             super::query::filetype_filter(&q.query, &mut merged);
@@ -1195,6 +1264,9 @@ fn replay(opts: &Options, queries: &[BenchQuery]) -> i32 {
                 undated: 0,
                 foreign: 0,
                 raw: None,
+                evidence: answers,
+                ranking: None,
+                reports: Vec::new(),
             };
             if opts.verbose {
                 crate::diag!("{:<6} {:<10} {}", q.id, verdict(&record), q.query);
@@ -1232,6 +1304,8 @@ enum SavedQueryAny {
         id: String,
         #[serde(default)]
         raw: Option<Vec<SavedSource>>,
+        #[serde(default)]
+        ranking: Option<super::rank::MergeInput>,
     },
     /// An older bench run: lane detail under `raw` as a map.
     Legacy {
@@ -1244,8 +1318,12 @@ enum SavedQueryAny {
 impl SavedQueryAny {
     fn into_saved(self) -> Option<SavedQuery> {
         match self {
-            Self::Artifact { id, raw } => raw.map(|raw| SavedQuery { id, raw }),
-            Self::Legacy { id, raw } => (!raw.is_empty()).then_some(SavedQuery { id, raw }),
+            Self::Artifact { id, raw, ranking } => raw.map(|raw| SavedQuery { id, raw, ranking }),
+            Self::Legacy { id, raw } => (!raw.is_empty()).then_some(SavedQuery {
+                id,
+                raw,
+                ranking: None,
+            }),
         }
     }
 }
@@ -1253,6 +1331,7 @@ impl SavedQueryAny {
 struct SavedQuery {
     id: String,
     raw: Vec<SavedSource>,
+    ranking: Option<super::rank::MergeInput>,
 }
 
 #[derive(Deserialize)]
@@ -1520,6 +1599,9 @@ mod tests {
                 undated: 0,
                 foreign: 0,
                 raw: None,
+                evidence: Vec::new(),
+                ranking: None,
+                reports: Vec::new(),
             });
         }
         assert_eq!(t.n, 4);
@@ -1554,6 +1636,9 @@ mod tests {
             undated: 0,
             foreign: 0,
             raw: None,
+            evidence: Vec::new(),
+            ranking: None,
+            reports: Vec::new(),
         };
         assert!(base.refused_ok(), "an empty answer is the right answer");
         let mut invented = base.clone();
@@ -1565,6 +1650,36 @@ mod tests {
         let mut leaked = base.clone();
         leaked.junk5 = 1;
         assert!(!leaked.refused_ok(), "a must_not match fails the row");
+    }
+
+    #[test]
+    fn saved_replay_keeps_the_actual_trust_and_independence_state() {
+        let mut input = super::super::rank::MergeInput {
+            per_engine: Vec::new(),
+            query: "rust ownership".into(),
+            intent: super::super::intent::Intent::Code,
+            trust: [("bing".into(), 0.4)].into(),
+            families: Default::default(),
+            depth: 12,
+            post_adjustments: Default::default(),
+        };
+        let urls: Vec<_> = (0..5).map(|i| format!("https://example.com/{i}")).collect();
+        for _ in 0..3 {
+            input.families.observe(&[
+                ("bing".into(), urls.clone()),
+                ("yahoo".into(), urls.clone()),
+            ]);
+        }
+        let saved: SavedQueryAny =
+            serde_json::from_value(json!({"id":"x", "raw":[], "ranking":input})).unwrap();
+        let restored = saved.into_saved().unwrap().ranking.unwrap();
+        assert_eq!(restored.trust["bing"], 0.4);
+        assert_eq!(
+            restored.families.family_of("bing"),
+            restored.families.family_of("yahoo")
+        );
+        let legacy: SavedQueryAny = serde_json::from_value(json!({"id":"x", "raw":[]})).unwrap();
+        assert!(legacy.into_saved().unwrap().ranking.is_none());
     }
 
     #[test]

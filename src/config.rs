@@ -138,6 +138,7 @@ section!(BypassSection {
 });
 
 section!(SearchSection {
+    /// Legacy mobile-protocol probe setting; default search uses native CSE.
     google_profile: String = String::new(),
     /// Deprecated no-op, kept so a config file that carries it still loads:
     /// search has no cross-encoder (5.3.0 §8). Removed in 6.0.
@@ -146,7 +147,8 @@ section!(SearchSection {
     /// Removed in 6.0.
     rerank_threads: u32 = 0,
     brightdata_zone: String = String::new(),
-    /// B3: learned host quality from enrich/prefetch success density.
+    /// Deprecated no-op: ranking no longer applies host-quality priors.
+    /// Accepted for configuration compatibility; removed in 6.0.
     quality_prior: bool = true,
     /// B4: agent-outcome feedback (must_contain miss / content_ok=false).
     /// DEFAULT OFF until the 24h soak proves it. Never triggers
@@ -167,7 +169,7 @@ section!(SearchSection {
     /// query shapes it was shipped for. Off ranks by the fusion alone: the switch that measures
     /// one against the other on the same candidates (`search-bench --replay`).
     learned_rank: bool = true,
-    /// C4: cancel stragglers once ≥3 independent families agree
+    /// C4: cancel stragglers once ≥2 distinct ranking families agree
     /// on a top-3 URL. Kill: DONSETCH_NO_SEARCH_EARLY.
     search_early: bool = true,
     /// C2: compile site:/filetype:/intitle: per-engine (strip from

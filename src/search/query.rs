@@ -30,7 +30,7 @@ impl CompiledQuery {
 /// DDG lite is the known liar: it treats `site:` as a search term.
 pub fn engine_honors(engine: &str) -> (bool, bool, bool) {
     match engine {
-        "ddg" | "ddg_lite" => (false, false, false),
+        "ddg" | "ddg_lite" | "yandex" => (false, false, false),
         "ddg_html" => (true, false, false),
         _ => (true, true, true),
     }
@@ -171,8 +171,7 @@ pub(crate) fn intitle_filter(query: &str, results: &mut Vec<super::rank::Merged>
     let Some(needle) = c.intitle else {
         return;
     };
-    let needle_l = needle.to_lowercase();
-    results.retain(|r| r.title.to_lowercase().contains(&needle_l));
+    results.retain(|r| phrase_matches(&needle, &r.title));
 }
 
 /// `filetype:` soft filter: keep URLs that look like the type or
@@ -184,17 +183,26 @@ pub(crate) fn filetype_filter(query: &str, results: &mut Vec<super::rank::Merged
         return;
     };
     let ft = ft.to_lowercase();
-    results.retain(|r| {
-        let path = url::Url::parse(&r.url)
-            .map(|u| u.path().to_ascii_lowercase())
-            .unwrap_or_else(|_| r.url.to_ascii_lowercase());
-        // Explicit other extension → drop. No extension or matching
-        // extension → keep.
-        match path.rsplit_once('.') {
-            Some((_, ext)) if !ext.contains('/') && ext.len() <= 5 => ext == ft,
-            _ => true,
-        }
-    });
+    results.retain(|r| url_filetype(&r.url).is_none_or(|ext| ext == ft));
+}
+
+/// An explicit filename extension or arXiv's declared PDF view. Dotted numeric
+/// identifiers do not themselves name a format.
+pub(crate) fn url_filetype(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    if url.host_str().map(|h| h.trim_start_matches("www.")) == Some("arxiv.org")
+        && url
+            .path()
+            .strip_prefix("/pdf/")
+            .is_some_and(|id| !id.is_empty())
+    {
+        return Some("pdf".into());
+    }
+    let (_, ext) = url.path().rsplit_once('.')?;
+    (ext.len() <= 5
+        && ext.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && ext.bytes().all(|c| c.is_ascii_alphanumeric()))
+    .then(|| ext.to_ascii_lowercase())
 }
 
 /// Split a `site:` value into the host to match and an optional path
@@ -219,6 +227,38 @@ pub(crate) fn site_scope(site: &str) -> (&str, Option<&str>) {
 /// the path is compared ASCII case-insensitively.
 pub(crate) fn site_path_matches(url: &url::Url, prefix: Option<&str>) -> bool {
     prefix.is_none_or(|prefix| url.path().to_ascii_lowercase().starts_with(prefix))
+}
+
+/// Constraints that can be checked from a candidate's URL and title, before
+/// consensus or ranking. Extensionless URLs retain the filetype filter's
+/// existing contract: their content type is unknown until fetched.
+pub(crate) fn permits(c: &CompiledQuery, title: &str, raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if let Some(site) = &c.site {
+        let (host, path) = site_scope(site);
+        let want = host.trim_start_matches("www.");
+        if !url.host_str().is_some_and(|h| {
+            let h = h.trim_start_matches("www.");
+            h == want || h.ends_with(&format!(".{want}"))
+        }) || !site_path_matches(&url, path)
+        {
+            return false;
+        }
+    }
+    if let Some(needle) = &c.intitle
+        && !phrase_matches(needle, title)
+    {
+        return false;
+    }
+    if let Some(ft) = &c.filetype
+        && let Some(ext) = url_filetype(raw)
+        && ext != *ft
+    {
+        return false;
+    }
+    true
 }
 
 /// site: routes to a matching vertical so a scoped search gets the
@@ -581,12 +621,8 @@ impl QueryFacts {
         while i < tokens.len() {
             let raw = tokens[i];
             i += 1;
-            if let Some(rest) = raw.strip_prefix('-')
-                && !rest.is_empty()
-            {
-                negated.push(rest.trim_matches('"').to_lowercase());
-                continue;
-            }
+            let excluded = raw.starts_with('-') && raw.len() > 1;
+            let raw = if excluded { &raw[1..] } else { raw };
             // A quoted span is one unit, however many words it spans: it names
             // an anchor and enters the terms as a phrase, so `"the quick brown
             // fox"` cannot be satisfied by a page carrying three of its words
@@ -608,6 +644,12 @@ impl QueryFacts {
                     }
                 }
                 let phrase = parts.join(" ").trim().to_lowercase();
+                if excluded {
+                    if !phrase.is_empty() {
+                        negated.push(phrase);
+                    }
+                    continue;
+                }
                 if !phrase.is_empty() {
                     anchors.push(phrase.clone());
                     push_term(&mut terms, phrase.clone(), 2.0);
@@ -618,6 +660,10 @@ impl QueryFacts {
                     }
                 }
                 first_word = false;
+                continue;
+            }
+            if excluded {
+                negated.push(raw.to_lowercase());
                 continue;
             }
             let quoted = raw.ends_with('"');
@@ -799,7 +845,7 @@ impl QueryFacts {
         if self.is_identifier() {
             return Shape::Identifier;
         }
-        let q = self.raw.to_lowercase();
+        let q = self.compiled.text.to_lowercase();
         if HOWTO_LEADS.iter().any(|lead| q.starts_with(lead)) {
             return Shape::HowTo;
         }
@@ -945,18 +991,42 @@ pub(crate) fn matches(term: &str, text: &str) -> bool {
     // A quoted span is one term: it matches a run of words, in order, with any
     // amount of whitespace or punctuation between them.
     if term.contains(char::is_whitespace) {
-        let hay = text
-            .to_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        return hay.contains(term);
+        return phrase_matches(term, text);
     }
     let lower = text.to_lowercase();
     let words = lower.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#');
     words
         .into_iter()
         .any(|w| w == term || (term.chars().count() >= 5 && w.starts_with(term)))
+}
+
+/// Whole phrase words in order, across punctuation and URL separators. Code
+/// punctuation written in the query remains literal: `operator<<` is not `>>`.
+fn phrase_matches(term: &str, text: &str) -> bool {
+    let term = term.to_lowercase();
+    let text = text.to_lowercase();
+    if term.chars().any(is_cjk) {
+        return text.contains(&term);
+    }
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '+' | '#');
+    if term.contains(['+', '#', '<', '>', ':', '!', '&']) {
+        let needle = term.split_whitespace().collect::<Vec<_>>().join(" ");
+        let hay = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        return !needle.is_empty()
+            && hay.match_indices(&needle).any(|(at, _)| {
+                !hay[..at].chars().next_back().is_some_and(word)
+                    && !hay[at + needle.len()..].chars().next().is_some_and(word)
+            });
+    }
+    let words = |s: &str| {
+        s.split(|c| !word(c))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let needle = words(&term);
+    let hay = words(&text);
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -1042,6 +1112,14 @@ mod tests {
         let ddg = for_engine(&c, "ddg");
         assert!(!ddg.contains("site:"), "ddg must strip: {ddg}");
         assert!(ddg.contains("tokio"));
+        assert_eq!(
+            QueryFacts::new("site:example.com how to replace a tire").shape(),
+            Shape::HowTo
+        );
+        assert_ne!(
+            QueryFacts::new("intitle:\"how to repair\" bicycle specifications").shape(),
+            Shape::HowTo
+        );
     }
 
     #[test]
@@ -1109,10 +1187,22 @@ mod tests {
         let mut rs = vec![
             m("https://a.example/1", "Rust Book chapter"),
             m("https://b.example/2", "Unrelated page"),
+            m("https://c.example/3", "Bookkeeping for beginners"),
         ];
         intitle_filter("rust intitle:book", &mut rs);
         assert_eq!(rs.len(), 1);
         assert!(rs[0].title.contains("Book"));
+        for (title, expected) in [
+            ("A car review", true),
+            ("A car-review", true),
+            ("A scar review", false),
+        ] {
+            let compiled = compile("intitle:\"car review\"");
+            assert_eq!(permits(&compiled, title, "https://example.com/p"), expected);
+        }
+        assert!(matches("C++ operator<<", "How C++ operator<< works"));
+        assert!(!matches("C++ operator<<", "How C++ operator>> works"));
+        assert!(!matches("C++ operator<<", "How C# operator<< works"));
     }
 
     #[test]
@@ -1140,9 +1230,31 @@ mod tests {
             m("https://a.example/paper.pdf", "Paper"),
             m("https://b.example/page.html", "HTML"),
             m("https://c.example/download?id=1", "Download"),
+            m("https://arxiv.org/pdf/1706.03762", "Paper"),
+            m("https://arxiv.org/pdf/1706.03762v2", "Paper version"),
+            m("https://a.example/releases/1.2", "Numeric identifier"),
         ];
+        let compiled = compile("paper filetype:pdf");
+        for r in &rs {
+            assert_eq!(
+                permits(&compiled, &r.title, &r.url),
+                !r.url.ends_with(".html")
+            );
+        }
         filetype_filter("paper filetype:pdf", &mut rs);
-        assert_eq!(rs.len(), 2, "pdf + extensionless kept: {rs:?}");
+        assert_eq!(rs.len(), 5, "PDFs and unknown types kept: {rs:?}");
+        assert_eq!(
+            url_filetype("https://a.example/REPORT.PDF?x=.html"),
+            Some("pdf".into())
+        );
+        assert_eq!(url_filetype("https://a.example/page.html/chapter"), None);
+        assert_eq!(
+            url_filetype("https://arxiv.org/pdf/1706.03762v2"),
+            Some("pdf".into())
+        );
+        assert_eq!(url_filetype("https://arxiv.org/abs/1706.03762"), None);
+        assert_eq!(url_filetype("https://a.example/pdf/1706.03762"), None);
+        assert_eq!(url_filetype("https://arxiv.org/pdf/"), None);
     }
 
     #[test]

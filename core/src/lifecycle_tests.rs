@@ -181,18 +181,28 @@ fn host() -> &'static str {
 
 #[test]
 fn a_first_contact_mints_and_is_content() {
+    let before = crate::state::now_unix();
     let origin = Origin::start(300);
     let mut session = Worker::new(false);
     let outcome = fetch(&mut session, &origin);
+    let after = crate::state::now_unix();
     assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
     assert_eq!(origin.verifies(), 1);
     let credential = &session.state.credentials[host()]["chrome"];
     assert_eq!(credential.vendor, "aws-waf");
     assert_eq!(credential.names, vec!["aws-waf-token".to_string()]);
+    let expires = session.state.cookies[host()]["chrome"]
+        .iter()
+        .find(|cookie| cookie.name == "aws-waf-token")
+        .and_then(|cookie| cookie.expires_unix)
+        .expect("the minted cookie keeps its declared expiry");
+    assert!((before..=after).contains(&(expires - 345_600)));
+    // The script can set the cookie just before a second boundary and the
+    // engine can return just after it. The expiry stays exact; the remaining
+    // lifetime is then one second shorter than the original Max-Age.
     assert_eq!(
         credential.declared_ttl,
-        Some(345_600),
-        "the vendor's declared lifetime is kept"
+        Some(expires - credential.minted_unix)
     );
     assert_eq!(credential.uses, 1, "the origin accepted it once");
 }

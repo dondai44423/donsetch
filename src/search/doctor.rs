@@ -225,6 +225,9 @@ struct LastRun {
 }
 
 fn last_path() -> Option<std::path::PathBuf> {
+    if crate::config::cfg().state.no_disk_state {
+        return None;
+    }
     let dir = crate::paths::cache_dir();
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("search-canary.json"))
@@ -317,7 +320,11 @@ fn parse(args: &[String]) -> Result<Args, String> {
 /// True when `search`'s arguments ask for the health commands rather than a
 /// search.
 pub fn wants(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--doctor" || a == "--sources")
+    let options: Vec<_> = args.iter().take_while(|arg| arg.as_str() != "--").collect();
+    options
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--doctor" | "--sources"))
+        || options.first().is_some_and(|arg| arg.as_str() == "doctor")
 }
 
 pub(crate) fn searcher() -> Result<Searcher, String> {
@@ -331,7 +338,17 @@ pub(crate) fn searcher() -> Result<Searcher, String> {
 }
 
 pub async fn run(args: &[String]) -> i32 {
-    let a = match parse(args) {
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            if arg == "doctor" {
+                "--doctor".into()
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    let a = match parse(&args) {
         Ok(a) => a,
         Err(e) => {
             crate::diag!("{e}");
@@ -361,6 +378,7 @@ pub async fn run(args: &[String]) -> i32 {
     };
     // Give the persisted health a moment to be what the table reads.
     let health = searcher.health_report();
+    let diagnostics = searcher.diagnostics();
     let age = if last.at_unix == 0 {
         None
     } else {
@@ -382,7 +400,7 @@ pub async fn run(args: &[String]) -> i32 {
             .collect();
         println!(
             "{}",
-            serde_json::json!({"sources": rows, "canary_age_s": age.map(|d| d.as_secs())})
+            serde_json::json!({"sources": rows, "canary_age_s": age.map(|d| d.as_secs()), "diagnostics": diagnostics})
         );
         return 0;
     }
@@ -406,6 +424,7 @@ pub async fn run(args: &[String]) -> i32 {
             h.family
         );
     }
+    println!("\nsearch: no runtime model; cache {}", diagnostics["cache"]);
     if let Some(age) = age {
         println!("\ncanaries last ran {} ago", span(age));
     }
@@ -492,6 +511,7 @@ mod tests {
     // handed it census words and convicted every source.
     fn st(name: &str, items: usize, status: &str) -> crate::search::SourceLine {
         let report = crate::search::EngineReport {
+            cache_age_ms: None,
             engine: name.into(),
             profile: None,
             status: status.into(),

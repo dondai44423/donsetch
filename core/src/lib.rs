@@ -41,8 +41,8 @@ pub use classify::{Class, Wall};
 pub use contract::Contract;
 pub use fetch::{Attempt, Outcome};
 pub use http::{
-    add_trust_pem, default_hop, proxy_url, Cancel, Hop, HopGuard, Kind, Policy, CANCELLED,
-    DOCUMENT_BODY_MAX, REDIRECTS_MAX,
+    add_trust_pem, default_hop, proxy_url, Cancel, Hop, HopGuard, Kind, Policy, RequestStart,
+    ResponseHead, CANCELLED, DOCUMENT_BODY_MAX, REDIRECTS_MAX,
 };
 
 use std::sync::Mutex;

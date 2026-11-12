@@ -76,7 +76,7 @@ fn reasons(e: &Explained) -> String {
     };
     pairs.retain(|(_, v)| v.abs() >= 0.005);
     pairs.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
-    pairs
+    let mut reasons = pairs
         .iter()
         .take(6)
         .map(|(j, v)| match e.parts {
@@ -84,7 +84,14 @@ fn reasons(e: &Explained) -> String {
             None => format!("{} {:.2}", NAMES[*j], v),
         })
         .collect::<Vec<_>>()
-        .join("  ")
+        .join("  ");
+    if e.post_adjustment != 0.0 {
+        reasons.push_str(&format!(
+            "  {:+.3} page/feedback adjustment",
+            e.post_adjustment
+        ));
+    }
+    reasons
 }
 
 pub async fn run(args: &[String]) -> i32 {

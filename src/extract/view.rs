@@ -600,6 +600,16 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
     out
 }
 
+/// Source passages with their heading context. Tables retain column headings,
+/// lists retain item boundaries and code retains its line breaks and indentation.
+pub(crate) fn source_passages(markdown: &str) -> Vec<(String, String)> {
+    let doc = Doc::parse(markdown);
+    passages(&doc, doc.body, markdown.len())
+        .into_iter()
+        .map(|p| (p.section.map(|s| doc.path(s)).unwrap_or_default(), p.text))
+        .collect()
+}
+
 /// The query's words that appear nowhere in `docs` (stopwords never count).
 fn absent_words(query: &str, docs: &[Vec<String>], lang: &LanguageInfo) -> Vec<String> {
     let present: std::collections::HashSet<&str> =

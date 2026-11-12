@@ -36,6 +36,7 @@ pub(super) struct LaneAnswer {
     pub class: engines::AnswerClass,
     /// Outbound requests this lane spent.
     pub requests: usize,
+    pub cache_age: Option<std::time::Duration>,
 }
 
 pub(super) type EngineResult = Result<LaneAnswer, (String, String, bool)>;
@@ -48,22 +49,110 @@ pub(super) struct EngineContext<'a> {
     pub fetcher: &'a Fetcher,
     pub pool: &'a EgressPool,
     pub google: &'a engines::google_wml::ProfileSelector,
+    pub cse: &'a super::cse::Client,
     /// The query's language, when the script named one.
     pub locale: Option<super::locale::Locale>,
+    /// Shared allowance for engine HTTP requests after first-party reserves.
+    pub requests: &'a RequestAllowance,
+    pub facts: Option<&'a super::query::QueryFacts>,
 }
 
-/// The pacing gate a request is admitted through. A `site:`-scoped query is a
-/// different question from the plain one (it is the official-docs recall that
-/// rides beside every search that names a technology), so it has its own slot:
-/// behind the plain query's it could never start inside a one-second budget,
-/// because the direct lane spaces one engine's requests 2.5 s or more apart.
-/// Each stream is still paced against its own previous request.
-fn pace_key(engine: &str, query: &str) -> String {
-    if super::query::compile(query).site.is_some() {
-        format!("{engine}#site")
-    } else {
-        engine.to_string()
+// Query syntax and sibling endpoints share the source's pacing allowance.
+fn pace_key<'a>(engine: &'a str, _query: &str) -> &'a str {
+    super::egress::health_key(engine)
+}
+
+pub(super) struct RequestAllowance {
+    remaining: std::sync::atomic::AtomicUsize,
+    initial: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    spent: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    >,
+}
+
+impl RequestAllowance {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            remaining: std::sync::atomic::AtomicUsize::new(limit),
+            initial: Default::default(),
+            spent: Default::default(),
+        }
     }
+    pub fn plan(&self, limit: usize, requests: Vec<(String, usize)>) {
+        let mut initial = self
+            .initial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        initial.clear();
+        let mut reserved = 0usize;
+        for (source, count) in requests {
+            let count = count.min(limit.saturating_sub(reserved));
+            *initial
+                .entry(super::egress::health_key(&source).to_string())
+                .or_default() += count;
+            reserved += count;
+        }
+        self.remaining.store(
+            limit.saturating_sub(reserved),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    fn reserve(&self, count: usize) -> bool {
+        self.remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(count),
+            )
+            .is_ok()
+    }
+    pub fn take_optional(&self) -> bool {
+        self.reserve(1)
+    }
+    pub fn counter(&self, source: &str) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(
+            self.spent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(super::egress::health_key(source).to_string())
+                .or_default(),
+        )
+    }
+    pub fn take(&self, source: &str) -> bool {
+        let mut initial = self
+            .initial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(credit) = initial.get_mut(super::egress::health_key(source))
+            && *credit > 0
+        {
+            *credit -= 1;
+            return true;
+        }
+        self.reserve(1)
+    }
+    pub fn release(&self, source: &str) {
+        let mut initial = self
+            .initial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unused = initial
+            .remove(super::egress::health_key(source))
+            .unwrap_or(0);
+        self.remaining
+            .fetch_add(unused, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn spent(&self, source: &str) -> usize {
+        self.counter(source)
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn may_retry_challenge(status: u16, verdict: &Verdict, body: &[u8]) -> bool {
+    status == 200
+        && body.len() <= 3 << 20
+        && (matches!(verdict, Verdict::Challenge(_))
+            || engines::serp_challenge(&String::from_utf8_lossy(body)))
 }
 
 /// One admission and HTTP attempt under a single deadline, including pacing.
@@ -76,16 +165,22 @@ pub(super) async fn engine_task_with_budget(
     budget: std::time::Duration,
     previous: Option<(&str, &str)>,
 ) -> (String, EngineResult) {
+    if engine == "google-cse" {
+        return super::cse::task(query, egress_id, proxy, context, budget).await;
+    }
     let EngineContext {
         fetcher,
         pool,
         google,
         locale,
+        requests: allowance,
+        facts: original_facts,
+        cse: _,
     } = context;
     let mut label = engine.clone();
     let deadline = tokio::time::Instant::now() + budget;
     let started = Instant::now();
-    if tokio::time::timeout_at(deadline, pool.pace(&pace_key(&engine, &query), &egress_id))
+    if tokio::time::timeout_at(deadline, pool.pace(pace_key(&engine, &query), &egress_id))
         .await
         .is_err()
     {
@@ -125,7 +220,11 @@ pub(super) async fn engine_task_with_budget(
         None
     };
     let lane = proxy.as_ref().or(env_proxy.as_ref());
-    let out = match tokio::time::timeout_at(deadline, async {
+    if !allowance.take(&engine) {
+        return (label, Err(("budget-skipped".into(), egress_id, true)));
+    }
+    let mut request_count = 1;
+    let mut out = match tokio::time::timeout_at(deadline, async {
         if let Some(ua) = google_ua {
             fetcher.fetch_once_via_user_agent(&url, lane, ua).await
         } else {
@@ -138,6 +237,36 @@ pub(super) async fn engine_task_with_budget(
         Ok(Err(e)) => return (label, Err((engine_fetch_status(&e), egress_id, true))),
         Ok(Ok(o)) => o,
     };
+    if engine == "yandex"
+        && out.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-yandex-captcha") && value == "captcha"
+        })
+    {
+        return (label, Err(("blocked:captcha".into(), egress_id, true)));
+    }
+    if engine != "google"
+        && may_retry_challenge(out.status, &out.verdict, &out.body)
+        && engines::parse(&engine, &String::from_utf8_lossy(&out.body)).is_empty()
+    {
+        let retry = async {
+            pool.pace(pace_key(&engine, &query), &egress_id).await;
+            if !allowance.take(&engine) {
+                return None;
+            }
+            request_count += 1;
+            label = format!("{engine}@firefox");
+            Some(fetcher.search_challenge_retry(&url, lane).await)
+        };
+        if let Ok(Some(Ok(retried))) = tokio::time::timeout_at(deadline, retry).await {
+            out = retried;
+        }
+    }
+    if let Some(rest) = verticals::throttle(&engine, out.status, &out.headers, &out.body) {
+        return (
+            label,
+            Err((format!("rate-limited:{}", rest.as_secs()), egress_id, true)),
+        );
+    }
     pool.observe_rtt(&egress_id, started.elapsed());
     // The deadline covers the FETCH only; the decode + DOM parse
     // below run synchronously after it. A hostile (or
@@ -168,15 +297,23 @@ pub(super) async fn engine_task_with_budget(
         }
         return (label, Err((status.into(), egress_id, true)));
     }
-    if out.status == 429 || !matches!(out.verdict, Verdict::ContentOk) {
+    if matches!(out.status, 403 | 429) || !matches!(out.verdict, Verdict::ContentOk) {
         // A challenge is a wall, but Bing's layout page is a moving target and
         // its own RSS interface answers the same question as data. The feed is
         // asked once before the lane is called walled.
         if engine == "bing"
-            && out.status != 429
+            && !matches!(out.status, 403 | 429)
             && super::query::compile(&query).site.is_none()
-            && let Some((rss_hits, rss_class, rss_items)) =
-                bing_rss_fallback(&query, lane, fetcher, deadline, locale).await
+            && let Some((rss_hits, rss_class, rss_items)) = bing_rss_fallback(
+                &query,
+                lane,
+                fetcher,
+                deadline,
+                locale,
+                allowance,
+                &mut request_count,
+            )
+            .await
             && rss_class.contributes()
         {
             return (
@@ -189,15 +326,16 @@ pub(super) async fn engine_task_with_budget(
                     engine_lane: true,
                     instant: None,
                     class: rss_class,
-                    requests: 2,
+                    requests: request_count,
+                    cache_age: None,
                 }),
             );
         }
         // A 2xx that is not content is a wall, and a wall is named: reporting
         // `blocked:200` told the ledger the source refused but not what it was,
         // so a captcha page and a dry page read the same in the census.
-        let status = if out.status == 429 {
-            "blocked:429".to_string()
+        let status = if matches!(out.status, 403 | 429) {
+            format!("blocked:{}", out.status)
         } else {
             match out.verdict {
                 Verdict::Challenge(_) => "blocked:challenge".to_string(),
@@ -219,8 +357,16 @@ pub(super) async fn engine_task_with_budget(
         let scoped = super::query::compile(&query).site.is_some();
         if engine == "bing"
             && !scoped
-            && let Some((rss_hits, rss_class, rss_items)) =
-                bing_rss_fallback(&query, lane, fetcher, deadline, locale).await
+            && let Some((rss_hits, rss_class, rss_items)) = bing_rss_fallback(
+                &query,
+                lane,
+                fetcher,
+                deadline,
+                locale,
+                allowance,
+                &mut request_count,
+            )
+            .await
             && rss_class.contributes()
         {
             return (
@@ -233,7 +379,8 @@ pub(super) async fn engine_task_with_budget(
                     engine_lane: true,
                     instant: None,
                     class: rss_class,
-                    requests: 2,
+                    requests: request_count,
+                    cache_age: None,
                 }),
             );
         }
@@ -259,7 +406,7 @@ pub(super) async fn engine_task_with_budget(
     // the set — because the per-hit coverage test this replaces was the thing
     // that turned a long query into a zero result and a lane into a rested one.
     let facts = super::query::QueryFacts::new(&query);
-    let judged = super::quality::judge(&facts, std::mem::take(&mut hits));
+    let judged = super::quality::judge(original_facts.unwrap_or(&facts), std::mem::take(&mut hits));
     let mut class = judged.class;
     let mut items = judged.items;
     hits = judged.kept;
@@ -280,11 +427,18 @@ pub(super) async fn engine_task_with_budget(
     // extra request when the layout answer is thin or does not credit the
     // source. Its feed endpoint ignores `site:`, so a scoped query never takes
     // an unscoped answer.
-    let mut requests = 1usize;
+    let mut requests = request_count;
     if (!class.credits() || thin) && engine == "bing" && scoped.is_none() {
-        let rss = bing_rss_fallback(&query, lane, fetcher, deadline, locale).await;
-        // Asked, whatever it returned: the budget counts the request.
-        requests += 1;
+        let rss = bing_rss_fallback(
+            &query,
+            lane,
+            fetcher,
+            deadline,
+            locale,
+            allowance,
+            &mut requests,
+        )
+        .await;
         if let Some((rss_hits, rss_class, rss_items)) = rss
             && rss_class.contributes()
             && (thin || rss_class.credits())
@@ -337,6 +491,7 @@ pub(super) async fn engine_task_with_budget(
             instant,
             class,
             requests,
+            cache_age: None,
         }),
     )
 }
@@ -350,6 +505,8 @@ async fn bing_rss_fallback(
     fetcher: &Fetcher,
     deadline: tokio::time::Instant,
     locale: Option<super::locale::Locale>,
+    allowance: &RequestAllowance,
+    requests: &mut usize,
 ) -> Option<(Vec<engines::Hit>, engines::AnswerClass, usize)> {
     if deadline.saturating_duration_since(tokio::time::Instant::now())
         < std::time::Duration::from_millis(400)
@@ -357,6 +514,10 @@ async fn bing_rss_fallback(
         return None;
     }
     let url = engines::serp_url_in("bing_rss", query, locale)?;
+    if !allowance.take("bing") {
+        return None;
+    }
+    *requests += 1;
     let out = tokio::time::timeout_at(
         deadline,
         fetcher.fetch_once_via(&url, &[], lane, false, None),
@@ -398,6 +559,7 @@ fn news_lane(name: &str, answer: super::news::Answer) -> (String, EngineResult) 
             instant: None,
             class,
             requests: answer.requests,
+            cache_age: None,
         })
     };
     (name.to_string(), result)
@@ -446,7 +608,11 @@ pub(super) async fn registry_task(
             let class = engines::vertical_class(&resolved.hits);
             let items = resolved.hits.len();
             (
-                "registry-any".to_string(),
+                if resolved.label == "registry" {
+                    "registry-any".into()
+                } else {
+                    format!("registry@{}", resolved.label)
+                },
                 Ok(LaneAnswer {
                     hits: resolved.hits,
                     items,
@@ -456,6 +622,7 @@ pub(super) async fn registry_task(
                     instant: None,
                     class,
                     requests: resolved.requests,
+                    cache_age: resolved.cache_age,
                 }),
             )
         }
@@ -475,10 +642,12 @@ pub(super) async fn registry_task(
 /// so a miss is `no-results` and never a fault.
 pub(super) async fn docs_task(
     item: super::resolve::Item,
+    query: String,
     fetcher: &Fetcher,
     budget: std::time::Duration,
 ) -> (String, EngineResult) {
-    let doc = super::resolve::docs(&item, fetcher, budget).await;
+    let mut doc = super::resolve::docs(&item, fetcher, budget).await;
+    doc.hits = contract::accept_first_party(&super::query::QueryFacts::new(&query), doc.hits);
     if doc.hits.is_empty() {
         return (
             "docs".to_string(),
@@ -499,6 +668,7 @@ pub(super) async fn docs_task(
             instant: None,
             class,
             requests: doc.requests,
+            cache_age: doc.cache_age,
         }),
     )
 }
@@ -569,6 +739,7 @@ fn vertical_success(
             instant: None,
             class,
             requests,
+            cache_age: None,
         }),
     )
 }
@@ -591,6 +762,10 @@ fn vertical_error_status(e: &verticals::VerticalError) -> String {
 /// behind `invalid-config: `, anything else its error text.
 fn vertical_failure_status(e: &FetchError) -> String {
     match e {
+        FetchError::Http(message) if message.starts_with("rested:") => message.clone(),
+        FetchError::Http(message) if message.contains("budget: request ceiling reached") => {
+            "budget-skipped".into()
+        }
         FetchError::Denied { .. } => RULE_DENIED_STATUS.into(),
         // The lane's proxy URL cannot be used: the operator's
         // configuration, not the vertical failing (see engine_fetch_status).
@@ -601,10 +776,17 @@ fn vertical_failure_status(e: &FetchError) -> String {
 
 /// The engine-report status for a failed SERP fetch. A rule refusal and a
 /// proxy configuration error are in the `invalid-config:` family.
-fn engine_fetch_status(e: &FetchError) -> String {
+pub(super) fn engine_fetch_status(e: &FetchError) -> String {
     match e {
+        FetchError::Http(message) if message.starts_with("rested:") => message.clone(),
+        FetchError::Http(message) if message.contains("budget: request ceiling reached") => {
+            "budget-skipped".into()
+        }
         FetchError::Timeout | FetchError::SlowTransfer(_) | FetchError::DnsTimeout(_) => {
             "timeout".into()
+        }
+        FetchError::Http(m) if m.starts_with("body: response larger than ") => {
+            "blocked:oversize-serp".into()
         }
         FetchError::Http(m) if m.contains("CONNECT -> 407") => "auth-fail".into(),
         FetchError::Http(m) if m.contains("CONNECT") => "dead-proxy".into(),
@@ -627,19 +809,216 @@ fn engine_fetch_status(e: &FetchError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Collects a receipt, including a refusal; a pass is not a quality claim.
+    #[tokio::test]
+    #[ignore = "live source witness; requires DSB_SOURCE_WITNESS output path"]
+    async fn mojeek_source_contract_live_witness() {
+        let path =
+            std::env::var_os("DSB_SOURCE_WITNESS").expect("set an absolute witness output path");
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let pool = EgressPool::new(Vec::new());
+        let google = engines::google_wml::ProfileSelector::from_env();
+        let cse = super::super::cse::Client::default();
+        let allowance = RequestAllowance::new(2);
+        let facts = super::super::query::QueryFacts::new("rust ownership");
+        let context = EngineContext {
+            fetcher: &fetcher,
+            pool: &pool,
+            google: &google,
+            cse: &cse,
+            locale: None,
+            requests: &allowance,
+            facts: Some(&facts),
+        };
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (label, answer) = crate::fetch::core::REQUEST_COUNT
+            .scope(
+                std::sync::Arc::clone(&count),
+                engine_task_with_budget(
+                    "mojeek".into(),
+                    "rust ownership".into(),
+                    "direct".into(),
+                    None,
+                    context,
+                    Duration::from_secs(10),
+                    None,
+                ),
+            )
+            .await;
+        let requests = count.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(requests <= 2);
+        let mut receipt = serde_json::json!({"source": "mojeek", "label": label,
+            "query": "rust ownership", "at_unix": super::super::bench::now_unix(), "requests": requests});
+        match answer {
+            Ok(answer) => {
+                receipt["status"] = answer.class.status().into();
+                receipt["hits"] = serde_json::to_value(answer.hits).unwrap();
+            }
+            Err((status, _, _)) => {
+                receipt["status"] = status.into();
+                receipt["hits"] = serde_json::json!([]);
+            }
+        }
+        crate::config::write_private(
+            std::path::Path::new(&path),
+            &serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "native public-source contract witness; requires network and explicit output path"]
+    async fn yandex_source_contract_live_witness() {
+        let path =
+            std::env::var_os("DSB_SOURCE_WITNESS").expect("set an absolute witness output path");
+        let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let out = crate::fetch::core::REQUEST_COUNT
+            .scope(
+                std::sync::Arc::clone(&count),
+                crate::fetch::core::REQUEST_LIMIT.scope(
+                    2,
+                    fetcher.fetch_once_via(
+                        "https://yandex.com/search/site/?text=rust%20ownership&lang=en&tmpl_version=releases&web=1&frame=1&searchid=3131712",
+                        &[],
+                        None,
+                        false,
+                        None,
+                    ),
+                ),
+            )
+            .await;
+        let requests = count.load(std::sync::atomic::Ordering::Relaxed);
+        let mut receipt = serde_json::json!({"source":"yandex", "query":"rust ownership",
+            "at_unix":super::super::bench::now_unix(), "requests":requests,
+            "identity":"host default, one identity, same egress", "promoted":false});
+        match out {
+            Ok(out) => {
+                receipt["http"] = out.status.into();
+                receipt["url"] = out.url.into();
+                receipt["hits"] = serde_json::to_value(engines::parse(
+                    "yandex",
+                    &String::from_utf8_lossy(&out.body),
+                ))
+                .unwrap();
+                receipt["body"] = String::from_utf8_lossy(&out.body).into_owned().into();
+                receipt["captcha_header"] = out
+                    .headers
+                    .iter()
+                    .any(|(name, value)| {
+                        name.eq_ignore_ascii_case("x-yandex-captcha") && value == "captcha"
+                    })
+                    .into();
+            }
+            Err(_) => receipt["error"] = "native request failed".into(),
+        }
+        assert!(requests <= 2);
+        crate::config::write_private(
+            std::path::Path::new(&path),
+            &serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
 
     #[test]
-    fn a_scoped_query_is_paced_apart_from_the_plain_one() {
+    fn challenge_retry_requires_a_200_challenge_and_a_request_token() {
+        let captcha = br#"<html><title>DuckDuckGo</title><form id="anomaly-form">Unfortunately, bots use DuckDuckGo too.</form></html>"#;
+        // Engine-specific challenge markers, not guessed status codes.
+        let captcha = String::from_utf8_lossy(captcha);
+        assert!(engines::serp_challenge(&captcha));
+        assert!(may_retry_challenge(
+            200,
+            &Verdict::ContentOk,
+            captcha.as_bytes()
+        ));
+        for status in [403, 429, 503] {
+            assert!(!may_retry_challenge(
+                status,
+                &Verdict::ContentOk,
+                captcha.as_bytes()
+            ));
+        }
+        assert!(!may_retry_challenge(
+            200,
+            &Verdict::ContentOk,
+            b"ordinary answer"
+        ));
+        let tokens = RequestAllowance::new(1);
+        assert!(tokens.take("bing"));
+        assert!(!tokens.take("bing"));
+        assert_eq!(
+            tokens.spent("bing"),
+            0,
+            "planning a token is not an HTTP exchange"
+        );
+        tokens
+            .counter("bing")
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(tokens.spent("bing"), 1);
+        assert_eq!(tokens.spent("yahoo"), 0);
+        tokens.plan(
+            4,
+            vec![
+                ("google-cse".into(), 2),
+                ("bing".into(), 1),
+                ("ddg".into(), 1),
+            ],
+        );
+        assert!(tokens.take("google-cse"));
+        assert!(tokens.take("bing"));
+        assert!(
+            !tokens.take("bing"),
+            "a retry cannot steal the reserved hedge"
+        );
+        assert!(
+            !tokens.take_optional(),
+            "an early page also needs an unreserved slot"
+        );
+        assert!(
+            tokens.take("ddg_html"),
+            "sibling labels use their source's reserved start"
+        );
+        assert!(
+            tokens.take("google-cse"),
+            "the actual query survives its bootstrap"
+        );
+        assert!(!tokens.take("bing"));
+        tokens.plan(
+            4,
+            vec![
+                ("google-cse".into(), 2),
+                ("bing".into(), 1),
+                ("ddg".into(), 1),
+            ],
+        );
+        assert!(tokens.take("google-cse"));
+        tokens.release("google-cse"); // bootstrap failed: its unused query slot is spare.
+        assert!(tokens.take("bing"));
+        assert!(tokens.take("bing"));
+        assert!(!tokens.take("bing"));
+        assert!(tokens.take("ddg"));
+        tokens.release("google-cse");
+        assert!(
+            !tokens.take("bing"),
+            "returning an already-returned slot cannot mint credit"
+        );
+    }
+
+    #[test]
+    fn scoped_queries_and_sibling_endpoints_share_the_source_pace() {
         assert_eq!(pace_key("yahoo", "git rebase squash"), "yahoo");
         assert_eq!(
             pace_key("yahoo", "git rebase squash site:git-scm.com"),
-            "yahoo#site"
+            "yahoo"
         );
         // Another engine's scoped stream is a different gate again.
         assert_ne!(
             pace_key("yahoo", "x site:a.com"),
             pace_key("bing", "x site:a.com")
         );
+        assert_eq!(pace_key("ddg_html", "x"), pace_key("ddg", "x site:a.com"));
     }
 
     #[test]
@@ -681,6 +1060,20 @@ mod tests {
 
     #[test]
     fn transport_failures_keep_their_statuses() {
+        let budget = FetchError::Http("budget: request ceiling reached".into());
+        assert_eq!(engine_fetch_status(&budget), "budget-skipped");
+        assert_eq!(vertical_failure_status(&budget), "budget-skipped");
+        assert!(!super::super::is_engine_fault("budget-skipped"));
+        assert_eq!(
+            engine_fetch_status(&FetchError::Http(
+                "body: response larger than 3145728 bytes".into()
+            )),
+            "blocked:oversize-serp"
+        );
+        assert_eq!(
+            engine_fetch_status(&FetchError::Http("body: read failed".into())),
+            "net"
+        );
         assert_eq!(engine_fetch_status(&FetchError::Timeout), "timeout");
         assert_eq!(
             engine_fetch_status(&FetchError::Http("CONNECT -> 407".into())),
@@ -720,7 +1113,10 @@ mod tests {
             fetcher: &fetcher,
             pool: &pool,
             google: &google,
+            cse: &super::super::cse::Client::default(),
             locale: None,
+            requests: &RequestAllowance::new(6),
+            facts: None,
         };
         pool.pace("bing", "direct").await;
         let (_, outcome) = engine_task_with_budget(
@@ -750,7 +1146,10 @@ mod tests {
             fetcher: &fetcher,
             pool: &pool,
             google: &google,
+            cse: &super::super::cse::Client::default(),
             locale: None,
+            requests: &RequestAllowance::new(6),
+            facts: None,
         };
         for query in [
             "rust programming language",
@@ -926,7 +1325,10 @@ mod tests {
             fetcher: &fetcher,
             pool: &pool,
             google: &google,
+            cse: &super::super::cse::Client::default(),
             locale: None,
+            requests: &RequestAllowance::new(6),
+            facts: None,
         };
         let out = engine_task_with_budget(
             "bing".into(),

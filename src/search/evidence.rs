@@ -8,8 +8,6 @@
 //!
 //! Everything here is lexical and native: no model scores a passage.
 
-use std::collections::HashSet;
-
 /// What a snippet below the lead results may take, in characters: where a
 /// snippet still reliably carries one complete claim. The render clips at the
 /// same [`budget`], so a picked snippet is shown whole.
@@ -33,28 +31,11 @@ pub fn budget(position: usize) -> usize {
     }
 }
 
-/// Words that carry no topic. Short on purpose: a stop list that grows is a
-/// language model written by hand.
-const STOP: &[&str] = &[
-    "a", "an", "the", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "be", "it",
-    "its", "this", "that", "with", "as", "at", "by", "from", "how", "what", "why", "when", "which",
-    "do", "does", "vs",
-];
-
-fn words(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect()
-}
-
 /// The topic words of a query, without operators or stop words.
 fn topic(query: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    words(query)
-        .into_iter()
-        .filter(|w| w.chars().count() >= 2 && !STOP.contains(&w.as_str()))
-        .filter(|w| seen.insert(w.clone()))
+    super::query::QueryFacts::new(query)
+        .terms()
+        .map(str::to_string)
         .collect()
 }
 
@@ -89,29 +70,27 @@ fn dot_ends(text: &str, i: usize) -> bool {
 }
 
 /// Sentences of `text`: split after `.`, `!`, `?` followed by whitespace, and at
-/// line breaks. A dot inside a token (`docs.rs`, `v1.2`) is not an end, and
-/// neither is one after an abbreviation (`e.g.`, `Oct.`).
+/// line breaks, and after `。！？` without requiring spaces. A dot inside a
+/// token (`docs.rs`, `v1.2`) or abbreviation (`e.g.`, `Oct.`) is not an end.
 fn sentences(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let ends = match b {
-            b'\n' => true,
-            b'.' => dot_ends(text, i),
-            b'!' | b'?' => bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace()),
+    for (i, c) in text.char_indices() {
+        let end = i + c.len_utf8();
+        let ends = match c {
+            '\n' | '。' | '！' | '？' => true,
+            '.' => dot_ends(text, i),
+            '!' | '?' => bytes.get(end).is_none_or(|n| n.is_ascii_whitespace()),
             _ => false,
         };
         if ends {
-            let s = text[start..=i].trim();
+            let s = text[start..end].trim();
             if !s.is_empty() {
                 out.push(s);
             }
-            start = i + 1;
+            start = end;
         }
-        i += 1;
     }
     let tail = text[start..].trim();
     if !tail.is_empty() {
@@ -125,13 +104,19 @@ fn cover(topic: &[String], passage: &str) -> f64 {
     if topic.is_empty() {
         return 0.0;
     }
-    let have: HashSet<String> = words(passage).into_iter().collect();
-    topic.iter().filter(|t| have.contains(*t)).count() as f64 / topic.len() as f64
+    topic
+        .iter()
+        .filter(|term| super::query::matches(term, passage))
+        .count() as f64
+        / topic.len() as f64
 }
 
 /// Cut `text` to at most `max` characters, at a sentence end when one lies in the
 /// last 40% of the window, otherwise at a word, with an ellipsis.
 pub fn cut(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     let text = text.trim();
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max {
@@ -141,17 +126,23 @@ pub fn cut(text: &str, max: usize) -> String {
     let window = &chars[..max];
     if let Some(end) = window
         .iter()
-        .rposition(|c| matches!(c, '.' | '!' | '?'))
+        .rposition(|c| matches!(c, '.' | '!' | '?' | '。' | '！' | '？'))
         .filter(|p| *p >= floor)
-        .filter(|p| chars.get(p + 1).is_none_or(|n| n.is_whitespace()))
+        .filter(|p| {
+            matches!(chars[*p], '。' | '！' | '？')
+                || chars.get(p + 1).is_none_or(|n| n.is_whitespace())
+        })
     {
         return window[..=end].iter().collect();
     }
+    // Reserve the ellipsis too; a word longer than the budget must not make
+    // the excerpt exceed it, including for a one-character Unicode window.
+    let window = &window[..max - 1];
     let space = window
         .iter()
         .rposition(|c| c.is_whitespace())
-        .unwrap_or(max);
-    let mut head: String = window[..space.max(1)].iter().collect();
+        .unwrap_or(window.len());
+    let mut head: String = window[..space].iter().collect();
     while head.ends_with([',', ';', ':', '-', ' ']) {
         head.pop();
     }
@@ -174,13 +165,14 @@ fn best_window(topic: &[String], text: &str, max: usize) -> Option<(f64, String)
             if len == 2 && joined.chars().count() > max {
                 continue;
             }
-            let c = cover(topic, &joined);
+            let visible = cut(&joined, max);
+            let c = cover(topic, &visible);
             // A little credit for filling the window: between two equal covers
             // the fuller sentence says more.
-            let fill = (joined.chars().count().min(max) as f64) / (max as f64) * 0.05;
+            let fill = visible.chars().count() as f64 / max as f64 * 0.05;
             let score = c + fill;
             if best.as_ref().is_none_or(|(s, _)| score > *s + 1e-9) {
-                best = Some((score, joined));
+                best = Some((score, visible));
             }
         }
     }
@@ -193,10 +185,34 @@ pub fn coverage(query: &str, passage: &str) -> f64 {
     cover(&topic(query), passage)
 }
 
+/// Fit an already-selected source excerpt, retaining complete lines when it
+/// contains code. Omissions are explicit; commands never become one sentence.
+pub(crate) fn quote(text: &str, max: usize) -> String {
+    if text.chars().count() <= max || !text.contains('\n') {
+        return cut(text, max);
+    }
+    let mut out = String::new();
+    for line in text.lines() {
+        let separator = usize::from(!out.is_empty());
+        if out.chars().count() + separator + line.chars().count() + 2 > max {
+            break;
+        }
+        if separator > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if out.is_empty() {
+        return cut(text.lines().next().unwrap_or(""), max);
+    }
+    out.push_str("\n…");
+    out
+}
+
 /// A date a SERP puts in front of the description ("Mar 10, 2020 · ...",
-/// "3 days ago — ..."): it is metadata, and in a 180-character window it costs
-/// words that belong to the answer.
-fn strip_lead_date(s: &str) -> &str {
+/// "3 days ago — ..."). Keep it attached to whichever passage is selected;
+/// removing it made dated search results unusable as evidence of a recent event.
+fn split_lead_date(s: &str) -> (&str, &str) {
     static LEAD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = LEAD.get_or_init(|| {
         regex::Regex::new(
@@ -205,8 +221,18 @@ fn strip_lead_date(s: &str) -> &str {
         .expect("lead-date pattern")
     });
     match re.find(s) {
-        Some(m) => &s[m.end()..],
-        None => s,
+        Some(m) => (&s[..m.end()], &s[m.end()..]),
+        None => ("", s),
+    }
+}
+
+/// Retain a source's displayed date when its teaser is replaced from that page.
+pub(crate) fn dated_passage(original: &str, passage: &str) -> String {
+    let (date, _) = split_lead_date(original);
+    if date.is_empty() || passage.starts_with(date) {
+        passage.to_string()
+    } else {
+        format!("{date}{passage}")
     }
 }
 
@@ -214,6 +240,27 @@ fn strip_lead_date(s: &str) -> &str {
 pub(crate) fn is_stub(s: &str) -> bool {
     let t = s.trim();
     t.chars().count() < 20 || t.starts_with("Redirecting")
+}
+
+/// A description that explicitly promises instructions rather than supplying
+/// them. A false positive costs one bounded page read; a false negative leaves
+/// the original excerpt. Inline code keeps a usable instruction out of this set.
+pub(crate) fn is_teaser(s: &str) -> bool {
+    if s.contains('`') {
+        return false;
+    }
+    let lower = s.to_lowercase();
+    [
+        "learn how to",
+        "this guide",
+        "this tutorial",
+        "this article",
+        "step-by-step guide",
+        "we will show you",
+        "we'll show you",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 
 /// The snippet to show for a result: across every source's snippet, the window
@@ -229,43 +276,197 @@ pub fn pick(query: &str, candidates: &[String], max: usize) -> String {
     };
     let mut best: Option<(f64, String)> = None;
     for c in pool {
-        if let Some((score, w)) = best_window(&topic, strip_lead_date(c), max)
+        let (date, body) = split_lead_date(c);
+        let room = max.saturating_sub(date.chars().count());
+        if room == 0 {
+            continue;
+        }
+        if let Some((score, w)) = best_window(&topic, body, room)
             && best.as_ref().is_none_or(|(s, _)| score > *s + 1e-9)
         {
-            best = Some((score, w));
+            best = Some((score, format!("{date}{w}")));
         }
     }
     best.map(|(_, w)| w).unwrap_or_default()
 }
 
-/// The passage of a fetched page that answers the query: paragraphs are the
-/// units, and the best-covering one is cut to `max`. `None` when no paragraph
-/// shares a single topic word with the query: a page that does not speak to the
-/// query has no passage to offer, and the teaser stays.
+/// The passage of a fetched page that speaks to the query. Prose, instructions,
+/// table rows and code share the document view's passage boundaries. Structured
+/// excerpts retain their source context, columns and indentation.
 pub fn passage(query: &str, markdown: &str, max: usize) -> Option<String> {
+    if max == 0 {
+        return None;
+    }
     let topic = topic(query);
     if topic.is_empty() {
         return None;
     }
     let mut best: Option<(f64, String)> = None;
-    for para in markdown.split("\n\n") {
-        let para = para.trim();
-        // Headings, rules, tables and code are not prose a person would quote.
-        if para.chars().count() < 40
-            || para.starts_with(['#', '|', '`', '>', '-', '*', '[', '!'])
-            || para.starts_with("---")
-        {
+    let howto = super::query::QueryFacts::new(query).shape() == super::query::Shape::HowTo;
+    let passages = crate::extract::view::source_passages(markdown);
+    for (index, (context, source)) in passages.iter().enumerate() {
+        let mut text = source.clone();
+        if list_item(source) {
+            // Adjacent instructions/ingredients belong together when they fit.
+            // Never cross a paragraph or heading to invent a combined recipe.
+            for (next_context, next) in passages.iter().skip(index + 1).take(3) {
+                if context != next_context
+                    || !list_item(next)
+                    || context.chars().count().min(80)
+                        + text.chars().count()
+                        + next.chars().count()
+                        + 3
+                        > max
+                {
+                    break;
+                }
+                text.push('\n');
+                text.push_str(next);
+            }
+        }
+        let para = text.trim();
+        // Projection notes and image/link-only navigation are not source facts.
+        if para.starts_with("*[") || para.starts_with("![") || para.is_empty() {
             continue;
         }
-        let flat = para.split_whitespace().collect::<Vec<_>>().join(" ");
-        let Some((score, w)) = best_window(&topic, &flat, max) else {
+        let structured = para.starts_with(['|', '`', '~']) || list_item(para);
+        let candidate = if structured {
+            let commands = howto.then(|| command_excerpt(para)).flatten();
+            structured_window(&topic, context, commands.as_deref().unwrap_or(para), max)
+        } else {
+            let flat = para.split_whitespace().collect::<Vec<_>>().join(" ");
+            best_window(&topic, &flat, max)
+        };
+        let Some((mut score, w)) = candidate else {
             continue;
         };
+        if howto {
+            // In a procedural question, actual source instructions beat a
+            // near-equal introduction that merely repeats the question.
+            score += if structured { 0.25 } else { 0.0 };
+            score -= if is_teaser(&w) { 0.3 } else { 0.0 };
+        }
         if cover(&topic, &w) > 0.0 && best.as_ref().is_none_or(|(s, _)| score > *s + 1e-9) {
             best = Some((score, w));
         }
     }
     best.map(|(_, w)| w)
+}
+
+fn list_item(text: &str) -> bool {
+    let text = text.trim_start();
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    text.starts_with("- ")
+        || text.starts_with("* ")
+        || text.starts_with("+ ")
+        || (digits > 0 && (text[digits..].starts_with(". ") || text[digits..].starts_with(") ")))
+}
+
+/// Console examples mark input with `$ `. For a procedural question, quote
+/// those inputs and their continuations rather than letting download logs win
+/// on incidental platform/version words. Omissions remain explicit.
+fn command_excerpt(text: &str) -> Option<String> {
+    if !text.starts_with("```") && !text.starts_with("~~~") {
+        return None;
+    }
+    if !text.lines().any(|s| s.trim_start().starts_with("$ ")) {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut continuation = false;
+    let mut omitted = false;
+    for line in text.lines().skip(1) {
+        if line.starts_with("```") || line.starts_with("~~~") {
+            break;
+        }
+        if continuation || line.trim_start().starts_with("$ ") {
+            if omitted && !lines.is_empty() {
+                lines.push("…");
+            }
+            lines.push(line);
+            continuation = line.trim_end().ends_with('\\');
+            omitted = false;
+        } else if !line.trim().is_empty() {
+            omitted = true;
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Quote complete source lines, never join shell commands or YAML indentation
+/// into prose. A table's column header is mandatory; oversized headers are left
+/// to the fetch tool rather than returning an unlabeled number.
+fn structured_window(
+    topic: &[String],
+    context: &str,
+    text: &str,
+    max: usize,
+) -> Option<(f64, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let fenced = lines
+        .first()
+        .is_some_and(|s| s.starts_with("```") || s.starts_with("~~~"));
+    let body = if fenced {
+        let end = lines.len()
+            - usize::from(
+                lines
+                    .last()
+                    .is_some_and(|s| s.starts_with("```") || s.starts_with("~~~"))
+                    && lines.len() > 1,
+            );
+        &lines[1..end]
+    } else {
+        &lines[..]
+    };
+    let context = cut(context, max.min(80));
+    let prefix = if context.is_empty() {
+        String::new()
+    } else {
+        format!("{context}:\n")
+    };
+    let table = text.starts_with('|');
+    let list = list_item(text);
+    let mut best: Option<(f64, String)> = None;
+    for start in 0..body.len() {
+        // Table passages already contain the header and one row.
+        if table && start > 0 {
+            break;
+        }
+        let mut quote = prefix.clone();
+        for line in &body[start..] {
+            let size = quote.chars().count()
+                + line.chars().count()
+                + usize::from(!quote.is_empty() && !quote.ends_with('\n'));
+            if size > max {
+                // A long instruction is prose; quote its opening with an
+                // ellipsis. Code and table cells must keep their syntax.
+                let separator = usize::from(!quote.is_empty() && !quote.ends_with('\n'));
+                let room = max.saturating_sub(quote.chars().count() + separator);
+                if list && room >= 40 {
+                    if separator > 0 {
+                        quote.push('\n');
+                    }
+                    quote.push_str(&cut(line, room));
+                }
+                break;
+            }
+            if !quote.is_empty() && !quote.ends_with('\n') {
+                quote.push('\n');
+            }
+            quote.push_str(line);
+        }
+        let content = quote.strip_prefix(&prefix).unwrap_or(&quote);
+        if content.trim().is_empty() || (table && content.lines().count() < body.len()) {
+            continue;
+        }
+        let score = cover(topic, &quote)
+            + 0.06
+            + content.chars().count().min(max) as f64 / max as f64 * 0.05;
+        if cover(topic, &quote) > 0.0 && best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((score, quote));
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -287,6 +488,15 @@ mod tests {
             EVIDENCE_CHARS,
         );
         assert_eq!(got, on_topic);
+        let hidden = format!(
+            "{} Tokio spawn creates asynchronous tasks.",
+            "Background without the answer ".repeat(30)
+        );
+        let got = pick("tokio spawn", &c(&[&hidden, on_topic]), 100);
+        assert!(
+            got.contains("Tokio") || got.contains("Tokio's"),
+            "only shown evidence may earn coverage: {got}"
+        );
     }
 
     #[test]
@@ -324,6 +534,17 @@ mod tests {
     fn dots_inside_tokens_do_not_end_a_sentence() {
         let s = sentences("See docs.rs/tokio for v1.2 details. Then read on.");
         assert_eq!(s, ["See docs.rs/tokio for v1.2 details.", "Then read on."]);
+        assert_eq!(
+            sentences("首都です。人口は多い！本当？はい。"),
+            ["首都です。", "人口は多い！", "本当？", "はい。"]
+        );
+        let long = format!(
+            "{}。人口は2025年に約1400万人と推計されます。詳細はこちら。",
+            "背景情報".repeat(70)
+        );
+        let got = pick("人口 2025", &c(&[&long]), 70);
+        assert!(got.contains("1400"), "{got}");
+        assert_eq!(cut("甲乙。丙丁。戊己。", 7), "甲乙。丙丁。");
     }
 
     #[test]
@@ -346,33 +567,41 @@ mod tests {
             "Redirecting to the page now please"
         );
         assert_eq!(pick("compose", &[], EVIDENCE_CHARS), "");
+        assert!(is_teaser(
+            "Learn how to configure a reverse proxy in this guide."
+        ));
+        assert!(!is_teaser(
+            "This guide uses `proxy_pass http://backend/;` to replace the prefix."
+        ));
+        assert!(!is_teaser(
+            "Compose waits for the dependency health check to pass."
+        ));
     }
 
     #[test]
-    fn a_date_in_front_of_a_description_is_not_part_of_the_snippet() {
-        for (raw, want) in [
-            (
-                "Mar 10, 2020 · Squash your commits using git rebase now.",
-                "Squash your commits using git rebase now.",
-            ),
-            (
-                "10 March 2020 — Squash your commits using git rebase now.",
-                "Squash your commits using git rebase now.",
-            ),
-            (
-                "3 days ago - Squash your commits using git rebase now.",
-                "Squash your commits using git rebase now.",
-            ),
-            (
-                "2020 was the year we squash commits with rebase.",
-                "2020 was the year we squash commits with rebase.",
-            ),
+    fn a_sources_date_stays_attached_to_its_selected_evidence() {
+        for raw in [
+            "Mar 10, 2020 · Squash your commits using git rebase now.",
+            "10 March 2020 — Squash your commits using git rebase now.",
+            "3 days ago - Squash your commits using git rebase now.",
+            "2020 was the year we squash commits with rebase.",
         ] {
             assert_eq!(
                 pick("squash commits rebase", &c(&[raw]), EVIDENCE_CHARS),
-                want
+                raw
             );
         }
+        assert_eq!(
+            dated_passage(
+                "3 days ago - Learn how to configure it.",
+                "Set Restart=on-failure."
+            ),
+            "3 days ago - Set Restart=on-failure."
+        );
+        assert_eq!(
+            dated_passage("No date here", "Actual instructions."),
+            "Actual instructions."
+        );
     }
 
     #[test]
@@ -381,6 +610,9 @@ mod tests {
         let long = "word ".repeat(100);
         let out = cut(&long, 50);
         assert!(out.chars().count() <= 51 && out.ends_with('…'), "{out}");
+        assert_eq!(cut("中文", 0), "");
+        assert_eq!(cut("中文", 1), "…");
+        assert_eq!(cut("unbrokenidentifier", 5).chars().count(), 5);
     }
 
     #[test]
@@ -396,5 +628,74 @@ mod tests {
             passage("the of", page, PASSAGE_CHARS).is_none(),
             "no topic, no passage"
         );
+        assert!(
+            passage(
+                "orion calibration",
+                "*[dropped by focus: orion calibration]*\n\nUnrelated prose.",
+                PASSAGE_CHARS
+            )
+            .is_none()
+        );
+        assert_eq!(
+            coverage("site:example.com -python sqlite wal", "SQLite WAL"),
+            1.0
+        );
+        let chinese =
+            "Dockerfile 使用 FROM 指定基础镜像，使用 COPY 复制文件，使用 RUN 执行构建命令。";
+        assert!(passage("Dockerfile 中文构建命令", chinese, PASSAGE_CHARS).is_some());
+
+        let code = "# Nginx upstream configuration\n\nThis guide explains Nginx upstream configuration.\n\n```nginx\nlocation /api/ {\n    proxy_pass http://backend/;\n}\n```";
+        let got = passage("nginx upstream configuration", code, PASSAGE_CHARS).unwrap();
+        assert!(
+            got.contains("location /api/ {\n    proxy_pass http://backend/;\n}"),
+            "{got}"
+        );
+        assert!(
+            !got.contains("```"),
+            "fences cannot leak into the surrounding result list"
+        );
+        let table = "# Aeron prices\n\n| Size | USD |\n| --- | --- |\n| B | 950 |";
+        let got = passage("aeron price", table, PASSAGE_CHARS).unwrap();
+        assert!(
+            got.contains("| Size | USD |\n| --- | --- |\n| B | 950 |"),
+            "{got}"
+        );
+        assert!(
+            passage("aeron price", table, 20).is_none(),
+            "no unlabeled table values"
+        );
+        assert!(
+            passage(
+                "nginx upstream",
+                "# Other\n\n```sh\necho unrelated\n```",
+                PASSAGE_CHARS
+            )
+            .is_none()
+        );
+        let steps = "# Brake pad replacement\n\n1. Remove the wheel and retaining pin.\n2. Reset the pistons before fitting new brake pads.";
+        let got = passage("how to replace brake pads", steps, PASSAGE_CHARS).unwrap();
+        assert!(
+            got.contains("Remove the wheel") && got.contains("Reset the pistons"),
+            "{got}"
+        );
+        let guide = "# Install Orion on Linux\n\nLearn how to install Orion on Linux in this guide.\n\n## Installation\n\n```sh\norion install\norion use stable\n```";
+        assert!(
+            passage("how to install Orion on Linux", guide, PASSAGE_CHARS)
+                .unwrap()
+                .contains("orion use stable")
+        );
+        let directions = format!(
+            "# Make a starter\n\n## Ingredients\n\n- Flour and water\n\n## Directions\n\n1. Mix 45 grams each flour and water. {}",
+            "Keep stirring until the mixture is smooth. ".repeat(15)
+        );
+        let got = passage("how to make a starter", &directions, PASSAGE_CHARS).unwrap();
+        assert!(
+            got.contains("Mix 45 grams") && got.chars().count() <= PASSAGE_CHARS,
+            "{got}"
+        );
+        let console = "```sh\n$ tool install \\\n  --stable\nDownloading tool-linux.tar.gz\nFinished\n$ tool use stable\nNow using stable\n```";
+        let got = command_excerpt(console).unwrap();
+        assert_eq!(got, "$ tool install \\\n  --stable\n…\n$ tool use stable");
+        assert!(command_excerpt("```sh\nprintf '$value'\n```").is_none());
     }
 }
