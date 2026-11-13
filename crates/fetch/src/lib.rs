@@ -1,4 +1,4 @@
-//! v5 fetch core as a library: carried identity and state, and a challenge
+//! The fetch layer as a library: carried identity and state, and a challenge
 //! engine that runs the site's own program in-process (V8) when a wall demands it.
 //! No browser is linked and none is launched.
 //!

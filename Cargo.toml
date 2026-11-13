@@ -201,7 +201,7 @@ codegen-units = 16
 opt-level = 1
 codegen-units = 16
 
-# The fetch core's vendored forks: patches apply from the workspace ROOT
+# The fetch layer's vendored forks: patches apply from the workspace ROOT
 # (core keeps the same table for its standalone builds).
 #  wreq/btls-sys: Chrome ClientHello parity (trust_anchors extension +
 #  signature-algorithm list) that the published presets cannot express.

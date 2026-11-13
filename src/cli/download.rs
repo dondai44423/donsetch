@@ -115,7 +115,7 @@ pub(crate) struct Route {
 
 /// The routes this install is configured for: its explicit or ambient route
 /// first, then every HTTP proxy lane in the pool. SOCKS lanes are left to the
-/// fetch core, which owns that transport.
+/// fetch layer, which owns that transport.
 pub(crate) fn configured_routes() -> Vec<Route> {
     let cfg = crate::config::cfg();
     let p = &cfg.proxy;

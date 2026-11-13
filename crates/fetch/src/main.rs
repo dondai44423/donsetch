@@ -1,4 +1,4 @@
-//! v5 fetch core — carried identity and state.
+//! The fetch layer's dev CLI: carried identity and state.
 //!
 //! Commands
 //!   fetch <url>          one encounter, portfolio selection, state spent/earned

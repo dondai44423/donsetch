@@ -8,9 +8,9 @@ most often: turning an issue into a change.
 
 ## Local project context
 
-When local `status.md` and `project.md` files exist, read `status.md` completely,
-then `project.md` and the governing brief they name before planning project
-work. They may be private and git-ignored; keep them that way. Current decisions
+When local `docs/status.md` and `docs/project.md` exist, read `status.md` completely, then
+`project.md` and the docs they name (`docs/search.md`, `crates/fetch/README.md`) before planning
+project work. They are private and git-ignored; keep them that way. Current decisions
 and approval gates take precedence over historical plans and experimental
 artifacts. A branch or a dirty implementation is not an approved roadmap.
 

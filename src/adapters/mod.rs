@@ -152,7 +152,7 @@ pub fn rewrite(u: &url::Url) -> Option<(String, &'static str)> {
 /// Legacy reddit hosts -> the content host, and nothing else. `old.` and
 /// `np.` serve a login wall to anonymous clients, so a caller who names them is
 /// sent to the host that answers. Every other reddit URL is fetched exactly as
-/// written: the v5 core's own encounter answers the page, running the site's JS
+/// written: the fetch layer's own encounter answers the page, running the site's JS
 /// gate in-process, and reddit's `.json` is refused to anonymous clients, so
 /// rewriting a page onto it bought a guaranteed 403 and a second request.
 fn reddit_host_rw(u: &url::Url) -> Option<String> {
@@ -399,7 +399,7 @@ mod tests {
         rewrite(&url::Url::parse(u).unwrap())
     }
 
-    // A reddit page is fetched exactly as written: the v5 core's own encounter
+    // A reddit page is fetched exactly as written: the fetch layer's own encounter
     // answers it (the JS gate runs in-process), and its `.json` is refused to
     // anonymous clients, so rewriting onto it only bought a 403 and a second
     // request.

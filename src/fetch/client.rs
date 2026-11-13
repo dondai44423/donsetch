@@ -1,4 +1,4 @@
-//! The fetcher every caller shares, over the v5 core (`src/fetch/v5.rs`).
+//! The fetcher every caller shares, over the fetch layer (`src/fetch/layer.rs`).
 //!
 //! Two entry points:
 //! - documents (`fetch`, `fetch_via*`, `fetch_persona*`, `fetch_cold_probe`)

@@ -1,4 +1,4 @@
-//! The product's fetches over the v5 core (`donsetch_fetch::Session`).
+//! The product's fetches over the fetch layer (`donsetch_fetch::Session`).
 //!
 //! Two entry points, the same two the product has always had:
 //! - a document (`Fetcher::fetch*`) is an encounter: the identity this origin
