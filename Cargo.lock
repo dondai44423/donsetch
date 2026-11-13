@@ -1335,7 +1335,7 @@ dependencies = [
  "clap",
  "config",
  "dirs",
- "donsetch-core",
+ "donsetch-fetch",
  "ed25519-dalek",
  "ego-tree",
  "encoding_rs",
@@ -1374,7 +1374,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "donsetch-core"
+name = "donsetch-fetch"
 version = "0.1.0"
 dependencies = [
  "btls",

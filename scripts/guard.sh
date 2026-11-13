@@ -39,7 +39,7 @@
 # Ceiling 55000M. The floor under it is the warm artifact set measured after
 # the 2026-11-08 profile split: fast ~22G (deps at opt-level 1), ci ~7G,
 # sccache <=10G (its own cap), a 3-day incremental window ~8G. One workspace
-# means one target dir (the core builds into it since core/ joined the
+# means one target dir (the fetch layer builds into it since crates/fetch joined the
 # workspace). ~45G is what a healthy tree costs; 55G leaves room for one
 # `dist` release-verification tree (~10G). A crossing means rot, not the ladder.
 #
@@ -63,10 +63,8 @@ case "${1:-}" in
     *) echo "guard: unknown argument: $1" >&2 ; exit 2 ;;
 esac
 
-# Every target dir this tree owns. the core keeps a target of its own (its
-# standalone builds and tests); it
-# counts toward the ceiling so its cache cannot hide outside it. Review
-# worktrees under target/wt* are already inside `target`.
+# Every target dir this tree owns. The workspace shares one; review worktrees
+# under target/wt* are already inside `target`.
 target_dirs() {
     for t in target fuzz/target; do
         if [ -d "$t" ]; then

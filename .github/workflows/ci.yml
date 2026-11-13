@@ -133,7 +133,7 @@ jobs:
                 # Code whose behaviour differs by operating system: processes
                 # and restarts, paths, profile detection, PDF and ONNX natives,
                 # the updater, the build itself and this workflow.
-                if echo "$changed" | grep -qE '^(src/(mcp|profile|pdf|browser|cli)/|src/(paths|onnx|handles|cpu|persona|state_probe|egress/proxy)\.|core/|build\.rs|Cargo\.(toml|lock)|npm/|scripts/|\.github/)'; then
+                if echo "$changed" | grep -qE '^(src/(mcp|profile|pdf|browser|cli)/|src/(paths|onnx|handles|cpu|persona|state_probe|egress/proxy)\.|crates/|build\.rs|Cargo\.(toml|lock)|npm/|scripts/|\.github/)'; then
                   platforms=true
                 fi
               else

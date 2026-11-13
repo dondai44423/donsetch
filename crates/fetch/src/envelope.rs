@@ -99,7 +99,7 @@ pub fn init_v8() -> Result<(), String> {
             let flag = format!("--wasm-max-mem-pages={WASM_MAX_PAGES}");
             // The first argument stands for the program name and always comes
             // back; anything else is a flag this V8 does not know.
-            let unknown = deno_core::v8_set_flags(vec!["donsetch-core".to_string(), flag.clone()]);
+            let unknown = deno_core::v8_set_flags(vec!["donsetch-fetch".to_string(), flag.clone()]);
             match unknown.get(1) {
                 None => Ok(()),
                 Some(bad) => Err(format!(

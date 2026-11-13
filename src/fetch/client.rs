@@ -63,7 +63,7 @@ pub type RedirectGate = std::sync::Arc<
 
 pub struct Fetcher {
     profile: BrowserProfile,
-    v5: crate::fetch::core::CoreFetcher,
+    v5: crate::fetch::layer::LayerFetcher,
     /// Shared egress fabric (v4 A2). When present and a proxy pool
     /// is configured, fetch sticks to one lane per host and rotates
     /// on 429/407/dead/timeout. None = historical env/slot path.
@@ -76,7 +76,7 @@ impl Fetcher {
             profile,
             // `state.no_disk_state` keeps v5's learned state and page cache in
             // memory, like every other store.
-            v5: crate::fetch::core::CoreFetcher::new(!crate::config::cfg().state.no_disk_state),
+            v5: crate::fetch::layer::LayerFetcher::new(!crate::config::cfg().state.no_disk_state),
             egress: None,
         })
     }
@@ -227,7 +227,7 @@ impl Fetcher {
         let hop_proxy = route.proxy_for(url_str)?;
         let out = self
             .v5
-            .document(crate::fetch::core::Document {
+            .document(crate::fetch::layer::Document {
                 url: url_str,
                 proxy: hop_proxy,
                 route: route.clone(),
@@ -261,7 +261,7 @@ impl Fetcher {
         user_agent: &str,
     ) -> Result<FetchOutcome, FetchError> {
         self.v5
-            .once(crate::fetch::core::OneShot {
+            .once(crate::fetch::layer::OneShot {
                 url: url_str,
                 conditional: &[],
                 proxy,
@@ -304,7 +304,7 @@ impl Fetcher {
         proxy: Option<&proxy::Proxy>,
     ) -> Result<FetchOutcome, FetchError> {
         self.v5
-            .once(crate::fetch::core::OneShot {
+            .once(crate::fetch::layer::OneShot {
                 url,
                 conditional: &[],
                 proxy,
@@ -329,7 +329,7 @@ impl Fetcher {
         class: RequestClass,
     ) -> Result<FetchOutcome, FetchError> {
         self.v5
-            .once(crate::fetch::core::OneShot {
+            .once(crate::fetch::layer::OneShot {
                 url: url_str,
                 conditional,
                 proxy,
@@ -536,7 +536,7 @@ fn lane_note(e: &FetchError) -> Option<LaneNote> {
         // The lane's proxy answered that it could not reach the target, which
         // is how a name it cannot resolve can come back: the lane connected,
         // so it stays seated, as for a name the local guard cannot resolve.
-        FetchError::Io(error) if crate::fetch::core::proxy_refused_the_target(error) => None,
+        FetchError::Io(error) if crate::fetch::layer::proxy_refused_the_target(error) => None,
         FetchError::Io(_) | FetchError::Tls(_) => Some(LaneNote::Dead),
         // A proxy that demands credentials. Ahead of the text arms:
         // "CONNECT -> 407" must never read as a dead lane.

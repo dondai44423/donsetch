@@ -16,18 +16,18 @@ artifacts. A branch or a dirty implementation is not an approved roadmap.
 
 ## The fetch path has a shape
 
-`src/` is the product; `core/` (repo root, its own crate and CI job) is the whole
-fetching layer: carried client identity, carried state, a page cache, wall
+`src/` is the product; `crates/fetch/` (its own crate and CI job) is the fetching
+layer: carried client identity, carried state, a page cache, wall
 classification, the site's own interfaces, and an in-process V8 engine that runs a
-challenge page's own program. No browser is in the path. `design/` is the private
-working set (the brief, the mechanism, the core README); frozen v4 evidence lives
+challenge page's own program. No browser is in the path. Private working docs live in `docs/`; frozen v4 evidence
+lives
 outside the checkout, in `~/Projects/donsetch-evidence/`.
 
 Fetch work is one of exactly four contract classes — **identity, state, request
 contract, egress**. Anything else is drift, however plausible. Before code:
 
 - **Classify first.** A wall is one of nine outcome classes with a vendor and an ask.
-  Reproduce it (`donsetch-core probe` / `bench`), name the class, then say what would
+  Reproduce it (`donsetch-fetch probe` / `bench`), name the class, then say what would
   answer it. A wall a clean reference client also receives on the same egress is not
   ours to fix.
 - **Only two asks are declared: human interaction and a login.** Identity, state,

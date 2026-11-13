@@ -4,7 +4,7 @@
   "max_single_test_s": 30,
   "max_sum_s": 720,
   "suites": {
-    "donsetch-core::donsetch_core": 232,
+    "donsetch-fetch::donsetch_fetch": 232,
     "donsetch::donsetch": 2148,
     "donsetch::it": 107
   },
@@ -12,6 +12,6 @@
   "fixtures_mb": {
     "tests/fixtures": 4,
     "tests/pdf-corpus": 50,
-    "core/fixtures": 8
+    "crates/fetch/fixtures": 8
   }
 }

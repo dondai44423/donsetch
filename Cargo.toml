@@ -1,8 +1,8 @@
-# One workspace: the product and its fetch core compile in PARALLEL. As a
-# standalone path dependency, core finished before donsetch started, and the
-# product could not share a profile, a lockfile, or an artifact cache with it.
+# One workspace: the product (this crate, at the root) and its fetch layer
+# (crates/fetch). They compile in parallel, and share one profile, one lockfile
+# and one artifact cache.
 [workspace]
-members = ["core"]
+members = ["crates/fetch"]
 # fuzz/ is a standalone crate with its own lock and nightly toolchain; it must
 # not be captured by the workspace manifest above.
 exclude = ["fuzz"]
@@ -13,12 +13,12 @@ name = "donsetch"
 version = "5.3.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-description = "Web fetch, search and crawl for AI agents. Custom stealthy fetch tier: the in-tree v5 core."
+description = "Web fetch, search and crawl for AI agents."
 
 [dependencies]
-# The fetch core, in-tree: carried identity and learned state per origin,
+# The fetch layer, in-tree: carried identity and learned state per origin,
 # the page cache, data paths and the in-process V8 challenge engine.
-donsetch-core = { path = "core" }
+donsetch-fetch = { path = "crates/fetch" }
 tokio = { version = "1", features = ["full"] }
 url = "2"
 brotli = "9"
@@ -206,5 +206,5 @@ codegen-units = 16
 #  wreq/btls-sys: Chrome ClientHello parity (trust_anchors extension +
 #  signature-algorithm list) that the published presets cannot express.
 [patch.crates-io]
-wreq = { path = "core/vendor/wreq" }
-btls-sys = { path = "core/vendor/btls-sys" }
+wreq = { path = "crates/fetch/vendor/wreq" }
+btls-sys = { path = "crates/fetch/vendor/btls-sys" }

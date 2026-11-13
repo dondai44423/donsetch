@@ -1268,7 +1268,7 @@ mod proxied_read_tests {
     }
 
     fn marked(error: &FetchError) -> bool {
-        matches!(error, FetchError::Io(error) if crate::fetch::core::proxy_refused_the_target(error))
+        matches!(error, FetchError::Io(error) if crate::fetch::layer::proxy_refused_the_target(error))
     }
 
     /// With fetch rotation on and private egress not allowed, a pool lane

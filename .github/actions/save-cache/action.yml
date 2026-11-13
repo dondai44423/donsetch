@@ -25,7 +25,7 @@ runs:
     - name: Drop this workspace's own artifacts
       shell: bash
       run: |
-        cargo clean -p donsetch -p donsetch-core --profile "${{ inputs.profile }}" || true
+        cargo clean -p donsetch -p donsetch-fetch --profile "${{ inputs.profile }}" || true
         rm -rf target/*/incremental
         du -sm target | awk '{print "cache payload: " $1 " MB uncompressed"}'
     - name: Save dependency cache

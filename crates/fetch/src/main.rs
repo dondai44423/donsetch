@@ -11,9 +11,9 @@
 //! The challenge engine runs the site's own program in-process, in V8, when a
 //! wall demands it. No browser is linked and none is launched.
 
-use donsetch_core::contract::{self, Contract};
-use donsetch_core::fetch::{self, class_name, Options, Worker};
-use donsetch_core::{classify, envelope, identity, state};
+use donsetch_fetch::contract::{self, Contract};
+use donsetch_fetch::fetch::{self, class_name, Options, Worker};
+use donsetch_fetch::{classify, envelope, identity, state};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -74,13 +74,13 @@ fn main() {
         "scorecard" => command_scorecard(&flags),
         "state" => command_state(&arguments, &flags),
         "cache" => {
-            donsetch_core::cache::PageCache::for_state().clear();
+            donsetch_fetch::cache::PageCache::for_state().clear();
             println!("page cache cleared");
             0
         }
         _ => {
             eprintln!(
-                "usage: donsetch-core <fetch <url>|probe --targets <file>|bench --targets <file>|identities|scorecard|state>"
+                "usage: donsetch-fetch <fetch <url>|probe --targets <file>|bench --targets <file>|identities|scorecard|state>"
             );
             2
         }
@@ -308,7 +308,7 @@ fn command_scorecard(flags: &Flags) -> i32 {
     } else {
         println!(
             "scorecard: {} of {} identities drifted or were unmeasurable; re-capture deliberately \
-and record with `donsetch-core scorecard --record`",
+and record with `donsetch-fetch scorecard --record`",
             failures.len(),
             baseline.identities.len()
         );
@@ -320,7 +320,7 @@ fn command_state(arguments: &[String], flags: &Flags) -> i32 {
     let action = arguments.get(2).map(String::as_str).unwrap_or("show");
     match action {
         "reset" => {
-            donsetch_core::cache::PageCache::for_state().clear();
+            donsetch_fetch::cache::PageCache::for_state().clear();
             if let Some(path) = state::state_path() {
                 let _ = std::fs::remove_file(&path);
                 println!("cleared {}", path.display());
@@ -678,7 +678,7 @@ fn command_bench(flags: &Flags) -> i32 {
 
     let summary = summarize(&reports, &curl_rows);
     let document = serde_json::json!({
-        "schema": "donsetch-core/bench/1",
+        "schema": "donsetch-fetch/bench/1",
         "runs": runs,
         "targets": reports,
         "curl": curl_rows,

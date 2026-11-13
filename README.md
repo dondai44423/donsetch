@@ -592,7 +592,7 @@ Every layer in Rust.
 
 | Component | What | Where |
 |---|---|---|
-| 🛡️ **Fetch core** | The fetch engine: client identities, learned state, page cache, wall classification, the site's own interfaces, the in-process V8 challenge engine | `core/` |
+| 🛡️ **Fetch core** | The fetch engine: client identities, learned state, page cache, wall classification, the site's own interfaces, the in-process V8 challenge engine | `crates/fetch/` |
 | 📝 **DonSift** | HTML → markdown, block model, 12-language BM25, the page views (`must_contain`, `focus`, `toc`, `section`) | `src/extract/` |
 | 🔎 **DonSeek** | Keyless multi-engine search, RRF + BM25+ + consensus + a compiled linear ranker | `src/search/` |
 | 🕷️ **DonTread** | Crawl engine, sitemap, focus frontier, Governor pacing, resume tokens | `src/crawl/` |

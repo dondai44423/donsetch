@@ -833,7 +833,7 @@ mod tests {
             facts: Some(&facts),
         };
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (label, answer) = crate::fetch::core::REQUEST_COUNT
+        let (label, answer) = crate::fetch::layer::REQUEST_COUNT
             .scope(
                 std::sync::Arc::clone(&count),
                 engine_task_with_budget(
@@ -875,10 +875,10 @@ mod tests {
             std::env::var_os("DSB_SOURCE_WITNESS").expect("set an absolute witness output path");
         let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let out = crate::fetch::core::REQUEST_COUNT
+        let out = crate::fetch::layer::REQUEST_COUNT
             .scope(
                 std::sync::Arc::clone(&count),
-                crate::fetch::core::REQUEST_LIMIT.scope(
+                crate::fetch::layer::REQUEST_LIMIT.scope(
                     2,
                     fetcher.fetch_once_via(
                         "https://yandex.com/search/site/?text=rust%20ownership&lang=en&tmpl_version=releases&web=1&frame=1&searchid=3131712",

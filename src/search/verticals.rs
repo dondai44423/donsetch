@@ -994,10 +994,10 @@ mod tests {
             std::env::var_os("DSB_SOURCE_WITNESS").expect("set an absolute witness output path");
         let fetcher = Fetcher::new(crate::profile::BrowserProfile::host_default()).unwrap();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let answer = crate::fetch::core::REQUEST_COUNT
+        let answer = crate::fetch::layer::REQUEST_COUNT
             .scope(
                 std::sync::Arc::clone(&count),
-                crate::fetch::core::REQUEST_LIMIT.scope(
+                crate::fetch::layer::REQUEST_LIMIT.scope(
                     2,
                     run(&fetcher, "wikipedia", "quantum entanglement", None, None),
                 ),

@@ -1,13 +1,11 @@
-# DonSeTch private working docs + build artifacts
-status.md
-project.md
-
-# Private design blueprints — never public
-design/
+# Private working docs — never public
+docs/status.md
+docs/project.md
+docs/search.md
 
 # Rust
 /target
-/core/target
+/crates/fetch/target
 # Machine-specific cargo config (libclang/bindgen env — differs per OS)
 .cargo/
 
@@ -27,7 +25,7 @@ bench/battle-corpus/
 bench/improve/out/
 
 # Vendored PDFium static libraries (build.rs auto-downloads)
-# Root-anchored: the committed forks live in core/vendor.
+# Root-anchored: the committed forks live in crates/fetch/vendor.
 /vendor/
 
 # PDF corpus binaries (download via scripts/download-corpus.sh)
@@ -47,7 +45,7 @@ bench/regression-results.json
 
 
 # Private core working material (corpus, fixtures, bench artifacts)
-/core/runs/
-/core/hard-corpus.json
-/core/fixtures/
+/crates/fetch/runs/
+/crates/fetch/hard-corpus.json
+/crates/fetch/fixtures/
 __pycache__/

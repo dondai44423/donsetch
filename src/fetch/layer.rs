@@ -1,4 +1,4 @@
-//! The product's fetches over the v5 core (`donsetch_core::Session`).
+//! The product's fetches over the v5 core (`donsetch_fetch::Session`).
 //!
 //! Two entry points, the same two the product has always had:
 //! - a document (`Fetcher::fetch*`) is an encounter: the identity this origin
@@ -87,12 +87,12 @@ tokio::task_local! {
     pub(crate) static REQUEST_LIMIT: usize;
     pub(crate) static REQUEST_SOURCE_COUNT: Arc<std::sync::atomic::AtomicUsize>;
     pub(crate) static REQUEST_ORIGIN_GUARD: OriginGuard;
-    pub(crate) static REQUEST_RESPONSE: donsetch_core::ResponseHead;
+    pub(crate) static REQUEST_RESPONSE: donsetch_fetch::ResponseHead;
 }
 
 pub(crate) type OriginGuard = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
 
-fn request_start(refusal: Arc<Mutex<Option<FetchError>>>) -> Option<donsetch_core::RequestStart> {
+fn request_start(refusal: Arc<Mutex<Option<FetchError>>>) -> Option<donsetch_fetch::RequestStart> {
     let total = REQUEST_COUNT.try_with(Arc::clone).ok();
     let source = REQUEST_SOURCE_COUNT.try_with(Arc::clone).ok();
     let limit = REQUEST_LIMIT.try_with(|limit| *limit).unwrap_or(usize::MAX);
@@ -125,8 +125,8 @@ fn request_start(refusal: Arc<Mutex<Option<FetchError>>>) -> Option<donsetch_cor
     }))
 }
 
-pub struct CoreFetcher {
-    session: Arc<donsetch_core::Session>,
+pub struct LayerFetcher {
+    session: Arc<donsetch_fetch::Session>,
 }
 
 /// A document request as the product describes it.
@@ -165,16 +165,16 @@ pub struct OneShot<'a> {
     pub identity: Option<&'static str>,
 }
 
-impl CoreFetcher {
+impl LayerFetcher {
     /// `persist` keeps v5's learned state (scores, cookies, credentials) and its
     /// page cache on disk under the product's cache root (`v5/`), so
     /// `DONSETCH_CACHE_DIR` and `[paths] cache_dir` move them with everything else.
     pub fn new(persist: bool) -> Self {
         add_configured_roots();
         let session = if persist {
-            donsetch_core::Session::at(state_path())
+            donsetch_fetch::Session::at(state_path())
         } else {
-            donsetch_core::Session::new(false)
+            donsetch_fetch::Session::new(false)
         };
         Self {
             session: Arc::new(session),
@@ -189,19 +189,19 @@ impl CoreFetcher {
         crate::fetch::guards::ensure_url_safe_via(document.url, document.proxy.as_ref()).await?;
         let direct = document.proxy.is_none().then(|| document.route.clone());
         let refusal: Arc<Mutex<Option<FetchError>>> = Arc::default();
-        let mut request = donsetch_core::Request::new(document.url);
+        let mut request = donsetch_fetch::Request::new(document.url);
         request.proxy = proxy;
         request.learn = document.learn;
         request.cache = document.learn && !document.skip_cache;
         request.deadline = document_budget();
-        let cancel = donsetch_core::Cancel::new();
-        request.policy = donsetch_core::Policy {
+        let cancel = donsetch_fetch::Cancel::new();
+        request.policy = donsetch_fetch::Policy {
             hop: Some(hop_guard(Arc::clone(&refusal), document.gate, direct)),
             request_start: request_start(Arc::clone(&refusal)),
             response_head: REQUEST_RESPONSE.try_with(Arc::clone).ok(),
             navigation: navigation_headers(document.referer, document.url),
             cancel: Some(cancel.clone()),
-            ..donsetch_core::Policy::default()
+            ..donsetch_fetch::Policy::default()
         };
         let started = Instant::now();
         let session = Arc::clone(&self.session);
@@ -327,7 +327,7 @@ impl CoreFetcher {
         let direct = lane.is_none().then(|| route.clone());
         let mut headers: Vec<(String, String)> = Vec::new();
         let kind = if shot.class == RequestClass::Navigation {
-            donsetch_core::Kind::Navigate
+            donsetch_fetch::Kind::Navigate
         } else {
             let (accept, dest) = shot.class.accept_and_dest();
             headers.push(("accept".into(), accept));
@@ -341,7 +341,7 @@ impl CoreFetcher {
                 .into(),
             ));
             headers.push(("sec-fetch-dest".into(), dest));
-            donsetch_core::Kind::Subresource
+            donsetch_fetch::Kind::Subresource
         };
         if let Some(agent) = shot.user_agent {
             headers.push(("user-agent".into(), agent.to_string()));
@@ -350,7 +350,7 @@ impl CoreFetcher {
             Some(referer) => headers.extend(navigation_headers(Some(referer), shot.url)),
             // A subresource always has an initiator; with none named it is the
             // page's own origin.
-            None if kind == donsetch_core::Kind::Subresource => {
+            None if kind == donsetch_fetch::Kind::Subresource => {
                 headers.push(("sec-fetch-site".into(), "same-origin".into()))
             }
             None => {}
@@ -365,8 +365,8 @@ impl CoreFetcher {
             ));
         }
         let refusal: Arc<Mutex<Option<FetchError>>> = Arc::default();
-        let cancel = donsetch_core::Cancel::new();
-        let once = donsetch_core::Once {
+        let cancel = donsetch_fetch::Cancel::new();
+        let once = donsetch_fetch::Once {
             identity: Some(
                 if shot.user_agent.is_some() {
                     LEGACY_IDENTITY
@@ -381,15 +381,15 @@ impl CoreFetcher {
             cookies: shot.use_jar,
             timeout: ONCE_TIMEOUT,
             cap: REQUEST_COUNT.try_with(|_| 3 << 20).ok(),
-            policy: donsetch_core::Policy {
+            policy: donsetch_fetch::Policy {
                 hop: Some(hop_guard(Arc::clone(&refusal), None, direct)),
                 request_start: request_start(Arc::clone(&refusal)),
                 response_head: REQUEST_RESPONSE.try_with(Arc::clone).ok(),
                 request_max: Duration::MAX,
                 cancel: Some(cancel.clone()),
-                ..donsetch_core::Policy::default()
+                ..donsetch_fetch::Policy::default()
             },
-            ..donsetch_core::Once::new(shot.url)
+            ..donsetch_fetch::Once::new(shot.url)
         };
         let started = Instant::now();
         let session = Arc::clone(&self.session);
@@ -415,7 +415,7 @@ impl CoreFetcher {
 
     /// The names of the cookies any identity holds for `host`.
     pub fn cookie_names(&self, host: &str) -> Vec<String> {
-        let mut names: Vec<String> = donsetch_core::identity::names()
+        let mut names: Vec<String> = donsetch_fetch::identity::names()
             .into_iter()
             .flat_map(|identity| self.session.cookie_names(host, identity))
             .collect();
@@ -433,7 +433,7 @@ fn add_configured_roots() {
     ONCE.call_once(|| {
         let tls = &crate::config::cfg().tls;
         for pem in configured_roots(&tls.cert_file, &tls.cert_dir) {
-            donsetch_core::add_trust_pem(pem);
+            donsetch_fetch::add_trust_pem(pem);
         }
     });
 }
@@ -479,7 +479,7 @@ fn engine_proxy(proxy: Option<&Proxy>) -> Result<Option<String>, FetchError> {
         return Ok(None);
     };
     let url = proxy.wire_url();
-    donsetch_core::proxy_url(&url).map_err(FetchError::ProxyConfig)?;
+    donsetch_fetch::proxy_url(&url).map_err(FetchError::ProxyConfig)?;
     Ok(Some(url))
 }
 
@@ -494,12 +494,12 @@ pub fn state_path() -> std::path::PathBuf {
 /// Run a v5 call off the async runtime. Dropping the returned future (a
 /// caller's timeout, an aborted task, a retiring daemon) flips `cancel`, so the
 /// request in flight is dropped with its connection instead of running on.
-async fn blocking<F, R>(cancel: donsetch_core::Cancel, job: F) -> R
+async fn blocking<F, R>(cancel: donsetch_fetch::Cancel, job: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    struct OnDrop(donsetch_core::Cancel);
+    struct OnDrop(donsetch_fetch::Cancel);
     impl Drop for OnDrop {
         fn drop(&mut self) {
             self.0.cancel();
@@ -525,19 +525,19 @@ fn hop_guard(
     refusal: Arc<Mutex<Option<FetchError>>>,
     gate: Option<RedirectGate>,
     direct: Option<RequestRoute>,
-) -> donsetch_core::HopGuard {
+) -> donsetch_fetch::HopGuard {
     let handle = tokio::runtime::Handle::try_current().ok();
     Arc::new(move |previous: &str, next: &str| {
         let refuse = |error: FetchError| {
             *refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
-            donsetch_core::Hop::Deny(next.to_string())
+            donsetch_fetch::Hop::Deny(next.to_string())
         };
         let Ok(base) = url::Url::parse(previous) else {
-            return donsetch_core::Hop::Deny(next.to_string());
+            return donsetch_fetch::Hop::Deny(next.to_string());
         };
         let url = match crate::fetch::guards::validate_redirect_url(&base, next) {
             Ok(url) => url,
-            Err(FetchError::NonHttpRedirect(_)) => return donsetch_core::Hop::Stop,
+            Err(FetchError::NonHttpRedirect(_)) => return donsetch_fetch::Hop::Stop,
             Err(error) => return refuse(error),
         };
         // The session runs on a blocking thread, outside the runtime: waiting
@@ -545,16 +545,16 @@ fn hop_guard(
         if let (Some(gate), Some(handle)) = (&gate, &handle)
             && !handle.block_on(gate(url.clone()))
         {
-            return donsetch_core::Hop::Stop;
+            return donsetch_fetch::Hop::Stop;
         }
         let Some(route) = &direct else {
-            return donsetch_core::Hop::Follow;
+            return donsetch_fetch::Hop::Follow;
         };
         // The chain's client has no proxy, so this hop would leave from this
         // machine's own address; where the route names a proxy for it, the
         // read fails instead.
         match route.proxy_for(url.as_str()) {
-            Ok(None) => donsetch_core::Hop::Follow,
+            Ok(None) => donsetch_fetch::Hop::Follow,
             Ok(Some(_)) => refuse(FetchError::ProxyConfig(format!(
                 "redirect to {} refused: the configured route sends it through a proxy, \
                  and this read started direct",
@@ -680,11 +680,11 @@ pub(crate) fn proxy_refused_the_target(error: &std::io::Error) -> bool {
 /// v5's outcome as the product's. The product's own wall detector reads the
 /// body, as on every path; v5's wall class wins over a body-only `ContentOk`.
 fn into_outcome(
-    outcome: donsetch_core::Outcome,
+    outcome: donsetch_fetch::Outcome,
     route: RequestRoute,
     refusal: &Mutex<Option<FetchError>>,
 ) -> Result<FetchOutcome, FetchError> {
-    if outcome.class == donsetch_core::Class::Network && outcome.status == 0 {
+    if outcome.class == donsetch_fetch::Class::Network && outcome.status == 0 {
         // No answer at all: the last attempt's failure names the class. An
         // encounter that ran out of budget before any request is a timeout.
         let reason = outcome
@@ -744,7 +744,7 @@ fn into_outcome(
         used_pool: false,
         verdict,
         elapsed: Duration::from_secs_f64(outcome.ms_total.max(0.0) / 1000.0),
-        verified: outcome.class == donsetch_core::Class::Content && verdict == Verdict::ContentOk,
+        verified: outcome.class == donsetch_fetch::Class::Content && verdict == Verdict::ContentOk,
     })
 }
 
@@ -753,12 +753,12 @@ fn into_outcome(
 /// the passive vendor scripts real pages carry (Medium's content page ships
 /// Cloudflare's). Login walls, paywalls and soft 404s stay the product's call.
 fn verdict_for(
-    class: donsetch_core::Class,
+    class: donsetch_fetch::Class,
     wall_vendor: Option<&str>,
     detected: Verdict,
 ) -> Verdict {
     match (class, detected) {
-        (donsetch_core::Class::Content, Verdict::Challenge(_) | Verdict::Blocked) => {
+        (donsetch_fetch::Class::Content, Verdict::Challenge(_) | Verdict::Blocked) => {
             Verdict::ContentOk
         }
         (class, Verdict::ContentOk) if is_wall(class) => Verdict::Challenge(vendor(wall_vendor)),
@@ -773,8 +773,8 @@ fn verdict_for(
     }
 }
 
-fn is_wall(class: donsetch_core::Class) -> bool {
-    use donsetch_core::Class::*;
+fn is_wall(class: donsetch_fetch::Class) -> bool {
+    use donsetch_fetch::Class::*;
     matches!(
         class,
         WallState | WallProgram | WallContract | WallInteraction | WallIdentity
@@ -800,8 +800,8 @@ mod tests {
     use crate::profile::BrowserProfile;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-    fn outcome(class: donsetch_core::Class, status: u16) -> donsetch_core::Outcome {
-        donsetch_core::Outcome {
+    fn outcome(class: donsetch_fetch::Class, status: u16) -> donsetch_fetch::Outcome {
+        donsetch_fetch::Outcome {
             url: "https://a.test/".into(),
             host: "a.test".into(),
             final_url: "https://a.test/".into(),
@@ -836,14 +836,14 @@ mod tests {
         )
     }
 
-    fn map(outcome: donsetch_core::Outcome) -> Result<FetchOutcome, FetchError> {
+    fn map(outcome: donsetch_fetch::Outcome) -> Result<FetchOutcome, FetchError> {
         into_outcome(outcome, RequestRoute::direct(), &Mutex::new(None))
     }
 
     #[test]
     fn a_v5_wall_overrides_a_body_only_content_verdict() {
-        let mut walled = outcome(donsetch_core::Class::WallProgram, 200);
-        walled.wall = Some(donsetch_core::Wall {
+        let mut walled = outcome(donsetch_fetch::Class::WallProgram, 200);
+        walled.wall = Some(donsetch_fetch::Wall {
             vendor: "cloudflare".into(),
             marker: "cf_chl_opt".into(),
             asks: "managed challenge (page program)",
@@ -852,7 +852,7 @@ mod tests {
             map(walled).expect("outcome").verdict,
             Verdict::Challenge(Vendor::Cloudflare)
         );
-        let content = map(outcome(donsetch_core::Class::Content, 200)).expect("outcome");
+        let content = map(outcome(donsetch_fetch::Class::Content, 200)).expect("outcome");
         assert_eq!(content.verdict, Verdict::ContentOk);
         assert_eq!(content.body, article().into_bytes());
     }
@@ -864,7 +864,7 @@ mod tests {
             "<html><head><title>Medium</title><script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script></head><body><article>{}</article></body></html>",
             "Stories a reader came for. ".repeat(30)
         );
-        let content = donsetch_core::Class::Content;
+        let content = donsetch_fetch::Class::Content;
         let detected = walls::detect(200, &[], page.as_bytes());
         assert_eq!(
             verdict_for(content, None, Verdict::Challenge(Vendor::Cloudflare)),
@@ -878,7 +878,7 @@ mod tests {
         // An answer v5 did not verify keeps the product's wall verdict.
         assert_eq!(
             verdict_for(
-                donsetch_core::Class::Incomplete,
+                donsetch_fetch::Class::Incomplete,
                 None,
                 Verdict::Challenge(Vendor::Cloudflare)
             ),
@@ -892,7 +892,7 @@ mod tests {
         // read the reference link.
         assert_eq!(
             verdict_for(
-                donsetch_core::Class::WallIdentity,
+                donsetch_fetch::Class::WallIdentity,
                 Some("akamai"),
                 Verdict::Challenge(Vendor::Generic)
             ),
@@ -901,7 +901,7 @@ mod tests {
         // A vendor the product named itself is kept.
         assert_eq!(
             verdict_for(
-                donsetch_core::Class::WallIdentity,
+                donsetch_fetch::Class::WallIdentity,
                 Some("akamai"),
                 Verdict::Challenge(Vendor::Cloudflare)
             ),
@@ -919,7 +919,7 @@ mod tests {
             (Some("changed"), CacheState::None),
             (None, CacheState::None),
         ] {
-            let mut served = outcome(donsetch_core::Class::Content, 200);
+            let mut served = outcome(donsetch_fetch::Class::Content, 200);
             served.cache = state.map(str::to_string);
             assert_eq!(map(served).expect("outcome").cache, expected, "{state:?}");
         }
@@ -927,7 +927,7 @@ mod tests {
 
     #[test]
     fn records_reach_the_product_as_text_not_the_shell_they_came_from() {
-        let mut data = outcome(donsetch_core::Class::Content, 200);
+        let mut data = outcome(donsetch_fetch::Class::Content, 200);
         data.transport = "data".into();
         data.body = Some("<html><div id=app></div></html>".into());
         data.headers = vec![("content-type".into(), "text/html".into())];
@@ -960,7 +960,7 @@ mod tests {
             ("redirect: more than 10 redirects", "TooManyRedirects"),
             ("proxy: 407 Proxy Authentication Required", "Http"),
         ] {
-            let mut failed = outcome(donsetch_core::Class::Network, 0);
+            let mut failed = outcome(donsetch_fetch::Class::Network, 0);
             failed.failures = vec![failure.into()];
             let error = map(failed).err().expect("an error");
             assert!(
@@ -968,7 +968,7 @@ mod tests {
                 "{failure}: {error:?}"
             );
         }
-        let mut proxy = outcome(donsetch_core::Class::Network, 0);
+        let mut proxy = outcome(donsetch_fetch::Class::Network, 0);
         proxy.failures = vec!["proxy: 407 Proxy Authentication Required".into()];
         assert!(
             map(proxy)
@@ -979,7 +979,7 @@ mod tests {
         );
         // Nothing was even attempted inside the budget.
         assert!(matches!(
-            map(outcome(donsetch_core::Class::Network, 0)),
+            map(outcome(donsetch_fetch::Class::Network, 0)),
             Err(FetchError::Timeout)
         ));
     }
@@ -987,7 +987,7 @@ mod tests {
     #[test]
     fn a_refused_hop_comes_back_as_the_typed_refusal() {
         let refusal = Mutex::new(Some(FetchError::Ssrf("10.0.0.1".into())));
-        let mut denied = outcome(donsetch_core::Class::Network, 0);
+        let mut denied = outcome(donsetch_fetch::Class::Network, 0);
         denied.failures = vec!["denied: http://10.0.0.1/".into()];
         assert!(matches!(
             into_outcome(denied, RequestRoute::direct(), &refusal),
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn an_unsolicited_304_is_never_a_page() {
-        assert!(map(outcome(donsetch_core::Class::Content, 304)).is_err());
+        assert!(map(outcome(donsetch_fetch::Class::Content, 304)).is_err());
     }
 
     #[test]
@@ -1062,16 +1062,16 @@ mod tests {
         let guard = hop_guard(Arc::clone(&refusal), None, None);
         assert_eq!(
             guard("https://a.test/", "https://b.test/next"),
-            donsetch_core::Hop::Follow
+            donsetch_fetch::Hop::Follow
         );
         assert!(matches!(
             guard("https://a.test/", "http://10.0.0.1/"),
-            donsetch_core::Hop::Deny(_)
+            donsetch_fetch::Hop::Deny(_)
         ));
         assert!(refusal.lock().unwrap().is_some());
         assert_eq!(
             guard("https://a.test/", "mailto:x@a.test"),
-            donsetch_core::Hop::Stop
+            donsetch_fetch::Hop::Stop
         );
     }
 

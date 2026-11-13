@@ -31,7 +31,7 @@ async fn fetch_with_budget(
             witness.clone(),
             run_with_budget(
                 Box::pin(
-                    crate::fetch::core::CALLER_DEADLINE
+                    crate::fetch::layer::CALLER_DEADLINE
                         .scope(until, fetch_single(daemon, args, url)),
                 ),
                 deadline,

@@ -642,7 +642,10 @@ pub struct SearchOutcome {
 
 pub(crate) fn origin_policy(
     ledger: Arc<Mutex<ledger::Ledger>>,
-) -> (crate::fetch::core::OriginGuard, donsetch_core::ResponseHead) {
+) -> (
+    crate::fetch::layer::OriginGuard,
+    donsetch_fetch::ResponseHead,
+) {
     let gate = Arc::clone(&ledger);
     let guard = Arc::new(move |raw: &str| {
         let origin = url::Url::parse(raw).ok()?.origin().ascii_serialization();
@@ -1066,9 +1069,9 @@ impl Searcher {
         let result = API_LEDGER
             .scope(
                 Arc::clone(&self.ledger),
-                crate::fetch::core::REQUEST_ORIGIN_GUARD.scope(
+                crate::fetch::layer::REQUEST_ORIGIN_GUARD.scope(
                     guard,
-                    crate::fetch::core::REQUEST_RESPONSE.scope(observe, work),
+                    crate::fetch::layer::REQUEST_RESPONSE.scope(observe, work),
                 ),
             )
             .await
@@ -1291,7 +1294,7 @@ impl Searcher {
                     query,
                     read == 0,
                     started,
-                    crate::fetch::core::REQUEST_LIMIT.scope(
+                    crate::fetch::layer::REQUEST_LIMIT.scope(
                         limit,
                         self.search_counted(query, max_results, forced_intent),
                     ),
@@ -1315,14 +1318,14 @@ impl Searcher {
             out.elapsed = started.elapsed();
             Ok::<_, FetchError>(out)
         };
-        let work = crate::fetch::core::REQUEST_COUNT.scope(
+        let work = crate::fetch::layer::REQUEST_COUNT.scope(
             Arc::clone(&count),
-            crate::fetch::core::REQUEST_LIMIT.scope(limit.saturating_add(read), pipeline),
+            crate::fetch::layer::REQUEST_LIMIT.scope(limit.saturating_add(read), pipeline),
         );
-        let mut outcome = crate::fetch::core::REQUEST_ORIGIN_GUARD
+        let mut outcome = crate::fetch::layer::REQUEST_ORIGIN_GUARD
             .scope(
                 guard,
-                crate::fetch::core::REQUEST_RESPONSE
+                crate::fetch::layer::REQUEST_RESPONSE
                     .scope(observe, API_LEDGER.scope(Arc::clone(&self.ledger), work)),
             )
             .await;
@@ -1945,7 +1948,7 @@ impl Searcher {
                 let allowance = &engine_allowance;
                 let source = name.clone();
                 let measured: TaskFut<'_> = Box::pin(async move {
-                    let (label, mut result) = crate::fetch::core::REQUEST_SOURCE_COUNT
+                    let (label, mut result) = crate::fetch::layer::REQUEST_SOURCE_COUNT
                         .scope(std::sync::Arc::clone(&counter), future)
                         .await;
                     allowance.release(&source);
@@ -2440,7 +2443,7 @@ impl Searcher {
                 "direct"
             }
             .into(),
-            requests: crate::fetch::core::REQUEST_COUNT
+            requests: crate::fetch::layer::REQUEST_COUNT
                 .try_with(|count| count.load(std::sync::atomic::Ordering::Relaxed))
                 .unwrap_or(resolved.requests),
         }];
@@ -2994,10 +2997,10 @@ mod tests {
             );
             Ok(planned.clone())
         };
-        let (overlapped, attempted) = crate::fetch::core::REQUEST_COUNT
+        let (overlapped, attempted) = crate::fetch::layer::REQUEST_COUNT
             .scope(
                 Arc::clone(&count),
-                crate::fetch::core::REQUEST_LIMIT.scope(
+                crate::fetch::layer::REQUEST_LIMIT.scope(
                     1,
                     searcher.with_early_evidence(
                         "how to perform Orion calibration",
@@ -3462,7 +3465,7 @@ mod tests {
     async fn a_throttled_source_is_rested_without_losing_trust() {
         let s = test_searcher();
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        crate::fetch::core::REQUEST_COUNT
+        crate::fetch::layer::REQUEST_COUNT
             .scope(
                 Arc::clone(&count),
                 API_LEDGER.scope(Arc::clone(&s.ledger), async {

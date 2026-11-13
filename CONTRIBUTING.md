@@ -66,7 +66,7 @@ One workflow, `.github/workflows/ci.yml`, with one required check, `gate`:
 |---|---|
 | Docs-only push or PR | nothing (the gate passes) |
 | Any other push or PR | `lint` (fmt, deny, budget, clippy on both feature sets) and the full suite on Linux, about 5 minutes warm |
-| That push touches platform code (processes, paths, profile, PDF, ONNX, the updater, `core/`, build files, workflows) | the same, plus the platform suite on Windows and macOS |
+| That push touches platform code (processes, paths, profile, PDF, ONNX, the updater, `crates/fetch/`, build files, workflows) | the same, plus the platform suite on Windows and macOS |
 | A release commit, and the nightly | everything: all three test lanes, and the five shipped binaries built and gated |
 
 A newer push to master cancels the unfinished run of an older one; a release
@@ -203,7 +203,7 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## Architecture overview
 
-The fetch layer is `core/` (repo root, its own crate and CI job): carried client
+The fetch layer is `crates/fetch/` (its own crate and CI job): carried client
 identity, carried state, a page cache, wall classification, the site's own interfaces,
 and an in-process V8 engine that runs a challenge page's own program. No browser is in
 the fetch path — Chromium serves `web_screenshot` and doctor's parity capture only. The

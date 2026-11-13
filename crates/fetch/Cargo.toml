@@ -1,9 +1,9 @@
 [package]
-name = "donsetch-core"
+name = "donsetch-fetch"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "v5 fetch core: carried identity and state, an in-process V8 challenge engine, no browser"
+description = "DonSeTch fetch layer: carried identity and state, an in-process V8 challenge engine, no browser"
 license = "AGPL-3.0-only"
 
 [dependencies]
