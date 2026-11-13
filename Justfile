@@ -3,11 +3,17 @@
 # THE LADDER (each rung is a different question; climb only as far as the
 # question needs):
 #
-#   1. just check       types + cfg, full feature set        ~1 s warm
-#   2. just t <expr>    the touched scope                    ~6 s warm
-#   3. just test        the whole default suite              ~35 s warm
+#   1. just check       types + cfg, no optional features        ~1 s warm
+#   2. just t <expr>    the touched scope, no optional features  ~6 s warm
+#   3. just test        the whole default suite                  ~35 s warm
 #   4. CI               Linux gate on every push, ~5 min; Windows and macOS on
 #                       platform-touching pushes, nightly and every release
+#
+# The quick rungs run WITHOUT `ocr,http`: the featureless graph is 386 crates
+# against 572 with them, and OCR/HTTP code is not what a fetch/search edit is
+# about. Feature work uses the full-feature twins: `just check-all`, `just tf`,
+# `just test` (full by default, the suite is the gate). `just all` runs the
+# full-feature check, so nothing feature-gated reaches a push unchecked.
 #
 # `just all` is the pre-push net: guard + fmt + check + lockgate + lint + the
 # static test budget. It does NOT run the suite: CI already does.
@@ -24,8 +30,10 @@
 # dispatches npm as its own run. It stops on the first red. Nothing runs on this
 # machine, nothing waits here.
 #
-#   just check        compile-check, full feature set, fast profile
+#   just check        compile-check, no optional features, fast profile
+#   just check-all    compile-check, full feature set, all targets
 #   just t <expr>     scoped tests, fast profile (`just t crawl::frontier`)
+#   just tf <expr>    scoped tests, full feature set
 #   just th <expr>    scoped heavy test, default-filter lifted
 #   just test         the default suite, fast profile
 #   just heavy        the heavy set (soak / corpus / PDF corpus / timing)
@@ -51,13 +59,12 @@
 #
 # CPU + MEMORY citizenship: this box is the operator's desktop (8 threads,
 # 31 GB RAM, a live session next to every compile). Every cargo/build/fuzz
-# command below runs through scripts/budget.sh, which pins the whole process
-# TREE to half the cores with taskset, exports the job caps into nested build
-# systems (cmake, make, nasm), and bounds the job count by MemAvailable right
-# now: ~700 MB per rustc at codegen-units 16, after reserving 1 GB.
-#   BG_JOBS=<n>     job count (default: min of half the cores and the RAM
-#                   budget; 3-4 with a browser open, 8 on an idle box)
-#   BG_CORES=<set>  taskset core set (default: the first half)
+# command below runs through scripts/budget.sh, which exports the job caps into
+# nested build systems (cmake, make, nasm) and bounds the job count by
+# MemAvailable right now: ~700 MB per rustc at codegen-units 16, after
+# reserving 1 GB.
+#   BG_JOBS=<n>     job count (default: min of all cores and the RAM budget)
+#   BG_CORES=<set>  taskset core set (default: every core; use 0-5 for quiet)
 # With sccache installed (rust-sccache), budget.sh wires RUSTC_WRAPPER and the
 # C/C++ compilers through it, so recompiles across profiles and branches are
 # cache hits instead of work.
@@ -69,6 +76,8 @@
 # Absolute, so a recipe that cd's first (fuzz) can still use it.
 budget := "sh '" + justfile_directory() / "scripts/budget.sh" + "'"
 feat := "--features ocr,http"
+# The quick rungs run featureless: 386 crates instead of 572.
+lite := ""
 
 # Storage guard: one implementation, four entry points (scripts/guard.sh):
 # `just guard`/`just all`/pre-push measure and reclaim at the ceiling,
@@ -176,7 +185,11 @@ test:
 
 # Scoped run: `just t crawl::frontier` runs only what matches. The heavy
 # default-filter still applies; `just th` is the escape for a heavy test.
+# Featureless by default; `just tf` is the full-feature twin.
 t expression:
+    {{budget}} cargo nextest run --cargo-profile fast {{lite}} -E 'test({{expression}})'
+
+tf expression:
     {{budget}} cargo nextest run --cargo-profile fast {{feat}} -E 'test({{expression}})'
 
 # Scoped heavy run: `just th pdf::tests::progit_book` (one test, on purpose).
@@ -228,10 +241,14 @@ bin:
 bin-dist:
     {{budget}} cargo build --profile dist-thin {{feat}}
 
-# Compile-only full-feature check: the whole-crate structural signal.
-# Fast when the check graph is warm; ~2.5 min when only the test graph is
-# (check and test build different artifacts for the deps).
+# Compile-only check for the edit loop: this crate and the core, no optional
+# features, libs and bins only. Feature work uses `check-all`.
 check:
+    {{budget}} cargo check --profile fast --workspace {{lite}}
+
+# The full structural signal: every target, both feature sets' worth of code
+# (`ocr,http` here; `just all` also runs the no-feature clippy).
+check-all:
     {{budget}} cargo check --profile fast --workspace --all-targets {{feat}}
 
 # What the ladder actually costs on THIS box, right now: warm check,

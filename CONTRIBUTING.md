@@ -19,11 +19,19 @@ cargo build --release         # local release: thin LTO, parallel codegen
 The ladder: climb only as far as the question needs.
 
 ```bash
-just check              # types + cfg on the full feature set   ~1 s warm
-just t crawl::frontier  # the touched scope, fast profile       ~6 s warm
-just test               # the default suite                     ~35 s warm
+just check              # types + cfg, no optional features      ~1 s warm
+just t crawl::frontier  # the touched scope, no features         ~2 s warm
+just test               # the default suite (full features)      ~36 s warm
+just check-all          # every target, full features (the old check)
+just tf crawl::frontier # the touched scope, full features
 just all                # pre-push: guard + fmt + check + lockgate + lint + budget-static
 ```
+
+`just check` and `just t` leave `ocr,http` off on purpose: the featureless
+graph is 386 crates against 572, and OCR/HTTP code is not what a fetch or
+search edit is about. `just check-all` and `just tf` are their full-feature
+twins; `just all` checks the full set, so nothing feature-gated reaches a
+push unchecked.
 
 `just check` and `just t` run the **`fast` profile** (this crate at opt-level 0,
 deps at opt-level 1, no debuginfo, codegen-units 16), and so does every CI test

@@ -17,10 +17,10 @@ cd "$(git rev-parse --show-toplevel)"
 
 # CPU citizenship (status.md mechanic 5): the checks below are cargo
 # commands, so they ride the SAME budget wrapper as the Justfile
-# recipes. The wrapper is the cap: the whole process tree is pinned to a
-# half the cores, niced and ionice-idle, and the job caps are
-# exported into build scripts. A bare `nice cargo ...` here was the old
-# "looks capped" form that still let rustc codegen threads and
+# recipes. The wrapper exports the job caps into build scripts and leaves
+# the whole machine to the build inside `nice`/`ionice`, so the live
+# session still wins every contention. A bare `nice cargo ...` here was the
+# old "looks capped" form that still let rustc codegen threads and
 # boring-sys's make -j$(nproc) take every core.
 net() { sh scripts/budget.sh "$@"; }
 
@@ -42,7 +42,7 @@ fi
 # dirty worktree is kept and named. Still over after reclaim fails.
 sh scripts/guard.sh
 net cargo fmt --check >/dev/null
-net cargo check --locked -q --profile fast >/dev/null
+net cargo check --locked -q --profile fast --features ocr,http >/dev/null
 net cargo check --locked -q --profile fast --no-default-features >/dev/null
 node --check npm/install.js >/dev/null
 node --check npm/bin/donsetch.js >/dev/null
