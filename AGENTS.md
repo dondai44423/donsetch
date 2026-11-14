@@ -20,9 +20,11 @@ artifacts. A branch or a dirty implementation is not an approved roadmap.
 layer: carried client identity, carried state, a page cache, wall
 classification, the site's own interfaces, and an in-process V8 engine that runs a
 challenge page's own program — or an application page's own program for content (the
-content lane: a data-plane DOM, never a rendering one). No browser is in the path. Private working docs live in `docs/`; frozen v4 evidence
-lives
-outside the checkout, in `~/Projects/donsetch-evidence/`.
+content lane: a data-plane DOM, never a rendering one). No browser is in the path. A first
+content run that passes the contract mines the app's own content request; later encounters replay
+it as plain HTTP on the identity that mined it, before any JS, and re-mine on a break. Private
+working docs live in `docs/`; frozen v4 evidence lives outside the checkout, in
+`~/Projects/donsetch-evidence/`.
 
 Fetch work is one of exactly four contract classes — **identity, state, request
 contract, egress**. Anything else is drift, however plausible. Before code:

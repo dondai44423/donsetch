@@ -544,6 +544,217 @@ impl Worker {
         Interface::Unanswered
     }
 
+    /// A mined contract's replay: the request the app's own program made when
+    /// it assembled this document, as plain HTTP, on the identity and jar that
+    /// mined it, before any JavaScript runs. `None` when there is no contract
+    /// for this URL shape, or it no longer answers; a failed replay is dropped
+    /// and the lane gets its turn, which mines a fresh one.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_contract(
+        &mut self,
+        url: &str,
+        host: &str,
+        document: &crate::http::Response,
+        options: &Options,
+        started: Instant,
+        first_ms: f64,
+        attempts: &mut Vec<Attempt>,
+        spent_state: bool,
+    ) -> Option<Outcome> {
+        let (contract, _values) = self.state.contract_any(host, &document.url)?;
+        // The contract is bound to the identity that mined it: the document may
+        // have been fetched by another client, but the app's own request is
+        // replayed on the wire and jar that witnessed it.
+        let identity = identity::lookup(&contract.identity)?;
+        let remaining = options.deadline.saturating_sub(started.elapsed());
+        if remaining.as_millis() < 700 {
+            return None;
+        }
+        let (request_url, headers, body) = contract.materialize(&document.url, &document.url)?;
+        let limits = options.content.clone();
+        let guard = crate::envelope::Guard::new(limits.clone(), host);
+        if let Err(error) = guard.check_url(&request_url) {
+            attempts.push(Attempt {
+                identity: identity.name.to_string(),
+                transport: "replay".to_string(),
+                class: Class::Incomplete,
+                status: 0,
+                ms: 0.0,
+                bytes: 0,
+                version: String::new(),
+                title: String::new(),
+                note: Some(format!("replay: {error}")),
+            });
+            self.state
+                .drop_contract(host, identity.name, &contract.shape);
+            return None;
+        }
+        let Ok(wire) = Wire::guarded(identity, &guard, self.proxy.as_deref()) else {
+            return None;
+        };
+        let cookie = self.state.cookie_header_for(&request_url, identity.name);
+        let extra: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let replay_started = Instant::now();
+        let response = wire.call(
+            identity,
+            crate::http::Call {
+                method: &contract.method,
+                url: &request_url,
+                cookie: cookie.as_deref(),
+                timeout: remaining.min(Duration::from_secs(9)),
+                extra: &extra,
+                body: body.as_deref(),
+                cap: Some(limits.response_body_max),
+                kind: crate::http::Kind::Subresource,
+            },
+        );
+        let ms = replay_started.elapsed().as_secs_f64() * 1000.0;
+        // What the caller may see: the API host and path, never a request that
+        // carries the app's own key or token in a query string.
+        let safe_url = url::Url::parse(&request_url)
+            .ok()
+            .map(|parsed| {
+                format!(
+                    "{}://{}{}",
+                    parsed.scheme(),
+                    parsed.host_str().unwrap_or_default(),
+                    parsed.path()
+                )
+            })
+            .unwrap_or_else(|| host.to_string());
+        let break_note = |reason: String| -> String {
+            format!(
+                "replay: {reason} ({} {safe_url}, shape {})",
+                contract.method, contract.shape
+            )
+        };
+        let fail = |attempts: &mut Vec<Attempt>, status: u16, note: String| {
+            attempts.push(Attempt {
+                identity: identity.name.to_string(),
+                transport: "replay".to_string(),
+                class: Class::Incomplete,
+                status,
+                ms,
+                bytes: 0,
+                version: String::new(),
+                title: String::new(),
+                note: Some(note),
+            });
+        };
+        match response {
+            Ok(response) if (200..300).contains(&response.status) => {
+                let body_text = &response.body;
+                match contract.extract(body_text, &request_url) {
+                    Some(items) => {
+                        attempts.push(Attempt {
+                            identity: identity.name.to_string(),
+                            transport: "replay".to_string(),
+                            class: Class::Content,
+                            status: response.status,
+                            ms,
+                            bytes: response.body.len(),
+                            version: response.version.clone(),
+                            title: items
+                                .first()
+                                .map(|item| item.title.clone())
+                                .unwrap_or_default(),
+                            note: Some(format!(
+                                "replay: {} items (min {}) from {} {safe_url}, shape {}",
+                                items.len(),
+                                contract.min_items,
+                                contract.method,
+                                contract.shape
+                            )),
+                        });
+                        if self.persist {
+                            self.state.record(host, identity.name, "content", true, ms);
+                            self.state
+                                .record_contract(host, identity.name, &contract.shape, true);
+                            self.state.origin_mut(host).route = Some("replay".into());
+                            self.save_state();
+                        }
+                        let text_chars: usize =
+                            items.iter().map(|item| item.title.chars().count()).sum();
+                        return Some(Outcome {
+                            url: url.to_string(),
+                            cache: None,
+                            host: host.to_string(),
+                            // The caller asked for the document; the API it
+                            // names is an implementation of that answer.
+                            final_url: url.to_string(),
+                            class: Class::Content,
+                            identity: Some(identity.name.to_string()),
+                            status: response.status,
+                            ms_total: started.elapsed().as_secs_f64() * 1000.0,
+                            ms_first: first_ms,
+                            attempts: std::mem::take(attempts),
+                            title: format!("replay {host}"),
+                            text_chars,
+                            wall: None,
+                            evidence: vec![
+                                format!(
+                                    "replay: {} items from {} {safe_url} (mined contract, shape {})",
+                                    items.len(),
+                                    contract.method,
+                                    contract.shape
+                                ),
+                                format!(
+                                    "contract: {} uses before this replay, {} failures",
+                                    contract.uses, contract.failures
+                                ),
+                            ],
+                            failures: Vec::new(),
+                            spent_state: spent_state || cookie.is_some(),
+                            transport: "replay".to_string(),
+                            items: items.len(),
+                            sample: items
+                                .iter()
+                                .take(5)
+                                .map(|item| item.title.clone())
+                                .collect(),
+                            sample_urls: items
+                                .iter()
+                                .filter_map(|item| item.url.clone())
+                                .take(5)
+                                .collect(),
+                            body_text: crate::mine::render(host, &items),
+                            body: None,
+                            headers: Vec::new(),
+                            bytes: None,
+                        });
+                    }
+                    None => {
+                        fail(
+                            attempts,
+                            response.status,
+                            break_note("the answer no longer has the mined shape".into()),
+                        );
+                        self.state
+                            .drop_contract(host, identity.name, &contract.shape);
+                    }
+                }
+            }
+            Ok(response) => {
+                fail(
+                    attempts,
+                    response.status,
+                    break_note(format!("status {} broke the contract", response.status)),
+                );
+                self.state
+                    .drop_contract(host, identity.name, &contract.shape);
+            }
+            Err(error) => {
+                fail(attempts, 0, break_note(format!("request failed: {error}")));
+                self.state
+                    .drop_contract(host, identity.name, &contract.shape);
+            }
+        }
+        None
+    }
+
     /// One content-lane run on a shell document: the page's own program, in the
     /// engine, as the identity that received the document and against the state
     /// it owns. A produced document that passes the contract is content, and the
@@ -565,6 +776,21 @@ impl Worker {
         spent_state: bool,
     ) -> Option<Outcome> {
         let (contract, generic) = contract;
+        // Replay a mined contract before any JavaScript: the app's own request,
+        // as plain HTTP, on the identity and jar that mined it. A break falls
+        // through to the lane, which mines a fresh contract when it passes.
+        if let Some(outcome) = self.replay_contract(
+            url,
+            host,
+            response,
+            options,
+            started,
+            first_ms,
+            attempts,
+            spent_state,
+        ) {
+            return Some(outcome);
+        }
         let lane_started = Instant::now();
         // The lane spends what the encounter has left, never more: an encounter
         // that gives the lane nothing has already ended, and a bench's 3 s
@@ -657,6 +883,35 @@ impl Worker {
             }
             return None;
         }
+        // The identity that produced the content is the one the next encounter
+        // must start with: the mined contract is bound to it, and a cold
+        // selection would otherwise take the lane again as someone else.
+        if self.persist {
+            self.state
+                .record(host, identity.name, "content", true, lane_ms);
+        }
+        // The first run that produces content is the witness; mine the request
+        // that assembled it so every later encounter answers without JS. The
+        // request URL is not printed: it may carry the app's own key.
+        let mined = crate::mine::mine(
+            &lane.document,
+            &response.url,
+            identity.name,
+            &lane.transcript,
+        );
+        let mined_note = mined.as_ref().map(|contract| {
+            format!(
+                "mined replay contract: {} ({} response, shape {}), at least {} items",
+                contract.method,
+                contract.array_path.join("."),
+                contract.shape,
+                contract.min_items
+            )
+        });
+        let mined_ok = mined.is_some();
+        if let Some(contract) = mined {
+            self.state.store_contract(contract);
+        }
         // The page cache keeps the produced page under the identity and egress
         // that produced it, through the same capture the network path uses.
         self.captured = Some(Captured {
@@ -670,7 +925,7 @@ impl Worker {
         });
         if self.persist {
             if let Some(origin) = self.state.origins.get_mut(host).map(Arc::make_mut) {
-                origin.route = None;
+                origin.route = mined_ok.then(|| "replay".to_string());
             }
             self.save_state();
         }
@@ -701,6 +956,9 @@ impl Worker {
             lane.document.len(),
             lane.transcript.len()
         ));
+        if let Some(note) = mined_note {
+            outcome.evidence.push(note);
+        }
         if let Some(navigate) = &lane.navigate {
             outcome
                 .evidence
@@ -2689,6 +2947,31 @@ impl Worker {
                     Class::Shell | Class::HttpError | Class::Network
                 )
             {
+                // An incomplete 2xx that is about to end the encounter still
+                // gets the lane's one run: two identities shown the same text
+                // are the site's answer, not a reason to skip the page's own
+                // program. Without this the natural-end trigger below is
+                // unreachable on exactly the shells that look identical to
+                // every client.
+                if verdict.class == Class::Incomplete
+                    && (200..300).contains(&response.status)
+                    && !content_tried
+                {
+                    if let Some(outcome) = self.content_lane(
+                        url,
+                        &host,
+                        &response,
+                        (&contract, generic),
+                        identity,
+                        options,
+                        started,
+                        first_ms,
+                        &mut attempts,
+                        spent_state,
+                    ) {
+                        return outcome;
+                    }
+                }
                 if self.persist {
                     self.save_state();
                 }
@@ -2733,7 +3016,6 @@ impl Worker {
                     && (200..300).contains(&attempt.status)
                     && !last_body.is_empty()
                 {
-                    content_tried = true;
                     if let Some(identity) = identity::lookup(&attempt.identity) {
                         let final_response = crate::http::Response {
                             status: attempt.status,

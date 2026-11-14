@@ -19,6 +19,7 @@ pub mod envelope;
 pub mod fetch;
 mod http;
 pub mod identity;
+mod mine;
 pub mod state;
 mod webcrypto;
 
@@ -32,6 +33,8 @@ mod engine_tests;
 mod fixture_tests;
 #[cfg(test)]
 mod redirect_tests;
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod revalidation_tests;
 #[cfg(test)]

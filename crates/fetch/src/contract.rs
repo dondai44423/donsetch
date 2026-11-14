@@ -314,7 +314,7 @@ pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
 }
 
 /// Remove subtrees whose text is not content, and comments.
-fn strip_noise(body: &str) -> String {
+pub(crate) fn strip_noise(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let lower = body.to_ascii_lowercase();
     let mut index = 0;
@@ -356,7 +356,7 @@ fn strip_noise(body: &str) -> String {
     out
 }
 
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut space = false;
     for character in text.chars() {

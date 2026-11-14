@@ -69,11 +69,12 @@ V5_ENGINE_LOG=1 ./target/release/donsetch-fetch fetch https://www.imdb.com/ --id
 | `src/http.rs` | One request on the wire, with the identity's headers and cookies |
 | `src/classify.rs` | Nine outcome classes, vendor-and-ask driven |
 | `src/contract.rs` | Content contracts (the frozen corpus's own predicates) |
-| `src/state.rs` | Scores, vendor priors, routes, cache trust, pacing clocks, cookie jars with bindings; bounded, merged into the file under a lock; the per-OS cache path |
+| `src/state.rs` | Scores, vendor priors, routes, cache trust, pacing clocks, cookie jars with bindings, mined request contracts; bounded, merged into the file under a lock; the per-OS cache path |
 | `src/cache.rs` | The page cache: what may be stored, served fresh, revalidated or audited |
-| `src/fetch.rs` | The encounter (`Worker`): pace, spend, classify, follow the vendor, run the engine, ask the interface, remember |
+| `src/fetch.rs` | The encounter (`Worker`): pace, spend, classify, follow the vendor, replay a mined contract, run the engine, ask the interface, remember |
 | `src/challenge.rs` | Native challenge contracts: Akamai's `bm-verify` hand-off, SiteGround's and NCBI's proof of work; hands page programs to the engine |
 | `src/datapath.rs` | Interface contracts: which host, which request, which items count |
+| `src/mine.rs` | Mined request contracts: the app's own content request templated by the document URL's components, its structural replay check, and the records it renders |
 | `src/engine.rs` | The challenge engine: V8 in-process, one HTTP op on the fetcher's identity, the mint, the watchdog |
 | `src/engine_host.js` | The challenge host layer (small DOM, forms, script loader, browser surfaces, WebAssembly budget) plus the content lane's data-plane DOM: real tree, host-side selector engine, firing observers, `matchMedia`, events, timers and frames. No rendering |
 | `src/webcrypto.rs` | WebCrypto on BoringSSL: digests, HMAC, AES, PBKDF2, HKDF; anything else is refused |
@@ -82,6 +83,7 @@ V5_ENGINE_LOG=1 ./target/release/donsetch-fetch fetch https://www.imdb.com/ --id
 | `src/engine_tests.rs`, `src/lifecycle_tests.rs` | Offline tests: hostile pages against the envelope and host fidelity; a fake AWS WAF origin with a controllable clock against the token lifecycle |
 | `src/fixture_tests.rs`, `fixtures/aws-waf/` | The three AWS WAF shapes (goku, legacy inline, interstitial) run from captured bundles against a local verifier |
 | `src/session_tests.rs` | The library seam: threads, `spawn_blocking`, proxy, body capture, vendor escalation, route memory, state location |
+| `src/replay_tests.rs` | The mined contract through the encounter: first run mines, the next replays; a 403 breaks it and the lane re-mines |
 | `src/cache_tests.rs`, `src/redirect_tests.rs`, `src/revalidation_tests.rs` | The page cache against a local site that changes, lies, walls and redirects under it |
 | `src/main.rs` | CLI: `fetch`, `probe`, `bench`, `identities`, `scorecard`, `state`, `cache` |
 
@@ -262,30 +264,54 @@ export getters — named imports are snapshots, documented in the host) that run
 application page's own program and returns the document it assembles. The contract is
 consulted **before any program runs**; then the run ends on content (visible text at the
 target), quiescence (honestly reported, still a shell) or the lane's envelope
-(`V5_CONTENT_WALL_MS`, default 2500 ms, clamped to the encounter's remaining deadline; 64
-ops; 48 MB). A `shell` or `incomplete` verdict takes the lane once per encounter, as the
-identity that received the document; a produced page that passes the contract is the answer
+(`V5_CONTENT_WALL_MS`, default 4000 ms, clamped to the encounter's remaining deadline; 64
+ops; 16 MB per response, 48 MB total). A `shell` or `incomplete` verdict takes the lane once
+per encounter — a shell as the identity that received it, an incomplete after every identity
+has had its turn, including the one that is about to end the encounter on the site's
+identity-blind answer. A produced page that passes the contract is the answer
 (`transport: "program"`) and enters the pipeline exactly where a network document does
 (contract, caller body, page cache). A preload pass fetches the document's own script/style
 set on worker threads while V8 boots — each script waits only for its own bytes through
 `op_prefetch_wait` — under the same guard and identity as the engine's own op. Every request
 leaves through the same op and wire; the wire tap (`transcript`) records what the program
-asked for, which is the request-contract mining input. `fetch --render` runs the lane on any
-encounter's final document, for measurement.
+asked for, response bodies and the request itself (method, URL, headers, body), which is the
+request-contract mining input. `fetch --render` re-runs the lane on the encounter's final
+document, for measurement.
+
+### The mined request contract
+
+A first successful lane run is the witness; the next encounter should not pay for the same
+program. After a produced document passes the contract, `mine.rs` finds the JSON response
+array whose values the document itself shows (titles in its text, URLs among its links),
+chooses the item's title/URL/detail fields, and stores the request that delivered it as a
+template per `(host, identity, URL shape)`: the document URL's variable components (an
+identifier path segment, a query value) become `{{n}}` placeholders in the request URL,
+headers and body; the literal parts stay exact. The table is bounded (8 per origin) and lives
+in `state.rs` with the origin, so it is evicted with it.
+
+The next encounter replays the contract in `content_lane` before any JS: the same identity
+that mined it, its own jar, the same wire and guard, `transport: "replay"`, and the records
+enter the caller exactly as a data path's do. The check is structural, never a value diff:
+the array is still there (or elsewhere in the answer with the same item shape), every item
+still carries the mined fields, and at least `min_items` of them have a title. Values move on;
+the shape is the promise. A break — an error status, a missing array, too few items — drops
+the contract, and the lane behind it runs and mines a fresh one. A document that already
+passes its contract never reaches the lane or the replay.
 
 ### The envelope
 
-Each mint runs inside limits enforced outside the page (`envelope.rs`); a breach ends the mint
-with a named cause, never a hang.
+Each mint and each lane run lives inside limits enforced outside the page
+(`envelope.rs`); a breach ends it with a named cause, never a hang.
 
 | Limit | Default | Mechanism |
 |---|---|---|
-| Wall clock | 10 s (`V5_ENGINE_WALL_MS`) | watchdog thread, `terminate_execution`; includes blocked time |
+| Mint wall clock | 10 s (`V5_ENGINE_WALL_MS`) | watchdog thread, `terminate_execution`; includes blocked time |
+| Content-lane wall clock | 4 s (`V5_CONTENT_WALL_MS`) | the same watchdog; clamped to the encounter's remaining deadline |
 | JS heap | 256 MB | near-heap-limit callback terminates V8 |
 | Typed arrays / `ArrayBuffer` | 128 MB live | custom allocator refuses past the cap |
 | WebAssembly memory | 128 MB total | V8 per-memory page flag plus host charges; resident-memory ceiling as backstop (`VmRSS`, working set, `task_info`) |
-| Ops | 96 per mint | counted in Rust |
-| Network | http(s), public addresses, 5 redirects, 1 MB request, 8 MB per response, 32 MB total | one guard for URL, resolver and redirect policy; the page's own host is exempt from the private-address rule |
+| Ops | 96 per mint, 64 per lane run | counted in Rust |
+| Network | http(s), public addresses, 5 redirects, 1 MB request, 8 MB per response (mint) / 16 MB (lane), 32 MB total (mint) / 48 MB (lane) | one guard for URL, resolver and redirect policy; the page's own host is exempt from the private-address rule |
 | Concurrency | one engine per process at a time | process-wide slot |
 
 The guards live in the Rust op bodies, not the JS wrapper, and `Deno` is deleted before any page
@@ -303,19 +329,27 @@ them as platform tasks and the host drains microtasks only); no measured challen
    vendor:** a named wall reorders the identities left to try. A human wall costs one identity
    past the class that saw it and a second one ends the encounter; a second identity shown the
    same text as the first with no wall named ends it too (the site is not reacting to the
-   client). A remembered origin gets one or two attempts, not the first-contact search.
+   client). A 2xx the contract cannot name still gets the lane's one run before that end, and
+   after every identity has had its turn. A remembered origin gets one or two attempts, not the
+   first-contact search.
 5. **Answer a native challenge.** If the page carries a hand-off we have a contract for, do
    exactly what it asks and re-classify.
 6. **Ask the interface.** If the document is still walled, a shell or incomplete and the origin
    has a data path for *this* URL, ask it as the same identity, obeying its published limits.
    Items that reach the minimum are content with `transport: data`. An interface that is only
    asking for time (paced, cooling, 429) has not answered and the encounter falls through.
-7. **Run the site's program.** Which program and when: AWS WAF decides by client class, so a
+7. **Replay a mined contract.** A shell or incomplete document whose origin has a contract for
+   this URL shape is answered by the app's own request as plain HTTP, on the identity that mined
+   it: `transport: replay`. A break drops the contract, and the lane below mines a fresh one
+   after its run passes. No JS runs when a contract answers.
+8. **Run the site's program.** Which program and when: AWS WAF decides by client class, so a
    plain client is re-asked as `chrome-local` and that page is executed; Cloudflare's page goes
    to the engine on the last allowed attempt; Reddit's gate is run as the client that received
-   it. What the mint produces is kept and spent by the same identity, and a 429 is paced.
-8. **Remember.** Scores, wall class, next identity, route, cookies and minted credentials
-   persist, so the next encounter starts at step 2 with better information.
+   it. A shell's program runs as the identity that received it; an incomplete one as the last
+   identity, once. What the mint produces is kept and spent by the same identity, and a 429 is
+   paced.
+9. **Remember.** Scores, wall class, next identity, route, cookies, minted credentials and the
+   mined contract persist, so the next encounter starts at step 2 with better information.
 
 ### The census, by class
 
@@ -402,7 +436,7 @@ not a browser), V8, `btls` (WebCrypto on the BoringSSL the TLS stack links), `ge
 | `V5_ENGINE_LOG` | `1` prints the challenge engine's host surfaces, cookies and errors |
 | `V5_ENGINE_DUMP_DIR` | a directory: every request the challenge page makes, headers and body, written out so a program's failure is read instead of guessed at (inspection only) |
 | `V5_ENGINE_WALL_MS` | the engine's wall-clock cap per mint (default 10000); the other limits are `envelope::Limits` defaults |
-| `V5_CONTENT_WALL_MS` | the content lane's wall-clock cap per run (default 2500); its other limits are `envelope::Limits::content()` |
+| `V5_CONTENT_WALL_MS` | the content lane's wall-clock cap per run (default 4000); its other limits are `envelope::Limits::content()` (64 ops, 16 MB per response, 48 MB total) |
 
 Tests are offline: `cargo test --release --offline`. A few tests are `#[ignore]`d by default —
 the AWS WAF fixture tests need the private captures (`--include-ignored`) and one is a

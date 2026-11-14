@@ -1014,6 +1014,13 @@ pub struct TranscriptEntry {
     /// The body, kept for JSON responses inside the transcript budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// The request headers the app's own program sent, as the host assembled
+    /// them (fetch metadata included). Mining filters identity-level ones.
+    #[serde(default)]
+    pub request_headers: Vec<(String, String)>,
+    /// The request body the app sent, base64, inside the tap's own budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
 }
 
 /// The largest document a content run reports (16 MiB): past this the run is an
@@ -1398,6 +1405,21 @@ fn content_from(value: serde_json::Value, cost: Cost) -> Result<Content, MintErr
             bytes: entry["bytes"].as_u64().unwrap_or(0) as usize,
             kind: entry["kind"].as_str().unwrap_or_default().to_string(),
             body: entry["body"].as_str().map(str::to_string),
+            request_headers: entry["reqHeaders"]
+                .as_array()
+                .map(|pairs| {
+                    pairs
+                        .iter()
+                        .filter_map(|pair| {
+                            Some((
+                                pair.get(0)?.as_str()?.to_string(),
+                                pair.get(1)?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            request_body: entry["reqBody"].as_str().map(str::to_string),
         });
     }
     if std::env::var("V5_ENGINE_LOG").is_ok() {

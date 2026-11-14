@@ -397,9 +397,9 @@ fn command_fetch(arguments: &[String], flags: &Flags) -> i32 {
             let _ = std::fs::write(path, body);
         }
     }
-    // `--render` is the M1 measurement path: the content lane runs on the
-    // document this encounter ended with. The encounter itself does not take the
-    // lane yet (M2), so a --render run measures and never changes the outcome.
+    // `--render` is the measurement path: the encounter already takes the lane;
+    // this re-runs it on the document the encounter ended with and reports what
+    // the page's own program assembled. It never changes the outcome.
     if render {
         let ok = render_content(
             &outcome,

@@ -871,7 +871,17 @@
       if (/^\s*[\[{]/.test(text) && text.length <= 262144 && M.transcriptBytes + text.length <= 1048576) {
         kept = text; M.transcriptBytes += text.length;
       }
-      M.transcript.push({ method, url: String(absolute), status: res.status, bytes: text.length, kind: dest, body: kept });
+      // The request side too: the mined contract replays what the app sent,
+      // not a reconstruction. A body is kept only inside the tap's own budget.
+      let keptRequest = null;
+      if (bodyBytes.length && bodyBytes.length <= 65536 && M.transcriptRequestBytes + bodyBytes.length <= 524288) {
+        keptRequest = bytesToBase64(bodyBytes);
+        M.transcriptRequestBytes += bodyBytes.length;
+      }
+      M.transcript.push({
+        method, url: String(absolute), status: res.status, bytes: text.length, kind: dest, body: kept,
+        reqHeaders: Object.entries(headers), reqBody: keptRequest,
+      });
     }
     if (String(absolute).includes("/inputs")) note("log", "inputs body " + String(res.body || "").slice(0, 1200));
     if (res.error) throw new TypeError("Failed to fetch (" + res.error + ")");
@@ -3095,6 +3105,18 @@
       }
     }
 
+    // A shadow root is a document fragment with a host: the data plane needs the
+    // interface for `instanceof` checks and for `attachShadow` styles, never a
+    // rendering boundary. Its children are not serialized into outerHTML, as in
+    // a browser.
+    class VShadowRoot extends VFragment {
+      constructor(host, mode) {
+        super(host.ownerDocument);
+        this.host = host;
+        this.mode = mode === "closed" ? "closed" : "open";
+      }
+    }
+
     const REFLECTED = {
       id: "id", title: "title", lang: "lang", dir: "dir", name: "name", type: "type", rel: "rel",
       media: "media", target: "target", action: "action", method: "method", placeholder: "placeholder",
@@ -3416,8 +3438,12 @@
       click() { note("log", "click " + this.tagName + " (not dispatched: no interaction in the lane)"); }
       scrollIntoView() {}
       animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {}, onfinish: null }; }
-      attachShadow() { note("surface", "element.attachShadow"); return this; }
-      get shadowRoot() { return null; }
+      attachShadow(init) {
+        note("surface", "element.attachShadow");
+        if (!this._shadowRoot) this._shadowRoot = new VShadowRoot(this, init && init.mode);
+        return this._shadowRoot;
+      }
+      get shadowRoot() { return this._shadowRoot || null; }
       cloneNode(deep) {
         const copy = this.ownerDocument.createElement(this.localName);
         for (const [name, value] of this._attrs) copy._attrs.set(name, value);
@@ -4229,7 +4255,7 @@
       FontFace: class { constructor(family, source) { this.family = family; this.status = "loaded"; } load() { return Promise.resolve(this); } },
       Screen: class {}, Navigator: class {}, Document: class {}, Window: class {},
       EventTarget: EventTargetShim, CSSStyleDeclaration: class {},
-      Node: VNode, Element: VElement, HTMLElement: VElement, Text: VText, CharacterData: VText, DocumentFragment: VFragment,
+      Node: VNode, Element: VElement, HTMLElement: VElement, Text: VText, CharacterData: VText, DocumentFragment: VFragment, ShadowRoot: VShadowRoot,
       HTMLCanvasElement: VElement, SVGElement: VElement, HTMLImageElement: VElement,
       HTMLScriptElement: VElement, HTMLTemplateElement: VElement,
       customElements: { define() {}, get() { return undefined; }, whenDefined: () => Promise.resolve(), upgrade() {} },
@@ -4500,7 +4526,7 @@
       guardWebAssembly(page.wasmBudget || 128 * 1024 * 1024);
       M = {
         jar: new Map(), surfaces: new Set(), logs: [], loader: null, loaded: new Set(),
-        started: ops.op_now(), page, mode: "content", transcript: [], transcriptBytes: 0,
+        started: ops.op_now(), page, mode: "content", transcript: [], transcriptBytes: 0, transcriptRequestBytes: 0,
       };
       try {
         const pageHost = new URL(page.url).hostname;

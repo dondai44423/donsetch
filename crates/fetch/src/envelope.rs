@@ -88,8 +88,19 @@ impl Limits {
     /// heavy app's boot without becoming a crawl.
     pub fn content() -> Self {
         Self {
-            wall: Duration::from_millis(2_500),
+            // The measured friendly SPA (hn.algolia, a 2.6 MB bundle and one
+            // API call) reaches content at 2.2–3.0 s across windows, so 2.5 s
+            // terminated runs inside the noise and 3 s sat on the edge. Four
+            // seconds is the ceiling for a heavy first boot, not a target: the
+            // stop rule is the contract, and the replay removes the cost after
+            // the first visit.
+            wall: Duration::from_millis(4_000),
             ops_max: 64,
+            // A modern app bundle is the page's own program: the measured
+            // Bluesky Expo bundle is 9.7 MB in one response, over the mint's
+            // 8 MB ceiling. The lane's total stays the same; one response may
+            // be larger because a first boot pays for the program once.
+            response_body_max: 16 * 1024 * 1024,
             total_response_max: 48 * 1024 * 1024,
             ..Self::default()
         }

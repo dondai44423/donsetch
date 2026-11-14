@@ -7,6 +7,7 @@
 //! Cookies are never shared across identities or hosts. Presenting an identity's
 //! token to another client is worse than presenting none.
 
+use crate::mine::MinedContract;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -72,6 +73,11 @@ pub struct OriginState {
     /// Its page changed inside a lifetime it declared: until then, every read asks.
     #[serde(default)]
     pub fresh_broken_until_unix: i64,
+    /// Mined request contracts for the content lane: the app's own requests,
+    /// replayed as plain HTTP before any JS runs. Bounded per origin and
+    /// evicted with it; a contract is bound to the identity that mined it.
+    #[serde(default)]
+    pub contracts: Vec<Shared<MinedContract>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -247,6 +253,104 @@ impl State {
     /// This host's entry, writable, when it exists.
     pub fn origin_get_mut(&mut self, host: &str) -> Option<&mut OriginState> {
         self.origins.get_mut(host).map(Arc::make_mut)
+    }
+
+    /// The mined contract that fits this document URL as this identity, with
+    /// the URL's components filled in. The most recently successful wins.
+    pub fn contract_for(
+        &self,
+        host: &str,
+        identity: &str,
+        url: &str,
+    ) -> Option<(Shared<MinedContract>, Vec<String>)> {
+        let origin = self.origins.get(host)?;
+        origin
+            .contracts
+            .iter()
+            .filter(|contract| contract.identity == identity)
+            .filter_map(|contract| {
+                contract
+                    .fill(url)
+                    .map(|values| (Arc::clone(contract), values))
+            })
+            .max_by_key(|(contract, _)| contract.last_ok_unix.max(contract.mined_unix))
+    }
+
+    /// The mined contract that fits this document URL, whichever identity
+    /// mined it. The replay runs on the contract's own identity, so a later
+    /// encounter whose first identity got the document still uses the contract
+    /// the content was witnessed under.
+    pub fn contract_any(
+        &self,
+        host: &str,
+        url: &str,
+    ) -> Option<(Shared<MinedContract>, Vec<String>)> {
+        let origin = self.origins.get(host)?;
+        origin
+            .contracts
+            .iter()
+            .filter_map(|contract| {
+                contract
+                    .fill(url)
+                    .map(|values| (Arc::clone(contract), values))
+            })
+            .max_by_key(|(contract, _)| contract.last_ok_unix.max(contract.mined_unix))
+    }
+
+    /// Keep a freshly mined contract, replacing the one with the same identity
+    /// and document shape. The per-origin table is bounded; the least recently
+    /// useful contract leaves first.
+    pub fn store_contract(&mut self, contract: MinedContract) {
+        let origin = self.origin_mut(&contract.host);
+        origin.contracts.retain(|known| {
+            !(known.identity == contract.identity && known.shape == contract.shape)
+        });
+        origin.contracts.push(Arc::new(contract));
+        while origin.contracts.len() > CONTRACTS_MAX {
+            let oldest = origin
+                .contracts
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, contract)| (contract.last_ok_unix, contract.mined_unix))
+                .map(|(index, _)| index);
+            match oldest {
+                Some(index) => {
+                    origin.contracts.remove(index);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Forget a contract that no longer answers (a 403, a shape change, too few
+    /// items): the next encounter runs the lane and mines a fresh one.
+    pub fn drop_contract(&mut self, host: &str, identity: &str, shape: &str) {
+        if let Some(origin) = self.origin_get_mut(host) {
+            origin
+                .contracts
+                .retain(|c| !(c.identity == identity && c.shape == shape));
+        }
+    }
+
+    /// Record one replay: a success extends the contract's life, a failure is
+    /// counted before the contract is replaced or dropped.
+    pub fn record_contract(&mut self, host: &str, identity: &str, shape: &str, ok: bool) {
+        if let Some(origin) = self.origin_get_mut(host) {
+            if let Some(contract) = origin
+                .contracts
+                .iter_mut()
+                .find(|c| c.identity == identity && c.shape == shape)
+            {
+                let contract = Arc::make_mut(contract);
+                if ok {
+                    contract.uses = contract.uses.saturating_add(1);
+                    contract.last_ok_unix = now_unix();
+                    contract.failures = 0;
+                } else {
+                    contract.failures = contract.failures.saturating_add(1);
+                }
+            }
+        }
     }
 
     /// Identities that have passed `vendor`, best first: what this state has
@@ -808,6 +912,9 @@ pub const SCORE_WINDOW: u32 = 32;
 /// Origins remembered; the least recently used are forgotten first, with their
 /// cookies, credentials and mint history.
 pub const ORIGINS_MAX: usize = 4096;
+/// How many mined request contracts one origin may keep: a shell's routes are
+/// few, and each is a replay path that must stay inspectable.
+pub const CONTRACTS_MAX: usize = 8;
 
 impl State {
     /// Drop what can no longer be used: expired cookies and credentials' hosts

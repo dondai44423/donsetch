@@ -116,6 +116,33 @@ pub fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Base64 (standard alphabet, padded) decoded; `None` on a bad alphabet or
+/// length. The engine's reported request bodies use the same alphabet.
+pub fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut chunk = 0u32;
+    let mut bits = 0;
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return None,
+        } as u32;
+        chunk = (chunk << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((chunk >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// The largest document body read: the product's own cap on a response.
 pub const DOCUMENT_BODY_MAX: usize = 64 << 20;
 

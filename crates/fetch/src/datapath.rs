@@ -839,7 +839,13 @@ fn unescape(value: &str) -> String {
 
 /// Clean text for the caller: one line per item, nothing invented.
 pub fn render(path: &DataPath, items: &[Item]) -> String {
-    let mut out = format!("# {} ({} items)\n\n", path.id, items.len());
+    render_items(path.id, items)
+}
+
+/// [`render`] for a source whose name is not a `DataPath`: the mined replay
+/// uses the same records shape as the hand-written interfaces.
+pub fn render_items(id: &str, items: &[Item]) -> String {
+    let mut out = format!("# {id} ({} items)\n\n", items.len());
     for item in items {
         // A markdown link, so every item is followable: the fetch tool turns
         // these into short handles when the caller asked for them, and the URL
