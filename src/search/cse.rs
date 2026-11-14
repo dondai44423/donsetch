@@ -204,7 +204,7 @@ fn response(body: &str) -> Result<Vec<Hit>, String> {
         .collect())
 }
 
-fn search_url(query: &str, token: &Token, locale: Option<super::locale::Locale>) -> String {
+fn search_url(query: &str, token: &Token, lang: Option<&super::lang::Lang>) -> String {
     let mut url = url::Url::parse("https://cse.google.com/cse/element/v1").unwrap();
     {
         let mut q = url.query_pairs_mut();
@@ -220,11 +220,14 @@ fn search_url(query: &str, token: &Token, locale: Option<super::locale::Locale>)
             ("rurl", ""),
             ("searchtype", ""),
         ]);
-        if let Some(locale) = locale {
-            q.append_pair("hl", locale.lang)
-                .append_pair("gl", locale.region);
-        } else if super::locale::latin_query(query) {
-            q.append_pair("hl", "en").append_pair("gl", "us");
+        if let Some(lang) = lang {
+            q.append_pair("hl", lang.code());
+            if let Some(region) = lang.region() {
+                q.append_pair("gl", &region.to_ascii_lowercase());
+            }
+        } else if super::lang::latin_query(query) {
+            // English is a language default, not a market.
+            q.append_pair("hl", "en");
         }
         if !token.experiments.is_empty() {
             q.append_pair("exp", &token.experiments);
@@ -291,7 +294,7 @@ pub(super) async fn task(
             return Err("budget-skipped".into());
         }
         requests += 1;
-        let url = search_url(&query, &token, context.locale);
+        let url = search_url(&query, &token, context.lang.as_ref());
         let out = context
             .fetcher
             .fetch_once_via(
@@ -398,6 +401,32 @@ mod tests {
         let han = url::Url::parse(&search_url("東京 地震 速報", &token, None)).unwrap();
         assert!(!han.query_pairs().any(|(key, _)| key == "hl" || key == "gl"));
     }
+    #[test]
+    fn a_language_is_not_a_market() {
+        let token = Token {
+            value: "issued".into(),
+            version: "v".into(),
+            experiments: String::new(),
+            written: 0,
+        };
+        let uk = crate::search::Lang::parse("uk").unwrap();
+        let url = url::Url::parse(&search_url("q", &token, Some(&uk))).unwrap();
+        assert_eq!(url.query_pairs().find(|(k, _)| k == "hl").unwrap().1, "uk");
+        assert!(!url.query_pairs().any(|(k, _)| k == "gl"));
+        let regional = crate::search::Lang::parse("uk-UA").unwrap();
+        let url = url::Url::parse(&search_url("q", &token, Some(&regional))).unwrap();
+        assert_eq!(url.query_pairs().find(|(k, _)| k == "gl").unwrap().1, "ua");
+        let ne = crate::search::Lang::parse("ne").unwrap();
+        let url = url::Url::parse(&search_url("q", &token, Some(&ne))).unwrap();
+        assert_eq!(url.query_pairs().find(|(k, _)| k == "hl").unwrap().1, "ne");
+        assert!(!url.query_pairs().any(|(k, _)| k == "hi" || k == "gl"));
+        let url = url::Url::parse(&search_url("rust", &token, None)).unwrap();
+        assert_eq!(url.query_pairs().find(|(k, _)| k == "hl").unwrap().1, "en");
+        assert!(!url.query_pairs().any(|(k, _)| k == "gl"));
+        let url = url::Url::parse(&search_url("новини", &token, None)).unwrap();
+        assert!(!url.query_pairs().any(|(k, _)| k == "hl" || k == "gl"));
+    }
+
     #[test]
     fn structured_results_and_refusals_remain_distinct() {
         let hits = response(r#"_({"results":[{"unescapedUrl":"https://example.com/docs","titleNoFormatting":"Documentation","contentNoFormatting":"Real evidence"},{"titleNoFormatting":"missing URL"}]});"#).unwrap();

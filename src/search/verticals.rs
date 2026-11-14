@@ -55,15 +55,11 @@ pub fn endpoint(vertical: &str, raw: &str) -> Option<String> {
 
 /// The endpoint with the query's language written into the source that has an
 /// edition per language (Wikipedia), and left alone for the rest.
-pub fn endpoint_in(
-    vertical: &str,
-    raw: &str,
-    locale: Option<super::locale::Locale>,
-) -> Option<String> {
+pub fn endpoint_in(vertical: &str, raw: &str, lang: Option<&super::lang::Lang>) -> Option<String> {
     let text = api_query(raw);
     let raw = text.as_str();
     let query = q(raw);
-    let wiki = locale.map(|l| l.lang).unwrap_or("en");
+    let wiki = lang.map(|l| l.code()).unwrap_or("en");
     match vertical {
         "wikipedia" => Some(format!(
             "https://{wiki}.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch={query}&gsrlimit=5&gsrnamespace=0&prop=extracts%7Cinfo&inprop=url&exintro=1&explaintext=1&exchars=1000&exlimit=5&format=json&formatversion=2"
@@ -177,11 +173,11 @@ pub async fn run(
     vertical: &str,
     query: &str,
     proxy: Option<&crate::egress::proxy::Proxy>,
-    locale: Option<super::locale::Locale>,
+    lang: Option<&super::lang::Lang>,
 ) -> Result<Vec<Hit>, VerticalError> {
     let text = api_query(query);
     let query = text.as_str();
-    let Some(url) = endpoint_in(vertical, query, locale) else {
+    let Some(url) = endpoint_in(vertical, query, lang) else {
         return Ok(Vec::new());
     };
     let out = fetcher
@@ -202,9 +198,9 @@ pub async fn run(
         let data = stackexchange_data(&body, &url)?;
         parse_stackexchange(&data, Some(query))
     } else if vertical == "wikipedia" {
-        wikipedia_response(&body, locale)?
+        wikipedia_response(&body, lang)?
     } else {
-        parse_in(vertical, &body, locale)
+        parse_in(vertical, &body, lang)
     };
     if vertical == "arxiv" && title_terms(query).is_some() {
         // The title lookup is an exact-ish contract: it is credited only for
@@ -238,11 +234,7 @@ pub async fn run(
                 out.status
             ))));
         }
-        return Ok(parse_in(
-            "arxiv",
-            &String::from_utf8_lossy(&out.body),
-            locale,
-        ));
+        return Ok(parse_in("arxiv", &String::from_utf8_lossy(&out.body), lang));
     }
     Ok(hits)
 }
@@ -556,10 +548,10 @@ pub fn parse(vertical: &str, body: &str) -> Vec<Hit> {
     parse_in(vertical, body, None)
 }
 
-pub fn parse_in(vertical: &str, body: &str, locale: Option<super::locale::Locale>) -> Vec<Hit> {
+pub fn parse_in(vertical: &str, body: &str, lang: Option<&super::lang::Lang>) -> Vec<Hit> {
     match vertical {
         "arxiv" => parse_arxiv(body),
-        _ => parse_json(vertical, body, locale),
+        _ => parse_json(vertical, body, lang),
     }
 }
 
@@ -580,7 +572,7 @@ pub fn rss_date_to_iso(date: &str) -> Option<String> {
 
 fn wikipedia_response(
     body: &str,
-    locale: Option<super::locale::Locale>,
+    lang: Option<&super::lang::Lang>,
 ) -> Result<Vec<Hit>, VerticalError> {
     let fail = || VerticalError::Fetch(FetchError::Http("wikipedia: invalid API response".into()));
     let data: Value = serde_json::from_str(body).map_err(|_| fail())?;
@@ -591,7 +583,7 @@ fn wikipedia_response(
         return Ok(parse_wikipedia_pages(&data));
     }
     if data["query"]["search"].is_array() {
-        return Ok(parse_json("wikipedia", body, locale));
+        return Ok(parse_json("wikipedia", body, lang));
     }
     if data.get("batchcomplete").is_some() && data.get("query").is_none() {
         return Ok(Vec::new());
@@ -640,7 +632,7 @@ fn parse_wikipedia_pages(data: &Value) -> Vec<Hit> {
         .collect()
 }
 
-fn parse_json(vertical: &str, body: &str, locale: Option<super::locale::Locale>) -> Vec<Hit> {
+fn parse_json(vertical: &str, body: &str, lang: Option<&super::lang::Lang>) -> Vec<Hit> {
     let Ok(v) = serde_json::from_str::<Value>(body) else {
         return Vec::new();
     };
@@ -660,7 +652,7 @@ fn parse_json(vertical: &str, body: &str, locale: Option<super::locale::Locale>)
                         title: it["title"].as_str().unwrap_or("").to_string(),
                         url: format!(
                             "https://{}.wikipedia.org/wiki/{}",
-                            locale.map(|l| l.lang).unwrap_or("en"),
+                            lang.map(|l| l.code()).unwrap_or("en"),
                             it["title"].as_str().unwrap_or("").replace(' ', "_")
                         ),
                         snippet: strip_tags(it["snippet"].as_str().unwrap_or("")),
@@ -987,8 +979,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wikipedia_edition_is_explicit_or_english() {
+        let uk = crate::search::Lang::parse("uk").unwrap();
+        assert!(
+            endpoint_in("wikipedia", "q", Some(&uk))
+                .unwrap()
+                .starts_with("https://uk.wikipedia.org/")
+        );
+        let ne = crate::search::Lang::parse("ne").unwrap();
+        assert!(
+            endpoint_in("wikipedia", "q", Some(&ne))
+                .unwrap()
+                .starts_with("https://ne.wikipedia.org/")
+        );
+        assert!(
+            endpoint_in("wikipedia", "q", None)
+                .unwrap()
+                .starts_with("https://en.wikipedia.org/")
+        );
+    }
+
     #[tokio::test]
-    #[ignore = "native public Wikipedia contract witness; requires network and explicit output path"]
+    #[ignore = "native_script public Wikipedia contract witness; requires network and explicit output path"]
     async fn wikipedia_extract_contract_live_witness() {
         let path =
             std::env::var_os("DSB_SOURCE_WITNESS").expect("set an absolute witness output path");

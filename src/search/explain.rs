@@ -110,7 +110,7 @@ pub async fn run(args: &[String]) -> i32 {
         }
     };
     searcher.forget(&a.query);
-    let outcome = match searcher.search(&a.query, a.max, None).await {
+    let outcome = match searcher.search(&a.query, a.max, None, None).await {
         Ok(o) => o,
         Err(e) => {
             crate::diag!("search: {e}");

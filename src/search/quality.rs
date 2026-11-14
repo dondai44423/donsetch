@@ -91,13 +91,7 @@ pub(crate) fn assess(
         .map(|r| facts.coverage(&format!("{} {} {}", r.title, r.snippet, r.url)))
         .sum::<f64>()
         / results.len().clamp(1, 3) as f64;
-    let foreign = super::locale::evidence_language(query).is_some_and(|lang| {
-        results
-            .iter()
-            .take(3)
-            .any(|r| !super::locale::native(lang, &r.title, &r.snippet))
-    });
-    let confidence = if results.is_empty() || foreign || coverage < 0.15 || junk_ratio > 0.5 {
+    let confidence = if results.is_empty() || coverage < 0.15 || junk_ratio > 0.5 {
         Confidence::Low
     } else if independent.len() >= 2
         && measured_agreement
@@ -197,11 +191,6 @@ pub fn judge(facts: &QueryFacts, hits: Vec<Hit>) -> Judgement {
     // is topical and its scoped results are left alone.
     kept = drop_look_alikes(facts, kept);
 
-    // A query written in a non-Latin script prefers an answer written in it —
-    // but only when one exists. Dropping the foreign items unconditionally is
-    // how a Japanese query with English documentation ends up with nothing.
-    kept = prefer_native(facts, kept);
-
     let mean = if kept.is_empty() {
         0.0
     } else {
@@ -212,20 +201,7 @@ pub fn judge(facts: &QueryFacts, hits: Vec<Hit>) -> Judgement {
     };
     let rare_shared = has_rare_term(facts, &kept);
 
-    // An answer in a different script cannot prove another topic by lexical
-    // absence alone (東京の天気 -> Tokyo weather). Keep that fallback
-    // thin; it has no evidence for high confidence or caching.
-    let foreign = !kept.is_empty()
-        && super::locale::evidence_language(&facts.compiled().text).is_some_and(|lang| {
-            !kept
-                .iter()
-                .any(|h| super::locale::native(lang, &h.title, &h.snippet))
-        });
-    let class = if foreign {
-        AnswerClass::Thin
-    } else {
-        classify(items, &kept, mean, rare_shared)
-    };
+    let class = classify(items, &kept, mean, rare_shared);
     // A junk set contributes nothing, by construction: `kept` is exactly what may
     // enter the merge, so no caller can merge it by forgetting to check the
     // class. `items` still reports what the source returned.
@@ -306,36 +282,6 @@ fn drop_look_alikes(facts: &QueryFacts, hits: Vec<Hit>) -> Vec<Hit> {
         .collect()
 }
 
-/// Keep the items written in the query's own script when the set has any,
-/// otherwise keep them all: no native answer is not a reason to have none.
-fn prefer_native(facts: &QueryFacts, hits: Vec<Hit>) -> Vec<Hit> {
-    if facts.script() == super::query::Script::Latin {
-        return hits;
-    }
-    let native = |h: &Hit| {
-        let text = format!("{} {}", h.title, h.snippet);
-        text.chars().any(|c| shares_script(facts.script(), c))
-    };
-    if !hits.iter().any(native) {
-        return hits;
-    }
-    hits.into_iter().filter(native).collect()
-}
-
-fn shares_script(script: super::query::Script, c: char) -> bool {
-    use super::query::Script as S;
-    match script {
-        S::Latin => c.is_ascii_alphabetic(),
-        S::Kana => ('\u{3040}'..='\u{30ff}').contains(&c),
-        S::Han => ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3400}'..='\u{4dbf}').contains(&c),
-        S::Hangul => ('\u{ac00}'..='\u{d7af}').contains(&c),
-        S::Cyrillic => ('\u{0400}'..='\u{04ff}').contains(&c),
-        S::Arabic => ('\u{0600}'..='\u{06ff}').contains(&c),
-        S::Devanagari => ('\u{0900}'..='\u{097f}').contains(&c),
-        S::Other => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,9 +343,9 @@ mod tests {
         let grade = assess("tokio runtime", &[result.clone()], &[], &families);
         assert_eq!(grade.confidence, Confidence::High);
         assert!(!grade.degraded());
-        let foreign = assess("tokio runtime 日本語", &[result.clone()], &[], &families);
-        assert_eq!(foreign.confidence, Confidence::Low);
-        assert!(foreign.degraded());
+        let unrelated = assess("kubernetes cluster", &[result.clone()], &[], &families);
+        assert_eq!(unrelated.confidence, Confidence::Low);
+        assert!(unrelated.degraded());
         let report = |status: &str| super::super::EngineReport {
             engine: "test".into(),
             profile: None,
@@ -582,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_native_answer_wins_when_the_query_is_written_in_its_script() {
+    fn a_query_does_not_filter_or_prefer_by_script() {
         let facts = QueryFacts::new("東京の天気");
         let rows = hits(&[
             ("Tokyo weather", "https://example.com/en/tokyo-weather"),
@@ -592,19 +538,18 @@ mod tests {
             ),
         ]);
         let j = judge(&facts, rows);
-        assert_eq!(j.kept.len(), 1);
-        assert!(j.kept[0].title.contains("東京"));
+        assert_eq!(j.kept.len(), 2, "script is not a veto and not a preference");
     }
 
     #[test]
-    fn a_foreign_answer_survives_when_there_is_no_native_one() {
-        let facts = QueryFacts::new("東京の天気");
-        let rows = hits(&[("Tokyo weather", "https://example.com/en/tokyo-weather")]);
+    fn a_matching_answer_survives_even_in_another_script() {
+        let facts = QueryFacts::new("rust 東京");
+        let rows = hits(&[("Rust Tokyo meetup", "https://example.com/rust-tokyo")]);
         let j = judge(&facts, rows);
         assert_eq!(
             j.kept.len(),
             1,
-            "no native answer is not a reason to have none"
+            "a matching answer is kept regardless of its script"
         );
     }
 

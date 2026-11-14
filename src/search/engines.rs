@@ -592,14 +592,12 @@ pub fn serp_url(engine: &str, query: &str) -> Option<String> {
     serp_url_in(engine, query, None)
 }
 
-/// The same URL with the query's locale in the parameters the source honors:
-/// Bing's `setlang`/`cc`, DuckDuckGo's `kl`, Yahoo's `vl`. Sources without a
-/// locale parameter are unchanged.
-pub fn serp_url_in(
-    engine: &str,
-    query: &str,
-    locale: Option<super::locale::Locale>,
-) -> Option<String> {
+/// The same URL with the language the caller stated. No language or market is
+/// inferred from the query's script. A language parameter is sent where the
+/// source accepts one; a country/market parameter is added only when the tag
+/// itself carried a region. DuckDuckGo's `kl` is a market, so it appears only
+/// for an explicit region; a language alone is not a market.
+pub fn serp_url_in(engine: &str, query: &str, lang: Option<&super::lang::Lang>) -> Option<String> {
     let q = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
     let mut url = match engine {
         "google" => Some(google_wml::url(query)),
@@ -623,31 +621,31 @@ pub fn serp_url_in(
         "bing_rss" => Some(format!("https://www.bing.com/search?format=rss&q={q}")),
         _ => None,
     }?;
-    if let Some(l) = locale {
+    if let Some(l) = lang {
         let extra = match engine {
-            "bing" | "bing_rss" => format!("&setlang={}&cc={}", l.lang, l.region),
-            "ddg" | "ddg_lite" | "ddg_html" => format!("&kl={}", l.kl()),
-            "yahoo" => format!("&vl=lang_{}", l.lang),
-            "yandex"
-                if matches!(
-                    l.lang,
-                    "en" | "ru" | "be" | "fr" | "de" | "id" | "kk" | "tt" | "tr" | "uk"
-                ) =>
-            {
-                format!("&lang={}", l.lang)
+            "bing" | "bing_rss" => {
+                let mut extra = format!("&setlang={}", l.code());
+                if let Some(region) = l.region() {
+                    extra.push_str(&format!("&cc={region}"));
+                }
+                extra
             }
+            "ddg" | "ddg_lite" | "ddg_html" => l
+                .kl()
+                .map(|market| format!("&kl={market}"))
+                .unwrap_or_default(),
+            "yahoo" => format!("&vl=lang_{}", l.code()),
+            "yandex" if yandex_lang(l.code()) => format!("&lang={}", l.code()),
             _ => String::new(),
         };
         url.push_str(&extra);
-    } else if super::locale::latin_query(query) {
-        // A Latin query names no language, but the source still has to pick a
-        // market: without one, Bing answered this egress's own locale (a Nepali
-        // result page for an English query, which then looked off-query and
-        // cost the lane its standing). The default is the tool's own English
-        // market, stated rather than inherited from wherever the caller runs.
+    } else if super::lang::latin_query(query) {
+        // English is the language default for a Latin-script query, stated as a
+        // language and never as a market: no cc/kl/gl. The old default also
+        // forced a country; that is exactly the inference this path removed.
         let extra = match engine {
-            "bing" | "bing_rss" => "&setlang=en&cc=us",
-            "ddg" | "ddg_lite" | "ddg_html" => "&kl=us-en",
+            "bing" | "bing_rss" => "&setlang=en",
+            "ddg" | "ddg_lite" | "ddg_html" => "",
             "yahoo" => "&vl=lang_en",
             "yandex" => "&lang=en",
             _ => "",
@@ -655,6 +653,15 @@ pub fn serp_url_in(
         url.push_str(extra);
     }
     Some(url)
+}
+
+/// Yandex's `lang` accepts a small fixed set. A language outside it is left
+/// alone rather than replaced by a different language or a country.
+fn yandex_lang(code: &str) -> bool {
+    matches!(
+        code,
+        "en" | "ru" | "be" | "fr" | "de" | "id" | "kk" | "tt" | "tr" | "uk"
+    )
 }
 
 /// Is a SERP that yielded no results a challenge page rather than an empty
@@ -1145,8 +1152,73 @@ mod tests {
     }
 
     #[test]
+    fn a_query_script_is_not_a_language_or_a_market() {
+        for query in ["новини Києва", "काठमाडौं मौसम"] {
+            for engine in ["bing", "ddg", "yahoo", "yandex"] {
+                let url = serp_url_in(engine, query, None).unwrap();
+                for banned in [
+                    "setlang=ru",
+                    "cc=RU",
+                    "kl=ru-ru",
+                    "vl=lang_ru",
+                    "lang=ru",
+                    "setlang=hi",
+                    "cc=IN",
+                    "kl=in-hi",
+                    "vl=lang_hi",
+                    "lang=hi",
+                ] {
+                    assert!(
+                        !url.contains(banned),
+                        "{engine} inferred {banned} from {query:?}: {url}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stated_language_is_language_only_and_a_region_is_explicit() {
+        let uk = crate::search::Lang::parse("uk").unwrap();
+        let bing = serp_url_in("bing", "q", Some(&uk)).unwrap();
+        assert!(bing.contains("setlang=uk"), "{bing}");
+        assert!(!bing.contains("cc="), "{bing}");
+        let yahoo = serp_url_in("yahoo", "q", Some(&uk)).unwrap();
+        assert!(yahoo.contains("vl=lang_uk"), "{yahoo}");
+        let ddg = serp_url_in("ddg", "q", Some(&uk)).unwrap();
+        assert!(!ddg.contains("kl="), "a language is not a market: {ddg}");
+        let yandex = serp_url_in("yandex", "q", Some(&uk)).unwrap();
+        assert!(yandex.contains("lang=uk"), "{yandex}");
+
+        let regional = crate::search::Lang::parse("uk-UA").unwrap();
+        let bing = serp_url_in("bing", "q", Some(&regional)).unwrap();
+        assert!(bing.contains("cc=UA"), "{bing}");
+        let ddg = serp_url_in("ddg", "q", Some(&regional)).unwrap();
+        assert!(ddg.contains("kl=ua-uk"), "{ddg}");
+
+        let ne = crate::search::Lang::parse("ne").unwrap();
+        let bing = serp_url_in("bing", "q", Some(&ne)).unwrap();
+        assert!(bing.contains("setlang=ne"), "{bing}");
+        assert!(!bing.contains("cc="), "{bing}");
+        assert!(!bing.contains("hi"), "{bing}");
+    }
+
+    #[test]
+    fn the_latin_default_is_english_language_not_a_us_market() {
+        let bing = serp_url_in("bing", "rust tokio", None).unwrap();
+        assert!(bing.contains("setlang=en"), "{bing}");
+        assert!(!bing.contains("cc="), "{bing}");
+        let ddg = serp_url_in("ddg", "rust tokio", None).unwrap();
+        assert!(!ddg.contains("kl="), "{ddg}");
+        let yahoo = serp_url_in("yahoo", "rust tokio", None).unwrap();
+        assert!(yahoo.contains("vl=lang_en"), "{yahoo}");
+        let yandex = serp_url_in("yandex", "rust tokio", None).unwrap();
+        assert!(yandex.contains("lang=en"), "{yandex}");
+    }
+
+    #[test]
     fn yandex_contract_reads_real_titles_and_dense_ranks_without_market_guessing() {
-        // Reduced from the accepted native /search/site witness. Its page title
+        // Reduced from the accepted native_script /search/site witness. Its page title
         // said "no results" even though its actual list carried ten records.
         let html = r#"<html><title>There are no search results</title><ul>
           <li class="serp-item"><a href="/next">Next</a></li>

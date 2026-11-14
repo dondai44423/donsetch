@@ -27,8 +27,9 @@ mod contract;
 mod cse;
 mod enrich;
 mod lane_cache;
+mod lang;
 pub(crate) mod ledger;
-mod locale;
+pub use lang::{Lang, native_script};
 mod news;
 mod persist;
 pub mod quality;
@@ -273,6 +274,14 @@ fn calendar_year(days: i64) -> i64 {
 /// its stopwords, an uppercase `OR`, and the `site:`, `filetype:` and
 /// `intitle:` operators as [`query::compile`] reads them, appended in
 /// that order after the terms.
+/// The language part of a search cache/single-flight key. Two languages are
+/// two searches: the same words can answer in different source sets.
+fn lang_tag(query: &str, lang: Option<&Lang>) -> String {
+    lang::effective(query, lang)
+        .map(|lang| lang.tag())
+        .unwrap_or_default()
+}
+
 fn norm_query(q: &str) -> String {
     const STOP: &[&str] = &[
         "a", "an", "the", "is", "are", "was", "were", "of", "in", "on", "at", "to", "for", "and",
@@ -1199,8 +1208,9 @@ impl Searcher {
         query: &str,
         max_results: usize,
         forced_intent: Option<Intent>,
+        lang: Option<&Lang>,
     ) -> Result<SearchOutcome, FetchError> {
-        self.search_with_read(query, max_results, forced_intent, 0)
+        self.search_with_read(query, max_results, forced_intent, 0, lang)
             .await
     }
 
@@ -1213,6 +1223,7 @@ impl Searcher {
         max_results: usize,
         forced_intent: Option<Intent>,
         read: usize,
+        lang: Option<&Lang>,
     ) -> Result<SearchOutcome, FetchError> {
         let started = Instant::now();
         let read = read.min(3);
@@ -1225,8 +1236,9 @@ impl Searcher {
         // Acquisition still shares across result/read limits. The complete
         // pipeline shares only equivalent requests, so a one-result caller
         // never pays for page reads requested by a twelve-result caller.
+        let lang_key = lang_tag(query, lang);
         let key = format!(
-            "{}|{}|read={read}|max={max_results}",
+            "{}|{}|read={read}|max={max_results}|lang={lang_key}",
             norm_query(&query::normalize(query)),
             forced_intent
                 .unwrap_or_else(|| intent::detect(query))
@@ -1296,14 +1308,14 @@ impl Searcher {
                     started,
                     crate::fetch::layer::REQUEST_LIMIT.scope(
                         limit,
-                        self.search_counted(query, max_results, forced_intent),
+                        self.search_counted(query, max_results, forced_intent, lang),
                     ),
                 )
                 .await?;
             if read > 0 {
                 self.read_results(&mut out.results, query, read).await;
             }
-            // Cold documents took 0.8–1.3 s in native witnesses; 450 ms spent
+            // Cold documents took 0.8–1.3 s in native_script witnesses; 450 ms spent
             // requests without yielding evidence. Use the remaining 2.2 s call
             // envelope, not an extra wait after an already-slow search.
             let repair_time = Duration::from_millis(2200)
@@ -1354,6 +1366,7 @@ impl Searcher {
         query: &str,
         max_results: usize,
         forced_intent: Option<Intent>,
+        lang: Option<&Lang>,
     ) -> Result<SearchOutcome, FetchError> {
         let started = Instant::now();
         // The merge holds at most 12; asking for more is asking for what the
@@ -1369,7 +1382,12 @@ impl Searcher {
         // max_results: the leader publishes the full top-12 into
         // the cache, so a query run once at max=2 and again at
         // max=10 shares one fan-out instead of paying two.
-        let sf_key = format!("{}|{}", norm_query(query), intent_probe.code());
+        let lang_key = lang_tag(query, lang);
+        let sf_key = format!(
+            "{}|{}|lang={lang_key}",
+            norm_query(query),
+            intent_probe.code()
+        );
         let flight = loop {
             let (leader, flight) = {
                 let mut map = self
@@ -1421,7 +1439,9 @@ impl Searcher {
             key: sf_key,
             flight: std::sync::Arc::clone(&flight),
         };
-        let mut outcome = self.search_inner(query, 12, forced_intent, started).await;
+        let mut outcome = self
+            .search_inner(query, 12, forced_intent, started, lang)
+            .await;
         if let Ok(answer) = &mut outcome {
             *flight
                 .answer
@@ -1443,6 +1463,7 @@ impl Searcher {
         max_results: usize,
         forced_intent: Option<Intent>,
         started: Instant,
+        lang: Option<&Lang>,
     ) -> Result<SearchOutcome, FetchError> {
         *self
             .last_merge
@@ -1452,11 +1473,15 @@ impl Searcher {
         // re-lists the same tail.
         let max_results = max_results.clamp(1, 12);
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
-        // The query's language, from its script. It goes to the sources that
-        // accept one and to Wikipedia's own edition; the contract uses the same
-        // script test to tell a native result from a foreign page.
-        let locale = locale::detect(query);
-        let cache_key = format!("{}|{}", norm_query(query), intent.code());
+        // The caller's language, or the English default for a Latin query.
+        // No script is turned into a language or a market here.
+        let lang = lang::effective(query, lang);
+        let cache_key = format!(
+            "{}|{}|lang={}",
+            norm_query(query),
+            intent.code(),
+            lang.as_ref().map(|lang| lang.tag()).unwrap_or_default()
+        );
 
         if let Some((at, cached, _total, reports, quality)) = self
             .cache
@@ -1654,7 +1679,7 @@ impl Searcher {
             pool: self.pool.as_ref(),
             google: &self.google,
             cse: &self.cse,
-            locale,
+            lang: lang.clone(),
             requests: &engine_allowance,
             facts: Some(&query_facts),
         };
@@ -1698,7 +1723,7 @@ impl Searcher {
                             q,
                             eg.id,
                             eg.proxy,
-                            context,
+                            context.clone(),
                             lane_budget(),
                             None,
                         )),
@@ -1713,7 +1738,7 @@ impl Searcher {
             .collect();
         let mut vfuts: Vec<(String, TaskFut)> = Vec::new();
         for v in verticals {
-            if verticals::endpoint_in(v, query, locale).is_none() {
+            if verticals::endpoint_in(v, query, lang.as_ref()).is_none() {
                 skipped.push((
                     v.to_string(),
                     Err(("not-asked".into(), "no-interface".into(), false)),
@@ -1748,7 +1773,7 @@ impl Searcher {
                             &self.fetcher,
                             None,
                             lane_budget(),
-                            locale,
+                            lang.as_ref(),
                         )),
                     ),
                 )),
@@ -2178,9 +2203,6 @@ impl Searcher {
                     .collect::<Vec<_>>()
             );
         }
-
-        let native_lang = locale::evidence_language(query);
-        retain_native_script(&mut per_engine, native_lang);
 
         let total = rank::merged_total(&per_engine);
         // What each general source returned teaches the independence graph, and
@@ -2715,21 +2737,6 @@ pub(crate) fn site_filter(query: &str, results: &mut Vec<Merged>) {
     });
 }
 
-fn retain_native_script(per_engine: &mut Vec<(String, Vec<engines::Hit>)>, lang: Option<&str>) {
-    let Some(lang) = lang else { return };
-    if !per_engine
-        .iter()
-        .flat_map(|(_, hits)| hits)
-        .any(|h| locale::native(lang, &h.title, &h.snippet))
-    {
-        return;
-    }
-    for (_, hits) in per_engine.iter_mut() {
-        hits.retain(|h| locale::native(lang, &h.title, &h.snippet));
-    }
-    per_engine.retain(|(_, hits)| !hits.is_empty());
-}
-
 /// A fresh answer shared only with callers waiting on the same request.
 #[derive(Default)]
 struct LocalFlight {
@@ -2782,7 +2789,17 @@ mod tests {
     use super::render::clip_snippet;
     use super::*;
 
-    // nextest isolates the installed process configuration and native cache.
+    /// The cache/single-flight key `search_inner` uses for a Latin query.
+    fn test_cache_key(query: &str, intent: Intent) -> String {
+        format!(
+            "{}|{}|lang={}",
+            norm_query(query),
+            intent.code(),
+            lang_tag(query, None)
+        )
+    }
+
+    // nextest isolates the installed process configuration and native_script cache.
     #[tokio::test]
     async fn default_repair_and_explicit_reads_report_and_obey_their_physical_budget() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2837,7 +2854,7 @@ mod tests {
             })
             .collect();
         searcher.cache.lock().unwrap().insert(
-            format!("{}|{}", norm_query(query), Intent::Web.code()),
+            test_cache_key(query, Intent::Web),
             (
                 Instant::now(),
                 results,
@@ -2861,7 +2878,10 @@ mod tests {
                 },
             ),
         );
-        let default = searcher.search(query, 2, Some(Intent::Web)).await.unwrap();
+        let default = searcher
+            .search(query, 2, Some(Intent::Web), None)
+            .await
+            .unwrap();
         assert_eq!(default.requests, Some(1));
         assert_eq!(
             default.report[0].requests, 0,
@@ -2873,7 +2893,7 @@ mod tests {
         assert!(default.results[0].from_page && default.results[0].snippet.contains("42"));
         assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
         let explicit = searcher
-            .search_with_read(query, 2, Some(Intent::Web), 2)
+            .search_with_read(query, 2, Some(Intent::Web), 2, None)
             .await
             .unwrap();
         assert_eq!(explicit.requests, Some(2));
@@ -2885,8 +2905,8 @@ mod tests {
         );
         assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 3);
         let (a, b) = tokio::join!(
-            searcher.search(query, 2, Some(Intent::Web)),
-            searcher.search(query, 2, Some(Intent::Web))
+            searcher.search(query, 2, Some(Intent::Web), None),
+            searcher.search(query, 2, Some(Intent::Web), None)
         );
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
@@ -2897,8 +2917,8 @@ mod tests {
         assert!(a.results[0].from_page && b.results[0].from_page);
         assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 4);
         let (a, b) = tokio::join!(
-            searcher.search_with_read(query, 2, Some(Intent::Web), 2),
-            searcher.search_with_read(query, 2, Some(Intent::Web), 2)
+            searcher.search_with_read(query, 2, Some(Intent::Web), 2, None),
+            searcher.search_with_read(query, 2, Some(Intent::Web), 2, None)
         );
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(
@@ -2908,8 +2928,8 @@ mod tests {
         );
         assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 6);
         let (a, b) = tokio::join!(
-            searcher.search(query, 2, Some(Intent::Web)),
-            searcher.search_with_read(query, 2, Some(Intent::Web), 1)
+            searcher.search(query, 2, Some(Intent::Web), None),
+            searcher.search_with_read(query, 2, Some(Intent::Web), 1, None)
         );
         assert_eq!(
             a.unwrap().requests.unwrap() + b.unwrap().requests.unwrap(),
@@ -2917,15 +2937,15 @@ mod tests {
             "different evidence requests keep their own page reads"
         );
         let (a, b) = tokio::join!(
-            searcher.search(query, 1, Some(Intent::Web)),
-            searcher.search(query, 2, Some(Intent::Web))
+            searcher.search(query, 1, Some(Intent::Web), None),
+            searcher.search(query, 2, Some(Intent::Web), None)
         );
         assert_eq!((a.unwrap().results.len(), b.unwrap().results.len()), (1, 2));
         slow.store(true, std::sync::atomic::Ordering::Release);
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(40),
-                searcher.search(query, 2, Some(Intent::Web))
+                searcher.search(query, 2, Some(Intent::Web), None)
             )
             .await
             .is_err()
@@ -2936,12 +2956,15 @@ mod tests {
         );
         assert!(searcher.inflight.lock().unwrap().is_empty());
         slow.store(false, std::sync::atomic::Ordering::Release);
-        let recovered = searcher.search(query, 2, Some(Intent::Web)).await.unwrap();
+        let recovered = searcher
+            .search(query, 2, Some(Intent::Web), None)
+            .await
+            .unwrap();
         assert!(recovered.results[0].from_page && recovered.results[0].snippet.contains("42"));
         let expired = SEARCH_DEADLINE
             .scope(
                 Some(tokio::time::Instant::now()),
-                searcher.search(query, 2, Some(Intent::Web)),
+                searcher.search(query, 2, Some(Intent::Web), None),
             )
             .await
             .unwrap();
@@ -3093,34 +3116,6 @@ mod tests {
             "a preview cannot insert a result the final ranking discarded"
         );
         server.abort();
-    }
-
-    #[test]
-    fn native_evidence_takes_precedence_without_erasing_a_useful_foreign_fallback() {
-        let hit = |title: &str| engines::Hit {
-            title: title.into(),
-            url: "https://example.com/page".into(),
-            snippet: String::new(),
-            rank: 0,
-            published: None,
-        };
-        let mut lists = vec![
-            ("one".into(), vec![hit("Tokyo weather"), hit("東京の天気")]),
-            ("two".into(), vec![hit("English-only title")]),
-        ];
-        let unchanged = lists.clone();
-        retain_native_script(&mut lists, None);
-        assert_eq!(lists.len(), unchanged.len());
-        retain_native_script(&mut lists, Some("ja"));
-        assert_eq!(lists.len(), 1);
-        assert_eq!(lists[0].1.len(), 1);
-        assert_eq!(lists[0].1[0].title, "東京の天気");
-        retain_native_script(&mut lists, Some("ko"));
-        assert_eq!(
-            lists.len(),
-            1,
-            "a missing native source must not erase the only available page"
-        );
     }
 
     #[derive(Clone, Copy)]
@@ -3661,7 +3656,7 @@ mod tests {
         s.byok_cache_put("shared query", &out);
         // The local cache key (query|intent) is a different slot, so a
         // local read finds nothing the BYOK write left behind.
-        let local_key = format!("{}|{}", norm_query("shared query"), Intent::Web.code());
+        let local_key = test_cache_key("shared query", Intent::Web);
         assert!(
             !s.cache
                 .lock()
@@ -3695,7 +3690,7 @@ mod tests {
 
     /// Store a local-path entry the way `search_inner` keys it.
     fn seed_local_cache(s: &Searcher, query: &str, url: &str) {
-        let key = format!("{}|{}", norm_query(query), Intent::Web.code());
+        let key = test_cache_key(query, Intent::Web);
         s.cache.lock().unwrap().insert(
             key,
             (
@@ -3718,12 +3713,12 @@ mod tests {
         seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
         // Negative: a repeat of the cached query is still a hit.
         let repeat = s
-            .search("jaguar car", 5, Some(Intent::Web))
+            .search("jaguar car", 5, Some(Intent::Web), None)
             .await
             .expect("a repeat query is served from the cache");
         assert!(repeat.cached);
         assert_eq!(repeat.results[0].url, JAGUAR_REVIEW);
-        let excluded = s.search("jaguar -car", 5, Some(Intent::Web)).await;
+        let excluded = s.search("jaguar -car", 5, Some(Intent::Web), None).await;
         assert!(
             matches!(&excluded, Err(e) if e.to_string().contains("all engines failed")),
             "\"jaguar -car\" must miss the \"jaguar car\" entry, got {:?}",
@@ -3737,7 +3732,7 @@ mod tests {
         bench_every_source(&s, &["jaguar car", "jaguar -car"]);
         // A "jaguar car" leader is in flight. A follower polls for its
         // cache write for up to 12 s before running on its own.
-        let leader = format!("{}|{}", norm_query("jaguar car"), Intent::Web.code());
+        let leader = test_cache_key("jaguar car", Intent::Web);
         let flight = std::sync::Arc::new(LocalFlight::default());
         s.inflight
             .lock()
@@ -3745,31 +3740,32 @@ mod tests {
             .insert(leader, std::sync::Arc::clone(&flight));
         // Negative: an identical query joins the flight and is served
         // what the leader publishes.
-        let (joined, ()) = tokio::join!(s.search("jaguar car", 5, Some(Intent::Web)), async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
-            let mut answer = s
-                .search_inner("jaguar car", 12, Some(Intent::Web), Instant::now())
-                .await
-                .unwrap();
-            // Concurrent callers may share a fresh weak answer, while later
-            // callers must not read it from the merged cache.
-            answer.cached = false;
-            answer.quality.confidence = quality::Confidence::Low;
-            answer.results[0].snippet =
-                "A detailed jaguar car review with independent road test results.".into();
-            answer.report = vec![EngineReport {
-                engine: "bing".into(),
-                profile: None,
-                status: "ok".into(),
-                hits: 1,
-                ms: 10,
-                egress: "direct".into(),
-                cache_age_ms: None,
-                requests: 1,
-            }];
-            *flight.answer.lock().unwrap() = Some(answer);
-        });
+        let (joined, ()) =
+            tokio::join!(s.search("jaguar car", 5, Some(Intent::Web), None), async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                seed_local_cache(&s, "jaguar car", JAGUAR_REVIEW);
+                let mut answer = s
+                    .search_inner("jaguar car", 12, Some(Intent::Web), Instant::now(), None)
+                    .await
+                    .unwrap();
+                // Concurrent callers may share a fresh weak answer, while later
+                // callers must not read it from the merged cache.
+                answer.cached = false;
+                answer.quality.confidence = quality::Confidence::Low;
+                answer.results[0].snippet =
+                    "A detailed jaguar car review with independent road test results.".into();
+                answer.report = vec![EngineReport {
+                    engine: "bing".into(),
+                    profile: None,
+                    status: "ok".into(),
+                    hits: 1,
+                    ms: 10,
+                    egress: "direct".into(),
+                    cache_age_ms: None,
+                    requests: 1,
+                }];
+                *flight.answer.lock().unwrap() = Some(answer);
+            });
         let joined = joined.expect("a follower is served the leader's results");
         assert!(!joined.cached);
         assert_eq!(joined.quality.confidence, quality::Confidence::Low);
@@ -3784,7 +3780,7 @@ mod tests {
         s.cache.lock().unwrap().clear();
         let excluded = tokio::time::timeout(
             Duration::from_secs(3),
-            s.search("jaguar -car", 5, Some(Intent::Web)),
+            s.search("jaguar -car", 5, Some(Intent::Web), None),
         )
         .await;
         assert!(
@@ -4355,6 +4351,17 @@ mod tests {
     }
 
     #[test]
+    fn languages_are_distinct_search_keys() {
+        let uk = Lang::parse("uk").unwrap();
+        let ne = Lang::parse("ne").unwrap();
+        let en = Lang::parse("en").unwrap();
+        assert_ne!(lang_tag("rust", Some(&uk)), lang_tag("rust", Some(&ne)));
+        assert_eq!(lang_tag("rust", None), lang_tag("rust", Some(&en)));
+        assert_ne!(lang_tag("Привіт", None), lang_tag("Привіт", Some(&uk)));
+        assert_eq!(lang_tag("Привіт", None), String::new());
+    }
+
+    #[test]
     fn norm_query_collapses_variants() {
         assert_eq!(
             norm_query("Rust Async: the Runtime, comparison!"),
@@ -4401,7 +4408,7 @@ mod tests {
     #[tokio::test]
     async fn persisted_cache_entry_counts_time_spent_stopped() {
         let query = "tokio runtime overview";
-        let key = format!("{}|{}", norm_query(query), Intent::Web.code());
+        let key = test_cache_key(query, Intent::Web);
         let mut map = persist::CacheMap::new();
         map.insert(
             key.clone(),

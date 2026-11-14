@@ -80,7 +80,7 @@ impl LaneCache {
     pub fn contains(&self, source: &str, query: &str, intent: super::intent::Intent) -> bool {
         self.entries
             .get(&format!("{source}|{}|{query}", intent.code()))
-            .is_some_and(|entry| valid(entry, now()) && has_native_evidence(query, &entry.hits))
+            .is_some_and(|entry| valid(entry, now()))
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -99,13 +99,6 @@ fn valid(entry: &Entry, time: u64) -> bool {
             .is_some_and(|age| age < entry.ttl)
 }
 
-fn has_native_evidence(query: &str, hits: &[super::engines::Hit]) -> bool {
-    super::locale::evidence_language(query).is_none_or(|lang| {
-        hits.iter()
-            .any(|hit| super::locale::native(lang, &hit.title, &hit.snippet))
-    })
-}
-
 /// The exact query is part of the key: scoped, excluded and quoted queries
 /// never borrow a different question's answer. TTL follows the source class.
 pub(super) async fn run(
@@ -120,11 +113,7 @@ pub(super) async fn run(
         let guard = cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = guard
-            .entries
-            .get(&key)
-            .filter(|e| valid(e, now()) && has_native_evidence(&query, &e.hits))
-        {
+        if let Some(entry) = guard.entries.get(&key).filter(|e| valid(e, now())) {
             return (
                 source,
                 Ok(LaneAnswer {
@@ -145,7 +134,6 @@ pub(super) async fn run(
     if let Ok(answer) = &answer
         && answer.class == AnswerClass::Answered
         && !answer.hits.is_empty()
-        && has_native_evidence(&query, &answer.hits)
     {
         let ttl = if super::news::wants_news(&query, intent) {
             120
@@ -217,18 +205,9 @@ mod tests {
             .unwrap()
             .entries
             .insert(format!("bing|{}|{query}", intent.code()), entry);
-        assert!(!cache.lock().unwrap().contains("bing", query, intent));
-        let fresh: TaskFut<'_> = Box::pin(async {
-            (
-                "bing".into(),
-                Err(("fresh-request".into(), "direct".into(), true)),
-            )
-        });
-        let (_, answer) = run(&cache, "bing".into(), query.into(), intent, fresh).await;
-        assert_eq!(
-            answer.unwrap_err().0,
-            "fresh-request",
-            "a foreign cached answer must not prevent a fresh native query"
+        assert!(
+            cache.lock().unwrap().contains("bing", query, intent),
+            "an answered entry is replayable regardless of the script of its hits"
         );
     }
 }

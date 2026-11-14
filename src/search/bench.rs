@@ -68,7 +68,7 @@ pub const SHAPES: &[&str] = &[
     "adversarial",
 ];
 
-/// Languages `locale::native` can judge a title against. A row that says `jp`
+/// Languages `lang::native_script` can judge a title against. A row that says `jp`
 /// would silently test nothing, so the schema refuses it.
 const LANGS: &[&str] = &["ja", "zh", "ko", "ru", "ar", "he", "th", "hi", "el"];
 
@@ -812,7 +812,9 @@ pub async fn one_run(
 /// The single-row body of an in-process run: search, then judge what came back.
 async fn in_process_row(searcher: &Searcher, opts: &Options, q: &BenchQuery) -> RowRecord {
     let t0 = Instant::now();
-    let outcome = searcher.search(&q.query, opts.max_results, None).await;
+    let outcome = searcher
+        .search(&q.query, opts.max_results, None, None)
+        .await;
     let ms = t0.elapsed().as_millis() as u64;
     let requests = outcome
         .as_ref()
@@ -867,7 +869,7 @@ async fn in_process_row(searcher: &Searcher, opts: &Options, q: &BenchQuery) -> 
     let mut foreign = 0usize;
     if let Some(lang) = q.lang.as_deref() {
         for row in answers.iter().take(3) {
-            if !super::locale::native(lang, &row.title, &row.snippet) {
+            if !super::lang::native_script(lang, &row.title, &row.snippet) {
                 foreign += 1;
             }
         }
@@ -1040,7 +1042,7 @@ pub fn artifact(
         "request_accounting": if mode == "in-process" { "http-exchanges-v1" } else { "not-observed" },
         "cold": opts.cold,
         "refusal_policy": "preserve-active-source-refusals-v1",
-        "default_pipeline": if mode == "in-process" { "native-search-and-default-repair-v1" } else { "not-observed" },
+        "default_pipeline": if mode == "in-process" { "native_script-search-and-default-repair-v1" } else { "not-observed" },
         "file_config": if opts.cold || std::env::var("DONSETCH_NO_CONFIG_FILE").as_deref() == Ok("1") { "disabled" } else { "ambient" },
         "search_env_overrides": std::env::vars_os().filter_map(|(name, _)| {
             let name = name.to_string_lossy();

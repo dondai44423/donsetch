@@ -22,6 +22,13 @@ pub(super) async fn search_tool(
     };
     let max = args.get("max_results").and_then(Value::as_u64).unwrap_or(7) as usize;
     let read = args.get("read").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let lang = match args.get("lang").and_then(Value::as_str) {
+        Some(raw) => match crate::search::Lang::parse(raw) {
+            Ok(lang) => Some(lang),
+            Err(error) => return tool_error(format!("search: {error}")),
+        },
+        None => None,
+    };
     let intent = match args.get("intent").and_then(Value::as_str) {
         Some("web") => Some(Intent::Web),
         Some("code") => Some(Intent::Code),
@@ -36,7 +43,7 @@ pub(super) async fn search_tool(
             if queries.len() == 1 {
                 let query = &queries[0];
                 run_with_budget(
-                    search_inner(daemon, query, max, intent, read),
+                    search_inner(daemon, query, max, intent, read, lang.as_ref()),
                     deadline,
                     ctx.as_mut(),
                     || search_deadline_error(query),
@@ -45,7 +52,7 @@ pub(super) async fn search_tool(
             } else {
                 let deadline_queries = queries.clone();
                 run_with_budget(
-                    search_batch_inner(daemon, &queries, max, intent, read),
+                    search_batch_inner(daemon, &queries, max, intent, read, lang.as_ref()),
                     deadline,
                     ctx.as_mut(),
                     move || search_batch_deadline_error(&deadline_queries),
@@ -115,8 +122,9 @@ pub(super) async fn search_inner(
     max: usize,
     intent: Option<Intent>,
     read: usize,
+    lang: Option<&crate::search::Lang>,
 ) -> Value {
-    match search_read(daemon, query, max, intent, read).await {
+    match search_read(daemon, query, max, intent, read, lang).await {
         Ok(out) => render_search_outcome(daemon, &out, max).await,
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
@@ -261,11 +269,12 @@ pub(super) async fn search_batch_inner(
     max: usize,
     intent: Option<Intent>,
     read: usize,
+    lang: Option<&crate::search::Lang>,
 ) -> Value {
     let started = std::time::Instant::now();
     let futures = queries
         .iter()
-        .map(|query| search_read(daemon, query, max, intent, read));
+        .map(|query| search_read(daemon, query, max, intent, read, lang));
     let outcomes = futures_util::future::join_all(futures).await;
     let ok = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
     if ok == 0 {
@@ -381,8 +390,9 @@ async fn search_read(
     max: usize,
     intent: Option<Intent>,
     read: usize,
+    lang: Option<&crate::search::Lang>,
 ) -> Result<crate::search::SearchOutcome, SearchFailure> {
-    let mut out = search_outcome(daemon, query, max, intent, read).await?;
+    let mut out = search_outcome(daemon, query, max, intent, read, lang).await?;
     if out.provider.is_none() {
         return Ok(out);
     }
@@ -409,6 +419,7 @@ pub(super) async fn search_outcome(
     max: usize,
     intent: Option<Intent>,
     read: usize,
+    lang: Option<&crate::search::Lang>,
 ) -> Result<crate::search::SearchOutcome, SearchFailure> {
     // Input hygiene first: a bad query is a permanent-shaped failure
     // whether the fanout would have been BYOK or local.
@@ -425,9 +436,11 @@ pub(super) async fn search_outcome(
     let byok_configured = daemon.byok.is_configured();
     let local_first = daemon.byok.is_local_default();
 
-    // BYOK-first mode: try providers, fall back to local.
+    // BYOK-first mode: try providers, fall back to local. An explicit `lang`
+    // keeps the local language-aware path: a provider that does not accept the
+    // tag must not silently answer in its own locale.
     let mut byok_fail: Option<String> = None;
-    if byok_configured && !local_first {
+    if byok_configured && !local_first && lang.is_none() {
         match byok_search_cached(daemon, query, max, intent).await {
             Ok(out) => return Ok(out),
             Err(e) => {
@@ -446,7 +459,7 @@ pub(super) async fn search_outcome(
     // Local search (primary in local-first mode, fallback in BYOK-first).
     match daemon
         .searcher
-        .search_with_read(query, max, intent, read)
+        .search_with_read(query, max, intent, read, lang)
         .await
     {
         Ok(mut out) => {

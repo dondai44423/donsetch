@@ -5,6 +5,20 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Search never infers a language or a market from a query's script.** `lang` is an explicit
+  optional tool parameter (BCP-47: `en`, `uk`, `ne`, `pt-BR`); a region is used only when the tag
+  carries one. Latin-script queries default to English as a language, not a country; non-Latin
+  queries send no language unless `lang` is set. The script-level native/foreign filter, the
+  Wikipedia-edition guess and the per-provider `setlang`/`cc`/`kl`/`vl` inference are removed.
+- **Fetch: the content lane mines and replays the app's own request (M3).** The wire tap records
+  the request; a first content run mines a request contract per host/identity/URL shape, and the
+  next encounter replays it as plain HTTP before any JS, with a structural check and a re-mine on
+  break.
+
 ## [5.3.0] - 2026-11-12
 
 Search as the fetch layer's sibling: a query is classified before anything runs, results are

@@ -44,14 +44,14 @@ pub(super) type EngineResult = Result<LaneAnswer, (String, String, bool)>;
 pub(super) type TaskFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = (String, EngineResult)> + Send + 'a>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct EngineContext<'a> {
     pub fetcher: &'a Fetcher,
     pub pool: &'a EgressPool,
     pub google: &'a engines::google_wml::ProfileSelector,
     pub cse: &'a super::cse::Client,
     /// The query's language, when the script named one.
-    pub locale: Option<super::locale::Locale>,
+    pub lang: Option<super::lang::Lang>,
     /// Shared allowance for engine HTTP requests after first-party reserves.
     pub requests: &'a RequestAllowance,
     pub facts: Option<&'a super::query::QueryFacts>,
@@ -172,7 +172,7 @@ pub(super) async fn engine_task_with_budget(
         fetcher,
         pool,
         google,
-        locale,
+        lang,
         requests: allowance,
         facts: original_facts,
         cse: _,
@@ -198,7 +198,7 @@ pub(super) async fn engine_task_with_budget(
         None
     };
     let google_ua = lease.as_ref().map(|lease| lease.user_agent());
-    let Some(url) = engines::serp_url_in(&engine, &query, locale) else {
+    let Some(url) = engines::serp_url_in(&engine, &query, lang.as_ref()) else {
         return (label, Err(("no-url".into(), egress_id, true)));
     };
     // The search lane hands over a picked egress lane, and with no pool
@@ -309,7 +309,7 @@ pub(super) async fn engine_task_with_budget(
                 lane,
                 fetcher,
                 deadline,
-                locale,
+                lang.as_ref(),
                 allowance,
                 &mut request_count,
             )
@@ -362,7 +362,7 @@ pub(super) async fn engine_task_with_budget(
                 lane,
                 fetcher,
                 deadline,
-                locale,
+                lang.as_ref(),
                 allowance,
                 &mut request_count,
             )
@@ -434,7 +434,7 @@ pub(super) async fn engine_task_with_budget(
             lane,
             fetcher,
             deadline,
-            locale,
+            lang.as_ref(),
             allowance,
             &mut requests,
         )
@@ -504,7 +504,7 @@ async fn bing_rss_fallback(
     lane: Option<&crate::egress::proxy::Proxy>,
     fetcher: &Fetcher,
     deadline: tokio::time::Instant,
-    locale: Option<super::locale::Locale>,
+    lang: Option<&super::lang::Lang>,
     allowance: &RequestAllowance,
     requests: &mut usize,
 ) -> Option<(Vec<engines::Hit>, engines::AnswerClass, usize)> {
@@ -513,7 +513,7 @@ async fn bing_rss_fallback(
     {
         return None;
     }
-    let url = engines::serp_url_in("bing_rss", query, locale)?;
+    let url = engines::serp_url_in("bing_rss", query, lang)?;
     if !allowance.take("bing") {
         return None;
     }
@@ -683,12 +683,12 @@ pub(super) async fn vertical_task(
     fetcher: &Fetcher,
     proxy: Option<crate::egress::proxy::Proxy>,
     budget: std::time::Duration,
-    locale: Option<super::locale::Locale>,
+    lang: Option<&super::lang::Lang>,
 ) -> (String, EngineResult) {
     let started = Instant::now();
     match tokio::time::timeout(
         budget,
-        verticals::run(fetcher, &vertical, &query, proxy.as_ref(), locale),
+        verticals::run(fetcher, &vertical, &query, proxy.as_ref(), lang),
     )
     .await
     {
@@ -828,7 +828,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &cse,
-            locale: None,
+            lang: None,
             requests: &allowance,
             facts: Some(&facts),
         };
@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "native public-source contract witness; requires network and explicit output path"]
+    #[ignore = "native_script public-source contract witness; requires network and explicit output path"]
     async fn yandex_source_contract_live_witness() {
         let path =
             std::env::var_os("DSB_SOURCE_WITNESS").expect("set an absolute witness output path");
@@ -912,7 +912,7 @@ mod tests {
                     })
                     .into();
             }
-            Err(_) => receipt["error"] = "native request failed".into(),
+            Err(_) => receipt["error"] = "native_script request failed".into(),
         }
         assert!(requests <= 2);
         crate::config::write_private(
@@ -1114,7 +1114,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &super::super::cse::Client::default(),
-            locale: None,
+            lang: None,
             requests: &RequestAllowance::new(6),
             facts: None,
         };
@@ -1147,7 +1147,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &super::super::cse::Client::default(),
-            locale: None,
+            lang: None,
             requests: &RequestAllowance::new(6),
             facts: None,
         };
@@ -1161,7 +1161,7 @@ mod tests {
                 query.into(),
                 "direct".into(),
                 None,
-                context,
+                context.clone(),
                 std::time::Duration::from_secs(8),
                 None,
             )
@@ -1326,7 +1326,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &super::super::cse::Client::default(),
-            locale: None,
+            lang: None,
             requests: &RequestAllowance::new(6),
             facts: None,
         };

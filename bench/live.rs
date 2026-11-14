@@ -482,7 +482,7 @@ fn external_row(bin: &Path, cache: &Path, opts: &Options, q: &BenchQuery) -> Row
     let mut foreign = 0usize;
     if let Some(lang) = q.lang.as_deref() {
         for row in answers.iter().take(3) {
-            if !crate::search::locale::native(lang, &row.title, &row.snippet) {
+            if !crate::search::native_script(lang, &row.title, &row.snippet) {
                 foreign += 1;
             }
         }

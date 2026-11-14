@@ -452,7 +452,9 @@ async fn doctor(searcher: &Searcher, pace: Duration, quiet: bool) -> BTreeMap<St
             // A canary measures the sources now, never a remembered answer: a
             // cached outcome has no per-source hits and would convict everyone.
             searcher.forget_cached();
-            if let Ok(o) = searcher.search(canary.query, 10, Some(canary.intent)).await
+            if let Ok(o) = searcher
+                .search(canary.query, 10, Some(canary.intent), None)
+                .await
                 && !o.cached
             {
                 observe(
