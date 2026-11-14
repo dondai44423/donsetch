@@ -86,6 +86,7 @@ fn get(session: &Session, url: String) -> crate::Outcome {
         identity: Some("chrome".into()),
         pace: Duration::ZERO,
         deadline: Duration::from_secs(10),
+        allow_private: true,
         ..Request::new(url)
     })
 }

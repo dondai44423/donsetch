@@ -21,6 +21,8 @@ fn request(url: String) -> Request {
         identity: Some("chrome".into()),
         pace: Duration::ZERO,
         deadline: Duration::from_secs(10),
+        // The fixtures are loopback servers; the test opts in explicitly.
+        allow_private: true,
         ..Request::new(url)
     }
 }

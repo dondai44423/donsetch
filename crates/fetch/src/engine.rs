@@ -651,7 +651,7 @@ pub fn mint_within(
     identity: &'static Identity,
     cookie_header: Option<&str>,
 ) -> Result<Mint, MintError> {
-    mint_within_via(limits, url, html, identity, cookie_header, None)
+    mint_within_via_policy(limits, url, html, identity, cookie_header, None, true)
 }
 
 /// The visible text length the lane's own stop rule measures on a served
@@ -1045,6 +1045,20 @@ pub fn mint_within_via(
     cookie_header: Option<&str>,
     proxy: Option<&str>,
 ) -> Result<Mint, MintError> {
+    mint_within_via_policy(limits, url, html, identity, cookie_header, proxy, false)
+}
+
+/// The mint with the caller's private-egress policy: the page's own host may
+/// resolve to a private address only when the user explicitly opted in.
+pub fn mint_within_via_policy(
+    limits: &Limits,
+    url: &str,
+    html: &str,
+    identity: &'static Identity,
+    cookie_header: Option<&str>,
+    proxy: Option<&str>,
+    allow_private: bool,
+) -> Result<Mint, MintError> {
     let (value, cost) = run_within(
         Mode::Mint,
         limits,
@@ -1054,6 +1068,7 @@ pub fn mint_within_via(
         cookie_header,
         proxy,
         0,
+        allow_private,
     )?;
     mint_from(value, cost)
 }
@@ -1071,6 +1086,30 @@ pub fn content_within_via(
     proxy: Option<&str>,
     text_target: usize,
 ) -> Result<Content, MintError> {
+    content_within_via_policy(
+        limits,
+        url,
+        html,
+        identity,
+        cookie_header,
+        proxy,
+        text_target,
+        false,
+    )
+}
+
+/// The content run with the caller's private-egress policy.
+#[allow(clippy::too_many_arguments)]
+pub fn content_within_via_policy(
+    limits: &Limits,
+    url: &str,
+    html: &str,
+    identity: &'static Identity,
+    cookie_header: Option<&str>,
+    proxy: Option<&str>,
+    text_target: usize,
+    allow_private: bool,
+) -> Result<Content, MintError> {
     let (value, cost) = run_within(
         Mode::Content,
         limits,
@@ -1080,6 +1119,7 @@ pub fn content_within_via(
         cookie_header,
         proxy,
         text_target,
+        allow_private,
     )?;
     content_from(value, cost)
 }
@@ -1097,6 +1137,7 @@ fn run_within(
     cookie_header: Option<&str>,
     proxy: Option<&str>,
     text_target: usize,
+    allow_private: bool,
 ) -> Result<(serde_json::Value, Cost), MintError> {
     let _slot = envelope::slot();
     envelope::init_v8().map_err(MintError::Runtime)?;
@@ -1106,7 +1147,7 @@ fn run_within(
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string))
         .unwrap_or_default();
-    let guard = Guard::new(limits.clone(), &page_host);
+    let guard = Guard::with_policy(limits.clone(), &page_host, allow_private);
     let wire = Wire::guarded(identity, &guard, proxy).map_err(MintError::Runtime)?;
     // The content lane opens with a preload pass: the document's own script and
     // stylesheet set fetched in parallel, before the isolate exists, so running

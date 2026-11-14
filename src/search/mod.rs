@@ -771,7 +771,7 @@ impl Searcher {
             .ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ready(&key);
+            .reserve(&key);
         match state {
             ledger::State::Ready => Some(Duration::ZERO),
             ledger::State::Paced(secs) => {
@@ -1530,20 +1530,6 @@ impl Searcher {
             });
         }
 
-        // A name with an ecosystem word is answered by the registry that owns
-        // it: one request, no fan-out, no ambiguity to rank around.
-        if let Some(plan) = resolve::plan(query)
-            && plan.ecosystem.is_some()
-            && let resolve::Resolution::Hits(resolved) = resolve::run(
-                &plan,
-                &self.fetcher,
-                stage_budget(Duration::from_millis(1500), Duration::from_millis(300)),
-            )
-            .await
-        {
-            return Ok(self.resolved_outcome(query, intent, max_results, started, resolved));
-        }
-
         let engines = intent::engines_for(intent);
         // C2: compile operators once; each engine gets the form it
         // actually honors (DDG lite strips site: so BM25 is not
@@ -1810,12 +1796,12 @@ impl Searcher {
             ));
         }
 
-        // A bare name is resolved alongside the fan-out: no latency cost, and
-        // its records lead the list when the name is real. The lane gets a
+        // A name is resolved alongside the fan-out, never instead of it: a
+        // registry record is one source, and `node path` still needs the Node
+        // docs even though npm has a package called `path`. The lane gets a
         // shorter budget than the fan-out's soft mark so its answer lands with
         // the first ones instead of arriving late.
         if let Some(plan) = resolve::plan(query)
-            && plan.ecosystem.is_none()
             && let Some(pace) = self.plan_lane("registry", &mut skipped)
         {
             futures.push((
@@ -2420,70 +2406,6 @@ impl Searcher {
             requests: None,
             stage_ms: stages,
         })
-    }
-
-    /// A resolved name becomes an answer without a fan-out: the registry is the
-    /// first-party source, and its records enter the ordinary merge as one lane
-    /// (so evidence picking, tiers and diversity apply unchanged).
-    fn resolved_outcome(
-        &self,
-        query: &str,
-        intent: Intent,
-        max_results: usize,
-        started: Instant,
-        resolved: resolve::Resolved,
-    ) -> SearchOutcome {
-        let input = rank::MergeInput {
-            per_engine: vec![("registry".to_string(), resolved.hits.clone())],
-            query: query.to_string(),
-            intent,
-            trust: HashMap::new(),
-            families: families::Families::default(),
-            depth: 12,
-            post_adjustments: HashMap::new(),
-        };
-        let results = input.merge();
-        *self
-            .last_merge
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
-        let report = vec![EngineReport {
-            cache_age_ms: resolved.cache_age.map(|age| age.as_millis() as u64),
-            engine: "registry".into(),
-            profile: Some(resolved.label),
-            status: if resolved.cache_age.is_some() {
-                "cached"
-            } else {
-                "ok"
-            }
-            .into(),
-            hits: resolved.hits.len(),
-            ms: resolved.ms,
-            egress: if resolved.cache_age.is_some() {
-                "cache"
-            } else {
-                "direct"
-            }
-            .into(),
-            requests: crate::fetch::layer::REQUEST_COUNT
-                .try_with(|count| count.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(resolved.requests),
-        }];
-        let quality = quality::assess(query, &results, &report, &families::Families::default());
-        SearchOutcome {
-            results: results.into_iter().take(max_results).collect(),
-            intent,
-            report,
-            cached: false,
-            quality,
-            cache_age: None,
-            elapsed: started.elapsed(),
-            provider: None,
-            reranked: false,
-            instant: None,
-            requests: None,
-            stage_ms: vec![("resolve", resolved.ms as u128)],
-        }
     }
 
     fn bump_trust(&self, base_engine: &str, intent: Intent, ok: bool) {

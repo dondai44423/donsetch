@@ -20,6 +20,7 @@ fn request(url: String) -> Request {
         identity: Some("chrome".into()),
         pace: Duration::ZERO,
         deadline: Duration::from_secs(10),
+        allow_private: true,
         ..Request::new(url)
     }
 }

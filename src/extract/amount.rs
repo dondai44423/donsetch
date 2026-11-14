@@ -115,9 +115,12 @@ static IN_PHRASE: LazyLock<regex::Regex> = LazyLock::new(|| {
         r"(?xi)
         (?P<pre> € | us\$ | \$ | £ | ¥ | ₹ | \b(?:eur|usd|gbp|jpy|cny|rmb|inr|chf)\b )?
         \s*
-        \b(?P<num> \d{1,3}(?:[,.\u{a0}\u{202f}'][0-9]{3})+(?:[.,][0-9]+)? | [0-9]+(?:[.,][0-9]+)? )
-        (?: \s* (?P<mag> thousands? | millions? | billions? | trillions? | mln | mn | mio | bln | bn | mrd | md | tn | [kmbt] ) \b )?
-        (?: \s* (?P<post> % | percent\b | per\s+cent\b | pct\b | euros?\b | dollars?\b | pounds?\b | yen\b | yuan\b | rupees?\b | € | \$ | £ | ¥ | ₹ | \b(?:eur|usd|gbp|jpy|cny|rmb|inr|chf)\b ) )?",
+        \b(?P<num> \d+(?:[,.\u{a0}\u{202f}'][0-9]{3})*(?:[.,][0-9]+)? )
+        (?:
+            \s* (?P<mag> thousands? | millions? | billions? | trillions? | mln | mn | mio | bln | bn | mrd | md | tn | [kmbt] ) \b
+          | \s* (?P<post> % | percent\b | per\s+cent\b | pct\b | euros?\b | dollars?\b | pounds?\b | yen\b | yuan\b | rupees?\b | € | \$ | £ | ¥ | ₹ | \b(?:eur|usd|gbp|jpy|cny|rmb|inr|chf)\b )
+          | (?:$|[^\d])
+        )",
     )
     .expect("amount pattern")
 });
@@ -158,11 +161,12 @@ fn number_value(raw: &str) -> Option<f64> {
     plain.parse().ok()
 }
 
-/// Every spelling of the number `x` (at most three decimals): digits grouped by
+/// Every spelling of the number `x` (at most six decimals): digits grouped by
 /// threes with any common separator or none, and a decimal part with either
-/// point and optional trailing zeros.
+/// point and optional trailing zeros. Three decimals collapsed `$0.0116` into
+/// `$0.012`, so a pricing probe matched the wrong amount.
 fn number_pattern(x: f64) -> String {
-    let fixed = format!("{x:.3}");
+    let fixed = format!("{x:.6}");
     let (int, frac) = fixed.split_once('.').unwrap_or((&fixed, ""));
     let frac = frac.trim_end_matches('0');
     let mut groups: Vec<&str> = Vec::new();
@@ -351,6 +355,13 @@ mod tests {
         assert!(matches("15K", "15k stars"));
         assert!(matches("15 million", "raised 15M"));
         assert!(!matches("15 million", "15m tall"));
+    }
+
+    #[test]
+    fn sub_cent_amounts_keep_all_their_digits() {
+        assert_eq!(number_value("0.0116"), Some(0.0116));
+        assert!(matches("$0.0116", "the price is $0.0116 per request"));
+        assert!(!matches("$0.0116", "the price is $0.012 per request"));
     }
 
     #[test]

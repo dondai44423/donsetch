@@ -88,6 +88,10 @@ pub struct Lane {
     /// Token bucket, refilled by the lane's rate.
     #[serde(default)]
     tokens: f64,
+    /// Tokens reserved by a caller that has not recorded its request yet. A
+    /// concurrent variant must not spend the same token twice.
+    #[serde(default)]
+    reserved: u32,
     #[serde(default)]
     refilled: u64,
     #[serde(default)]
@@ -106,6 +110,7 @@ impl Lane {
             rest_cause: RestCause::Backoff,
             fails: 0,
             tokens: burst,
+            reserved: 0,
             refilled: now(),
             last_ok: 0,
             updated_ms: 0,
@@ -243,6 +248,23 @@ impl Ledger {
         State::Ready
     }
 
+    /// Reserve a token for the request that is about to go out. `ready` is the
+    /// pure diagnostic; a caller that will actually ask must reserve, or a
+    /// burst of variants all see the same token and leave nothing to spend.
+    pub fn reserve(&mut self, key: &str) -> State {
+        let state = self.ready(key);
+        if state == State::Ready {
+            let lane = self
+                .lanes
+                .entry(key.to_string())
+                .or_insert_with(|| Lane::for_key(key));
+            lane.tokens -= 1.0;
+            lane.reserved = lane.reserved.saturating_add(1);
+            self.dirty = true;
+        }
+        state
+    }
+
     /// A known origin's rest, without creating a pacing bucket for every URL.
     pub(crate) fn origin_rest(&mut self, origin: &str) -> Option<u64> {
         let key = format!("origin:{origin}|http");
@@ -274,9 +296,16 @@ impl Ledger {
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         lane.updated_ms = receipt_ms.max(lane.updated_ms.saturating_add(1));
-        // A request was spent, whatever it returned.
+        // A reserved request already spent its token when it was admitted; a
+        // direct `record` (tests, origin receipts) spends one here.
         let elapsed = t.saturating_sub(lane.refilled) as f64;
-        lane.tokens = (lane.tokens + elapsed * rate).min(burst) - 1.0;
+        let spent = if lane.reserved > 0 {
+            lane.reserved -= 1;
+            0.0
+        } else {
+            1.0
+        };
+        lane.tokens = (lane.tokens + elapsed * rate).min(burst) - spent;
         lane.refilled = t;
         let published = (lane.rest_cause != RestCause::Backoff && lane.rest_until > t).then_some((
             lane.rest_until,
@@ -646,6 +675,25 @@ mod tests {
             "concurrent cold groups retain every source's refusal"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_burst_cannot_spend_the_same_token_twice() {
+        let mut l = Ledger {
+            lanes: BTreeMap::new(),
+            dirty: false,
+        };
+        let k = key("bing", "serp");
+        assert_eq!(l.reserve(&k), State::Ready);
+        assert_eq!(l.reserve(&k), State::Ready);
+        assert!(
+            matches!(l.reserve(&k), State::Paced(_)),
+            "the third concurrent variant must see the bucket empty"
+        );
+        // Each reservation is consumed by its own receipt, never subtracted twice.
+        l.record(&k, Outcome::Answered, None);
+        l.record(&k, Outcome::Answered, None);
+        assert_eq!(l.lane(&k).unwrap().reserved, 0);
     }
 
     #[test]

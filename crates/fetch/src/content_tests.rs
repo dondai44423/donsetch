@@ -4,7 +4,7 @@
 //! came back: the document the page's own program assembled, the wire tap of
 //! the requests it made, and the honest stop reason when it assembles nothing.
 
-use crate::engine::{content_within_via, Content, MintError};
+use crate::engine::{content_within_via_policy, Content, MintError};
 use crate::envelope::Limits;
 use crate::identity::{self, Identity};
 use crate::testkit::{Reply, Server};
@@ -31,7 +31,7 @@ fn render_with(
 ) -> Result<Content, MintError> {
     let _turn = crate::engine_tests::serial();
     let url = format!("http://{}/", server.addr);
-    content_within_via(limits, &url, html, chrome(), None, None, target)
+    content_within_via_policy(limits, &url, html, chrome(), None, None, target, true)
 }
 
 fn render(server: &Server, html: &str, target: usize) -> Result<Content, MintError> {
@@ -426,6 +426,7 @@ fn the_encounter_takes_the_content_lane_on_a_shell() {
             wall: Duration::from_millis(5_000),
             ..crate::envelope::Limits::content()
         },
+        allow_private: true,
         ..Default::default()
     };
     let url = format!("http://{}/", server.addr);

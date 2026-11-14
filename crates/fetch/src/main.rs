@@ -213,6 +213,7 @@ fn command_scorecard(flags: &Flags) -> i32 {
             identity: Some(identity.name.to_string()),
             pace_ms: 900,
             engine: envelope::Limits::from_env(),
+            allow_private: false,
             content: envelope::Limits::content_from_env(),
             policy: Default::default(),
         };
@@ -381,6 +382,7 @@ fn command_fetch(arguments: &[String], flags: &Flags) -> i32 {
             .map(|value| value as i64)
             .unwrap_or(900),
         engine: envelope::Limits::from_env(),
+        allow_private: false,
         content: envelope::Limits::content_from_env(),
         policy: Default::default(),
     };

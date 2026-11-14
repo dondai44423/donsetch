@@ -16,6 +16,29 @@ const FOOTER: &str = r#"<footer><a href="/about">About</a><a href="/help">Help</
 <a href="/terms">Terms of Service</a><a href="/privacy">Privacy Policy</a>
 <p>© 2026 Example Inc. All rights reserved.</p></footer>"#;
 
+#[test]
+fn an_auth_word_in_a_title_is_the_article_not_a_gate() {
+    let prose = "Password managers store credentials behind one master key. ".repeat(12);
+    for heading in [
+        "The Best Password Managers",
+        "Processor register",
+        "Concentrar la atención",
+    ] {
+        let html = format!("<h1>{heading}</h1><p>{prose}</p>");
+        assert_ne!(
+            verdict(&html),
+            Verdict::AuthGate,
+            "{heading:?} is a title, not a sign-in gate"
+        );
+    }
+}
+
+#[test]
+fn a_bare_sign_in_heading_is_a_gate() {
+    let html = "<h1>Sign in to continue</h1><p>Use your account to read this page.</p>";
+    assert_eq!(verdict(html), Verdict::AuthGate);
+}
+
 // ------------------------------------------------------------ not content
 
 #[test]

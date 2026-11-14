@@ -564,7 +564,18 @@ impl Wire {
     /// `socks5://` URL, credentials in the userinfo), or direct when `None`: the proxy variables of
     /// the environment are not read.
     pub fn via(identity: &Identity, proxy: Option<&str>) -> Result<Self, String> {
-        Self::build(identity, None, proxy)
+        Self::build(identity, None, proxy, false)
+    }
+
+    /// The document client: every resolved address is validated against
+    /// `guard`, but redirects stay with the caller's hop loop so local rules
+    /// and robots gates still run.
+    pub fn resolved(
+        identity: &Identity,
+        guard: &Arc<Guard>,
+        proxy: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::build(identity, Some(guard), proxy, false)
     }
 
     /// The same client for a page program's own requests: every redirect hop and
@@ -576,13 +587,14 @@ impl Wire {
         guard: &Arc<Guard>,
         proxy: Option<&str>,
     ) -> Result<Self, String> {
-        Self::build(identity, Some(guard), proxy)
+        Self::build(identity, Some(guard), proxy, true)
     }
 
     fn build(
         identity: &Identity,
         guard: Option<&Arc<Guard>>,
         proxy: Option<&str>,
+        guard_redirects: bool,
     ) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -599,15 +611,19 @@ impl Wire {
             .retry(wreq::retry::Policy::never())
             .connect_timeout(Duration::from_millis(2500))
             .timeout(Duration::from_secs(8))
+            // Keep the peer chain on the response: the compromised-CA list is
+            // checked after the handshake because wreq exposes no verify hook.
+            .tls_info(true)
             // One identity, one pool: connections are reused inside a process.
             .pool_max_idle_per_host(4);
         if let Some(roots) = trust_roots() {
             builder = builder.tls_cert_store(roots);
         }
         if let Some(guard) = guard {
-            builder = builder
-                .redirect(guard.redirect_policy())
-                .dns_resolver(guard.resolver());
+            if guard_redirects {
+                builder = builder.redirect(guard.redirect_policy());
+            }
+            builder = builder.dns_resolver(guard.resolver());
         }
         if let Some(proxy) = proxy {
             // Through a proxy the name is resolved on the proxy's side: the
@@ -657,7 +673,10 @@ impl Wire {
             client,
             runtime: Some(runtime),
             max_body: guard.map(|guard| guard.limits.response_body_max),
-            guarded: guard.is_some(),
+            // Only the engine's client follows redirects inside the client.
+            // A document client with a resolver guard still returns each 3xx
+            // to the caller's hop loop.
+            guarded: guard_redirects,
             policy: std::sync::Mutex::new(Policy::default()),
         })
     }
@@ -1053,6 +1072,16 @@ impl Wire {
                 .await
                 .map_err(|_| "timeout: operation timed out".to_string())?
                 .map_err(|error| describe(&error))?;
+            if let Some(info) = response.extensions().get::<wreq::tls::TlsInfo>() {
+                if let Some(chain) = info.peer_certificate_chain() {
+                    if chain.into_iter().any(crate::ca_blocklist::blocked_der) {
+                        return Err(
+                            "tls: the certificate chain uses a CA key publicly known to be compromised"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             let status = response.status().as_u16();
             let version = format!("{:?}", response.version());
             let url = response.uri().to_string();

@@ -56,6 +56,8 @@ pub struct Options {
     /// Redirects (followed or not, each hop asked of the caller's guard) and the
     /// headers a navigation carries besides the identity's own.
     pub policy: crate::http::Policy,
+    /// The explicit private-egress opt-out for the engine's network guard.
+    pub allow_private: bool,
 }
 
 impl Default for Options {
@@ -81,6 +83,7 @@ impl Default for Options {
             cache: true,
             revalidate: false,
             policy: crate::http::Policy::default(),
+            allow_private: false,
         }
     }
 }
@@ -198,9 +201,14 @@ enum Interface {
 /// state it learns into. Single-threaded; `donsetch_fetch::Session` pools these.
 pub struct Worker {
     state: State,
-    wires: HashMap<(&'static str, Option<String>), Wire>,
+    wires: HashMap<(&'static str, Option<String>, Option<String>), Wire>,
     /// The egress of the fetch in progress.
     proxy: Option<String>,
+    /// The document guard for this fetch: its resolver pins every name the
+    /// document's connection resolves, redirects included. None through a
+    /// proxy, where the proxy resolves.
+    guard: Option<Arc<crate::envelope::Guard>>,
+    guard_host: Option<String>,
     /// The redirect and header rules of the fetch in progress.
     policy: crate::http::Policy,
     /// Learn from encounters: scores, cookies, credentials.
@@ -265,6 +273,8 @@ impl Worker {
             state,
             wires: HashMap::new(),
             proxy: None,
+            guard: None,
+            guard_host: None,
             policy: crate::http::Policy::default(),
             persist,
             saves,
@@ -572,7 +582,8 @@ impl Worker {
         }
         let (request_url, headers, body) = contract.materialize(&document.url, &document.url)?;
         let limits = options.content.clone();
-        let guard = crate::envelope::Guard::new(limits.clone(), host);
+        let guard =
+            crate::envelope::Guard::with_policy(limits.clone(), host, options.allow_private);
         if let Err(error) = guard.check_url(&request_url) {
             attempts.push(Attempt {
                 identity: identity.name.to_string(),
@@ -813,7 +824,7 @@ impl Worker {
         let mut limits = options.content.clone();
         limits.wall = limits.wall.min(remaining);
         let cookie = self.state.cookie_header_for(&response.url, identity.name);
-        let lane = match crate::engine::content_within_via(
+        let lane = match crate::engine::content_within_via_policy(
             &limits,
             &response.url,
             &response.body,
@@ -821,6 +832,7 @@ impl Worker {
             cookie.as_deref(),
             self.proxy.as_deref(),
             200,
+            options.allow_private,
         ) {
             Ok(lane) => lane,
             Err(error) => {
@@ -1067,9 +1079,16 @@ impl Worker {
     }
 
     fn wire(&mut self, identity: &'static Identity) -> Result<&Wire, String> {
-        let key = (identity.name, self.proxy.clone());
+        let key = (
+            identity.name,
+            self.proxy.clone(),
+            self.guard_host.clone().filter(|_| self.guard.is_some()),
+        );
         if !self.wires.contains_key(&key) {
-            let wire = Wire::via(identity, self.proxy.as_deref())?;
+            let wire = match (&self.guard, self.proxy.as_deref()) {
+                (Some(guard), None) => Wire::resolved(identity, guard, None)?,
+                _ => Wire::via(identity, self.proxy.as_deref())?,
+            };
             self.wires.insert(key.clone(), wire);
         }
         let wire = self.wires.get(&key).expect("wire just inserted");
@@ -1174,6 +1193,21 @@ impl Worker {
     /// the encounter; what was learned is written once, at the end.
     pub fn fetch(&mut self, url: &str, options: &Options) -> Outcome {
         self.policy = options.policy.clone();
+        self.proxy = options.proxy.clone();
+        self.guard_host = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase));
+        self.guard = if self.proxy.is_none() {
+            self.guard_host.as_deref().map(|host| {
+                crate::envelope::Guard::with_policy(
+                    crate::envelope::Limits::default(),
+                    host,
+                    options.allow_private,
+                )
+            })
+        } else {
+            None
+        };
         let outcome = self.through_cache(url, options);
         self.release();
         self.pending = None;
@@ -2654,13 +2688,14 @@ impl Worker {
                     if gate.is_ok() && is_program_page(program_vendor, &engine_body) {
                         let cookie = self.state.cookie_header_for(url, engine_identity.name);
                         let mut failure_reason: Option<String> = None;
-                        match crate::engine::mint_within_via(
+                        match crate::engine::mint_within_via_policy(
                             &options.engine,
                             &engine_url,
                             &engine_body,
                             engine_identity,
                             cookie.as_deref(),
                             self.proxy.as_deref(),
+                            options.allow_private,
                         ) {
                             Ok(mint) => {
                                 // The challenge's own host: the asked one, or where a

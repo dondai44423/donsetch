@@ -73,6 +73,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock README.md LICENSE ./
 COPY build.rs ./
 COPY src/ ./src/
+COPY crates/ ./crates/
 COPY tests/ ./tests/
 
 # Pre-fetch PDFium before cargo build. build.rs vendors the library
@@ -102,12 +103,11 @@ RUN set -eu; \
     tar -xzf /tmp/pdfium.tgz -C vendor/pdfium; \
     rm /tmp/pdfium.tgz
 
-# Build all features (OCR + semantic reranking), locked to Cargo.lock
+# Build the shipped feature set, locked to Cargo.lock.
 ENV CARGO_TERM_COLOR=always
-# All three features: ocr + rerank (ONNX) and http (axum/tower-http
-# streamable-HTTP transport, same set as the linux-x64/macOS-arm64/
-# Windows-x64 release binaries).
-RUN cargo build --release --features ocr,rerank,http --locked
+# ocr (ONNX) + http (axum/tower-http streamable-HTTP transport), the same
+# set as the release binaries. The rerank feature no longer exists.
+RUN cargo build --release --features ocr,http --locked
 
 # Stage the ONNX Runtime shared library for the runtime image. Since
 # 3.2.5, ort loads ONNX Runtime dynamically: when ocr/rerank are

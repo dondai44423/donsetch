@@ -327,18 +327,28 @@ fn public_v6(ip: Ipv6Addr) -> bool {
 /// What the page's own network ops may touch.
 pub struct Guard {
     pub limits: Limits,
-    /// The page's own host: it was already fetched by the user's request, so it
-    /// is trusted even when it is not public (a local development server).
+    /// The page's own host. It is not trusted just because the document was
+    /// fetched: a rebinding name can resolve to loopback after that fetch.
     page_host: String,
+    /// The explicit private-egress opt-out. When false, even the page's own
+    /// host must resolve to a public address before the engine dials it.
+    allow_private_page: bool,
     ops: AtomicU32,
     bytes: AtomicUsize,
 }
 
 impl Guard {
     pub fn new(limits: Limits, page_host: &str) -> Arc<Self> {
+        Self::with_policy(limits, page_host, false)
+    }
+
+    /// Build a guard with the caller's private-egress policy. Production passes
+    /// `false`; a deliberate private read or a local fixture passes `true`.
+    pub fn with_policy(limits: Limits, page_host: &str, allow_private_page: bool) -> Arc<Self> {
         Arc::new(Self {
             limits,
             page_host: page_host.to_ascii_lowercase(),
+            allow_private_page,
             ops: AtomicU32::new(0),
             bytes: AtomicUsize::new(0),
         })
@@ -376,7 +386,13 @@ impl Guard {
     }
 
     fn address_allowed(&self, host: &str, ip: IpAddr) -> bool {
-        is_public(ip) || self.is_page_host(host)
+        // An opted-in read may use its own page host and the loopback alias
+        // localhost; it is not a licence for every private address.
+        is_public(ip)
+            || (self.allow_private_page
+                && (self.is_page_host(host)
+                    || (host.eq_ignore_ascii_case("localhost")
+                        && self.page_host.starts_with("127."))))
     }
 
     /// Validate a URL before any socket exists: scheme, port and a literal
@@ -678,11 +694,14 @@ mod tests {
     }
 
     #[test]
-    fn the_pages_own_host_is_trusted_even_when_local() {
+    fn the_pages_own_host_is_not_trusted_without_the_private_policy() {
         let guard = guard("127.0.0.1");
-        assert!(guard.check_url("http://127.0.0.1:8080/x").is_ok());
-        assert!(guard.check_url("http://127.0.0.2:8080/x").is_err());
-        assert!(guard.check_url("http://169.254.169.254/").is_err());
+        assert!(guard.check_url("http://127.0.0.1:8080/x").is_err());
+        let local = Guard::with_policy(Limits::default(), "127.0.0.1", true);
+        assert!(local.check_url("http://127.0.0.1:8080/x").is_ok());
+        assert!(local.check_url("http://127.0.0.2:8080/x").is_err());
+        assert!(local.check_url("http://169.254.169.254/").is_err());
+        assert!(local.check_url("http://localhost:8080/x").is_ok());
     }
 
     #[test]

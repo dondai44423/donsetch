@@ -191,6 +191,7 @@ impl LayerFetcher {
         let refusal: Arc<Mutex<Option<FetchError>>> = Arc::default();
         let mut request = donsetch_fetch::Request::new(document.url);
         request.proxy = proxy;
+        request.allow_private = crate::config::cfg().fetch.allow_private_egress;
         request.learn = document.learn;
         request.cache = document.learn && !document.skip_cache;
         request.deadline = document_budget();

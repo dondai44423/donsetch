@@ -9,6 +9,7 @@
 //! learned back into the session's state, which is written to disk once per
 //! call when the session persists.
 
+mod ca_blocklist;
 pub mod cache;
 mod challenge;
 pub mod classify;
@@ -84,6 +85,9 @@ pub struct Request {
     /// it is dialed) and the headers a navigation carries besides the identity's
     /// own (a link's `referer` and `sec-fetch-site`).
     pub policy: Policy,
+    /// The explicit private-egress opt-out for the engine's network guard.
+    /// Production passes `false`; a deliberate private read passes `true`.
+    pub allow_private: bool,
 }
 
 impl Request {
@@ -101,6 +105,7 @@ impl Request {
             cache: true,
             revalidate: false,
             policy: Policy::default(),
+            allow_private: false,
         }
     }
 }
@@ -258,6 +263,7 @@ impl Session {
             cache: request.cache,
             revalidate: request.revalidate,
             policy: request.policy.clone(),
+            allow_private: request.allow_private,
             ..fetch::Options::default()
         };
         // The engine shares the encounter's deadline: a mint never outlives it.

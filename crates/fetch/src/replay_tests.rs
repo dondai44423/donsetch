@@ -56,6 +56,8 @@ fn options() -> Options {
         cache: false,
         revalidate: false,
         policy: Default::default(),
+        // The fixture origin is loopback; the test explicitly opts in.
+        allow_private: true,
     }
 }
 

@@ -154,6 +154,8 @@ fn options() -> Options {
         pace_ms: 0,
         persist: false,
         deadline: Duration::from_secs(20),
+        // The fake origin is a loopback server; tests explicitly opt in.
+        allow_private: true,
         ..Options::default()
     }
 }

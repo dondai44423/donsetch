@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The document and engine connections pin their DNS answers.** A public name that
+  rebinds to loopback, a LAN address or cloud metadata is refused before the socket,
+  redirect hops included. The engine no longer trusts the page's own host at any
+  private address; the explicit private-egress opt-out is the only exception.
+- **Compromised CA chains are refused.** The eight eMudhra keys are checked against
+  the peer chain, so a trust store that still carries the cross-sign cannot deliver
+  content through them.
+- **The search lane ledger reserves a token before a request.** A concurrent burst
+  can no longer spend the same token twice and leave the next search with no engine.
+
+### Fixed
+
+- **The Bright Data unlocker applies the caller's views.** `must_contain`, `focus`,
+  `section`, `toc` and `offset` are no longer bypassed on an unlocked page.
+- **Auth words in titles are not sign-in gates.** “The Best Password Managers” and
+  “Processor register” are articles; only a bare sign-in call to action opens a gate.
+- **Sub-cent amounts keep their digits.** `$0.0116` no longer matches `$0.012`.
+- **Registry names no longer replace the fan-out.** `node path` still gets the Node
+  docs; the npm record is one source, not the whole answer.
+- **The Docker image copies the fetch crate and builds `ocr,http`** instead of the
+  deleted `rerank` feature.
+
 ### Changed
 
 - **Search never infers a language or a market from a query's script.** `lang` is an explicit

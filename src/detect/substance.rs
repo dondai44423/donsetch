@@ -1223,6 +1223,73 @@ fn has_data(text: &str) -> bool {
     })
 }
 
+/// A heading that is itself a sign-in call to action. Exact forms and a
+/// small set of "sign in to …" prefixes; a title with an auth word in it is
+/// not enough.
+fn auth_cta(text: &str) -> bool {
+    let l = text
+        .to_lowercase()
+        .trim_matches(|c: char| c.is_whitespace() || ":|·•-–—>»›".contains(c))
+        .to_string();
+    let n = words(&l).len();
+    if n == 0 || n > 6 {
+        return false;
+    }
+    const EXACT: &[&str] = &[
+        "sign in",
+        "sign-in",
+        "signin",
+        "sign up",
+        "sign-up",
+        "signup",
+        "log in",
+        "log-in",
+        "login",
+        "log out",
+        "logout",
+        "register",
+        "create account",
+        "create an account",
+        "create your account",
+        "create a free account",
+        "forgot password",
+        "forgot your password",
+        "reset password",
+        "reset your password",
+        "remember me",
+        "join",
+        "join now",
+        "join free",
+        "subscribe",
+        "subscriber login",
+        "members only",
+        "access denied",
+        "request access",
+        "enter password",
+        "password required",
+        "authentication required",
+        "continue",
+    ];
+    const PREFIX: &[&str] = &[
+        "sign in to ",
+        "log in to ",
+        "sign up with ",
+        "sign up for ",
+        "log in with ",
+        "continue with ",
+        "create your account",
+        "create an account",
+        "forgot your password",
+        "reset your password",
+        "enter your password",
+        "authentication required",
+        "password required",
+        "request access",
+        "members only",
+    ];
+    EXACT.contains(&l.as_str()) || PREFIX.iter().any(|prefix| l.starts_with(prefix))
+}
+
 fn label_kind(text: &str) -> Label {
     let l = text
         .to_lowercase()
@@ -1553,10 +1620,11 @@ pub fn assess(doc: &Html, url: &str) -> Page {
             if auth_level.is_some_and(|l| u.ctx.heading <= l) {
                 auth_level = None;
             }
-            // Only a bare call to action opens a sign-in section ("Sign
-            // Up", "Log in"); a title about signing in ("How to sign in to
-            // your account") heads an article.
-            if label_kind(&u.text) == Label::Auth && words(&u.text).len() <= 4 {
+            // Only a heading that is itself a call to sign in opens a
+            // sign-in section. A title that merely contains an auth word
+            // ("The Best Password Managers", "Processor register") is the
+            // article, not a gate.
+            if auth_cta(&u.text) {
                 auth_level = Some(u.ctx.heading);
             }
         }

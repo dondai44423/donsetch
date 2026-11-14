@@ -1191,7 +1191,7 @@ async fn fetch_single_inner(
                 // Blocked); skipped for AuthWall/Paywall/SoftNotFound
                 // (credentials/money/dead).
                 if matches!(v, Verdict::Challenge(_) | Verdict::Blocked)
-                    && let Some(v3) = try_bypass(daemon, &url, &opts, &mut trace).await
+                    && let Some(v3) = try_bypass(daemon, &url, &opts, &view, &mut trace).await
                 {
                     return v3;
                 }
@@ -1475,7 +1475,7 @@ async fn fetch_single_inner(
         // The optional unlocker: a paid opt-in reached after a local
         // failure, never a tier. No key = inert.
         if matches!(v, Verdict::Challenge(_) | Verdict::Blocked)
-            && let Some(v3) = try_bypass(daemon, &url, &opts, &mut trace).await
+            && let Some(v3) = try_bypass(daemon, &url, &opts, &view, &mut trace).await
         {
             return v3;
         }
@@ -1794,6 +1794,7 @@ pub(super) async fn try_bypass(
     daemon: &Arc<Daemon>,
     url: &str,
     opts: &ExtractOptions,
+    view: &extract::view::View,
     trace: &mut Trace,
 ) -> Option<Value> {
     let cfg = crate::fetch::bypass::BypassConfig::from_env();
@@ -1840,7 +1841,7 @@ pub(super) async fn try_bypass(
         mime => mime,
     };
     let unlocked_ct = format!("{mime}; charset=utf-8");
-    let ex = match extract::extract_off_worker(&outcome.body, &unlocked_ct, url, opts).await {
+    let mut ex = match extract::extract_off_worker(&outcome.body, &unlocked_ct, url, opts).await {
         Ok(e) => e,
         Err(e) => {
             trace.step(
@@ -1862,6 +1863,12 @@ pub(super) async fn try_bypass(
         trace.step("bypass", "unlocker", &msg, t0.elapsed().as_millis());
         return None;
     }
+    // The unlocker returns the whole page; the caller's view is still the
+    // caller's view. Apply the same projection every local read gets.
+    let rendered = extract::view::render(&ex.markdown, view, None);
+    ex.markdown = rendered.text;
+    ex.next_offset = rendered.next_offset;
+    ex.tokens_est = ex.markdown.len() / 4;
     trace.step(
         "bypass",
         "unlocker",
@@ -1882,6 +1889,27 @@ pub(super) async fn try_bypass(
         trace,
         t0.elapsed().as_millis(),
     );
+    if view.offset > 0
+        && let Some(cell) = res.pointer_mut("/content/0/text")
+    {
+        *cell = json!(ex.markdown.trim_start_matches('\n'));
+    }
+    if let Some(sc) = res.pointer_mut("/structuredContent") {
+        if !ex.thin {
+            sc["read_status"] = json!(rendered.status);
+            sc["content_complete"] = json!(rendered.complete);
+        }
+        if let Some(state) = rendered.state.as_object() {
+            for (key, value) in state {
+                sc[key] = value.clone();
+            }
+        }
+        if rendered.verdict.is_some()
+            && let Some(object) = sc.as_object_mut()
+        {
+            object.remove("content_kind");
+        }
+    }
     res["_meta"]["com.donsetch/fetch-debug"]["bypass"] = json!({
         "provider": "brightdata",
         "cache": outcome.cached,
@@ -2715,7 +2743,17 @@ mod bypass_content_tests {
                     .cached
             );
             let mut trace = Trace::default();
-            let result = try_bypass(&daemon, &url, &ExtractOptions::default(), &mut trace).await;
+            let result = try_bypass(
+                &daemon,
+                &url,
+                &ExtractOptions::default(),
+                &extract::view::View {
+                    max_chars: 16_000,
+                    ..Default::default()
+                },
+                &mut trace,
+            )
+            .await;
             assert_eq!(
                 result.is_some(),
                 accepted,
@@ -2813,7 +2851,18 @@ mod bypass_content_tests {
                 .unwrap();
             server.await.unwrap();
             let mut trace = Trace::default();
-            match try_bypass(&daemon, &url, &ExtractOptions::default(), &mut trace).await {
+            match try_bypass(
+                &daemon,
+                &url,
+                &ExtractOptions::default(),
+                &extract::view::View {
+                    max_chars: 16_000,
+                    ..Default::default()
+                },
+                &mut trace,
+            )
+            .await
+            {
                 None => wrong.push(format!("{name}: refused: {}", trace.value())),
                 Some(result) => {
                     let shown = result["content"][0]["text"].as_str().unwrap_or_default();
