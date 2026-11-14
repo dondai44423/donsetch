@@ -80,6 +80,9 @@ struct Shared {
     guard: Arc<Guard>,
     handle: v8::IsolateHandle,
     stop: Arc<AtomicU8>,
+    /// The preload board of a content run: script and style bytes fetched while
+    /// the isolate boots, waited on per URL by the host.
+    prefetch: Option<Arc<PrefetchBoard>>,
 }
 
 impl Shared {
@@ -287,6 +290,26 @@ fn parse_tree(html: &str, mode: &str) -> String {
 #[string]
 fn op_parse_html(#[string] html: String, #[string] mode: String) -> String {
     parse_tree(&html, &mode)
+}
+
+/// The preload board's wait: the entry for `url` once it is published, or "" on
+/// timeout or when the scanner never took it (the host then goes live).
+#[op2]
+#[string]
+fn op_prefetch_wait(state: &mut OpState, #[string] url: String, #[smi] ms: i32) -> String {
+    let shared = state.borrow::<Shared>();
+    let Some(board) = &shared.prefetch else {
+        return String::new();
+    };
+    let remaining = shared.remaining();
+    if remaining.is_zero() {
+        return String::new();
+    }
+    let timeout = Duration::from_millis(ms.clamp(0, 5_000) as u64).min(remaining);
+    match board.take_wait(&url, timeout) {
+        Some(entry) => entry.to_string(),
+        None => String::new(),
+    }
 }
 
 #[op2(fast)]
@@ -580,6 +603,7 @@ fn extension() -> Extension {
             op_page(),
             op_result(),
             op_parse_html(),
+            op_prefetch_wait(),
             op_fetch(),
             op_now(),
             op_sleep(),
@@ -628,6 +652,327 @@ pub fn mint_within(
     cookie_header: Option<&str>,
 ) -> Result<Mint, MintError> {
     mint_within_via(limits, url, html, identity, cookie_header, None)
+}
+
+/// The visible text length the lane's own stop rule measures on a served
+/// document (scripts, styles and hidden subtrees out), used to skip the preload
+/// pass when the contract is already met and no program will run.
+fn document_text_len(html: &str) -> usize {
+    use scraper::Node;
+    fn walk(node: ego_tree::NodeRef<'_, Node>, total: &mut usize) {
+        for child in node.children() {
+            match child.value() {
+                Node::Text(text) => {
+                    *total += text.text.chars().filter(|c| !c.is_whitespace()).count();
+                }
+                Node::Element(element) => {
+                    if matches!(element.name(), "script" | "style" | "noscript" | "template") {
+                        continue;
+                    }
+                    if element.attrs.iter().any(|(key, value)| {
+                        key.local.as_ref() == "hidden"
+                            || (key.local.as_ref() == "aria-hidden" && value == "true")
+                    }) {
+                        continue;
+                    }
+                    walk(child, total);
+                }
+                _ => walk(child, total),
+            }
+        }
+    }
+    let document = scraper::Html::parse_document(html);
+    let mut total = 0usize;
+    walk(document.tree.root(), &mut total);
+    total
+}
+
+/// The preload board: the document's script and stylesheet set is fetched on
+/// detached threads WHILE the isolate boots and the first scripts run, and each
+/// fetch publishes its outcome here. The host waits on one URL at a time
+/// (`op_prefetch_wait`), so a script blocks only for its own bytes and every
+/// other resource keeps loading underneath the run. One spend per URL; a miss
+/// (never scanned, failed, or over the lane's budget) goes live through the
+/// engine's own op.
+#[derive(Default)]
+struct PrefetchState {
+    pending: std::collections::HashSet<String>,
+    entries: std::collections::HashMap<String, serde_json::Value>,
+}
+
+struct PrefetchBoard {
+    state: std::sync::Mutex<PrefetchState>,
+    ready: std::sync::Condvar,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl PrefetchBoard {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(PrefetchState::default()),
+            ready: std::sync::Condvar::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn register(&self, url: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending.insert(url.to_string());
+        }
+    }
+
+    /// Publish one URL's outcome, or its absence (the host then goes live).
+    fn finish_one(&self, url: &str, entry: Option<serde_json::Value>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending.remove(url);
+            if let Some(entry) = entry {
+                state.entries.insert(url.to_string(), entry);
+            }
+            drop(state);
+            self.ready.notify_all();
+        }
+    }
+
+    /// The host's wait: the entry for `url`, once published or on timeout. A URL
+    /// the scanner never took answers `None` immediately, without waiting.
+    fn take_wait(&self, url: &str, timeout: Duration) -> Option<serde_json::Value> {
+        let limit = Instant::now() + timeout;
+        let mut state = self.state.lock().ok()?;
+        if !state.pending.contains(url) && !state.entries.contains_key(url) {
+            return None;
+        }
+        while state.pending.contains(url) && !self.is_closed() {
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self.ready.wait_timeout(state, left).ok()?.0;
+        }
+        state.entries.remove(url)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ready.notify_all();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Start the preload pass: scan the document's own script and stylesheet set,
+/// then fetch it on worker threads while the run proceeds. Each request obeys
+/// the same guard as the engine's own op (op budget, byte caps, identity,
+/// egress) and is bounded by the lane's remaining wall clock.
+#[allow(clippy::too_many_arguments)]
+fn start_prefetch(
+    html: &str,
+    page_url: &str,
+    identity: &'static Identity,
+    guard: Arc<Guard>,
+    proxy: Option<String>,
+    op_timeout: Duration,
+    cookie_header: Option<String>,
+    deadline: Instant,
+) -> Option<Arc<PrefetchBoard>> {
+    /// How many resources one preload may fetch, how many sockets it may open,
+    /// how long one fetch may take and how much body it may carry: a browser's
+    /// own parallelism, bounded by the lane's budget.
+    const PREFETCH_MAX: usize = 32;
+    const PREFETCH_WORKERS: usize = 6;
+    const PREFETCH_TIMEOUT: Duration = Duration::from_millis(1_500);
+    const PREFETCH_BODY_MAX: usize = 4 * 1024 * 1024;
+    const PREFETCH_TOTAL_MAX: usize = 12 * 1024 * 1024;
+
+    let Ok(base) = url::Url::parse(page_url) else {
+        return None;
+    };
+    let page_host = base
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let origin = base.origin().ascii_serialization();
+    let document = scraper::Html::parse_document(html);
+    let mut targets: Vec<(String, &'static str)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in document.tree.root().descendants() {
+        let scraper::Node::Element(element) = node.value() else {
+            continue;
+        };
+        let attr = |name: &str| {
+            element
+                .attrs
+                .iter()
+                .find(|(key, _)| key.local.as_ref() == name)
+                .map(|(_, value)| value.to_string())
+        };
+        let target = match element.name() {
+            "script" => attr("src").map(|src| (src, "script")),
+            "link" => {
+                let rel = attr("rel").unwrap_or_default().to_ascii_lowercase();
+                if rel.split_whitespace().any(|part| part == "stylesheet") {
+                    attr("href").map(|href| (href, "style"))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some((target, dest)) = target else {
+            continue;
+        };
+        let Ok(resolved) = base.join(&target) else {
+            continue;
+        };
+        if !matches!(resolved.scheme(), "http" | "https") {
+            continue;
+        }
+        let text = resolved.to_string();
+        if seen.insert(text.clone()) {
+            targets.push((text, dest));
+        }
+        if targets.len() >= PREFETCH_MAX {
+            break;
+        }
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(300) {
+        return None;
+    }
+    let board = Arc::new(PrefetchBoard::new());
+    for (url, _) in &targets {
+        board.register(url);
+    }
+    let page_host = Arc::new(page_host);
+    let origin = Arc::new(origin);
+    let page_url = Arc::new(page_url.to_string());
+    let cookie_header = Arc::new(cookie_header);
+    let proxy = Arc::new(proxy);
+    let targets = Arc::new(targets);
+    let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let workers = PREFETCH_WORKERS.min(targets.len());
+    for worker in 0..workers {
+        let board = Arc::clone(&board);
+        let guard = Arc::clone(&guard);
+        let targets = Arc::clone(&targets);
+        let page_host = Arc::clone(&page_host);
+        let origin = Arc::clone(&origin);
+        let page_url = Arc::clone(&page_url);
+        let cookie_header = Arc::clone(&cookie_header);
+        let proxy = Arc::clone(&proxy);
+        let total = Arc::clone(&total);
+        std::thread::spawn(move || {
+            let wire = match Wire::guarded(identity, &guard, proxy.as_deref()) {
+                Ok(wire) => wire,
+                Err(_) => {
+                    for index in (worker..targets.len()).step_by(workers) {
+                        board.finish_one(&targets[index].0, None);
+                    }
+                    return;
+                }
+            };
+            for index in (worker..targets.len()).step_by(workers) {
+                let (url, dest) = &targets[index];
+                if board.is_closed() {
+                    break;
+                }
+                if !guard.take_op() {
+                    break;
+                }
+                if guard.check_url(url).is_err() {
+                    board.finish_one(url, None);
+                    continue;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining < Duration::from_millis(150) {
+                    break;
+                }
+                let cap = guard.body_allowance();
+                if cap == 0 {
+                    break;
+                }
+                let timeout = PREFETCH_TIMEOUT.min(op_timeout).min(remaining);
+                let same_origin = url::Url::parse(url)
+                    .ok()
+                    .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+                    .as_deref()
+                    == Some(page_host.as_str());
+                let cookie = if same_origin {
+                    cookie_header.as_deref()
+                } else {
+                    None
+                };
+                let site = if same_origin {
+                    "same-origin"
+                } else {
+                    "cross-site"
+                };
+                let accept = if *dest == "style" {
+                    "text/css,*/*;q=0.1"
+                } else {
+                    "*/*"
+                };
+                let referer = if same_origin {
+                    page_url.as_str().to_string()
+                } else {
+                    format!("{}/", origin.as_str())
+                };
+                let extra: Vec<(&str, &str)> = vec![
+                    ("sec-fetch-site", site),
+                    ("sec-fetch-mode", "no-cors"),
+                    ("sec-fetch-dest", dest),
+                    ("referer", &referer),
+                    ("accept", accept),
+                ];
+                let call = Call {
+                    method: "GET",
+                    url,
+                    cookie,
+                    timeout,
+                    extra: &extra,
+                    body: None,
+                    cap: Some(cap),
+                    kind: Kind::Subresource,
+                };
+                match wire.call(identity, call) {
+                    Ok(response) => {
+                        let size = response.raw.as_ref().map_or(response.body.len(), Vec::len);
+                        guard.record_bytes(size);
+                        if size > PREFETCH_BODY_MAX {
+                            board.finish_one(url, None);
+                            continue;
+                        }
+                        if total.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size
+                            > PREFETCH_TOTAL_MAX
+                        {
+                            board.finish_one(url, None);
+                            continue;
+                        }
+                        let mut entry = serde_json::json!({
+                            "status": response.status,
+                            "url": response.url,
+                            "headers": response.headers,
+                            "body": response.body,
+                        });
+                        if let Some(raw) = &response.raw {
+                            entry["body_b64"] = serde_json::Value::String(crate::http::base64(raw));
+                        }
+                        board.finish_one(url, Some(entry));
+                    }
+                    Err(_error) => board.finish_one(url, None),
+                }
+            }
+            // Whatever this worker will not take (the run closed, the budget
+            // ran out) answers "go live" for its remaining URLs.
+            for index in (worker..targets.len()).step_by(workers) {
+                board.finish_one(&targets[index].0, None);
+            }
+        });
+    }
+    Some(board)
 }
 
 /// What a content run produced: the document the page's own program assembled,
@@ -756,6 +1101,29 @@ fn run_within(
         .unwrap_or_default();
     let guard = Guard::new(limits.clone(), &page_host);
     let wire = Wire::guarded(identity, &guard, proxy).map_err(MintError::Runtime)?;
+    // The content lane opens with a preload pass: the document's own script and
+    // stylesheet set fetched in parallel, before the isolate exists, so running
+    // them costs no round trip each. A document that already passes the
+    // contract prefetches nothing (no program will run), and every prefetch
+    // obeys the same guard, identity and egress as the engine's own op.
+    // The content lane opens its preload pass here: fetching starts now, on the
+    // lane's own threads, and runs underneath the isolate's boot and the first
+    // scripts; the host waits per URL through `op_prefetch_wait`. A document
+    // that already passes the contract prefetches nothing (no program will run).
+    let prefetch = if mode == Mode::Content && document_text_len(html) < text_target {
+        start_prefetch(
+            html,
+            url,
+            identity,
+            Arc::clone(&guard),
+            proxy.map(str::to_string),
+            limits.op_timeout,
+            cookie_header.map(str::to_string),
+            deadline,
+        )
+    } else {
+        None
+    };
     let debug = std::env::var("V5_ENGINE_LOG").is_ok();
     let page = match mode {
         Mode::Mint => serde_json::json!({
@@ -779,6 +1147,7 @@ fn run_within(
             "textTarget": text_target,
             "deadlineMs": limits.wall.as_millis() as u64,
             "documentCap": CONTENT_DOCUMENT_CAP,
+            "prefetch": prefetch.is_some(),
         }),
     }
     .to_string();
@@ -828,6 +1197,7 @@ fn run_within(
         page,
         result: None,
         result_cap,
+        prefetch: prefetch.clone(),
         wire,
         identity,
         started,
@@ -933,6 +1303,11 @@ fn run_within(
     let raw = raw.ok_or(MintError::NoResult)?;
     let value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|error| MintError::Script(format!("engine result: {error}")))?;
+    // The run is over: the preload workers stop between requests (a fetch in
+    // flight finishes within its own timeout) and waiters are released.
+    if let Some(board) = &prefetch {
+        board.close();
+    }
     Ok((value, cost))
 }
 

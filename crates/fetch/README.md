@@ -43,7 +43,7 @@ V5_STATE=/tmp/donsetch-fetch/state.json ./target/release/donsetch-fetch bench \
 # a repeat fetch is answered by the page cache: fresh, revalidated (304) or changed
 ./target/release/donsetch-fetch fetch https://pypi.org/ [--revalidate] [--no-cache]
 
-# the content lane (M1: measurement only): run the final document's own program and report
+# the content lane (measurement): run the final document's own program and report
 # the stop reason, the text it assembled and every request it made
 ./target/release/donsetch-fetch fetch https://example.com/ --render
 
@@ -253,19 +253,25 @@ taken from the identity's own headers, and — for Reddit's gate — `document.f
 fields, live `elements.namedItem`, and `submit()`/`requestSubmit()` producing the GET navigation
 a browser would make. A method the host does not run is logged, never guessed at.
 
-### The content lane (M1 — measured behind `--render`)
+### The content lane
 
 `engine_host.js` carries a second host beside the challenge host: a data-plane DOM (real tree,
 html5ever-parsed `innerHTML`, host-side selector matching, firing observers, `matchMedia`,
-events, timers and frames) that runs an application page's own program and returns the
-document it assembles. The contract is consulted **before any program runs**; then the run
-ends on content (visible text at the target), quiescence (honestly reported, still a shell)
-or the lane's envelope (`V5_CONTENT_WALL_MS`, default 2500 ms; 64 ops; 48 MB). Every request
-still leaves through the same op and the same identity wire — the app sees the identity that
-fetched the document — and the wire tap (`transcript`) records what the program asked for,
-which is the request-contract mining input. M1 ships measurement only: `fetch --render` runs
-the lane on an encounter's final document; the encounter trigger is M2, module scripts are
-M2, and nothing in the default fetch path changes.
+events, timers and frames; module scripts through a statement-level ESM loader with live
+export getters — named imports are snapshots, documented in the host) that runs an
+application page's own program and returns the document it assembles. The contract is
+consulted **before any program runs**; then the run ends on content (visible text at the
+target), quiescence (honestly reported, still a shell) or the lane's envelope
+(`V5_CONTENT_WALL_MS`, default 2500 ms, clamped to the encounter's remaining deadline; 64
+ops; 48 MB). A `shell` or `incomplete` verdict takes the lane once per encounter, as the
+identity that received the document; a produced page that passes the contract is the answer
+(`transport: "program"`) and enters the pipeline exactly where a network document does
+(contract, caller body, page cache). A preload pass fetches the document's own script/style
+set on worker threads while V8 boots — each script waits only for its own bytes through
+`op_prefetch_wait` — under the same guard and identity as the engine's own op. Every request
+leaves through the same op and wire; the wire tap (`transcript`) records what the program
+asked for, which is the request-contract mining input. `fetch --render` runs the lane on any
+encounter's final document, for measurement.
 
 ### The envelope
 

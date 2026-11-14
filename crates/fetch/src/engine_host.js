@@ -842,8 +842,23 @@
     const sendCookies = credentials === "include" || (credentials === "same-origin" && sameOrigin) || mode === "no-cors" || mode === "navigate";
     const jarCookie = sendCookies ? cookieHeader(targetHost) : "-";
     if (DEBUG) note("log", "cookies " + targetHost + " " + (sendCookies ? String(jarCookie).split(";").map((c) => { const at = c.indexOf("="); const v = c.slice(at + 1); return c.slice(0, at).trim() + ":" + v.length + ":" + v.slice(37, 53); }).join(",") : "omitted"));
-    const raw = ops.op_fetch(method, absolute, JSON.stringify(Object.entries(headers)), bodyBytes, jarCookie || (sendCookies ? "" : "-"), "subresource");
-    const res = JSON.parse(raw);
+    // The preload pass fetched the document's own script/style set while V8 was
+    // booting, so a script waits (here) only for its own bytes; a URL the
+    // scanner never took answers instantly and goes live. One spend per URL.
+    let res;
+    let prefetched = null;
+    if (M.prefetch && method === "GET" && bodyBytes.length === 0) {
+      const raw = ops.op_prefetch_wait(absolute, 1500);
+      if (raw) prefetched = JSON.parse(raw);
+    }
+    if (prefetched) {
+      if (prefetched.error) throw new TypeError("Failed to fetch (" + prefetched.error + ")");
+      res = { status: prefetched.status, url: prefetched.url || absolute, headers: prefetched.headers || [], body: prefetched.body || "" };
+      if (prefetched.body_b64 !== undefined) res.body_b64 = prefetched.body_b64;
+    } else {
+      const raw = ops.op_fetch(method, absolute, JSON.stringify(Object.entries(headers)), bodyBytes, jarCookie || (sendCookies ? "" : "-"), "subresource");
+      res = JSON.parse(raw);
+    }
     // The response's own bytes, when they are not text: a binary payload must
     // reach the page unchanged.
     const responseBytes = () => (res.body_b64 !== undefined ? base64ToBytes(res.body_b64) : core.encode(res.body || ""));
@@ -2243,6 +2258,629 @@
     return out;
   }
 
+  // ----- module scripts (ESM) -----
+  // The modern web's script class: Vite/Rollup/Next production bundles. A module
+  // graph executes synchronously on the host's own wire: fetch, transform the
+  // statement-level ESM surface (static imports, named/default/namespace
+  // bindings, export maps, re-exports, export *, import.meta, dynamic import),
+  // and evaluate dependencies first with the exports object registered before
+  // evaluation (a cycle sees the partial namespace, as ESM does).
+  //
+  // Exports are live getters on the namespace; NAMED imports are snapshots of
+  // the binding at import time (a module-level `let` reassigned after import is
+  // not observed). Measured bundles export stable references; a bundle that
+  // needs more is a logged finding, never guessed at. A construct the transform
+  // cannot parse skips the whole module with a named log line: honest failure,
+  // not a half-run program.
+  const MODULES = new Map();
+  let INLINE_MODULE = 0;
+  const MODULE_ENV = { MODE: "production", PROD: true, DEV: false, BASE_URL: "/", SSR: false };
+
+  function skipQuoted(source, start) {
+    const n = source.length;
+    const quote = source[start];
+    let i = start + 1;
+    while (i < n) {
+      const c = source[i];
+      if (c === "\\") { i += 2; continue; }
+      if (c === quote) return i + 1;
+      i++;
+    }
+    return n;
+  }
+  function skipLineComment(source, start) {
+    let i = start + 2;
+    while (i < source.length && source[i] !== "\n") i++;
+    return i;
+  }
+  function skipBlockComment(source, start) {
+    let i = start + 2;
+    while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
+    return Math.min(i + 2, source.length);
+  }
+  function skipTemplateLiteral(source, start) {
+    const n = source.length;
+    let i = start + 1;
+    while (i < n) {
+      const c = source[i];
+      if (c === "\\") { i += 2; continue; }
+      if (c === "`") return i + 1;
+      if (c === "$" && source[i + 1] === "{") { i = skipBracedExpression(source, i + 2); continue; }
+      i++;
+    }
+    return n;
+  }
+  function skipBracedExpression(source, start) {
+    const n = source.length;
+    let i = start;
+    let depth = 0;
+    while (i < n) {
+      const c = source[i];
+      if (c === '"' || c === "'") { i = skipQuoted(source, i); continue; }
+      if (c === "`") { i = skipTemplateLiteral(source, i); continue; }
+      if (c === "/" && source[i + 1] === "/") { i = skipLineComment(source, i); continue; }
+      if (c === "/" && source[i + 1] === "*") { i = skipBlockComment(source, i); continue; }
+      if (c === "{") { depth++; i++; continue; }
+      if (c === "}") { if (depth === 0) return i + 1; depth--; i++; continue; }
+      i++;
+    }
+    return n;
+  }
+  /// The ranges the statement scanner must never rewrite: strings, template
+  /// literals, comments and regex literals. Whether a `/` opens a regex or
+  /// divides is decided by the PREVIOUS SIGNIFICANT TOKEN, not by the previous
+  /// character: char-level heuristics desync on minified bundles (one false
+  /// range cascades and swallows real statements), and a regex literal may
+  /// contain quotes that must not start a string. A regex that crosses a
+  /// newline or runs past any real literal's size is treated as a division.
+  const REGEX_AFTER_KEYWORDS = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
+  function regexCanStartAfter(token, value) {
+    if (token === "ident" || token === "number" || token === "string" || token === "regex" || token === "template" || token === "close") return false;
+    if (token === "keyword") return REGEX_AFTER_KEYWORDS.has(value);
+    return true;
+  }
+  function skipRegexLiteral(source, start) {
+    const n = source.length;
+    const cap = Math.min(n, start + 8192);
+    let i = start + 1;
+    let inClass = false;
+    while (i < cap) {
+      const c = source[i];
+      if (c === "\\") { i += 2; continue; }
+      if (c === "\n") return start;
+      if (c === "[") { inClass = true; i++; continue; }
+      if (c === "]") { inClass = false; i++; continue; }
+      if (c === "/" && !inClass) {
+        i++;
+        while (i < n && /[a-z]/i.test(source[i])) i++;
+        return i;
+      }
+      i++;
+    }
+    return start;
+  }
+  function protectedRanges(source) {
+    const ranges = [];
+    const n = source.length;
+    let i = 0;
+    let token = "";
+    let value = "";
+    while (i < n) {
+      const c = source[i];
+      if (c === '"' || c === "'") { const end = skipQuoted(source, i); ranges.push([i, end]); i = end; token = "string"; value = ""; continue; }
+      if (c === "`") { const end = skipTemplateLiteral(source, i); ranges.push([i, end]); i = end; token = "template"; value = ""; continue; }
+      if (c === "/" && source[i + 1] === "/") { const end = skipLineComment(source, i); ranges.push([i, end]); i = end; continue; }
+      if (c === "/" && source[i + 1] === "*") { const end = skipBlockComment(source, i); ranges.push([i, end]); i = end; continue; }
+      if (c === "/" && regexCanStartAfter(token, value)) {
+        const end = skipRegexLiteral(source, i);
+        if (end > i) { ranges.push([i, end]); i = end; token = "regex"; value = ""; continue; }
+      }
+      if (/[A-Za-z_$]/.test(c)) {
+        let j = i + 1;
+        while (j < n && /[\w$]/.test(source[j])) j++;
+        value = source.slice(i, j);
+        token = REGEX_AFTER_KEYWORDS.has(value) ? "keyword" : "ident";
+        i = j;
+        continue;
+      }
+      if (/[0-9]/.test(c)) { let j = i + 1; while (j < n && /[\w.$]/.test(source[j])) j++; i = j; token = "number"; value = ""; continue; }
+      if (/\s/.test(c)) { i++; continue; }
+      if (c === ")" || c === "]" || c === "}") { token = "close"; value = c; i++; continue; }
+      token = "punct"; value = c;
+      i++;
+    }
+    return ranges;
+  }
+  /// The first `;` at bracket depth zero after `start`, skipping protected
+  /// ranges. Statements in bundles are semicolon-terminated; a scan that reaches
+  /// the end without one is a transform error, not a guess.
+  function statementEnd(source, start, ranges) {
+    const n = source.length;
+    let i = start;
+    let depth = 0;
+    let rangeAt = 0;
+    while (rangeAt < ranges.length && ranges[rangeAt][1] <= i) rangeAt++;
+    while (i < n) {
+      if (rangeAt < ranges.length && ranges[rangeAt][0] === i) { i = ranges[rangeAt][1]; rangeAt++; continue; }
+      const c = source[i];
+      if (c === "(" || c === "[" || c === "{") depth++;
+      else if (c === ")" || c === "]" || c === "}") { if (depth > 0) depth--; }
+      else if (c === ";" && depth === 0) return i + 1;
+      i++;
+    }
+    return n;
+  }
+  /// The end of a brace-bodied declaration's statement: the matching `}` of the
+  /// body at depth zero (plus an optional trailing `;`).
+  function braceStatementEnd(source, start, ranges) {
+    const n = source.length;
+    let i = start;
+    let rangeAt = 0;
+    while (rangeAt < ranges.length && ranges[rangeAt][1] <= i) rangeAt++;
+    // The declaration head runs to the first `{` at paren depth zero, so an
+    // object literal in a default parameter is not mistaken for the body.
+    let parens = 0;
+    while (i < n) {
+      if (rangeAt < ranges.length && ranges[rangeAt][0] === i) { i = ranges[rangeAt][1]; rangeAt++; continue; }
+      const c = source[i];
+      if (c === "(") { parens++; i++; continue; }
+      if (c === ")") { if (parens > 0) parens--; i++; continue; }
+      if (c === "{" && parens === 0) break;
+      i++;
+    }
+    if (i >= n) return n;
+    let depth = 0;
+    while (i < n) {
+      if (rangeAt < ranges.length && ranges[rangeAt][0] === i) { i = ranges[rangeAt][1]; rangeAt++; continue; }
+      const c = source[i];
+      if (c === "{") depth++;
+      else if (c === "}") { depth--; if (depth === 0) { i++; break; } }
+      i++;
+    }
+    while (i < n && (source[i] === ";" || /\s/.test(source[i]))) i++;
+    return i;
+  }
+  const IDENTIFIER = "[A-Za-z_$][\\w$]*";
+  const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/;
+  /// `{a, b as c}` -> [[a, a], [b, c]]. Throws on anything else: a name the
+  /// transform cannot prove is left for the honest failure path.
+  function parseNameList(text) {
+    const out = [];
+    for (const piece of String(text).split(",")) {
+      const trimmed = piece.trim();
+      if (!trimmed) continue;
+      const parts = trimmed.split(/\s+as\s+/);
+      if (parts.length === 1) {
+        if (!IDENTIFIER_RE.test(trimmed)) throw new Error("unsupported export name: " + trimmed.slice(0, 40));
+        out.push([trimmed, trimmed]);
+      } else if (parts.length === 2) {
+        const from = parts[0].trim();
+        const to = parts[1].trim();
+        if (!IDENTIFIER_RE.test(from) || !IDENTIFIER_RE.test(to)) throw new Error("unsupported export alias: " + trimmed.slice(0, 40));
+        out.push([from, to]);
+      } else throw new Error("unsupported export list: " + trimmed.slice(0, 40));
+    }
+    return out;
+  }
+  /// `import` clause forms bundles emit: default, * as ns, {a, b as c}, and the
+  /// combinations of default with either.
+  function parseImportClause(clause) {
+    const result = { defaultName: null, namespace: null, names: [] };
+    let text = clause.trim();
+    if (!text) return result;
+    const take = (pattern) => {
+      const match = pattern.exec(text);
+      if (!match) return null;
+      text = text.slice(match[0].length).replace(/^\s*,\s*/, "");
+      return match;
+    };
+    if (!text.startsWith("{") && !text.startsWith("*")) {
+      const match = take(new RegExp("^(" + IDENTIFIER + ")"));
+      if (!match) throw new Error("unsupported import clause: " + clause.slice(0, 60));
+      result.defaultName = match[1];
+    }
+    if (text.startsWith("*")) {
+      const match = take(/^\*\s+as\s+([A-Za-z_$][\w$]*)/);
+      if (!match) throw new Error("unsupported namespace import: " + clause.slice(0, 60));
+      result.namespace = match[1];
+    } else if (text.startsWith("{")) {
+      const close = text.indexOf("}");
+      if (close < 0) throw new Error("unterminated import list");
+      result.names.push(...parseNameList(text.slice(1, close)));
+      text = text.slice(close + 1);
+    }
+    if (text.trim()) throw new Error("unsupported import clause tail: " + text.slice(0, 60));
+    return result;
+  }
+  /// Rewrite one module source into the wrapper body the factory evaluates.
+  function skipSpaces(source, i) {
+    while (i < source.length && /\s/.test(source[i])) i++;
+    return i;
+  }
+  function readWord(source, i) {
+    let j = i;
+    while (j < source.length && /[\w$]/.test(source[j])) j++;
+    return { word: source.slice(i, j), end: j };
+  }
+  function readString(source, i) {
+    if (source[i] !== '"' && source[i] !== "'") return null;
+    const end = skipQuoted(source, i);
+    return { text: source.slice(i + 1, end - 1), end };
+  }
+  /// The index after the `}` matching the `{` at `open`, skipping protected
+  /// ranges; -1 when the brace never closes.
+  function matchingBrace(source, open, ranges) {
+    const n = source.length;
+    let i = open;
+    let depth = 0;
+    let rangeAt = 0;
+    while (rangeAt < ranges.length && ranges[rangeAt][1] <= i) rangeAt++;
+    while (i < n) {
+      if (rangeAt < ranges.length && ranges[rangeAt][0] === i) { i = ranges[rangeAt][1]; rangeAt++; continue; }
+      const c = source[i];
+      if (c === "{") depth++;
+      else if (c === "}") { depth--; if (depth === 0) return i + 1; }
+      i++;
+    }
+    return -1;
+  }
+  /// One `import` statement at `start`: `{clause, specifier, end}`, or null when
+  /// the token is not a statement (`import.meta`, dynamic `import(`, or a shape
+  /// this parser cannot prove).
+  function parseImportAt(source, start, ranges) {
+    let i = skipSpaces(source, start + 6);
+    const sideEffect = readString(source, i);
+    if (sideEffect) {
+      const k = skipSpaces(source, sideEffect.end);
+      if (source[k] !== ";") return null;
+      return { clause: "", specifier: sideEffect.text, end: k + 1 };
+    }
+    const clauseStart = i;
+    let k = i;
+    // Optional default binding, then the comma before the next clause part.
+    if (/[A-Za-z_$]/.test(source[k] || "")) {
+      const binding = readWord(source, k);
+      k = skipSpaces(source, binding.end);
+      if (source[k] === ",") k = skipSpaces(source, k + 1);
+    }
+    if (source[k] === "*") {
+      k = skipSpaces(source, k + 1);
+      const asWord = readWord(source, k);
+      if (asWord.word !== "as") return null;
+      k = skipSpaces(source, asWord.end);
+      const name = readWord(source, k);
+      if (!IDENTIFIER_RE.test(name.word)) return null;
+      k = skipSpaces(source, name.end);
+    } else if (source[k] === "{") {
+      const close = matchingBrace(source, k, ranges);
+      if (close < 0) return null;
+      k = skipSpaces(source, close);
+    } else return null;
+    const fromWord = readWord(source, k);
+    if (fromWord.word !== "from") return null;
+    const clause = source.slice(clauseStart, k).trim();
+    k = skipSpaces(source, fromWord.end);
+    const specifier = readString(source, k);
+    if (!specifier) return null;
+    k = skipSpaces(source, specifier.end);
+    if (source[k] !== ";") return null;
+    return { clause, specifier: specifier.text, end: k + 1 };
+  }
+
+  /// Rewrite one module source into the wrapper body the factory evaluates.
+  /// Discovery is token-aware and depth-aware, never line-based: production
+  /// bundles are one minified line (Vite, Rollup), so a statement may begin
+  /// anywhere; `import` and `export` are reserved words at module depth only.
+  function transformModule(source, url) {
+    const ranges = protectedRanges(source);
+    const edits = []; // {start, end, text}
+    let temp = 0;
+    const n = source.length;
+    let i = 0;
+    let depth = 0;
+    let rangeAt = 0;
+    while (i < n) {
+      // A statement jump can leap over protected ranges (an import's own
+      // specifier string sits inside its span): advance the cursor past them, or
+      // the walk reads string content as code from here on.
+      while (rangeAt < ranges.length && ranges[rangeAt][1] <= i) rangeAt++;
+      if (rangeAt < ranges.length && ranges[rangeAt][0] === i) { i = ranges[rangeAt][1]; rangeAt++; continue; }
+      const c = source[i];
+      if (c === "(" || c === "[" || c === "{") { depth++; i++; continue; }
+      if (c === ")" || c === "]" || c === "}") { if (depth > 0) depth--; i++; continue; }
+      if (depth === 0 && /[A-Za-z_$]/.test(c)) {
+        const word = readWord(source, i);
+        if (word.word === "import") {
+          const statement = parseImportAt(source, i, ranges);
+          if (statement) {
+            const clause = parseImportClause(statement.clause);
+            const moduleName = "__m" + (temp++);
+            const lines = ["const " + moduleName + " = __import(" + JSON.stringify(statement.specifier) + ");"];
+            if (clause.defaultName) lines.push("const " + clause.defaultName + " = " + moduleName + ".default;");
+            if (clause.namespace) lines.push("const " + clause.namespace + " = " + moduleName + ";");
+            for (const [imported, local] of clause.names) lines.push("const " + local + " = " + moduleName + "." + imported + ";");
+            edits.push({ start: i, end: statement.end, text: lines.join("\n") });
+            i = statement.end;
+            continue;
+          }
+        } else if (word.word === "export") {
+          const at = skipSpaces(source, word.end);
+          const next = source[at];
+          if (next === "{") {
+            const close = matchingBrace(source, at, ranges);
+            let handled = false;
+            if (close > 0) {
+              let k = skipSpaces(source, close);
+              let specifier = null;
+              const fromWord = readWord(source, k);
+              if (fromWord.word === "from") {
+                k = skipSpaces(source, fromWord.end);
+                const s = readString(source, k);
+                if (s) { specifier = s.text; k = skipSpaces(source, s.end); }
+              }
+              if (source[k] === ";") {
+                const pairs = parseNameList(source.slice(at + 1, close - 1));
+                const end = k + 1;
+                if (specifier) {
+                  const moduleName = "__re" + (temp++);
+                  const lines = ["const " + moduleName + " = __import(" + JSON.stringify(specifier) + ");"];
+                  for (const [exported, local] of pairs) lines.push("__export(" + JSON.stringify(local) + ", () => " + moduleName + "." + exported + ");");
+                  edits.push({ start: i, end, text: lines.join("\n") });
+                } else {
+                  const lines = pairs.map(([local, exported]) => "__export(" + JSON.stringify(exported) + ", () => " + local + ");");
+                  edits.push({ start: i, end, text: lines.join("\n") });
+                }
+                i = end;
+                handled = true;
+              }
+            }
+            if (!handled) { i = word.end; continue; }
+            continue;
+          }
+          if (next === "*") {
+            let k = skipSpaces(source, at + 1);
+            let namespace = null;
+            const asWord = readWord(source, k);
+            if (asWord.word === "as") {
+              k = skipSpaces(source, asWord.end);
+              const name = readWord(source, k);
+              namespace = name.word;
+              k = skipSpaces(source, name.end);
+            }
+            const fromWord = readWord(source, k);
+            if (fromWord.word === "from") {
+              k = skipSpaces(source, fromWord.end);
+              const s = readString(source, k);
+              if (s) {
+                k = skipSpaces(source, s.end);
+                if (source[k] === ";") {
+                  const end = k + 1;
+                  edits.push({ start: i, end, text: namespace
+                    ? "const __star" + (temp++) + " = __import(" + JSON.stringify(s.text) + ");\n__export(" + JSON.stringify(namespace) + ", () => __star" + (temp - 1) + ");"
+                    : "__exportStar(__import(" + JSON.stringify(s.text) + "));" });
+                  i = end;
+                  continue;
+                }
+              }
+            }
+          } else {
+            const declaration = readWord(source, at);
+            if (declaration.word === "default") {
+              const declStart = i;
+              const restStart = skipSpaces(source, declaration.end);
+              const rest = source.slice(restStart);
+              const named = new RegExp("^((?:async\\s+)?function\\s*\\*?\\s*(" + IDENTIFIER + ")|class\\s+(" + IDENTIFIER + "))").exec(rest);
+              if (named) {
+                const end = braceStatementEnd(source, restStart, ranges);
+                const header = source.slice(restStart, end).replace(/;$/, "");
+                const name = named[2] || named[3];
+                edits.push({ start: declStart, end, text: header + "\n__export(\"default\", () => " + name + ");" });
+              } else if (/^(?:async\s+)?function\s*\*?\s*\(|^class\s*\{/.test(rest)) {
+                const end = braceStatementEnd(source, restStart, ranges);
+                const body = source.slice(restStart, end).replace(/;$/, "");
+                edits.push({ start: declStart, end, text: "const __default" + (temp++) + " = " + body + ";\n__export(\"default\", () => __default" + (temp - 1) + ");" });
+              } else {
+                const end = statementEnd(source, restStart, ranges);
+                const expression = source.slice(restStart, end).replace(/;$/, "");
+                edits.push({ start: declStart, end, text: "const __default" + (temp++) + " = (" + expression + ");\n__export(\"default\", () => __default" + (temp - 1) + ");" });
+              }
+              i = declStart + 6;
+              continue;
+            }
+            if (declaration.word === "const" || declaration.word === "let" || declaration.word === "var") {
+              const declStart = i;
+              const end = statementEnd(source, declStart, ranges);
+              const statement = source.slice(declStart, end);
+              // The emitted declaration keeps its keyword; the name scan works on
+              // the declarators alone (the keyword itself is not a name).
+              const declarationText = statement.replace(/^export\s+/, "");
+              const names = [];
+              let scanDepth = 0;
+              let word2 = "";
+              let expectName = true;
+              const body = declarationText.replace(/^(const|let|var)\s+/, "");
+              for (let k = 0; k < body.length; k++) {
+                const c2 = body[k];
+                if (c2 === "(" || c2 === "[" || c2 === "{") { scanDepth++; continue; }
+                if (c2 === ")" || c2 === "]" || c2 === "}") { scanDepth--; continue; }
+                if (scanDepth === 0 && expectName) {
+                  const wordMatch = new RegExp(IDENTIFIER).exec(body.slice(k));
+                  if (wordMatch && wordMatch.index === 0) { word2 = wordMatch[0]; k += word2.length - 1; expectName = false; continue; }
+                  expectName = false;
+                }
+                if (scanDepth === 0 && c2 === "," ) { expectName = true; continue; }
+                if (scanDepth === 0 && c2 === "=") { if (word2) names.push(word2); expectName = false; }
+              }
+              if (word2) names.push(word2);
+              const unique = Array.from(new Set(names.filter((name) => IDENTIFIER_RE.test(name))));
+              const exports = unique.map((name) => "__export(" + JSON.stringify(name) + ", () => " + name + ");").join("\n");
+              edits.push({ start: declStart, end, text: declarationText + "\n" + exports });
+              i = end;
+              continue;
+            }
+            if (declaration.word === "function" || declaration.word === "class" || declaration.word === "async") {
+              const declStart = i;
+              const head = new RegExp("^((?:async\\s+)?function\\s*\\*?\\s*|class\\s+)(" + IDENTIFIER + ")").exec(source.slice(at));
+              if (head) {
+                const end = braceStatementEnd(source, declStart, ranges);
+                const body = source.slice(declStart, end).replace(/^export\s+/, "").replace(/;$/, "");
+                edits.push({ start: declStart, end, text: body + "\n__export(" + JSON.stringify(head[2]) + ", () => " + head[2] + ");" });
+                i = end;
+                continue;
+              }
+            }
+          }
+        }
+        i = word.end;
+        continue;
+      }
+      i++;
+    }
+    edits.sort((a, b) => a.start - b.start);
+    // One pass over the source: statement edits replace their spans; everything
+    // else is copied, with `import.meta` and dynamic `import(` rewritten outside
+    // protected ranges.
+    let out = "";
+    let at = 0;
+    let copyAt = 0;
+    let editAt = 0;
+    while (at < n) {
+      // Same discipline as the walk: an edit span can contain protected ranges
+      // (a specifier string), so the cursor advances past everything the jump
+      // covered before the next token can be read.
+      while (copyAt < ranges.length && ranges[copyAt][1] <= at) copyAt++;
+      if (editAt < edits.length && edits[editAt].start === at) {
+        out += edits[editAt].text;
+        at = edits[editAt].end;
+        editAt++;
+        continue;
+      }
+      if (copyAt < ranges.length && ranges[copyAt][0] === at) {
+        out += source.slice(at, ranges[copyAt][1]);
+        at = ranges[copyAt][1];
+        copyAt++;
+        continue;
+      }
+      const c = source[at];
+      const before = at === 0 ? "" : source[at - 1];
+      const boundary = before === "" || !/[$\w]/.test(before);
+      if (boundary && source.startsWith("import", at)) {
+        const afterWord = source[at + 6] || "";
+        if (afterWord === "." && source.startsWith("meta", at + 7)) {
+          out += "importMeta";
+          at += 11;
+          continue;
+        }
+        let probe = at + 6;
+        while (probe < n && (source[probe] === " " || source[probe] === "\t")) probe++;
+        if (source[probe] === "(") {
+          out += "__dynamicImport";
+          at += 6;
+          continue;
+        }
+      }
+      out += c;
+      at++;
+    }
+    if (editAt < edits.length) throw new Error("transform left an edit unapplied");
+    return out;
+  }
+
+  function exportStarInto(define, from) {
+    for (const key of Object.keys(from)) {
+      if (key === "default") continue;
+      const source = from;
+      define(key, () => source[key]);
+    }
+  }
+
+  /// Run one module graph node: transform, evaluate with its dependency function
+  /// bound to this module's URL, register the exports object before evaluation.
+  function evaluateModuleSource(source, url) {
+    const record = { exports: {}, state: "loading" };
+    MODULES.set(url, record);
+    let code;
+    try {
+      code = transformModule(String(source), url);
+    } catch (error) {
+      note("log", "module transform " + String(url).slice(0, 90) + ": " + (error && error.message));
+      record.state = "failed";
+      return record.exports;
+    }
+    const compile = (text) => {
+      const compiled = core.evalContext("(function (__export, __exportStar, __import, __dynamicImport, importMeta) {\"use strict\";\n" + text + "\n})", url);
+      const thrown = compiled && compiled[1];
+      if (thrown) throw thrown.thrown || thrown;
+      return compiled[0];
+    };
+    let factory = null;
+    try {
+      factory = compile(code);
+    } catch (error) {
+      const message = String((error && error.message) || error);
+      // A quote inside a regex literal can hide an `import.meta` from the
+      // transform. The retry is logged and bounded to that one class: it either
+      // compiles the module or fails visibly, as before.
+      if (message.indexOf("import.meta") < 0) {
+        note("log", "module " + String(url).slice(0, 90) + ": " + message);
+        record.state = "failed";
+        return record.exports;
+      }
+      try {
+        factory = compile(String(code).split("import.meta").join("importMeta"));
+        note("log", "module " + String(url).slice(0, 90) + ": lenient import.meta replacement");
+      } catch (retryError) {
+        note("log", "module " + String(url).slice(0, 90) + ": " + String((retryError && retryError.message) || retryError));
+        record.state = "failed";
+        return record.exports;
+      }
+    }
+    try {
+      const define = (name, getter) => Object.defineProperty(record.exports, name, { get: getter, enumerable: true, configurable: true });
+      factory(
+        define,
+        (from) => exportStarInto(define, from),
+        (specifier) => importModule(String(specifier), url),
+        (specifier) => Promise.resolve().then(() => importModule(String(specifier), url)),
+        { url, resolve: (specifier) => new URLShim(String(specifier), url).href, env: MODULE_ENV },
+      );
+    } catch (error) {
+      note("log", "module " + String(url).slice(0, 90) + ": " + (error && error.message));
+      record.state = "failed";
+    }
+    if (record.state !== "failed") record.state = "done";
+    return record.exports;
+  }
+
+  function importModule(specifier, base) {
+    let absolute;
+    try {
+      absolute = new URLShim(String(specifier), base).href;
+    } catch (error) {
+      note("log", "module specifier " + String(specifier).slice(0, 80) + ": " + (error && error.message));
+      return {};
+    }
+    return importAbsolute(absolute);
+  }
+
+  function importAbsolute(url) {
+    const existing = MODULES.get(url);
+    if (existing) return existing.exports;
+    let parsed;
+    try {
+      parsed = loadScript(url);
+    } catch (error) {
+      parsed = { error: String(error && error.message) };
+    }
+    if (parsed.error || !(parsed.status >= 200 && parsed.status < 300)) {
+      note("log", "module fetch " + String(url).slice(0, 110) + " -> " + (parsed.error || parsed.status));
+      const empty = { exports: {}, state: "failed" };
+      MODULES.set(url, empty);
+      return empty.exports;
+    }
+    return evaluateModuleSource(parsed.body, url);
+  }
+
   function makeContentEnvironment(page) {
     const host = new URL(page.url).hostname;
     const ident = IDENTITY = page.identity;
@@ -2259,8 +2897,27 @@
     const viewportHeight = 1080;
 
     // ----- nodes -----
-    class VNode {
+    // EventTarget is the base the DOM inheritance chain starts from; every node
+    // is one, and libraries extend it directly.
+    class EventTargetShim {
+      addEventListener(type, handler, options) {
+        if (typeof handler !== "function" && !(handler && typeof handler.handleEvent === "function")) return;
+        if (!listeners.has(this)) listeners.set(this, new Map());
+        const map = listeners.get(this);
+        if (!map.has(type)) map.set(type, []);
+        map.get(type).push({ handler, once: !!(options && options.once) });
+      }
+      removeEventListener(type, handler) {
+        const map = listeners.get(this);
+        if (!map || !map.has(type)) return;
+        map.set(type, map.get(type).filter((entry) => entry.handler !== handler));
+      }
+      dispatchEvent(event) { return dispatchOn(this, event); }
+    }
+
+    class VNode extends EventTargetShim {
       constructor(ownerDocument) {
+        super();
         this.ownerDocument = ownerDocument;
         this.parentNode = null;
         this.childNodes = [];
@@ -2366,19 +3023,6 @@
         this.childNodes = [];
         if (value !== "" && value != null) this.insertBefore(this.ownerDocument.createTextNode(String(value)), null);
       }
-      addEventListener(type, handler, options) {
-        if (typeof handler !== "function" && !(handler && typeof handler.handleEvent === "function")) return;
-        if (!listeners.has(this)) listeners.set(this, new Map());
-        const map = listeners.get(this);
-        if (!map.has(type)) map.set(type, []);
-        map.get(type).push({ handler, once: !!(options && options.once) });
-      }
-      removeEventListener(type, handler) {
-        const map = listeners.get(this);
-        if (!map || !map.has(type)) return;
-        map.set(type, map.get(type).filter((entry) => entry.handler !== handler));
-      }
-      dispatchEvent(event) { return dispatchOn(this, event); }
     }
 
     // Dispatch along the path a browser takes: the target, its ancestors, the
@@ -2488,6 +3132,28 @@
             return "data:image/png;base64," + body;
           };
           canvas.toBlob = (callback) => { try { callback(null); } catch (error) { /* as Chrome */ } };
+        }
+        if (this.tagName === "STYLE" || this.tagName === "LINK") {
+          // A style element's CSSOM view: emotion and every CSS-in-JS layer insert
+          // rules through it. The rules are kept as data, never applied to a
+          // layout (there is none).
+          const owner = this;
+          const rules = [];
+          this.sheet = {
+            get cssRules() { return rules; },
+            get ownerNode() { return owner; },
+            insertRule(rule, index) {
+              const at = index === undefined ? rules.length : Math.max(0, Math.min(index, rules.length));
+              rules.splice(at, 0, { cssText: String(rule) });
+              return at;
+            },
+            deleteRule(index) { rules.splice(index, 1); },
+            replaceSync(text) {
+              rules.length = 0;
+              for (const part of String(text).split("}")) if (part.trim()) rules.push({ cssText: part + "}" });
+            },
+            replace(text) { this.replaceSync(text); return Promise.resolve(); },
+          };
         }
       }
       _makeStyle() {
@@ -2793,8 +3459,12 @@
     const elementStub = {
       get(target, key, receiver) {
         if (typeof key === "symbol" || Reflect.has(target, key)) return Reflect.get(target, key, receiver);
+        // A browser answers `undefined` for a member it does not have, and
+        // feature checks (React's own internal keys among them) depend on that
+        // answer. The touch is logged so a measured gap can be filled; a guess
+        // is never returned in its place.
         note("surface", "element." + String(key));
-        return function () { return undefined; };
+        return undefined;
       },
     };
 
@@ -2916,6 +3586,15 @@
         return allElements(this).filter((element) => element.getAttribute("name") === String(name));
       }
       get forms() { return allElements(this).filter((element) => element.tagName === "FORM"); }
+      get styleSheets() { return allElements(this).filter((element) => (element.tagName === "STYLE" || element.tagName === "LINK") && element.sheet).map((element) => element.sheet); }
+      get implementation() {
+        return {
+          createHTMLDocument: (title) => { const scratch = new VDocument(page.url); if (title) scratch.title = String(title); return scratch; },
+          createDocument: () => new VDocument(page.url),
+          createDocumentType: () => ({}),
+          hasFeature: () => true,
+        };
+      }
       get images() { return allElements(this).filter((element) => element.tagName === "IMG"); }
       get links() {
         return allElements(this).filter((element) => (element.tagName === "A" || element.tagName === "AREA") && element.hasAttribute("href"));
@@ -3183,6 +3862,20 @@
     class CustomEventShim extends EventShim {
       constructor(type, init) { super(type, init); this.detail = (init && init.detail) !== undefined ? init.detail : null; }
     }
+    // The DOM event family: the constructors frameworks build events with, each
+    // carrying the fields its name implies from the init dictionary.
+    const eventClass = (name, fields) => {
+      const cls = class extends EventShim {
+        constructor(type, init) {
+          super(type, init);
+          init = init || {};
+          for (const field of fields) this[field] = init[field] !== undefined ? init[field] : null;
+        }
+        get [Symbol.toStringTag]() { return name; }
+      };
+      try { Object.defineProperty(cls, "name", { value: name, configurable: true }); } catch (error) { /* frozen */ }
+      return cls;
+    };
 
     // ----- media queries -----
     function evalMediaFeature(name, value) {
@@ -3298,6 +3991,16 @@
     win.requestIdleCallback = (fn) => win.setTimeout(() => { try { fn({ didTimeout: false, timeRemaining: () => 50 }); } catch (error) { note("log", "idle: " + (error && error.message)); } }, 0);
     win.cancelIdleCallback = (id) => win.clearTimeout(id);
 
+    // Console arguments keep an Error's stack: a framework's own error report is
+    // the cheapest diagnosis the lane gets, and String(error) drops it.
+    const formatLogArg = (value) => {
+      if (value && typeof value === "object" && typeof value.stack === "string") return value.stack;
+      if (value && typeof value === "object") {
+        try { return JSON.stringify(value); } catch (error) { return String(value); }
+      }
+      return String(value);
+    };
+
     // ----- the window surface -----
     Object.assign(win, {
       document: doc,
@@ -3360,6 +4063,81 @@
       ResizeObserver: ResizeObserverShim,
       Event: EventShim,
       CustomEvent: CustomEventShim,
+      MessageEvent: eventClass("MessageEvent", ["data", "origin", "lastEventId", "source", "ports"]),
+      ErrorEvent: eventClass("ErrorEvent", ["message", "filename", "lineno", "colno", "error"]),
+      UIEvent: eventClass("UIEvent", ["detail", "view"]),
+      MouseEvent: eventClass("MouseEvent", ["clientX", "clientY", "screenX", "screenY", "button", "buttons", "relatedTarget"]),
+      PointerEvent: eventClass("PointerEvent", ["pointerId", "pointerType", "clientX", "clientY", "button", "buttons"]),
+      KeyboardEvent: eventClass("KeyboardEvent", ["key", "code", "keyCode", "which", "repeat", "altKey", "ctrlKey", "metaKey", "shiftKey"]),
+      FocusEvent: eventClass("FocusEvent", ["relatedTarget"]),
+      InputEvent: eventClass("InputEvent", ["data", "inputType", "isComposing"]),
+      SubmitEvent: eventClass("SubmitEvent", ["submitter"]),
+      TouchEvent: eventClass("TouchEvent", ["touches", "targetTouches", "changedTouches"]),
+      WheelEvent: eventClass("WheelEvent", ["deltaX", "deltaY", "deltaZ", "deltaMode"]),
+      DragEvent: eventClass("DragEvent", ["dataTransfer"]),
+      ProgressEvent: eventClass("ProgressEvent", ["lengthComputable", "loaded", "total"]),
+      StorageEvent: eventClass("StorageEvent", ["key", "oldValue", "newValue", "url", "storageArea"]),
+      PopStateEvent: eventClass("PopStateEvent", ["state"]),
+      HashChangeEvent: eventClass("HashChangeEvent", ["oldURL", "newURL"]),
+      PageTransitionEvent: eventClass("PageTransitionEvent", ["persisted"]),
+      BeforeUnloadEvent: eventClass("BeforeUnloadEvent", []),
+      CloseEvent: eventClass("CloseEvent", ["code", "reason", "wasClean"]),
+      PromiseRejectionEvent: eventClass("PromiseRejectionEvent", ["promise", "reason"]),
+      CSS: {
+        supports: () => true,
+        escape: (value) => String(value).replace(/[^a-zA-Z0-9_\u00A0-\uFFFF-]/g, (ch) => "\\" + ch),
+      },
+      Worker: class {
+        constructor(url) { note("surface", "Worker"); this._url = String(url); }
+        postMessage() {} terminate() {} addEventListener() {} removeEventListener() {}
+      },
+      BroadcastChannel: class {
+        constructor(name) { this.name = String(name); }
+        postMessage() {} close() {} addEventListener() {} removeEventListener() {}
+      },
+      getSelection: () => ({ rangeCount: 0, toString: () => "", addRange() {}, removeAllRanges() {}, getRangeAt: () => null, collapse() {} }),
+      scroll: () => {}, scrollTo: () => {}, scrollBy: () => {},
+      visualViewport: { width: viewportWidth, height: viewportHeight, scale: 1, addEventListener() {}, removeEventListener() {} },
+      reportError: (error) => { note("log", "reportError: " + (error && (error.message || String(error)))); },
+      // WHATWG Streams, minimal but real enough to construct and wire. The lane's
+      // model is synchronous: a reader that truly streams gets an immediate end,
+      // and the surface is logged when touched.
+      ReadableStream: class {
+        constructor(source) { this._source = source || null; this.locked = false; note("surface", "ReadableStream"); }
+        getReader() {
+          this.locked = true;
+          return { read: () => Promise.resolve({ done: true, value: undefined }), releaseLock: () => { this.locked = false; }, cancel: () => Promise.resolve(), closed: Promise.resolve() };
+        }
+        cancel() { return Promise.resolve(); }
+        tee() { return [new win.ReadableStream(), new win.ReadableStream()]; }
+        pipeTo() { return Promise.resolve(); }
+        pipeThrough(transform) { return transform && transform.readable ? transform.readable : new win.ReadableStream(); }
+        [Symbol.asyncIterator]() { return { next: () => Promise.resolve({ done: true, value: undefined }) }; }
+      },
+      WritableStream: class {
+        constructor(sink) { this._sink = sink || null; this.locked = false; note("surface", "WritableStream"); }
+        getWriter() {
+          this.locked = true;
+          const sink = this._sink;
+          return {
+            write(chunk) { if (sink && typeof sink.write === "function") { try { sink.write(chunk); } catch (error) { /* as logged */ } } return Promise.resolve(); },
+            close() { if (sink && typeof sink.close === "function") { try { sink.close(); } catch (error) { /* as logged */ } } return Promise.resolve(); },
+            abort() { return Promise.resolve(); },
+            releaseLock() { /* released */ },
+          };
+        }
+        close() { if (this._sink && typeof this._sink.close === "function") { try { this._sink.close(); } catch (error) { /* as logged */ } } return Promise.resolve(); }
+        abort() { return Promise.resolve(); }
+      },
+      TransformStream: class {
+        constructor(transformer) { this.readable = new win.ReadableStream(); this.writable = new win.WritableStream(null); this._transformer = transformer || null; note("surface", "TransformStream"); }
+      },
+      TextEncoderStream: class {
+        constructor() { const stream = new win.TransformStream(); this.readable = stream.readable; this.writable = stream.writable; this.encoding = "utf-8"; note("surface", "TextEncoderStream"); }
+      },
+      TextDecoderStream: class {
+        constructor() { const stream = new win.TransformStream(); this.readable = stream.readable; this.writable = stream.writable; this.encoding = "utf-8"; note("surface", "TextDecoderStream"); }
+      },
       Response: class {
         constructor(body, init) {
           init = init || {};
@@ -3382,6 +4160,13 @@
         removeEventListener() {}
         dispatchEvent() { return true; }
         throwIfAborted() { if (this.aborted) throw this.reason; }
+        static abort(reason) { const signal = new win.AbortSignal(); signal.aborted = true; signal.reason = reason; return signal; }
+        static timeout(ms) {
+          const signal = new win.AbortSignal();
+          win.setTimeout(() => { signal.aborted = true; signal.reason = new DOMExceptionShim("signal timed out", "TimeoutError"); }, ms);
+          return signal;
+        }
+        static any() { return new win.AbortSignal(); }
       },
       AbortController: class {
         constructor() { this.signal = new win.AbortSignal(); }
@@ -3443,8 +4228,11 @@
       createImageBitmap: () => Promise.resolve({ width: 1, height: 1, close() {} }),
       FontFace: class { constructor(family, source) { this.family = family; this.status = "loaded"; } load() { return Promise.resolve(this); } },
       Screen: class {}, Navigator: class {}, Document: class {}, Window: class {},
-      HTMLCanvasElement: class {}, CSSStyleDeclaration: class {}, SVGElement: class {}, Node: class {},
-      Element: class {}, HTMLImageElement: class {}, HTMLScriptElement: class {}, HTMLTemplateElement: class {},
+      EventTarget: EventTargetShim, CSSStyleDeclaration: class {},
+      Node: VNode, Element: VElement, HTMLElement: VElement, Text: VText, CharacterData: VText, DocumentFragment: VFragment,
+      HTMLCanvasElement: VElement, SVGElement: VElement, HTMLImageElement: VElement,
+      HTMLScriptElement: VElement, HTMLTemplateElement: VElement,
+      customElements: { define() {}, get() { return undefined; }, whenDefined: () => Promise.resolve(), upgrade() {} },
       DOMParser: class {
         constructor() { note("surface", "DOMParser"); }
         parseFromString(text, type) {
@@ -3470,7 +4258,13 @@
       FormData: FormDataShim,
       Headers: HeadersShim,
       Request: RequestShim,
-      console: { log: (...args) => note("log", args.join(" ")), warn: (...args) => note("log", args.join(" ")), error: (...args) => note("log", args.join(" ")), info: (...args) => note("log", args.join(" ")), debug() {}, trace() {}, dir() {}, table() {}, group() {}, groupEnd() {}, time() {}, timeEnd() {} },
+      console: {
+        log: (...args) => note("log", args.map(formatLogArg).join(" ")),
+        warn: (...args) => note("log", args.map(formatLogArg).join(" ")),
+        error: (...args) => note("log", args.map(formatLogArg).join(" ")),
+        info: (...args) => note("log", args.map(formatLogArg).join(" ")),
+        debug() {}, trace() {}, dir() {}, table() {}, group() {}, groupEnd() {}, time() {}, timeEnd() {},
+      },
       chrome: {
         app: { isInstalled: false, InstallState: { DISABLED: "disabled" }, RunningState: { CANNOT_RUN: "cannot_run" } },
         runtime: {},
@@ -3479,14 +4273,68 @@
       },
     });
 
-    // Tag-named element classes so `constructor.name` and `instanceof` read true.
+    // Tag-named element classes: `instanceof` answers true for every element (an
+    // over-approximation that keeps boot paths alive; a program that needs exact
+    // per-tag constructors is a measured finding, never invented here).
     for (const [tag, name] of TAG_CLASS_NAMES) {
-      const holder = globalThis[name] || function () {};
-      if (!holder.prototype || holder.name !== name) {
-        try { Object.defineProperty(holder, "name", { value: name, configurable: true }); } catch (error) { /* frozen */ }
-      }
-      win[name] = holder;
+      win[name] = VElement;
     }
+    // Every standard HTML element interface name, so `x instanceof HTML...`
+    // checks (React's own commit path does one) never meet an undefined
+    // constructor.
+    for (const name of [
+      "HTMLAnchorElement", "HTMLAreaElement", "HTMLAudioElement", "HTMLBRElement", "HTMLBaseElement",
+      "HTMLBodyElement", "HTMLButtonElement", "HTMLCanvasElement", "HTMLDListElement", "HTMLDataElement",
+      "HTMLDataListElement", "HTMLDetailsElement", "HTMLDialogElement", "HTMLDivElement", "HTMLEmbedElement",
+      "HTMLFieldSetElement", "HTMLFormElement", "HTMLHRElement", "HTMLHeadElement", "HTMLHeadingElement",
+      "HTMLHtmlElement", "HTMLIFrameElement", "HTMLImageElement", "HTMLInputElement", "HTMLLIElement",
+      "HTMLLabelElement", "HTMLLegendElement", "HTMLLinkElement", "HTMLMapElement", "HTMLMediaElement",
+      "HTMLMenuElement", "HTMLMetaElement", "HTMLMeterElement", "HTMLModElement", "HTMLOListElement",
+      "HTMLObjectElement", "HTMLOptGroupElement", "HTMLOptionElement", "HTMLOutputElement",
+      "HTMLParagraphElement", "HTMLParamElement", "HTMLPictureElement", "HTMLPreElement",
+      "HTMLProgressElement", "HTMLQuoteElement", "HTMLScriptElement", "HTMLSelectElement", "HTMLSlotElement",
+      "HTMLSourceElement", "HTMLSpanElement", "HTMLStyleElement", "HTMLTableCaptionElement",
+      "HTMLTableCellElement", "HTMLTableColElement", "HTMLTableElement", "HTMLTableRowElement",
+      "HTMLTableSectionElement", "HTMLTemplateElement", "HTMLTextAreaElement", "HTMLTimeElement",
+      "HTMLTitleElement", "HTMLTrackElement", "HTMLUListElement", "HTMLUnknownElement", "HTMLVideoElement",
+    ]) {
+      if (!(name in win)) win[name] = VElement;
+    }
+    // The remaining DOM interface names programs `instanceof`-check or build
+    // events with; the list shapes alias Array because that is what the host's
+    // query methods return.
+    win.NodeList = Array;
+    win.HTMLCollection = Array;
+    win.DOMTokenList = Array;
+    win.NamedNodeMap = Array;
+    win.FileList = Array;
+    win.TouchList = Array;
+    win.DataTransfer = class {
+      constructor() { this.files = []; this.items = []; this.types = []; this.dropEffect = "none"; this.effectAllowed = "all"; }
+      setData() {} getData() { return ""; } clearData() {} setDragImage() {}
+    };
+    win.DOMRect = class {
+      constructor(x = 0, y = 0, width = 0, height = 0) {
+        this.x = x; this.y = y; this.width = width; this.height = height;
+        this.top = y; this.left = x; this.right = x + width; this.bottom = y + height;
+      }
+      static fromRect(rect) { return new this((rect && rect.x) || 0, (rect && rect.y) || 0, (rect && rect.width) || 0, (rect && rect.height) || 0); }
+    };
+    win.DOMRectReadOnly = win.DOMRect;
+    win.Range = class {
+      constructor() { this.startContainer = null; this.endContainer = null; this.startOffset = 0; this.endOffset = 0; this.collapsed = true; }
+      setStart() {} setEnd() {} collapse() {} selectNodeContents() {}
+      getBoundingClientRect() { return new win.DOMRect(); }
+      getClientRects() { return []; }
+      toString() { return ""; }
+    };
+    win.Selection = class {};
+    win.ClipboardEvent = eventClass("ClipboardEvent", ["clipboardData"]);
+    win.AnimationEvent = eventClass("AnimationEvent", ["animationName", "elapsedTime"]);
+    win.TransitionEvent = eventClass("TransitionEvent", ["propertyName", "elapsedTime"]);
+    win.Touch = class { constructor(init) { init = init || {}; this.identifier = init.identifier || 0; this.clientX = init.clientX || 0; this.clientY = init.clientY || 0; this.target = init.target || null; } };
+    win.ResizeObserverEntry = class {};
+    win.IntersectionObserverEntry = class {};
 
     // navigator and screen come from the identity's own measured view, so the
     // page's program never sees a fact that contradicts the wire.
@@ -3664,9 +4512,25 @@
 
       const env = makeContentEnvironment(page);
       M.doc = env.doc;
+      // The preload pass runs on the lane's own threads, underneath this run;
+      // the host waits per URL through op_prefetch_wait.
+      M.prefetch = !!page.prefetch;
+      note("log", "prefetch " + (M.prefetch ? "on" : "off"));
       env.runScript = (element) => {
         const type = (element.getAttribute("type") || "").toLowerCase();
-        if (type === "module") { note("surface", "script.module"); note("log", "module script skipped (M2): " + String(element.getAttribute("src") || "inline").slice(0, 90)); return; }
+        if (type === "module") {
+          note("surface", "script.module");
+          const src = element.getAttribute("src");
+          if (src) {
+            let absolute = src;
+            try { absolute = new URL(src, M.page.url).href; } catch (error) { /* as given */ }
+            importAbsolute(absolute);
+          } else if ((element.textContent || "").trim()) {
+            evaluateModuleSource(element.textContent, M.page.url + "#module-" + (++INLINE_MODULE));
+          }
+          if (element.onload) { try { element.onload(); } catch (error) { note("log", "script onload: " + (error && error.message)); } }
+          return;
+        }
         if (type && !/^(text|application)\/(javascript|ecmascript)$/.test(type)) { note("log", "script type " + type + " skipped"); return; }
         const src = element.getAttribute("src");
         if (src) {
@@ -3782,6 +4646,10 @@
         }
       })(html);
       env.armed = true;
+      // Module scripts are deferred by the spec: classic scripts run first, then
+      // the module graph in document order (this whole run is post-parse, so
+      // deferral is just which queue runs last).
+      const moduleQueue = [];
       for (const item of order) {
         if (item.kind === "style") {
           const href = item.element.getAttribute("href");
@@ -3789,10 +4657,13 @@
             const response = netFetch(href, { __dest: "style", mode: "no-cors", credentials: "include", headers: { accept: "text/css,*/*;q=0.1" } });
             note("log", "style " + String(href).slice(0, 70) + " -> " + response.status);
           } catch (error) { note("log", "style " + String(href).slice(0, 70) + ": " + (error && error.message)); }
+        } else if ((item.element.getAttribute("type") || "").toLowerCase() === "module") {
+          moduleQueue.push(item.element);
         } else {
           env.runScript(item.element);
         }
       }
+      for (const element of moduleQueue) env.runScript(element);
       settle();
       doc.readyState = "interactive";
       doc.dispatchEvent({ type: "readystatechange", bubbles: false });

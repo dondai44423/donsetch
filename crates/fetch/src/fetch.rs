@@ -43,6 +43,9 @@ pub struct Options {
     pub pace_ms: i64,
     /// The envelope the challenge engine runs inside.
     pub engine: crate::envelope::Limits,
+    /// The envelope the content lane runs inside (a client-rendered shell or a
+    /// 2xx the contract cannot name, once per encounter).
+    pub content: crate::envelope::Limits,
     /// Egress proxy URL for every request of the encounter, the engine's included.
     pub proxy: Option<String>,
     /// Read and keep pages in the page cache (`cache.rs`). Only a persisting
@@ -73,6 +76,7 @@ impl Default for Options {
             identity: None,
             pace_ms: 900,
             engine: crate::envelope::Limits::from_env(),
+            content: crate::envelope::Limits::content_from_env(),
             proxy: None,
             cache: true,
             revalidate: false,
@@ -538,6 +542,177 @@ impl Worker {
             }
         }
         Interface::Unanswered
+    }
+
+    /// One content-lane run on a shell document: the page's own program, in the
+    /// engine, as the identity that received the document and against the state
+    /// it owns. A produced document that passes the contract is content, and the
+    /// produced page enters the pipeline exactly where a network document does
+    /// (its body is the caller's, its copy goes to the page cache). Anything
+    /// else returns None and the encounter ends on the shell it already had.
+    #[allow(clippy::too_many_arguments)]
+    fn content_lane(
+        &mut self,
+        url: &str,
+        host: &str,
+        response: &crate::http::Response,
+        contract: (&Contract, bool),
+        identity: &'static Identity,
+        options: &Options,
+        started: Instant,
+        first_ms: f64,
+        attempts: &mut Vec<Attempt>,
+        spent_state: bool,
+    ) -> Option<Outcome> {
+        let (contract, generic) = contract;
+        let lane_started = Instant::now();
+        // The lane spends what the encounter has left, never more: an encounter
+        // that gives the lane nothing has already ended, and a bench's 3 s
+        // deadline bounds the lane with the same number.
+        let remaining = options.deadline.saturating_sub(started.elapsed());
+        if remaining < Duration::from_millis(500) {
+            attempts.push(Attempt {
+                identity: identity.name.to_string(),
+                transport: "program".to_string(),
+                class: Class::Shell,
+                status: response.status,
+                ms: 0.0,
+                bytes: 0,
+                version: String::new(),
+                title: String::new(),
+                note: Some("content lane: the encounter had no budget left".to_string()),
+            });
+            return None;
+        }
+        let mut limits = options.content.clone();
+        limits.wall = limits.wall.min(remaining);
+        let cookie = self.state.cookie_header_for(&response.url, identity.name);
+        let lane = match crate::engine::content_within_via(
+            &limits,
+            &response.url,
+            &response.body,
+            identity,
+            cookie.as_deref(),
+            self.proxy.as_deref(),
+            200,
+        ) {
+            Ok(lane) => lane,
+            Err(error) => {
+                attempts.push(Attempt {
+                    identity: identity.name.to_string(),
+                    transport: "program".to_string(),
+                    class: Class::Shell,
+                    status: response.status,
+                    ms: lane_started.elapsed().as_secs_f64() * 1000.0,
+                    bytes: 0,
+                    version: String::new(),
+                    title: String::new(),
+                    note: Some(format!("content lane: {error}")),
+                });
+                return None;
+            }
+        };
+        let lane_ms = lane.ms.max(lane_started.elapsed().as_secs_f64() * 1000.0);
+        // What the program stored is the identity's own state, bound to it.
+        self.state
+            .store_cookies(host, identity.name, lane.cookies.clone());
+        // The produced document is verified by the same contract a network
+        // document answers, with no header facts to lean on.
+        let content = crate::contract::verify_response(
+            200,
+            &[],
+            &lane.document,
+            &response.url,
+            contract,
+            generic,
+        );
+        attempts.push(Attempt {
+            identity: identity.name.to_string(),
+            transport: "program".to_string(),
+            class: if content.passed {
+                Class::Content
+            } else {
+                Class::Incomplete
+            },
+            status: 200,
+            ms: lane_ms,
+            bytes: lane.document.len(),
+            version: String::new(),
+            title: content.title.clone(),
+            note: Some(format!(
+                "content lane: stop={} {} text chars, {} requests{}",
+                lane.stop,
+                lane.text_chars,
+                lane.transcript.len(),
+                if content.passed {
+                    String::new()
+                } else {
+                    format!(", contract: {}", content.failures.join("; "))
+                }
+            )),
+        });
+        if !content.passed {
+            if self.persist {
+                self.save_state();
+            }
+            return None;
+        }
+        // The page cache keeps the produced page under the identity and egress
+        // that produced it, through the same capture the network path uses.
+        self.captured = Some(Captured {
+            identity: identity.name,
+            final_url: response.url.clone(),
+            status: 200,
+            headers: Vec::new(),
+            bytes: lane.document.clone().into_bytes(),
+            cookie: cookie.clone(),
+            revalidated: None,
+        });
+        if self.persist {
+            if let Some(origin) = self.state.origins.get_mut(host).map(Arc::make_mut) {
+                origin.route = None;
+            }
+            self.save_state();
+        }
+        let mut outcome = answer(
+            url,
+            host.to_string(),
+            response,
+            Class::Content,
+            identity.name,
+            Ended {
+                started,
+                first_ms,
+                attempts: std::mem::take(attempts),
+                spent_state,
+                capture: options.capture_body,
+            },
+        );
+        outcome.title = content.title;
+        outcome.text_chars = content.text_chars;
+        outcome.transport = "program".to_string();
+        outcome.evidence.push(format!(
+            "content lane: stop={} in {:.0} ms as {} ({} ops, {} B read)",
+            lane.stop, lane_ms, identity.name, lane.cost.ops, lane.cost.bytes_read
+        ));
+        outcome.evidence.push(format!(
+            "produced document: {} text chars, {} B, {} requests",
+            lane.text_chars,
+            lane.document.len(),
+            lane.transcript.len()
+        ));
+        if let Some(navigate) = &lane.navigate {
+            outcome
+                .evidence
+                .push(format!("the page chose a navigation: {navigate}"));
+        }
+        if options.capture_body {
+            // The body a caller inspects is the produced document, not the shell.
+            outcome.body = Some(lane.document);
+            outcome.headers = Vec::new();
+            outcome.bytes = None;
+        }
+        Some(outcome)
     }
 
     /// One request as one named identity, no selection and no state: the probe
@@ -1346,6 +1521,7 @@ impl Worker {
         let mut spent_state = false;
         let mut data_tried = false;
         let mut engine_tried = false;
+        let mut content_tried = false;
         let mut last_body = String::new();
         let mut last_final_url = String::new();
         let mut last_headers: Vec<(String, String)> = Vec::new();
@@ -1717,6 +1893,30 @@ impl Worker {
                 content_ok: content.passed,
                 headers: &response.headers,
             });
+
+            // A client-rendered shell gets the lane once: a Shell verdict ends
+            // the encounter here regardless, so the lane takes the last word the
+            // site gave and never a later identity's turn.
+            if verdict.class == Class::Shell
+                && !content_tried
+                && (200..300).contains(&response.status)
+            {
+                content_tried = true;
+                if let Some(outcome) = self.content_lane(
+                    url,
+                    &host,
+                    &response,
+                    (&contract, generic),
+                    identity,
+                    options,
+                    started,
+                    first_ms,
+                    &mut attempts,
+                    spent_state,
+                ) {
+                    return outcome;
+                }
+            }
 
             // The origin's verdict on a credential the engine minted earlier: a
             // content answer extends what we know of its lifetime; a 202/401/403
@@ -2518,6 +2718,50 @@ impl Worker {
 
         if self.persist {
             self.save_state();
+        }
+        // A 2xx the contract could not name gets the lane once, after every
+        // identity has had its turn: identity and egress spend first, and a
+        // later identity's turn is never taken by JavaScript.
+        if !content_tried {
+            let last_answer_row = attempts
+                .iter()
+                .rev()
+                .find(|attempt| attempt.status != 0)
+                .cloned();
+            if let Some(attempt) = last_answer_row {
+                if attempt.class == Class::Incomplete
+                    && (200..300).contains(&attempt.status)
+                    && !last_body.is_empty()
+                {
+                    content_tried = true;
+                    if let Some(identity) = identity::lookup(&attempt.identity) {
+                        let final_response = crate::http::Response {
+                            status: attempt.status,
+                            version: String::new(),
+                            headers: last_headers.clone(),
+                            body: last_body.clone(),
+                            url: last_final_url.clone(),
+                            elapsed_ms: attempt.ms,
+                            cookies: Vec::new(),
+                            raw: last_raw.clone(),
+                        };
+                        if let Some(outcome) = self.content_lane(
+                            url,
+                            &host,
+                            &final_response,
+                            (&contract, generic),
+                            identity,
+                            options,
+                            started,
+                            first_ms,
+                            &mut attempts,
+                            spent_state,
+                        ) {
+                            return outcome;
+                        }
+                    }
+                }
+            }
         }
         // The answer the encounter ends on is the last one a server gave: a
         // later attempt that never reached it (a network failure) does not

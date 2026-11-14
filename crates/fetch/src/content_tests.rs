@@ -281,6 +281,186 @@ document.body.textContent = "routed without a document load";"#,
 }
 
 #[test]
+fn modules_run_after_classic_scripts_with_all_binding_forms() {
+    let server = Server::start(|request| {
+        match request.path.as_str() {
+        "/classic.js" => Reply::ok("window.__classicRan = true;"),
+        "/dep.js" => Reply::ok(
+            "export const named = 'named-value';\nexport default 'default-value';\nexport function helper() { return 'helper-value'; }",
+        ),
+        "/entry.js" => Reply::ok(
+            "import def, { named, helper } from './dep.js';\nimport * as ns from './dep.js';\nif (!window.__classicRan) throw new Error('module ran before the classic script');\ndocument.body.textContent = [def, named, helper(), ns.named].join(' ');",
+        ),
+        _ => Reply::ok("ok"),
+    }
+    });
+    let html = r#"<html><head><script src="/classic.js"></script><script type="module" src="/entry.js"></script></head><body></body></html>"#;
+    let content = render(&server, html, 10).expect("content run");
+    assert_eq!(content.stop, "content", "logs: {:?}", content.logs);
+    assert!(
+        content
+            .document
+            .contains("default-value named-value helper-value named-value"),
+        "all binding forms must arrive: {}",
+        content.document
+    );
+}
+
+#[test]
+fn module_reexports_and_export_star_work() {
+    let server = Server::start(|request| match request.path.as_str() {
+        "/base.js" => {
+            Reply::ok("export const a = 'A';\nexport const b = 'B';\nexport default 'D';")
+        }
+        "/mid.js" => {
+            Reply::ok("export { a as alpha } from './base.js';\nexport * from './base.js';")
+        }
+        "/entry.js" => Reply::ok(
+            "import { alpha, b } from './mid.js';\ndocument.body.textContent = alpha + b;",
+        ),
+        _ => Reply::ok("ok"),
+    });
+    let html =
+        r#"<html><head><script type="module" src="/entry.js"></script></head><body></body></html>"#;
+    let content = render(&server, html, 2).expect("content run");
+    assert_eq!(content.stop, "content", "logs: {:?}", content.logs);
+    assert!(content.document.contains("AB"), "{}", content.document);
+}
+
+#[test]
+fn module_import_meta_and_dynamic_import_work() {
+    let server = Server::start(|request| {
+        match request.path.as_str() {
+        "/part.js" => Reply::ok("export const value = 'lazy-value';"),
+        "/entry.js" => Reply::ok(
+            "const here = import.meta.url;\nimport('./part.js').then(function (m) { document.body.textContent = here + ' ' + m.value; });",
+        ),
+        _ => Reply::ok("ok"),
+    }
+    });
+    let html =
+        r#"<html><head><script type="module" src="/entry.js"></script></head><body></body></html>"#;
+    let content = render(&server, html, 10).expect("content run");
+    assert_eq!(content.stop, "content", "logs: {:?}", content.logs);
+    assert!(
+        content.document.contains("entry.js lazy-value"),
+        "import.meta.url and the dynamic import must both resolve: {}",
+        content.document
+    );
+}
+
+#[test]
+fn module_cycles_complete_without_hanging() {
+    let server = Server::start(|request| {
+        match request.path.as_str() {
+        "/a.js" => Reply::ok(
+            "import { bName } from './b.js';\nexport function aName() { return 'a'; }\nexport function joined() { return aName() + '-' + bName(); }",
+        ),
+        "/b.js" => Reply::ok("import { aName } from './a.js';\nexport function bName() { return 'b' + typeof aName; }"),
+        "/entry.js" => Reply::ok("import { joined } from './a.js';\ndocument.body.textContent = 'joined:' + typeof joined;"),
+        _ => Reply::ok("ok"),
+    }
+    });
+    let html =
+        r#"<html><head><script type="module" src="/entry.js"></script></head><body></body></html>"#;
+    let content = render(&server, html, 5).expect("content run");
+    assert_eq!(content.stop, "content", "logs: {:?}", content.logs);
+    assert!(
+        content.document.contains("joined:function"),
+        "{}",
+        content.document
+    );
+}
+
+#[test]
+fn a_module_the_transform_cannot_parse_is_named_and_skipped() {
+    let server = Server::start(|request| match request.path.as_str() {
+        "/broken.js" => {
+            Reply::ok("import { 'x' as y } from './dep.js';\ndocument.body.textContent = 'never';")
+        }
+        "/entry.js" => {
+            Reply::ok("import './broken.js';\ndocument.body.textContent = 'after broken';")
+        }
+        _ => Reply::ok("ok"),
+    });
+    let html =
+        r#"<html><head><script type="module" src="/entry.js"></script></head><body></body></html>"#;
+    let content = render(&server, html, 5).expect("content run");
+    assert_eq!(content.stop, "content", "logs: {:?}", content.logs);
+    assert!(
+        content.document.contains("after broken"),
+        "{}",
+        content.document
+    );
+    assert!(
+        content
+            .logs
+            .iter()
+            .any(|line| line.contains("module") && line.contains("broken.js")),
+        "the skipped module must be named in the log: {:?}",
+        content.logs
+    );
+}
+
+#[test]
+fn the_encounter_takes_the_content_lane_on_a_shell() {
+    let server = Server::start(|request| {
+        match request.path.as_str() {
+        "/" => Reply::ok(
+            r#"<html><head><title>Shell</title><script>window.__a = 1;</script><script>window.__b = 2;</script><script src="/app.js"></script></head><body><div id="root">Loading</div></body></html>"#,
+        ),
+        "/app.js" => Reply::ok(
+            "document.getElementById('root').textContent = 'Lane Rendered Item. ' + 'The page owns this paragraph and assembled it after the document arrived. '.repeat(4);",
+        ),
+        _ => Reply::ok("ok"),
+    }
+    });
+    let _turn = crate::engine_tests::serial();
+    let mut worker = crate::fetch::Worker::new(false);
+    let options = crate::fetch::Options {
+        capture_body: true,
+        max_tries: 1,
+        persist: false,
+        cache: false,
+        content: crate::envelope::Limits {
+            wall: Duration::from_millis(5_000),
+            ..crate::envelope::Limits::content()
+        },
+        ..Default::default()
+    };
+    let url = format!("http://{}/", server.addr);
+    let outcome = worker.fetch(&url, &options);
+    assert_eq!(
+        outcome.class,
+        crate::classify::Class::Content,
+        "evidence: {:?}",
+        outcome.evidence
+    );
+    assert_eq!(outcome.transport, "program");
+    assert!(
+        outcome.text_chars >= 200,
+        "text chars: {}",
+        outcome.text_chars
+    );
+    assert!(
+        outcome
+            .body
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Lane Rendered Item"),
+        "the produced document must be the caller's body"
+    );
+    assert!(
+        outcome
+            .attempts
+            .iter()
+            .any(|attempt| attempt.transport == "program"),
+        "the lane must be a recorded attempt: {:?}",
+        outcome.attempts
+    );
+}
+
+#[test]
 fn the_body_fill_of_a_real_page_crosses_the_contract() {
     // The stop rule is the contract, not the clock: a page that assembles more
     // than the target ends the run as content before its budget.
