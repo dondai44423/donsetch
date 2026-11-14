@@ -19,7 +19,8 @@ artifacts. A branch or a dirty implementation is not an approved roadmap.
 `src/` is the product; `crates/fetch/` (its own crate and CI job) is the fetching
 layer: carried client identity, carried state, a page cache, wall
 classification, the site's own interfaces, and an in-process V8 engine that runs a
-challenge page's own program. No browser is in the path. Private working docs live in `docs/`; frozen v4 evidence
+challenge page's own program — or an application page's own program for content (the
+content lane: a data-plane DOM, never a rendering one). No browser is in the path. Private working docs live in `docs/`; frozen v4 evidence
 lives
 outside the checkout, in `~/Projects/donsetch-evidence/`.
 

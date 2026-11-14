@@ -14,7 +14,7 @@ mod challenge;
 pub mod classify;
 pub mod contract;
 mod datapath;
-mod engine;
+pub mod engine;
 pub mod envelope;
 pub mod fetch;
 mod http;
@@ -24,6 +24,8 @@ mod webcrypto;
 
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod content_tests;
 #[cfg(test)]
 mod engine_tests;
 #[cfg(test)]

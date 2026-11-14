@@ -34,3 +34,7 @@ url = "2"
 # HTML parsing only: contracts are verified against the served document.
 # This is a parser, not a browser: no scripts, no layout, no rendering.
 scraper = "0.27"
+# scraper's tree type, named directly so the content lane can walk a parsed
+# document into the JS host's tree format. Same crate and version the lockfile
+# already carries through scraper; this names it, it adds no new code.
+ego-tree = "0.11"

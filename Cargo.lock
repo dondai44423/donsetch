@@ -1379,6 +1379,7 @@ version = "0.1.0"
 dependencies = [
  "btls",
  "deno_core",
+ "ego-tree",
  "futures-util",
  "getrandom 0.2.17",
  "rustls-native-certs",

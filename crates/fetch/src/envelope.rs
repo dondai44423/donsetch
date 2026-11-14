@@ -80,6 +80,33 @@ impl Limits {
         }
         limits
     }
+
+    /// The content lane's envelope: the same enforcement, a lane-sized budget.
+    /// The wall clock covers the app's own script fetches and data calls; the
+    /// default is the first-visit budget the upgrade doc names (+1–2 s over the
+    /// document fetch). One lane run per encounter, so the op count covers a
+    /// heavy app's boot without becoming a crawl.
+    pub fn content() -> Self {
+        Self {
+            wall: Duration::from_millis(2_500),
+            ops_max: 64,
+            total_response_max: 48 * 1024 * 1024,
+            ..Self::default()
+        }
+    }
+
+    /// `content()`, with the wall clock overridable by `V5_CONTENT_WALL_MS`.
+    pub fn content_from_env() -> Self {
+        let mut limits = Self::content();
+        if let Some(ms) = std::env::var("V5_CONTENT_WALL_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms >= 500)
+        {
+            limits.wall = Duration::from_millis(ms);
+        }
+        limits
+    }
 }
 
 // ----- V8 flags ---------------------------------------------------------------

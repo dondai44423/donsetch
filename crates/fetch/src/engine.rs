@@ -1,10 +1,11 @@
-//! The challenge engine: the site's own program, run in our process.
+//! The site's own program, run in our process.
 //!
-//! V8 executes the challenge page's scripts against a bounded host layer
-//! (`engine_host.js`) and one op that performs HTTP with the fetcher's own
-//! identity. Nothing renders, nothing is laid out, and no browser is involved.
-//! A mint returns the credentials the site itself issued; the caller binds them
-//! to the identity that earned them and retries.
+//! Two modes of one engine. A **mint** executes a challenge page's scripts
+//! against a bounded host layer (`engine_host.js`) and one op that performs HTTP
+//! with the fetcher's own identity; it returns the credentials the site itself
+//! issued. A **content run** executes an application page's scripts against the
+//! same op and a data-plane DOM, and returns the document the app assembled.
+//! Nothing renders, nothing is laid out, and no browser is involved.
 
 use crate::envelope::{self, Guard, Limits, Meter};
 use crate::http::{Call, Kind, Wire};
@@ -69,6 +70,9 @@ impl fmt::Display for MintError {
 struct Shared {
     page: String,
     result: Option<String>,
+    /// The largest report the host may post: a mint reports cookies and logs, a
+    /// content run reports the document.
+    result_cap: usize,
     wire: Wire,
     identity: &'static Identity,
     started: Instant,
@@ -141,12 +145,156 @@ fn op_page(state: &mut OpState) -> String {
     state.borrow::<Shared>().page.clone()
 }
 
+/// Write `text` as a JSON string literal.
+fn write_json_string(out: &mut String, text: &str) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// One parsed node, in the host's tree format: an element is
+/// `[tag, {attributes}, ...children]` and a text node is a JSON string. The
+/// doctype and comments are dropped — the content lane is a data plane, and the
+/// reader never looks at them.
+fn write_node(out: &mut String, node: ego_tree::NodeRef<'_, scraper::Node>) {
+    use scraper::Node;
+    match node.value() {
+        Node::Element(element) => {
+            out.push('[');
+            write_json_string(out, element.name());
+            out.push_str(",{");
+            let mut first = true;
+            for (name, value) in element.attrs.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                match &name.prefix {
+                    Some(prefix) => write_json_string(
+                        out,
+                        &format!("{}:{}", prefix.as_ref(), name.local.as_ref()),
+                    ),
+                    None => write_json_string(out, name.local.as_ref()),
+                }
+                out.push(':');
+                write_json_string(out, value);
+            }
+            out.push('}');
+            for child in node.children() {
+                // Comments, doctypes and processing instructions are not part of
+                // the data plane: skip them before the separator is written.
+                if !matches!(child.value(), Node::Element(_) | Node::Text(_)) {
+                    continue;
+                }
+                out.push(',');
+                write_node(out, child);
+            }
+            out.push(']');
+        }
+        Node::Text(text) => write_json_string(out, &text.text),
+        _ => {}
+    }
+}
+
+fn find_element<'a>(
+    node: ego_tree::NodeRef<'a, scraper::Node>,
+    name: &str,
+) -> Option<ego_tree::NodeRef<'a, scraper::Node>> {
+    if let scraper::Node::Element(element) = node.value() {
+        if element.name() == name {
+            return Some(node);
+        }
+    }
+    for child in node.children() {
+        if let Some(hit) = find_element(child, name) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// The largest tree the op will hand the host. A document past this is an
+/// honest failure (the run reports it), never a truncated DOM.
+const PARSE_TREE_CAP: usize = 24 * 1024 * 1024;
+
+/// Parse an HTML document (`mode` = `document`) or an `innerHTML` fragment
+/// (`mode` = `fragment`) into the host's tree format. Parsing is html5ever's
+/// (through `scraper`, the crate contracts already use), so the tree the app
+/// boots on is the tree a browser would build.
+fn parse_tree(html: &str, mode: &str) -> String {
+    use scraper::{Html, Node};
+    let document = Html::parse_document(html);
+    let root = document.tree.root();
+    let mut out = String::with_capacity(html.len() + html.len() / 2);
+    if mode == "fragment" {
+        // A fragment parses in the body context, as `innerHTML` on a body-like
+        // element does. Table-context fragments (rows, cells set by string) are
+        // measured work, not assumed here.
+        let host = find_element(root, "body").unwrap_or(root);
+        out.push('[');
+        let mut first = true;
+        for child in host.children() {
+            if matches!(child.value(), Node::Element(_) | Node::Text(_)) {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                write_node(&mut out, child);
+            }
+        }
+        out.push(']');
+    } else {
+        match find_element(root, "html") {
+            Some(html_node) => write_node(&mut out, html_node),
+            // No <html> element (a stub or a fragment-shaped body): synthesize
+            // the browser's own wrapper around what the parser did produce.
+            None => {
+                out.push_str("[[\"html\",{},");
+                out.push_str("[\"head\",{},");
+                out.push_str("[\"body\",{}");
+                for child in root.children() {
+                    if matches!(child.value(), Node::Element(_) | Node::Text(_)) {
+                        out.push(',');
+                        write_node(&mut out, child);
+                    }
+                }
+                out.push_str("]]]");
+            }
+        }
+    }
+    if out.len() > PARSE_TREE_CAP {
+        return "{\"error\":\"parsed tree exceeds the lane cap\"}".to_string();
+    }
+    out
+}
+
+/// Parse an HTML document or fragment into the host's tree format. The content
+/// lane materializes the result as its DOM; nothing renders.
+#[op2]
+#[string]
+fn op_parse_html(#[string] html: String, #[string] mode: String) -> String {
+    parse_tree(&html, &mode)
+}
+
 #[op2(fast)]
 fn op_result(state: &mut OpState, #[string] json: String) -> bool {
-    // One report per mint, and bounded: the host layer sends a few KB of cookies
-    // and logs; a page reaching this op directly must not park megabytes here.
+    // One report per run, and bounded: a mint sends a few KB of cookies and
+    // logs; a content run sends its document, up to the lane's cap.
     let shared = state.borrow_mut::<Shared>();
-    if shared.result.is_some() || json.len() > 4 * 1024 * 1024 {
+    if shared.result.is_some() || json.len() > shared.result_cap {
         return false;
     }
     shared.result = Some(json);
@@ -431,6 +579,7 @@ fn extension() -> Extension {
         ops: Cow::Owned(vec![
             op_page(),
             op_result(),
+            op_parse_html(),
             op_fetch(),
             op_now(),
             op_sleep(),
@@ -458,7 +607,7 @@ pub struct Mint {
     pub cost: Cost,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct Cost {
     pub heap_used: usize,
     pub heap_total: usize,
@@ -481,6 +630,60 @@ pub fn mint_within(
     mint_within_via(limits, url, html, identity, cookie_header, None)
 }
 
+/// What a content run produced: the document the page's own program assembled,
+/// and everything the caller needs to classify it and (in M3) mine its contracts.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Content {
+    /// `documentElement.outerHTML` of the tree the app built, after the run.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub document: String,
+    /// Why the run ended: `content` (the text target), `quiescent` (nothing was
+    /// happening), `budget` (the wall clock) or `error`.
+    pub stop: String,
+    /// Visible text in the final tree (scripts, styles and hidden subtrees out).
+    pub text_chars: usize,
+    /// Where the page's own location ended up.
+    pub visited: String,
+    /// A navigation the page chose during the run, if any. Never followed here;
+    /// the caller decides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigate: Option<String>,
+    /// Every request the app made, in order: the wire tap M3 mines contracts from.
+    pub transcript: Vec<TranscriptEntry>,
+    pub cookies: Vec<StoredCookie>,
+    pub surfaces: Vec<String>,
+    pub logs: Vec<String>,
+    pub ms: f64,
+    pub cost: Cost,
+}
+
+/// One request the page's own program made during a content run.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TranscriptEntry {
+    pub method: String,
+    pub url: String,
+    pub status: u16,
+    pub bytes: usize,
+    /// The fetch destination the page declared (`empty`, `script`, `style`, …).
+    pub kind: String,
+    /// The body, kept for JSON responses inside the transcript budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+/// The largest document a content run reports (16 MiB): past this the run is an
+/// honest failure, never a truncated DOM.
+pub const CONTENT_DOCUMENT_CAP: usize = 16 * 1024 * 1024;
+/// The largest report a content run may post: the document plus the transcript.
+const CONTENT_RESULT_CAP: usize = 20 * 1024 * 1024;
+
+/// Which program is being run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Mint,
+    Content,
+}
+
 /// `mint_within`, with the page program's requests leaving through `proxy`.
 pub fn mint_within_via(
     limits: &Limits,
@@ -490,6 +693,59 @@ pub fn mint_within_via(
     cookie_header: Option<&str>,
     proxy: Option<&str>,
 ) -> Result<Mint, MintError> {
+    let (value, cost) = run_within(
+        Mode::Mint,
+        limits,
+        url,
+        html,
+        identity,
+        cookie_header,
+        proxy,
+        0,
+    )?;
+    mint_from(value, cost)
+}
+
+/// Run an application page's own program and return the document it assembled,
+/// inside the content lane's envelope. `text_target` is the visible-text length
+/// that ends the run early (the same contract the caller classifies against);
+/// the host also stops on quiescence or the wall clock.
+pub fn content_within_via(
+    limits: &Limits,
+    url: &str,
+    html: &str,
+    identity: &'static Identity,
+    cookie_header: Option<&str>,
+    proxy: Option<&str>,
+    text_target: usize,
+) -> Result<Content, MintError> {
+    let (value, cost) = run_within(
+        Mode::Content,
+        limits,
+        url,
+        html,
+        identity,
+        cookie_header,
+        proxy,
+        text_target,
+    )?;
+    content_from(value, cost)
+}
+
+/// The shared runner: one V8 isolate, one wire, one watchdog, one report. The
+/// mode selects the host entry (`__v5Mint` / `__v5Content`), the page profile
+/// and the report size; the envelope and its enforcement are the same in both.
+#[allow(clippy::too_many_arguments)]
+fn run_within(
+    mode: Mode,
+    limits: &Limits,
+    url: &str,
+    html: &str,
+    identity: &'static Identity,
+    cookie_header: Option<&str>,
+    proxy: Option<&str>,
+    text_target: usize,
+) -> Result<(serde_json::Value, Cost), MintError> {
     let _slot = envelope::slot();
     envelope::init_v8().map_err(MintError::Runtime)?;
     let started = Instant::now();
@@ -500,16 +756,36 @@ pub fn mint_within_via(
         .unwrap_or_default();
     let guard = Guard::new(limits.clone(), &page_host);
     let wire = Wire::guarded(identity, &guard, proxy).map_err(MintError::Runtime)?;
-    let page = serde_json::json!({
-        "url": url,
-        "html": html,
-        "cookie": cookie_header.unwrap_or(""),
-        "identity": identity.script_view(),
-        "debug": std::env::var("V5_ENGINE_LOG").is_ok(),
-        "referrer": "",
-        "wasmBudget": limits.buffer_max,
-    })
+    let debug = std::env::var("V5_ENGINE_LOG").is_ok();
+    let page = match mode {
+        Mode::Mint => serde_json::json!({
+            "url": url,
+            "html": html,
+            "cookie": cookie_header.unwrap_or(""),
+            "identity": identity.script_view(),
+            "debug": debug,
+            "referrer": "",
+            "wasmBudget": limits.buffer_max,
+        }),
+        Mode::Content => serde_json::json!({
+            "url": url,
+            "html": html,
+            "cookie": cookie_header.unwrap_or(""),
+            "identity": identity.script_view(),
+            "debug": debug,
+            "referrer": "",
+            "wasmBudget": limits.buffer_max,
+            "mode": "content",
+            "textTarget": text_target,
+            "deadlineMs": limits.wall.as_millis() as u64,
+            "documentCap": CONTENT_DOCUMENT_CAP,
+        }),
+    }
     .to_string();
+    let result_cap = match mode {
+        Mode::Mint => 4 * 1024 * 1024,
+        Mode::Content => CONTENT_RESULT_CAP,
+    };
 
     // V8 posts delayed tasks to the tokio runtime current at isolate creation.
     // Enter one for creation only: the HTTP client owns a separate runtime, and
@@ -551,6 +827,7 @@ pub fn mint_within_via(
     runtime.op_state().borrow_mut().put(Shared {
         page,
         result: None,
+        result_cap,
         wire,
         identity,
         started,
@@ -600,7 +877,11 @@ pub fn mint_within_via(
             }
         })
     };
-    let outcome = runtime.execute_script("v5:mint", "globalThis.__v5Mint();");
+    let (script_name, entry) = match mode {
+        Mode::Mint => ("v5:mint", "globalThis.__v5Mint();"),
+        Mode::Content => ("v5:content", "globalThis.__v5Content();"),
+    };
+    let outcome = runtime.execute_script(script_name, entry);
     let _ = finished.send(());
     let _ = watchdog.join();
     drop(tokio_runtime);
@@ -652,22 +933,21 @@ pub fn mint_within_via(
     let raw = raw.ok_or(MintError::NoResult)?;
     let value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|error| MintError::Script(format!("engine result: {error}")))?;
-    let mut mint = Mint {
-        ms: value["ms"].as_f64().unwrap_or(0.0),
-        redirect: value["redirect"].as_str().map(str::to_string),
-        cost,
-        ..Default::default()
-    };
+    Ok((value, cost))
+}
+
+fn stored_cookies(value: &serde_json::Value) -> Vec<StoredCookie> {
+    let mut cookies = Vec::new();
     for cookie in value["cookies"].as_array().cloned().unwrap_or_default() {
         let Some(name) = cookie["name"].as_str() else {
             continue;
         };
-        let Some(value) = cookie["value"].as_str() else {
+        let Some(cookie_value) = cookie["value"].as_str() else {
             continue;
         };
-        mint.cookies.push(StoredCookie {
+        cookies.push(StoredCookie {
             name: name.to_string(),
-            value: value.to_string(),
+            value: cookie_value.to_string(),
             domain: cookie["domain"].as_str().map(str::to_string),
             path: cookie["path"].as_str().map(str::to_string),
             expires_unix: cookie["expires"].as_i64(),
@@ -675,7 +955,11 @@ pub fn mint_within_via(
             http_only: cookie["httpOnly"].as_bool().unwrap_or(false),
         });
     }
-    mint.surfaces = value["surfaces"]
+    cookies
+}
+
+fn string_list(value: &serde_json::Value) -> Vec<String> {
+    value
         .as_array()
         .map(|items| {
             items
@@ -683,16 +967,19 @@ pub fn mint_within_via(
                 .filter_map(|item| item.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
-    mint.logs = value["logs"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn mint_from(value: serde_json::Value, cost: Cost) -> Result<Mint, MintError> {
+    let mut mint = Mint {
+        ms: value["ms"].as_f64().unwrap_or(0.0),
+        redirect: value["redirect"].as_str().map(str::to_string),
+        cost,
+        ..Default::default()
+    };
+    mint.cookies = stored_cookies(&value);
+    mint.surfaces = string_list(&value["surfaces"]);
+    mint.logs = string_list(&value["logs"]);
     if std::env::var("V5_ENGINE_LOG").is_ok() {
         for line in &mint.logs {
             eprintln!("[engine] {}", line.replace('\n', "\\n").replace('\r', ""));
@@ -707,6 +994,52 @@ pub fn mint_within_via(
         );
     }
     Ok(mint)
+}
+
+fn content_from(value: serde_json::Value, cost: Cost) -> Result<Content, MintError> {
+    // The host reports a catchable failure as `error`: the run happened, the
+    // program could not finish. That is a named failure, not a truncated result.
+    if let Some(error) = value["error"].as_str() {
+        return Err(MintError::Script(error.to_string()));
+    }
+    let mut content = Content {
+        document: value["document"].as_str().unwrap_or_default().to_string(),
+        stop: value["stop"].as_str().unwrap_or("quiescent").to_string(),
+        text_chars: value["textChars"].as_u64().unwrap_or(0) as usize,
+        visited: value["visited"].as_str().unwrap_or_default().to_string(),
+        navigate: value["navigate"].as_str().map(str::to_string),
+        ms: value["ms"].as_f64().unwrap_or(0.0),
+        cost,
+        ..Default::default()
+    };
+    content.cookies = stored_cookies(&value);
+    content.surfaces = string_list(&value["surfaces"]);
+    content.logs = string_list(&value["logs"]);
+    for entry in value["transcript"].as_array().cloned().unwrap_or_default() {
+        content.transcript.push(TranscriptEntry {
+            method: entry["method"].as_str().unwrap_or_default().to_string(),
+            url: entry["url"].as_str().unwrap_or_default().to_string(),
+            status: entry["status"].as_u64().unwrap_or(0) as u16,
+            bytes: entry["bytes"].as_u64().unwrap_or(0) as usize,
+            kind: entry["kind"].as_str().unwrap_or_default().to_string(),
+            body: entry["body"].as_str().map(str::to_string),
+        });
+    }
+    if std::env::var("V5_ENGINE_LOG").is_ok() {
+        for line in &content.logs {
+            eprintln!("[engine] {}", line.replace('\n', "\\n").replace('\r', ""));
+        }
+        eprintln!(
+            "[engine] content: stop={} {} text chars, {} requests, cost: heap {} KB used, {} ops, {} KB read",
+            content.stop,
+            content.text_chars,
+            content.transcript.len(),
+            content.cost.heap_used / 1024,
+            content.cost.ops,
+            content.cost.bytes_read / 1024
+        );
+    }
+    Ok(content)
 }
 
 /// True when a page is an AWS WAF challenge this engine can run: the goku-shaped
@@ -746,5 +1079,22 @@ mod host_source_tests {
             .find(|(_, line)| !line.is_ascii())
             .map(|(index, line)| format!("line {}: {line}", index + 1));
         assert_eq!(stray, None);
+    }
+
+    /// The host's tree format: an element is `[tag, attributes, ...children]`, a
+    /// text node a JSON string; the doctype and comments are dropped.
+    #[test]
+    fn the_parse_tree_is_the_host_format() {
+        let tree = super::parse_tree(
+            "<div id=a>hi<!-- a comment between nodes --><span class='x'>yo</span></div>",
+            "document",
+        );
+        assert!(tree.starts_with("[\"html\",{"), "{tree}");
+        assert!(
+            tree.contains("[\"div\",{\"id\":\"a\"},\"hi\",[\"span\",{\"class\":\"x\"},\"yo\"]]"),
+            "{tree}"
+        );
+        let fragment = super::parse_tree("<p>a</p>text", "fragment");
+        assert_eq!(fragment, "[[\"p\",{},\"a\"],\"text\"]");
     }
 }

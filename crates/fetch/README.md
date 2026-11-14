@@ -2,7 +2,8 @@
 
 One Rust binary that fetches the web: carried client identity, carried state, a page cache, the
 site's own interface in front of its walled document, and an in-process V8 engine that runs a
-challenge page's own scripts when a wall demands it. No browser, no layout, no rasteriser.
+challenge page's own scripts when a wall demands it, or an application page's own program when
+its document is a shell (the content lane). No browser, no layout, no rasteriser.
 
 The crate lives in `crates/fetch/`, a workspace member: build and test it from the repo root
 with `-p donsetch-fetch` (`cargo test -p donsetch-fetch`), so it shares the lockfile and target
@@ -42,6 +43,10 @@ V5_STATE=/tmp/donsetch-fetch/state.json ./target/release/donsetch-fetch bench \
 # a repeat fetch is answered by the page cache: fresh, revalidated (304) or changed
 ./target/release/donsetch-fetch fetch https://pypi.org/ [--revalidate] [--no-cache]
 
+# the content lane (M1: measurement only): run the final document's own program and report
+# the stop reason, the text it assembled and every request it made
+./target/release/donsetch-fetch fetch https://example.com/ --render
+
 # a recognised challenge (AWS WAF's goku shape) mints in-process on its own;
 # V5_ENGINE_LOG=1 prints the host surfaces and cookies the mint needed
 V5_ENGINE_LOG=1 ./target/release/donsetch-fetch fetch https://www.imdb.com/ --identity chrome-local
@@ -70,7 +75,7 @@ V5_ENGINE_LOG=1 ./target/release/donsetch-fetch fetch https://www.imdb.com/ --id
 | `src/challenge.rs` | Native challenge contracts: Akamai's `bm-verify` hand-off, SiteGround's and NCBI's proof of work; hands page programs to the engine |
 | `src/datapath.rs` | Interface contracts: which host, which request, which items count |
 | `src/engine.rs` | The challenge engine: V8 in-process, one HTTP op on the fetcher's identity, the mint, the watchdog |
-| `src/engine_host.js` | The bounded host layer: small DOM (including a page's own forms and a JS challenge's form navigation), script loader, browser surfaces, WebAssembly budget, no rendering |
+| `src/engine_host.js` | The challenge host layer (small DOM, forms, script loader, browser surfaces, WebAssembly budget) plus the content lane's data-plane DOM: real tree, host-side selector engine, firing observers, `matchMedia`, events, timers and frames. No rendering |
 | `src/webcrypto.rs` | WebCrypto on BoringSSL: digests, HMAC, AES, PBKDF2, HKDF; anything else is refused |
 | `src/envelope.rs` | The engine's limits: wall clock, heap, typed-array and WebAssembly memory, op count, URL/redirect/size guard, one engine at a time, resident-memory backstop on Linux, Windows and macOS |
 | `src/testkit.rs` | A local HTTP server for offline tests, including hostile replies (endless, trickled, silent, redirecting) |
@@ -248,6 +253,20 @@ taken from the identity's own headers, and — for Reddit's gate — `document.f
 fields, live `elements.namedItem`, and `submit()`/`requestSubmit()` producing the GET navigation
 a browser would make. A method the host does not run is logged, never guessed at.
 
+### The content lane (M1 — measured behind `--render`)
+
+`engine_host.js` carries a second host beside the challenge host: a data-plane DOM (real tree,
+html5ever-parsed `innerHTML`, host-side selector matching, firing observers, `matchMedia`,
+events, timers and frames) that runs an application page's own program and returns the
+document it assembles. The contract is consulted **before any program runs**; then the run
+ends on content (visible text at the target), quiescence (honestly reported, still a shell)
+or the lane's envelope (`V5_CONTENT_WALL_MS`, default 2500 ms; 64 ops; 48 MB). Every request
+still leaves through the same op and the same identity wire — the app sees the identity that
+fetched the document — and the wire tap (`transcript`) records what the program asked for,
+which is the request-contract mining input. M1 ships measurement only: `fetch --render` runs
+the lane on an encounter's final document; the encounter trigger is M2, module scripts are
+M2, and nothing in the default fetch path changes.
+
 ### The envelope
 
 Each mint runs inside limits enforced outside the page (`envelope.rs`); a breach ends the mint
@@ -377,6 +396,7 @@ not a browser), V8, `btls` (WebCrypto on the BoringSSL the TLS stack links), `ge
 | `V5_ENGINE_LOG` | `1` prints the challenge engine's host surfaces, cookies and errors |
 | `V5_ENGINE_DUMP_DIR` | a directory: every request the challenge page makes, headers and body, written out so a program's failure is read instead of guessed at (inspection only) |
 | `V5_ENGINE_WALL_MS` | the engine's wall-clock cap per mint (default 10000); the other limits are `envelope::Limits` defaults |
+| `V5_CONTENT_WALL_MS` | the content lane's wall-clock cap per run (default 2500); its other limits are `envelope::Limits::content()` |
 
 Tests are offline: `cargo test --release --offline`. A few tests are `#[ignore]`d by default —
 the AWS WAF fixture tests need the private captures (`--include-ignored`) and one is a

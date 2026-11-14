@@ -13,7 +13,7 @@
 
 use donsetch_fetch::contract::{self, Contract};
 use donsetch_fetch::fetch::{self, class_name, Options, Worker};
-use donsetch_fetch::{classify, envelope, identity, state};
+use donsetch_fetch::{classify, engine, envelope, identity, state};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
@@ -354,8 +354,9 @@ fn command_fetch(arguments: &[String], flags: &Flags) -> i32 {
         .and_then(|raw| serde_json::from_str::<Contract>(raw).ok())
         .or_else(|| flags.value("contract-file").and_then(read_contract))
         .unwrap_or_else(Contract::generic);
+    let render = flags.switches.contains("render");
     let options = Options {
-        capture_body: flags.value("body").is_some(),
+        capture_body: flags.value("body").is_some() || render,
         proxy: flags.value("proxy").map(str::to_string),
         cache: !flags.switches.contains("no-cache"),
         revalidate: flags.switches.contains("revalidate"),
@@ -394,10 +395,97 @@ fn command_fetch(arguments: &[String], flags: &Flags) -> i32 {
             let _ = std::fs::write(path, body);
         }
     }
+    // `--render` is the M1 measurement path: the content lane runs on the
+    // document this encounter ended with. The encounter itself does not take the
+    // lane yet (M2), so a --render run measures and never changes the outcome.
+    if render {
+        let ok = render_content(
+            &outcome,
+            url,
+            options.proxy.as_deref(),
+            flags.switches.contains("json"),
+        );
+        return if ok { 0 } else { 1 };
+    }
     if outcome.class == classify::Class::Content {
         0
     } else {
         1
+    }
+}
+
+/// Run the content lane on the encounter's final document and report what the
+/// page's own program assembled: the stop reason, the text, the document size
+/// and every request the program made (the M3 mining input).
+fn render_content(outcome: &fetch::Outcome, url: &str, proxy: Option<&str>, json: bool) -> bool {
+    let page_url = if outcome.final_url.is_empty() {
+        url.to_string()
+    } else {
+        outcome.final_url.clone()
+    };
+    let identity_name = outcome
+        .identity
+        .clone()
+        .unwrap_or_else(|| "chrome-local".to_string());
+    let Some(identity) = identity::lookup(&identity_name) else {
+        eprintln!("render: no such identity: {identity_name}");
+        return false;
+    };
+    let Some(body) = outcome.body.clone() else {
+        eprintln!(
+            "render: the encounter kept no body (status {})",
+            outcome.status
+        );
+        return false;
+    };
+    let cookie = state::State::load().cookie_header_for(&page_url, &identity_name);
+    let limits = envelope::Limits::content_from_env();
+    match engine::content_within_via(
+        &limits,
+        &page_url,
+        &body,
+        identity,
+        cookie.as_deref(),
+        proxy,
+        200,
+    ) {
+        Ok(content) => {
+            if json {
+                println!(
+                    "render {}",
+                    serde_json::to_string(&content).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "render stop={} {} text chars, {} B document, {} requests, {:.0} ms ({} ops, heap {} KB)",
+                    content.stop,
+                    content.text_chars,
+                    content.document.len(),
+                    content.transcript.len(),
+                    content.ms,
+                    content.cost.ops,
+                    content.cost.heap_used / 1024
+                );
+                if let Some(navigate) = &content.navigate {
+                    println!("  navigated: {navigate}");
+                }
+                for entry in content.transcript.iter().take(12) {
+                    println!(
+                        "  {:<9} {:>3} {:<4} {:>8} B {}",
+                        entry.kind,
+                        entry.status,
+                        entry.method,
+                        entry.bytes,
+                        entry.url.chars().take(110).collect::<String>()
+                    );
+                }
+            }
+            content.stop == "content"
+        }
+        Err(error) => {
+            println!("render failed: {error}");
+            false
+        }
     }
 }
 
