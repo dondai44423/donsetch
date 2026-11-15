@@ -41,6 +41,8 @@ mod revalidation_tests;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]
+mod surface_tests;
+#[cfg(test)]
 mod testkit;
 
 pub use classify::{Class, Wall};

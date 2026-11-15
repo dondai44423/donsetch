@@ -5,7 +5,26 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [5.4.0] - 2026-11-15
+
+### Added
+
+- **Fetch: a JavaScript application's own program now runs for content.** A thin shell or a
+  JS-required page boots its own scripts in the in-process engine and returns the document it
+  assembles, which enters the pipeline exactly where a fetched document does. There is no browser,
+  no layout and no raster: the page's program runs against a data-plane DOM, as the identity that
+  fetched the document, through the same wire, cookies and pacing, and its own network requests are
+  recorded as they leave. A document that already answers never runs anything (10-13 ms, zero
+  requests), so ordinary pages cost what they cost today.
+- **Fetch: the request the app makes for its content is remembered.** A first run mines that
+  request (method, URL template, headers, body) per host, identity and URL shape; the next
+  encounter replays it as plain HTTP before any JavaScript, checks the answer's structure, and
+  mines a fresh one if it breaks. Measured on the same page: 2.3 s to 3,072 characters on the
+  first fetch, then 1.23 s for 30 items with no JS, against curl's 1.53 s on the document alone.
+- **Fetch: the JS-visible surface is measured, not guessed.** Window geometry, `screen`, media
+  queries (range syntax included) and the observer family answer from the identity's captured
+  client, and a test holds every one of them to a real browser's capture of the same probe page.
+  An element's box is its declared size; positions are 0, because there is no layout.
 
 ### Security
 
@@ -38,10 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries one. Latin-script queries default to English as a language, not a country; non-Latin
   queries send no language unless `lang` is set. The script-level native/foreign filter, the
   Wikipedia-edition guess and the per-provider `setlang`/`cc`/`kl`/`vl` inference are removed.
-- **Fetch: the content lane mines and replays the app's own request (M3).** The wire tap records
-  the request; a first content run mines a request contract per host/identity/URL shape, and the
-  next encounter replays it as plain HTTP before any JS, with a structural check and a re-mine on
-  break.
+- **The repo has no release gates.** The 220×3 cold pool, the 50-query blind review and the peer
+  matrix are gone, with the tools that ran them (`bench/release_gate*.py`, `bench/blind_review.py`,
+  `bench/headtohead.py`, `bench/rubric.md`). They cost hours of wall clock and hammered the egress
+  IP for a number; search is now judged by one cold run over the held rows plus live queries, and
+  the rule against time-consuming gates is in `project.md`. `just gates` is gone too: the payload
+  checks (`scripts/gates.sh`) run only inside the release pipeline, on every artifact.
+- **Fetch: the content lane's budget follows the measurement.** 96 ops and a 5 s ceiling, from
+  the heaviest measured shell (455 KB, 70 requests) quiescing at 4.0-4.3 s. Under the previous 64
+  ops its own last requests were refused, so the run ended on the wall instead of its own
+  quiescence. A budget is measurable without a rebuild: `V5_CONTENT_OPS`.
 
 ## [5.3.0] - 2026-11-12
 

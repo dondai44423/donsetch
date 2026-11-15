@@ -1,0 +1,312 @@
+{
+ "schema": "surface-reference/2",
+ "source": "headed Chromium 157.0.8103.38 on this box (Wayland/niri): window inner 1911x988, outer 1927x1079, screen 1920x1080, dpr 1, scrollbar 15. Captured 2026-11-15 by serving src/surface_probe.html and reading document.getElementById('answers') from the real browser.",
+ "browser": {
+  "name": "chromium",
+  "version": "157.0.8103.38",
+  "headless": false,
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+  "regenerate": "python3 -m http.server --bind 127.0.0.1 18790 in crates/fetch/src; bladebro nav http://127.0.0.1:18790/surface_probe.html; bladebro act eval \"JSON.stringify(document.getElementById('answers').textContent)\"; store that JSON under `measured`. A headless capture is not the reference: it reports hover:none, pointer:none and prefers-color-scheme:light, which no desktop client reports."
+ },
+ "persona": "chrome-local",
+ "measured": {
+  "geometry": {
+   "characterSet": "UTF-8",
+   "compatMode": "CSS1Compat",
+   "contentType": "text/html",
+   "devicePixelRatio": 1,
+   "innerHeight": 988,
+   "innerWidth": 1911,
+   "outerHeight": 1079,
+   "outerWidth": 1927,
+   "readyState": "loading",
+   "screen": {
+    "availHeight": 1080,
+    "availWidth": 1920,
+    "colorDepth": 24,
+    "height": 1080,
+    "orientation": "landscape-primary",
+    "pixelDepth": 24,
+    "width": 1920
+   },
+   "screenX": 0,
+   "screenY": 5,
+   "scrollX": 0,
+   "scrollY": 0,
+   "scrollbarHeight": 0,
+   "scrollbarWidth": 15,
+   "visibilityState": "visible"
+  },
+  "afterTimers": {
+   "innerWidth": 1911,
+   "innerHeight": 988,
+   "readyState": "complete",
+   "devicePixelRatio": 1
+  },
+  "media": {
+   "(-webkit-min-device-pixel-ratio: 1)": true,
+   "(400px <= width <= 2000px)": true,
+   "(any-hover: hover)": true,
+   "(any-hover: none)": false,
+   "(any-pointer: coarse)": false,
+   "(any-pointer: fine)": true,
+   "(aspect-ratio: 1911/988)": true,
+   "(color)": true,
+   "(color-gamut: p3)": false,
+   "(color-gamut: rec2020)": false,
+   "(color-gamut: srgb)": true,
+   "(device-height: 1080px)": true,
+   "(device-width: 1920px)": true,
+   "(display-mode: browser)": true,
+   "(display-mode: standalone)": false,
+   "(dynamic-range: high)": false,
+   "(dynamic-range: standard)": true,
+   "(forced-colors: active)": false,
+   "(forced-colors: none)": true,
+   "(grid)": false,
+   "(grid: 0)": true,
+   "(hover: hover)": true,
+   "(hover: hover) and (pointer: fine)": true,
+   "(hover: none)": false,
+   "(inverted-colors: none)": false,
+   "(max-aspect-ratio: 1/1)": false,
+   "(max-height: 987px)": false,
+   "(max-height: 988px)": true,
+   "(max-resolution: 1dppx)": true,
+   "(max-width: 100px)": false,
+   "(max-width: 1910px)": false,
+   "(max-width: 1911px)": true,
+   "(min-aspect-ratio: 1/1)": true,
+   "(min-color: 8)": true,
+   "(min-device-width: 1920px)": true,
+   "(min-height: 900px)": true,
+   "(min-height: 988px)": true,
+   "(min-resolution: 1dppx)": true,
+   "(min-resolution: 2dppx)": false,
+   "(min-width: 100px)": true,
+   "(min-width: 1911px)": true,
+   "(min-width: 1920px)": false,
+   "(min-width: 600.5px)": true,
+   "(min-width: 600px) and (max-width: 900px), (min-width: 1000px)": true,
+   "(monochrome)": false,
+   "(monochrome: 0)": true,
+   "(orientation: landscape)": true,
+   "(orientation: portrait)": false,
+   "(overflow-block: none)": false,
+   "(overflow-block: paged)": false,
+   "(overflow-block: scroll)": true,
+   "(overflow-inline: none)": false,
+   "(overflow-inline: scroll)": true,
+   "(pointer: coarse)": false,
+   "(pointer: fine)": true,
+   "(prefers-color-scheme: dark)": true,
+   "(prefers-color-scheme: light)": false,
+   "(prefers-color-scheme: no-preference)": false,
+   "(prefers-contrast: more)": false,
+   "(prefers-contrast: no-preference)": true,
+   "(prefers-reduced-data: no-preference)": false,
+   "(prefers-reduced-data: reduce)": false,
+   "(prefers-reduced-motion: no-preference)": true,
+   "(prefers-reduced-motion: reduce)": false,
+   "(prefers-reduced-transparency: no-preference)": true,
+   "(prefers-reduced-transparency: reduce)": false,
+   "(resolution: 1dppx)": true,
+   "(resolution: 96dpi)": true,
+   "(scan: progressive)": false,
+   "(scripting: enabled)": true,
+   "(scripting: none)": false,
+   "(update: fast)": true,
+   "(update: none)": false,
+   "(update: slow)": false,
+   "(video-dynamic-range: standard)": false,
+   "(width > 1911px)": false,
+   "(width >= 1000px)": true,
+   "(width: 1911px)": true,
+   "(width: 1920px)": false,
+   "SCREEN AND (MIN-WIDTH: 100PX)": true,
+   "all": true,
+   "not all and (min-width: 100px)": false,
+   "not screen and (min-width: 100px)": false,
+   "only screen and (min-width: 100px)": true,
+   "print": false,
+   "print and (min-width: 100px)": false,
+   "screen": true,
+   "screen and (min-width: 100px) and (max-width: 5000px)": true
+  },
+  "observers": {
+   "mutation": {
+    "added": 2,
+    "attributeNames": [
+     "data-flag"
+    ],
+    "characterData": false,
+    "records": 3,
+    "syncDelivered": true,
+    "targets": 3,
+    "types": [
+     "childList",
+     "attributes",
+     "childList"
+    ]
+   },
+   "mutationSyncDelivered": false,
+   "intersectionOrder": [
+    "inview",
+    "paddedio",
+    "far"
+   ],
+   "intersection": {
+    "far": {
+     "coveredHeight": 0,
+     "coveredWidth": 0,
+     "hasRootBounds": true,
+     "height": 50,
+     "intersectionRatio": 0,
+     "isIntersecting": false,
+     "rootHeight": 988,
+     "rootWidth": 1896,
+     "time": "number",
+     "width": 50
+    },
+    "inview": {
+     "coveredHeight": 50,
+     "coveredWidth": 50,
+     "hasRootBounds": true,
+     "height": 50,
+     "intersectionRatio": 1,
+     "isIntersecting": true,
+     "rootHeight": 988,
+     "rootWidth": 1896,
+     "time": "number",
+     "width": 50
+    },
+    "paddedio": {
+     "coveredHeight": 28,
+     "coveredWidth": 108,
+     "hasRootBounds": true,
+     "height": 28,
+     "intersectionRatio": 1,
+     "isIntersecting": true,
+     "rootHeight": 988,
+     "rootWidth": 1896,
+     "time": "number",
+     "width": 108
+    }
+   },
+   "resize": {
+    "count": 2,
+    "targets": {
+     "paddedio": {
+      "borderHeight": 28,
+      "borderWidth": 108,
+      "contentHeight": 20,
+      "contentWidth": 100,
+      "hasBorderBox": true,
+      "height": 20,
+      "width": 100
+     },
+     "sized": {
+      "borderHeight": 59,
+      "borderWidth": 137,
+      "contentHeight": 45,
+      "contentWidth": 123,
+      "hasBorderBox": true,
+      "height": 45,
+      "width": 123
+     }
+    }
+   }
+  },
+  "presence": {
+   "DOMRect": "function",
+   "DOMRectReadOnly": "function",
+   "IntersectionObserver": "function",
+   "IntersectionObserverEntry": "function",
+   "MutationObserver": "function",
+   "MutationRecord": "function",
+   "ResizeObserver": "function",
+   "ResizeObserverEntry": "function",
+   "devicePixelRatio": "number",
+   "elementFromPoint": "function",
+   "getBoundingClientRect": "undefined",
+   "getClientRects": "undefined",
+   "getComputedStyle": "function",
+   "innerHeight": "number",
+   "innerWidth": "number",
+   "matchMedia": "function",
+   "outerHeight": "number",
+   "outerWidth": "number",
+   "requestAnimationFrame": "function",
+   "requestIdleCallback": "function",
+   "screenX": "number",
+   "screenY": "number",
+   "scrollX": "number",
+   "scrollY": "number",
+   "visualViewport": "object"
+  },
+  "boxes": {
+   "sized": {
+    "content": {
+     "width": 123,
+     "height": 45
+    },
+    "client": {
+     "width": 133,
+     "height": 55
+    },
+    "border": {
+     "width": 137,
+     "height": 59
+    },
+    "scroll": {
+     "width": 133,
+     "height": 55
+    }
+   },
+   "paddedio": {
+    "content": {
+     "width": 100,
+     "height": 20
+    },
+    "client": {
+     "width": 106,
+     "height": 26
+    },
+    "border": {
+     "width": 108,
+     "height": 28
+    },
+    "scroll": {
+     "width": 106,
+     "height": 26
+    }
+   },
+   "inview": {
+    "content": {
+     "width": 50,
+     "height": 50
+    },
+    "client": {
+     "width": 50,
+     "height": 50
+    },
+    "border": {
+     "width": 50,
+     "height": 50
+    },
+    "scroll": {
+     "width": 50,
+     "height": 50
+    }
+   }
+  }
+ },
+ "declared": {
+  "rects": "positions are zeros: there is no layout. An element's box size is what its inline style or a replaced element's width/height attribute declares, in px; a size that comes from a stylesheet, a percentage, an em or the content itself reports 0.",
+  "intersection": "every observed element is reported visible at ratio 1: the lane's viewport contract, so a lazy loader loads. A real browser reports an off-screen target as not intersecting (the reference's `far` entry, ratio 0).",
+  "rootBounds": "the intersection root is the client box: innerWidth less the scrollbar, innerHeight.",
+  "style": "getComputedStyle returns declared values and tag defaults, never a cascade: font metrics, colours and box metrics that come from CSS are not computed.",
+  "elementFromPoint": "document.elementFromPoint answers null: a point's topmost element is a layout question."
+ },
+ "declaredAbsent": []
+}

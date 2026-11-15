@@ -1304,6 +1304,7 @@ mod error_code_tests {
     // retried. The guard's own error variant now sets the code, and the
     // classifier reads that code instead of matching prose.
     #[tokio::test]
+    #[ignore = "network: needs a resolver that answers NXDOMAIN"]
     pub(super) async fn a_host_that_does_not_resolve_is_not_a_policy_block() {
         let err =
             crate::fetch::guards::ensure_url_safe("https://no-such-host-for-donsetch.invalid/")
@@ -1326,6 +1327,29 @@ mod error_code_tests {
         );
     }
 
+    // The same classification, offline: a name failure is permanent, a network
+    // failure, and never a policy block (#248). The live twin above proves the guard
+    // raises it; this pins what the agent is told, on a box whose resolver answers
+    // NXDOMAIN and on one whose resolver drops the query.
+    #[test]
+    pub(super) fn a_dns_name_failure_is_permanent_and_not_a_policy_block() {
+        let err = crate::error::FetchError::Dns("no such host: no-such-host.invalid".into());
+        let v = tool_error_structured(
+            friendly_fetch_error(&err),
+            fetch_error_kind(&err),
+            Some(json!({
+                "code": fetch_error_code(&err),
+                "fetch_error": transport_class(&err),
+            })),
+        );
+        assert_eq!(v["code"], "network.dns", "got {v}");
+        assert_eq!(v["errorKind"], "permanent", "got {v}");
+        assert_eq!(v["structuredContent"]["fetch_error"], json!("dns"));
+        assert!(
+            !v["content"][0]["text"].as_str().unwrap().contains("SSRF"),
+            "the message must not read as a policy block: {v}"
+        );
+    }
     #[test]
     pub(super) fn a_resolver_timeout_is_transient() {
         let err = FetchError::DnsTimeout("the resolver did not answer within 5s".into());

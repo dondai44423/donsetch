@@ -28,6 +28,12 @@ pub struct Persona {
     pub webgl: Option<serde_json::Value>,
     pub hardware_concurrency: Option<u64>,
     pub screen: Option<serde_json::Value>,
+    /// The window the capture presented: inner and outer size, screen offset,
+    /// device pixel ratio and the scrollbar it reserves.
+    pub geometry: Option<serde_json::Value>,
+    /// The media-query answers the same capture gave: colour scheme, hover,
+    /// pointer, contrast, update, overflow and the rest.
+    pub media: Option<serde_json::Value>,
 }
 
 /// The chrome-local persona: the fields this crate reads, distilled from the
@@ -97,6 +103,8 @@ fn parse_persona(raw: &str) -> Option<Persona> {
         webgl: value.get("webgl").cloned(),
         hardware_concurrency: navigator["hardwareConcurrency"].as_u64(),
         screen: value.get("screen").cloned(),
+        geometry: value.get("geometry").cloned(),
+        media: value.get("media").cloned(),
     })
 }
 
@@ -271,8 +279,76 @@ impl Identity {
             "pdfViewer": platform != Os::Android,
             "webgl": webgl,
             "screen": screen,
+            "geometry": geometry_view(platform, local),
+            "media": media_view(platform, local),
         })
     }
+}
+
+/// The window an identity presents to a page's own program: the persona's own
+/// capture when it has one, else the reference window's measured frame over this
+/// identity's platform screen.
+///
+/// The frame is the one measured on this box — 1911x988 inner inside 1927x1079 on
+/// a 1920x1080 screen, with a 15 px scrollbar — applied to whatever screen the
+/// identity claims, so an identity without a capture is still self-consistent:
+/// 9 px of window frame beside the viewport and 92 px of browser chrome above it.
+fn geometry_view(platform: Os, local: Option<&Persona>) -> serde_json::Value {
+    if let Some(captured) = local.and_then(|persona| persona.geometry.as_ref()) {
+        return captured.clone();
+    }
+    let (width, height) = platform.screen();
+    let inner_width = width.saturating_sub(9).max(320);
+    let inner_height = height.saturating_sub(platform.taskbar() + 92).max(240);
+    serde_json::json!({
+        "innerWidth": inner_width,
+        "innerHeight": inner_height,
+        "outerWidth": inner_width + 16,
+        "outerHeight": inner_height + 91,
+        "devicePixelRatio": 1,
+        "screenX": 0,
+        "screenY": 5,
+        "scrollbarWidth": 15,
+        "scrollbarHeight": 0,
+    })
+}
+
+/// The media-query facts a page's own program reads, answered from the reference
+/// capture. The one thing the platform itself decides is touch: a phone that
+/// reported `hover: hover` would contradict the touch points it declares, so a
+/// mobile identity answers no hover and a coarse pointer.
+fn media_view(platform: Os, local: Option<&Persona>) -> serde_json::Value {
+    let touch = platform == Os::Android;
+    let mut media = serde_json::json!({
+        "prefersColorScheme": "dark",
+        "hover": if touch { "none" } else { "hover" },
+        "anyHover": if touch { "none" } else { "hover" },
+        "pointer": if touch { "coarse" } else { "fine" },
+        "anyPointer": if touch { "coarse" } else { "fine" },
+        "prefersContrast": "no-preference",
+        "prefersReducedMotion": "no-preference",
+        "prefersReducedTransparency": "no-preference",
+        "forcedColors": "none",
+        "update": "fast",
+        "overflowBlock": "scroll",
+        "overflowInline": "scroll",
+        "displayMode": "browser",
+        "colorGamut": "srgb",
+        "dynamicRange": "standard",
+        "colorBits": 24,
+        "monochromeBits": 0,
+        "resolutionDppx": 1,
+        "scripting": "enabled",
+        "grid": 0,
+    });
+    if let Some(captured) = local.and_then(|persona| persona.media.as_ref()) {
+        if let (Some(media), Some(captured)) = (media.as_object_mut(), captured.as_object()) {
+            for (key, value) in captured {
+                media.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    media
 }
 
 /// The operating system a user agent names, and the facts a script reads that
@@ -547,5 +623,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every identity presents a window a page's program can believe: a viewport
+    /// that fits the screen it claims, a real device pixel ratio, a scrollbar on a
+    /// desktop client, and no hover on a touch one. The reference capture answers
+    /// for `chrome-local`; every other identity derives the same measured frame
+    /// from its own platform screen.
+    #[test]
+    fn every_identity_presents_a_coherent_window_and_media_surface() {
+        let mut checked = 0;
+        for name in [
+            "chrome",
+            "chrome-local",
+            "chrome-win",
+            "chrome-android",
+            "firefox",
+            "safari",
+            "plain",
+        ] {
+            let Some(identity) = lookup(name) else {
+                continue;
+            };
+            checked += 1;
+            let view = identity.script_view();
+            let geometry = &view["geometry"];
+            let media = &view["media"];
+            let inner_width = geometry["innerWidth"].as_i64().unwrap_or(0);
+            let inner_height = geometry["innerHeight"].as_i64().unwrap_or(0);
+            let screen_width = view["screen"]["width"].as_i64().unwrap_or(0);
+            let screen_height = view["screen"]["height"].as_i64().unwrap_or(0);
+            assert!(
+                inner_width > 200 && inner_height > 200,
+                "{name}: {geometry}"
+            );
+            assert!(
+                inner_width <= screen_width && inner_height <= screen_height,
+                "{name}: the viewport does not fit its own screen: {geometry} in {screen_width}x{screen_height}"
+            );
+            assert_eq!(
+                geometry["devicePixelRatio"].as_f64(),
+                Some(1.0),
+                "{name}: {geometry}"
+            );
+            assert!(
+                geometry["scrollbarWidth"].as_u64().unwrap_or(0) > 0,
+                "{name}: a desktop scrollbar reserves width: {geometry}"
+            );
+            assert!(
+                media["prefersColorScheme"].is_string(),
+                "{name}: no colour scheme: {media}"
+            );
+            if view["maxTouchPoints"].as_u64().unwrap_or(0) > 0 {
+                assert_eq!(
+                    media["hover"], "none",
+                    "{name}: a touch client reports no hover"
+                );
+                assert_eq!(
+                    media["pointer"], "coarse",
+                    "{name}: a touch client reports a coarse pointer"
+                );
+            }
+        }
+        assert!(
+            checked >= 5,
+            "the portfolio was checked ({checked} identities)"
+        );
+    }
+
+    /// The local reference carries its own capture, not a derived frame: the
+    /// numbers the surface probe measured against this box's Chromium.
+    #[test]
+    fn the_local_reference_carries_its_measured_window_and_media() {
+        let identity = lookup("chrome-local").expect("chrome-local");
+        let view = identity.script_view();
+        let geometry = &view["geometry"];
+        assert_eq!(geometry["innerWidth"].as_u64(), Some(1911));
+        assert_eq!(geometry["innerHeight"].as_u64(), Some(988));
+        assert_eq!(geometry["outerWidth"].as_u64(), Some(1927));
+        assert_eq!(geometry["outerHeight"].as_u64(), Some(1079));
+        assert_eq!(geometry["screenY"].as_u64(), Some(5));
+        assert_eq!(geometry["scrollbarWidth"].as_u64(), Some(15));
+        assert_eq!(geometry["scrollbarHeight"].as_u64(), Some(0));
+        assert_eq!(view["screen"]["width"].as_u64(), Some(1920));
+        assert_eq!(view["screen"]["availHeight"].as_u64(), Some(1080));
+        let media = &view["media"];
+        assert_eq!(media["prefersColorScheme"], "dark");
+        assert_eq!(media["hover"], "hover");
+        assert_eq!(media["pointer"], "fine");
+        assert_eq!(media["anyPointer"], "fine");
+        assert_eq!(media["forcedColors"], "none");
+        assert_eq!(media["resolutionDppx"].as_u64(), Some(1));
     }
 }

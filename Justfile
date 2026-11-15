@@ -44,7 +44,6 @@
 #   just all          pre-push net: guard + fmt + check + lockgate + lint + budget-static
 #   just bin          target/fast/donsetch (fast live smokes)
 #   just bin-dist     target/dist-thin/donsetch (the shipped shape)
-#   just gates        bin-dist + the payload gates the release pipeline runs
 #   just smoke        bin + doctor + fetch + search
 #   just bench        the live search bench, each shape cold (bench-smoke: 3 min)
 #   just rank-train   retrain the search ranker from saved bench artifacts
@@ -112,13 +111,6 @@ all: guard fmt-check check lockgate lint budget-static
 # `just check`, so this costs seconds when the loop is warm.
 lockgate:
     {{budget}} cargo check --locked --profile fast --workspace --all-targets {{feat}}
-
-# The release pipeline's payload gates (size, ONNX payload, version, non-AVX
-# CPU) against a locally built shipped-shape binary. Only needed when
-# scripts/gates.sh or the release job itself changed: the pipeline runs the
-# same script on all five platforms.
-gates: bin-dist
-    @sh scripts/gates.sh linux-x64 target/dist-thin
 
 fmt:
     cargo fmt --all
@@ -284,10 +276,6 @@ bench *args: bin-dist
 
 bench-smoke *args: bin-dist
     target/dist-thin/donsetch search-bench --set all --smoke {{args}}
-
-# Same fixed 100-query comparison against a local JSON endpoint.
-bench-against provider endpoint: bin-dist
-    python3 bench/headtohead.py --include donsetch {{provider}} --endpoint {{endpoint}} --out bench/results/local-{{provider}}.json
 
 # Retrain the ranker from saved bench artifacts: their candidate pools are
 # replayed through this build, dumped with their features, and trained on the

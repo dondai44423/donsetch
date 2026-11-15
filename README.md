@@ -425,12 +425,11 @@ No API key, no account. Keyless engines and first-party interfaces run in parall
 - **Evidence, not teasers**: each result's snippet is the sentence, across all sources that returned it, that best covers your query, cut at a sentence boundary: up to 320 characters for the top three, 180 for the rest, sharing a 1,600-byte snippet budget across the answer. Readable Unicode paths avoid spending context on percent-encoded letters; destinations and reserved URL escapes are preserved. Actual token use also depends on URLs, titles and language. `read: N` (max 3) fetches the top N pages inside the same deadline and shows the passage of each page that answers the query, marked `page:`; automatic repair reads top-three stubs and a procedural result or excerpt promising instructions, with one independent publisher as a fallback when needed. One procedural read can overlap the remaining index requests when an unreserved request slot is available; its excerpt is used only if that URL survives the final ranking. All automatic reads use the remaining time inside a 2.2-second native-call envelope and the existing three-page/request allowance. Page passages preserve code line breaks, list steps and table column headers, and source dates stay attached to evidence. Read pages are warm for the follow-up fetch when prewarming is enabled.
 - **Query compiler**: `site:`, `filetype:` and `intitle:` are sent only to engines that honor them, and SERP instant answers are extracted with their source URLs.
 
-Measure keyless quality with `donsetch search-bench --set all --cold --out run.json`.
-The corpus separates tuning from held-out queries and reports answering-page rank, whether
-expected phrases appear in snippets, empty answers, forbidden matches, and latency by query
-shape. Actual answer accuracy requires the separate blinded evidence review.
-`python3 bench/headtohead.py --help` runs the same fixed queries against provider APIs;
-results from different corpora or judging methods are not directly comparable.
+Measure keyless quality with `donsetch search-bench --set all --smoke --out run.json` — one
+three-minute pass over the first 60 rows. The corpus separates tuning from held-out queries and
+reports answering-page rank, whether expected phrases appear in snippets, empty answers, forbidden
+matches, and latency by query shape. There is no multi-hour release ritual: a change is judged by
+one held-rows run plus real queries against the live web.
 
 Search reports `requested_results`, `returned_results`, and `underfilled`
 when engines cannot supply the requested count. `source_type` identifies video, community, paper, reference,
@@ -767,7 +766,7 @@ For that other shape of work, use **[Bladebro](https://github.com/dondai44423/bl
 | It cannot | Why |
 |---|---|
 | Solve interactive captchas locally | hCaptcha, reCAPTCHA, Turnstile: an honest dead end, no solving service by design. |
-| Render a page | Nothing is laid out or painted in the fetch path. A page whose content exists only after rendering, with no interface behind it, is reported as a shell. |
+| Render a page | Nothing is laid out or painted in the fetch path. A page that assembles its own content with JavaScript is fetched, not declared: its program runs in-process against a data-plane DOM and the document it builds is checked like any other. A page whose content exists only after layout is declared, never faked — `web_screenshot` is the pixel answer. |
 | Search with every engine down | An error with per-engine status. Honest, never fake. |
 | Replace a human working a defended site | See "Pick the right tool" above. |
 

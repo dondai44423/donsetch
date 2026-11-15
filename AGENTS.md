@@ -44,6 +44,11 @@ contract, egress**. Anything else is drift, however plausible. Before code:
   measured against the real browser it claims to be. Never a patched field, never a
   relabelled stack. State binds to the client that earned it: clearance is never banked
   across fingerprints, and pacing is part of identity.
+- **A JS-visible surface is measured, never guessed.** The content host answers geometry, screen,
+  media queries and observer entries from the identity's own capture, and `surface_tests` holds it
+  to a real browser's capture of the same probe page (`crates/fetch/src/surface_probe.html`). An element's box
+  is its declared style; positions are zeros because there is no layout. Adding a surface means
+  adding it to the probe and re-capturing the reference, not inventing a plausible answer.
 - **Never:** a browser or rendered page in the fetch path, layout or raster, a host
   surface no measured challenge needs, a second fetch architecture, a resumed
   doncore/Persona-Engine experiment, a tier-1/tier-2 browser lane, a login or session

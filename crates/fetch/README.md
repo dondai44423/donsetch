@@ -84,6 +84,7 @@ V5_ENGINE_LOG=1 ./target/release/donsetch-fetch fetch https://www.imdb.com/ --id
 | `src/fixture_tests.rs`, `fixtures/aws-waf/` | The three AWS WAF shapes (goku, legacy inline, interstitial) run from captured bundles against a local verifier |
 | `src/session_tests.rs` | The library seam: threads, `spawn_blocking`, proxy, body capture, vendor escalation, route memory, state location |
 | `src/replay_tests.rs` | The mined contract through the encounter: first run mines, the next replays; a 403 breaks it and the lane re-mines |
+| `src/surface_tests.rs`, `src/surface_probe.html`, `src/surface_reference.json` | The content host's JS-visible surface held to a real browser: the probe page read by this box's Chromium 157 (the reference) and by the lane, compared surface by surface |
 | `src/cache_tests.rs`, `src/redirect_tests.rs`, `src/revalidation_tests.rs` | The page cache against a local site that changes, lies, walls and redirects under it |
 | `src/main.rs` | CLI: `fetch`, `probe`, `bench`, `identities`, `scorecard`, `state`, `cache` |
 
@@ -264,8 +265,8 @@ export getters — named imports are snapshots, documented in the host) that run
 application page's own program and returns the document it assembles. The contract is
 consulted **before any program runs**; then the run ends on content (visible text at the
 target), quiescence (honestly reported, still a shell) or the lane's envelope
-(`V5_CONTENT_WALL_MS`, default 4000 ms, clamped to the encounter's remaining deadline; 64
-ops; 16 MB per response, 48 MB total). A `shell` or `incomplete` verdict takes the lane once
+(`V5_CONTENT_WALL_MS`, default 5000 ms, clamped to the encounter's remaining deadline; 96
+ops; 16 MB per response, 48 MB total; 600 pump rounds). A `shell` or `incomplete` verdict takes the lane once
 per encounter — a shell as the identity that received it, an incomplete after every identity
 has had its turn, including the one that is about to end the encounter on the site's
 identity-blind answer. A produced page that passes the contract is the answer
@@ -277,6 +278,36 @@ leaves through the same op and wire; the wire tap (`transcript`) records what th
 asked for, response bodies and the request itself (method, URL, headers, body), which is the
 request-contract mining input. `fetch --render` re-runs the lane on the encounter's final
 document, for measurement.
+
+### The surface a page's program reads
+
+There is no layout, so every JS-visible fact the lane answers is either carried by the identity
+or declared from the document, never computed from a rendered box. `src/surface_probe.html`
+is one page that reads the whole family — window geometry, `screen`, the media queries, the
+observer entries, the constructors a bot check reads — and `src/surface_reference.json` is
+that same page read by this box's real Chromium 157, headed (a headless capture answers
+`hover: none`, `pointer: none` and `prefers-color-scheme: light`, which no desktop client does).
+`surface_tests` feeds the lane the same page and fails on any surface that disagrees, so the
+answers are measured and stay measured.
+
+- **Geometry** comes from the persona: `personas/chrome-local.json` carries the capture (inner
+  1911x988 inside 1927x1079 on a 1920x1080 screen, dpr 1, a 15 px scrollbar). An identity without
+  its own capture gets that reference window's measured frame over its platform screen, and a
+  touch platform answers no hover and a coarse pointer.
+- **Media queries** are answered from the same capture. `min-`/`max-` prefixes, range syntax
+  (`(width >= 1000px)`, `(400px <= width <= 2000px)`), units and comma lists parse; a feature
+  Chrome does not support makes its query false, `not` included.
+- **Observers** carry the target's declared box and the client box as `rootBounds`, in one
+  batched callback, as Chrome delivers them. Every observed element reports visible at ratio 1:
+  the lane's viewport contract, so a lazy loader loads, where a real browser reports an
+  off-screen target as not intersecting.
+- **A box is declared, not laid out.** Content, client and border come from the inline style (and
+  a replaced element's `width`/`height` attribute) in px; a size from a stylesheet, a percentage
+  or the content itself reports 0, and every position is 0. `getComputedStyle` returns declared
+  values and tag defaults. `elementFromPoint` answers null: a point's topmost element is a layout
+  question.
+
+Measured 2026-11-15: `runs/m6-surface-fidelity.txt`.
 
 ### The mined request contract
 
@@ -306,11 +337,12 @@ Each mint and each lane run lives inside limits enforced outside the page
 | Limit | Default | Mechanism |
 |---|---|---|
 | Mint wall clock | 10 s (`V5_ENGINE_WALL_MS`) | watchdog thread, `terminate_execution`; includes blocked time |
-| Content-lane wall clock | 4 s (`V5_CONTENT_WALL_MS`) | the same watchdog; clamped to the encounter's remaining deadline |
+| Content-lane wall clock | 5 s (`V5_CONTENT_WALL_MS`) | the same watchdog; clamped to the encounter's remaining deadline |
 | JS heap | 256 MB | near-heap-limit callback terminates V8 |
 | Typed arrays / `ArrayBuffer` | 128 MB live | custom allocator refuses past the cap |
 | WebAssembly memory | 128 MB total | V8 per-memory page flag plus host charges; resident-memory ceiling as backstop (`VmRSS`, working set, `task_info`) |
-| Ops | 96 per mint, 64 per lane run | counted in Rust |
+| Ops | 96 per mint and per lane run (`V5_CONTENT_OPS` for the lane) | counted in Rust |
+| Lane pump rounds | 600 | the pump's own loop cap: a page that keeps scheduling work without ever changing the document ends there, reported as `budget` like the wall |
 | Network | http(s), public addresses, 5 redirects, 1 MB request, 8 MB per response (mint) / 16 MB (lane), 32 MB total (mint) / 48 MB (lane) | one guard for URL, resolver and redirect policy; the page's own host is exempt from the private-address rule |
 | Concurrency | one engine per process at a time | process-wide slot |
 
@@ -364,8 +396,8 @@ egress, human interaction, the page's own program) and the **nine outcome classe
 | `wall_identity` | another identity or egress | refused with no page of its own, or a short page titled as a refusal even when served 200 (Akamai's "Access Denied") | yes — identity/egress |
 | `wall_interaction` | human interaction | slider, press-and-hold, captcha, Turnstile widget | identity only — the vendor's known passers are tried; otherwise declared |
 | `wall_program` | the page's own program | managed JS challenge, WAF stub (`202`/`204`, `x-amzn-waf-action`), or a page whose inline program fills and submits a challenge form | yes — engine, then interface |
-| `shell` | page's program, unanswered | 2xx, program-driven application with no content in the document | yes — interface |
-| `incomplete` | — | 2xx, contract failed, no wall, no shell | no — declared |
+| `shell` | page's program, unanswered | 2xx, program-driven application with no content in the document | yes — the content lane, once, as the identity that received it |
+| `incomplete` | — | 2xx, contract failed, no wall, no shell | yes — the content lane, once at the encounter's end, after every identity has had its turn |
 | `network` / `http_error` | — | no response, or an HTTP error with no wall markers. A failure before any client is shown ends the encounter on its first attempt; one after the client spoke earns one identity of another wire class (a silent server's on a 4 s clock), never a third | diagnose |
 
 Content contracts are the frozen corpus's own predicates: title, minimum text, required phrases,
@@ -385,7 +417,7 @@ fitting.
 | Etsy, Yelp | DataDome | captcha | no identity passes |
 | Bloomberg, Zillow | PerimeterX | press and hold | desktop Chrome class passes intermittently; Zillow passes all but `chrome` |
 | Glassdoor, Product Hunt, Indeed, npm, Medium | Cloudflare | managed challenge | content by identity (`okhttp`; Indeed `chrome-win`) |
-| TikTok | — (shell) | signed `item_list` API | declared: every identity gets the same shell |
+| TikTok | — (shell) | signed `item_list` API behind the edge gate | declared: the lane boots both shells (the 3-script stub quiesces in ~0.5 s; the 455 KB, 70-request one at 4.0–4.3 s) and neither assembles content, so the answer is identity work and there is no first content run to mine |
 | AliExpress, Instagram | — | stub / login shell for `plain` | the Chrome class passes |
 | crates.io | — (Ember shell) | `/api/v1/summary` | data path, paced 1 req/s |
 | PubMed (NCBI) | NCBI | `/_pow/solve`, HTTP 203 | answered natively |
@@ -436,7 +468,8 @@ not a browser), V8, `btls` (WebCrypto on the BoringSSL the TLS stack links), `ge
 | `V5_ENGINE_LOG` | `1` prints the challenge engine's host surfaces, cookies and errors |
 | `V5_ENGINE_DUMP_DIR` | a directory: every request the challenge page makes, headers and body, written out so a program's failure is read instead of guessed at (inspection only) |
 | `V5_ENGINE_WALL_MS` | the engine's wall-clock cap per mint (default 10000); the other limits are `envelope::Limits` defaults |
-| `V5_CONTENT_WALL_MS` | the content lane's wall-clock cap per run (default 4000); its other limits are `envelope::Limits::content()` (64 ops, 16 MB per response, 48 MB total) |
+| `V5_CONTENT_WALL_MS` | the content lane's wall-clock cap per run (default 5000); its other limits are `envelope::Limits::content()` (96 ops, 16 MB per response, 48 MB total) |
+| `V5_CONTENT_OPS` | the content lane's op budget per run (default 96) |
 
 Tests are offline: `cargo test --release --offline`. A few tests are `#[ignore]`d by default —
 the AWS WAF fixture tests need the private captures (`--include-ignored`) and one is a

@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>surface probe</title>
+<style>
+  body { margin: 8px; font: 16px/1.4 sans-serif; }
+  .tall { height: 4000px; }
+  #pinned { color: rgb(10, 20, 30); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="sized" style="width: 123px; height: 45px; padding: 5px; border: 2px solid black"></div>
+<p id="para">A paragraph.</p>
+<span id="inline">inline</span>
+<strong id="bold">bold</strong>
+<ul id="list"><li id="li1">one</li><li id="li2">two</li></ul>
+<div id="inview" style="width: 50px; height: 50px"></div>
+<div id="paddedio" style="width: 100px; height: 20px; padding: 3px; border: 1px solid black"></div>
+<div class="tall"></div>
+<div id="far" style="width: 50px; height: 50px"></div>
+<button id="button" type="button">Go</button>
+<input id="text" type="text" value="v">
+<script type="application/json" id="answers">{}</script>
+<script>
+(function () {
+  "use strict";
+  var answers = {
+    schema: "surface-probe/1",
+    ua: navigator.userAgent,
+    phases: {},
+    geometry: {},
+    media: {},
+    boxes: {},
+    style: {},
+    observers: {},
+    presence: {},
+    errors: []
+  };
+
+  function attempt(where, fn) {
+    try { return fn(); } catch (error) { answers.errors.push(where + ": " + (error && error.message ? error.message : String(error))); return null; }
+  }
+
+  function rect(element) {
+    var r = element.getBoundingClientRect();
+    return [Math.round(r.x || 0), Math.round(r.y || 0), Math.round(r.width || 0), Math.round(r.height || 0),
+            Math.round(r.top || 0), Math.round(r.left || 0)];
+  }
+
+  function measureBoxes() {
+    var ids = ["sized", "para", "inline", "bold", "li1", "button", "text", "inview", "paddedio"];
+    var boxes = {
+      documentElement: { clientWidth: document.documentElement.clientWidth, clientHeight: document.documentElement.clientHeight,
+                         scrollWidth: document.documentElement.scrollWidth, scrollHeight: document.documentElement.scrollHeight },
+      body: { clientWidth: document.body.clientWidth, clientHeight: document.body.clientHeight,
+              scrollWidth: document.body.scrollWidth, scrollHeight: document.body.scrollHeight,
+              rect: attempt("body.rect", function () { return rect(document.body); }) },
+      elements: {}
+    };
+    ids.forEach(function (id) {
+      var element = document.getElementById(id);
+      if (!element) { boxes.elements[id] = null; return; }
+      boxes.elements[id] = attempt("boxes." + id, function () {
+        return {
+          rect: rect(element),
+          clientWidth: element.clientWidth, clientHeight: element.clientHeight,
+          offsetWidth: element.offsetWidth, offsetHeight: element.offsetHeight,
+          scrollWidth: element.scrollWidth, scrollHeight: element.scrollHeight,
+          clientRects: element.getClientRects().length
+        };
+      });
+    });
+    return boxes;
+  }
+
+  function measureStyle() {
+    var out = {};
+    [["body", document.body], ["sized", document.getElementById("sized")],
+     ["para", document.getElementById("para")], ["inline", document.getElementById("inline")],
+     ["bold", document.getElementById("bold")], ["button", document.getElementById("button")],
+     ["pinned", null]].forEach(function (pair) {
+      var element = pair[1];
+      if (pair[0] === "pinned") { element = document.createElement("div"); element.id = "pinned"; document.body.appendChild(element); }
+      if (!element) return;
+      out[pair[0]] = attempt("style." + pair[0], function () {
+        var cs = getComputedStyle(element);
+        function read(name) { return cs.getPropertyValue ? cs.getPropertyValue(name) : cs[name]; }
+        return {
+          display: read("display"), position: read("position"), color: read("color"),
+          fontSize: read("font-size"), fontFamily: read("font-family"),
+          marginTop: read("margin-top"), marginLeft: read("margin-left"),
+          paddingLeft: read("padding-left"), borderTopWidth: read("border-top-width"),
+          lineHeight: read("line-height"), visibility: read("visibility"),
+          opacity: read("opacity"), overflowX: read("overflow-x"),
+          backgroundColor: read("background-color")
+        };
+      });
+    });
+    return out;
+  }
+
+  function measurePresence() {
+    var names = ["getBoundingClientRect", "getClientRects", "getComputedStyle", "matchMedia",
+                 "MutationObserver", "IntersectionObserver", "ResizeObserver", "requestAnimationFrame",
+                 "requestIdleCallback", "visualViewport", "ResizeObserverEntry", "IntersectionObserverEntry",
+                 "MutationRecord", "DOMRect", "DOMRectReadOnly", "scrollX", "scrollY", "devicePixelRatio",
+                 "innerWidth", "innerHeight", "outerWidth", "outerHeight", "screenX", "screenY"];
+    var out = {};
+    names.forEach(function (name) {
+      out[name] = attempt("presence." + name, function () {
+        var value = window[name];
+        return value === undefined ? "undefined" : (typeof value === "function" ? "function" : typeof value);
+      });
+    });
+    out.elementFromPoint = attempt("presence.elementFromPoint", function () {
+      return typeof document.elementFromPoint;
+    });
+    return out;
+  }
+
+  function measureMedia() {
+    var queries = [
+      "all", "screen", "print", "(min-width: 100px)", "(max-width: 100px)",
+      "(min-width: 1920px)", "(max-width: 1911px)", "(width: 1911px)", "(width: 1920px)",
+      "(min-height: 988px)", "(max-height: 987px)", "(orientation: landscape)", "(orientation: portrait)",
+      "(prefers-color-scheme: light)", "(prefers-color-scheme: dark)",
+      "(prefers-reduced-motion: no-preference)", "(prefers-reduced-motion: reduce)",
+      "(prefers-contrast: no-preference)", "(prefers-contrast: more)",
+      "(prefers-reduced-transparency: no-preference)", "(prefers-reduced-transparency: reduce)",
+      "(forced-colors: none)", "(forced-colors: active)", "(inverted-colors: none)",
+      "(hover: hover)", "(hover: none)", "(any-hover: hover)", "(any-hover: none)",
+      "(pointer: fine)", "(pointer: coarse)", "(any-pointer: fine)", "(any-pointer: coarse)",
+      "(display-mode: browser)", "(display-mode: standalone)",
+      "(color)", "(min-color: 8)", "(monochrome)", "(scripting: enabled)", "(scripting: none)",
+      "(update: fast)", "(update: slow)", "(overflow-block: scroll)", "(overflow-inline: scroll)",
+      "(dynamic-range: standard)", "(color-gamut: srgb)", "(resolution: 1dppx)", "(min-resolution: 2dppx)",
+      "not all and (min-width: 100px)", "screen and (min-width: 100px) and (max-width: 5000px)",
+      "(min-width: 600px) and (max-width: 900px), (min-width: 1000px)",
+      "(min-width: 1911px)", "(max-width: 1910px)", "(min-height: 900px)", "(max-height: 988px)",
+      "(aspect-ratio: 1911/988)", "(min-aspect-ratio: 1/1)", "(max-aspect-ratio: 1/1)",
+      "(device-width: 1920px)", "(device-height: 1080px)", "(min-device-width: 1920px)",
+      "(prefers-reduced-data: no-preference)", "(prefers-reduced-data: reduce)",
+      "(color-gamut: p3)", "(color-gamut: rec2020)", "(dynamic-range: high)",
+      "(video-dynamic-range: standard)", "(update: none)", "(overflow-block: paged)",
+      "(overflow-block: none)", "(overflow-inline: none)", "(grid)", "(grid: 0)",
+      "(scan: progressive)", "(monochrome: 0)", "(prefers-color-scheme: no-preference)",
+      "(hover: hover) and (pointer: fine)", "print and (min-width: 100px)",
+      "SCREEN AND (MIN-WIDTH: 100PX)", "only screen and (min-width: 100px)",
+      "not screen and (min-width: 100px)", "(min-resolution: 1dppx)", "(max-resolution: 1dppx)",
+      "(resolution: 96dpi)", "(-webkit-min-device-pixel-ratio: 1)", "(width >= 1000px)",
+      "(width > 1911px)", "(400px <= width <= 2000px)", "(min-width: 600.5px)"
+    ];
+    var out = {};
+    queries.forEach(function (query) {
+      out[query] = attempt("media." + query, function () { return matchMedia(query).matches; });
+    });
+    return out;
+  }
+
+  function measureGeometry() {
+    return attempt("geometry", function () {
+      return {
+        innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+        outerWidth: window.outerWidth, outerHeight: window.outerHeight,
+        devicePixelRatio: window.devicePixelRatio,
+        scrollX: window.scrollX, scrollY: window.scrollY,
+        screenX: window.screenX, screenY: window.screenY,
+        screen: {
+          width: screen.width, height: screen.height,
+          availWidth: screen.availWidth, availHeight: screen.availHeight,
+          colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth,
+          orientation: screen.orientation ? screen.orientation.type : null
+        },
+        scrollbarWidth: window.innerWidth - document.documentElement.clientWidth,
+        scrollbarHeight: window.innerHeight - document.documentElement.clientHeight,
+        compatMode: document.compatMode, characterSet: document.characterSet,
+        contentType: document.contentType, readyState: document.readyState,
+        visibilityState: document.visibilityState
+      };
+    });
+  }
+
+  function store() {
+    document.getElementById("answers").textContent = JSON.stringify(answers);
+  }
+
+  answers.phases.sync = { ran: true };
+  answers.geometry = measureGeometry();
+  answers.media = measureMedia();
+  answers.boxes = measureBoxes();
+  answers.style = measureStyle();
+  answers.presence = measurePresence();
+
+  // MutationObserver: synchronous mutations recorded, delivered after the
+  // current script (microtask), with `records` and per-record fields.
+  var mutations = { syncDelivered: false, records: 0, types: [], attributeNames: [], added: 0, characterData: false, targets: 0 };
+  var observer = new MutationObserver(function (records) {
+    mutations.syncDelivered = true;
+    mutations.records = records.length;
+    for (var i = 0; i < records.length; i += 1) {
+      var record = records[i];
+      mutations.types.push(record.type);
+      if (record.type === "attributes") mutations.attributeNames.push(record.attributeName);
+      if (record.addedNodes) mutations.added += record.addedNodes.length;
+      if (record.type === "characterData") mutations.characterData = record.characterData === true;
+      if (record.target) mutations.targets += 1;
+    }
+    answers.observers.mutation = mutations;
+    store();
+  });
+  attempt("observers.mutation", function () {
+    var host = document.createElement("div");
+    host.id = "mutated";
+    document.body.appendChild(host);
+    observer.observe(host, { childList: true, attributes: true, characterData: true, subtree: true });
+    var child = document.createElement("span");
+    child.textContent = "x";
+    host.appendChild(child);
+    host.setAttribute("data-flag", "1");
+    child.textContent = "y";
+    return true;
+  });
+  answers.observers.mutationSyncDelivered = mutations.syncDelivered;
+
+  // IntersectionObserver: one element in the viewport, one far below it.
+  var intersections = {};
+  var order = [];
+  var io = new IntersectionObserver(function (entries) {
+    for (var i = 0; i < entries.length; i += 1) {
+      var entry = entries[i];
+      var key = entry.target && entry.target.id ? entry.target.id : "anonymous";
+      order.push(key);
+      var box = entry.boundingClientRect || {};
+      var root = entry.rootBounds || {};
+      var covered = entry.intersectionRect || {};
+      intersections[key] = {
+        isIntersecting: entry.isIntersecting === true,
+        intersectionRatio: Math.round((entry.intersectionRatio || 0) * 1000) / 1000,
+        width: Math.round(box.width || 0), height: Math.round(box.height || 0),
+        hasRootBounds: entry.rootBounds !== null && entry.rootBounds !== undefined,
+        rootWidth: Math.round(root.width || 0), rootHeight: Math.round(root.height || 0),
+        coveredWidth: Math.round(covered.width || 0), coveredHeight: Math.round(covered.height || 0),
+        time: typeof entry.time
+      };
+    }
+    answers.observers.intersection = intersections;
+    answers.observers.intersectionOrder = order;
+    store();
+  });
+  attempt("observers.intersection", function () {
+    io.observe(document.getElementById("inview"));
+    io.observe(document.getElementById("paddedio"));
+    io.observe(document.getElementById("far"));
+    return true;
+  });
+
+  // ResizeObserver: a sized element's content box and border box.
+  attempt("observers.resize", function () {
+    function size(boxes) {
+      var box = boxes && boxes[0] ? boxes[0] : (boxes || {});
+      return { width: Math.round(box.inlineSize || 0), height: Math.round(box.blockSize || 0) };
+    }
+    var ro = new ResizeObserver(function (entries) {
+      var targets = {};
+      for (var i = 0; i < entries.length; i += 1) {
+        var entry = entries[i];
+        var key = entry.target && entry.target.id ? entry.target.id : "anonymous";
+        var box = entry.contentRect || {};
+        targets[key] = {
+          width: Math.round(box.width || 0), height: Math.round(box.height || 0),
+          hasBorderBox: entry.borderBoxSize !== undefined,
+          borderWidth: size(entry.borderBoxSize).width, borderHeight: size(entry.borderBoxSize).height,
+          contentWidth: size(entry.contentBoxSize).width, contentHeight: size(entry.contentBoxSize).height
+        };
+      }
+      answers.observers.resize = { count: entries.length, targets: targets };
+      store();
+    });
+    ro.observe(document.getElementById("sized"));
+    ro.observe(document.getElementById("paddedio"));
+    return true;
+  });
+
+  // Timer phases: a real client delivers these as tasks in order.
+  setTimeout(function () { answers.phases.timeout0 = true; store(); }, 0);
+  setTimeout(function () {
+    answers.phases.timeout50 = true;
+    answers.geometryAfterTimers = measureGeometry();
+    store();
+  }, 50);
+  setTimeout(function () {
+    answers.phases.timeout200 = true;
+    answers.done = true;
+    store();
+  }, 200);
+  store();
+})();
+</script>
+</body>
+</html>

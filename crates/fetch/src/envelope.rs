@@ -90,12 +90,19 @@ impl Limits {
         Self {
             // The measured friendly SPA (hn.algolia, a 2.6 MB bundle and one
             // API call) reaches content at 2.2–3.0 s across windows, so 2.5 s
-            // terminated runs inside the noise and 3 s sat on the edge. Four
-            // seconds is the ceiling for a heavy first boot, not a target: the
-            // stop rule is the contract, and the replay removes the cost after
-            // the first visit.
-            wall: Duration::from_millis(4_000),
-            ops_max: 64,
+            // terminated runs inside the noise and 3 s sat on the edge. The heavy
+            // shell measured at the same time (TikTok, 427–455 KB, 70 requests)
+            // boots, runs its program and quiesces at 4.0–4.3 s end to end, so 5 s
+            // is the ceiling for a heavy first boot, not a target: the stop rule is
+            // the contract, and the replay removes the cost after the first visit.
+            wall: Duration::from_millis(5_000),
+            // Ops are the lane's own host calls, not just network requests: the
+            // same heavy shell spent 70 of them. Under the old 64-op budget its own
+            // requests were refused six short of that, the page stalled, and the run
+            // ended on the wall reporting `budget`; the refusal itself names the cap
+            // in the log. 96 covers the heaviest measured boot with room, and a
+            // content-free shell still stops on the contract long before it.
+            ops_max: 96,
             // A modern app bundle is the page's own program: the measured
             // Bluesky Expo bundle is 9.7 MB in one response, over the mint's
             // 8 MB ceiling. The lane's total stays the same; one response may
@@ -106,7 +113,9 @@ impl Limits {
         }
     }
 
-    /// `content()`, with the wall clock overridable by `V5_CONTENT_WALL_MS`.
+    /// `content()`, with the wall clock and the op budget overridable by
+    /// `V5_CONTENT_WALL_MS` and `V5_CONTENT_OPS`: a budget is a measured
+    /// quantity, so measuring it does not need a rebuild.
     pub fn content_from_env() -> Self {
         let mut limits = Self::content();
         if let Some(ms) = std::env::var("V5_CONTENT_WALL_MS")
@@ -115,6 +124,13 @@ impl Limits {
             .filter(|ms| *ms >= 500)
         {
             limits.wall = Duration::from_millis(ms);
+        }
+        if let Some(ops) = std::env::var("V5_CONTENT_OPS")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .filter(|ops| *ops >= 8)
+        {
+            limits.ops_max = ops;
         }
         limits
     }

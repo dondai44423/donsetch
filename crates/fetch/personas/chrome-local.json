@@ -75,5 +75,38 @@
   "availLeft": 0,
   "availTop": 0,
   "isExtended": false
+ },
+ "geometry": {
+  "innerWidth": 1911,
+  "innerHeight": 988,
+  "outerWidth": 1927,
+  "outerHeight": 1079,
+  "devicePixelRatio": 1,
+  "screenX": 0,
+  "screenY": 5,
+  "scrollbarWidth": 15,
+  "scrollbarHeight": 0
+ },
+ "media": {
+  "prefersColorScheme": "dark",
+  "hover": "hover",
+  "anyHover": "hover",
+  "pointer": "fine",
+  "anyPointer": "fine",
+  "prefersContrast": "no-preference",
+  "prefersReducedMotion": "no-preference",
+  "prefersReducedTransparency": "no-preference",
+  "forcedColors": "none",
+  "update": "fast",
+  "overflowBlock": "scroll",
+  "overflowInline": "scroll",
+  "displayMode": "browser",
+  "colorGamut": "srgb",
+  "dynamicRange": "standard",
+  "colorBits": 24,
+  "monochromeBits": 0,
+  "resolutionDppx": 1,
+  "scripting": "enabled",
+  "grid": 0
  }
 }

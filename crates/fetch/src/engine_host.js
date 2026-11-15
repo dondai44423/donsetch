@@ -2903,8 +2903,101 @@
     const navigationMs = Math.max(0, Number(page.navigationMs) || 0);
     const now = () => Math.floor((ops.op_now() + navigationMs) * 10) / 10;
     const timeOrigin = Math.floor((Date.now() - (ops.op_now() + navigationMs)) * 10) / 10;
-    const viewportWidth = 1920;
-    const viewportHeight = 1080;
+    // ----- the window the identity presents -----
+    // Measured against a real client and carried by the identity: the persona's
+    // own capture (personas/chrome-local.json) or, for an identity without one,
+    // the reference window's frame over its platform screen (identity.rs derives
+    // that). Nothing here is guessed per page.
+    const geometry = (ident && ident.geometry) || {};
+    const numberOr = (value, fallback) => (typeof value === "number" && Number.isFinite(value) ? value : fallback);
+    const viewportWidth = numberOr(geometry.innerWidth, 1920);
+    const viewportHeight = numberOr(geometry.innerHeight, 1080);
+    const windowOuterWidth = numberOr(geometry.outerWidth, viewportWidth);
+    const windowOuterHeight = numberOr(geometry.outerHeight, viewportHeight);
+    const windowScreenX = numberOr(geometry.screenX, 0);
+    const windowScreenY = numberOr(geometry.screenY, 0);
+    const scrollbarWidth = numberOr(geometry.scrollbarWidth, 0);
+    const scrollbarHeight = numberOr(geometry.scrollbarHeight, 0);
+    const devicePixelRatioValue = numberOr(geometry.devicePixelRatio, 1);
+    // The client box: the viewport less the scrollbars a real window reserves.
+    const clientBoxWidth = viewportWidth - scrollbarWidth;
+    const clientBoxHeight = viewportHeight - scrollbarHeight;
+    const clientBox = () => ({ x: 0, y: 0, width: clientBoxWidth, height: clientBoxHeight, top: 0, left: 0, right: clientBoxWidth, bottom: clientBoxHeight });
+
+    // ----- the declared box -----
+    // There is no layout, so an element's box is what its own inline style and
+    // presentational attributes declare, in px: content, client (content plus
+    // padding) and border. A size that comes from a stylesheet, a percentage, an
+    // em or the content itself is not computed and reports 0.
+    function styleOf(element) {
+      const declared = {};
+      if (element && element._attrs && element._attrs.has && element._attrs.has("style")) {
+        for (const part of String(element._attrs.get("style")).split(";")) {
+          const at = part.indexOf(":");
+          if (at > 0) declared[kebabToCamel(part.slice(0, at).trim())] = part.slice(at + 1).trim();
+        }
+      }
+      return declared;
+    }
+    const pxOf = (text) => {
+      const match = /^(-?\d+(?:\.\d+)?)px$/.exec(String(text === undefined ? "" : text).trim().toLowerCase());
+      return match ? Number(match[1]) : 0;
+    };
+    function declaredPadding(style) {
+      const box = { top: 0, right: 0, bottom: 0, left: 0 };
+      if (style.padding !== undefined) {
+        const parts = String(style.padding).trim().split(/\s+/).filter(Boolean).map(pxOf);
+        if (parts.length === 1) { box.top = box.right = box.bottom = box.left = parts[0]; }
+        else if (parts.length === 2) { box.top = box.bottom = parts[0]; box.right = box.left = parts[1]; }
+        else if (parts.length === 3) { box.top = parts[0]; box.right = box.left = parts[1]; box.bottom = parts[2]; }
+        else if (parts.length >= 4) { box.top = parts[0]; box.right = parts[1]; box.bottom = parts[2]; box.left = parts[3]; }
+      }
+      for (const side of ["top", "right", "bottom", "left"]) {
+        const key = "padding" + side.charAt(0).toUpperCase() + side.slice(1);
+        if (style[key] !== undefined) box[side] = pxOf(style[key]);
+      }
+      return box;
+    }
+    function declaredBorder(style) {
+      const widthOf = (text) => {
+        const match = /(-?\d+(?:\.\d+)?)px/.exec(String(text === undefined ? "" : text).toLowerCase());
+        return match ? Number(match[1]) : 0;
+      };
+      const all = style.border !== undefined ? widthOf(style.border) : pxOf(style.borderWidth);
+      const box = { top: all, right: all, bottom: all, left: all };
+      for (const side of ["top", "right", "bottom", "left"]) {
+        const name = side.charAt(0).toUpperCase() + side.slice(1);
+        if (style["border" + name] !== undefined) box[side] = widthOf(style["border" + name]);
+        if (style["border" + name + "Width"] !== undefined) box[side] = pxOf(style["border" + name + "Width"]);
+      }
+      return box;
+    }
+    // A presentational `width`/`height` attribute sizes a replaced element, which
+    // is the one size Chrome honours outside CSS.
+    const REPLACED_TAGS = new Set(["IMG", "CANVAS", "VIDEO", "IFRAME", "EMBED", "OBJECT", "SVG"]);
+    function declaredContentBox(element) {
+      const style = styleOf(element);
+      const attribute = (name) => {
+        const value = element && element.getAttribute ? element.getAttribute(name) : null;
+        return value === null ? 0 : pxOf(value);
+      };
+      const replaced = element && REPLACED_TAGS.has(element.tagName);
+      return {
+        width: style.width !== undefined ? pxOf(style.width) : replaced ? attribute("width") : 0,
+        height: style.height !== undefined ? pxOf(style.height) : replaced ? attribute("height") : 0,
+      };
+    }
+    function declaredClientBox(element) {
+      const content = declaredContentBox(element);
+      const pad = declaredPadding(styleOf(element));
+      return { width: content.width + pad.left + pad.right, height: content.height + pad.top + pad.bottom };
+    }
+    function declaredBorderBox(element) {
+      const client = declaredClientBox(element);
+      const border = declaredBorder(styleOf(element));
+      return { width: client.width + border.left + border.right, height: client.height + border.top + border.bottom };
+    }
+    const rectOf = (box) => ({ x: 0, y: 0, width: box.width, height: box.height, top: 0, left: 0, right: box.width, bottom: box.height });
 
     // ----- nodes -----
     // EventTarget is the base the DOM inheritance chain starts from; every node
@@ -3385,22 +3478,28 @@
       getHTML() { return this.innerHTML; }
       getBoundingClientRect() {
         const box = this === this.ownerDocument.documentElement || this === this.ownerDocument.body
-          ? { x: 0, y: 0, width: viewportWidth, height: viewportHeight, top: 0, left: 0, right: viewportWidth, bottom: viewportHeight }
-          : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
+          ? clientBox()
+          : rectOf(declaredBorderBox(this));
         note("surface", "element.getBoundingClientRect");
         return box;
       }
-      getClientRects() { note("surface", "element.getClientRects"); return []; }
-      get clientWidth() { return this === this.ownerDocument.documentElement || this === this.ownerDocument.body ? viewportWidth : 0; }
-      get clientHeight() { return this === this.ownerDocument.documentElement || this === this.ownerDocument.body ? viewportHeight : 0; }
-      get offsetWidth() { return this.clientWidth; }
-      get offsetHeight() { return this.clientHeight; }
+      getClientRects() {
+        note("surface", "element.getClientRects");
+        const box = this.getBoundingClientRect();
+        return [new win.DOMRect(box.x, box.y, box.width, box.height)];
+      }
+      get clientWidth() { return this === this.ownerDocument.documentElement || this === this.ownerDocument.body ? clientBoxWidth : declaredClientBox(this).width; }
+      get clientHeight() { return this === this.ownerDocument.documentElement || this === this.ownerDocument.body ? clientBoxHeight : declaredClientBox(this).height; }
+      get offsetWidth() { return this === this.ownerDocument.documentElement || this === this.ownerDocument.body ? clientBoxWidth : declaredBorderBox(this).width; }
+      get offsetHeight() { return this === this.ownerDocument.documentElement || this === this.ownerDocument.body ? clientBoxHeight : declaredBorderBox(this).height; }
       offsetTop = 0;
       offsetLeft = 0;
       scrollTop = 0;
       scrollLeft = 0;
-      scrollWidth = viewportWidth;
-      scrollHeight = viewportHeight;
+      get scrollWidth() { return this.clientWidth; }
+      set scrollWidth(_value) {}
+      get scrollHeight() { return this.clientHeight; }
+      set scrollHeight(_value) {}
       get width() { return Number(this.getAttribute("width")) || 0; }
       set width(value) { this.setAttribute("width", String(value)); }
       get height() { return Number(this.getAttribute("height")) || 0; }
@@ -3821,8 +3920,20 @@
       catch (error) { note("log", "observer: " + (error && error.message)); }
     };
     // The lane's viewport contract: the window is the viewport and everything in
-    // it is visible, so a lazy loader loads. One entry per observe.
-    const windowBox = () => ({ x: 0, y: 0, width: viewportWidth, height: viewportHeight, top: 0, left: 0, right: viewportWidth, bottom: viewportHeight });
+    // it is visible, so a lazy loader loads. `rootBounds` is the client box and an
+    // entry's own box is the element's declared one. Chrome delivers every pending
+    // target of one observer in a single callback, and so does this.
+    const observeBatch = (observer, deliver) => {
+      if (observer._scheduled) return;
+      observer._scheduled = true;
+      win.setTimeout(() => {
+        observer._scheduled = false;
+        const targets = Array.from(observer._pending).filter((target) => observer._targets.has(target));
+        observer._pending.clear();
+        if (!targets.length) return;
+        fireObserver(observer._callback, deliver(targets), observer);
+      }, 0);
+    };
 
     class IntersectionObserverShim {
       constructor(callback, options) {
@@ -3831,19 +3942,24 @@
         this.rootMargin = (options && options.rootMargin) || "0px";
         this.thresholds = (options && options.threshold) ? [].concat(options.threshold) : [0];
         this._targets = new Set();
+        this._pending = new Set();
+        this._scheduled = false;
         note("surface", "IntersectionObserver");
       }
       observe(target) {
         if (this._targets.has(target)) return;
         this._targets.add(target);
-        win.setTimeout(() => {
-          if (!this._targets.has(target)) return;
-          const box = windowBox();
-          fireObserver(this._callback, [{ target, isIntersecting: true, intersectionRatio: 1, isVisible: true, time: now(), boundingClientRect: box, intersectionRect: box, rootBounds: box }], this);
-        }, 0);
+        this._pending.add(target);
+        observeBatch(this, (targets) => {
+          const rootBounds = clientBox();
+          return targets.map((target) => {
+            const box = rectOf(declaredBorderBox(target));
+            return { target, isIntersecting: true, intersectionRatio: 1, isVisible: true, time: now(), boundingClientRect: box, intersectionRect: box, rootBounds };
+          });
+        });
       }
-      unobserve(target) { this._targets.delete(target); }
-      disconnect() { this._targets.clear(); }
+      unobserve(target) { this._targets.delete(target); this._pending.delete(target); }
+      disconnect() { this._targets.clear(); this._pending.clear(); }
       takeRecords() { return []; }
     }
 
@@ -3851,19 +3967,31 @@
       constructor(callback) {
         this._callback = callback;
         this._targets = new Set();
+        this._pending = new Set();
+        this._scheduled = false;
         note("surface", "ResizeObserver");
       }
       observe(target) {
         if (this._targets.has(target)) return;
         this._targets.add(target);
-        win.setTimeout(() => {
-          if (!this._targets.has(target)) return;
-          const size = { inlineSize: viewportWidth, blockSize: viewportHeight };
-          fireObserver(this._callback, [{ target, contentRect: windowBox(), borderBoxSize: [size], contentBoxSize: [size], devicePixelContentBoxSize: [size] }], this);
-        }, 0);
+        this._pending.add(target);
+        observeBatch(this, (targets) => {
+          const size = (box) => ({ inlineSize: box.width, blockSize: box.height });
+          return targets.map((target) => {
+            const content = declaredContentBox(target);
+            const border = declaredBorderBox(target);
+            return {
+              target,
+              contentRect: rectOf(content),
+              borderBoxSize: [size(border)],
+              contentBoxSize: [size(content)],
+              devicePixelContentBoxSize: [size(border)],
+            };
+          });
+        });
       }
-      unobserve(target) { this._targets.delete(target); }
-      disconnect() { this._targets.clear(); }
+      unobserve(target) { this._targets.delete(target); this._pending.delete(target); }
+      disconnect() { this._targets.clear(); this._pending.clear(); }
     }
 
     class EventShim {
@@ -3904,49 +4032,203 @@
     };
 
     // ----- media queries -----
-    function evalMediaFeature(name, value) {
-      const width = viewportWidth;
-      const height = viewportHeight;
-      const numeric = value === null ? null : parseFloat(value);
-      switch (name) {
-        case "width": return numeric === null ? true : width === numeric;
-        case "min-width": return numeric !== null && width >= numeric;
-        case "max-width": return numeric !== null && width <= numeric;
-        case "height": return numeric === null ? true : height === numeric;
-        case "min-height": return numeric !== null && height >= numeric;
-        case "max-height": return numeric !== null && height <= numeric;
-        case "orientation": return String(value).toLowerCase() === (width >= height ? "landscape" : "portrait");
-        case "prefers-color-scheme": return String(value).toLowerCase() === "light";
-        case "prefers-reduced-motion": return String(value).toLowerCase() === "no-preference";
-        case "prefers-contrast": return String(value).toLowerCase() === "no-preference";
-        case "hover": case "any-hover": return String(value).toLowerCase() === "hover";
-        case "pointer": case "any-pointer": return String(value).toLowerCase() === "fine";
-        case "display-mode": return String(value).toLowerCase() === "browser";
-        case "resolution": case "min-resolution": case "max-resolution": return true;
-        case "color": return true;
-        case "monochrome": return String(value) === "0" || numeric === 0;
-        case "scripting": return String(value).toLowerCase() === "enabled";
-        case "update": return String(value).toLowerCase() === "fast";
-        default: note("surface", "matchMedia:" + name); return false;
+    // Every answer here is the reference browser's, captured by the probe and
+    // carried by the identity: personas/chrome-local.json holds the capture, and
+    // identity.rs supplies the reference defaults for an identity without one. A
+    // feature the lane does not model makes its query unparseable, which is
+    // exactly how Chrome answers a feature it does not support, including the
+    // ones it hides behind a `not`.
+    const mediaFacts = Object.assign({
+      prefersColorScheme: "light", hover: "hover", anyHover: "hover",
+      pointer: "fine", anyPointer: "fine", prefersContrast: "no-preference",
+      prefersReducedMotion: "no-preference", prefersReducedTransparency: "no-preference",
+      forcedColors: "none", update: "fast", overflowBlock: "scroll", overflowInline: "scroll",
+      displayMode: "browser", colorGamut: "srgb", dynamicRange: "standard",
+      colorBits: 24, monochromeBits: 0, resolutionDppx: 1, scripting: "enabled", grid: 0,
+    }, ident.media || {});
+    const screenWidth = (ident.screen && ident.screen.width) || viewportWidth;
+    const screenHeight = (ident.screen && ident.screen.height) || viewportHeight;
+
+    // A length in px. A unit the lane cannot resolve answers null, so the query
+    // is unparseable rather than silently wrong.
+    function lengthValue(text) {
+      const match = /^(-?\d+(?:\.\d+)?)(px|em|rem|vw|vh|pt|pc|in|cm|mm)?$/.exec(String(text === undefined ? "" : text).trim().toLowerCase());
+      if (!match) return null;
+      const amount = Number(match[1]);
+      switch (match[2]) {
+        case undefined: case "px": return amount;
+        case "em": case "rem": return amount * 16;
+        case "vw": return (amount * viewportWidth) / 100;
+        case "vh": return (amount * viewportHeight) / 100;
+        case "pt": return (amount * 4) / 3;
+        case "pc": return amount * 16;
+        case "in": return amount * 96;
+        case "cm": return (amount * 96) / 2.54;
+        case "mm": return (amount * 96) / 25.4;
+        default: return null;
       }
     }
+    function resolutionValue(text) {
+      const match = /^(-?\d+(?:\.\d+)?)(dppx|dpi|dpcm|x)?$/.exec(String(text === undefined ? "" : text).trim().toLowerCase());
+      if (!match) return null;
+      const amount = Number(match[1]);
+      switch (match[2]) {
+        case undefined: case "dppx": case "x": return amount;
+        case "dpi": return amount / 96;
+        // 1in = 2.54cm, so one dot per cm is 2.54 dots per inch.
+        case "dpcm": return (amount * 2.54) / 96;
+        default: return null;
+      }
+    }
+    function ratioValue(text) {
+      const match = /^(-?\d+(?:\.\d+)?)\s*\/\s*(-?\d+(?:\.\d+)?)$/.exec(String(text === undefined ? "" : text).trim());
+      if (!match) return null;
+      const denominator = Number(match[2]);
+      return denominator === 0 ? null : Number(match[1]) / denominator;
+    }
+    const numberValue = (text) => {
+      const amount = Number(String(text === undefined ? "" : text).trim());
+      return Number.isFinite(amount) ? amount : null;
+    };
+
+    // What this client reports for a range feature, and how a query's value reads
+    // for it. Only the features the reference answered are here: a feature Chrome
+    // does not support (prefers-reduced-data, inverted-colors, scan,
+    // video-dynamic-range) is deliberately absent and so answers false everywhere.
+    const rangeFeatures = {
+      "width": () => viewportWidth,
+      "height": () => viewportHeight,
+      "device-width": () => screenWidth,
+      "device-height": () => screenHeight,
+      "aspect-ratio": () => (viewportHeight === 0 ? null : viewportWidth / viewportHeight),
+      "device-aspect-ratio": () => (screenHeight === 0 ? null : screenWidth / screenHeight),
+      "resolution": () => mediaFacts.resolutionDppx,
+      "color": () => mediaFacts.colorBits,
+      "monochrome": () => mediaFacts.monochromeBits,
+      "grid": () => mediaFacts.grid,
+      "device-pixel-ratio": () => devicePixelRatioValue,
+    };
+    const rangeParsers = {
+      "width": lengthValue, "height": lengthValue,
+      "device-width": lengthValue, "device-height": lengthValue,
+      "aspect-ratio": ratioValue, "device-aspect-ratio": ratioValue,
+      "resolution": resolutionValue, "color": numberValue, "monochrome": numberValue,
+      "grid": numberValue, "device-pixel-ratio": resolutionValue,
+    };
+    const discreteFeatures = {
+      "orientation": () => (viewportWidth >= viewportHeight ? "landscape" : "portrait"),
+      "prefers-color-scheme": () => mediaFacts.prefersColorScheme,
+      "prefers-contrast": () => mediaFacts.prefersContrast,
+      "prefers-reduced-motion": () => mediaFacts.prefersReducedMotion,
+      "prefers-reduced-transparency": () => mediaFacts.prefersReducedTransparency,
+      "forced-colors": () => mediaFacts.forcedColors,
+      "hover": () => mediaFacts.hover,
+      "any-hover": () => mediaFacts.anyHover,
+      "pointer": () => mediaFacts.pointer,
+      "any-pointer": () => mediaFacts.anyPointer,
+      "update": () => mediaFacts.update,
+      "overflow-block": () => mediaFacts.overflowBlock,
+      "overflow-inline": () => mediaFacts.overflowInline,
+      "display-mode": () => mediaFacts.displayMode,
+      "color-gamut": () => mediaFacts.colorGamut,
+      "dynamic-range": () => mediaFacts.dynamicRange,
+      "scripting": () => mediaFacts.scripting,
+    };
+    const featureName = (name) => String(name).replace(/^-webkit-/, "");
+    const compare = (actual, operator, value) => {
+      if (actual === null || value === null) return null;
+      switch (operator) {
+        case "<": return actual < value;
+        case "<=": return actual <= value;
+        case ">": return actual > value;
+        case ">=": return actual >= value;
+        case "=": return actual === value;
+        default: return null;
+      }
+    };
+    // One parenthesised condition: `(feature: value)`, `(min-feature: value)`,
+    // `(feature)`, or the range syntax `(width >= 1000px)` and
+    // `(400px <= width <= 2000px)`. null means the lane does not model it.
+    function evalCondition(inner) {
+      const text = String(inner).trim().toLowerCase();
+      if (!text) return null;
+      const chained = /^(.+?)\s*(<=|>=|<|>)\s*([a-z-]+)\s*(<=|>=|<|>)\s*(.+)$/.exec(text);
+      if (chained) {
+        const name = featureName(chained[3]);
+        if (!(name in rangeFeatures)) return null;
+        const parser = rangeParsers[name];
+        const actual = rangeFeatures[name]();
+        const left = compare(parser(chained[1].trim()), chained[2], actual);
+        const right = compare(actual, chained[4], parser(chained[5].trim()));
+        return left === null || right === null ? null : left && right;
+      }
+      const single = /^([a-z-]+)\s*(<=|>=|<|>|=)\s*(.+)$/.exec(text);
+      if (single) {
+        const name = featureName(single[1]);
+        if (!(name in rangeFeatures)) return null;
+        return compare(rangeFeatures[name](), single[2], rangeParsers[name](single[3].trim()));
+      }
+      const pair = /^([a-z-]+)\s*:\s*(.+)$/.exec(text);
+      if (pair) {
+        const name = featureName(pair[1]);
+        const value = pair[2].trim();
+        const prefixed = /^(min|max)-(.+)$/.exec(name);
+        if (prefixed) {
+          const base = prefixed[2];
+          if (!(base in rangeFeatures)) return null;
+          const wanted = rangeParsers[base](value);
+          if (wanted === null) return null;
+          const actual = rangeFeatures[base]();
+          if (actual === null) return null;
+          return prefixed[1] === "min" ? actual >= wanted : actual <= wanted;
+        }
+        if (name in rangeFeatures) {
+          const wanted = rangeParsers[name](value);
+          return wanted === null ? null : compare(rangeFeatures[name](), "=", wanted);
+        }
+        if (name in discreteFeatures) return String(discreteFeatures[name]()).toLowerCase() === value;
+        return null;
+      }
+      const bare = /^([a-z-]+)$/.exec(text);
+      if (bare) {
+        const name = featureName(bare[1]);
+        if (name in rangeFeatures) {
+          const actual = rangeFeatures[name]();
+          return typeof actual === "number" ? actual !== 0 : null;
+        }
+        if (name in discreteFeatures) {
+          const value = String(discreteFeatures[name]()).toLowerCase();
+          return value !== "none" && value !== "no-preference";
+        }
+        return null;
+      }
+      return null;
+    }
+    // A media type, then its conditions. An unknown type, or a condition the lane
+    // cannot parse, makes the query false: never true, and never flipped by `not`.
     function evalMediaQuery(query) {
       let text = String(query).trim().toLowerCase();
       let negate = false;
-      if (text.startsWith("not ")) { negate = true; text = text.slice(4); }
-      let result = true;
-      for (const part of text.split(/\s+and\s+/)) {
-        const piece = part.trim();
-        if (!piece) continue;
-        if (piece === "all" || piece === "screen") continue;
-        if (piece === "print") { result = false; continue; }
-        const feature = /^\(\s*([a-z-]+)\s*:\s*(.+?)\s*\)$/.exec(piece);
-        const bare = /^\(\s*([a-z-]+)\s*\)$/.exec(piece);
-        if (feature) { if (!evalMediaFeature(feature[1], feature[2])) result = false; }
-        else if (bare) { if (!evalMediaFeature(bare[1], null)) result = false; }
-        else { note("log", "matchMedia: unparsed " + piece); result = false; }
+      for (;;) {
+        if (text.startsWith("not ")) { negate = !negate; text = text.slice(4).trim(); continue; }
+        if (text.startsWith("only ")) { text = text.slice(5).trim(); continue; }
+        break;
       }
-      return negate ? !result : result;
+      let matched = true;
+      for (const raw of text.split(/\s+and\s+/)) {
+        const piece = raw.trim();
+        if (!piece) continue;
+        if (piece.startsWith("(")) {
+          const condition = /^\((.*)\)$/.exec(piece);
+          const result = condition ? evalCondition(condition[1]) : null;
+          if (result === null) { note("log", "matchMedia: unmodeled " + piece); return false; }
+          if (!result) matched = false;
+          continue;
+        }
+        if (piece === "all" || piece === "screen") continue;
+        return false;
+      }
+      return negate ? !matched : matched;
     }
     class MediaQueryListShim {
       constructor(query) {
@@ -4040,17 +4322,17 @@
       origin: parts.origin,
       innerWidth: viewportWidth,
       innerHeight: viewportHeight,
-      outerWidth: viewportWidth,
-      outerHeight: viewportHeight,
-      devicePixelRatio: 1,
+      outerWidth: windowOuterWidth,
+      outerHeight: windowOuterHeight,
+      devicePixelRatio: devicePixelRatioValue,
       scrollX: 0,
       scrollY: 0,
       pageXOffset: 0,
       pageYOffset: 0,
-      screenX: 0,
-      screenY: 0,
-      screenLeft: 0,
-      screenTop: 0,
+      screenX: windowScreenX,
+      screenY: windowScreenY,
+      screenLeft: windowScreenX,
+      screenTop: windowScreenY,
       localStorage: storage(),
       sessionStorage: storage(),
       performance: {
@@ -4123,7 +4405,19 @@
       },
       getSelection: () => ({ rangeCount: 0, toString: () => "", addRange() {}, removeAllRanges() {}, getRangeAt: () => null, collapse() {} }),
       scroll: () => {}, scrollTo: () => {}, scrollBy: () => {},
-      visualViewport: { width: viewportWidth, height: viewportHeight, scale: 1, addEventListener() {}, removeEventListener() {} },
+      visualViewport: {
+        width: viewportWidth,
+        height: viewportHeight,
+        offsetLeft: 0,
+        offsetTop: 0,
+        pageLeft: 0,
+        pageTop: 0,
+        scale: 1,
+        onresize: null,
+        onscroll: null,
+        addEventListener() {},
+        removeEventListener() {},
+      },
       reportError: (error) => { note("log", "reportError: " + (error && (error.message || String(error)))); },
       // WHATWG Streams, minimal but real enough to construct and wire. The lane's
       // model is synchronous: a reader that truly streams gets an immediate end,
@@ -4361,6 +4655,20 @@
     win.Touch = class { constructor(init) { init = init || {}; this.identifier = init.identifier || 0; this.clientX = init.clientX || 0; this.clientY = init.clientY || 0; this.target = init.target || null; } };
     win.ResizeObserverEntry = class {};
     win.IntersectionObserverEntry = class {};
+    win.MutationRecord = class {
+      constructor(init) {
+        init = init || {};
+        this.type = init.type || null;
+        this.target = init.target || null;
+        this.addedNodes = init.addedNodes || [];
+        this.removedNodes = init.removedNodes || [];
+        this.previousSibling = init.previousSibling || null;
+        this.nextSibling = init.nextSibling || null;
+        this.attributeName = init.attributeName || null;
+        this.attributeNamespace = init.attributeNamespace || null;
+        this.oldValue = init.oldValue === undefined ? null : init.oldValue;
+      }
+    };
 
     // navigator and screen come from the identity's own measured view, so the
     // page's program never sees a fact that contradicts the wire.

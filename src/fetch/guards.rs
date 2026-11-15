@@ -814,7 +814,12 @@ mod tests {
         );
     }
 
+    // Needs a resolver that answers NXDOMAIN: a network that drops the query instead
+    // (this box's does) turns the lookup into a timeout, which is a different error
+    // class, so the end-to-end proof is a live check. The classification itself is
+    // pinned offline in `mcp::server::errors::tests::a_dns_name_failure_is_permanent`.
     #[tokio::test]
+    #[ignore = "network: needs a resolver that answers NXDOMAIN"]
     async fn ensure_url_safe_fail_closed_on_dns_error() {
         // Non-existent hostname must fail closed, not silently allow.
         // This proves we do not swallow DNS errors for web_screenshot.
