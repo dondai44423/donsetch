@@ -5,6 +5,18 @@ All notable changes to DonSeTch are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.4.1] - 2026-11-15
+
+### Fixed
+
+- **The updater downloads release assets over parallel ranges.** A single stream from the release
+  CDN is throttled per connection on some networks — measured 4-28 KB/s while the same 40 MB asset
+  came down at 200+ KB/s over several connections — so an upgrade that should take minutes gave up
+  after twenty. The downloader now probes with one range request, splits what is missing across
+  eight connections, resumes each segment on a stall, and keeps the buffer a resumable prefix for
+  the next route; a server that ignores `Range` is streamed exactly as before. An asset below 2 MB
+  still takes the streaming path.
+
 ## [5.4.0] - 2026-11-15
 
 ### Added

@@ -172,6 +172,164 @@ fn total_from_content_range(value: &str) -> Option<u64> {
     value.rsplit('/').next()?.trim().parse().ok()
 }
 
+/// Connections per asset. A single stream from the release CDN is throttled to
+/// tens of KB/s on some networks (measured: 4-28 KB/s while the same file came
+/// down at 200+ KB/s over sixteen connections); parallel ranges are the
+/// difference between a 25-minute upgrade and a three-minute one.
+const PARALLEL_CHUNKS: usize = 8;
+/// Assets below this go down the streaming path: range setup would cost more
+/// than it saves.
+const PARALLEL_FLOOR: u64 = 2 * 1024 * 1024;
+
+enum Parallel {
+    Done,
+    /// The route does not do ranges (or the asset is small): stream it instead.
+    Unsupported,
+    /// Delivered bytes, but under the floor.
+    TooSlow(u64),
+}
+
+/// One closed range, resumed inside the segment on a stall. Only a whole segment
+/// comes back: a partial one would break the caller's resumable-prefix contract.
+async fn fetch_segment(
+    client: &reqwest::Client,
+    url: &str,
+    accept: Option<&str>,
+    from: u64,
+    to: u64,
+    stall: Duration,
+) -> Result<Vec<u8>, String> {
+    let want = (to.saturating_sub(from)) as usize;
+    let mut bytes = Vec::with_capacity(want);
+    let mut tries = 0;
+    while bytes.len() < want {
+        tries += 1;
+        if tries > 4 {
+            return Err(format!(
+                "range {from}-{}: gave up at {} bytes",
+                to - 1,
+                bytes.len()
+            ));
+        }
+        let at = from + bytes.len() as u64;
+        let mut request = client
+            .get(url)
+            .header("Range", format!("bytes={at}-{}", to - 1));
+        if let Some(accept) = accept {
+            request = request.header("Accept", accept);
+        }
+        let mut response = request.send().await.map_err(|e| e.to_string())?;
+        if response.status().as_u16() != 206 {
+            return Err(format!(
+                "range {from}-{}: HTTP {}",
+                to - 1,
+                response.status().as_u16()
+            ));
+        }
+        // Ends on the segment's end, a broken stream or a stall; the outer loop
+        // then resumes this segment from where it got to.
+        while let Ok(Ok(Some(chunk))) = tokio::time::timeout(stall, response.chunk()).await {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() >= want {
+                bytes.truncate(want);
+                break;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// The ranged path. Ask for everything from `buf.len()` on, split what is missing
+/// across connections, and append only the contiguous completed head so `buf`
+/// stays a resumable prefix for the next route.
+async fn attempt_parallel(
+    client: &reqwest::Client,
+    url: &str,
+    accept: Option<&str>,
+    buf: &mut Vec<u8>,
+    policy: &Policy,
+    patient: bool,
+    progress: &mut impl FnMut(usize),
+) -> Result<Parallel, String> {
+    let start = buf.len() as u64;
+    let mut probe = client.get(url).header("Range", format!("bytes={start}-"));
+    if let Some(accept) = accept {
+        probe = probe.header("Accept", accept);
+    }
+    let response = probe.send().await.map_err(|e| e.to_string())?;
+    let total = match response.status().as_u16() {
+        206 => response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(total_from_content_range),
+        // A server that ignores the Range answers 200: stream it instead.
+        200 => None,
+        other => return Err(format!("HTTP {other}")),
+    };
+    let Some(total) = total else {
+        return Ok(Parallel::Unsupported);
+    };
+    drop(response);
+    if total <= start {
+        return Ok(Parallel::Done);
+    }
+    if start == 0 && total - start < PARALLEL_FLOOR {
+        return Ok(Parallel::Unsupported);
+    }
+    let chunk = ((total - start) / PARALLEL_CHUNKS as u64).max(256 * 1024);
+    let mut segments = Vec::new();
+    let mut at = start;
+    while at < total {
+        let end = (at + chunk).min(total);
+        segments.push((at, end));
+        at = end;
+    }
+    let begun = Instant::now();
+    let mut tasks = Vec::new();
+    for (from, to) in segments {
+        let client = client.clone();
+        let url = url.to_string();
+        let accept = accept.map(str::to_string);
+        let stall = policy.stall;
+        tasks.push(tokio::spawn(async move {
+            fetch_segment(&client, &url, accept.as_deref(), from, to, stall).await
+        }));
+    }
+    let mut parts = Vec::new();
+    for task in tasks {
+        parts.push(task.await.map_err(|e| e.to_string())?);
+    }
+    let mut appended = 0usize;
+    let mut contiguous = true;
+    let mut failure: Option<String> = None;
+    for part in parts {
+        match part {
+            Ok(bytes) if contiguous => {
+                appended += bytes.len();
+                buf.extend_from_slice(&bytes);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                contiguous = false;
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    progress(buf.len());
+    if buf.len() as u64 == total {
+        return Ok(Parallel::Done);
+    }
+    let seconds = begun.elapsed().as_secs_f64().max(0.001);
+    let rate = (appended as f64 / seconds) as u64;
+    let floor = policy.min_per_window / policy.window.as_secs().max(1);
+    if !patient && rate < floor {
+        return Ok(Parallel::TooSlow(rate));
+    }
+    Err(failure
+        .unwrap_or_else(|| format!("ranged download ended at {} of {total} bytes", buf.len())))
+}
+
 async fn attempt(
     client: &reqwest::Client,
     source: &Source,
@@ -181,6 +339,13 @@ async fn attempt(
     progress: &mut impl FnMut(usize),
 ) -> Result<Attempt, String> {
     let (url, accept) = source.resolve(client).await?;
+    // Parallel ranges first: a single stream is throttled per connection on some
+    // networks, and that is the shape that made upgrades crawl.
+    match attempt_parallel(client, &url, accept, buf, policy, patient, progress).await? {
+        Parallel::Done => return Ok(Attempt::Done),
+        Parallel::TooSlow(rate) => return Ok(Attempt::TooSlow(rate)),
+        Parallel::Unsupported => {}
+    }
     let mut request = client.get(&url);
     if let Some(accept) = accept {
         request = request.header("Accept", accept);
@@ -331,22 +496,36 @@ mod tests {
                         head.push(byte[0]);
                     }
                     let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
-                    let start = if ignore_range {
-                        0
+                    let range = if ignore_range {
+                        None
                     } else {
                         text.lines()
                             .find_map(|l| l.strip_prefix("range: bytes="))
-                            .and_then(|r| r.trim_end_matches('-').trim().parse::<u64>().ok())
-                            .unwrap_or(0)
-                    } as usize;
+                            .map(|spec| {
+                                let spec = spec.trim();
+                                let (first, last) = spec.split_once('-').unwrap_or((spec, ""));
+                                let start = first
+                                    .trim()
+                                    .parse::<usize>()
+                                    .unwrap_or(0)
+                                    .min(body.len() - 1);
+                                let end = last
+                                    .trim()
+                                    .parse::<usize>()
+                                    .map(|end| end.min(body.len() - 1))
+                                    .unwrap_or(body.len() - 1);
+                                (start, end.max(start))
+                            })
+                    };
+                    let (start, end) = range.unwrap_or((0, body.len() - 1));
                     seen.store(start as u64, Ordering::SeqCst);
-                    let rest = &body[start..];
-                    let header = if start > 0 {
+                    let rest = &body[start..=end];
+                    let header = if range.is_some() {
                         format!(
                             "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\ncontent-range: bytes {}-{}/{}\r\nconnection: close\r\n\r\n",
                             rest.len(),
                             start,
-                            body.len() - 1,
+                            end,
                             body.len()
                         )
                     } else {
@@ -540,5 +719,64 @@ mod tests {
         assert_eq!(total_from_content_range("bytes 100-199/200"), Some(200));
         assert_eq!(total_from_content_range("bytes */200"), Some(200));
         assert_eq!(total_from_content_range("bytes 0-1/*"), None);
+    }
+
+    /// A throttled asset comes down over several connections: the whole file, in
+    /// order, with progress reporting what is held.
+    #[tokio::test]
+    async fn a_throttled_asset_finishes_over_parallel_ranges() {
+        // 2.4 MB is over the ranged floor; 4 KiB per 4 ms is ~1 MB/s per
+        // connection, so one stream would take ~2.4 s and eight segments finish
+        // in well under the stall.
+        let body: Arc<Vec<u8>> = Arc::new((0..2_400_000u32).map(|i| (i % 251) as u8).collect());
+        let (url_text, _seen) = serve(body.clone(), 4096, Duration::from_millis(4), false).await;
+        let policy = fast_policy();
+        let client = client_for(&direct(), &policy).unwrap();
+        let mut buf = Vec::new();
+        let mut reported = 0;
+        let outcome = attempt_parallel(
+            &client,
+            &url_text,
+            None,
+            &mut buf,
+            &policy,
+            false,
+            &mut |n| reported = n,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, Parallel::Done),
+            "the ranged path should finish the file"
+        );
+        assert_eq!(buf.len(), body.len());
+        assert_eq!(&buf[..], &body[..], "the segments assemble in order");
+        assert_eq!(reported, buf.len(), "progress reports what is held");
+    }
+
+    /// A server that ignores `Range` is streamed instead: the ranged path steps
+    /// aside rather than failing the upgrade.
+    #[tokio::test]
+    async fn a_server_without_ranges_streams_instead() {
+        let body = payload();
+        let (url_text, _seen) = serve(body.clone(), 16 * 1024, Duration::ZERO, true).await;
+        let policy = fast_policy();
+        let client = client_for(&direct(), &policy).unwrap();
+        let mut buf = Vec::new();
+        let outcome = attempt(
+            &client,
+            &url("direct", url_text),
+            &mut buf,
+            &policy,
+            false,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, Attempt::Done),
+            "the streaming path should finish"
+        );
+        assert_eq!(&buf[..], &body[..]);
     }
 }
