@@ -1,6 +1,6 @@
 # Native Google search
 
-The 5.3 candidate's default Google source is `google-cse`: the public search-element
+The default Google source is `google-cse`: the public search-element
 bootstrap and structured JSONP interface, read through DonSeTch's native HTTP transport.
 Search requires no user API key, account, browser, script execution or model download.
 Availability depends on Google and the network; a successful witness establishes the

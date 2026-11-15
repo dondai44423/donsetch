@@ -34,8 +34,7 @@ D=$(rustup run nightly rustc --print sysroot)/lib/rustlib/$T/bin/gcc-ld
 RUSTFLAGS="-C link-arg=-fuse-ld=lld -C link-arg=-B$D" rustup run nightly cargo fuzz run extract -s none -- -max_total_time=300
 ```
 
-CI runs a 90s smoke of every target on each
-master push; long runs are manual.
+Nightly CI runs a 90s smoke of every target; long runs are manual.
 
 When a crash is found: the artifact lands in `fuzz/artifacts/`,
 reproduce with `cargo fuzz run <target> -s none artifacts/<file>`,

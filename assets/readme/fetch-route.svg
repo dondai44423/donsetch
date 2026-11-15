@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="660" viewBox="0 0 1040 660" role="img" aria-labelledby="title desc">
+  <title id="title">The DonSeTch fetch route</title>
+  <desc id="desc">A simplified route map: check cache, request with a coherent identity, and classify. When needed, try a site's public interface, a mined request replay, or bounded V8. Every answer must pass its content contract. Successful identity, state and request contracts inform the next encounter. Screenshots take a separate Chromium path.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10Z" fill="#e84b50"/></marker>
+    <marker id="ivory" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10Z" fill="#f2e7d3"/></marker>
+  </defs>
+  <rect width="1040" height="660" rx="3" fill="#141416"/>
+  <path d="M0 0H1040V8H0Z" fill="#e52b31"/>
+  <path d="M34 36H40V106H34Z" fill="#e52b31"/>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="58" y="64" font-size="31" font-weight="800" letter-spacing="2" fill="#f2e7d3">THE FETCH ROUTE</text>
+    <text x="58" y="95" font-size="17" fill="#c7bfb0">HTTP first. A program only when the answer needs one.</text>
+    <text x="1004" y="57" text-anchor="end" font-size="13" letter-spacing="2" fill="#e96a6f">DONSETCH / ENGINE MAP</text>
+
+    <rect x="34" y="135" width="220" height="93" rx="2" fill="#222225" stroke="#605a52"/>
+    <text x="52" y="161" font-size="12" letter-spacing="2" fill="#e96a6f">01 / CHECK</text>
+    <text x="52" y="186" font-size="21" font-weight="700" fill="#f2e7d3">URL + page cache</text>
+    <text x="52" y="209" font-size="15" fill="#c7bfb0">Revalidate or reuse if earned</text>
+
+    <path d="M254 181H288" fill="none" stroke="#f2e7d3" stroke-width="2" marker-end="url(#ivory)"/>
+    <rect x="300" y="135" width="306" height="93" rx="2" fill="#222225" stroke="#605a52"/>
+    <text x="318" y="161" font-size="12" letter-spacing="2" fill="#e96a6f">02 / REQUEST</text>
+    <text x="318" y="186" font-size="21" font-weight="700" fill="#f2e7d3">One coherent identity</text>
+    <text x="318" y="209" font-size="15" fill="#c7bfb0">TLS · HTTP/2 · headers · its own jar</text>
+
+    <path d="M606 181H640" fill="none" stroke="#f2e7d3" stroke-width="2" marker-end="url(#ivory)"/>
+    <rect x="652" y="135" width="352" height="93" rx="2" fill="#e52b31"/>
+    <text x="670" y="161" font-size="12" letter-spacing="2" fill="#fff5e3">03 / CLASSIFY</text>
+    <text x="670" y="186" font-size="21" font-weight="700" fill="#fff5e3">Content, or a named outcome</text>
+    <text x="670" y="209" font-size="15" fill="#fff5e3">Identity · contract · program · human · login</text>
+
+    <path d="M828 228V257H179V288" fill="none" stroke="#e84b50" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M499 257V288" fill="none" stroke="#e84b50" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M828 257V288" fill="none" stroke="#e84b50" stroke-width="2" marker-end="url(#arrow)"/>
+    <text x="34" y="271" font-size="13" letter-spacing="1.4" fill="#c7bfb0">WHEN NEEDED</text>
+
+    <rect x="34" y="300" width="290" height="115" rx="2" fill="#222225" stroke="#605a52"/>
+    <text x="52" y="330" font-size="20" font-weight="700" fill="#f2e7d3">The site's interface</text>
+    <text x="52" y="357" font-size="16" fill="#c7bfb0">Its public API or feed</text>
+    <text x="52" y="387" font-size="13" font-family="monospace" fill="#e96a6f">transport: data</text>
+
+    <rect x="354" y="300" width="290" height="115" rx="2" fill="#222225" stroke="#605a52"/>
+    <text x="372" y="330" font-size="20" font-weight="700" fill="#f2e7d3">A mined request</text>
+    <text x="372" y="357" font-size="16" fill="#c7bfb0">Replay before running JS</text>
+    <text x="372" y="387" font-size="13" font-family="monospace" fill="#e96a6f">transport: replay</text>
+
+    <rect x="674" y="300" width="330" height="115" rx="2" fill="#222225" stroke="#e52b31"/>
+    <text x="692" y="330" font-size="20" font-weight="700" fill="#f2e7d3">Its own program · V8</text>
+    <text x="692" y="357" font-size="16" fill="#c7bfb0">Mint clearance or assemble content</text>
+    <text x="692" y="387" font-size="13" fill="#e96a6f">Bounded. Same identity. No rendering.</text>
+
+    <path d="M179 415V445H839V415M499 415V465" fill="none" stroke="#e84b50" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="34" y="477" width="970" height="69" rx="2" fill="#f2e7d3"/>
+    <text x="52" y="506" font-size="21" font-weight="800" fill="#171719">VERIFY. THEN RETURN.</text>
+    <text x="52" y="530" font-size="16" fill="#3c3733">A passing contract earns content. A wall stays a wall. The caller gets the next action.</text>
+
+    <path d="M1004 199H1020V511H1007" fill="none" stroke="#f2e7d3" stroke-width="2" marker-end="url(#ivory)"/>
+    <text x="988" y="456" text-anchor="end" font-size="13" fill="#c7bfb0">Content can return directly.</text>
+    <circle cx="44" cy="576" r="5" fill="#e52b31"/>
+    <text x="60" y="582" font-size="16" fill="#f2e7d3">Remember the winner, earned state, and reusable requests for the next encounter.</text>
+    <path d="M34 607H1004" stroke="#49453f"/>
+    <text x="34" y="635" font-size="13" letter-spacing="1.5" fill="#c7bfb0">SEPARATE PATH</text>
+    <text x="214" y="635" font-size="16" fill="#f2e7d3">web_screenshot → installed Chromium → PNG</text>
+    <text x="1004" y="635" text-anchor="end" font-size="13" fill="#e96a6f">No browser state flows into fetch.</text>
+  </g>
+</svg>

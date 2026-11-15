@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Test-suite budget guard.
 
-The suite is a tool, not a landfill. This fails when it grows or slows without
-someone deliberately raising the budget, and it names the two honest fixes:
+The suite is a tool, not a landfill. This fails when its time or fixture cost
+exceeds a limit without someone deliberately raising the budget, and it names the two honest fixes:
 make the test cheaper, or move it to the heavy lane.
 
 Usage:
@@ -13,11 +13,9 @@ Usage:
       # headroom), after a green full run. Ceilings only ever move on purpose:
       # raising one is a reviewed edit to budget.json, lowering one is this.
 
-Three things keep the suite from growing by accident:
-  * ceilings (count, per-suite count, single-test time, total CPU, fixtures)
+Two things keep the suite's cost from growing by accident:
+  * ceilings (single-test time, total CPU, fixtures; never test count)
     that fail the run when crossed;
-  * a slack warning when a ceiling sits far above what the suite really uses,
-    because a loose ceiling is room for growth nobody decided on;
   * the slowest tests printed on every run, so creep is visible before it
     crosses anything.
 """

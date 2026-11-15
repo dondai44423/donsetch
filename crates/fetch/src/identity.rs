@@ -15,8 +15,8 @@ use wreq::IntoEmulation;
 use wreq_util::{Emulation, Platform, Profile};
 
 /// Captured identity of the reference browser on this machine. It is *data*: the
-/// user agent and client hints a real Chrome sends, so state acquired by that
-/// browser (clearance, sessions) can be spent by the identity that acquired it.
+/// user agent and client hints a real Chrome sends. The fetcher earns its own
+/// clearance on that identity; no browser cookies or signed-in sessions are imported.
 pub struct Persona {
     pub user_agent: String,
     pub brands: String,

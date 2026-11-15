@@ -16,7 +16,7 @@ artifacts. A branch or a dirty implementation is not an approved roadmap.
 
 ## The fetch path has a shape
 
-`src/` is the product; `crates/fetch/` (its own crate and CI job) is the fetching
+`src/` is the product; `crates/fetch/` (a workspace crate tested in CI) is the fetching
 layer: carried client identity, carried state, a page cache, wall
 classification, the site's own interfaces, and an in-process V8 engine that runs a
 challenge page's own program — or an application page's own program for content (the
@@ -118,11 +118,11 @@ The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
 - **For a code change, a test that fails without the fix**, built from the
   real capture where one exists, and at least one negative case that shows
   the fix does not fire where it must not.
-- **A test has a cost budget.** The default suite is capped by
-  `.config/nextest.toml`'s default-filter and `tests/budget.json` (count,
-  per-suite count, single-test time, total CPU, fixture size). Keep a new test
+- **A test has a cost budget.** Heavy tests are excluded by
+  `.config/nextest.toml`'s default-filter; `tests/budget.json` caps
+  single-test time, total CPU and fixture size, never test count. Keep a new test
   under ~2 s; a corpus or clock test belongs in the heavy set (`just heavy`),
-  not in the per-push gate. CI fails on growth without a deliberate raise of
+  not in the per-push gate. CI fails on cost beyond the limits without a deliberate raise of
   the budget in the same change.
 - **Tests isolate their own state instead of relying on the runner.** A
   per-test temp dir isolates nothing when it reaches the code through

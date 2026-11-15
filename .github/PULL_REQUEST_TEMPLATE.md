@@ -13,10 +13,10 @@
 
 ## Checks
 
-- [ ] `cargo nextest run --all-features` passes (not `cargo test`: several tests rely on nextest's one process per test)
-- [ ] `cargo clippy --all-targets --all-features -- -Dwarnings` passes (zero warnings)
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] CI is green on all 5 lanes (Linux x86_64 and aarch64, macOS arm64 and x86_64, Windows)
+<!-- Documentation-only changes need no build or test run. -->
+- [ ] Relevant scoped tests pass via `just t <scope>` (or `just tf <scope>` for feature-gated code; nextest, not bare `cargo test`)
+- [ ] `just all` passes for shared code changes (format, compile, lockfile, clippy and static budget checks)
+- [ ] The required CI `gate` is green; the workflow selects the applicable test and build lanes
 
 ## Breaking changes
 

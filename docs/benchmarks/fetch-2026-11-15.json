@@ -1,0 +1,79 @@
+{
+  "description": "Aggregate receipts from saved local measurements. Full corpus and raw runs are not distributed. No new benchmark was run for this documentation change.",
+  "recorded_date": "2026-11-15",
+  "egress": "home IP",
+  "runs": [
+    {
+      "source_file": "m6-hard-cold.json",
+      "source_sha256": "504a2b18d870dc6839ae418caab64e1b1f011c89fd2bdd43c4fca2b59e78c033",
+      "rounds": 2,
+      "target_count": 28,
+      "summary": {
+        "fetches": 56,
+        "content": 49,
+        "classes": {
+          "content": 49,
+          "network": 1,
+          "shell": 4,
+          "wall_interaction": 2
+        },
+        "content_rate": 0.875,
+        "ms_p50": 1181.257968,
+        "ms_p95": 2871.388541,
+        "ms_max": 4732.204329,
+        "curl_content": 21,
+        "curl_fetches": 56,
+        "median_ratio_vs_curl": 1.0670622271417995,
+        "ratios": [
+          0.6130877709346148,
+          0.9247368521038322,
+          0.9252327731403157,
+          0.9315180915143272,
+          0.9781397522696524,
+          0.9984586493975386,
+          1.0102154880725014,
+          1.0179308209409752,
+          1.0441671000379944,
+          1.048510892254485,
+          1.0670622271417995,
+          1.0675420408022827,
+          1.1169800507314018,
+          1.1224158815865182,
+          1.1465864601149882,
+          1.2073342701509753,
+          1.2127862166913126,
+          1.3031206555626895,
+          1.4605936405960016,
+          1.462990142463613,
+          1.9576883262736584
+        ]
+      }
+    },
+    {
+      "source_file": "m6-hard-learned.json",
+      "source_sha256": "b5609479ac681254b9fd01130cba2f79a124bbe04ed6eb450b3accb255e8e3f5",
+      "rounds": 3,
+      "target_count": 28,
+      "summary": {
+        "fetches": 84,
+        "content": 69,
+        "classes": {
+          "content": 69,
+          "incomplete": 2,
+          "network": 1,
+          "shell": 6,
+          "wall_interaction": 5,
+          "wall_program": 1
+        },
+        "content_rate": 0.8214285714285714,
+        "ms_p50": 981.97845,
+        "ms_p95": 3028.404673,
+        "ms_max": 10304.311865000001,
+        "curl_content": 0,
+        "curl_fetches": 0,
+        "median_ratio_vs_curl": 0.0,
+        "ratios": []
+      }
+    }
+  ]
+}

@@ -12,7 +12,7 @@ just bin-dist                 # the SHIPPED shape: target/dist-thin/donsetch (wh
 cargo build --release         # local release: thin LTO, parallel codegen
 ```
 
-**Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [README](README.md#-install) for platform-specific install commands.
+**Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [setup guide](docs/setup.md#build-from-source) for platform-specific install commands.
 
 ## Development workflow
 
@@ -37,15 +37,14 @@ push unchecked.
 deps at opt-level 1, no debuginfo, codegen-units 16), and so does every CI test
 lane: what you run is what CI runs. `dist-thin` is the shipped shape (opt-level
 3, no LTO, `panic = "abort"`); the release pipeline builds it and the nightly
-heavy suite runs on it, because those tests measure time and memory. There are
-no other profiles. A plain `cargo build --release` is thin LTO on purpose: a
+heavy suite runs on it, because those tests measure time and memory. These are
+the two workflow profiles. A plain `cargo build --release` is thin LTO on purpose: a
 local release binary should not cost ten minutes.
 
 **Tests are budgeted.** The default filter in `.config/nextest.toml` excludes
-the four tests that parse a 501-page PDF, a large scanned PDF, or prove a
-20-second timing ceiling. They still run in `just heavy` and in nightly CI.
-`tests/budget.json` caps the default suite (count, per-suite count, single-test
-time, total CPU, fixture size); CI fails when a change grows past it without a
+the heavy PDF, soak and timing tests. They still run in `just heavy` and in nightly CI.
+`tests/budget.json` caps single-test time, total CPU and fixture size, never
+test count; CI fails when a change exceeds those cost limits without a
 deliberate raise. A new test should be cheap and specific: prefer a unit test or
 one integration test for the contract, keep it under ~2 s, and put anything that
 needs a real corpus or a real clock in the heavy set.
@@ -84,9 +83,9 @@ installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
 profiles, feature sets and branches become cache hits, and it wraps the C/C++
 compilers too, which is where BoringSSL's build cost actually lives.
 
-The recipes go through `scripts/budget.sh`, which pins the whole build tree to
-half the cores and passes the job cap into nested build systems (cmake, make,
-nasm). It also sizes the job count from `MemAvailable` right now (~700 MB per
+The recipes go through `scripts/budget.sh`, which uses all cores by default
+(`BG_CORES` narrows the set) and passes the job cap into nested build systems
+(cmake, make, nasm). It also sizes the job count from `MemAvailable` right now (~700 MB per
 rustc at codegen-units 16, 1 GB reserved): three to four jobs with a browser
 open, eight on an idle box. `BG_JOBS=<n>` overrides it.
 
@@ -106,11 +105,12 @@ or credential failure there never reddens the release; retry it with
 
 ### Verifying Windows compilation from Linux
 
-Linux-only changes regularly broke Windows CI in `cfg`-gated code that never
-compiled locally. `just win-check` type-checks the whole crate for
+Linux-only changes can break Windows CI in `cfg`-gated code that never
+compiles locally. `just win-check` attempts to type-check the workspace for
 `x86_64-pc-windows-gnu` without linking — both ends of the feature matrix
 (full `ocr,http` and `--no-default-features`), all targets,
-`-Dwarnings` — so those breaks surface before the push. It is not part of
+`-Dwarnings`. **The embedded V8 dependency currently prevents a complete Windows
+cross-check from Linux; native Windows CI is authoritative.** It is not part of
 `just all` because it needs a cross toolchain on top of the normal build
 prerequisites (NASM, CMake and libclang are already required above). On
 Debian/Ubuntu:
@@ -137,11 +137,10 @@ Per recipe:
   headers (`libssl-dev`, usually already present).
 - **`win-check`** runs both.
 
-The first run compiles BoringSSL for the mingw target (a few minutes); warm
-runs take seconds. The recipe's comments in the Justfile explain the three
-environment workarounds it applies. Windows CI proper stays authoritative —
-it builds the msvc target and links — but `win-check` catches the common
-case. Type-checking is the ceiling here: an actual `cargo build` for
+The cross toolchain setup above is retained for checks that the dependencies
+support. The recipe's comments in the Justfile explain the three environment
+workarounds it applies. Windows CI builds the msvc target and links.
+Even when dependencies permit a cross-check, type-checking is the ceiling: an actual `cargo build` for
 `x86_64-pc-windows-gnu` fails to link even with `--no-default-features`
 (BoringSSL), so do not expect a runnable binary out of the cross setup. The
 common case is code under `#[cfg(windows)]` or `#[cfg(unix)]` that no longer compiles
@@ -195,7 +194,7 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## What we're not looking for
 
-- **New native BYOK search providers are paused.** We are keeping the current featured provider list for now; please do not open PRs adding providers to it. Additional services can use the existing [search plugin interface](README.md#search-plugins-any-provider-no-release-needed), without a DonSeTch release.
+- **New native BYOK search providers are paused.** We are keeping the current featured provider list for now; please do not open PRs adding providers to it. Additional services can use the existing [search plugin interface](docs/tools.md#search-plugins), without a DonSeTch release.
 - **Core features that hard-require API keys.** The default toolset must work with zero keys, zero accounts. Existing BYOK integrations remain optional: the user opts in by providing their own key. They must never degrade the keyless experience.
 - Adding Python or Node.js dependencies. DonSeTch is Rust, built from scratch. That's the point.
 - Solving interactive captchas (hCaptcha, reCAPTCHA). That's a hard line, not a TODO.
@@ -203,20 +202,20 @@ Scope optional: `feat(search): add scholar vertical`.
 
 ## Architecture overview
 
-The fetch layer is `crates/fetch/` (its own crate and CI job): carried client
+The fetch layer is `crates/fetch/` (a workspace crate): carried client
 identity, carried state, a page cache, wall classification, the site's own interfaces,
-and an in-process V8 engine that runs a challenge page's own program. No browser is in
+and an in-process V8 engine that runs challenge programs or application programs for content. No browser is in
 the fetch path — Chromium serves `web_screenshot` and doctor's parity capture only. The
-[README architecture map](README.md#-built-from-scratch) is the public description of
+[architecture guide](docs/architecture.md) is the public description of
 the whole product.
 
 Fetch work is measured, not argued. The crate has `fetch`, `probe` (identity × target
 matrix), `bench` (cold, paired with curl in the same window) and `state`, and the rules
 for improving it — classify the wall first, then identity, state, request contract or
 egress, with a witness — are in
-[AGENTS.md](AGENTS.md#the-fetch-path-has-a-shape). Its suite runs as its
-own CI job on linux-x86_64 and linux-aarch64: `cd core && cargo test --release
---locked`.
+[AGENTS.md](AGENTS.md#the-fetch-path-has-a-shape). Its suite runs with the
+workspace on Linux in CI. From the repo root, a scoped fetch-crate run is
+`sh scripts/budget.sh cargo nextest run --cargo-profile fast --locked -p donsetch-fetch`.
 
 Experimental branches may have a different source layout; do not treat their
 implementation as a released feature or an approved plan. For local planning context,
@@ -226,9 +225,9 @@ follow [AGENTS.md](AGENTS.md#local-project-context).
 
 1. Fork the repo, create a branch (`feat/...`, `fix/...`, `docs/...`).
 2. Write tests for your change: unit tests in a `#[cfg(test)]` module next to the code, integration tests as a module under `tests/it/` (registered in `tests/it/main.rs`, so they share one binary). Do not add a new top-level `tests/*.rs` file: each one becomes a separate test binary that links the whole crate again.
-3. Ensure `just all` passes and let CI (the full matrix) be the gate.
+3. For code changes, run relevant scoped tests and `just all`; documentation-only changes need no build or test run.
 4. Open a PR with a conventional commit title.
-5. CI must be green on all 5 lanes before merge.
+5. The required CI `gate` must be green before merge; the workflow selects the applicable test and build lanes.
 
 ## Reporting issues
 

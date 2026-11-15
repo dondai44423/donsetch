@@ -1,6 +1,9 @@
 # Improve soak (v4 B battle-test)
 
-Mandatory receipt before any public self-improvement claim.
+Historical v4 measurement harness, not a current release gate. Current fetch
+learning is measured with `donsetch-fetch bench`; see
+[the fetch layer](../../crates/fetch/README.md). The arms and protocol below
+describe the original v4 experiment.
 
 ## Arms
 
@@ -35,5 +38,5 @@ Learning is proven only if, comparing the two arms' full-duration reports:
 1. `warm_rate_late` (ON) > `warm_rate_late` (OFF)
 2. `mean_ms_late` (ON) < `mean_ms_late` (OFF)
 
-No public improve claim without both receipts. Keep this directory;
+For this v4 comparison, a public improve claim requires both receipts. Keep this directory;
 it is the evidence, not a product surface.

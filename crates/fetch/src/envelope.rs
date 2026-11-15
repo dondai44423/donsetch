@@ -11,9 +11,9 @@
 //! * memory — a V8 heap limit that terminates instead of aborting, and an
 //!   ArrayBuffer allocator that refuses past a live-bytes cap;
 //! * network — http(s) only, browser-unsafe ports refused, non-public addresses
-//!   refused (at the URL, at DNS resolution and at every redirect hop) unless the
-//!   host is the page's own, bounded op count, request size, response size, total
-//!   bytes and redirect chain;
+//!   refused (at the URL, at DNS resolution and at every redirect hop), including
+//!   the page's own host unless private egress is explicitly enabled; bounded op
+//!   count, request size, response size, total bytes and redirect chain;
 //! * one engine at a time per process.
 
 use std::ffi::c_void;
@@ -83,9 +83,9 @@ impl Limits {
 
     /// The content lane's envelope: the same enforcement, a lane-sized budget.
     /// The wall clock covers the app's own script fetches and data calls; the
-    /// default is the first-visit budget the upgrade doc names (+1–2 s over the
-    /// document fetch). One lane run per encounter, so the op count covers a
-    /// heavy app's boot without becoming a crawl.
+    /// default is a 5-second ceiling, clamped to the encounter's remaining deadline.
+    /// One lane run per encounter, so the op count covers a heavy app's boot
+    /// without becoming a crawl.
     pub fn content() -> Self {
         Self {
             // The measured friendly SPA (hn.algolia, a 2.6 MB bundle and one

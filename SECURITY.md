@@ -32,7 +32,7 @@ If the vulnerability is confirmed, a fix will be released and you will be credit
 DonSeTch is a local MCP server that fetches web pages, searches the web, and crawls sites. Security-relevant areas:
 
 - **TLS handling**: the custom BoringSSL stack, certificate validation, and connection pooling.
-- **Challenge engine**: the embedded V8 that runs a walled page's own scripts against a bounded host, inside the DonSeTch process.
+- **Script engine**: the embedded V8 that runs challenge or application scripts against a bounded host, inside the DonSeTch process.
 - **Browser** (`web_screenshot` and `donsetch doctor`'s launch check and `--stealth --parity` capture): CDP communication and the browser process lifecycle.
 - **PDF parsing**: the PDFium FFI layer and untrusted-file handling.
 - **Search**: the egress pool, proxy handling, and rate-limit backoff.
@@ -58,15 +58,17 @@ OS access controls. Cached pages and downloaded model files also live locally.
 
 Outbound requests include the requested research, version/update checks, and
 optional model downloads. DonSeTch has no telemetry collection.
-PDFium libraries are downloaded at build time; OCR/reranker models are
-retrieved when needed. Page reads launch no browser: when a wall needs the
+PDFium libraries are downloaded at build time; OCR models are
+retrieved when needed. Search downloads no model and never loads ONNX.
+Page reads launch no browser: when a challenge or application shell needs the
 page's own program, its scripts run in an embedded V8 inside the DonSeTch
 process. `web_screenshot` and `donsetch doctor --stealth --parity`
 (which loads tls.peet.ws) run page
 JavaScript inside the installed Chromium-family browser, so that browser and
 the operating system should be kept current.
 
-HTTPS over TCP and the opt-in HTTP/3 path verify peer certificates against
+HTTPS connections verify peer certificates against
 the configured trust store and refuse the known compromised CA keys listed
 in the transport. This incident blocklist is not a general OS revocation or
-Certificate Transparency implementation. HTTP/3 is disabled by default.
+Certificate Transparency implementation. HTTP/3 is retired in v5; its legacy
+configuration keys are accepted but have no effect.

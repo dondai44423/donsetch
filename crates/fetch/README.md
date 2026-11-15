@@ -6,7 +6,7 @@ challenge page's own scripts when a wall demands it, or an application page's ow
 its document is a shell (the content lane). No browser, no layout, no rasteriser.
 
 The crate lives in `crates/fetch/`, a workspace member: build and test it from the repo root
-with `-p donsetch-fetch` (`cargo test -p donsetch-fetch`), so it shares the lockfile and target
+with `-p donsetch-fetch` (`cargo nextest run --cargo-profile fast -p donsetch-fetch`), so it shares the lockfile and target
 cache with the product. `hard-corpus.json`, `fixtures/` and `runs/` are private working
 material (git-ignored); this README is tracked.
 
@@ -24,7 +24,7 @@ V5_PERSONA=~/Projects/donsetch-evidence/research/persona/chrome-local.json \
   --targets ~/Projects/donsetch-evidence/research/corpus.json --out matrix.json
 
 # interface equivalence: the ids the page links to must be the ids we return
-python3 runs/verify_datapaths.py
+python3 crates/fetch/runs/verify_datapaths.py
 
 # cold measurement paired with curl on the same window
 ./target/release/donsetch-fetch bench \
@@ -32,8 +32,8 @@ python3 runs/verify_datapaths.py
 
 # the same corpus through one egress lane: the egress class is the variable
 source ~/.config/secrets.env
-./target/release/donsetch-fetch bench --targets hard-corpus.json --runs 2 --curl \
-  --proxy "http://$V5_PROXY_USER:$V5_PROXY_PASS@198.23.243.226:6361" --out runs/a6-dc.json
+./target/release/donsetch-fetch bench --targets crates/fetch/hard-corpus.json --runs 2 --curl \
+  --proxy "http://$V5_PROXY_USER:$V5_PROXY_PASS@198.23.243.226:6361" --out crates/fetch/runs/a6-dc.json
 
 # steady state: discovery allowed, state carried between rounds (--no-cache measures learning
 # alone; without it the page cache answers too)
@@ -109,12 +109,12 @@ and order). A ninth identity labelled `curl` was removed: it was the native stac
 user-agent, a claim no detector would believe.
 
 All Chrome identities share JA4 `t13d1517h2_8daaf6152771_cb7bf5808d99` and 17 headers in the
-same order; JA3 varies per connection as Chrome's does. Chromium 156/157 send TLS extension
+same order; JA3 varies per connection as Chrome's does. Android Chromium 156/157 and this box's desktop Chromium 157 send TLS extension
 4832, which no `wreq-util` profile sends — hence `chrome-android` is declared as 149 rather
 than relabelled, and replacing it is a reference-capture task, not a code change.
 
 One-shot product reads present the host's own class — `chrome-local` on Linux, `chrome-win` on
-Windows, `safari` on macOS (`src/fetch/core.rs`): a Linux UA leaving a Windows box contradicts
+Windows, `safari` on macOS (`src/fetch/layer.rs`): a Linux UA leaving a Windows box contradicts
 the client hints and is the incoherence this rule forbids.
 
 **Selection is per origin, measured:** stored winner → this origin's scored identities → for a
@@ -343,7 +343,7 @@ Each mint and each lane run lives inside limits enforced outside the page
 | WebAssembly memory | 128 MB total | V8 per-memory page flag plus host charges; resident-memory ceiling as backstop (`VmRSS`, working set, `task_info`) |
 | Ops | 96 per mint and per lane run (`V5_CONTENT_OPS` for the lane) | counted in Rust |
 | Lane pump rounds | 600 | the pump's own loop cap: a page that keeps scheduling work without ever changing the document ends there, reported as `budget` like the wall |
-| Network | http(s), public addresses, 5 redirects, 1 MB request, 8 MB per response (mint) / 16 MB (lane), 32 MB total (mint) / 48 MB (lane) | one guard for URL, resolver and redirect policy; the page's own host is exempt from the private-address rule |
+| Network | http(s), public addresses, 5 redirects, 1 MB request, 8 MB per response (mint) / 16 MB (lane), 32 MB total (mint) / 48 MB (lane) | one guard for URL, resolver and redirect policy; even the page's own host must resolve publicly unless private egress is explicitly enabled |
 | Concurrency | one engine per process at a time | process-wide slot |
 
 The guards live in the Rust op bodies, not the JS wrapper, and `Deno` is deleted before any page
@@ -391,7 +391,7 @@ egress, human interaction, the page's own program) and the **nine outcome classe
 | Outcome | Wall class | Meaning | Ours? |
 |---|---|---|---|
 | `content` | covered by state we hold | the contract passed | done |
-| `wall_state` | state renewal | clearance or session missing or stale; a login form is the commonest shape | declared — never a failure; sessions deferred, never credentials |
+| `wall_state` | state renewal | clearance missing or stale, or a login gate | clearance renewal is work; login is declared, never attempted; no stored login credentials or signed-in sessions |
 | `wall_contract` | request contract | the page carries a challenge payload a native contract can answer | yes — contract |
 | `wall_identity` | another identity or egress | refused with no page of its own, or a short page titled as a refusal even when served 200 (Akamai's "Access Denied") | yes — identity/egress |
 | `wall_interaction` | human interaction | slider, press-and-hold, captcha, Turnstile widget | identity only — the vendor's known passers are tried; otherwise declared |
@@ -471,13 +471,16 @@ not a browser), V8, `btls` (WebCrypto on the BoringSSL the TLS stack links), `ge
 | `V5_CONTENT_WALL_MS` | the content lane's wall-clock cap per run (default 5000); its other limits are `envelope::Limits::content()` (96 ops, 16 MB per response, 48 MB total) |
 | `V5_CONTENT_OPS` | the content lane's op budget per run (default 96) |
 
-Tests are offline: `cargo test --release --offline`. A few tests are `#[ignore]`d by default —
-the AWS WAF fixture tests need the private captures (`--include-ignored`) and one is a
+Tests are offline: from the repo root, run
+`sh scripts/budget.sh cargo nextest run --cargo-profile fast --locked -p donsetch-fetch --offline`.
+A few tests are `#[ignore]`d by default —
+the AWS WAF fixture tests need the private captures (`--run-ignored all`) and one is a
 measurement. Engine tests take a process-wide turn, so timing assertions are not contaminated by
 parallel tests. Measured runs land in `runs/` (bench JSON, the identity matrix, datapath
 equivalence).
 
-Where the suite runs: linux-x64 and linux-aarch64 in CI, both with the product binary starting
-(PDFium links with the toolchain's `rust-lld`; see the root README, "LLD"). The product's macOS
-and Windows jobs exercise this crate as a library through their own suites; a native `cargo
-test` on those two happens on a contributor's machine at release, never in CI.
+Where the suite runs: the Linux x86_64 CI test lane runs the workspace, including this crate.
+The macOS arm64 and Windows x86_64 platform lanes compile the workspace tests and run selected
+platform scopes. Release and nightly build jobs build and gate five binaries, including
+Linux aarch64 and macOS x86_64; those build jobs are not full test-suite lanes.
+PDFium links with the toolchain's `rust-lld`; see the root README, "LLD".
