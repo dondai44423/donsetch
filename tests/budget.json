@@ -1,13 +1,7 @@
 {
-  "_comment": "A deliberate ceiling, not a target. Growth is a decision: raise a number here in the same commit that adds the coverage, and say why. After a clean full run `just ratchet` tightens every ceiling back to what the suite really uses, so room to grow never builds up unnoticed. max_single_test_s is CI-runner headroom (the desktop's slowest test is ~10 s); a test that needs more belongs in the heavy lane (.config/nextest.toml default-filter).",
-  "max_total": 2458,
+  "_comment": "A deliberate ceiling on wall clock, not on coverage: the suite may grow as the product does (a test is cheap; a slow suite is not). max_single_test_s is CI-runner headroom (the desktop's slowest test is ~10 s); a test that needs more belongs in the heavy lane (.config/nextest.toml default-filter). max_sum_s is the CPU ceiling; `just ratchet` tightens it to the last measured run. There is no test-count ceiling and there must not be one: counting tests punished the coverage the release needs.",
   "max_single_test_s": 30,
   "max_sum_s": 720,
-  "suites": {
-    "donsetch-fetch::donsetch_fetch": 232,
-    "donsetch::donsetch": 2148,
-    "donsetch::it": 107
-  },
   "allow_slow": [],
   "fixtures_mb": {
     "tests/fixtures": 4,
