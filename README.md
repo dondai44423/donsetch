@@ -19,7 +19,7 @@
 [![npm downloads](https://img.shields.io/npm/dm/donsetch?color=cb3837&logo=npm&label=downloads)](https://www.npmjs.com/package/donsetch)
 [![GitHub stars](https://img.shields.io/github/stars/dondai44423/donsetch?style=flat&logo=github&color=e3b341)](https://github.com/dondai44423/donsetch/stargazers)
 
-[Why](#-why-its-different) · [Demo](#-demo) · [Sponsors](#-our-sponsors) · [Install](#-install) · [Quickstart](#-quickstart) · [The 4 tools](#-the-4-tools) · [Fetch](#-fetch) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Stealth](#-stealth-real-clients-not-chrome-like) · [Compare](#-how-it-compares) · [Limits](#-gotchas--honest-limits) · [CLI](#-cli)
+[Why](#-why-its-different) · [Demo](#-demo) · [Field test](#-field-test-v5-against-the-live-web) · [Sponsors](#-our-sponsors) · [Install](#-install) · [Quickstart](#-quickstart) · [The 4 tools](#-the-4-tools) · [Fetch](#-fetch) · [Search](#-keyless-search) · [PDF](#-pdf--ocr) · [Stealth](#-stealth-real-clients-not-chrome-like) · [Compare](#-how-it-compares) · [Limits](#-gotchas--honest-limits) · [CLI](#-cli)
 
 </div>
 
@@ -71,6 +71,54 @@ Works with every MCP client (Claude Code, Cursor, OpenCode, Pi, Hermes) and as a
 </div>
 
 *(Pi agent session: live research with DonSeTch as a native extension)*
+
+## 🧪 Field test: v5 against the live web
+
+One run, 15 Nov 2026: ~90 live reads over 75+ public sites, from one ordinary home egress (geolocating in Nepal, which is part of why prices and listings read local), every result opened and read by hand rather than scored by a script. Every wall's `[meta]` reported one escalation stage, `local / http-fetch` — there is no browser hop anywhere in the ladder, so each pass below was won by client identity, held state, or the site's own interface. No Chrome, no Playwright, no per-page VM.
+
+Conditions, since they matter: this was the **learned** regime, not a cold corpus — the state file already held 48 earlier origins, the learned vendor priors and their cookie jars (152 of the 202 origin records were written during the sweep itself). That is the regime a real user is in after a few days, and the one the numbers below describe.
+
+| | |
+|---|---|
+| **Median read to content** | **1.1 s** (p90 3.8 s, best 0.41 s, 39 of 54 timed reads under 2 s) |
+| **Batch** | 8 URLs → 36.6 KB extracted in 5.1 s, 6/8 content |
+| **Outcome, 85 scored reads** | 60 content (≈71%) · 15 refused (≈18%, one at the transport layer) · 7 JS-shell or degraded · 3 size or timeout |
+| **Plus** | 4 login walls, correctly returned as `wall.auth` and not counted as blocks |
+
+**Where it walked through.** These are the reads that prove it was real data, not a landing shell:
+
+| Site | What came back |
+|---|---|
+| `linkedin.com/jobs/search` (Berlin, data engineer) | 20 real postings, employers and ages — from a site that walls almost everyone |
+| `walmart.com/search` | live listing with price and review count (`$89.97`, 971 reviews) |
+| `amazon.com` + `/s?k=` | homepage and 20+ real search listings |
+| `crunchbase.com/organization/openai` | profile page (`seekingalpha.com`, `g2.com`, `zoominfo.com`, `stockx.com` likewise) |
+| `finance.yahoo.com/quote/AAPL` | quote `356.27 +0.39%`, close time |
+| `twitch.tv` | live top streams with viewer counts via `twitch-gql` |
+| `reddit.com/r/programming` | 24 real items via the JSON interface |
+| `ebay.com/sch`, `etsy.com`, `nike.com`, `zillow.com`, `wayfair.com`, `booking.com`, `airbnb.com` | real listings, prices, availability |
+| `reuters.com`, `ft.com`, `nytimes.com`, `lefigaro.fr` | 4–15 KB of article text each |
+
+**Where it was stopped, and by whom.** Named, not hand-waved:
+
+| Wall | Sites | Answer |
+|---|---|---|
+| Cloudflare managed challenge | Indeed, DoorDash, BlackHatWorld, Mercari, nowsecure.nl, one Reddit permalink | `Challenge(Cloudflare)` 403 |
+| DataDome | Yelp | `Challenge(DataDome)` 403 |
+| Kasada | Chewy | `Challenge(Kasada)` 429 |
+| Generic challenge | Home Depot, Avito, Ozon, StubHub, TikTok | 403 / 429, or an interstitial that did not clear |
+| Transport-level | Best Buy (twice) | HTTP/2 `stream error` — refused below HTTP |
+| Soft gate | Quora | "Something went wrong", reported as transient, not as content |
+
+**Passes that did not pay out.** A fair accounting has to include these: `threads.net` and category pages on Target and Costco are built after layout and come back as an honest JS-shell note; Flightradar24 is a canvas; Google's SERP returned a stub with zero results; Temu ships marketing copy with words replaced by `*`; Crunchbase renders funding figures as the literal string `obfuscated`; Reddit's listing answered through its JSON interface, then degraded to 20–40 s timeouts under repeat reads instead of a clean 429. Two hard limits also showed up: an 8 MiB body cap (Bloomberg), and a heavy page that timed out (Rakuten).
+
+**Why it costs the machine almost nothing.** Those ~90 reads ran inside the session's existing process while the rest of the machine was in normal use — no browser spawned per page, so no 300 MB+ renderer churn, no GPU, no zombie Chromium, nothing to leak between sites. A read is one HTTP request at curl's cost (~4 KB of state, not a VM); V8 only spins when a wall needs the page's own program, bounded to that mint, then exits. The same sweep through a browser fleet is either a long serial crawl or a dozen parallel Chrome instances saturating RAM and CPU.
+
+**Honest limits, no asterisks.** Cloudflare's managed challenge still does not pass cold — identity is spent first, which covers the sites that accept the identity. DataDome, Kasada, Turnstile and press-and-hold walls do not clear without an external unlocker key, by design. Pages whose content exists only after layout stay declared as shells. Client-side obfuscation (Temu's text, Crunchbase's figures) is not defeated by any fetch layer.
+
+Being clear about the achievement: **71% content and a 1.1 s median across 75+ real sites, with LinkedIn jobs, Walmart prices, Crunchbase and Yahoo quotes in the pass column, is a browser-class result from a process that never started a browser.** The rest came up short for exactly the reasons a browser-free client is supposed to: a named wall, a declared shell, or an honest size limit — never an interstitial passed off as the page.
+
+Stealth work continues — managed-chain Cloudflare, DataDome and Kasada in-process, and getting the SPA cases to their data without adding a renderer — under one constraint that will not be traded away: **the fast path stays browser-free and stays ~1 s.**
 
 ## 💛 Our Sponsors
 
