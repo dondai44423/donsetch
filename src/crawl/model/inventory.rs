@@ -97,7 +97,19 @@ pub async fn collect(fetch: &PageFetcher, opts: &InventoryOptions<'_>) -> Invent
     let thin = !c.pagelist_found
         && (in_scope == 0 || (in_scope < 3 && raw_count > in_scope.saturating_mul(2)));
     if thin {
-        c.seed_links().await;
+        c.seed_links(true).await;
+        // The seed's links are one hop deep. When the site publishes no
+        // inventory, its own hub pages are where the tree continues: a
+        // travel category links to its books. Bounded link discovery, as
+        // the site model says, never a frontier walk.
+        c.expand_hubs().await;
+    } else if opts.seed_page.is_some() {
+        // The seed page is already in hand. Its navigation names the pages
+        // the sitemap lists (a sitemap carries URLs, never titles), and that
+        // label is what focus recall needs: "Flexbox" is a title, while the
+        // URL says `Flexible_box_layout`. Labels only, no new URLs, no
+        // request.
+        c.seed_links(false).await;
     }
     c.finish()
 }
@@ -154,10 +166,14 @@ impl<'a> Collector<'a> {
         Some(page)
     }
 
-    /// Add one candidate. Returns true when it is a new inventory URL.
+    /// Add one candidate. `label` is the site's own name for the page
+    /// (link text, an `llms.txt` title) and is kept for focus matching;
+    /// a page whose URL says nothing can still answer a topic.
+    /// Returns true when it is a new inventory URL.
     fn add(
         &mut self,
         raw: &str,
+        label: Option<&str>,
         lastmod: Option<String>,
         source: &'static str,
         base: &Url,
@@ -188,9 +204,13 @@ impl<'a> Collector<'a> {
             return false;
         }
         let key = frontier::normalize(&u);
+        let label = label.map(str::trim).filter(|l| !l.is_empty());
         match self.urls.get_mut(&key) {
             Some(existing) => {
                 existing.lastmod = newer(existing.lastmod.take(), lastmod);
+                if existing.title.is_none() {
+                    existing.title = label.map(str::to_string);
+                }
                 false
             }
             None => {
@@ -200,6 +220,7 @@ impl<'a> Collector<'a> {
                         url: key,
                         lastmod,
                         source: source.to_string(),
+                        title: label.map(str::to_string),
                     },
                 );
                 *self.sources.entry(source.to_string()).or_default() += 1;
@@ -234,7 +255,7 @@ impl<'a> Collector<'a> {
             if low.contains("/pagelist") || low.contains("/article/body") {
                 continue;
             }
-            self.add(&link, None, "llms", &base);
+            self.add(&link, Some(title.as_str()), None, "llms", &base);
         }
         if page_list.is_none() {
             for u in raw_urls(&text) {
@@ -276,7 +297,7 @@ impl<'a> Collector<'a> {
         let base = self.origin_url();
         let mut added = 0usize;
         for p in paths {
-            if self.add(&p, None, "pagelist", &base) {
+            if self.add(&p, None, None, "pagelist", &base) {
                 added += 1;
             }
         }
@@ -338,7 +359,7 @@ impl<'a> Collector<'a> {
                 // A plain-text sitemap: one URL per line.
                 for line in text.lines() {
                     let l = line.trim();
-                    if l.starts_with("http") && self.add(l, None, "sitemap", self.opts.seed) {
+                    if l.starts_with("http") && self.add(l, None, None, "sitemap", self.opts.seed) {
                         saw_page = true;
                     }
                 }
@@ -348,7 +369,7 @@ impl<'a> Collector<'a> {
                     if child_locale_ok(&e.loc, self.seed_locale().as_deref()) && queue.len() < 64 {
                         queue.push_back(e.loc);
                     }
-                } else if self.add(&e.loc, e.lastmod, "sitemap", self.opts.seed) {
+                } else if self.add(&e.loc, None, e.lastmod, "sitemap", self.opts.seed) {
                     saw_page = true;
                 }
             }
@@ -367,13 +388,38 @@ impl<'a> Collector<'a> {
             && !self.cap_hit;
     }
 
-    async fn seed_links(&mut self) {
+    /// Set the site's own label on a URL already in the inventory. A label
+    /// never adds a URL: on a sitemap site the seed's navigation names pages
+    /// the sitemap already lists, and that name is what focus recall needs.
+    fn label(&mut self, raw: &str, label: &str, base: &Url) {
+        if raw.is_empty() || label.trim().is_empty() {
+            return;
+        }
+        let Ok(mut u) = base.join(raw) else {
+            return;
+        };
+        u.set_fragment(None);
+        if !matches!(u.scheme(), "http" | "https") {
+            return;
+        }
+        let u = frontier::canonical_scheme(&u, self.opts.seed);
+        let key = frontier::normalize(&u);
+        if let Some(entry) = self.urls.get_mut(&key)
+            && entry.title.is_none()
+        {
+            entry.title = Some(label.trim().to_string());
+        }
+    }
+
+    async fn seed_links(&mut self, add_missing: bool) {
         let page = match self.opts.seed_page {
             Some(p) => p.clone(),
-            None => match self.get(self.opts.seed.as_str()).await {
+            None if add_missing => match self.get(self.opts.seed.as_str()).await {
                 Some(p) => p,
                 None => return,
             },
+            // A label pass never spends an inventory request.
+            None => return,
         };
         if !(200..300).contains(&page.status) || !matches!(page.verdict, Verdict::ContentOk) {
             if !self.deadline_hit {
@@ -393,7 +439,9 @@ impl<'a> Collector<'a> {
             if let Ok(selector) = Selector::parse("a[href]") {
                 for el in doc.select(&selector) {
                     if let Some(href) = el.value().attr("href") {
-                        links.push(href.to_string());
+                        let text = el.text().collect::<String>();
+                        let label = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        links.push((href.to_string(), label));
                     }
                 }
             }
@@ -409,8 +457,15 @@ impl<'a> Collector<'a> {
             });
             (links, feed_href)
         };
-        for href in links {
-            self.add(&href, None, "seed-link", &base);
+        for (href, label) in links {
+            if add_missing {
+                self.add(&href, Some(&label), None, "seed-link", &base);
+            } else {
+                self.label(&href, &label, &base);
+            }
+        }
+        if !add_missing {
+            return;
         }
         if self.remaining() > 0
             && let Some(href) = feed_href
@@ -422,6 +477,69 @@ impl<'a> Collector<'a> {
         }
     }
 
+    /// One bounded hop through the site's own hub pages. Only when the
+    /// inventory is the seed's links (no sitemap, page list or feed): the
+    /// best-ranked seed link for the focus is read, and its links join the
+    /// inventory. Two hubs at most, inside the same request budget.
+    async fn expand_hubs(&mut self) {
+        let Some(query) = self.opts.focus.or(self.opts.seed_query) else {
+            return;
+        };
+        let seed_key = frontier::normalize(self.opts.seed);
+        let mut hubs: Vec<(f64, String)> = self
+            .urls
+            .iter()
+            .filter(|(key, entry)| *key != &seed_key && entry.source == "seed-link")
+            .filter_map(|(key, entry)| {
+                let url = Url::parse(key).ok()?;
+                if !frontier::scope_allowed(url.path(), self.opts.include, self.opts.exclude) {
+                    return None;
+                }
+                let score = crate::crawl::score::score_candidate(
+                    entry.title.as_deref().unwrap_or(""),
+                    url.path(),
+                    Some(query),
+                );
+                Some((score, key.clone()))
+            })
+            .collect();
+        hubs.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        for (score, key) in hubs.into_iter().take(2) {
+            if self.remaining() == 0 || score <= 0.0 {
+                break;
+            }
+            let Some(page) = self.get(&key).await else {
+                break;
+            };
+            if !(200..300).contains(&page.status) || !matches!(page.verdict, Verdict::ContentOk) {
+                continue;
+            }
+            let html = text_of(&page);
+            let base = Url::parse(&page.url).unwrap_or_else(|_| self.opts.seed.clone());
+            let links = {
+                let doc = Html::parse_document(&html);
+                let mut links = Vec::new();
+                if let Ok(selector) = Selector::parse("a[href]") {
+                    for el in doc.select(&selector) {
+                        if let Some(href) = el.value().attr("href") {
+                            let text = el.text().collect::<String>();
+                            let label = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            links.push((href.to_string(), label));
+                        }
+                    }
+                }
+                links
+            };
+            for (href, label) in links {
+                self.add(&href, Some(&label), None, "hub-link", &base);
+            }
+        }
+    }
+
     fn feed(&mut self, page: &FetchedPage, base: &Url) {
         let text = text_of(page);
         let doc = Html::parse_document(&text);
@@ -430,12 +548,12 @@ impl<'a> Collector<'a> {
         };
         for el in doc.select(&selector) {
             if let Some(href) = el.value().attr("href") {
-                self.add(href, None, "feed", base);
+                self.add(href, None, None, "feed", base);
             } else {
                 let text = el.text().collect::<String>();
                 let link = text.trim();
                 if link.starts_with("http") {
-                    self.add(link, None, "feed", base);
+                    self.add(link, None, None, "feed", base);
                 }
             }
         }
@@ -503,7 +621,8 @@ impl<'a> Collector<'a> {
             self.sitemap_complete && !self.cap_hit && !self.deadline_hit
         };
         let seed_links = self.sources.get("seed-link").copied().unwrap_or(0)
-            + self.sources.get("feed").copied().unwrap_or(0);
+            + self.sources.get("feed").copied().unwrap_or(0)
+            + self.sources.get("hub-link").copied().unwrap_or(0);
         let sitemap_count = self.sources.get("sitemap").copied().unwrap_or(0);
         let complete = complete && seed_links == 0;
         let source = if self.pagelist_found {

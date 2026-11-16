@@ -18,6 +18,7 @@ fn inv(url: &str) -> InvUrl {
         url: url.to_string(),
         lastmod: None,
         source: "sitemap".to_string(),
+        title: None,
     }
 }
 

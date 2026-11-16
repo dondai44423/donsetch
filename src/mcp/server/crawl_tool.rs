@@ -907,10 +907,15 @@ fn render_crawl_plan(
             text.push_str(&format!("sources: {sources}\n"));
         }
     }
-    let focus = match (&plan.focus, plan.coverage.focus_matches) {
-        (Some(q), n) if n > 0 => format!("\"{q}\" {n}/{} pages", plan.pages.len()),
-        (Some(q), _) => format!("\"{q}\" no match"),
-        (None, _) => "none".to_string(),
+    let focus = match &plan.focus {
+        Some(q) => format!(
+            "\"{q}\": {}/{} topics · {}/{} pages",
+            plan.coverage.focus_topics_answered,
+            plan.coverage.focus_topics,
+            plan.coverage.focus_matches,
+            plan.pages.len().max(1)
+        ),
+        None => "none".to_string(),
     };
     text.push_str(&format!(
         "plan: {} pages · {}/{} sections ({}% of URLs) · {}/{} families · focus {} · {} est tokens · {} ms · {}\n",
@@ -929,6 +934,12 @@ fn render_crawl_plan(
         text.push_str(
             "focus fallback: no URL matched; the plan is breadth-only and focus precision is 0.\n",
         );
+    }
+    if !plan.coverage.focus_unanswered.is_empty() {
+        text.push_str(&format!(
+            "focus gaps: {} — no inventory URL carries the term\n",
+            plan.coverage.focus_unanswered.join(", ")
+        ));
     }
     text.push_str("\n## Pages\n");
     for (index, row) in plan.pages.iter().enumerate() {
@@ -1081,6 +1092,10 @@ fn render_crawl_digest(result: &crate::crawl::CrawlResult) -> Value {
         })).collect::<Vec<_>>(),
         "handles": d.pages.iter().map(|p| (p.handle.clone(), json!(p.url))).collect::<serde_json::Map<_, _>>(),
     });
+    if let Some(job) = &d.job {
+        // `resume` is the documented continuation token; the job id is it.
+        structured["resume"] = json!(job);
+    }
     if let Some(delta) = &result.delta {
         structured["mode"] = json!("diff");
         structured["delta"] = serde_json::to_value(delta).unwrap_or(Value::Null);
@@ -1304,6 +1319,9 @@ fn render_crawl_run_dataset(result: &crate::crawl::CrawlResult) -> Value {
         "plan": result.plan,
         "handles": d.pages.iter().map(|p| (p.handle.clone(), json!(p.url))).collect::<serde_json::Map<_, _>>(),
     });
+    if let Some(job) = &d.job {
+        structured["resume"] = json!(job);
+    }
     if !next_action.is_empty() {
         structured["next_action"] = json!(next_action);
     }
@@ -1374,10 +1392,15 @@ fn render_model_brief(m: &crate::crawl::model::ModelSummary) -> String {
 }
 
 fn plan_summary_line(plan: &crate::crawl::model::plan::Plan) -> String {
-    let focus = match (&plan.focus, plan.coverage.focus_matches) {
-        (Some(q), n) if n > 0 => format!("\"{q}\" {n}/{} pages", plan.pages.len()),
-        (Some(q), _) => format!("\"{q}\" no match"),
-        (None, _) => "none".to_string(),
+    let focus = match &plan.focus {
+        Some(q) => format!(
+            "\"{q}\": {}/{} topics · {}/{} pages",
+            plan.coverage.focus_topics_answered,
+            plan.coverage.focus_topics,
+            plan.coverage.focus_matches,
+            plan.pages.len().max(1)
+        ),
+        None => "none".to_string(),
     };
     format!(
         "plan: {} pages · {}/{} sections ({}% of URLs) · {}/{} families · focus {} · {} est tokens · {}\n",

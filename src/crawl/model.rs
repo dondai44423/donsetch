@@ -168,7 +168,7 @@ pub async fn map(fetch: &PageFetcher, req: MapRequest<'_>) -> MapOutcome {
             },
             families: d.families.clone(),
             sections: infer::sections_from_families(&d.families),
-            urls: Vec::new(),
+            urls: dossier_inventory(&d.inventory, &d.labels),
             summary,
             seed_failure: None,
             filtered_out,
@@ -228,6 +228,11 @@ pub async fn map(fetch: &PageFetcher, req: MapRequest<'_>) -> MapOutcome {
         top_families: built.families.iter().take(40).cloned().collect(),
     };
     let inventory_urls: Vec<String> = inv.urls.iter().map(|u| u.url.clone()).collect();
+    let inventory_labels: BTreeMap<String, String> = inv
+        .urls
+        .iter()
+        .filter_map(|u| u.title.clone().map(|title| (u.url.clone(), title)))
+        .collect();
     let contract = dossier::ChangeContract {
         inventory_hash: built.inventory_hash.clone(),
         source: inv.source.to_string(),
@@ -242,6 +247,7 @@ pub async fn map(fetch: &PageFetcher, req: MapRequest<'_>) -> MapOutcome {
             families: &built.families,
             map: &inv.map,
             inventory: &inventory_urls,
+            labels: &inventory_labels,
             contract: Some(&contract),
             focus: req.opts.focus.as_deref(),
             include: &include,
@@ -282,6 +288,26 @@ pub async fn map(fetch: &PageFetcher, req: MapRequest<'_>) -> MapOutcome {
         filtered_out: inv.filtered.total(),
         stop,
     }
+}
+
+/// The dossier's stored inventory as planner input. A warm map has no live
+/// `InvUrl` list, and a plan needs every in-scope URL to assign families and
+/// spend its budget, not just the family samples. The dossier keeps the URL
+/// strings and the site's own labels; a page with no label falls back to its
+/// family's freshness.
+fn dossier_inventory(
+    inventory: &[String],
+    labels: &BTreeMap<String, String>,
+) -> Vec<infer::InvUrl> {
+    inventory
+        .iter()
+        .map(|url| infer::InvUrl {
+            url: url.clone(),
+            lastmod: None,
+            source: "dossier".to_string(),
+            title: labels.get(url).cloned(),
+        })
+        .collect()
 }
 
 fn static_source(source: &str) -> &'static str {

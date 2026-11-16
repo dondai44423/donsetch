@@ -7,6 +7,7 @@
 
 use super::infer::{Family, InvUrl, Section, SiteKind};
 use crate::crawl::score::{self, FocusIdf};
+use crate::extract::{focus as lexicon, language};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -19,6 +20,11 @@ pub const TOKENS_PER_PAGE: usize = 1200;
 /// Reserve rows kept for a failed page. Enough for a run that loses a
 /// quarter of its budget without a second planning pass.
 const RESERVE_CAP: usize = 24;
+/// Members kept per family. A family is a set of pages; this bound is
+/// memory, not policy.
+const MEMBER_CAP: usize = 64;
+/// Focus topics a plan answers. The caller's own words, bounded.
+const TOPIC_CAP: usize = 8;
 /// Explain mode's candidate table is bounded: the agent gets the shape,
 /// not 14k rows.
 const TRACE_CAP: usize = 200;
@@ -80,6 +86,10 @@ pub struct PlanRow {
     #[serde(default)]
     pub freshness: Option<String>,
     pub focus: bool,
+    /// The caller's focus topics this page answers, by label. A multi-topic
+    /// focus is planned per topic, so a row names what it buys.
+    #[serde(default)]
+    pub topics: Vec<String>,
     pub request_class: String,
 }
 
@@ -91,10 +101,27 @@ pub struct PlanCoverage {
     pub families_covered: usize,
     pub urls_total: usize,
     pub urls_covered: usize,
+    /// Pages this plan actually returns. `urls_covered` is section-credited
+    /// (one page speaks for its whole section); this is the honest count.
+    #[serde(default)]
+    pub urls_planned: usize,
     /// Families in the focus pool before any fallback.
     pub focus_pool: usize,
+    /// URLs in the focus pool: every inventory page that answers the focus.
+    #[serde(default)]
+    pub focus_urls: usize,
     pub focus_matches: usize,
     pub focus_precision: f64,
+    /// The caller's focus topics: terms the plan owes an answer, not words
+    /// scored against a family representative.
+    #[serde(default)]
+    pub focus_topics: usize,
+    #[serde(default)]
+    pub focus_topics_answered: usize,
+    /// Topics no planned page answers. An empty list is the recall claim;
+    /// a non-empty one names the gap instead of hiding it behind `covered`.
+    #[serde(default)]
+    pub focus_unanswered: Vec<String>,
     /// URL-weighted section coverage: one page in a section credits the
     /// section's whole family size. The gate's unit.
     pub url_weight: f64,
@@ -141,6 +168,12 @@ pub struct Plan {
     families_total: usize,
     #[serde(default)]
     urls_total: usize,
+    /// Focus URLs in the pool and the labels it owes an answer for, kept
+    /// so `recompute` re-derives coverage after a failed-page replacement.
+    #[serde(default)]
+    focus_urls: usize,
+    #[serde(default)]
+    focus_labels: Vec<String>,
 }
 
 pub struct PlanRequest<'a> {
@@ -160,14 +193,42 @@ pub struct PlanRequest<'a> {
 
 /// One family's representative URL and score. Owned because the plan
 /// sorts and reuses it after the input borrow ends.
+///
+/// A family is a **set**, not a page: `members` carries the rest of the
+/// inventory URLs this family covers, best first, so depth can spend the
+/// remaining budget on them instead of stopping at a three-URL sample.
 struct Candidate {
     family: usize,
     section: usize,
     url: String,
-    samples: Vec<String>,
+    /// Focus topics the representative answers.
+    topics: u32,
+    members: Vec<Member>,
     focus: bool,
     score: f64,
+    /// The representative's own focus score, without the family prior.
+    best_score: f64,
 }
+
+/// One inventory page inside a family: what it scores for the focus and
+/// which of the caller's topics it answers.
+struct Member {
+    url: String,
+    score: f64,
+    topics: u32,
+    lastmod: Option<String>,
+}
+
+/// One term of the caller's focus string. The label is the caller's own
+/// word; the tokens are its stemmed forms, matched against a URL path.
+#[derive(Debug, Clone)]
+struct Topic {
+    label: String,
+    tokens: Vec<String>,
+}
+
+/// `best_topic_member` uses this to name a candidate's own URL.
+const OWN: usize = usize::MAX;
 
 /// Build a plan. Deterministic for the same model and options.
 pub fn build(req: PlanRequest<'_>) -> Plan {
@@ -189,58 +250,46 @@ pub fn build(req: PlanRequest<'_>) -> Plan {
         )
     });
 
-    // Every focus URL, grouped by its most-specific section. The full
-    // inventory is used, not the capped map view: a 10-page plan should
-    // not inherit a ranking cut made for a 120-URL preview.
-    let focus_by_section: HashMap<String, Vec<String>> = if let Some(q) = focus {
-        let section_paths: HashSet<&str> = sections.iter().map(|s| s.path.as_str()).collect();
-        let max_depth = sections
-            .iter()
-            .map(|s| s.path.split('/').count())
-            .max()
-            .unwrap_or(0);
-        let mut by_section: HashMap<String, Vec<String>> = HashMap::new();
-        for entry in req.urls {
-            let url = &entry.url;
-            if !url_matches(url, q) {
-                continue;
-            }
-            if let Some(section) = section_for_url(url, &section_paths, max_depth) {
-                by_section.entry(section).or_default().push(url.clone());
-            }
-        }
-        by_section
-    } else {
-        HashMap::new()
-    };
-
-    let mut focus_pool = 0usize;
-    let mut candidates = candidate_pool(
+    // The family is a set, not a page. Every in-scope URL is assigned to
+    // the family its shape belongs to, so a family's members are all of its
+    // pages rather than a three-URL sample. A focus plan scores those
+    // members and answers each named topic before it spends a page on
+    // breadth; whatever the budget leaves is spent on members, not dropped.
+    let topics = focus.map(topics_of).unwrap_or_default();
+    let mut by_section_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (fi, f) in families.iter().enumerate() {
+        by_section_path
+            .entry(f.section.as_str())
+            .or_default()
+            .push(fi);
+    }
+    let (mut candidates, mut focus_pool, focus_urls) = build_candidates(
         &families,
         &sections,
         &section_index,
-        &focus_by_section,
+        &by_section_path,
+        req.urls,
         focus,
         idf.as_ref(),
+        &topics,
         req.site_kind,
-        focus.is_some(),
-        &mut focus_pool,
     );
     let mut focus_fallback = false;
     if focus.is_some() && candidates.is_empty() {
         focus_fallback = true;
         focus_pool = 0;
-        candidates = candidate_pool(
+        let (fallback, _, _) = build_candidates(
             &families,
             &sections,
             &section_index,
-            &focus_by_section,
+            &by_section_path,
+            req.urls,
             None,
             None,
+            &[],
             req.site_kind,
-            false,
-            &mut focus_pool,
         );
+        candidates = fallback;
     }
 
     // Site-kind ordering of sections: focus first when set, then the
@@ -288,33 +337,69 @@ pub fn build(req: PlanRequest<'_>) -> Plan {
     let mut reserves: Vec<PlanRow> = Vec::new();
     let mut used_urls: HashSet<String> = HashSet::new();
     let mut used_families: HashSet<usize> = HashSet::new();
-    let mut selected: Vec<usize> = Vec::new();
+    let mut covered_sections: HashSet<usize> = HashSet::new();
 
-    // 1. Cover: one page per active section first. This is the coverage
-    // unit; a second page in the same section is depth, not breadth.
-    for si in section_order {
+    // 0. The caller's topics first. Every named term the inventory can
+    // answer gets a page before breadth spends one: the recall unit is the
+    // topic, never a family representative that happens to carry a word.
+    for ti in 0..topics.len() {
         if pages.len() >= budget {
             break;
+        }
+        let label = topics[ti].label.clone();
+        if pages.iter().any(|r| r.topics.contains(&label)) {
+            continue;
+        }
+        let Some((ci, mi)) = best_topic_member(&candidates, ti, &used_urls) else {
+            continue;
+        };
+        let (url, mask, score) = member_at(&candidates[ci], mi);
+        push_row(
+            &mut pages,
+            &mut used_urls,
+            &mut used_families,
+            &mut covered_sections,
+            &candidates,
+            ci,
+            url,
+            mask,
+            score,
+            &families,
+            &sections,
+            &topics,
+            PlanKind::Cover,
+            format!("focus topic \"{label}\""),
+            true,
+        );
+    }
+
+    // 1. Cover: one page per section the plan has not represented yet.
+    for &si in &section_order {
+        if pages.len() >= budget {
+            break;
+        }
+        if covered_sections.contains(&si) {
+            continue;
         }
         let Some(list) = by_section.get(&si) else {
             continue;
         };
-        if let Some(&ci) = list.iter().find(|&&ci| {
-            !used_families.contains(&candidates[ci].family)
-                && !used_urls.contains(&candidates[ci].url)
-        }) {
+        if let Some(&ci) = list
+            .iter()
+            .find(|&&ci| !used_urls.contains(&candidates[ci].url))
+        {
             push_page(
                 &mut pages,
                 &mut used_urls,
                 &mut used_families,
-                &mut selected,
-                ci,
+                &mut covered_sections,
                 &candidates,
+                ci,
                 &families,
                 &sections,
+                &topics,
                 PlanKind::Cover,
                 format!("cover section {}", sections[si].path),
-                candidates[ci].focus,
             );
         }
     }
@@ -333,62 +418,61 @@ pub fn build(req: PlanRequest<'_>) -> Plan {
             &mut pages,
             &mut used_urls,
             &mut used_families,
-            &mut selected,
-            ci,
+            &mut covered_sections,
             &candidates,
+            ci,
             &families,
             &sections,
+            &topics,
             PlanKind::Cover,
             format!(
                 "cover family {}/{}",
                 families[candidates[ci].family].section, families[candidates[ci].family].template
             ),
-            candidates[ci].focus,
         );
     }
 
-    // 3. Deepen: only after every selectable family has a page. Extra
-    // samples from already-covered families; focus samples stay focus.
-    let deepen_order = selected.clone();
-    for ci in deepen_order {
+    // 3. Deepen: after breadth the remaining budget goes to the members of
+    // the families already represented, best first. `tokio/tutorial/:v` is
+    // ten pages, not a representative plus two samples.
+    for &ci in &order {
         if pages.len() >= budget {
             break;
         }
-        let c = &candidates[ci];
-        for sample in &c.samples {
-            if pages.len() >= budget {
-                break;
-            }
-            if sample == &c.url || used_urls.contains(sample) {
+        let mut mi = 0;
+        while mi < candidates[ci].members.len() && pages.len() < budget {
+            let (url, mask, score) = member_at(&candidates[ci], mi);
+            mi += 1;
+            if used_urls.contains(&url) {
                 continue;
             }
-            if let Some(q) = focus
-                && !url_matches(sample, q)
-            {
-                continue;
-            }
-            let family = &families[c.family];
-            let row = make_row(
-                c,
-                family,
-                &sections[c.section],
-                sample.clone(),
+            let family = &families[candidates[ci].family];
+            let page_no = pages.len() + 1;
+            push_row(
+                &mut pages,
+                &mut used_urls,
+                &mut used_families,
+                &mut covered_sections,
+                &candidates,
+                ci,
+                url,
+                mask,
+                score,
+                &families,
+                &sections,
+                &topics,
                 PlanKind::Deepen,
                 format!(
                     "deepen {}/{} (page {})",
-                    family.section,
-                    family.template,
-                    pages.len() + 1
+                    family.section, family.template, page_no
                 ),
-                focus.is_some(),
+                candidates[ci].focus,
             );
-            used_urls.insert(row.url.clone());
-            pages.push(row);
         }
     }
 
-    // 4. Reserves: the next family reps and unused samples, in score
-    // order. A failed page is replaced from here without a second map.
+    // 4. Reserves: family reps and members the budget did not reach, in
+    // score order. A failed page is replaced from here without a second map.
     for &ci in &order {
         if reserves.len() >= RESERVE_CAP {
             break;
@@ -397,37 +481,36 @@ pub fn build(req: PlanRequest<'_>) -> Plan {
         let family = &families[c.family];
         if !used_urls.contains(&c.url) {
             let row = make_row(
-                c,
                 family,
                 &sections[c.section],
                 c.url.clone(),
+                c.topics,
+                c.best_score,
                 PlanKind::Reserve,
                 format!("reserve: {}/{}", family.section, family.template),
                 c.focus,
+                &topics,
             );
             used_urls.insert(row.url.clone());
             reserves.push(row);
         }
-        for sample in &c.samples {
+        for member in &c.members {
             if reserves.len() >= RESERVE_CAP {
                 break;
             }
-            if sample == &c.url || used_urls.contains(sample) {
-                continue;
-            }
-            if let Some(q) = focus
-                && !url_matches(sample, q)
-            {
+            if used_urls.contains(&member.url) {
                 continue;
             }
             let row = make_row(
-                c,
                 family,
                 &sections[c.section],
-                sample.clone(),
+                member.url.clone(),
+                member.topics,
+                member.score,
                 PlanKind::Reserve,
                 format!("reserve: deepen {}/{}", family.section, family.template),
-                focus.is_some(),
+                c.focus,
+                &topics,
             );
             used_urls.insert(row.url.clone());
             reserves.push(row);
@@ -446,6 +529,8 @@ pub fn build(req: PlanRequest<'_>) -> Plan {
         families_total,
         urls_total,
         focus_pool,
+        focus_urls,
+        &topics,
     );
 
     let stop = if pages.len() >= budget {
@@ -506,6 +591,8 @@ pub fn build(req: PlanRequest<'_>) -> Plan {
         sections_total,
         families_total,
         urls_total,
+        focus_urls,
+        focus_labels: topics.iter().map(|t| t.label.clone()).collect(),
     }
     .finish(started)
 }
@@ -550,6 +637,14 @@ impl Plan {
     }
 
     fn recompute(&mut self) {
+        let topics: Vec<Topic> = self
+            .focus_labels
+            .iter()
+            .map(|label| Topic {
+                label: label.clone(),
+                tokens: Vec::new(),
+            })
+            .collect();
         self.coverage = coverage_of(
             &self.pages,
             &self.section_urls,
@@ -557,84 +652,310 @@ impl Plan {
             self.families_total,
             self.urls_total,
             self.coverage.focus_pool,
+            self.focus_urls,
+            &topics,
         );
         self.estimated_tokens = self.pages.len() * TOKENS_PER_PAGE;
     }
 }
 
+/// Build one candidate per family from the inventory. A family's members
+/// are every in-scope URL whose shape belongs to it, best first; the
+/// family's samples are the fallback when the plan has no inventory (a warm
+/// dossier). Returns the candidates and the focus pool's size in families
+/// and URLs.
 #[allow(clippy::too_many_arguments)]
-fn candidate_pool(
+fn build_candidates(
     families: &[Family],
     sections: &[Section],
     section_index: &HashMap<String, usize>,
-    focus_by_section: &HashMap<String, Vec<String>>,
+    by_section: &HashMap<&str, Vec<usize>>,
+    urls: &[InvUrl],
     focus: Option<&str>,
     idf: Option<&FocusIdf>,
+    topics: &[Topic],
     kind: SiteKind,
-    filter_focus: bool,
-    focus_pool: &mut usize,
-) -> Vec<Candidate> {
-    let mut out = Vec::new();
-    let mut focus_cursor: HashMap<String, usize> = HashMap::new();
-    let mut used_focus_urls: HashSet<String> = HashSet::new();
+) -> (Vec<Candidate>, usize, usize) {
+    let mut raw: Vec<Vec<Member>> = (0..families.len()).map(|_| Vec::new()).collect();
+    for entry in urls {
+        let Some(fi) = family_for(&entry.url, families, by_section) else {
+            continue;
+        };
+        let mask = topic_mask(&entry.url, entry.title.as_deref(), topics);
+        if let Some(q) = focus
+            && mask == 0
+            && !url_matches(&entry.url, entry.title.as_deref(), q)
+        {
+            continue;
+        }
+        let score = match focus {
+            Some(q) => score::score_candidate_with_idf(
+                entry.title.as_deref().unwrap_or(""),
+                path_of(&entry.url),
+                Some(q),
+                idf,
+            ),
+            None => 0.0,
+        };
+        raw[fi].push(Member {
+            url: entry.url.clone(),
+            score,
+            topics: mask,
+            lastmod: entry.lastmod.clone(),
+        });
+    }
+
+    let mut out: Vec<Candidate> = Vec::with_capacity(families.len());
+    let mut focus_pool = 0usize;
+    let mut focus_urls = 0usize;
     for (fi, family) in families.iter().enumerate() {
         let Some(&si) = section_index.get(&family.section) else {
             continue;
         };
-        // A focused pool only scores sections that have a matching URL;
-        // on a 14k-section site this is the difference between 14k sample
-        // clones and the handful that can be planned.
-        if filter_focus
-            && !focus_by_section.is_empty()
-            && !focus_by_section.contains_key(&family.section)
-        {
-            continue;
+        let mut list = std::mem::take(&mut raw[fi]);
+        if list.is_empty() {
+            list = sample_members(family, focus, idf, topics);
         }
-        let samples: Vec<String> = family
-            .sample
-            .iter()
-            .filter(|u| Url::parse(u).is_ok())
-            .cloned()
-            .collect();
-        if samples.is_empty() {
-            continue;
-        }
-        let matching = focus.and_then(|q| {
-            if let Some(url) = samples.iter().find(|u| url_matches(u, q)).cloned()
-                && used_focus_urls.insert(url.clone())
-            {
-                return Some(url);
+        list.sort_by(|a, b| {
+            if focus.is_some() {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| b.lastmod.cmp(&a.lastmod))
+                    .then_with(|| a.url.cmp(&b.url))
+            } else {
+                b.lastmod.cmp(&a.lastmod).then_with(|| a.url.cmp(&b.url))
             }
-            let list = focus_by_section.get(&family.section)?;
-            let cursor = focus_cursor.entry(family.section.clone()).or_insert(0);
-            while let Some(url) = list.get(*cursor) {
-                *cursor += 1;
-                if used_focus_urls.insert(url.clone()) {
-                    return Some(url.clone());
-                }
-            }
-            None
         });
-        let (url, is_focus) = if filter_focus {
-            let Some(url) = matching else {
-                continue;
-            };
-            *focus_pool += 1;
-            (url, true)
-        } else {
-            (samples[0].clone(), false)
-        };
-        let score = family_score(family, &sections[si], focus, idf, kind);
+        list.dedup_by(|a, b| a.url == b.url);
+        if list.is_empty() {
+            continue;
+        }
+        if focus.is_some() {
+            focus_pool += 1;
+            focus_urls += list.len();
+        }
+        list.truncate(MEMBER_CAP);
+        let best = list.remove(0);
+        let mut score = family_score(family, &sections[si], focus, idf, kind);
+        if focus.is_some() {
+            score += best.score;
+        }
         out.push(Candidate {
             family: fi,
             section: si,
-            url,
-            samples,
-            focus: is_focus,
+            url: best.url,
+            topics: best.topics,
+            members: list,
+            focus: focus.is_some(),
             score,
+            best_score: best.score,
+        });
+    }
+    (out, focus_pool, focus_urls)
+}
+
+/// A family's own samples, for a plan with no inventory behind it.
+fn sample_members(
+    family: &Family,
+    focus: Option<&str>,
+    idf: Option<&FocusIdf>,
+    topics: &[Topic],
+) -> Vec<Member> {
+    let mut out = Vec::new();
+    for url in &family.sample {
+        if Url::parse(url).is_err() {
+            continue;
+        }
+        let mask = topic_mask(url, None, topics);
+        if let Some(q) = focus
+            && mask == 0
+            && !url_matches(url, None, q)
+        {
+            continue;
+        }
+        let score = match focus {
+            Some(q) => score::score_candidate_with_idf("", path_of(url), Some(q), idf),
+            None => 0.0,
+        };
+        out.push(Member {
+            url: url.clone(),
+            score,
+            topics: mask,
+            lastmod: None,
         });
     }
     out
+}
+
+/// The family a URL's shape belongs to: the longest stored section that is
+/// a path prefix, then the template whose segments match. Falls back to the
+/// section's own family when the inventory moved after the model was built.
+fn family_for(
+    url: &str,
+    families: &[Family],
+    by_section: &HashMap<&str, Vec<usize>>,
+) -> Option<usize> {
+    let u = Url::parse(url).ok()?;
+    let segs: Vec<&str> = u.path().split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return by_section
+            .get("root")
+            .and_then(|list| {
+                list.iter()
+                    .copied()
+                    .find(|&fi| families[fi].template == ":v")
+            })
+            .or_else(|| {
+                by_section
+                    .get("root")
+                    .and_then(|list| list.first().copied())
+            });
+    }
+    for depth in (1..=segs.len()).rev() {
+        let prefix = segs[..depth].join("/");
+        let Some(list) = by_section.get(prefix.as_str()) else {
+            continue;
+        };
+        if let Some(&fi) = list
+            .iter()
+            .find(|&&fi| template_matches(&families[fi].template, &segs))
+        {
+            return Some(fi);
+        }
+        return list.first().copied();
+    }
+    None
+}
+
+fn template_matches(template: &str, segs: &[&str]) -> bool {
+    let parts: Vec<&str> = template.split('/').filter(|s| !s.is_empty()).collect();
+    parts.len() == segs.len()
+        && parts
+            .iter()
+            .zip(segs)
+            .all(|(part, seg)| *part == ":v" || part.eq_ignore_ascii_case(seg))
+}
+
+/// The caller's focus as topics: one per meaningful word, so a multi-topic
+/// ask is answered topic by topic instead of collapsing into one family
+/// representative.
+fn topics_of(focus: &str) -> Vec<Topic> {
+    let lang = language::detect_from_text(focus);
+    let mut out: Vec<Topic> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in focus.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if raw.chars().count() < 3 {
+            continue;
+        }
+        let tokens = lexicon::tokenize(raw, &lang);
+        if tokens.is_empty() {
+            continue;
+        }
+        let label = raw.to_lowercase();
+        if seen.insert(label.clone()) {
+            out.push(Topic { label, tokens });
+        }
+        if out.len() == TOPIC_CAP {
+            break;
+        }
+    }
+    if out.is_empty() {
+        for token in lexicon::tokenize(focus, &lang).into_iter().take(TOPIC_CAP) {
+            if seen.insert(token.clone()) {
+                out.push(Topic {
+                    label: token.clone(),
+                    tokens: vec![token],
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The topic bitset one URL answers: a topic is answered when any of its
+/// tokens is a token of the page's own label or its path.
+fn topic_mask(url: &str, title: Option<&str>, topics: &[Topic]) -> u32 {
+    if topics.is_empty() {
+        return 0;
+    }
+    let Ok(parsed) = Url::parse(url) else {
+        return 0;
+    };
+    let lang = language::detect_from_text(parsed.path());
+    let mut text = String::new();
+    if let Some(title) = title {
+        text.push_str(title);
+        text.push(' ');
+    }
+    text.push_str(&parsed.path().replace(['/', '-', '_', '.'], " "));
+    let tokens = lexicon::tokenize(&text, &lang);
+    let mut mask = 0u32;
+    for (i, topic) in topics.iter().enumerate() {
+        if topic
+            .tokens
+            .iter()
+            .any(|needle| tokens.iter().any(|token| token == needle))
+        {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+fn labels(mask: u32, topics: &[Topic]) -> Vec<String> {
+    topics
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, topic)| topic.label.clone())
+        .collect()
+}
+
+/// The best unselected page for one topic: a focus page that answers it,
+/// which is what makes `focus "a b c"` plan all three.
+fn best_topic_member(
+    candidates: &[Candidate],
+    topic: usize,
+    used: &HashSet<String>,
+) -> Option<(usize, usize)> {
+    let bit = 1u32 << topic;
+    let mut best: Option<(f64, usize, usize)> = None;
+    for (ci, c) in candidates.iter().enumerate() {
+        let mut consider = |score: f64, mi: usize| {
+            let better = match best {
+                None => true,
+                Some((s, _, _)) => score > s,
+            };
+            if better {
+                best = Some((score, ci, mi));
+            }
+        };
+        if c.topics & bit != 0 && !used.contains(&c.url) {
+            consider(c.best_score, OWN);
+        }
+        for (mi, member) in c.members.iter().enumerate() {
+            if member.topics & bit != 0 && !used.contains(&member.url) {
+                consider(member.score, mi);
+            }
+        }
+    }
+    best.map(|(_, ci, mi)| (ci, mi))
+}
+
+fn member_at(c: &Candidate, mi: usize) -> (String, u32, f64) {
+    if mi == OWN {
+        (c.url.clone(), c.topics, c.best_score)
+    } else {
+        let member = &c.members[mi];
+        (member.url.clone(), member.topics, member.score)
+    }
+}
+
+fn path_of(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, rest)| rest.find('/').map_or("/", |i| &rest[i..]))
+        .unwrap_or(url)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -642,40 +963,82 @@ fn push_page(
     pages: &mut Vec<PlanRow>,
     used_urls: &mut HashSet<String>,
     used_families: &mut HashSet<usize>,
-    selected: &mut Vec<usize>,
-    ci: usize,
+    covered_sections: &mut HashSet<usize>,
     candidates: &[Candidate],
+    ci: usize,
     families: &[Family],
     sections: &[Section],
+    topics: &[Topic],
+    kind: PlanKind,
+    reason: String,
+) {
+    let c = &candidates[ci];
+    push_row(
+        pages,
+        used_urls,
+        used_families,
+        covered_sections,
+        candidates,
+        ci,
+        c.url.clone(),
+        c.topics,
+        c.best_score,
+        families,
+        sections,
+        topics,
+        kind,
+        reason,
+        c.focus,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_row(
+    pages: &mut Vec<PlanRow>,
+    used_urls: &mut HashSet<String>,
+    used_families: &mut HashSet<usize>,
+    covered_sections: &mut HashSet<usize>,
+    candidates: &[Candidate],
+    ci: usize,
+    url: String,
+    mask: u32,
+    score: f64,
+    families: &[Family],
+    sections: &[Section],
+    topics: &[Topic],
     kind: PlanKind,
     reason: String,
     focus: bool,
 ) {
     let c = &candidates[ci];
     let row = make_row(
-        c,
         &families[c.family],
         &sections[c.section],
-        c.url.clone(),
+        url,
+        mask,
+        score,
         kind,
         reason,
         focus,
+        topics,
     );
     used_urls.insert(row.url.clone());
     used_families.insert(c.family);
+    covered_sections.insert(c.section);
     pages.push(row);
-    selected.push(ci);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn make_row(
-    c: &Candidate,
     family: &Family,
     section: &Section,
     url: String,
+    mask: u32,
+    score: f64,
     kind: PlanKind,
     reason: String,
     focus: bool,
+    topics: &[Topic],
 ) -> PlanRow {
     PlanRow {
         url,
@@ -683,12 +1046,13 @@ fn make_row(
         template: family.template.clone(),
         kind,
         reason,
-        score: round(c.score),
+        score: round(score),
         family_size: family.size,
         section_urls: section.urls,
         est_tokens: TOKENS_PER_PAGE,
         freshness: family.lastmod.clone().or_else(|| section.lastmod.clone()),
         focus,
+        topics: labels(mask, topics),
         request_class: "content".to_string(),
     }
 }
@@ -775,32 +1139,13 @@ fn date_rank(section: &Section) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn url_matches(url: &str, focus: &str) -> bool {
+fn url_matches(url: &str, title: Option<&str>, focus: &str) -> bool {
     Url::parse(url)
-        .map(|u| score::focus_match("", u.path(), focus))
+        .map(|u| score::focus_match(title.unwrap_or(""), u.path(), focus))
         .unwrap_or(false)
 }
 
-fn section_for_url(url: &str, sections: &HashSet<&str>, max_depth: usize) -> Option<String> {
-    let u = Url::parse(url).ok()?;
-    let segments: Vec<&str> = u
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.is_empty() {
-        return sections.contains("root").then(|| "root".to_string());
-    }
-    for depth in (1..=segments.len().min(max_depth)).rev() {
-        let candidate = segments[..depth].join("/");
-        if sections.contains(candidate.as_str()) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
+#[allow(clippy::too_many_arguments)]
 fn coverage_of(
     pages: &[PlanRow],
     section_urls: &BTreeMap<String, usize>,
@@ -808,6 +1153,8 @@ fn coverage_of(
     families_total: usize,
     urls_total: usize,
     focus_pool: usize,
+    focus_urls: usize,
+    topics: &[Topic],
 ) -> PlanCoverage {
     let mut sections: HashSet<&str> = HashSet::new();
     let mut families: HashSet<(&str, &str)> = HashSet::new();
@@ -823,6 +1170,18 @@ fn coverage_of(
         .iter()
         .filter_map(|s| section_urls.get(*s).copied())
         .sum();
+    let mut answered = 0usize;
+    let mut focus_unanswered: Vec<String> = Vec::new();
+    for topic in topics {
+        if pages
+            .iter()
+            .any(|row| row.topics.iter().any(|label| label == &topic.label))
+        {
+            answered += 1;
+        } else {
+            focus_unanswered.push(topic.label.clone());
+        }
+    }
     PlanCoverage {
         sections_total,
         sections_covered: sections.len(),
@@ -830,13 +1189,18 @@ fn coverage_of(
         families_covered: families.len(),
         urls_total,
         urls_covered,
+        urls_planned: pages.len(),
         focus_pool,
+        focus_urls,
         focus_matches,
         focus_precision: if pages.is_empty() {
             0.0
         } else {
             focus_matches as f64 / pages.len() as f64
         },
+        focus_topics: topics.len(),
+        focus_topics_answered: answered,
+        focus_unanswered,
         url_weight: if urls_total == 0 {
             0.0
         } else {
@@ -883,6 +1247,61 @@ mod tests {
             urls: &[],
             explain,
         })
+    }
+
+    fn build_with_inventory(
+        families: &[Family],
+        urls: &[&str],
+        focus: Option<&str>,
+        max_pages: usize,
+    ) -> Plan {
+        let sections = sections_from_families(families);
+        let inventory: Vec<InvUrl> = urls
+            .iter()
+            .map(|url| InvUrl {
+                url: (*url).to_string(),
+                lastmod: None,
+                source: "test".to_string(),
+                title: None,
+            })
+            .collect();
+        build(PlanRequest {
+            seed: "https://ex.com/tokio/tutorial",
+            host: "ex.com",
+            site_kind: SiteKind::Docs,
+            focus,
+            max_pages,
+            families,
+            sections: &sections,
+            urls: &inventory,
+            explain: false,
+        })
+    }
+
+    fn tutorial() -> (Vec<Family>, Vec<&'static str>) {
+        let families = vec![fam(
+            "tokio/tutorial",
+            "tokio/tutorial/:v",
+            10,
+            &[
+                "https://ex.com/tokio/tutorial/async",
+                "https://ex.com/tokio/tutorial/channels",
+                "https://ex.com/tokio/tutorial/framing",
+            ],
+        )];
+        let urls = vec![
+            "https://ex.com/tokio/tutorial/async",
+            "https://ex.com/tokio/tutorial/channels",
+            "https://ex.com/tokio/tutorial/framing",
+            "https://ex.com/tokio/tutorial/hello-tokio",
+            "https://ex.com/tokio/tutorial/io",
+            "https://ex.com/tokio/tutorial/select",
+            "https://ex.com/tokio/tutorial/setup",
+            "https://ex.com/tokio/tutorial/shared-state",
+            "https://ex.com/tokio/tutorial/spawning",
+            "https://ex.com/tokio/tutorial/streams",
+        ];
+        (families, urls)
     }
 
     #[test]
@@ -1053,5 +1472,66 @@ mod tests {
         assert!(plan.focus_fallback);
         assert_eq!(plan.coverage.focus_precision, 0.0);
         assert!(!plan.pages.is_empty());
+    }
+
+    #[test]
+    fn a_multi_topic_focus_plans_one_page_per_named_topic() {
+        // The regression this architecture exists for: channels, select and
+        // shared-state are one family (`tokio/tutorial/:v`). One page per
+        // family would drop shared-state however large the budget was.
+        let (families, urls) = tutorial();
+        let plan = build_with_inventory(&families, &urls, Some("channels select shared state"), 10);
+        let planned: HashSet<&str> = plan.pages.iter().map(|p| p.url.as_str()).collect();
+        for expected in ["channels", "select", "shared-state"] {
+            assert!(
+                planned.iter().any(|u| u.ends_with(expected)),
+                "{expected} must be planned, got {planned:?}"
+            );
+        }
+        assert_eq!(plan.coverage.focus_topics, 4);
+        assert_eq!(plan.coverage.focus_topics_answered, 4);
+        assert!(plan.coverage.focus_unanswered.is_empty());
+        assert_eq!(
+            plan.coverage.focus_urls, 3,
+            "channels, select and shared-state are the focus pool"
+        );
+        assert_eq!(plan.pages.len(), 3, "three matching pages, nothing padded");
+        assert_eq!(plan.stop, PlanStop::Covered);
+    }
+
+    #[test]
+    fn family_members_fill_the_budget_instead_of_stopping_at_samples() {
+        let (families, urls) = tutorial();
+        let plan = build_with_inventory(&families, &urls, None, 8);
+        assert_eq!(
+            plan.pages.len(),
+            8,
+            "a 10-page family can spend an 8-page budget"
+        );
+        let unique: HashSet<&str> = plan.pages.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(unique.len(), 8, "no page selected twice");
+        assert_eq!(plan.stop, PlanStop::Budget);
+    }
+
+    #[test]
+    fn a_topic_the_inventory_cannot_answer_is_reported_not_hidden() {
+        let (families, urls) = tutorial();
+        let plan = build_with_inventory(&families, &urls, Some("channels quantum"), 4);
+        assert_eq!(plan.coverage.focus_topics, 2);
+        assert_eq!(plan.coverage.focus_topics_answered, 1);
+        assert_eq!(plan.coverage.focus_unanswered, vec!["quantum".to_string()]);
+    }
+
+    #[test]
+    fn a_six_page_multi_topic_plan_covers_all_three_named_pages() {
+        let (families, urls) = tutorial();
+        let plan = build_with_inventory(&families, &urls, Some("channels select shared state"), 6);
+        assert_eq!(plan.pages.len(), 3);
+        let planned: HashSet<&str> = plan.pages.iter().map(|p| p.url.as_str()).collect();
+        assert!(planned.iter().any(|u| u.ends_with("shared-state")));
+        assert!(planned.iter().any(|u| u.ends_with("/channels")));
+        assert!(planned.iter().any(|u| u.ends_with("/select")));
+        assert_eq!(plan.coverage.focus_topics_answered, 4);
+        assert_eq!(plan.stop, PlanStop::Covered);
     }
 }

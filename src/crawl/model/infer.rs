@@ -15,6 +15,12 @@ pub struct InvUrl {
     pub lastmod: Option<String>,
     #[serde(default)]
     pub source: String,
+    /// The site's own label for the page: link text, an `llms.txt` title or
+    /// a feed item title. A page's URL does not always carry its topic
+    /// (`/tutorial/errors.html` is "Errors and Exceptions"), so recall
+    /// scores this label beside the path.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// One `(section, template)` family: the unit of coverage.

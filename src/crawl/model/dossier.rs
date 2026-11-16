@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// Hosts kept before the oldest dossiers go. A bounded store, like the v5
 /// state's origin cap.
 const KEEP: usize = 256;
@@ -83,6 +83,11 @@ pub struct Dossier {
     /// The last full in-scope inventory, bounded; removed-page reports use it.
     #[serde(default)]
     pub inventory: Vec<String>,
+    /// The site's own labels for those URLs, when the inventory source had
+    /// one (`llms.txt`, seed link text). Focus recall scores a page's label
+    /// beside its path, so a warm plan keeps them.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
     /// Per-URL change memory, bounded by `PAGE_CAP`.
     #[serde(default)]
     pub pages: BTreeMap<String, PageMemory>,
@@ -95,6 +100,8 @@ pub struct Snapshot<'a> {
     pub map: &'a [String],
     /// Full current inventory for removed-page reporting.
     pub inventory: &'a [String],
+    /// URL → the site's own label, for focus recall on a warm plan.
+    pub labels: &'a BTreeMap<String, String>,
     pub contract: Option<&'a ChangeContract>,
     pub focus: Option<&'a str>,
     pub include: &'a [String],
@@ -164,6 +171,12 @@ pub fn save(host: &str, snapshot: &Snapshot<'_>) -> bool {
             .iter()
             .take(INVENTORY_CAP)
             .cloned()
+            .collect(),
+        labels: snapshot
+            .labels
+            .iter()
+            .filter(|(url, _)| snapshot.inventory.contains(url))
+            .map(|(url, label)| (url.clone(), label.clone()))
             .collect(),
         pages: previous
             .as_ref()

@@ -174,11 +174,12 @@ MCP `focus` is CLI `--topic`. It ranks the inventory and plan lexically by link 
 
 `map` reads the site's own inventory (`llms.txt`, sitemaps, feeds, then the seed's links) and answers with the model: site kind, sections, families, URL counts, freshness and the inventory requests it spent. It never reads a content page; the seed page is read only when the site publishes no inventory. `map_limit` caps the flat URL list; the model still covers the whole inventory and says when the list is capped.
 
-`plan` spends no page: it chooses one page per section/family, deepens only after breadth, keeps a
-reserve list, and states each row's reason, section, cost and request class. A focus filters the
-plan to matching URLs and keeps focus precision at 1.0; if nothing matches it says so and falls
-back to breadth. `explain` adds a bounded candidate table (`explain=true` in MCP). A focused plan
-uses the full inventory; a no-focus plan can use the warm dossier. `max_pages` is the plan budget.
+`plan` spends no page: it answers every focus topic first (one page per named term the inventory
+can answer), then covers sections and families, then deepens into a family's members, keeping a
+reserve list and stating each row's reason, section, cost and request class. A focus filters the
+plan to matching URLs; if nothing matches it says so and falls back to breadth. `explain` adds a
+bounded candidate table (`explain=true` in MCP). A focused plan uses the full inventory; a
+no-focus plan can use the warm dossier. `max_pages` is the plan budget.
 
 `full` is `plan` then `run`: it spends the plan through the v5 fetch engine, one page at a time
 per host, the plan budget plus reserves as the host request budget, a wall declaration for the
@@ -187,7 +188,10 @@ Every completed page is persisted before the next request; `resume=<job>` (CLI `
 returns the same pages and does not re-fetch them. A complete job is idempotent. A wall is not
 retried: switch egress or use a real browser driver. The response is the digest: a site brief,
 page cards and stable `pN` handles; repeated source headers/footers are removed, headings and
-focus passages are kept. `crawl get pN --job <job>` reads the full stored page with no network;
+focus passages are kept, and cards grow with the page budget (a 10-page crawl returns ten full
+cards, not a fixed brief). The result carries `job` and `resume` (the same id) and names the
+focus topics it answered, the pages it planned against the inventory, and any unanswered term.
+`crawl get pN --job <job>` reads the full stored page with no network;
 `--section`/`--offset` project it like a fetch. Dataset mode emits schema
 `donsetch.crawl.page` v3 with `handle`, `headings`, `card` and the full `markdown` per row.
 
@@ -207,7 +211,7 @@ Crawl respects robots.txt by default, shares per-host pacing across processes, a
 
 An output cap, failed sitemap, failed page, policy denial, wall or deadline is not site-wide completeness. Inventory discovery has safety bounds of 100,000 URLs and 32 sitemap reads. Run jobs last 7 days (50-job LRU) and are resumed with the `job` id; pass `crawl resume <job>` (or `resume` alone in MCP). `crawl diff` uses the warm dossier (inventory hash, source, lastmod trust, stable page list, per-URL fingerprint/lastmod) and `--refresh` revalidates now; the dossier keeps at most 256 hosts, 20,000 inventory URLs and 4,096 page memories per host, evicting the least recently used page memory. `crawl sites` lists dossiers; `crawl forget <host>` removes one without touching the fetch cache.
 
-Crawl receipts name their own stop: map/plan `covered`, `budget` or `empty`; run `covered`, `budget`, `empty`, `deadline`, `walled`, `cancelled` or `throttled`. Map mode can finish as `InventoryComplete`. Plan mode reports its own `covered`, `budget`, or `empty` and maps budget to `MaxPages` in the crawl receipt; run mode reports `covered`, `budget`, `empty`, `deadline`, `walled`, `cancelled`, or `throttled`, and a wall carries class/vendor/status. Always inspect the completeness receipt too.
+Crawl receipts name their own stop: map/plan `covered`, `budget` or `empty`; run `covered`, `budget`, `empty`, `deadline`, `walled`, `cancelled` or `throttled`. A focus receipt also reports `n/m topics answered` and names an unanswered term; a focus that matched nothing says so. Map mode can finish as `InventoryComplete`. Plan mode reports its own `covered`, `budget`, or `empty` and maps budget to `MaxPages` in the crawl receipt; run mode reports `covered`, `budget`, `empty`, `deadline`, `walled`, `cancelled`, or `throttled`, and a wall carries class/vendor/status. Always inspect the completeness receipt too.
 
 ## Screenshot
 

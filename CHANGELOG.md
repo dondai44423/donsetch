@@ -1,5 +1,35 @@
 # Changelog
 
+## [5.5.2] - 2026-11-16
+
+### Fixed
+
+- **A multi-topic focus plans every named topic.** `web_crawl`'s focus is the caller's words, and
+  the planner now answers each term before it spends a page on breadth: `focus "channels select
+  shared state"` returns the Tokio tutorial's channels, select and shared-state pages instead of
+  collapsing them into one family representative.
+- **A family is a set, not a page.** The deepening phase spends the remaining budget on a family's
+  inventory members instead of its first three samples, so a ten-page family can fill a ten-page
+  budget and a no-focus crawl stops padding.
+- **The site's own labels are scored.** Seed navigation, `llms.txt` titles and hub links are matched
+  beside the URL path: MDN's Flexbox guides (`/Guides/Flexible_box_layout`) and Python's "Errors
+  and Exceptions" (`errors.html`) are found by the name the site uses, not only its slug.
+- **Bounded link discovery on a site with no published inventory.** When there is no sitemap, page
+  list or feed, the map reads the focus's best-ranked seed link and inventories its links — a
+  category page's items become plannable, inside the inventory's request budget.
+- **Coverage and stop reasons tell the truth.** The digest reports topics answered (`4/4 topics`),
+  pages planned against the in-scope inventory, and names an unanswered term; `covered` is no
+  longer claimed while a named page sat unselected. The plan renderer never divides by zero.
+- **`resume` is in the crawl result.** The documented continuation token is the job id, now
+  returned beside `job`.
+
+### Changed
+
+- **Digest cards follow the page budget:** 500–3,200 characters per card and a 14k–60k character
+  envelope, so a 10-page crawl returns ten real cards instead of a fixed 900-character brief.
+- **The crawl dossier is v4**, adding the site's own labels for its inventory URLs. An older
+  dossier is discarded and rebuilt by the next map.
+
 ## [5.5.1] - 2026-11-16
 
 ### Fixed

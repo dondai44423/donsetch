@@ -6,10 +6,14 @@ use crate::crawl::{CrawlPage, CrawlResult};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
-/// Per-card body cap. Headings are kept outside this cap.
-pub const CARD_CHARS: usize = 900;
-/// Whole digest body cap (site brief + cards + trailing notes excluded).
-pub const DIGEST_CHARS: usize = 14_000;
+/// The digest is the evidence document, so its size follows the plan's
+/// page count: a 10-page crawl spends its context on 10 real cards, not on
+/// a fixed 900-character brief that drops what the caller asked to read.
+/// The floor and ceiling keep a 200-page crawl inside one tool result.
+const CARD_MIN_CHARS: usize = 500;
+const CARD_MAX_CHARS: usize = 3_200;
+const DIGEST_MIN_CHARS: usize = 14_000;
+const DIGEST_MAX_CHARS: usize = 60_000;
 const MAX_HEADINGS: usize = 32;
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,9 +48,18 @@ pub struct Digest {
     pub sections_total: usize,
     pub families_covered: usize,
     pub families_total: usize,
+    /// Pages this plan selected and the inventory's in-scope pages: the
+    /// honest numerator/denominator of what the crawl covered.
+    pub planned: usize,
+    pub inventory_urls: usize,
+    pub reserves: usize,
     pub url_weight: f64,
     pub focus_matches: usize,
     pub focus_precision: f64,
+    /// The caller's topics, and the ones no planned page answered.
+    pub topics_answered: usize,
+    pub topics_total: usize,
+    pub topics_unanswered: Vec<String>,
     pub stop: String,
     pub wall: Option<String>,
     pub text: String,
@@ -219,6 +232,9 @@ fn page_sig(page: &CrawlPage) -> u64 {
 pub fn build(result: &CrawlResult) -> Digest {
     let plan = result.plan.as_ref();
     let focus = plan.and_then(|p| p.focus.clone());
+    let kept = result.pages.iter().filter(|p| !p.duplicate).count().max(1);
+    let digest_cap = (kept * 2_400).clamp(DIGEST_MIN_CHARS, DIGEST_MAX_CHARS);
+    let card_cap = (digest_cap / kept).clamp(CARD_MIN_CHARS, CARD_MAX_CHARS);
     let focus_terms: Vec<String> = focus
         .as_deref()
         .unwrap_or("")
@@ -322,7 +338,7 @@ pub fn build(result: &CrawlResult) -> Digest {
             header.push_str(&format!("H: {heading_text}\n"));
         }
         let header_chars = header.chars().count();
-        let allowed = CARD_CHARS.saturating_sub(header_chars).max(200);
+        let allowed = card_cap.saturating_sub(header_chars).max(200);
         let mut chosen: Vec<usize> = Vec::new();
         let mut body = String::new();
         for (_, i, b) in candidates {
@@ -347,9 +363,9 @@ pub fn build(result: &CrawlResult) -> Digest {
             card.push('\n');
             card.push_str(&body);
         }
-        card = truncate_chars(&card, CARD_CHARS);
-        if used + card.chars().count() > DIGEST_CHARS {
-            card = truncate_chars(&card, DIGEST_CHARS.saturating_sub(used));
+        card = truncate_chars(&card, card_cap);
+        if used + card.chars().count() > digest_cap {
+            card = truncate_chars(&card, digest_cap.saturating_sub(used));
             if card.chars().count() < 80 {
                 break;
             }
@@ -383,6 +399,7 @@ pub fn build(result: &CrawlResult) -> Digest {
 
     let read_chars = result.pages.iter().map(|p| p.chars).sum();
     let digest_chars = pages.iter().map(|p| p.chars).sum();
+    let planned = plan.map_or(pages.len(), |p| p.pages.len());
     let host = result
         .model
         .as_ref()
@@ -407,9 +424,17 @@ pub fn build(result: &CrawlResult) -> Digest {
         sections_total: plan.map_or(0, |p| p.coverage.sections_total),
         families_covered: plan.map_or(0, |p| p.coverage.families_covered),
         families_total: plan.map_or(0, |p| p.coverage.families_total),
+        planned,
+        inventory_urls: plan.map_or(0, |p| p.coverage.urls_total),
+        reserves: plan.map_or(0, |p| p.reserves.len()),
         url_weight: plan.map_or(0.0, |p| p.coverage.url_weight),
         focus_matches: plan.map_or(0, |p| p.coverage.focus_matches),
         focus_precision: plan.map_or(0.0, |p| p.coverage.focus_precision),
+        topics_answered: plan.map_or(0, |p| p.coverage.focus_topics_answered),
+        topics_total: plan.map_or(0, |p| p.coverage.focus_topics),
+        topics_unanswered: plan
+            .map(|p| p.coverage.focus_unanswered.clone())
+            .unwrap_or_default(),
         stop: result
             .run
             .as_ref()
@@ -566,15 +591,29 @@ pub fn render(d: &Digest) -> String {
             d.families_covered,
             d.families_total
         ));
-        if let Some(focus) = &d.focus {
+        if d.inventory_urls > 0 {
             out.push_str(&format!(
-                " · focus \"{focus}\": {}/{} pages (precision {:.2})",
-                d.focus_matches,
-                d.pages.len(),
-                d.focus_precision
+                " · {} of {} inventory pages planned",
+                d.planned, d.inventory_urls
             ));
         }
         out.push('\n');
+    }
+    if let Some(focus) = &d.focus {
+        out.push_str(&format!(
+            "focus \"{focus}\": {}/{} topics answered · {} of {} pages focus",
+            d.topics_answered,
+            d.topics_total,
+            d.focus_matches,
+            d.pages.len().max(1)
+        ));
+        out.push('\n');
+        if !d.topics_unanswered.is_empty() {
+            out.push_str(&format!(
+                "focus gaps: {} — no inventory page carries the term\n",
+                d.topics_unanswered.join(", ")
+            ));
+        }
     }
     if d.boilerplate_removed > 0 || d.collapsed > 0 {
         out.push_str(&format!(
@@ -595,9 +634,25 @@ pub fn render(d: &Digest) -> String {
         out.push_str("## No pages\nNo readable page was returned.\n\n");
     }
     out.push_str("## Not fetched\n");
-    out.push_str(
-        "The plan's remaining rows are in the job; ask for one by handle or plan a narrower focus.\n",
-    );
+    if d.inventory_urls > d.planned {
+        out.push_str(&format!(
+            "{} of {} in-scope page(s) are outside this plan (budget or a family already represented).\n",
+            d.inventory_urls - d.planned,
+            d.inventory_urls
+        ));
+    }
+    if d.families_total > d.families_covered {
+        out.push_str(&format!(
+            "{} family(ies) not represented.\n",
+            d.families_total - d.families_covered
+        ));
+    }
+    if d.reserves > 0 {
+        out.push_str(&format!(
+            "{} reserve page(s) stand by if a planned page fails.\n",
+            d.reserves
+        ));
+    }
     out.push_str("next: ");
     if let Some(p) = d.pages.first() {
         match &d.job {
@@ -698,5 +753,44 @@ mod tests {
         assert!(d.boilerplate_removed > 0);
         assert!(d.digest_chars < d.read_chars);
         assert!(d.text.contains("crawl get p1"));
+    }
+
+    #[test]
+    fn focus_line_names_topics_and_never_divides_by_zero() {
+        let d = Digest {
+            host: "ex.com".into(),
+            seed: "https://ex.com/".into(),
+            job: Some("j1".into()),
+            pages: Vec::new(),
+            read_chars: 0,
+            digest_chars: 0,
+            boilerplate_removed: 0,
+            collapsed: 0,
+            focus: Some("channels select shared state".into()),
+            sections_covered: 1,
+            sections_total: 3,
+            families_covered: 1,
+            families_total: 5,
+            planned: 3,
+            inventory_urls: 18,
+            reserves: 2,
+            url_weight: 0.6,
+            focus_matches: 3,
+            focus_precision: 1.0,
+            topics_answered: 3,
+            topics_total: 4,
+            topics_unanswered: vec!["quantum".into()],
+            stop: "covered".into(),
+            wall: None,
+            text: String::new(),
+        };
+        let text = render(&d);
+        assert!(text.contains("3/4 topics answered"), "{text}");
+        assert!(text.contains("quantum — no inventory page carries the term"));
+        assert!(
+            !text.contains("/0 pages"),
+            "a zero denominator is a display bug, got {text}"
+        );
+        assert!(text.contains("3 of 18 inventory pages planned"));
     }
 }

@@ -534,6 +534,16 @@ impl Crawler {
             && prev.contract.is_some()
         {
             let sections = model::infer::sections_from_families(&prev.families);
+            let inventory: Vec<model::infer::InvUrl> = prev
+                .inventory
+                .iter()
+                .map(|url| model::infer::InvUrl {
+                    url: url.clone(),
+                    lastmod: None,
+                    source: "dossier".to_string(),
+                    title: prev.labels.get(url).cloned(),
+                })
+                .collect();
             let plan = model::plan::build(model::plan::PlanRequest {
                 seed: &prev.seed,
                 host: &prev.summary.host,
@@ -542,7 +552,7 @@ impl Crawler {
                 max_pages: opts.max_pages,
                 families: &prev.families,
                 sections: &sections,
-                urls: &[],
+                urls: &inventory,
                 explain: false,
             });
             let unchanged = plan.pages.len();
