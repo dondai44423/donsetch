@@ -11,7 +11,7 @@ The Rust workspace has two crates: the product at the root and its fetching foun
 | Fetch layer | Client identities, carried state, cache, classification, interfaces, V8, mined requests | [crates/fetch](../crates/fetch/README.md) |
 | DonSift | HTML extraction, typed blocks, reading views, headings, links, text quality | [src/extract](../src/extract/) |
 | DonSeek | Query planning, keyless retrieval, merging, ranking, source health | [src/search](../src/search/) |
-| DonTread | Site model (map), planner (plan), executor (run), digest/get (pN), delta/change memory, frontier (full/content), pacing, budgets, resume | [src/crawl](../src/crawl/) |
+| DonTread | Site model (map), planner (plan), executor (run), digest/get (pN), delta/change memory, pacing, budgets, job resume | [src/crawl](../src/crawl/) |
 | DonSheet | PDFium FFI, reading order, glyph/pixel fusion, tables, OCR, forms | [src/pdf](../src/pdf/) |
 | Browser | Throwaway screenshots and diagnostic captures | [src/browser](../src/browser/) |
 | MCP | Stdio and HTTP transport, compatibility output, supervisor | [src/mcp](../src/mcp/) |

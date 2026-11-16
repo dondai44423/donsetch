@@ -871,12 +871,13 @@ Use --max-results to cap the list and --intent to pick a vertical \
 engine health)."
         }
         "crawl" => {
-            "Crawl a site: sitemap-aware, budgeted, focused. \
-The default --mode content walks the same domain from the seed with \
-a best-first frontier, scoring pages for the --topic you give. \
---mode map is a cheap sitemap-shape inventory. \
-Returns pages with per-page notes; long crawls emit a resume token \
-you can pass with --resume to continue later."
+            "Crawl a known site into a token-bounded digest. \
+--mode full (default) plans the site and executes it, returning page cards \
+and pN handles; map returns the site model; plan returns the pages to fetch \
+first; run keeps a named durable job; diff fetches only changed/new pages; \
+get reads a stored page with no network; sites/forget manage dossiers. \
+Use --topic to focus the inventory and digest. Resume a job with \
+crawl resume <job>; read a page with crawl get pN --job <job>."
         }
         _ => tool.summary,
     };

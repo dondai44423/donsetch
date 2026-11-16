@@ -1,5 +1,13 @@
 # Changelog
 
+## [5.5.1] - 2026-11-16
+
+### Fixed
+
+- **Crawl CLI help describes the shipped v6 crawl.** The `crawl --help` long text still named the
+  retired sitemap/content frontier path. It now names `full` (plan + execute), `map`, `plan`,
+  `run`, `diff`, `get`, `sites`, `forget`, job resume and `pN` handles.
+
 ## [5.5.0] - 2026-11-15
 
 ### Changed

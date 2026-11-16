@@ -1,4 +1,4 @@
-//! The crawl tool handler: dispatch, map/content mode, and the
+//! The crawl tool handler: dispatch, map/plan/run/diff/get, and the
 //! CrawlResult rendering + next-action guidance for the model.
 
 use serde_json::{Value, json};
