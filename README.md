@@ -173,7 +173,7 @@ The opponent was **Firecrawl's paid, hosted cloud service**, accessed with an AP
 
 | Task | DonSeTch | Firecrawl Cloud | Result in this session |
 |---|---|---|---|
-| Fetch · 12 targets | **0.83 s** median on the 10 targets both read; faster on **9/10** | **2.00 s** on those same targets | DonSeTch gave faster reads, cleaner code on the tested Pydantic page, and structured PDF tables. Both returned content on **11/12** targets. |
+| Fetch · 12 targets | **0.83 s** median on the 10 targets both read; faster on **9/10** | **2.00 s** on those same targets | DonSeTch gave faster reads, cleaner code on the tested Pydantic page, and structured PDF tables. Both returned content on **11/12** in the original core-tool test. |
 | Focused crawl · 4 runs | **9.49 s** median; **19 pages** selected around the requested topics | **19.60 s**; **26 pages**, including navigation and feeds | DonSeTch found the HTTPX async and uv Python-version material Firecrawl missed, with **7 fewer page fetches**. Firecrawl returned **6–22× as many characters** across the four runs. |
 | Search · 9 queries | **1.71 s** median over 8 timed pairs; faster on **8/8** | **3.19 s** over those pairs | The agent preferred Firecrawl's results on **6 queries**, DonSeTch's on **1**, with **2 ties**. |
 
@@ -182,6 +182,8 @@ The opponent was **Firecrawl's paid, hosted cloud service**, accessed with an AP
 **DonSeTch kinda got its ass beat on search relevance.** It surfaced a stale Intel CEO snippet and weaker exact-error/product results. You can use a search API alongside the local reading tools—[Tavily offers a free allowance](https://docs.tavily.com/documentation/api-credits); [setup is below](#optional-keys). BYOK search wasn't tested here.
 
 Specific issues remain: Firecrawl read G2 through a Cloudflare wall and was faster on IMDb; DonSeTch's crawl digest flattened code on two sites. This was a small, hand-picked session with uncontrolled caches and different output views. The comparison doc includes every rated case, the environment, tools and settings.
+
+**Reddit update:** Firecrawl Alexandria returned Reddit data in a follow-up, giving Firecrawl + Alexandria the practical-access edge in these checks. DonSeTch still read it in **one 1.2 s call**, versus **~6–8 s across six discovery/read calls**. [Follow-up and workflow details →](docs/firecrawl-comparison.md#reddit-follow-up-alexandria-works)
 
 [Full comparison: results, examples and methodology →](docs/firecrawl-comparison.md)
 

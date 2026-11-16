@@ -1,6 +1,6 @@
 # DonSeTch vs. paid Firecrawl Cloud
 
-A hands-on MCP comparison from 16 November 2026: 12 fetch targets, 9 search queries, 4 focused crawls, a map comparison and a warm diff. [Back to the README](../README.md#donsetch-vs-firecrawl-cloud).
+A hands-on MCP comparison from 16 November 2026: 12 fetch targets, 9 search queries, 4 focused crawls, a map comparison and a warm diff, with a subsequent Reddit/Alexandria follow-up below. [Back to the README](../README.md#donsetch-vs-firecrawl-cloud).
 
 **DonSeTch came out ahead on fetching and focused crawling in this session. Firecrawl had better search relevance.** The practical difference was how much useful work the agent got from each call: DonSeTch usually answered faster, kept more site furniture out, and selected pages closer to the crawl's topic. Its reading views and digest handles let the agent choose when to spend context on a full page.
 
@@ -16,17 +16,17 @@ The cloud account's subscription tier and dollar bill weren't recorded. The resp
 
 ## Fetch: faster reads and cleaner extraction
 
-Both tools returned content on **11 of 12 targets**. DonSeTch read Reddit where Firecrawl reported it unsupported; Firecrawl read the Cloudflare-protected G2 page where DonSeTch returned a wall.
+In the original core-tool test, both returned content on **11 of 12 targets**. DonSeTch read Reddit where `firecrawl_scrape` reported it unsupported; Firecrawl read the Cloudflare-protected G2 page where DonSeTch returned a wall. **The later Alexandria check succeeded on Reddit**; that corrects the broader impression that Firecrawl couldn't access it.
 
 On the **ten targets both read**, DonSeTch was faster on **nine**, with recorded medians of **827.5 ms vs 1,996.5 ms**—about 2.4× faster for those calls. IMDb was the exception: Firecrawl took 2.16 s against DonSeTch's 5.69 s.
 
 The agent also preferred DonSeTch's extraction: Python code kept its line breaks on Pydantic, the arXiv PDF's tables appeared as Markdown tables, and GitHub/Stack Overflow reads contained less interface text. Firecrawl's Pydantic output joined code lines; its PDF tables appeared as flattened text. Those are observations on these pages, rather than claims about every page either tool handles.
 
-| Target | DonSeTch ms | Firecrawl Cloud ms | Observed result |
+| Target | DonSeTch ms | Firecrawl core scrape ms | Observed result |
 |---|---:|---:|---|
 | MDN Fetch API | **449** | 1,473 | DonSeTch returned a clean excerpt with continuation; Firecrawl included navigation in 22,126 chars. |
 | Pydantic models | **711** | 1,833 | DonSeTch kept Python code intact; Firecrawl joined code lines, observed twice on this URL. |
-| Reddit LocalLLaMA weekly top | **1,195** | 1,124, unsupported | DonSeTch returned 24 items with followable handles. Firecrawl couldn't scrape the site in this session. |
+| Reddit LocalLLaMA weekly top | **1,195** | 1,124, unsupported | DonSeTch returned 24 items with followable handles. The core scrape call failed; [Alexandria later returned Reddit data](#reddit-follow-up-alexandria-works). |
 | Stack Overflow question 59073556 | **522** | 2,957 | DonSeTch returned the question and answers with intact code; Firecrawl also included voting/save/advertising text. |
 | G2 Slack reviews | 889, wall | **1,936** | Firecrawl returned content; DonSeTch reported a Cloudflare 403. |
 | Wikipedia: Transformer architecture | **944** | 3,940 | DonSeTch returned the requested 1,500-char window; Firecrawl returned 208,959 chars. |
@@ -43,7 +43,25 @@ DonSeTch's bounded output is an agent-control feature. The caller can ask for a 
 
 The test used DonSeTch `max_chars` values from 500 to 16,000 against Firecrawl's full Markdown/main-content responses. That is the workflow whose latency was measured. It shows the benefit of selective reading for these tasks; it doesn't measure the cost of reading every byte through both tools. Partial reads stay identified as partial, with continuation available. [Reading controls →](tools.md#fetch)
 
-G2 and Reddit show different access strengths. The session doesn't establish a universal stealth winner. An initial Firecrawl JSON-format request also failed because the caller omitted required `jsonOptions`; its subsequent Markdown response is the timed JSON row above.
+An initial Firecrawl JSON-format request also failed because the caller omitted required `jsonOptions`; its subsequent Markdown response is the timed JSON row above.
+
+### Reddit follow-up: Alexandria works
+
+A Firecrawl team member pointed out that I'd missed Reddit access through [Alexandria](https://alexandria.firecrawl.dev/). I tried it, and it worked. My fault: I'd tested the core tools after adding an API key and stopped there. The scrape error itself also pointed toward Alexandria.
+
+**My updated access/stealth verdict for these checks: Firecrawl + Alexandria has the edge**, covering Reddit as well as Firecrawl's earlier G2 success. **DonSeTch still had the simpler, faster Reddit reading workflow.** Here's what my agent reported for the follow-up, beside the original DonSeTch read:
+
+| Getting Reddit content | DonSeTch | Firecrawl Alexandria |
+|---|---|---|
+| Calls to first content | **1** `web_fetch` call | **6**: two catalog searches, list `/library`, find the Reddit capability, read its contract, then `alexandria_library_read` |
+| Tool time | **1.195 s** | **~6–8 s** through discovery; **3.77 s** for the data read alone |
+| Returned data | 24 items as ranked Markdown, scores/authors/comment counts, followable handles and `next_offset` | 17 posts under `data.posts`, with typed fields and cursor pagination |
+| Discovery/context overhead | No extra catalog or provider-contract lookup | One catalog response was reported at **~15k tokens**, plus contract/schema inspection |
+| Pacing encountered | No provider quota; origin pacing still applies | The agent encountered an **11 requests/minute** limit and one quota stall during exploration |
+
+The broader exploration reached roughly ten calls: repeated Reddit reads while locating the nested rows, a Wikipedia title/redirect mismatch, and a broad library search that timed out. Those aren't all failures to fetch Reddit. The two runs also returned different item counts; this follow-up didn't establish identical weekly-top ordering or item coverage.
+
+So yes, Alexandria got through. For a one-off page read, the extra discovery was a hassle compared with DonSeTch's one call. Discovery can be reused, and Alexandria's typed fields (`ups`, `upvote_ratio`, `created_utc`, `link_flair_text`) and cursor pagination are useful for dataset work. These are the agent's reported timings and encountered limits, not a new cold benchmark or a universal quota claim; the original core-tool medians above stay separate.
 
 ## Crawl: more useful pages with less work
 
