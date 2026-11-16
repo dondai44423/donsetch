@@ -186,7 +186,7 @@ For development, use the [contributor build ladder](../CONTRIBUTING.md#developme
 |---|---|
 | First command is downloading | Allow the one-time verified binary download to finish. Later starts use the installed copy. |
 | Installed with `--ignore-scripts` or strict script policy | No extra step: run `donsetch doctor` or start Pi. DonSeTch has no install scripts. |
-| `npm install -g` fails with `EACCES` | Use `npx -y donsetch doctor`, or `npm install -g --prefix "$HOME/.local" donsetch` then `~/.local/bin/donsetch doctor`. Add `~/.local/bin` to your shell's `PATH` for later use. |
+| `npm install -g` fails with `EACCES` | Use `npx -y donsetch doctor`, or create `~/.local/lib` with `mkdir -p ~/.local/lib`, run `npm install -g --prefix "$HOME/.local" donsetch`, then `~/.local/bin/donsetch doctor`. Add `~/.local/bin` to your shell's `PATH` for later use. |
 | Package directory is read-only at runtime | The launcher downloads into your user cache automatically. `DONSETCH_BINARY` can select an existing binary; `PATH` and `~/.cargo/bin` are fallback locations. |
 | Download needs a proxy | Set `HTTPS_PROXY` or `HTTP_PROXY` to an HTTP CONNECT proxy. |
 | GitHub Releases is inaccessible | Set `DONSETCH_RELEASES_BASE` to a mirror with `<tag>/<asset>` paths. |
