@@ -51,6 +51,8 @@ Add this to your MCP client's server configuration, then restart the client:
 
 Choose `must_contain` for phrase checks, `focus` for relevant passages, or `toc` then `section` for one part of a long page. These views work on PDFs too. Login gates, bot walls, and incomplete sources remain explicit outcomes.
 
+**DonSeTch vs. paid Firecrawl Cloud:** in my agent-run field test, DonSeTch came out ahead on fetching and focused crawling—faster reads, better topic selection, and much smaller responses with handles to read more. Firecrawl had better search relevance. I chose cloud after internal self-hosted testing favored DonSeTch; those earlier runs aren't published. [Full results, specific issues, environment and settings](https://github.com/dondai44423/donsetch/blob/master/docs/firecrawl-comparison.md).
+
 ## Use the terminal
 
 ```bash

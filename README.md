@@ -24,6 +24,7 @@
   <a href="#start-here">Install</a> ·
   <a href="#four-tools-one-process">Tools</a> ·
   <a href="#under-the-hood">Design</a> ·
+  <a href="#donsetch-vs-firecrawl-cloud">Comparison</a> ·
   <a href="#proxies-without-the-guesswork">Proxies</a> ·
   <a href="#know-the-limits">Limits</a> ·
   <a href="#documentation">Docs</a> ·
@@ -157,6 +158,26 @@ These are home-IP measurements, not a promise for every site or network. The col
 
 [Method, failures, and the separate live-web field test →](docs/benchmarks.md)
 
+### DonSeTch vs. Firecrawl Cloud
+
+**DonSeTch came out ahead on fetching and focused crawling in this test. Firecrawl had better search relevance.** I asked an AI agent to use both MCP servers on real tasks on 16 November 2026, inspect the returned content, and write up what happened.
+
+The opponent was **Firecrawl's paid, hosted cloud service**, accessed with an API key. I tried its [free, open-source self-hosted version](https://github.com/firecrawl/firecrawl) internally first; DonSeTch was far ahead in those runs, so I chose cloud for a closer contest. I didn't publish the self-hosted results. The linked report covers the cloud session only.
+
+| Task | DonSeTch | Firecrawl Cloud | Result in this session |
+|---|---|---|---|
+| Fetch · 12 targets | **0.83 s** median on the 10 targets both read; faster on **9/10** | **2.00 s** on those same targets | DonSeTch gave faster reads, cleaner code on the tested Pydantic page, and structured PDF tables. Both returned content on **11/12** targets. |
+| Focused crawl · 4 runs | **9.49 s** median; **19 pages** selected around the requested topics | **19.60 s**; **26 pages**, including navigation and feeds | DonSeTch found the HTTPX async and uv Python-version material Firecrawl missed, with **7 fewer page fetches**. Firecrawl returned **6–22× as many characters** across the four runs. |
+| Search · 9 queries | **1.71 s** median over 8 timed pairs; faster on **8/8** | **3.19 s** over those pairs | The agent preferred Firecrawl's results on **6 queries**, DonSeTch's on **1**, with **2 ties**. |
+
+**Reading less is part of the design.** DonSeTch lets the agent choose an excerpt, section or full read, and expand when needed. Crawl digests give it relevant passages and `pN` handles for the stored pages. In these tasks, that meant less irrelevant reading and better page selection.
+
+**DonSeTch kinda got its ass beat on search relevance.** It surfaced a stale Intel CEO snippet and weaker exact-error/product results. You can use a search API alongside the local reading tools—[Tavily offers a free allowance](https://docs.tavily.com/documentation/api-credits); [setup is below](#optional-keys). BYOK search wasn't tested here.
+
+Specific issues remain: Firecrawl read G2 through a Cloudflare wall and was faster on IMDb; DonSeTch's crawl digest flattened code on two sites. This was a small, hand-picked session with uncontrolled caches and different output views. The comparison doc includes every rated case, the environment, tools and settings.
+
+[Full comparison: results, examples and methodology →](docs/firecrawl-comparison.md)
+
 ## Proxies without the guesswork
 
 **You don't need one to start.** A proxy is useful when an engine rate-limits your IP or a site treats your network differently.
@@ -193,6 +214,8 @@ donsetch keys add tavily 'YOUR_KEY'
 donsetch keys add exa 'YOUR_KEY'
 donsetch keys default local           # Keyless first; paid search as fallback.
 ```
+
+To use a provider for search first, run `donsetch keys default tavily` (or your chosen provider), then restart MCP. Search queries go to that service; fetch and crawl keep their local engine. An explicit search `lang` uses the keyless path instead. The comparison above tested keyless search only.
 
 Native search providers: Tavily, Exa, Serper, SerpApi, SerpBase, Brave Search, TinyFish, Parallel, and Bright Data. Other providers can use the [executable plugin interface](docs/tools.md#search-plugins).
 
@@ -244,6 +267,7 @@ Settings live in `donsetch.toml`. Precedence: defaults → legacy environment �
 | [Proxies](docs/proxies.md) | Pool routing, environment proxies, credential formats, and diagnostics. |
 | [Architecture](docs/architecture.md) | Fetch, search, extraction, PDF, state, and the code behind them. |
 | [Measurements](docs/benchmarks.md) | Benchmark conditions and the live-web field report. |
+| [Firecrawl Cloud comparison](docs/firecrawl-comparison.md) | Fetch, crawl and search results, examples, environment, and methodology. |
 | [Local rules](docs/rules.md) | Refuse a host before fetching and give the agent your instructions. |
 | [Bright Data](docs/brightdata.md) | Optional SERP and Web Unlocker setup. |
 | [Contributing](CONTRIBUTING.md) | Development loop, tests, PRs, and releases. |

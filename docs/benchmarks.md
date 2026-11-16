@@ -62,6 +62,8 @@ The sample was manually selected and not independently blinded. Its success rate
 
 No cold search-bench artifact is recorded for the current build, so this page makes no current search-accuracy claim.
 
+In my [16 November comparison with paid Firecrawl Cloud](firecrawl-comparison.md), the agent preferred DonSeTch for fetching and focused crawling, and Firecrawl for search relevance. It compared 12 fetch targets, 9 search queries, 4 full crawls and a map, plus an unpaired DonSeTch warm diff. The write-up shows the faster calls, more useful crawl selection and smaller reading views, alongside specific defects, the environment, tools and settings. It's a hand-picked MCP field test with uncontrolled caches; the results describe that session.
+
 The compiled ranker records a held-out MRR of 0.8467 versus fusion's 0.8070 over 400 saved rows in [rank_weights.rs](../src/search/rank_weights.rs). This is a ranker validation on saved candidates, not live end-to-end search accuracy.
 
 The v4 Firecrawl comparison predates the fetch-engine replacement. Cloud/local peer comparisons without a recorded run remain unmeasured. They are not evidence that the current release is faster or more accurate than those products.
