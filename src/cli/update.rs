@@ -822,7 +822,7 @@ fn replace_binary(exe: &Path, temp_dir: &Path) -> Result<(), String> {
 /// and the updater must carry across upgrades: Linux
 /// `libonnxruntime.so`, macOS `libonnxruntime.dylib` since #316
 /// (both dlopen'd from the exe dir by onnx.rs), Windows
-/// `pdfium.dll` and `onnxruntime.dll`. A tarball without one simply
+/// PDFium, ONNX and the app-local Visual C++ runtimes. A tarball without one simply
 /// stages nothing. Rollback restores the same list so a rolled-back
 /// binary never keeps a newer sibling runtime.
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -832,7 +832,14 @@ pub(crate) const SIBLING_LIBS: &[&str] = &["libonnxruntime.so"];
 pub(crate) const SIBLING_LIBS: &[&str] = &["libonnxruntime.dylib"];
 
 #[cfg(windows)]
-pub(crate) const SIBLING_LIBS: &[&str] = &["pdfium.dll", "onnxruntime.dll"];
+pub(crate) const SIBLING_LIBS: &[&str] = &[
+    "pdfium.dll",
+    "onnxruntime.dll",
+    "msvcp140.dll",
+    "msvcp140_1.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+];
 
 fn sibling_tmp(exe_dir: &Path, name: &str) -> std::path::PathBuf {
     exe_dir.join(format!(".{name}.update.tmp"))

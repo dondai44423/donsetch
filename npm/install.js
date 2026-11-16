@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-// donsetch postinstall: download the prebuilt binary for this platform
-// from GitHub Releases, verify SHA256, and extract to ./binaries/.
+// First-run bootstrap: download the prebuilt binary for this platform
+// from GitHub Releases, verify SHA256, and extract to the package or user cache.
 
 const http = require('http');
 const https = require('https');
@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { findExistingBinary, targetWritable } = require('./resolve-binary.js');
+const { findExistingBinary } = require('./resolve-binary.js');
 const { pipeline } = require('stream/promises');
 
 const REPO = 'dondai44423/donsetch';
@@ -106,7 +106,14 @@ if (process.platform === 'linux'
   process.exit(1);
 }
 
-const binDir = path.join(__dirname, 'binaries');
+const binDirIndex = process.argv.indexOf('--bin-dir');
+if (binDirIndex >= 0 && !process.argv[binDirIndex + 1]) {
+  console.error('donsetch: --bin-dir requires a directory');
+  process.exit(1);
+}
+const binDir = binDirIndex >= 0
+  ? path.resolve(process.argv[binDirIndex + 1])
+  : path.join(__dirname, 'binaries');
 const binaryPath = path.join(binDir, plat.binary);
 const stampPath = `${binaryPath}.version`;
 
@@ -309,9 +316,8 @@ async function main() {
   } catch (err) {
     settleUnwritable(err);
   }
-  if (!targetWritable(__dirname)) {
-    settleUnwritable(new Error(`${binDir} is not writable`));
-  }
+  try { fs.accessSync(binDir, fs.constants.W_OK); }
+  catch (err) { settleUnwritable(err); }
   cleanupStaleTemps();
 
   if (process.platform === 'win32') {

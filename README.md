@@ -51,7 +51,7 @@ npm install -g donsetch
 donsetch doctor
 ```
 
-The installer downloads a SHA256-verified release binary. No Rust toolchain needed. Linux, macOS, and Windows are supported.
+The first `donsetch` command downloads a SHA256-verified release binary. No install scripts to approve and no Rust toolchain needed. Linux, macOS, and Windows are supported.
 
 <details>
 <summary>Homebrew, Pi, DeepSeek Harness, or build from source</summary>

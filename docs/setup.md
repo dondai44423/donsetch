@@ -9,7 +9,11 @@ npm install -g donsetch
 donsetch doctor
 ```
 
-The npm package downloads the matching release asset and verifies its SHA256. It is a launcher and installer; the tools run in the Rust binary.
+The npm package has no install lifecycle scripts, so npm, pnpm and bun need no script approval. The first command (`donsetch doctor` above) downloads the matching release asset and verifies its SHA256. The tools run in the Rust binary. Pi prepares the same binary at session start.
+
+The binary normally lives inside the package. If a system-wide package is read-only, it uses a versioned directory under your user cache instead (`donsetch/npm/<version>/<platform>`). `DONSETCH_CACHE_DIR` relocates that cache; `DONSETCH_BINARY` selects an existing executable for both CLI and Pi. No sudo is needed for the first-run download.
+
+Windows release archives include the required Visual C++ runtime DLLs beside `donsetch.exe`; installing a machine-wide redistributable is not required.
 
 | Platform | Asset | OCR / HTTP transport |
 |---|---|---|
@@ -180,9 +184,10 @@ For development, use the [contributor build ladder](../CONTRIBUTING.md#developme
 
 | Symptom | Try |
 |---|---|
-| pnpm/bun skipped postinstall | Approve the package's build script, then reinstall. For pnpm: `pnpm approve-builds`. |
-| Installed with `--ignore-scripts` | Run `node node_modules/donsetch/install.js`, or let the `npx donsetch` shim download the binary. |
-| Global npm directory is not writable | Use a user-owned prefix, or set `DONSETCH_BINARY` to an existing binary. The launcher also checks `PATH` and `~/.cargo/bin`. |
+| First command is downloading | Allow the one-time verified binary download to finish. Later starts use the installed copy. |
+| Installed with `--ignore-scripts` or strict script policy | No extra step: run `donsetch doctor` or start Pi. DonSeTch has no install scripts. |
+| `npm install -g` fails with `EACCES` | Use `npx -y donsetch doctor`, or `npm install -g --prefix "$HOME/.local" donsetch` then `~/.local/bin/donsetch doctor`. Add `~/.local/bin` to your shell's `PATH` for later use. |
+| Package directory is read-only at runtime | The launcher downloads into your user cache automatically. `DONSETCH_BINARY` can select an existing binary; `PATH` and `~/.cargo/bin` are fallback locations. |
 | Download needs a proxy | Set `HTTPS_PROXY` or `HTTP_PROXY` to an HTTP CONNECT proxy. |
 | GitHub Releases is inaccessible | Set `DONSETCH_RELEASES_BASE` to a mirror with `<tag>/<asset>` paths. |
 | Windows cannot extract the asset | Ensure `tar` is available; Windows 10 1803 and later include it. |

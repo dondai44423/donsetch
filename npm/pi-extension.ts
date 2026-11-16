@@ -10,12 +10,10 @@
  * binary. When donsetch adds or changes tools, this extension picks
  * them up automatically : no code changes needed here.
  *
- * Auto-download: if the binary is missing (e.g. postinstall was
- * blocked by npm 10+), the extension resolves through
- * resolve-binary.js at session_start: the package binary gets
- * installed when possible, otherwise an existing donsetch
- * (DONSETCH_BINARY / PATH / cargo bin) is used (#361: system-wide
- * installs under a root-owned prefix).
+ * First run: resolve-binary.js prepares the verified binary at
+ * session_start without npm install scripts. DONSETCH_BINARY wins;
+ * read-only package directories use the user's versioned cache or
+ * an existing executable on PATH / cargo bin.
  *
  * Custom TUI: each tool has clean renderCall/renderResult showing
  * a compact summary card : not the full raw output. The LLM still
@@ -24,10 +22,8 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { resolveBinary } from "./resolve-binary.js";
 import { Text } from "@earendil-works/pi-tui";
 
 // ── Constants ──
@@ -102,45 +98,13 @@ const toolNames: string[] = [];
 
 // ── Binary resolution ──
 
-function getBinaryPath(): string {
-  const pkgDir = __dirname;
-  const binaryName = process.platform === "win32" ? "donsetch.exe" : "donsetch";
-  return join(pkgDir, "binaries", binaryName);
-}
-
 function ensureBinary(): string {
-  const binaryPath = getBinaryPath();
-  if (existsSync(binaryPath)) return binaryPath;
-
-  const resolverScript = join(__dirname, "resolve-binary.js");
-  if (!existsSync(resolverScript)) {
-    throw new Error(
-      `donsetch binary not found at ${binaryPath} and resolve-binary.js is missing. ` +
-      `Run \`npm rebuild donsetch\` or \`npm install -g --allow-scripts=donsetch donsetch@latest\`.`
-    );
-  }
-
-  // The shared resolver installs the package binary when it can and
-  // falls back to an existing donsetch when it cannot. stdio is
-  // inherited so first-run download progress stays visible; the path
-  // arrives via a temp file because stdout belongs to the terminal.
-  const outFile = join(tmpdir(), `donsetch-resolve-${process.pid}.txt`);
-  try {
-    execFileSync(
-      process.execPath,
-      [resolverScript, "--print-file", outFile, "--pkg-dir", __dirname],
-      { stdio: "inherit", cwd: __dirname, timeout: 300_000 }
-    );
-    const resolved = readFileSync(outFile, "utf8").trim();
-    if (!resolved) throw new Error("resolver returned no binary path");
-    return resolved;
-  } catch (err: any) {
-    throw new Error(
-      `Failed to resolve the donsetch binary. The resolver output above names the cause and the ways out (${err.message}).`
-    );
-  } finally {
-    try { rmSync(outFile, { force: true }); } catch { /* best effort */ }
-  }
+  const resolved = resolveBinary({
+    pkgDir: __dirname,
+    onOutput: (chunk: string) => process.stderr.write(chunk),
+  });
+  if (resolved.notice) process.stderr.write(resolved.notice + "\n");
+  return resolved.path;
 }
 
 // ── MCP JSON-RPC 2.0 over stdio ──

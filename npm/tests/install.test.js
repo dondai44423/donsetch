@@ -175,3 +175,40 @@ test('DONSETCH_SKIP_DOWNLOAD=1 exits 0 without installing', (t) => {
   assert.match(r.stdout, /download skipped/);
   assert.ok(!existsSync(join(pkg, 'binaries', 'donsetch')));
 });
+
+test('a read-only npm install bootstraps once into the user cache', async (t) => {
+  if (!h.IS_POSIX || h.SKIP_IF_ROOT) return t.skip('non-root POSIX fixture');
+  const { root, pkg } = scaffold('user-cache');
+  const m = await mirror(root, pkg);
+  if (!m) return t.skip('unsupported test platform');
+  t.after(() => m.server.close());
+  chmodSync(pkg, 0o555);
+  // A writable cache can install the pinned release: an older binary on
+  // PATH must not silently defeat an npm upgrade of a system-wide package.
+  const userbin = join(root, 'userbin');
+  h.stubBinary(userbin, 'OLDER-BINARY');
+  m.env.PATH += `:${userbin}`;
+  const wrapper = join(pkg, 'bin', 'donsetch.js');
+  const r = await h.spawnNode([wrapper, '--version'], { env: m.env });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, 'TARBALL-BINARY --version\n');
+  assert.match(r.stderr, /user cache/);
+  assert.ok(!existsSync(join(pkg, 'binaries')), 'read-only package left untouched');
+  const version = JSON.parse(readFileSync(join(pkg, 'package.json'))).version;
+  const cache = process.platform === 'darwin'
+    ? join(root, 'home', 'Library', 'Caches') : join(root, 'home', '.cache');
+  assert.equal(readFileSync(join(cache, 'donsetch', 'npm', version,
+    `${process.platform}-${process.arch}`, 'donsetch'), 'utf8'), BIN_BODY);
+  const hits = m.server.hits.length;
+  const again = await h.spawnNode([wrapper, '--version'], { env: m.env });
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal(again.stdout, r.stdout);
+  assert.equal(m.server.hits.length, hits, 'second run must work offline');
+});
+
+test('the npm package has no install lifecycle scripts to approve', () => {
+  const pkg = require('../package.json');
+  for (const name of ['preinstall', 'install', 'postinstall', 'prepare']) {
+    assert.ok(!pkg.scripts[name], `${name} would bring back install-script blocking`);
+  }
+});

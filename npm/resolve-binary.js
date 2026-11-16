@@ -2,16 +2,16 @@
 'use strict';
 
 // Binary resolution for the npm package, shared by every consumer:
-// bin/donsetch.js (the CLI / MCP wrapper, in-process), install.js
-// (install-time acknowledgement), and pi-extension.ts (spawned as
-// `node resolve-binary.js --print-file <path>`).
+// bin/donsetch.js (the CLI / MCP wrapper), install.js (failure-path
+// acknowledgement), and pi-extension.ts.
 //
 // Order:
 //   1. DONSETCH_BINARY            explicit override, wins over everything
 //   2. <pkg>/binaries/<name>      the pinned copy this package installs
-//   3. install.js                 fetch the pinned copy when it can run
-//   4. an existing binary         PATH, $CARGO_HOME/bin, ~/.cargo/bin
-//   5. hard failure               curated, names every way out
+//   3. versioned user cache       read-only global packages need no sudo
+//   4. install.js                 fetch the pinned copy on first use
+//   5. an existing binary         PATH, $CARGO_HOME/bin, ~/.cargo/bin
+//   6. hard failure               curated, names every way out
 //
 // The fallback exists because the pinned copy is not always obtainable
 // (issue #361): a system-wide npm package under a root-owned prefix
@@ -24,6 +24,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execFileSync } = require('child_process');
 
 const BINARY_NAME = process.platform === 'win32' ? 'donsetch.exe' : 'donsetch';
@@ -48,6 +49,23 @@ function real(p) {
 
 function packageBinary(pkgDir) {
   return path.join(pkgDir, 'binaries', BINARY_NAME);
+}
+
+// A system-wide npm package can be read-only to its caller. First-run
+// installation still works without sudo, in a versioned per-user cache.
+function cachedBinary(pkgDir) {
+  const version = require(path.join(pkgDir, 'package.json')).version;
+  const home = os.homedir();
+  let root = process.env.DONSETCH_CACHE_DIR;
+  if (!root) {
+    const base = process.platform === 'win32'
+      ? (process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'))
+      : process.platform === 'darwin'
+        ? path.join(home, 'Library', 'Caches')
+        : (process.env.XDG_CACHE_HOME || path.join(home, '.cache'));
+    root = path.join(base, 'donsetch');
+  }
+  return path.join(root, 'npm', version, `${process.platform}-${process.arch}`, BINARY_NAME);
 }
 
 // The package-local copy, with a chmod rescue: an executable bit lost
@@ -150,13 +168,13 @@ function noBinaryMessage(why) {
   ].join('\n');
 }
 
-function runInstaller(pkgDir, onOutput) {
+function runInstaller(pkgDir, onOutput, binDir) {
   const installScript = path.join(pkgDir, 'install.js');
   if (!fs.existsSync(installScript)) {
     return { ok: false, error: `installer missing: ${installScript}` };
   }
   try {
-    const out = execFileSync(process.execPath, [installScript], {
+    const out = execFileSync(process.execPath, [installScript, '--bin-dir', binDir], {
       cwd: pkgDir,
       encoding: 'utf8',
       timeout: 300_000,
@@ -187,13 +205,21 @@ function resolveBinary(opts) {
   const local = packageBinary(pkgDir);
   if (usableLocal(local)) return { path: local, source: 'package' };
 
+  const cached = cachedBinary(pkgDir);
+  if (usableLocal(cached)) return { path: cached, source: 'cache' };
+
   let why;
   if (process.env.DONSETCH_SKIP_DOWNLOAD === '1') {
     why = 'download skipped (DONSETCH_SKIP_DOWNLOAD=1)';
   } else if (!targetWritable(pkgDir)) {
     why = `${path.join(pkgDir, 'binaries')} is not writable`;
+    if (onOutput) onOutput('donsetch: first run; installing the verified binary in your user cache...\n');
+    const result = runInstaller(pkgDir, onOutput, path.dirname(cached));
+    if (usableLocal(cached)) return { path: cached, source: 'cache' };
+    why = result.ok ? 'the installer did not produce the binary' : result.error;
   } else {
-    const result = runInstaller(pkgDir, onOutput);
+    if (onOutput) onOutput('donsetch: first run; downloading the verified binary...\n');
+    const result = runInstaller(pkgDir, onOutput, path.dirname(local));
     if (usableLocal(local)) return { path: local, source: 'package' };
     // The installer can also exit 0 without a local binary (its own
     // existing-binary acknowledgement): name that, never "undefined".
@@ -201,20 +227,21 @@ function resolveBinary(opts) {
   }
 
   const existing = findExistingBinary({ pkgDir, self: opts.self });
-  if (existing) {
-    return {
-      path: existing.path,
-      source: existing.source,
-      notice: `donsetch: package binary unavailable (${why}); using existing binary: ${existing.path}`,
-    };
-  }
+  if (existing) return existingNotice(existing, why);
   throw new Error(noBinaryMessage(why));
 }
 
-module.exports = { resolveBinary, findExistingBinary, targetWritable, packageBinary };
+function existingNotice(existing, why) {
+  return {
+    ...existing,
+    notice: `donsetch: package binary unavailable (${why}); using existing binary: ${existing.path}`,
+  };
+}
+
+module.exports = { resolveBinary, findExistingBinary, targetWritable, packageBinary, cachedBinary };
 
 // ── CLI mode ─────────────────────────────────────────────────────
-// Used by pi-extension.ts. `--print` writes the resolved path to
+// `--print` writes the resolved path to
 // stdout; `--print-file <path>` writes it to a file and keeps stdout
 // free for an inheriting caller. Progress and failures go to stderr.
 if (require.main === module) {

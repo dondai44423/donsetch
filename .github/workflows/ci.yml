@@ -200,6 +200,19 @@ jobs:
           key: ${{ steps.setup.outputs.cache-key }}
           profile: fast
 
+  # Installation has its own cheap gate; no Rust dependency cache or build.
+  npm:
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - run: node --test --test-timeout=90000 npm/tests/*.test.js
+
   # ── The suite ──────────────────────────────────────────────────────────────
   test:
     name: test (${{ matrix.name }})
@@ -326,6 +339,10 @@ jobs:
       - name: QEMU (non-AVX gate)
         if: matrix.name == 'linux-x64'
         run: sudo apt-get install -y --no-install-recommends qemu-user binutils
+      - name: Stage app-local Windows runtime
+        if: matrix.name == 'win32-x64'
+        shell: pwsh
+        run: ./scripts/windows-runtime.ps1 -Destination target/dist-thin
       - name: Payload gates
         env:
           CI: 'true'
@@ -338,7 +355,7 @@ jobs:
         run: |
           cd target/dist-thin
           case "${{ matrix.name }}" in
-            win32-x64)    files="donsetch.exe pdfium.dll onnxruntime.dll" ;;
+            win32-x64)    files="donsetch.exe pdfium.dll onnxruntime.dll msvcp140.dll msvcp140_1.dll vcruntime140.dll vcruntime140_1.dll" ;;
             linux-x64)    files="donsetch libonnxruntime.so" ;;
             darwin-*)     files="donsetch libonnxruntime.dylib" ;;
             *)            files="donsetch" ;;
@@ -373,10 +390,11 @@ jobs:
 
   # ── Tag + release, from the artifacts that were just gated ─────────────────
   publish:
-    needs: [plan, lint, test, build]
+    needs: [plan, lint, npm, test, build]
     if: >-
       needs.plan.outputs.release == 'true'
-      && needs.lint.result == 'success' && needs.test.result == 'success' && needs.build.result == 'success'
+      && needs.lint.result == 'success' && needs.npm.result == 'success'
+      && needs.test.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -441,7 +459,7 @@ jobs:
   # ── The one required check ─────────────────────────────────────────────────
   gate:
     name: gate
-    needs: [plan, lint, test, build]
+    needs: [plan, lint, npm, test, build]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 2

@@ -19,7 +19,9 @@ npm install -g donsetch
 donsetch doctor
 ```
 
-The package downloads a SHA256-verified release binary. No Rust build tools needed. Linux, macOS, and Windows are supported; [the setup guide](https://github.com/dondai44423/donsetch/blob/master/docs/setup.md) lists platform requirements and OCR availability.
+The first `donsetch` command downloads a SHA256-verified release binary. There are no install scripts to approve, including with npm, pnpm, or bun. No Rust build tools needed. Linux, macOS, and Windows are supported; [the setup guide](https://github.com/dondai44423/donsetch/blob/master/docs/setup.md) lists platform requirements and OCR availability.
+
+For Pi, run `pi install npm:donsetch`; the extension prepares the binary when the session starts. A read-only global package uses your user cache automatically. Windows releases include the Visual C++ runtime beside the binary; no administrator runtime setup is required.
 
 ## Connect your agent
 
@@ -78,7 +80,7 @@ Paid search providers and Bright Data Web Unlocker are optional. [Provider/plugi
 
 ## Need help?
 
-Run `donsetch doctor --deep` for live network/provider checks and `doctor --fix` for mechanical repairs. For pnpm/bun, approve the install script if your package manager blocks it. `DONSETCH_BINARY` selects an existing binary; `DONSETCH_RELEASES_BASE` selects a release mirror.
+Run `donsetch doctor --deep` for live network/provider checks and `doctor --fix` for mechanical repairs. If a global npm install fails with `EACCES`, try `npx -y donsetch doctor` or use a user-owned npm prefix. `DONSETCH_BINARY` selects an existing binary for both CLI and Pi; `DONSETCH_RELEASES_BASE` selects a release mirror.
 
 [Install troubleshooting](https://github.com/dondai44423/donsetch/blob/master/docs/setup.md#troubleshooting) · [Issues](https://github.com/dondai44423/donsetch/issues) · [Changelog](https://github.com/dondai44423/donsetch/blob/master/CHANGELOG.md)
 

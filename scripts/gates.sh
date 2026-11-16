@@ -66,6 +66,11 @@ if [ -n "$LIB" ]; then
 fi
 if [ "$platform" = "win32-x64" ]; then
     [ -f pdfium.dll ] || fail "pdfium.dll missing beside the binary"
+    # A runner has the VC runtime globally; a fresh user's PC may not.
+    # Require app-local copies instead of letting that hide an incomplete zip.
+    for dll in msvcp140.dll msvcp140_1.dll vcruntime140.dll vcruntime140_1.dll; do
+        [ -s "$dll" ] || fail "$dll missing beside the binary"
+    done
 fi
 
 # The binary reports the Cargo.toml version (and so the tag: a release commit

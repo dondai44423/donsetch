@@ -1,5 +1,23 @@
 # Changelog
 
+## [5.5.3] - 2026-11-16
+
+### Fixed
+
+- **Windows releases include their Visual C++ runtime.** The required DLLs ship beside
+  `donsetch.exe`, so a PC without a machine-wide redistributable can start the CLI, MCP and Pi.
+  Packaging checks the runtime dependencies; self-update and rollback carry the same DLLs.
+- **Pi uses the same binary resolver as the CLI.** `DONSETCH_BINARY` takes precedence even
+  when the package has a local binary, and a lost executable bit is repaired before startup.
+
+### Changed
+
+- **npm installation needs no script approval.** The postinstall hook is removed. The first
+  CLI command or Pi session downloads and verifies the matching release binary; npm, pnpm,
+  bun and `--ignore-scripts` installs follow the same path. A read-only global package can
+  install its binary into the user's versioned cache without sudo. Existing local binaries
+  and explicit overrides keep working offline.
+
 ## [5.5.2] - 2026-11-16
 
 ### Fixed
