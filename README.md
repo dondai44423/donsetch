@@ -21,6 +21,7 @@
 </p>
 
 <p align="center">
+  <a href="#see-it-in-action">Demo</a> ·
   <a href="#start-here">Install</a> ·
   <a href="#four-tools-one-process">Tools</a> ·
   <a href="#under-the-hood">Design</a> ·
@@ -34,6 +35,12 @@
 Find a source, read the useful part, follow a link, check a claim. DonSeTch gives agents that web loop over MCP or from your terminal, with about 2,000 tokens of tool schemas.
 
 **Page reads launch no browser.** Real client profiles, learned routes, and embedded V8 handle the fetch. Chromium is used separately for screenshots. Search needs no model download.
+
+## See it in action
+
+A 54-second demo of an agent searching the web and reading sources with DonSeTch in OpenCode.
+
+https://github.com/user-attachments/assets/8762aaec-8553-4ebb-8a2a-0eb56bc3adf4
 
 ## Start here
 
