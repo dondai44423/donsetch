@@ -98,30 +98,52 @@ const toolNames: string[] = [];
 
 // ── Binary resolution ──
 
-function ensureBinary(): string {
-  const resolved = resolveBinary({
-    pkgDir: __dirname,
-    onOutput: (chunk: string) => process.stderr.write(chunk),
-  });
-  if (resolved.notice) process.stderr.write(resolved.notice + "\n");
-  return resolved.path;
+// The resolver installs in this process on first use (resolve-binary.js
+// imports install.js), so a compiled host's process.execPath is never
+// spawned as if it were a JS runtime (issue #450: Pi-Bolt is a
+// Bun-compiled pi and rejects `install.js --bin-dir` as its own
+// arguments). Concurrent callers share one installation: session_start
+// and a tool call must not both start a 19MB download.
+let ensuring: Promise<string> | null = null;
+
+function ensureBinary(): Promise<string> {
+  if (!ensuring) {
+    ensuring = resolveBinary({
+      pkgDir: __dirname,
+      onOutput: (chunk: string) => process.stderr.write(chunk),
+    })
+      .then((resolved) => {
+        if (resolved.notice) process.stderr.write(resolved.notice + "\n");
+        return resolved.path;
+      })
+      .finally(() => {
+        ensuring = null;
+      });
+  }
+  return ensuring;
 }
 
 // ── MCP JSON-RPC 2.0 over stdio ──
 
-function startServer(): Promise<void> {
-  if (proc && initialized) return Promise.resolve();
-  if (proc && !initialized) return Promise.reject(new Error("donsetch MCP server is still initializing"));
+let starting: Promise<void> | null = null;
+
+async function startServer(): Promise<void> {
+  if (proc && initialized) return;
+  if (starting) return starting;
+  if (proc && !initialized) throw new Error("donsetch MCP server is still initializing");
+  starting = spawnServer().finally(() => {
+    starting = null;
+  });
+  return starting;
+}
+
+async function spawnServer(): Promise<void> {
+  // Resolution can install the binary on first run, which awaits I/O;
+  // it happens before the spawn so two concurrent callers share one
+  // `starting` promise instead of starting two servers.
+  const binaryPath = await ensureBinary();
 
   return new Promise((resolve, reject) => {
-    let binaryPath: string;
-    try {
-      binaryPath = ensureBinary();
-    } catch (err: any) {
-      reject(err);
-      return;
-    }
-
     try {
       // --supervised: crash-only daemon. If the MCP server is SIGKILLed
       // (OOM, crash), the supervisor respawns it and replays in-flight
@@ -240,7 +262,13 @@ function startServer(): Promise<void> {
         initialized = true;
         resolve();
       })
-      .catch(reject);
+      .catch((err: any) => {
+        // A server that never finished the handshake is unusable, and
+        // leaving it alive would make every later call fail with
+        // "still initializing" instead of retrying the start.
+        killServer();
+        reject(err);
+      });
   });
 }
 

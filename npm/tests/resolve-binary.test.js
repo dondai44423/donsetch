@@ -5,7 +5,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { chmodSync, mkdirSync, readFileSync, symlinkSync } = require('fs');
+const { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } = require('fs');
 const { join } = require('path');
 const h = require('./helpers.js');
 
@@ -186,6 +186,24 @@ test('installer failure falls back to PATH with a named reason, never "undefined
   assert.equal(r.out, join(userbin, 'donsetch'));
   assert.match(r.stderr, /using existing binary/);
   assert.doesNotMatch(r.stderr, /undefined/);
+});
+
+test('a fallback names its version, and says when it is not the pinned one', (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const root = h.scratch('fallback-version');
+  const pkg = h.stagePkg(join(root, 'pkg'));
+  const userbin = join(root, 'userbin');
+  mkdirSync(userbin, { recursive: true });
+  const other = join(userbin, 'donsetch');
+  writeFileSync(other, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "DonSeTch 9.9.9"; else echo STUB; fi\n');
+  chmodSync(other, 0o755);
+  const r = resolve(pkg, {
+    path: [userbin],
+    home: join(root, 'home'),
+    extra: { DONSETCH_SKIP_DOWNLOAD: '1' },
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /using existing binary: .*\(version 9\.9\.9; this package pins \d+\.\d+\.\d+\)/);
 });
 
 test('--print-file keeps stdout empty and puts the path in the file', (t) => {

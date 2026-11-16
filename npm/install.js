@@ -2,7 +2,20 @@
 'use strict';
 
 // First-run bootstrap: download the prebuilt binary for this platform
-// from GitHub Releases, verify SHA256, and extract to the package or user cache.
+// from GitHub Releases, verify SHA256, and extract it.
+//
+// The installer is a library first: `install()` runs in the CALLING
+// process. resolve-binary.js imports it instead of spawning a script,
+// because the host that needs it can be a compiled executable — Pi-Bolt
+// is a Bun-compiled pi, so `process.execPath` is that host, not a JS
+// runtime, and `<host> install.js --bin-dir DIR` is rejected as an
+// unknown option (issue #450). Nothing here calls process.exit or
+// writes to stdout: the caller may own both (an MCP stdio session owns
+// stdout outright).
+//
+// The file still runs directly (`node install.js [--bin-dir DIR]`) for
+// anyone driving it by hand; that mode keeps the old exit codes, its
+// progress on stdout, and its failures on stderr.
 
 const http = require('http');
 const https = require('https');
@@ -17,120 +30,37 @@ const { pipeline } = require('stream/promises');
 
 const REPO = 'dondai44423/donsetch';
 const VERSION = require('./package.json').version;
-const TAG = process.env.DONSETCH_INSTALL_TAG || `v${VERSION}`;
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_REDIRECTS = 5;
 const RETRIES = 3;
 const RETRY_BACKOFF_MS = [1_000, 3_000];
 
 const PLATFORMS = {
-  'linux-x64':    { asset: 'donsetch-linux-x64.tar.gz',    binary: 'donsetch' },
-  'linux-arm64':  { asset: 'donsetch-linux-arm64.tar.gz',  binary: 'donsetch' },
-  'darwin-arm64': { asset: 'donsetch-darwin-arm64.tar.gz', binary: 'donsetch' },
-  'darwin-x64':   { asset: 'donsetch-darwin-x64.tar.gz',   binary: 'donsetch' },
-  'win32-x64':    { asset: 'donsetch-win32-x64.tar.gz',    binary: 'donsetch.exe' },
-  'win32-arm64':  { asset: 'donsetch-win32-x64.tar.gz',    binary: 'donsetch.exe', emulated: true },
+  'linux-x64':    { label: 'linux-x64      Linux x86_64 (glibc)',           asset: 'donsetch-linux-x64.tar.gz',    binary: 'donsetch' },
+  'linux-arm64':  { label: 'linux-arm64    Linux ARM64 (glibc)',            asset: 'donsetch-linux-arm64.tar.gz',  binary: 'donsetch' },
+  'darwin-arm64': { label: 'darwin-arm64   macOS Apple Silicon',            asset: 'donsetch-darwin-arm64.tar.gz', binary: 'donsetch' },
+  'darwin-x64':   { label: 'darwin-x64     macOS Intel',                    asset: 'donsetch-darwin-x64.tar.gz',   binary: 'donsetch' },
+  'win32-x64':    { label: 'win32-x64      Windows x86_64',                 asset: 'donsetch-win32-x64.tar.gz',    binary: 'donsetch.exe' },
+  'win32-arm64':  { label: 'win32-arm64    Windows ARM64 (x64 emulation)',  asset: 'donsetch-win32-x64.tar.gz',    binary: 'donsetch.exe', emulated: true },
 };
 
-const platKey = `${process.platform}-${process.arch}`;
-const plat = PLATFORMS[platKey];
-
-if (!plat) {
-  console.error(`donsetch: unsupported platform ${platKey}`);
-  console.error('');
-  console.error('Supported platforms:');
-  console.error('  linux-x64      Linux x86_64 (glibc)');
-  console.error('  linux-arm64    Linux ARM64 (glibc)');
-  console.error('  darwin-arm64   macOS Apple Silicon');
-  console.error('  darwin-x64     macOS Intel');
-  console.error('  win32-x64      Windows x86_64');
-  console.error('  win32-arm64    Windows ARM64 (x64 emulation)');
-  console.error('');
-  console.error('Build from source: https://github.com/' + REPO);
-  process.exit(1);
-}
-
-if (process.env.DONSETCH_SKIP_DOWNLOAD === '1') {
-  console.log('donsetch: download skipped (DONSETCH_SKIP_DOWNLOAD=1)');
-  process.exit(0);
-}
-
-if (plat.emulated) {
-  console.log('donsetch: Windows arm64 uses the win32-x64 build under emulation.');
-}
-
-function detectMusl() {
-  let interpreter;
-  try {
-    const fd = fs.openSync('/proc/self/exe', 'r');
-    const hdr = Buffer.alloc(64);
-    fs.readSync(fd, hdr, 0, 64, 0);
-    const ePhOff = hdr.readBigUInt64LE(0x20);
-    const ePhEntSize = hdr.readUInt16LE(0x36);
-    const ePhNum = hdr.readUInt16LE(0x38);
-    for (let i = 0; i < ePhNum; i++) {
-      const ph = Buffer.alloc(ePhEntSize);
-      fs.readSync(fd, ph, 0, ePhEntSize, Number(ePhOff) + i * ePhEntSize);
-      if (ph.readUInt32LE(0) === 3) {
-        const offset = Number(ph.readBigUInt64LE(0x08));
-        const size = Number(ph.readBigUInt64LE(0x20));
-        const value = Buffer.alloc(size);
-        fs.readSync(fd, value, 0, size, offset);
-        interpreter = value.toString('ascii').replace(/\0/g, '').trim();
-        break;
-      }
-    }
-    fs.closeSync(fd);
-  } catch (_) {
-    interpreter = undefined;
+// A failure the CLI reports in its own words; `code` names the class so
+// the message can stay one line for a caller that shows only that.
+class InstallError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'InstallError';
+    this.code = code;
   }
-  if (interpreter) return interpreter.includes('musl');
-
-  const muslLoader = fs.existsSync('/lib/ld-musl-x86_64.so.1')
-    || fs.existsSync('/lib/ld-musl-aarch64.so.1');
-  const glibcLoader = fs.existsSync('/lib64/ld-linux-x86-64.so.2')
-    || fs.existsSync('/lib/ld-linux-aarch64.so.1');
-  return muslLoader && !glibcLoader;
 }
 
-if (process.platform === 'linux'
-    && process.env.DONSETCH_FORCE_GLIBC !== '1'
-    && detectMusl()) {
-  console.error('donsetch: musl libc detected (Alpine?).');
-  console.error('The prebuilt Linux binaries are glibc-linked and will not run.');
-  console.error('');
-  console.error('Build from source:');
-  console.error(`  git clone https://github.com/${REPO} && cd donsetch && cargo build --release`);
-  console.error('Or use a glibc-based image (Debian, Ubuntu, Fedora).');
-  console.error('Set DONSETCH_FORCE_GLIBC=1 only if a glibc compatibility layer is installed.');
-  process.exit(1);
+function platformFor(platform, arch) {
+  return PLATFORMS[`${platform}-${arch}`] || null;
 }
 
-const binDirIndex = process.argv.indexOf('--bin-dir');
-if (binDirIndex >= 0 && !process.argv[binDirIndex + 1]) {
-  console.error('donsetch: --bin-dir requires a directory');
-  process.exit(1);
+function supportedPlatforms() {
+  return Object.values(PLATFORMS).map((p) => p.label);
 }
-const binDir = binDirIndex >= 0
-  ? path.resolve(process.argv[binDirIndex + 1])
-  : path.join(__dirname, 'binaries');
-const binaryPath = path.join(binDir, plat.binary);
-const stampPath = `${binaryPath}.version`;
-
-if (fs.existsSync(binaryPath) && fs.existsSync(stampPath)) {
-  let stamp;
-  try { stamp = fs.readFileSync(stampPath, 'utf8').trim(); } catch (_) {}
-  if (stamp === VERSION) {
-    console.log(`donsetch: binary already present (${plat.binary} ${VERSION})`);
-    process.exit(0);
-  }
-  console.log(`donsetch: binary version stamp mismatch; re-downloading ${VERSION}`);
-}
-
-const releasesBase = (process.env.DONSETCH_RELEASES_BASE
-  || `https://github.com/${REPO}/releases/download`).replace(/\/+$/, '');
-const assetUrl = `${releasesBase}/${TAG}/${plat.asset}`;
-const checksumUrl = `${assetUrl}.sha256`;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -274,7 +204,7 @@ function statusError(url, status) {
   return error;
 }
 
-async function download(url, dest) {
+async function download(url, dest, warn) {
   for (let attempt = 0; attempt < RETRIES; attempt++) {
     try {
       const response = await getWithRedirects(url);
@@ -293,126 +223,50 @@ async function download(url, dest) {
       try { fs.unlinkSync(dest); } catch (_) {}
       if (attempt + 1 >= RETRIES || error.retryable === false) throw error;
       const delay = RETRY_BACKOFF_MS[attempt] || RETRY_BACKOFF_MS[RETRY_BACKOFF_MS.length - 1];
-      console.error(`donsetch: download attempt ${attempt + 1} failed (${error.message}); retrying in ${delay / 1000}s`);
+      warn(`donsetch: download attempt ${attempt + 1} failed (${error.message}); retrying in ${delay / 1000}s`);
       await sleep(delay);
     }
   }
 }
 
-async function main() {
-  // Per-pid temp names: two first runs racing (two MCP clients
-  // starting together) must never share a write target. The renames
-  // that land the files are atomic; the temps are invisible until then.
-  const tarball = path.join(binDir, `${plat.asset}.tmp-${process.pid}`);
-  const checksumFile = path.join(binDir, `checksum.sha256.tmp-${process.pid}`);
-  const extractDir = path.join(binDir, `extract.tmp-${process.pid}`);
-
-  // The unwritable install dir (#361: a system-wide npm package under
-  // a root-owned prefix, run by an unprivileged user) is decided
-  // BEFORE any download, so the failure names the directory and the
-  // ways out instead of dying after 19MB of network.
+function detectMusl() {
+  let interpreter;
   try {
-    fs.mkdirSync(binDir, { recursive: true });
-  } catch (err) {
-    settleUnwritable(err);
-  }
-  try { fs.accessSync(binDir, fs.constants.W_OK); }
-  catch (err) { settleUnwritable(err); }
-  cleanupStaleTemps();
-
-  if (process.platform === 'win32') {
-    try {
-      execFileSync('tar', ['--version'], { stdio: 'ignore' });
-    } catch (_) {
-      console.error('donsetch: `tar` not found on this Windows system.');
-      console.error('tar ships with Windows 10 1803+. Update Windows, or extract manually');
-      console.error(`after downloading ${assetUrl}`);
-      process.exit(1);
+    const fd = fs.openSync('/proc/self/exe', 'r');
+    const hdr = Buffer.alloc(64);
+    fs.readSync(fd, hdr, 0, 64, 0);
+    const ePhOff = hdr.readBigUInt64LE(0x20);
+    const ePhEntSize = hdr.readUInt16LE(0x36);
+    const ePhNum = hdr.readUInt16LE(0x38);
+    for (let i = 0; i < ePhNum; i++) {
+      const ph = Buffer.alloc(ePhEntSize);
+      fs.readSync(fd, ph, 0, ePhEntSize, Number(ePhOff) + i * ePhEntSize);
+      if (ph.readUInt32LE(0) === 3) {
+        const offset = Number(ph.readBigUInt64LE(0x08));
+        const size = Number(ph.readBigUInt64LE(0x20));
+        const value = Buffer.alloc(size);
+        fs.readSync(fd, value, 0, size, offset);
+        interpreter = value.toString('ascii').replace(/\0/g, '').trim();
+        break;
+      }
     }
-  }
-
-  console.log(`donsetch: downloading ${plat.asset} from ${TAG}...`);
-  try {
-    await download(assetUrl, tarball);
-    console.log('donsetch: verifying checksum...');
-    await download(checksumUrl, checksumFile);
-
-    const expectedHash = fs.readFileSync(checksumFile, 'utf8').trim().split(/\s+/)[0];
-    const actualHash = crypto.createHash('sha256').update(fs.readFileSync(tarball)).digest('hex');
-    if (!/^[a-f0-9]{64}$/.test(expectedHash) || actualHash !== expectedHash) {
-      throw new Error(`SHA256 mismatch (expected ${expectedHash}, actual ${actualHash})`);
-    }
-
-    console.log('donsetch: extracting...');
-    fs.rmSync(extractDir, { recursive: true, force: true });
-    fs.mkdirSync(extractDir, { recursive: true });
-    execFileSync('tar', ['xzf', tarball, '-C', extractDir], { stdio: 'inherit' });
-
-    const entries = fs.readdirSync(extractDir);
-    if (!entries.includes(plat.binary)) {
-      throw new Error(`expected ${plat.binary} not found after extraction in ${binDir}`);
-    }
-    // Land each entry with a rename inside binDir: a rename is atomic,
-    // so a concurrent first run can only ever replace a complete file,
-    // never expose a half-written one. The stamp goes last: a crash
-    // before it leaves no stamp, and the next run re-downloads.
-    for (const name of entries) {
-      fs.renameSync(path.join(extractDir, name), path.join(binDir, name));
-    }
-    fs.rmSync(extractDir, { recursive: true, force: true });
-    if (process.platform !== 'win32') fs.chmodSync(binaryPath, 0o755);
-    fs.writeFileSync(stampPath, `${VERSION}\n`);
-    console.log(`donsetch: installed ${plat.binary} to ${binaryPath}`);
-  } finally {
-    // Always drop the download artifacts: a failed checksum fetch, a
-    // failed extract, or a missing binary must not leave the tarball
-    // and checksum sitting in ./binaries/ forever.
-    try { fs.unlinkSync(tarball); } catch (_) {}
-    try { fs.unlinkSync(checksumFile); } catch (_) {}
-    try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch (_) {}
-  }
-}
-
-// One existing-binary lookup for the failure paths: an install that
-// cannot succeed must not take a working donsetch down with it (#361).
-// Returns false when there is nothing to fall back on.
-function ackExisting(detail) {
-  let existing = null;
-  try {
-    existing = findExistingBinary({ pkgDir: __dirname });
+    fs.closeSync(fd);
   } catch (_) {
-    return false;
+    interpreter = undefined;
   }
-  if (!existing) return false;
-  console.log(`donsetch: install failed: ${detail}`);
-  console.log(`donsetch: an existing binary was found and will be used: ${existing.path}`);
-  process.exit(0);
-}
+  if (interpreter) return interpreter.includes('musl');
 
-// The unwritable install dir: acknowledge an existing binary when one
-// is findable (npm install / postinstall stays green), otherwise fail
-// with every way out named.
-function settleUnwritable(cause) {
-  const detail = cause && cause.message ? cause.message : 'directory is not writable';
-  if (ackExisting(detail)) return;
-  console.error(
-    `donsetch: cannot install into ${binDir} (${detail}) and no existing donsetch binary was found.`
-  );
-  console.error('');
-  console.error('Options:');
-  console.error('  - install under a user-writable prefix:');
-  console.error('      npm config set prefix ~/.npm-global && npm install -g donsetch');
-  console.error('  - point at a donsetch binary you already have:');
-  console.error('      DONSETCH_BINARY=/path/to/donsetch');
-  console.error('  - build from source:');
-  console.error(`      git clone https://github.com/${REPO} && cd donsetch && cargo build --release`);
-  process.exit(1);
+  const muslLoader = fs.existsSync('/lib/ld-musl-x86_64.so.1')
+    || fs.existsSync('/lib/ld-musl-aarch64.so.1');
+  const glibcLoader = fs.existsSync('/lib64/ld-linux-x86-64.so.2')
+    || fs.existsSync('/lib/ld-linux-aarch64.so.1');
+  return muslLoader && !glibcLoader;
 }
 
 // Temp leftovers from crashed runs (this installer is the only writer
 // of `.tmp-<pid>` / `extract.tmp-<pid>` names in binDir). A pid that
 // is still alive keeps its workspace.
-function cleanupStaleTemps() {
+function cleanupStaleTemps(binDir) {
   let names;
   try {
     names = fs.readdirSync(binDir);
@@ -433,16 +287,238 @@ function cleanupStaleTemps() {
   }
 }
 
-main().catch((error) => {
-  if (ackExisting(error.message)) return;
-  console.error(`donsetch: install failed: ${error.message}`);
-  console.error('');
-  console.error('Options:');
-  console.error('  - install under a user-writable prefix:');
-  console.error('      npm config set prefix ~/.npm-global && npm install -g donsetch');
-  console.error('  - point at a donsetch binary you already have:');
-  console.error('      DONSETCH_BINARY=/path/to/donsetch');
-  console.error('  - build from source:');
-  console.error(`  git clone https://github.com/${REPO} && cd donsetch && cargo build --release`);
-  process.exit(1);
-});
+function unwritable(cause, binDir) {
+  const detail = cause && cause.message ? cause.message : 'directory is not writable';
+  const error = new InstallError(`cannot install into ${binDir} (${detail})`, 'UNWRITABLE');
+  error.binDir = binDir;
+  return error;
+}
+
+// Download, verify and land the pinned binary in `binDir`.
+//
+// Returns { status, binaryPath } where status is 'skipped' (the caller
+// asked not to download), 'present' (the pinned version is already
+// there) or 'installed'. Throws InstallError on any failure, with
+// `code` naming the class so a CLI can phrase it.
+//
+// All progress goes through `log(line)`; `warn(line)` carries the
+// retry and transient-failure lines that belong on stderr.
+async function install(opts = {}) {
+  const log = typeof opts.log === 'function' ? opts.log : () => {};
+  const warn = typeof opts.warn === 'function' ? opts.warn : log;
+  const platform = opts.platform || process.platform;
+  const arch = opts.arch || process.arch;
+  const version = opts.version || VERSION;
+  const binDir = opts.binDir ? path.resolve(opts.binDir) : path.join(__dirname, 'binaries');
+  const tag = process.env.DONSETCH_INSTALL_TAG || `v${version}`;
+  const releasesBase = (opts.releasesBase
+    || process.env.DONSETCH_RELEASES_BASE
+    || `https://github.com/${REPO}/releases/download`).replace(/\/+$/, '');
+
+  const platKey = `${platform}-${arch}`;
+  const plat = platformFor(platform, arch);
+  if (!plat) {
+    throw new InstallError(`unsupported platform ${platKey}`, 'UNSUPPORTED_PLATFORM');
+  }
+
+  if (process.env.DONSETCH_SKIP_DOWNLOAD === '1') {
+    return { status: 'skipped' };
+  }
+
+  if (plat.emulated) {
+    log('donsetch: Windows arm64 uses the win32-x64 build under emulation.');
+  }
+
+  if (platform === 'linux'
+      && process.env.DONSETCH_FORCE_GLIBC !== '1'
+      && detectMusl()) {
+    throw new InstallError(
+      [
+        'donsetch: musl libc detected (Alpine?).',
+        'The prebuilt Linux binaries are glibc-linked and will not run.',
+        '',
+        'Build from source:',
+        `  git clone https://github.com/${REPO} && cd donsetch && cargo build --release`,
+        'Or use a glibc-based image (Debian, Ubuntu, Fedora).',
+        'Set DONSETCH_FORCE_GLIBC=1 only if a glibc compatibility layer is installed.',
+      ].join('\n'),
+      'UNSUPPORTED_LIBC'
+    );
+  }
+
+  const binaryPath = path.join(binDir, plat.binary);
+  const stampPath = `${binaryPath}.version`;
+  const assetUrl = `${releasesBase}/${tag}/${plat.asset}`;
+  const checksumUrl = `${assetUrl}.sha256`;
+
+  if (fs.existsSync(binaryPath) && fs.existsSync(stampPath)) {
+    let stamp;
+    try { stamp = fs.readFileSync(stampPath, 'utf8').trim(); } catch (_) {}
+    if (stamp === version) {
+      log(`donsetch: binary already present (${plat.binary} ${version})`);
+      return { status: 'present', binaryPath };
+    }
+    log(`donsetch: binary version stamp mismatch; re-downloading ${version}`);
+  }
+
+  // The unwritable install dir (#361: a system-wide npm package under
+  // a root-owned prefix, run by an unprivileged user) is decided
+  // BEFORE any download, so the failure names the directory and the
+  // ways out instead of dying after 19MB of network.
+  try {
+    fs.mkdirSync(binDir, { recursive: true });
+  } catch (err) {
+    throw unwritable(err, binDir);
+  }
+  try { fs.accessSync(binDir, fs.constants.W_OK); }
+  catch (err) { throw unwritable(err, binDir); }
+  cleanupStaleTemps(binDir);
+
+  if (platform === 'win32') {
+    try {
+      execFileSync('tar', ['--version'], { stdio: 'ignore' });
+    } catch (_) {
+      throw new InstallError(
+        [
+          '`tar` not found on this Windows system.',
+          'tar ships with Windows 10 1803+. Update Windows, or extract manually',
+          `after downloading ${assetUrl}`,
+        ].join('\n'),
+        'NO_TAR'
+      );
+    }
+  }
+
+  // Per-pid temp names: two first runs racing (two MCP clients
+  // starting together) must never share a write target. The renames
+  // that land the files are atomic; the temps are invisible until then.
+  const tarball = path.join(binDir, `${plat.asset}.tmp-${process.pid}`);
+  const checksumFile = path.join(binDir, `checksum.sha256.tmp-${process.pid}`);
+  const extractDir = path.join(binDir, `extract.tmp-${process.pid}`);
+
+  log(`donsetch: downloading ${plat.asset} from ${tag}...`);
+  try {
+    await download(assetUrl, tarball, warn);
+    log('donsetch: verifying checksum...');
+    await download(checksumUrl, checksumFile, warn);
+
+    const expectedHash = fs.readFileSync(checksumFile, 'utf8').trim().split(/\s+/)[0];
+    const actualHash = crypto.createHash('sha256').update(fs.readFileSync(tarball)).digest('hex');
+    if (!/^[a-f0-9]{64}$/.test(expectedHash) || actualHash !== expectedHash) {
+      throw new Error(`SHA256 mismatch (expected ${expectedHash}, actual ${actualHash})`);
+    }
+
+    log('donsetch: extracting...');
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    fs.mkdirSync(extractDir, { recursive: true });
+    execFileSync('tar', ['xzf', tarball, '-C', extractDir], { stdio: 'ignore' });
+
+    const entries = fs.readdirSync(extractDir);
+    if (!entries.includes(plat.binary)) {
+      throw new Error(`expected ${plat.binary} not found after extraction in ${binDir}`);
+    }
+    // Land each entry with a rename inside binDir: a rename is atomic,
+    // so a concurrent first run can only ever replace a complete file,
+    // never expose a half-written one. The stamp goes last: a crash
+    // before it leaves no stamp, and the next run re-downloads.
+    for (const name of entries) {
+      fs.renameSync(path.join(extractDir, name), path.join(binDir, name));
+    }
+    fs.rmSync(extractDir, { recursive: true, force: true });
+    if (platform !== 'win32') fs.chmodSync(binaryPath, 0o755);
+    fs.writeFileSync(stampPath, `${version}\n`);
+    log(`donsetch: installed ${plat.binary} to ${binaryPath}`);
+    return { status: 'installed', binaryPath };
+  } finally {
+    // Always drop the download artifacts: a failed checksum fetch, a
+    // failed extract, or a missing binary must not leave the tarball
+    // and checksum sitting in ./binaries/ forever.
+    try { fs.unlinkSync(tarball); } catch (_) {}
+    try { fs.unlinkSync(checksumFile); } catch (_) {}
+    try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch (_) {}
+  }
+}
+
+function optionsText() {
+  return [
+    'Options:',
+    '  - install under a user-writable prefix:',
+    '      npm config set prefix ~/.npm-global && npm install -g donsetch',
+    '  - point at a donsetch binary you already have:',
+    '      DONSETCH_BINARY=/path/to/donsetch',
+    '  - build from source:',
+    `      git clone https://github.com/${REPO} && cd donsetch && cargo build --release`,
+  ];
+}
+
+// One existing-binary lookup for the failure paths: an install that
+// cannot succeed must not take a working donsetch down with it (#361).
+// Returns false when there is nothing to fall back on.
+function ackExisting(detail, log = console.log) {
+  let existing = null;
+  try {
+    existing = findExistingBinary({ pkgDir: __dirname });
+  } catch (_) {
+    return false;
+  }
+  if (!existing) return false;
+  log(`donsetch: install failed: ${detail}`);
+  log(`donsetch: an existing binary was found and will be used: ${existing.path}`);
+  return true;
+}
+
+// ── CLI mode ─────────────────────────────────────────────────────
+// `node install.js [--bin-dir DIR]`: the manual entry point. Keeps the
+// original contract — progress on stdout, failures on stderr, and an
+// existing binary acknowledged so an npm install stays green.
+async function main(argv = process.argv.slice(2)) {
+  const binDirIndex = argv.indexOf('--bin-dir');
+  if (binDirIndex >= 0 && !argv[binDirIndex + 1]) {
+    console.error('donsetch: --bin-dir requires a directory');
+    return 1;
+  }
+  const binDir = binDirIndex >= 0
+    ? path.resolve(argv[binDirIndex + 1])
+    : path.join(__dirname, 'binaries');
+
+  try {
+    const result = await install({
+      binDir,
+      log: (line) => console.log(line),
+      warn: (line) => console.error(line),
+    });
+    if (result.status === 'skipped') {
+      console.log('donsetch: download skipped (DONSETCH_SKIP_DOWNLOAD=1)');
+    }
+    return 0;
+  } catch (error) {
+    if (error.code === 'UNSUPPORTED_PLATFORM') {
+      console.error(`donsetch: ${error.message}`);
+      console.error('');
+      console.error('Supported platforms:');
+      for (const line of supportedPlatforms()) console.error(`  ${line}`);
+      console.error('');
+      console.error(`Build from source: https://github.com/${REPO}`);
+      return 1;
+    }
+    if (error.code === 'UNSUPPORTED_LIBC' || error.code === 'NO_TAR') {
+      console.error(error.message);
+      return 1;
+    }
+    if (ackExisting(error.message, console.log)) return 0;
+    if (error.code === 'UNWRITABLE') {
+      console.error(`donsetch: ${error.message} and no existing donsetch binary was found.`);
+    } else {
+      console.error(`donsetch: install failed: ${error.message}`);
+    }
+    console.error('');
+    for (const line of optionsText()) console.error(line);
+    return 1;
+  }
+}
+
+if (require.main === module) {
+  main().then((code) => process.exit(code));
+}
+
+module.exports = { install, InstallError, platformFor, supportedPlatforms };

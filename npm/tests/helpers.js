@@ -8,12 +8,15 @@
 const crypto = require('crypto');
 const https = require('https');
 const { execFileSync, spawn, spawnSync } = require('child_process');
-const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } = require('fs');
+const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } = require('fs');
 const { tmpdir } = require('os');
 const { join } = require('path');
 
 const PKG_SRC = join(__dirname, '..');
 const NODE = process.execPath;
+
+// The bytes a first-run fixture ships as the platform binary.
+const TARBALL_BINARY = '#!/bin/sh\necho TARBALL-BINARY "$@"\n';
 
 const IS_POSIX = process.platform !== 'win32';
 const IS_ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
@@ -93,6 +96,63 @@ function spawnNode(args, { env, cwd, timeout = 60_000 } = {}) {
 // contains exactly those and nothing that could resolve as a donsetch.
 function toolPath(name) {
   return execFileSync('/bin/sh', ['-c', `command -v ${name}`], { encoding: 'utf8' }).trim();
+}
+
+// A Bun to build a compiled-host fixture with, or null. `BUN` wins; a
+// bun on PATH is next. The compiled-host test skips without it.
+function bunPath() {
+  if (process.env.BUN) return process.env.BUN;
+  try {
+    return execFileSync('/bin/sh', ['-c', 'command -v bun'], { encoding: 'utf8' }).trim() || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Build a standalone Bun executable from `source` (a .ts entry that
+// dynamically imports its target at runtime, the way a Pi host loads an
+// extension). Returns the executable path.
+function buildBunHost(root, source, name = 'compiled-host') {
+  const bun = bunPath();
+  if (!bun) throw new Error('bun is not available');
+  const entry = join(root, `${name}.ts`);
+  writeFileSync(entry, source);
+  const out = join(root, name);
+  execFileSync(bun, ['build', '--compile', entry, '--outfile', out], { stdio: 'ignore' });
+  return out;
+}
+
+// First-run fixture: a local HTTPS release mirror serving the platform
+// tarball plus a PATH holding exactly the tools the installer shells
+// out to (tar and its gzip). `pkg` is staged separately.
+async function firstRunMirror(root, { tag = 'v0.0.0-test', files = { donsetch: TARBALL_BINARY } } = {}) {
+  const asset = assetName();
+  if (!asset) return null;
+  const tls = makeTlsFixture(root);
+  const tarball = makeTarball(root, files);
+  const server = await startReleaseServer(tls, {
+    tag,
+    asset,
+    tarballPath: tarball,
+    sha: sha256File(tarball),
+  });
+  const tools = join(root, 'tools');
+  mkdirSync(tools, { recursive: true });
+  for (const tool of ['tar', 'gzip']) {
+    symlinkSync(toolPath(tool), join(tools, tool));
+  }
+  const home = join(root, 'home');
+  mkdirSync(home, { recursive: true });
+  const env = cleanEnv({
+    path: [tools],
+    home,
+    extra: {
+      DONSETCH_RELEASES_BASE: `https://127.0.0.1:${server.port}`,
+      DONSETCH_INSTALL_TAG: tag,
+      NODE_EXTRA_CA_CERTS: tls.certPath,
+    },
+  });
+  return { asset, server, env, tarball };
 }
 
 function assetName() {
@@ -183,8 +243,12 @@ function startReleaseServer(tls, { tag, asset, tarballPath, sha }) {
 module.exports = {
   IS_POSIX,
   SKIP_IF_ROOT,
+  TARBALL_BINARY,
   assetName,
+  buildBunHost,
+  bunPath,
   cleanEnv,
+  firstRunMirror,
   makeTarball,
   makeTlsFixture,
   runNode,
