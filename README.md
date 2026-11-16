@@ -103,7 +103,7 @@ The CLI and MCP tools use the same engine. No account setup sits between install
 |---|---|---|
 | `web_fetch` | Pages, PDFs, structured site records, or up to 12 URLs at once | `must_contain`, `focus`, `toc`, `section`, `since_last` |
 | `web_search` | Ranked sources and evidence snippets, keyless by default | `intent`, `lang`, `max_results`, `read` |
-| `web_crawl` | A site map or a bounded crawl with resumable progress | `mode`, `focus`, `max_pages`, `resume` |
+| `web_crawl` | A site model, a plan, or a bounded crawl with a digest and resumable job | `mode`, `focus`, `max_pages`, `job`, `handle` |
 | `web_screenshot` | A rendered PNG through an installed Chromium-family browser | `full_page`, `wait_ms`, `deadline_ms` |
 
 Your agent chooses what to read next. DonSeTch supplies the tools.

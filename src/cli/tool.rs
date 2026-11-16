@@ -38,6 +38,43 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     // after the capture on the caller's result.
     let mut out_path: Option<String> = None;
     let mut out_seen = false;
+    // `crawl plan <url>` and `crawl explain <url>` are the CLI's verbs;
+    // rewrite them onto the shared `--mode plan` surface before clap.
+    let mut crawl_verb: Option<Vec<String>> = None;
+    if cmd == "crawl"
+        && let Some(verb) = args.first().map(String::as_str)
+    {
+        match verb {
+            "plan" | "explain" => {
+                let mut rewritten = args[1..].to_vec();
+                rewritten.push("--mode".to_string());
+                rewritten.push("plan".to_string());
+                if verb == "explain" {
+                    rewritten.push("--explain".to_string());
+                }
+                crawl_verb = Some(rewritten);
+            }
+            "run" => {
+                let mut rewritten = args[1..].to_vec();
+                rewritten.push("--mode".to_string());
+                rewritten.push("run".to_string());
+                crawl_verb = Some(rewritten);
+            }
+            "resume" => {
+                let mut rewritten = vec!["--mode".to_string(), "run".to_string()];
+                rewritten.push("--resume".to_string());
+                rewritten.extend_from_slice(&args[1..]);
+                crawl_verb = Some(rewritten);
+            }
+            "get" | "diff" | "sites" | "forget" => {
+                let mut rewritten = args[1..].to_vec();
+                rewritten.push("--mode".to_string());
+                rewritten.push(verb.to_string());
+                crawl_verb = Some(rewritten);
+            }
+            _ => {}
+        }
+    }
     let args_ref: &[String] = if cmd == "screenshot" {
         let mut clean: Vec<String> = Vec::with_capacity(args.len());
         let mut skip = false;
@@ -55,6 +92,8 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             clean.push(a.clone());
         }
         Box::leak(clean.into_boxed_slice())
+    } else if let Some(rewritten) = &crawl_verb {
+        rewritten
     } else {
         args
     };

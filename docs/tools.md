@@ -146,6 +146,14 @@ Optional `error_kind`: `invalid_key`, `credit_depleted`, `rate_limited`, `server
 
 ```bash
 donsetch crawl https://docs.python.org/3/ --mode map --topic asyncio
+donsetch crawl plan https://docs.python.org/3/ --topic asyncio --max-pages 10
+donsetch crawl explain https://docs.python.org/3/ --topic asyncio --max-pages 10
+donsetch crawl run https://docs.python.org/3/ --topic asyncio --max-pages 10
+donsetch crawl get p1 --job j0123456789abcdef
+donsetch crawl diff https://docs.python.org/3/ --refresh
+donsetch crawl sites
+donsetch crawl forget docs.python.org
+donsetch crawl resume j0123456789abcdef
 donsetch crawl https://docs.python.org/3/ --mode full --topic asyncio \
   --max-pages 10 --deadline 60
 donsetch crawl --resume 'TOKEN_FROM_PREVIOUS_RESULT'
@@ -153,28 +161,53 @@ donsetch crawl --resume 'TOKEN_FROM_PREVIOUS_RESULT'
 
 | Mode | Work |
 |---|---|
-| `full` · default | Discover sitemap inventory, then fetch content. |
-| `map` | Return inventory; without a sitemap, use seed-page links. |
-| `content` | Walk from the seed without sitemap discovery. |
+| `full` · default | Plan the site, then execute the plan; returns the digest and job. |
+| `map` | Return the site model: sections, families, URL counts and freshness; no page fetches. |
+| `plan` | Return the pages to fetch first, with reasons, coverage, cost and reserves; no page fetches. CLI verb `crawl plan`. |
+| `run` | Spend the plan through the executor: one page at a time, durable job, declared wall; returns the digest and pN handles. CLI verb `crawl run`. |
+| `get` | Read one `pN` page from a run job with no network. Supports `--section` and `--offset`. |
+| `diff` | Revalidate the inventory and fetch only changed/new pages; report removed URLs. |
+| `sites` | List the bounded host dossiers and their page-memory counts. |
+| `forget` | Remove one host's dossier; the fetch cache is untouched. |
 
-MCP `focus` is CLI `--topic`. It scores link text and URL paths before fetch, then focuses extracted passages. This is lexical matching: a link sharing no query token is not enqueued.
+MCP `focus` is CLI `--topic`. It ranks the inventory and plan lexically by link text and URL paths, then keeps focus passages in the digest. This is lexical matching: no embeddings, query rewriting or semantic guess. A focus that matches nothing says so and falls back to breadth.
+
+`map` reads the site's own inventory (`llms.txt`, sitemaps, feeds, then the seed's links) and answers with the model: site kind, sections, families, URL counts, freshness and the inventory requests it spent. It never reads a content page; the seed page is read only when the site publishes no inventory. `map_limit` caps the flat URL list; the model still covers the whole inventory and says when the list is capped.
+
+`plan` spends no page: it chooses one page per section/family, deepens only after breadth, keeps a
+reserve list, and states each row's reason, section, cost and request class. A focus filters the
+plan to matching URLs and keeps focus precision at 1.0; if nothing matches it says so and falls
+back to breadth. `explain` adds a bounded candidate table (`explain=true` in MCP). A focused plan
+uses the full inventory; a no-focus plan can use the warm dossier. `max_pages` is the plan budget.
+
+`full` is `plan` then `run`: it spends the plan through the v5 fetch engine, one page at a time
+per host, the plan budget plus reserves as the host request budget, a wall declaration for the
+first classified challenge/block/auth/paywall, and a durable job under `cache/crawl/jobs/`.
+Every completed page is persisted before the next request; `resume=<job>` (CLI `crawl resume`)
+returns the same pages and does not re-fetch them. A complete job is idempotent. A wall is not
+retried: switch egress or use a real browser driver. The response is the digest: a site brief,
+page cards and stable `pN` handles; repeated source headers/footers are removed, headings and
+focus passages are kept. `crawl get pN --job <job>` reads the full stored page with no network;
+`--section`/`--offset` project it like a fetch. Dataset mode emits schema
+`donsetch.crawl.page` v3 with `handle`, `headings`, `card` and the full `markdown` per row.
 
 | Budget | Default / range |
 |---|---|
-| `max_pages` | 10 / up to 200 |
-| `map_limit` | 120 / 1–50,000 inventory URLs |
+| `max_pages` | 10 / up to 200; plan mode: pages to plan; run mode: pages to fetch |
+| `explain` | Plan mode: include the candidate table |
+| `map_limit` | 120 / 1–50,000 URLs in the flat map list |
 | `max_depth` | 2 / 0 means seed only |
 | `max_total_chars` · CLI `--max-chars` | 60,000 / 1–500,000 |
 | `per_page_max` | 8,000 / 1–40,000 |
 | `deadline_s` · CLI `--deadline` | 120 / 1–600 seconds |
 
-Character caps apply to page Markdown, not inventory and header metadata. Cut pages carry `next_offset` and `content_complete: false`; continue with fetch. `include_paths` / `exclude_paths` (CLI `--include` / `--exclude`) accept path globs.
+Character caps apply to page Markdown, not inventory and header metadata. Cut pages carry `next_offset` and `content_complete: false`; continue with fetch or `crawl get --offset`. Run dataset rows are schema `donsetch.crawl.page` v3. `include_paths` / `exclude_paths` (CLI `--include` / `--exclude`) accept path globs.
 
-Crawl respects robots.txt by default, shares per-host pacing across processes, and honors published waits. It starts on the direct lane; [pool routing](proxies.md) can spread subsequent work. `since_last` suppresses unchanged sources after rechecking. `dataset` returns versioned JSON Lines with per-page focus receipts.
+Crawl respects robots.txt by default, shares per-host pacing across processes, and honors published waits. It starts on the direct lane; [pool routing](proxies.md) can spread subsequent work. `since_last` on a run is delta mode: unchanged pages cost no fetch, moved/new pages are fetched, and removed URLs are reported. `dataset` returns versioned JSON Lines.
 
-An output cap, failed sitemap, failed page, policy denial, or depth limit is not site-wide completeness. Inventory discovery has safety bounds of 100,000 URLs and 32 sitemap reads. Resume tokens last 30 minutes and survive process restarts; pass `resume` alone.
+An output cap, failed sitemap, failed page, policy denial, wall or deadline is not site-wide completeness. Inventory discovery has safety bounds of 100,000 URLs and 32 sitemap reads. Run jobs last 7 days (50-job LRU) and are resumed with the `job` id; pass `crawl resume <job>` (or `resume` alone in MCP). `crawl diff` uses the warm dossier (inventory hash, source, lastmod trust, stable page list, per-URL fingerprint/lastmod) and `--refresh` revalidates now; the dossier keeps at most 256 hosts, 20,000 inventory URLs and 4,096 page memories per host, evicting the least recently used page memory. `crawl sites` lists dossiers; `crawl forget <host>` removes one without touching the fetch cache.
 
-Stop reasons include `FrontierEmpty`, `MaxPages`, `CharBudget`, `DepthLimit`, `Deadline`, `ThrottledOut`, `Cancelled`, and `InventoryLimit`. Map mode can finish as `InventoryComplete`. Always inspect the completeness receipt too.
+Crawl receipts name their own stop: map/plan `covered`, `budget` or `empty`; run `covered`, `budget`, `empty`, `deadline`, `walled`, `cancelled` or `throttled`. Map mode can finish as `InventoryComplete`. Plan mode reports its own `covered`, `budget`, or `empty` and maps budget to `MaxPages` in the crawl receipt; run mode reports `covered`, `budget`, `empty`, `deadline`, `walled`, `cancelled`, or `throttled`, and a wall carries class/vendor/status. Always inspect the completeness receipt too.
 
 ## Screenshot
 

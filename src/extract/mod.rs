@@ -131,7 +131,7 @@ pub struct Extracted {
     pub partial: Option<PartialContent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentKind {
     Article,
     Listing,

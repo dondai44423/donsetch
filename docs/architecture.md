@@ -11,7 +11,7 @@ The Rust workspace has two crates: the product at the root and its fetching foun
 | Fetch layer | Client identities, carried state, cache, classification, interfaces, V8, mined requests | [crates/fetch](../crates/fetch/README.md) |
 | DonSift | HTML extraction, typed blocks, reading views, headings, links, text quality | [src/extract](../src/extract/) |
 | DonSeek | Query planning, keyless retrieval, merging, ranking, source health | [src/search](../src/search/) |
-| DonTread | Sitemaps, frontier, pacing, budgets, resume | [src/crawl](../src/crawl/) |
+| DonTread | Site model (map), planner (plan), executor (run), digest/get (pN), delta/change memory, frontier (full/content), pacing, budgets, resume | [src/crawl](../src/crawl/) |
 | DonSheet | PDFium FFI, reading order, glyph/pixel fusion, tables, OCR, forms | [src/pdf](../src/pdf/) |
 | Browser | Throwaway screenshots and diagnostic captures | [src/browser](../src/browser/) |
 | MCP | Stdio and HTTP transport, compatibility output, supervisor | [src/mcp](../src/mcp/) |
@@ -81,7 +81,7 @@ DonSift builds typed content blocks with section breadcrumbs, removes page furni
 
 DonSheet gets glyphs and rendered pixels from PDFium. Pixel structure supplies borders and table rules; glyphs supply text. Region-level audits decide where OCR is needed. OCR is optional and lazy; ONNX belongs to that path only.
 
-DonTread inventories sitemaps and/or walks a best-first frontier, then uses the same fetch and extraction pipeline. Per-host/lane pacing and shared host state prevent parallel crawls from simply doubling the rate. Output budgets and resume receipts remain visible to the caller.
+DonTread's `map` builds the v6 site model from the site's own inventory (`llms.txt`, sitemaps, feeds, seed links) — templates, families, sections and a dossier — without reading a content page. `plan` spends that model on a page budget: one page per section/family, deepen after breadth, reserves, a reason and cost per row, no fetch. `run` spends the plan through v5: one page at a time per host, host request budget, durable job, resume, and a host circuit breaker that declares a classified wall instead of retrying page by page. Its response is a digest — brief, page cards, stable `pN` handles, headings and focus passages, repeated boilerplate removed — and `crawl get pN` reads the full stored page from the job with no network. Dataset v3 carries the same card fields plus full markdown. The dossier (v3) stores the change contract, bounded inventory and per-URL fingerprint/lastmod memory; `crawl diff` uses it to fetch only changed/new pages and report removed URLs, while `crawl sites`/`forget` list or remove a host's memory. `full` is the v6 plan + executor path, on the same v5 fetch and extraction pipeline; per-host pacing and shared host state prevent parallel crawls from doubling the rate. `map`, `plan`, `full`, `diff`, `get` and job `resume` are the crawl contract.
 
 Screenshots use a separate installed browser and return PNGs. They never supply cookies, tokens, or content to fetch.
 

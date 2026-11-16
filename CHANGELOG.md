@@ -1,5 +1,32 @@
 # Changelog
 
+## [5.5.0] - 2026-11-15
+
+### Changed
+
+- **Crawl is rebuilt around a site model, a plan and a digest.** `full` now plans the site and
+  spends that plan through the v5 fetch engine, returning page cards with stable `pN` handles
+  instead of a page dump. `map`, `plan`, `run`, `diff`, `get`, `sites` and `forget` are the
+  crawl contract. Page cards keep headings and focus passages; `crawl get pN` returns the full
+  stored page with no network; dataset rows are schema v3.
+- **A repeat crawl is cheap and honest.** The dossier records the inventory hash, source,
+  lastmod trust, page-list stability and bounded per-URL fingerprint/lastmod memory. `crawl diff`
+  fetches only changed/new pages and reports removed URLs; `crawl sites`/`forget` manage the
+  bounded host dossiers.
+
+### Removed
+
+- **The old crawl execution path.** The best-first frontier walk, its scheduler and worker pool,
+  the 30-minute resume store and the page-dump renderer are gone. `full` no longer walks a
+  frontier; one plan, one executor, one digest and one job store remain. The tool name, the
+  four-tool cap and the `web_crawl` surface stay.
+
+### Fixed
+
+- **The crawl tool definition matches the shipped contract.** `content` is no longer advertised;
+  `full`, `map`, `plan`, `run`, `diff`, `get`, `sites`, `forget`, `refresh`, `job`, `handle` and
+  dataset v3 are documented in the generated schema and fixtures.
+
 All notable changes to DonSeTch are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

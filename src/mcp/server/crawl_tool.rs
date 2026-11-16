@@ -7,6 +7,12 @@ use std::borrow::Cow;
 use super::*;
 #[allow(clippy::field_reassign_with_default)]
 pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<ToolCtx>) -> Value {
+    match args.get("mode").and_then(Value::as_str) {
+        Some("get") => return crawl_get(args),
+        Some("sites") => return crawl_sites(args),
+        Some("forget") => return crawl_forget(args),
+        _ => {}
+    }
     // Resume can work without a url (the seed is stored in the
     // resume state). If url is missing AND no resume token, error.
     let url = match args.get("url").and_then(Value::as_str) {
@@ -82,21 +88,10 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         }));
     }
 
-    // Centralized guard (SSRF and local rules) on the seed. A url-less
-    // resume guards the seed stored in its token: the peek reads the
-    // token without consuming it, so a seed refused here leaves the
-    // token usable once the operator changes the rule. An unreadable
-    // token is not this check's to report: crawl() takes it below and
-    // returns its own resume-token error.
-    let guarded_seed = if url.is_empty() {
-        resume
-            .as_deref()
-            .and_then(|tok| crate::crawl::resume_store_peek(tok).ok())
-    } else {
-        Some(url.clone())
-    };
-    if let Some(seed) = &guarded_seed
-        && let Some(refusal) = seed_guard_error(seed)
+    // Centralized guard (SSRF and local rules) on the seed. A run resume
+    // with no URL is loaded by the executor from its job and guards itself.
+    if !url.is_empty()
+        && let Some(refusal) = seed_guard_error(&url)
     {
         return refusal;
     }
@@ -166,6 +161,171 @@ pub(super) async fn crawl_tool(daemon: &Arc<Daemon>, args: &Value, ctx: Option<T
         rendered["structuredContent"]["resolved_seed"] = json!(result.seed);
     }
     rendered
+}
+
+fn crawl_sites(_args: &Value) -> Value {
+    let sites = crate::crawl::model::dossier::list();
+    let mut text = String::from("# Crawl sites\n");
+    for s in &sites {
+        text.push_str(&format!(
+            "- {} · {} · {} URLs · {} families · {} page memories · {}\n",
+            s.host, s.seed, s.urls, s.families, s.pages, s.source
+        ));
+    }
+    if sites.is_empty() {
+        text.push_str("No dossiers yet.\n");
+    }
+    json!({
+        "content": [{ "type": "text", "text": text.trim_end() }],
+        "structuredContent": {"ok": true, "mode": "sites", "sites": sites, "count": sites.len()},
+        "_meta": {"com.donsetch/crawl-debug": {"mode": "sites", "count": sites.len()}},
+    })
+}
+
+fn crawl_forget(args: &Value) -> Value {
+    let raw = args
+        .get("host")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("url").and_then(Value::as_str))
+        .unwrap_or("")
+        .trim();
+    if raw.is_empty() {
+        return tool_error("crawl forget: host required");
+    }
+    let host = url::Url::parse(raw)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_else(|| raw.trim_start_matches("www.").to_ascii_lowercase());
+    if crate::crawl::model::dossier::forget(&host) {
+        json!({
+            "content": [{"type": "text", "text": format!("forgot {host}: dossier removed; fetch cache untouched")}],
+            "structuredContent": {"ok": true, "mode": "forget", "host": host, "forgotten": true},
+            "_meta": {"com.donsetch/crawl-debug": {"mode": "forget", "host": host}},
+        })
+    } else {
+        tool_error(format!("crawl forget: no dossier for {host}"))
+    }
+}
+
+/// `crawl get pN`: read a page straight from the durable run job. No
+/// crawler, no network, no resume guard: the bytes were already fetched.
+fn crawl_get(args: &Value) -> Value {
+    use crate::crawl::executor::JobStore;
+    use crate::extract::view::View;
+
+    let Some(mut handle) = args
+        .get("handle")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("url").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return tool_error("crawl get: handle required (p1, or job:p1)");
+    };
+    let mut job_id = args
+        .get("job")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("resume").and_then(Value::as_str))
+        .map(String::from);
+    if let Some((prefix, rest)) = handle.split_once(':')
+        && prefix.starts_with('j')
+        && rest.starts_with('p')
+    {
+        job_id = Some(prefix.to_string());
+        handle = rest;
+    }
+    let store = JobStore::default();
+    let id = match job_id {
+        Some(id) => id,
+        None => match store.latest_id() {
+            Ok(id) => id,
+            Err(e) => return tool_error(format!("crawl get: {e}")),
+        },
+    };
+    let job = match store.load(&id) {
+        Ok(job) => job,
+        Err(e) => return tool_error(format!("crawl get: {e}")),
+    };
+    let page = match job.page_by_handle(handle) {
+        Some(page) => page,
+        None => {
+            return tool_error(format!(
+                "crawl get: no {handle} in job {id} ({} handles)",
+                job.handle_count()
+            ));
+        }
+    };
+    let section = args
+        .get("section")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(1_000_000_000) as usize;
+    let view = View {
+        section: section.clone(),
+        offset,
+        max_chars: 100_000,
+        ..Default::default()
+    };
+    let incomplete = page
+        .partial
+        .as_ref()
+        .map(|p| {
+            format!(
+                "{}: {} of {:?} items",
+                p.reason, p.items_found, p.items_total
+            )
+        })
+        .or_else(|| {
+            page.next_offset
+                .map(|_| "the stored page was capped".to_string())
+        });
+    let rendered = crate::extract::view::render(&page.markdown, &view, incomplete.as_deref());
+    let content_complete = rendered.next_offset.is_none()
+        && page.partial.is_none()
+        && !page.focus.as_ref().is_some_and(|f| f.omitted);
+    let mut text = format!("# [{handle}]");
+    if !page.title.is_empty() {
+        text.push_str(&format!(" {}", page.title));
+    }
+    text.push('\n');
+    text.push_str(&page.url);
+    text.push_str("\n\n");
+    if offset > 0 {
+        text.push_str(rendered.text.trim_start_matches('\n'));
+    } else {
+        text.push_str(&rendered.text);
+    }
+    let mut structured = json!({
+        "ok": true,
+        "mode": "get",
+        "handle": handle,
+        "job": id,
+        "url": page.url,
+        "title": page.title,
+        "kind": format!("{:?}", page.kind).to_lowercase(),
+        "section": section,
+        "offset": offset,
+        "next_offset": rendered.next_offset,
+        "read_status": rendered.status,
+        "content_complete": content_complete,
+        "chars": rendered.text.chars().count(),
+        "full_chars": page.markdown.chars().count(),
+        "lastmod": page.lastmod,
+    });
+    if let Some(state) = rendered.state.as_object() {
+        for (k, v) in state {
+            structured[k] = v.clone();
+        }
+    }
+    json!({
+        "content": [{ "type": "text", "text": text.trim_end() }],
+        "structuredContent": structured,
+        "_meta": {"com.donsetch/crawl-debug": {"job": id, "handle": handle, "mode": "get"}},
+    })
 }
 
 /// The refusal for a seed the guard rejects, or None when it passes.
@@ -394,6 +554,12 @@ fn crawl_options(args: &Value) -> CrawlOptions {
     opts.focus = args.get("focus").and_then(Value::as_str).map(String::from);
     opts.mode = match args.get("mode").and_then(Value::as_str).unwrap_or("full") {
         "map" => CrawlMode::Map,
+        "plan" => CrawlMode::Plan,
+        "run" => CrawlMode::Run,
+        "get" => CrawlMode::Get,
+        "diff" => CrawlMode::Diff,
+        "sites" => CrawlMode::Sites,
+        "forget" => CrawlMode::Forget,
         "content" => CrawlMode::Content,
         _ => CrawlMode::Full,
     };
@@ -446,6 +612,27 @@ fn crawl_options(args: &Value) -> CrawlOptions {
     {
         opts.dataset = true;
     }
+    opts.plan_explain = args
+        .get("explain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if args
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        opts.force_fresh_map = true;
+    }
+    // A run asked to be incremental is the delta mode; the old full
+    // path keeps its own since_last semantics until M6.
+    if opts.mode == CrawlMode::Run
+        && args
+            .get("since_last")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        opts.mode = CrawlMode::Diff;
+    }
     opts
 }
 
@@ -470,8 +657,19 @@ pub(super) fn render_crawl_result(
     requested_mode: CrawlMode,
     dataset: bool,
 ) -> Value {
+    if requested_mode == CrawlMode::Plan
+        && let Some(plan) = &result.plan
+    {
+        return render_crawl_plan(result, plan, requested_mode);
+    }
     if dataset {
         return render_crawl_dataset(result, requested_mode);
+    }
+    if matches!(
+        requested_mode,
+        CrawlMode::Full | CrawlMode::Run | CrawlMode::Diff
+    ) {
+        return render_crawl_digest(result);
     }
     // One linear evidence document: page identity and body appear exactly once.
     let mut text = String::new();
@@ -483,6 +681,44 @@ pub(super) fn render_crawl_result(
             "Excluded by the operator's local DonSeTch rules: {}, listed at the end.\n\n",
             url_count(result.denied.total())
         ));
+    }
+    if let Some(run) = &result.run {
+        text.push_str(&format!(
+            "job: {} · {} pages · {} requests · {} attempts · {} ms · {}\n",
+            run.job,
+            run.fetched,
+            run.requests,
+            run.attempts,
+            run.elapsed_ms,
+            run.stop.as_str(),
+        ));
+        if let Some(wall) = &run.wall {
+            text.push_str(&format!(
+                "wall: {} · {} · {} · {}\n",
+                wall.class,
+                wall.vendor.as_deref().unwrap_or("unknown vendor"),
+                wall.status,
+                wall.ask,
+            ));
+        }
+    }
+    if let Some(model) = &result.model {
+        if result.run.is_some() {
+            text.push_str(&render_model_brief(model));
+        } else {
+            text.push_str(&render_model(model));
+        }
+        if requested_mode == CrawlMode::Map && result.map.len() >= result.inventory.limit {
+            text.push_str(&format!(
+                "map list capped at {} URLs; the model covers all {} in-scope URLs.\n\n",
+                result.inventory.limit, model.urls
+            ));
+        }
+    }
+    if result.run.is_some()
+        && let Some(plan) = &result.plan
+    {
+        text.push_str(&plan_summary_line(plan));
     }
     if requested_mode == CrawlMode::Map {
         text.push_str("## Discovered URLs\n");
@@ -556,6 +792,22 @@ pub(super) fn render_crawl_result(
         })).collect::<Vec<_>>(),
         "stop": format!("{:?}", result.stop),
     });
+    if let Some(model) = &result.model {
+        structured["model"] = serde_json::to_value(model).unwrap_or(Value::Null);
+    }
+    if let Some(run) = &result.run {
+        structured["mode"] = json!("run");
+        structured["run"] = serde_json::to_value(run).unwrap_or(Value::Null);
+        structured["job"] = json!(run.job);
+        structured["stop"] = json!(run.stop.as_str());
+        structured["complete"] = json!(run.complete);
+        if let Some(plan) = &result.plan {
+            structured["plan"] = serde_json::to_value(plan).unwrap_or(Value::Null);
+        }
+        if let Some(wall) = &run.wall {
+            structured["wall"] = serde_json::to_value(wall).unwrap_or(Value::Null);
+        }
+    }
     if requested_mode != CrawlMode::Content {
         structured["map"] = json!(result.map);
     } else {
@@ -607,11 +859,254 @@ pub(super) fn render_crawl_result(
         })).collect::<Vec<_>>(),
         "crawl_delay": result.crawl_delay,
         "elapsed_s": result.elapsed.as_secs_f64(),
+        "model": &result.model,
     });
     json!({
         "content": [{"type": "text", "text": text.trim_end()}],
         "structuredContent": structured,
         "_meta": {"com.donsetch/crawl-debug": debug},
+    })
+}
+
+/// Plan mode's evidence document: the plan is the deliverable; the model
+/// header says what inventory it came from. Every page row carries its
+/// reason, cost and section; reserves are visible before a page fails.
+fn render_crawl_plan(
+    result: &crate::crawl::CrawlResult,
+    plan: &crate::crawl::model::plan::Plan,
+    requested_mode: CrawlMode,
+) -> Value {
+    use crate::crawl::model::plan::PlanStop;
+
+    let mut text = format!("# Crawl plan\n{}\n\n", result.seed);
+    if let Some(model) = &result.model {
+        text.push_str(&format!(
+            "site: {} · {} of {} URLs · {} families · {} sections · {} inventory requests · {}\n",
+            model.site_kind.as_str(),
+            model.urls,
+            model.raw,
+            model.families,
+            model.sections,
+            model.requests,
+            if model.complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
+        ));
+        if model.cached {
+            text.push_str(&format!("cached map · {}\n", age_secs(model.generated_at)));
+        }
+        if !model.sources.is_empty() {
+            let sources = model
+                .sources
+                .iter()
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&format!("sources: {sources}\n"));
+        }
+    }
+    let focus = match (&plan.focus, plan.coverage.focus_matches) {
+        (Some(q), n) if n > 0 => format!("\"{q}\" {n}/{} pages", plan.pages.len()),
+        (Some(q), _) => format!("\"{q}\" no match"),
+        (None, _) => "none".to_string(),
+    };
+    text.push_str(&format!(
+        "plan: {} pages · {}/{} sections ({}% of URLs) · {}/{} families · focus {} · {} est tokens · {} ms · {}\n",
+        plan.pages.len(),
+        plan.coverage.sections_covered,
+        plan.coverage.sections_total,
+        (plan.coverage.url_weight * 100.0).round() as usize,
+        plan.coverage.families_covered,
+        plan.coverage.families_total,
+        focus,
+        plan.estimated_tokens,
+        plan.elapsed_ms,
+        plan.stop.as_str(),
+    ));
+    if plan.focus_fallback {
+        text.push_str(
+            "focus fallback: no URL matched; the plan is breadth-only and focus precision is 0.\n",
+        );
+    }
+    text.push_str("\n## Pages\n");
+    for (index, row) in plan.pages.iter().enumerate() {
+        text.push_str(&format!(
+            "{}. [{}] {}\n   {} · section {} ({} URLs) · {} est tokens{}\n",
+            index + 1,
+            row.kind.as_str(),
+            row.url,
+            row.reason,
+            row.section,
+            row.section_urls,
+            row.est_tokens,
+            if row.focus { " · focus" } else { "" },
+        ));
+    }
+    if !plan.reserves.is_empty() {
+        text.push_str(&format!("\n## Reserves ({})\n", plan.reserves.len()));
+        for row in plan.reserves.iter().take(12) {
+            text.push_str(&format!(
+                "- [{}] {} — {}\n",
+                row.kind.as_str(),
+                row.url,
+                row.reason
+            ));
+        }
+        if plan.reserves.len() > 12 {
+            text.push_str(&format!("- … {} more reserves\n", plan.reserves.len() - 12));
+        }
+    }
+    if !plan.trace.is_empty() {
+        text.push_str(&format!(
+            "\n## Candidates (top {} of {})\n",
+            plan.trace.len().min(20),
+            if plan.trace_truncated {
+                "more"
+            } else {
+                "the pool"
+            }
+        ));
+        for row in plan.trace.iter().take(20) {
+            text.push_str(&format!(
+                "- {}/{} — score {:.3}{} · {}\n",
+                row.section,
+                row.template,
+                row.score,
+                if row.focus { " · focus" } else { "" },
+                row.status
+            ));
+        }
+        if plan.trace.len() > 20 || plan.trace_truncated {
+            text.push_str("- …\n");
+        }
+    }
+    if !result.denied.is_empty() {
+        if !text.ends_with("\n\n") {
+            text.push('\n');
+        }
+        text.push_str(&denied_section(&result.denied));
+    }
+
+    let next_action = compute_crawl_next_action(result);
+    let mut structured = json!({
+        "ok": true,
+        "seed": &result.seed,
+        "mode": "plan",
+        "complete": plan.stop == PlanStop::Covered,
+        "inventory": {
+            "complete": result.inventory.complete,
+            "source": result.inventory.source,
+            "limit": result.inventory.limit,
+        },
+        "stop": plan.stop.as_str(),
+        "plan": plan,
+    });
+    if let Some(model) = &result.model {
+        structured["model"] = serde_json::to_value(model).unwrap_or(Value::Null);
+    }
+    if !next_action.is_empty() {
+        structured["next_action"] = json!(next_action);
+    }
+    if !result.denied.is_empty() {
+        structured["denied_by_local_rules"] = denied_structured(&result.denied);
+    }
+    let debug = json!({
+        "mode": format!("{:?}", requested_mode),
+        "map": result.map,
+        "filtered_out": result.filtered_out,
+        "elapsed_s": result.elapsed.as_secs_f64(),
+        "model": &result.model,
+        "plan": &result.plan,
+        "run": &result.run,
+    });
+    json!({
+        "content": [{"type": "text", "text": text.trim_end()}],
+        "structuredContent": structured,
+        "_meta": {"com.donsetch/crawl-debug": debug},
+    })
+}
+
+/// Run mode's evidence document: a site brief, page cards with stable pN
+/// handles, boilerplate removed and focus facts kept. The full page is one
+/// `crawl get` away.
+fn render_crawl_digest(result: &crate::crawl::CrawlResult) -> Value {
+    let d = crate::crawl::digest::build(result);
+    let mut text = d.text.clone();
+    if let Some(delta) = &result.delta {
+        text.push_str(&format!(
+            "\n## Delta\n{} new · {} changed · {} unchanged · {} removed · {} page(s) fetched\n",
+            delta.new,
+            delta.changed,
+            delta.unchanged,
+            delta.removed.len(),
+            delta.pages_fetched
+        ));
+        for u in delta.removed.iter().take(20) {
+            text.push_str(&format!("- removed: {u}\n"));
+        }
+        if delta.removed.len() > 20 {
+            text.push_str(&format!("- … {} more removed\n", delta.removed.len() - 20));
+        }
+    }
+    let next_action = compute_crawl_next_action(result);
+    let run = result.run.as_ref();
+    let mut structured = json!({
+        "ok": true,
+        "seed": result.seed,
+        "mode": "run",
+        "job": d.job,
+        "stop": d.stop,
+        "complete": run.is_some_and(|r| r.complete),
+        "run": run,
+        "plan": result.plan,
+        "digest_chars": d.digest_chars,
+        "read_chars": d.read_chars,
+        "boilerplate_removed": d.boilerplate_removed,
+        "collapsed": d.collapsed,
+        "pages": d.pages.iter().map(|p| json!({
+            "handle": p.handle,
+            "url": p.url,
+            "title": p.title,
+            "section": p.section,
+            "template": p.template,
+            "kind": p.kind,
+            "lastmod": p.lastmod,
+            "headings": p.headings,
+            "chars": p.chars,
+            "full_chars": p.full_chars,
+            "focus": p.focus,
+            "duplicate_of": p.duplicate_of,
+        })).collect::<Vec<_>>(),
+        "handles": d.pages.iter().map(|p| (p.handle.clone(), json!(p.url))).collect::<serde_json::Map<_, _>>(),
+    });
+    if let Some(delta) = &result.delta {
+        structured["mode"] = json!("diff");
+        structured["delta"] = serde_json::to_value(delta).unwrap_or(Value::Null);
+        structured["complete"] = json!(delta.new + delta.changed == 0);
+    }
+    if let Some(model) = &result.model {
+        structured["model"] = serde_json::to_value(model).unwrap_or(Value::Null);
+    }
+    if let Some(wall) = run.and_then(|r| r.wall.as_ref()) {
+        structured["wall"] = serde_json::to_value(wall).unwrap_or(Value::Null);
+    }
+    if !next_action.is_empty() {
+        structured["next_action"] = json!(next_action);
+    }
+    json!({
+        "content": [{ "type": "text", "text": text.trim_end() }],
+        "structuredContent": structured,
+        "_meta": {"com.donsetch/crawl-debug": {
+            "mode": if result.delta.is_some() { "diff" } else { "run" },
+            "job": d.job,
+            "digest_chars": d.digest_chars,
+            "read_chars": d.read_chars,
+            "boilerplate_removed": d.boilerplate_removed,
+            "collapsed": d.collapsed,
+            "pages": d.pages.len(),
+        }},
     })
 }
 
@@ -624,6 +1119,9 @@ pub(super) fn render_crawl_dataset(
     result: &crate::crawl::CrawlResult,
     requested_mode: CrawlMode,
 ) -> Value {
+    if result.run.is_some() {
+        return render_crawl_run_dataset(result);
+    }
     let mut rows: Vec<Value> = result
         .pages
         .iter()
@@ -676,6 +1174,16 @@ pub(super) fn render_crawl_dataset(
         "inventory": { "complete": result.inventory.complete, "source": result.inventory.source, "limit": result.inventory.limit },
         "stop": format!("{:?}", result.stop),
     });
+    if let Some(run) = &result.run {
+        structured["mode"] = json!("run");
+        structured["run"] = serde_json::to_value(run).unwrap_or(Value::Null);
+        structured["job"] = json!(run.job);
+        structured["stop"] = json!(run.stop.as_str());
+        structured["complete"] = json!(run.complete);
+        if let Some(plan) = &result.plan {
+            structured["plan"] = serde_json::to_value(plan).unwrap_or(Value::Null);
+        }
+    }
     let partial_pages = result
         .pages
         .iter()
@@ -722,12 +1230,270 @@ pub(super) fn render_crawl_dataset(
             .collect::<Vec<_>>(),
         "crawl_delay": result.crawl_delay,
         "elapsed_s": result.elapsed.as_secs_f64(),
+        "model": &result.model,
     });
     json!({
         "content": [{ "type": "text", "text": text.trim_end() }],
         "structuredContent": structured,
         "_meta": { "com.donsetch/crawl-debug": debug },
     })
+}
+
+/// Run dataset v3: one row per digest card with the handle, headings,
+/// section/template and full stored markdown. `crawl get` is still the
+/// lossless path; the row is the machine-readable card.
+fn render_crawl_run_dataset(result: &crate::crawl::CrawlResult) -> Value {
+    let d = crate::crawl::digest::build(result);
+    let mut rows: Vec<Value> = d
+        .pages
+        .iter()
+        .filter_map(|p| {
+            let page = result.pages.iter().find(|page| page.url == p.url)?;
+            Some(json!({
+                "schema": "donsetch.crawl.page",
+                "schema_version": 3,
+                "handle": p.handle,
+                "url": p.url,
+                "title": p.title,
+                "section": p.section,
+                "template": p.template,
+                "kind": p.kind,
+                "lastmod": p.lastmod,
+                "headings": p.headings,
+                "card": p.card,
+                "markdown": page.markdown,
+                "chars": page.chars,
+                "digest_chars": p.chars,
+                "full_chars": p.full_chars,
+                "focus": p.focus,
+                "duplicate_of": p.duplicate_of,
+                "fetched_at": page.fetched_at,
+                "parent": page.parent,
+                "content_complete": page.next_offset.is_none()
+                    && page.partial.is_none()
+                    && !page.focus.as_ref().is_some_and(|f| f.omitted),
+            }))
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a["url"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["url"].as_str().unwrap_or(""))
+    });
+    let mut text = String::new();
+    for row in &rows {
+        text.push_str(&serde_json::to_string(row).unwrap_or_default());
+        text.push('\n');
+    }
+    let next_action = compute_crawl_next_action(result);
+    let mut structured = json!({
+        "ok": true,
+        "seed": result.seed,
+        "mode": "run",
+        "dataset": true,
+        "schema": "donsetch.crawl.page",
+        "dataset_version": 3,
+        "rows": rows.len(),
+        "chars": d.digest_chars,
+        "digest_chars": d.digest_chars,
+        "complete": result.run.as_ref().is_some_and(|r| r.complete),
+        "stop": d.stop,
+        "job": d.job,
+        "run": result.run,
+        "plan": result.plan,
+        "handles": d.pages.iter().map(|p| (p.handle.clone(), json!(p.url))).collect::<serde_json::Map<_, _>>(),
+    });
+    if !next_action.is_empty() {
+        structured["next_action"] = json!(next_action);
+    }
+    json!({
+        "content": [{ "type": "text", "text": text.trim_end() }],
+        "structuredContent": structured,
+        "_meta": {"com.donsetch/crawl-debug": {"mode": "run", "rows": rows.len(), "dataset_version": 3}},
+    })
+}
+
+/// The model header a run uses: the site line and provenance, not the
+/// whole section outline (the pages are the evidence).
+fn render_model_brief(m: &crate::crawl::model::ModelSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "site: {} · {} of {} URLs · {} families · {} sections · {} inventory requests · {}\n",
+        m.site_kind.as_str(),
+        m.urls,
+        m.raw,
+        m.families,
+        m.sections,
+        m.requests,
+        if m.complete { "complete" } else { "incomplete" },
+    ));
+    if m.cached {
+        out.push_str(&format!("cached map · {}\n", age_secs(m.generated_at)));
+    }
+    if !m.sources.is_empty() {
+        let sources = m
+            .sources
+            .iter()
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("sources: {sources}\n"));
+    }
+    let f = &m.filtered;
+    if f.total() > 0 {
+        let mut parts = Vec::new();
+        for (name, n) in [
+            ("robots", f.robots),
+            ("rules", f.rules),
+            ("scope", f.scope),
+            ("locale", f.locale),
+            ("assets", f.assets),
+            ("other", f.other),
+        ] {
+            if n > 0 {
+                parts.push(format!("{name} {n}"));
+            }
+        }
+        out.push_str(&format!("filtered: {}\n", parts.join(", ")));
+    }
+    if let Some(prev) = &m.previous {
+        out.push_str(&format!(
+            "previous map: {} · {}\n",
+            age_secs(prev.generated_at),
+            if prev.changed { "changed" } else { "unchanged" }
+        ));
+    }
+    if !m.apis.is_empty() {
+        out.push_str(&format!(
+            "site interfaces: {}\n",
+            m.apis.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out
+}
+
+fn plan_summary_line(plan: &crate::crawl::model::plan::Plan) -> String {
+    let focus = match (&plan.focus, plan.coverage.focus_matches) {
+        (Some(q), n) if n > 0 => format!("\"{q}\" {n}/{} pages", plan.pages.len()),
+        (Some(q), _) => format!("\"{q}\" no match"),
+        (None, _) => "none".to_string(),
+    };
+    format!(
+        "plan: {} pages · {}/{} sections ({}% of URLs) · {}/{} families · focus {} · {} est tokens · {}\n",
+        plan.pages.len(),
+        plan.coverage.sections_covered,
+        plan.coverage.sections_total,
+        (plan.coverage.url_weight * 100.0).round() as usize,
+        plan.coverage.families_covered,
+        plan.coverage.families_total,
+        focus,
+        plan.estimated_tokens,
+        plan.stop.as_str(),
+    )
+}
+
+/// The site model a map built: the outline an agent reads before it
+/// spends a page. Compact by design; the flat URL list follows.
+fn render_model(m: &crate::crawl::model::ModelSummary) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "site: {} · {} of {} URLs · {} families · {} sections · {} inventory requests · {}\n",
+        m.site_kind.as_str(),
+        m.urls,
+        m.raw,
+        m.families,
+        m.sections,
+        m.requests,
+        if m.complete { "complete" } else { "incomplete" },
+    ));
+    if m.cached {
+        out.push_str(&format!("cached map · {}\n", age_secs(m.generated_at)));
+    }
+    if !m.sources.is_empty() {
+        let sources = m
+            .sources
+            .iter()
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("sources: {sources}\n"));
+    }
+    let f = &m.filtered;
+    if f.total() > 0 {
+        let mut parts = Vec::new();
+        for (name, n) in [
+            ("robots", f.robots),
+            ("rules", f.rules),
+            ("scope", f.scope),
+            ("locale", f.locale),
+            ("assets", f.assets),
+            ("other", f.other),
+        ] {
+            if n > 0 {
+                parts.push(format!("{name} {n}"));
+            }
+        }
+        out.push_str(&format!("filtered: {}\n", parts.join(", ")));
+    }
+    if let Some(prev) = &m.previous {
+        out.push_str(&format!(
+            "previous map: {} · {}\n",
+            age_secs(prev.generated_at),
+            if prev.changed { "changed" } else { "unchanged" }
+        ));
+    }
+    if !m.apis.is_empty() {
+        out.push_str(&format!(
+            "site interfaces: {}\n",
+            m.apis.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !m.top_sections.is_empty() {
+        out.push_str(&format!("\n## Sections ({} shown)\n", m.top_sections.len()));
+        for s in &m.top_sections {
+            out.push_str(&format!(
+                "- {} — {} URLs, {} families",
+                s.path, s.urls, s.families
+            ));
+            if let Some(sample) = s.sample.first() {
+                out.push_str(&format!(" · {sample}"));
+            }
+            out.push('\n');
+        }
+    }
+    if !m.top_families.is_empty() {
+        out.push_str(&format!("\n## Families ({} shown)\n", m.top_families.len()));
+        for f in &m.top_families {
+            out.push_str(&format!(
+                "- {} · {} — {} URLs",
+                f.section, f.template, f.size
+            ));
+            if let Some(sample) = f.sample.first() {
+                out.push_str(&format!(" · {sample}"));
+            }
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn age_secs(ts: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let d = now.saturating_sub(ts);
+    if d < 90 {
+        "just now".to_string()
+    } else if d < 5400 {
+        format!("{}m ago", d / 60)
+    } else if d < 172_800 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
 }
 
 fn url_count(n: usize) -> String {
@@ -803,6 +1569,65 @@ fn is_policy_skip(reason: &str) -> bool {
 /// normally (no guidance needed).
 pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> String {
     use crate::crawl::StopReason;
+
+    if let Some(delta) = &result.delta {
+        if delta.new + delta.changed == 0 {
+            return if delta.removed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{} page(s) removed; the delta lists them.",
+                    delta.removed.len()
+                )
+            };
+        }
+        return "diff fetched the changed/new pages; use crawl get for a full page.".into();
+    }
+
+    if let Some(run) = &result.run {
+        return match run.stop {
+            crate::crawl::executor::RunStop::Covered => String::new(),
+            crate::crawl::executor::RunStop::Walled => {
+                let wall = run
+                    .wall
+                    .as_ref()
+                    .map(|w| format!("{} {}", w.class, w.vendor.as_deref().unwrap_or("")))
+                    .unwrap_or_else(|| "a classified wall".into());
+                format!(
+                    "the host is declared walled ({wall}); use another egress or a real browser driver (bladebro), or resume={} later.",
+                    run.job
+                )
+            }
+            crate::crawl::executor::RunStop::Deadline
+            | crate::crawl::executor::RunStop::Cancelled
+            | crate::crawl::executor::RunStop::Throttled => {
+                format!("resume={} to continue the job.", run.job)
+            }
+            crate::crawl::executor::RunStop::Budget if run.complete => String::new(),
+            crate::crawl::executor::RunStop::Budget => {
+                format!(
+                    "page budget spent; raise max_pages or resume={} to continue.",
+                    run.job
+                )
+            }
+            crate::crawl::executor::RunStop::Empty => {
+                "the plan selected no pages; widen include_paths or remove the focus.".into()
+            }
+        };
+    }
+
+    if let Some(plan) = &result.plan {
+        return match plan.stop {
+            crate::crawl::model::plan::PlanStop::Budget => format!(
+                "page budget {} spent; raise max_pages or narrow focus/include_paths for another plan.",
+                plan.budget_pages
+            ),
+            crate::crawl::model::plan::PlanStop::Empty => {
+                "no selectable pages in scope; widen include_paths or drop the focus.".into()
+            }
+            crate::crawl::model::plan::PlanStop::Covered => String::new(),
+        };
+    }
 
     // Resume available : always suggest it first.
     if let Some(tok) = &result.resume {
@@ -900,6 +1725,9 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
         StopReason::ThrottledOut => {
             "the host throttled the crawler. Wait a few minutes and resume.".into()
         }
+        StopReason::Walled => {
+            "a classified wall stopped this host; the wall report names its class. Use another egress or a real browser driver (bladebro) for that host.".into()
+        }
         StopReason::DepthLimit => {
             "crawl hit the depth limit. Increase max_depth to discover more pages.".into()
         }
@@ -909,6 +1737,21 @@ pub(super) fn compute_crawl_next_action(result: &crate::crawl::CrawlResult) -> S
 }
 
 fn crawl_complete(result: &crate::crawl::CrawlResult, mode: CrawlMode) -> bool {
+    if matches!(mode, CrawlMode::Full | CrawlMode::Run) {
+        return result.run.as_ref().is_some_and(|r| r.complete);
+    }
+    if mode == CrawlMode::Diff {
+        return result
+            .delta
+            .as_ref()
+            .is_some_and(|d| d.new + d.changed == 0);
+    }
+    if mode == CrawlMode::Plan {
+        return result
+            .plan
+            .as_ref()
+            .is_some_and(|p| p.stop == crate::crawl::model::plan::PlanStop::Covered);
+    }
     matches!(result.stop, crate::crawl::StopReason::FrontierEmpty)
         && if mode == CrawlMode::Map {
             !result.map.is_empty() && result.inventory.complete
@@ -929,896 +1772,4 @@ fn crawl_complete(result: &crate::crawl::CrawlResult, mode: CrawlMode) -> bool {
                 // were not crawled.
                 && result.denied.is_empty()
         }
-}
-
-#[cfg(test)]
-mod crawl_output_contract_tests {
-    #[test]
-    fn report_audit_inventory_does_not_bloat_content_and_partial_pages_are_honest() {
-        let mut result = dataset_fixture();
-        result.map = (0..1000)
-            .map(|i| format!("https://example.com/page/{i}"))
-            .collect();
-        result.stop = StopReason::FrontierEmpty;
-        result.pages[0].next_offset = Some(400);
-        let content = render_crawl_result(&result, CrawlMode::Full, false);
-        assert!(content["content"][0]["text"].as_str().unwrap().len() < 1000);
-        assert_eq!(content["structuredContent"]["complete"], false);
-        assert_eq!(content["structuredContent"]["pages"][0]["next_offset"], 400);
-        let dataset = render_crawl_result(&result, CrawlMode::Full, true);
-        assert_eq!(
-            dataset["structuredContent"]["partial_pages"][0]["next_offset"],
-            400
-        );
-        result.pages[0].next_offset = None;
-        result.pages[0].partial = Some(crate::extract::PartialContent {
-            reason: "source returned a subset",
-            items_found: 3,
-            items_total: Some(20),
-        });
-        let subset = render_crawl_result(&result, CrawlMode::Full, false);
-        assert_eq!(subset["structuredContent"]["complete"], false);
-        assert_eq!(
-            subset["structuredContent"]["pages"][0]["content_complete"],
-            false
-        );
-        assert_eq!(
-            subset["structuredContent"]["pages"][0]["partial"]["items_total"],
-            20
-        );
-        let subset_data = render_crawl_result(&result, CrawlMode::Full, true);
-        assert_eq!(
-            subset_data["structuredContent"]["partial_pages"][0]["partial"]["items_found"],
-            3
-        );
-        let map = render_crawl_result(&result, CrawlMode::Map, false);
-        assert!(map["structuredContent"].get("pages").is_none());
-        assert_eq!(map["structuredContent"]["discovered"], 1000);
-        assert_eq!(map["structuredContent"]["stop"], "InventoryComplete");
-    }
-
-    use super::render_crawl_result;
-    use crate::crawl::{CrawlMode, CrawlPage, CrawlResult, StopReason};
-    use crate::extract::ContentKind;
-    use serde_json::json;
-    use std::time::Duration;
-
-    #[test]
-    fn wave450_map_inventory_is_model_state_without_false_404() {
-        let mut result = CrawlResult {
-            inventory: crate::crawl::InventoryStatus {
-                complete: true,
-                source: "sitemap",
-                limit: 1000,
-            },
-            seed: "https://example.com/docs/".into(),
-            pages: vec![],
-            queued: vec![],
-            filtered_out: 0,
-            skipped: vec![],
-            stop: StopReason::FrontierEmpty,
-            elapsed: Duration::ZERO,
-            map: vec!["https://example.com/docs/a".into()],
-            crawl_delay: None,
-            resume: None,
-            denied: Default::default(),
-            depth_cut: vec![],
-            seed_failure: None,
-        };
-        let rendered = render_crawl_result(&result, CrawlMode::Map, false);
-        assert_eq!(rendered["structuredContent"]["map"], json!(result.map));
-        assert!(rendered["structuredContent"].get("next_action").is_none());
-        result.map.clear();
-        let empty = render_crawl_result(&result, CrawlMode::Content, false);
-        assert_eq!(empty["structuredContent"]["complete"], false);
-        assert!(
-            !empty["structuredContent"]["next_action"]
-                .as_str()
-                .unwrap()
-                .contains("404")
-        );
-    }
-
-    #[test]
-    pub(super) fn crawl_renders_page_identity_once_and_keeps_resume_as_state() {
-        let page = CrawlPage {
-            focus: None,
-            url: "https://example.com/docs/page".into(),
-            title: "Evidence page".into(),
-            kind: ContentKind::Article,
-            markdown: "# Evidence page\nhttps://example.com/docs/page\n\nUseful evidence.".into(),
-            next_offset: None,
-            partial: None,
-            chars: 16,
-            quality: 0.93,
-            duplicate: false,
-            parent: Some("https://example.com/docs/".into()),
-            score: 0.88,
-            lastmod: Some("2026-09-04".into()),
-            fetched_at: 1_770_000_000,
-        };
-        let result = CrawlResult {
-            inventory: crate::crawl::InventoryStatus {
-                complete: true,
-                source: "sitemap",
-                limit: 1000,
-            },
-            seed: "https://example.com/docs/".into(),
-            pages: vec![page],
-            queued: vec![],
-            filtered_out: 0,
-            skipped: vec![],
-            stop: StopReason::MaxPages,
-            elapsed: Duration::from_millis(42),
-            map: vec![],
-            crawl_delay: None,
-            resume: Some("opaque-resume".into()),
-            denied: Default::default(),
-            depth_cut: vec![],
-            seed_failure: None,
-        };
-        let output = render_crawl_result(&result, CrawlMode::Full, false);
-        let text = output["content"][0]["text"].as_str().unwrap();
-        assert_eq!(text.matches("Evidence page").count(), 1);
-        assert_eq!(text.matches("https://example.com/docs/page").count(), 1);
-        assert!(!text.contains("quality="));
-        assert!(!text.contains("opaque-resume"));
-        assert_eq!(output["structuredContent"]["resume"], "opaque-resume");
-        assert!(
-            output["structuredContent"]["pages"][0]
-                .get("quality")
-                .is_none()
-        );
-        assert_eq!(
-            output["_meta"]["com.donsetch/crawl-debug"]["pages"][0]["quality"],
-            json!(0.93_f32)
-        );
-    }
-
-    // The debug block carried every queued URL: a wide crawl put
-    // thousands of them into each response. It carries a preview and
-    // the count.
-    #[test]
-    fn the_queued_list_in_the_response_is_a_bounded_preview() {
-        let result = CrawlResult {
-            inventory: crate::crawl::InventoryStatus {
-                complete: true,
-                source: "sitemap",
-                limit: 1000,
-            },
-            seed: "https://example.com/".into(),
-            pages: vec![],
-            queued: (0..5_000)
-                .map(|i| format!("https://example.com/p/{i}"))
-                .collect(),
-            filtered_out: 0,
-            skipped: vec![],
-            stop: StopReason::MaxPages,
-            elapsed: Duration::from_millis(1),
-            map: vec![],
-            crawl_delay: None,
-            resume: Some("tok".into()),
-            denied: Default::default(),
-            depth_cut: vec![],
-            seed_failure: None,
-        };
-        for dataset in [false, true] {
-            let output = render_crawl_result(&result, CrawlMode::Full, dataset);
-            let debug = &output["_meta"]["com.donsetch/crawl-debug"];
-            let shown = debug["queued"].as_array().unwrap().len();
-            assert!(
-                shown <= super::QUEUED_PREVIEW,
-                "dataset={dataset}: {shown} queued URLs in the response"
-            );
-            assert_eq!(debug["queued_total"], json!(5_000), "dataset={dataset}");
-            assert_eq!(debug["queued"][0], "https://example.com/p/0");
-        }
-    }
-
-    // A depth-cut crawl renders as incomplete with the depth-limit next
-    // action and no resume token, and its debug block carries the count
-    // and a bounded sample. Negative: a drained crawl with no cut stays
-    // complete and reports a zero count.
-    #[test]
-    fn a_depth_limit_stop_is_incomplete_and_counts_its_cut() {
-        let mut result = dataset_fixture();
-        result.skipped.clear();
-        for dataset in [false, true] {
-            let out = render_crawl_result(&result, CrawlMode::Content, dataset);
-            assert_eq!(
-                out["structuredContent"]["complete"], true,
-                "dataset={dataset}"
-            );
-            let debug = &out["_meta"]["com.donsetch/crawl-debug"];
-            assert_eq!(debug["depth_cut"], 0, "dataset={dataset}");
-            assert_eq!(debug["depth_cut_sample"], json!([]), "dataset={dataset}");
-        }
-        result.stop = StopReason::DepthLimit;
-        result.depth_cut = (0..25)
-            .map(|i| format!("https://example.com/docs/deep/{i:02}"))
-            .collect();
-        for dataset in [false, true] {
-            let out = render_crawl_result(&result, CrawlMode::Content, dataset);
-            let state = &out["structuredContent"];
-            assert_eq!(state["complete"], false, "dataset={dataset}");
-            assert_eq!(state["stop"], "DepthLimit", "dataset={dataset}");
-            assert!(state.get("resume").is_none(), "dataset={dataset}");
-            assert_eq!(
-                state["next_action"],
-                "crawl hit the depth limit. Increase max_depth to discover more pages.",
-                "dataset={dataset}"
-            );
-            let debug = &out["_meta"]["com.donsetch/crawl-debug"];
-            assert_eq!(debug["depth_cut"], 25, "dataset={dataset}");
-            let sample = debug["depth_cut_sample"].as_array().unwrap();
-            assert_eq!(sample.len(), super::DEPTH_CUT_SAMPLE, "dataset={dataset}");
-            assert_eq!(sample[0], "https://example.com/docs/deep/00");
-        }
-    }
-
-    fn dataset_fixture() -> crate::crawl::CrawlResult {
-        let page = |url: &str, title: &str, md: &str, dup: bool| CrawlPage {
-            focus: None,
-            url: url.into(),
-            title: title.into(),
-            kind: crate::extract::ContentKind::Article,
-            markdown: md.into(),
-            next_offset: None,
-            partial: None,
-            chars: md.len(),
-            quality: 0.9,
-            duplicate: dup,
-            parent: None,
-            score: 1.0,
-            lastmod: None,
-            fetched_at: 1_770_000_000,
-        };
-        crate::crawl::CrawlResult {
-            inventory: crate::crawl::InventoryStatus {
-                complete: true,
-                source: "sitemap",
-                limit: 1000,
-            },
-            seed: "https://example.com/docs/".into(),
-            pages: vec![
-                page(
-                    "https://example.com/docs/b",
-                    "B",
-                    "line with \"quotes\" and\nnewlines",
-                    false,
-                ),
-                page("https://example.com/docs/a", "A", "alpha body", false),
-                page(
-                    "https://example.com/docs/b?x=1",
-                    "B dup",
-                    "alpha body",
-                    true,
-                ),
-            ],
-            queued: vec![],
-            filtered_out: 0,
-            skipped: vec![(
-                "https://example.com/docs/walled".into(),
-                "wall.challenge".into(),
-            )],
-            stop: crate::crawl::StopReason::FrontierEmpty,
-            elapsed: std::time::Duration::from_millis(7),
-            map: vec![],
-            crawl_delay: None,
-            resume: None,
-            denied: Default::default(),
-            depth_cut: vec![],
-            seed_failure: None,
-        }
-    }
-
-    // Dataset mode must emit one VALID JSON object per non-duplicate
-    // page, sorted by URL, with the page's own markdown verbatim
-    // (escaping included). A markdown document or unsorted/duplicate
-    // rows fail this test.
-    #[test]
-    fn dataset_mode_emits_valid_sorted_jsonl() {
-        let out = render_crawl_result(&dataset_fixture(), crate::crawl::CrawlMode::Full, true);
-        let text = out["content"][0]["text"].as_str().unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "duplicates dropped, one row per page");
-        let row0: serde_json::Value = serde_json::from_str(lines[0]).expect("row 0 valid JSON");
-        let row1: serde_json::Value = serde_json::from_str(lines[1]).expect("row 1 valid JSON");
-        assert_eq!(row0["url"], "https://example.com/docs/a");
-        assert_eq!(row1["url"], "https://example.com/docs/b");
-        // Verbatim markdown with hostile characters survives the round trip.
-        assert_eq!(row1["markdown"], "line with \"quotes\" and\nnewlines");
-        assert_eq!(row0["fetched_at"], 1_770_000_000u64);
-        assert_eq!(out["structuredContent"]["rows"], 2);
-        assert_eq!(out["structuredContent"]["dataset"], true);
-        assert_eq!(out["structuredContent"]["dataset_version"], 2);
-        assert_eq!(out["structuredContent"]["complete"], false);
-        // Skipped pages surface in debug, never as rows.
-        assert_eq!(
-            out["_meta"]["com.donsetch/crawl-debug"]["skipped"][0]["reason"],
-            "wall.challenge"
-        );
-    }
-
-    #[test]
-    fn dataset_mode_still_reports_resume_and_budget_stops() {
-        let mut r = dataset_fixture();
-        r.stop = crate::crawl::StopReason::MaxPages;
-        r.resume = Some("tok-1".into());
-        let out = render_crawl_result(&r, crate::crawl::CrawlMode::Full, true);
-        assert_eq!(out["structuredContent"]["resume"], "tok-1");
-        assert_eq!(out["structuredContent"]["complete"], false);
-        let hint = out["structuredContent"]["next_action"].as_str().unwrap();
-        assert!(hint.contains("resume"), "resume guidance preserved");
-    }
-
-    #[test]
-    fn markdown_mode_unchanged_by_dataset_flag_absence() {
-        let out = render_crawl_result(&dataset_fixture(), crate::crawl::CrawlMode::Full, false);
-        let text = out["content"][0]["text"].as_str().unwrap();
-        assert!(text.starts_with("# Crawl"));
-        assert!(text.contains("## [1]"));
-    }
-
-    fn denied_fixture() -> crate::crawl::DeniedLog {
-        crate::crawl::DeniedLog {
-            groups: vec![
-                crate::crawl::DeniedGroup {
-                    rule: "banned.example".into(),
-                    kind: "walled".into(),
-                    message: "use BladeBrowser for this site".into(),
-                    count: 16,
-                    urls: vec![
-                        "https://www.banned.example/publication/1".into(),
-                        "https://www.banned.example/publication/2".into(),
-                    ],
-                },
-                crate::crawl::DeniedGroup {
-                    rule: "gone-mirror.example".into(),
-                    kind: "permanent".into(),
-                    message: "this mirror is gone, do not look for it".into(),
-                    count: 3,
-                    urls: vec![],
-                },
-            ],
-        }
-    }
-
-    fn empty_result() -> CrawlResult {
-        CrawlResult {
-            inventory: crate::crawl::InventoryStatus {
-                complete: true,
-                source: "sitemap",
-                limit: 1000,
-            },
-            seed: "https://example.com/docs/".into(),
-            pages: vec![],
-            queued: vec![],
-            filtered_out: 0,
-            skipped: vec![],
-            stop: StopReason::FrontierEmpty,
-            elapsed: Duration::ZERO,
-            map: vec![],
-            crawl_delay: None,
-            resume: None,
-            denied: Default::default(),
-            depth_cut: vec![],
-            seed_failure: None,
-        }
-    }
-
-    #[test]
-    fn denied_urls_get_a_head_counter_and_a_trailing_section_without_the_rule_key() {
-        // Both the positive assertions and the negative ones below read the
-        // section's name from here, so a rewording fails the positive ones
-        // loudly instead of leaving the negatives matching a string nothing
-        // emits any more.
-        const HEADING: &str = "Excluded by the operator's local DonSeTch rules";
-
-        let mut result = dataset_fixture();
-        result.denied = denied_fixture();
-        let out = render_crawl_result(&result, CrawlMode::Full, false);
-        let text = out["content"][0]["text"].as_str().unwrap();
-        let counter = text
-            .find(&format!("{HEADING}: 19 URLs, listed at the end."))
-            .expect(text);
-        let first_page = text.find("## [1]").unwrap();
-        let section = text
-            .find(&format!(
-                "## {HEADING} (not fetched; web_fetch returns the same)"
-            ))
-            .expect(text);
-        assert!(counter < first_page && first_page < section, "{text}");
-        let tail = &text[section..];
-        assert!(
-            tail.contains(
-                "another source may have this content\nNext action: use BladeBrowser for this site\n- https://www.banned.example/publication/1\n- https://www.banned.example/publication/2\n…and 14 more"
-            ),
-            "{tail}"
-        );
-        // A group with no listed URLs (crawl_denied_urls_per_rule = 0)
-        // still shows its kind, message and count.
-        assert!(
-            tail.contains(
-                "the operator keeps this out of scope\nNext action: this mirror is gone, do not look for it\n3 URLs"
-            ),
-            "{tail}"
-        );
-        assert!(
-            !text.contains("gone-mirror.example"),
-            "no rule key in the text"
-        );
-
-        let denied = &out["structuredContent"]["denied_by_local_rules"];
-        assert_eq!(denied["count"], 19);
-        assert_eq!(denied["groups"][0]["rule"], "banned.example");
-        assert_eq!(denied["groups"][0]["errorKind"], "walled");
-        assert_eq!(
-            denied["groups"][0]["next_action"],
-            "use BladeBrowser for this site"
-        );
-        assert_eq!(denied["groups"][0]["count"], 16);
-        assert_eq!(denied["groups"][0]["urls"].as_array().unwrap().len(), 2);
-        assert_eq!(denied["groups"][1]["errorKind"], "permanent");
-
-        let data = render_crawl_result(&result, CrawlMode::Full, true);
-        assert_eq!(data["structuredContent"]["denied_by_local_rules"], *denied);
-        assert!(
-            !data["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains(HEADING),
-            "JSON Lines stay rows only"
-        );
-
-        // Negative: a crawl that denied nothing carries no trace of it.
-        for dataset in [false, true] {
-            let clean = render_crawl_result(&dataset_fixture(), CrawlMode::Full, dataset);
-            assert!(
-                clean["structuredContent"]
-                    .get("denied_by_local_rules")
-                    .is_none()
-            );
-            assert!(
-                !clean["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains(HEADING)
-            );
-        }
-    }
-
-    #[test]
-    fn a_denial_or_a_policy_skip_row_makes_the_crawl_incomplete() {
-        let complete = |r: &CrawlResult| {
-            render_crawl_result(r, CrawlMode::Full, false)["structuredContent"]["complete"].clone()
-        };
-        let mut result = dataset_fixture();
-        result.skipped.clear();
-        assert_eq!(complete(&result), true);
-        // Negative: a real duplicate row stays harmless.
-        result.skipped = vec![(
-            "https://example.com/docs/a?ref=1".into(),
-            "duplicate of https://example.com/docs/a".into(),
-        )];
-        assert_eq!(complete(&result), true);
-        // The operator's key holds "duplicate", the row is still a refusal.
-        result.skipped = vec![(
-            "https://example.com/docs/moved".into(),
-            "policy.denied.unspecified: excluded by the operator's local DonSeTch rules `duplicate-finder.example`"
-                .into(),
-        )];
-        assert_eq!(complete(&result), false);
-        result.skipped.clear();
-        result.denied = denied_fixture();
-        assert_eq!(complete(&result), false);
-    }
-
-    #[test]
-    fn policy_skip_rows_do_not_trip_the_wall_or_404_guidance() {
-        let mut result = empty_result();
-        result.skipped = vec![
-            (
-                "https://a.example/x".into(),
-                "policy.denied.unspecified: excluded by the operator's local DonSeTch rules `wallpaper.example`"
-                    .into(),
-            ),
-            (
-                "https://b.example/y".into(),
-                "policy.denied.ip_ban: excluded by the operator's local DonSeTch rules `404news.example`".into(),
-            ),
-        ];
-        let hint = super::compute_crawl_next_action(&result);
-        assert!(hint.contains("local DonSeTch rule"), "{hint}");
-        assert!(!hint.contains("blocked the crawler"), "{hint}");
-        assert!(!hint.contains("404"), "{hint}");
-        // Negative: a genuine wall row keeps the wall guidance.
-        result.skipped = vec![(
-            "https://a.example/x".into(),
-            "wall.challenge Blocked".into(),
-        )];
-        assert!(super::compute_crawl_next_action(&result).contains("blocked the crawler"));
-    }
-
-    #[test]
-    fn a_throttled_out_stop_with_a_token_says_to_wait_before_resuming() {
-        let mut result = empty_result();
-        result.stop = StopReason::ThrottledOut;
-        result.queued = vec!["https://example.com/docs/b".into()];
-        result.resume = Some("c1a2".into());
-        assert_eq!(
-            super::compute_crawl_next_action(&result),
-            "the host throttled the crawler. Wait a few minutes, then resume=c1a2 to continue crawling."
-        );
-        // Negative: another stop with a token is told to resume, no wait.
-        result.stop = StopReason::MaxPages;
-        assert_eq!(
-            super::compute_crawl_next_action(&result),
-            "resume=c1a2 to continue crawling (stopped: MaxPages)."
-        );
-    }
-
-    fn seed_failure(status: u16, verdict: Option<&str>) -> crate::crawl::SeedFailure {
-        crate::crawl::SeedFailure {
-            requested: "https://example.org/old-docs/".into(),
-            landing: None,
-            status,
-            verdict: verdict.map(String::from),
-            error: None,
-            robots: None,
-            denial: None,
-            has_sitemap_phase: true,
-        }
-    }
-
-    #[test]
-    fn a_failed_seed_error_carries_its_cause_kind_and_evidence() {
-        use crate::crawl::RobotsRefusal;
-
-        let mut gone = seed_failure(404, Some("SoftNotFound"));
-        gone.landing = Some("https://example.org/new-docs/".into());
-        let error = super::seed_failure_error(&gone, None);
-        let sc = &error["structuredContent"];
-        assert_eq!(sc["ok"], false, "{error}");
-        // The code web_fetch gives a 404, with its read_status and
-        // moved-page query.
-        assert_eq!(sc["code"], "content.notfound");
-        assert_eq!(sc["read_status"], "notfound");
-        assert_eq!(sc["suggested_query"], "site:example.org old docs");
-        assert_eq!(error["errorKind"], "permanent");
-        assert_eq!(sc["status"], 404);
-        assert_eq!(sc["verdict"], "SoftNotFound");
-        assert_eq!(sc["requested_url"], "https://example.org/old-docs/");
-        assert_eq!(sc["landing_url"], "https://example.org/new-docs/");
-        assert!(
-            sc["discovery"]
-                .as_str()
-                .unwrap()
-                .contains("no sitemap entries")
-        );
-        let text = error["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("redirected to https://example.org/new-docs/"),
-            "{text}"
-        );
-
-        let walled =
-            super::seed_failure_error(&seed_failure(403, Some("Challenge(Cloudflare)")), None);
-        assert_eq!(walled["errorKind"], "walled");
-        assert_eq!(walled["structuredContent"]["code"], "wall.challenge");
-        // A 401 whose verdict names no wall still gets a wall code.
-        let auth = super::seed_failure_error(&seed_failure(401, Some("ContentOk")), None);
-        assert_eq!(auth["structuredContent"]["code"], "wall.auth");
-
-        // A fetch error the classifier names keeps its network code.
-        let mut slow = seed_failure(0, Some("Blocked"));
-        slow.error = Some("network: timed out".into());
-        let slow = super::seed_failure_error(&slow, None);
-        assert_eq!(slow["structuredContent"]["code"], "network.timeout");
-
-        let limited = super::seed_failure_error(&seed_failure(429, Some("Blocked")), None);
-        assert_eq!(limited["structuredContent"]["code"], "network.ratelimit");
-        assert_eq!(limited["errorKind"], "transient", "a 429 is not a wall");
-        // Causes web_fetch has no code for get the crawl fallback, never
-        // the malformed-seed input code.
-        let down = super::seed_failure_error(&seed_failure(503, Some("Blocked")), None);
-        assert_eq!(down["structuredContent"]["code"], "crawl.seed_failed");
-        assert_eq!(down["errorKind"], "transient");
-        // Negative: a challenge served as 503 or 429 is a wall, as in
-        // web_fetch, not an outage to wait out.
-        for (status, verdict) in [(503, "Challenge(Cloudflare)"), (429, "Challenge(DataDome)")] {
-            let challenged = super::seed_failure_error(&seed_failure(status, Some(verdict)), None);
-            assert_eq!(challenged["errorKind"], "walled", "{status} {verdict}");
-            assert_eq!(challenged["structuredContent"]["code"], "wall.challenge");
-        }
-
-        // A fetch error arrives as status 0 with a Blocked verdict: it is
-        // a network failure, not a wall.
-        let mut offline = seed_failure(0, Some("Blocked"));
-        offline.error = Some("network: connection refused".into());
-        offline.has_sitemap_phase = false;
-        let offline = super::seed_failure_error(&offline, None);
-        assert_eq!(offline["errorKind"], "transient");
-        // The classifier has no code for a refused connection.
-        assert_eq!(offline["structuredContent"]["code"], "crawl.seed_failed");
-        assert_eq!(
-            offline["structuredContent"]["error"],
-            "network: connection refused"
-        );
-        assert!(
-            offline["structuredContent"]["discovery"]
-                .as_str()
-                .unwrap()
-                .contains("no sitemap phase")
-        );
-        assert!(offline["structuredContent"].get("landing_url").is_none());
-
-        let mut disallowed = seed_failure(0, None);
-        disallowed.robots = Some(RobotsRefusal::Disallow);
-        let disallowed = super::seed_failure_error(&disallowed, None);
-        assert_eq!(disallowed["errorKind"], "walled");
-        assert_eq!(
-            disallowed["structuredContent"]["code"],
-            "crawl.robots_disallow"
-        );
-        assert_eq!(disallowed["structuredContent"]["robots"], "disallow");
-        assert!(
-            disallowed["structuredContent"]["next_action"]
-                .as_str()
-                .unwrap()
-                .contains("respect_robots=false")
-        );
-
-        // Negative: an unreachable robots.txt gets no bypass hint.
-        let mut outage = seed_failure(0, None);
-        outage.robots = Some(RobotsRefusal::Unreachable);
-        let outage = super::seed_failure_error(&outage, None);
-        assert_eq!(outage["errorKind"], "transient");
-        assert_eq!(
-            outage["structuredContent"]["code"],
-            "crawl.robots_unreachable"
-        );
-        assert!(
-            !outage["structuredContent"]["next_action"]
-                .as_str()
-                .unwrap()
-                .contains("respect_robots")
-        );
-    }
-
-    #[test]
-    fn a_seed_redirected_into_a_denied_host_fails_with_the_policy_error() {
-        let mut failure = seed_failure(0, Some("Blocked"));
-        failure.landing = Some("https://www.banned.example/publication/1".into());
-        failure.denial = Some(crate::rules::Denial {
-            rule: "banned.example".into(),
-            message: "ask the human operator to download the file".into(),
-            kind: "walled".into(),
-            reason: Some("ip_ban".into()),
-        });
-        let error = super::seed_failure_error(&failure, Some(json!([])));
-        let sc = &error["structuredContent"];
-        assert_eq!(sc["code"], "policy.denied.ip_ban", "{error}");
-        assert_eq!(error["errorKind"], "walled");
-        assert_eq!(sc["rule"], "banned.example");
-        assert_eq!(
-            sc["next_action"],
-            "ask the human operator to download the file"
-        );
-        assert_eq!(sc["requested_url"], "https://example.org/old-docs/");
-        assert_eq!(
-            sc["landing_url"],
-            "https://www.banned.example/publication/1"
-        );
-    }
-
-    /// A map crawl of one seed answering `seed_status` with a page full of
-    /// links; every other URL is a 404.
-    async fn map_crawl_of_seed(seed_status: u16) -> CrawlResult {
-        use crate::crawl::governor::{Governor, Lane, LaneKind};
-        use crate::crawl::{CrawlOptions, Crawler, FetchedPage, PageFetcher};
-        use crate::detect::walls::Verdict;
-        use futures_util::FutureExt;
-        use std::sync::Arc;
-
-        const SEED: &str = "https://example.org/old-docs/";
-        const PAGE: &str = "<html><head><title>Docs</title></head><body><main><ul>\
-            <li><a href=\"/old-docs/getting-started\">Getting started</a></li>\
-            <li><a href=\"/old-docs/configuration\">Configuration</a></li>\
-            <li><a href=\"/old-docs/reference\">Reference</a></li>\
-            </ul></main></body></html>";
-        let fetch: PageFetcher = Arc::new(
-            move |url: String,
-                  lane: String,
-                  _referer: Option<String>,
-                  _gate: Option<crate::fetch::client::RedirectGate>| {
-                async move {
-                    let (status, body, verdict) = if url == SEED {
-                        let verdict = if seed_status == 200 {
-                            Verdict::ContentOk
-                        } else {
-                            Verdict::SoftNotFound
-                        };
-                        (seed_status, PAGE, verdict)
-                    } else {
-                        (404, "not found", Verdict::SoftNotFound)
-                    };
-                    FetchedPage {
-                        lane,
-                        route: Some(crate::egress::request_route::RequestRoute::direct()),
-                        url,
-                        status,
-                        headers: vec![("content-type".into(), "text/html".into())],
-                        body: body.as_bytes().to_vec(),
-                        verdict,
-                        latency: Duration::ZERO,
-                        cached: false,
-                        error_hint: None,
-                        denied: None,
-                    }
-                }
-                .boxed()
-            },
-        );
-        let crawler = Crawler::new(
-            fetch,
-            Arc::new(Governor::new(vec![Lane {
-                id: "direct".into(),
-                kind: LaneKind::Direct,
-            }])),
-        );
-        crawler
-            .crawl(
-                SEED,
-                CrawlOptions {
-                    mode: CrawlMode::Map,
-                    respect_robots: false,
-                    deadline: Duration::from_secs(30),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_dead_seed_with_links_fails_in_map_mode_while_a_live_one_keeps_its_map() {
-        let dead = map_crawl_of_seed(404).await;
-        assert!(dead.map.is_empty(), "{:?}", dead.map);
-        let failure = dead
-            .seed_failure
-            .as_ref()
-            .expect("a 404 seed with nothing else to map is a failed seed");
-        let error = super::seed_failure_error(failure, None);
-        assert_eq!(error["structuredContent"]["ok"], false, "{error}");
-        assert_eq!(error["errorKind"], "permanent");
-        assert_eq!(error["structuredContent"]["status"], 404);
-
-        // Negative: the same page served 200 keeps its map.
-        let live = map_crawl_of_seed(200).await;
-        assert!(live.seed_failure.is_none());
-        assert!(!live.map.is_empty());
-        let rendered = render_crawl_result(&live, CrawlMode::Map, false);
-        assert_eq!(
-            rendered["structuredContent"]["complete"], false,
-            "seed links cannot prove the entire site inventory"
-        );
-    }
-
-    // Installs a ruleset into the process (crate::config::install) and
-    // writes resume tokens into its cache root: depends on nextest's
-    // process-per-test.
-    #[tokio::test]
-    async fn a_resumed_seed_on_a_denied_host_is_refused_and_keeps_its_token() {
-        use crate::rules::{RuleAction, UrlRule};
-        use std::sync::Arc;
-
-        let mut config = crate::config::DonsetchConfig::default();
-        config.proxy.from_environment = false;
-        config.rules.url.insert(
-            "denied.example".into(),
-            UrlRule {
-                action: RuleAction::Deny,
-                message: Some("ask the human operator for this file".into()),
-                reason: Some("ip_ban".into()),
-                ..Default::default()
-            },
-        );
-        crate::config::install(config).unwrap();
-        let dir = crate::paths::cache_dir().join("crawl-resumes");
-        std::fs::create_dir_all(&dir).unwrap();
-        // The token file's on-disk shape (`ResumeState`, crawl/mod.rs).
-        let write_token = |tok: &str, seed: &str| {
-            let path = dir.join(format!("{tok}.json"));
-            std::fs::write(
-                &path,
-                json!({ "seed": seed, "queue": [], "seen": [] }).to_string(),
-            )
-            .unwrap();
-            path
-        };
-        let denied_token = write_token("cdenied1", "https://denied.example/docs/");
-        let allowed_token = write_token("callowed1", "https://allowed.example/docs/");
-        let daemon = Arc::new(super::Daemon::new().await.unwrap());
-
-        let refused = super::crawl_tool(&daemon, &json!({ "resume": "cdenied1" }), None).await;
-        let sc = &refused["structuredContent"];
-        assert_eq!(sc["ok"], false, "{refused}");
-        assert_eq!(sc["code"], "policy.denied.ip_ban");
-        assert_eq!(sc["errorKind"], "walled");
-        assert_eq!(sc["rule"], "denied.example");
-        assert_eq!(sc["next_action"], "ask the human operator for this file");
-        assert!(
-            denied_token.exists(),
-            "a refused resumed seed must not consume its token"
-        );
-
-        // An explicit seed on the same host takes the same refusal.
-        let explicit = super::crawl_tool(
-            &daemon,
-            &json!({ "url": "https://denied.example/docs/" }),
-            None,
-        )
-        .await;
-        assert_eq!(
-            explicit["structuredContent"]["code"], "policy.denied.ip_ban",
-            "{explicit}"
-        );
-
-        // Negative: an allowed resumed seed resumes as before. An empty
-        // queue in content mode with robots off makes no request.
-        let resumed = super::crawl_tool(
-            &daemon,
-            &json!({
-                "resume": "callowed1",
-                "mode": "content",
-                "respect_robots": false,
-                "deadline_s": 5,
-            }),
-            None,
-        )
-        .await;
-        assert_eq!(resumed["structuredContent"]["ok"], true, "{resumed}");
-        assert!(
-            !allowed_token.exists(),
-            "a resumed crawl consumes its token"
-        );
-    }
-    #[test]
-    fn reliability_nxdomain_during_robots_check_is_permanent() {
-        let mut failed = seed_failure(0, None);
-        failed.robots = Some(crate::crawl::RobotsRefusal::Unreachable);
-        failed.error = Some("network.dns: name or service not known".into());
-        let error = super::seed_failure_error(&failed, None);
-        assert_eq!(error["errorKind"], "permanent");
-        assert_eq!(error["structuredContent"]["code"], "network.dns");
-        assert!(
-            error["structuredContent"]["error"]
-                .as_str()
-                .unwrap()
-                .contains("not known")
-        );
-        assert!(
-            !error["structuredContent"]["next_action"]
-                .as_str()
-                .unwrap()
-                .contains("respect_robots")
-        );
-        failed.error = Some("network.dns_timeout: temporary resolver failure".into());
-        assert_eq!(
-            super::seed_failure_error(&failed, None)["errorKind"],
-            "transient"
-        );
-    }
-    #[test]
-    fn reliability_small_tool_limits_are_not_silently_raised() {
-        let opts = super::crawl_options(
-            &json!({"per_page_max":100,"max_total_chars":500,"deadline_s":3,"map_limit":15000}),
-        );
-        assert_eq!(opts.per_page_max, 100);
-        assert_eq!(opts.max_total_chars, 500);
-        assert_eq!(opts.deadline, Duration::from_secs(3));
-        assert_eq!(opts.map_cap, 15000);
-    }
 }

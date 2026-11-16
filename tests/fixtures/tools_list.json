@@ -145,7 +145,7 @@
     },
     {
       "name": "web_crawl",
-      "description": "Read multiple pages of a known site within explicit budgets. Text starts with [meta] JSON containing completion, page URLs and resume state. FrontierEmpty is complete only if evidence was obtained without failed or excluded pages; budget, deadline, throttle, cancellation and depth stops are incomplete. Cite page URLs. dataset=true returns JSONL after the metadata line.",
+      "description": "Crawl a known site into a token-bounded digest. Text starts with [meta] JSON: model/plan/job/completion. full (default) returns page cards and pN handles; map/plan are network-light; diff fetches only moved pages; get reads a stored page with no network; sites/forget manage dossiers. Cite page URLs. dataset=true returns schema v3 JSONL.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -158,21 +158,54 @@
             "enum": [
               "full",
               "map",
-              "content"
+              "plan",
+              "run",
+              "get",
+              "diff",
+              "sites",
+              "forget"
             ],
-            "description": "full (default) discovers pages and reads content; map returns only the URL inventory (a site map when one exists, otherwise the seed page's links, with no page fetches); content follows links from the seed when no usable site map exists."
+            "description": "full (default) plans and executes, returning the digest; map returns the site model (sections, families, counts, freshness) without reading a page; plan returns the pages to fetch first, each with a reason, section, cost and a reserve list, without fetching; run spends that plan through the executor and persists a resumable job; get reads a pN handle straight from a job with no network; diff compares the current inventory and per-URL lastmod with the dossier, fetches only changed/new pages and reports removed URLs (use refresh=true to revalidate a warm dossier now); sites lists dossiers and forget removes one."
+          },
+          "explain": {
+            "type": "boolean",
+            "description": "Plan mode: include the bounded candidate table that shows why each family was chosen, reserved, or left to the budget."
           },
           "focus": {
             "type": "string",
             "description": "Topic or question for selecting relevant pages and passages. Set when the request targets one subject; omit only when the whole site scope is relevant."
           },
+          "refresh": {
+            "type": "boolean",
+            "description": "diff mode: revalidate the inventory now; otherwise the warm dossier may answer within its TTL."
+          },
+          "handle": {
+            "type": "string",
+            "description": "get mode: a pN handle from a run digest, or job:pN."
+          },
+          "job": {
+            "type": "string",
+            "description": "get mode: job id; omit for the newest job."
+          },
+          "section": {
+            "type": "string",
+            "description": "get mode: one heading section of the stored page."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "get mode: continue at this byte offset."
+          },
+          "host": {
+            "type": "string",
+            "description": "forget mode: host or URL whose dossier is removed."
+          },
           "max_pages": {
             "type": "integer",
-            "description": "Max pages to fetch+extract (default 10, cap 200)."
+            "description": "Max pages to fetch+extract (default 10, cap 200); plan mode: pages to plan."
           },
           "map_limit": {
             "type": "integer",
-            "description": "Max URLs returned in the inventory (default 120, range 1-50000). A capped inventory is incomplete; narrow focus/include_paths for large sites."
+            "description": "Max URLs in the map's flat URL list (default 120, range 1-50000). The model still covers the whole inventory; a capped list is incomplete."
           },
           "max_depth": {
             "type": "integer",
