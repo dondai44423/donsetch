@@ -1892,9 +1892,12 @@ impl Searcher {
             let is_news = |name: &str| matches!(name, "bing-news" | "feed" | "gdelt");
             futures.sort_by_key(|(name, _)| !is_news(name));
         }
-        if query.split_whitespace().count() == 1
-            && futures.iter().any(|(name, _)| name == "registry")
-        {
+        // A bare word is where the registry record can be the answer, but
+        // only when it is written like a package name. A proper noun
+        // ("Calgary", "React") is a topic for the web indexes: spending
+        // three of the six request exchanges on a registry guess is how a
+        // first search planned one engine and answered from nothing.
+        if guess_is_the_answer(query) && futures.iter().any(|(name, _)| name == "registry") {
             futures.sort_by_key(|(name, _)| name != "registry");
             priority_sources.push("registry".into());
         }
@@ -2149,13 +2152,14 @@ impl Searcher {
             }
             // A source that answered "nothing relevant" is an answer: the web
             // has nothing for this query, and that is not a tool failure. Only
-            // a call where nothing could be asked at all is an error.
-            let answered = report.iter().any(|r| {
-                matches!(
-                    r.status.split(':').next().unwrap_or(""),
-                    "off-query" | "no-results" | "empty-parse" | "thin"
-                )
-            });
+            // a call where nothing could be asked at all is an error. A
+            // first-party lookup is not that answer: "no package by that
+            // name" or "that item has no docs page" says nothing about the
+            // web, and it must not dress a fan-out where every engine failed
+            // as a finished "no results".
+            let answered = report
+                .iter()
+                .any(|r| !first_party_lookup(&r.engine) && web_answer(&r.status));
             if !answered {
                 return Err(FetchError::Http(format!(
                     "search: all engines failed : {}",
@@ -2612,6 +2616,34 @@ fn width_for_stress(stress: f64, available: usize) -> usize {
     } else {
         available.min(3)
     }
+}
+
+/// True when a registry guess should claim the budget before the general
+/// engines: one bare word, written like a package name. Package names are
+/// lower case (npm, crates and PyPI all resolve them lower case anyway); a
+/// capitalised word names a place or a thing, and the web index is the
+/// source that answers it.
+fn guess_is_the_answer(query: &str) -> bool {
+    let mut words = query.split_whitespace();
+    let Some(word) = words.next() else {
+        return false;
+    };
+    words.next().is_none() && !word.chars().any(|c| c.is_uppercase())
+}
+
+/// A lane that resolves a name against its own index instead of searching
+/// the web (`docs.rs`, the package registries).
+fn first_party_lookup(engine: &str) -> bool {
+    engine == "docs" || engine.starts_with("registry")
+}
+
+/// A status that answers the query — even with nothing — as opposed to a
+/// scheduling or transport outcome.
+fn web_answer(status: &str) -> bool {
+    matches!(
+        status.split(':').next().unwrap_or(""),
+        "off-query" | "no-results" | "empty-parse" | "thin"
+    )
 }
 
 /// Enforce `site:domain.com` operator: extract the target domain
@@ -4747,5 +4779,61 @@ mod tests {
             ],
             "site:github.com/tokio-rs must keep the github.com/tokio-rs results"
         );
+    }
+
+    // A first search on a fresh state must not spend its request budget on
+    // a registry guess for a word that names a place or a thing: three of
+    // six exchanges bought "Calgary is not a package" while four engines
+    // were never asked.
+    #[test]
+    fn a_proper_noun_does_not_claim_the_registry_priority() {
+        for (query, expected) in [
+            ("zod", true),
+            ("serde_json", true),
+            ("react-router", true),
+            ("@tanstack/query", true),
+            ("Calgary", false),
+            ("React", false),
+            ("Calgary Flames", false),
+            ("", false),
+        ] {
+            assert_eq!(guess_is_the_answer(query), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn a_first_party_lookup_never_answers_for_the_web() {
+        let report = |engine: &str, status: &str| EngineReport {
+            cache_age_ms: None,
+            engine: engine.into(),
+            profile: None,
+            status: status.into(),
+            hits: 0,
+            ms: 0,
+            egress: "-".into(),
+            requests: 1,
+        };
+        assert!(first_party_lookup("registry-any"));
+        assert!(first_party_lookup("registry@crates"));
+        assert!(first_party_lookup("docs"));
+        assert!(!first_party_lookup("bing"));
+        assert!(!first_party_lookup("feed"));
+
+        let answered = |r: &[EngineReport]| {
+            r.iter()
+                .any(|r| !first_party_lookup(&r.engine) && web_answer(&r.status))
+        };
+        // "no package by that name" beside a captcha'd engine is not an
+        // answer: the call reports the failure instead of "no results".
+        assert!(!answered(&[
+            report("registry-any", "no-results"),
+            report("bing", "blocked:captcha"),
+        ]));
+        // An engine that came back empty is.
+        assert!(answered(&[
+            report("registry-any", "no-results"),
+            report("ddg", "no-results"),
+        ]));
+        assert!(answered(&[report("bing", "off-query")]));
     }
 }
