@@ -1,5 +1,25 @@
 # Changelog
 
+## [5.5.4] - 2026-11-16
+
+### Fixed
+
+- **Pi installs its pinned binary under a compiled host.** The first run ran the installer as
+  `process.execPath install.js --bin-dir DIR`; in a Bun-compiled host (Pi-Bolt) that executable
+  is the host itself, which rejects the installer's arguments, so the pinned binary was never
+  installed and a different `donsetch` on PATH was used silently. The installer is now a library
+  that runs in the calling process, whatever started it; a fallback names its version and says
+  when it is not the version the package pins (issue #450).
+- **A first search answers from the web, not from a registry guess.** A bare proper noun
+  ("Calgary") spent three of the six request exchanges on a package-registry lookup before any
+  engine was asked, so on a fresh state one engine decided the whole call. The guess claims the
+  budget first only for a word written like a package name, and a first-party lookup that finds
+  no record no longer turns a fan-out where every engine failed into "no results": the call
+  reports the engine statuses instead.
+- **A half-started MCP server no longer blocks the next start.** The Pi extension kills a server
+  whose initialize never completed, so a later tool call retries the handshake instead of
+  failing with "still initializing".
+
 ## [5.5.3] - 2026-11-16
 
 ### Fixed
