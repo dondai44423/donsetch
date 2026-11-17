@@ -158,10 +158,22 @@
     get encoding() { return "utf-8"; }
     encode(s) { return core.encode(s === undefined ? "" : String(s)); }
     encodeInto(s, target) {
-      const bytes = core.encode(String(s));
-      const written = Math.min(bytes.length, target.length);
-      target.set(bytes.subarray(0, written));
-      return { read: String(s).length, written };
+      const str = String(s);
+      const full = core.encode(str);
+      if (full.length <= target.length) {
+        target.set(full, 0);
+        return { read: str.length, written: full.length };
+      }
+      let read = 0;
+      let written = 0;
+      for (const ch of str) {
+        const chunk = core.encode(ch);
+        if (written + chunk.length > target.length) break;
+        target.set(chunk, written);
+        written += chunk.length;
+        read += ch.length;
+      }
+      return { read, written };
     }
   }
   class TextDecoderShim {
