@@ -189,29 +189,29 @@ enum Parallel {
     TooSlow(u64),
 }
 
-/// One closed range, resumed inside the segment on a stall. Only a whole segment
-/// comes back: a partial one would break the caller's resumable-prefix contract.
+/// One closed range, resumed inside the segment on a stall, writing arrived
+/// bytes incrementally into `slot` so an abandoned route still leaves a
+/// contiguous resumable prefix in segment order.
 async fn fetch_segment(
     client: &reqwest::Client,
     url: &str,
     accept: Option<&str>,
-    from: u64,
-    to: u64,
+    range: (u64, u64),
     stall: Duration,
-) -> Result<Vec<u8>, String> {
+    slot: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    delivered: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let (from, to) = range;
     let want = (to.saturating_sub(from)) as usize;
-    let mut bytes = Vec::with_capacity(want);
+    let mut got = 0usize;
     let mut tries = 0;
-    while bytes.len() < want {
+    while got < want {
         tries += 1;
         if tries > 4 {
-            return Err(format!(
-                "range {from}-{}: gave up at {} bytes",
-                to - 1,
-                bytes.len()
-            ));
+            return Err(format!("range {from}-{}: gave up at {got} bytes", to - 1));
         }
-        let at = from + bytes.len() as u64;
+        let at = from + got as u64;
         let mut request = client
             .get(url)
             .header("Range", format!("bytes={at}-{}", to - 1));
@@ -226,22 +226,27 @@ async fn fetch_segment(
                 response.status().as_u16()
             ));
         }
-        // Ends on the segment's end, a broken stream or a stall; the outer loop
-        // then resumes this segment from where it got to.
         while let Ok(Ok(Some(chunk))) = tokio::time::timeout(stall, response.chunk()).await {
-            bytes.extend_from_slice(&chunk);
-            if bytes.len() >= want {
-                bytes.truncate(want);
+            let take = chunk.len().min(want - got);
+            if take > 0 {
+                slot.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..take]);
+                got += take;
+                delivered.fetch_add(take as u64, Ordering::Relaxed);
+            }
+            if got >= want {
                 break;
             }
         }
     }
-    Ok(bytes)
+    Ok(())
 }
 
 /// The ranged path. Ask for everything from `buf.len()` on, split what is missing
-/// across connections, and append only the contiguous completed head so `buf`
-/// stays a resumable prefix for the next route.
+/// across connections, monitor aggregate throughput per `policy.window`, and
+/// append only the contiguous completed prefix so `buf` stays resumable for the
+/// next route.
 async fn attempt_parallel(
     client: &reqwest::Client,
     url: &str,
@@ -251,6 +256,10 @@ async fn attempt_parallel(
     patient: bool,
     progress: &mut impl FnMut(usize),
 ) -> Result<Parallel, String> {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
     let start = buf.len() as u64;
     let mut probe = client.get(url).header("Range", format!("bytes={start}-"));
     if let Some(accept) = accept {
@@ -286,43 +295,124 @@ async fn attempt_parallel(
         at = end;
     }
     let begun = Instant::now();
-    let mut tasks = Vec::new();
-    for (from, to) in segments {
+    let delivered = Arc::new(AtomicU64::new(0));
+    let mut slots: Vec<Arc<Mutex<Vec<u8>>>> = Vec::with_capacity(segments.len());
+    let mut join_set = tokio::task::JoinSet::new();
+    for (idx, &(from, to)) in segments.iter().enumerate() {
+        let want = (to.saturating_sub(from)) as usize;
+        let slot = Arc::new(Mutex::new(Vec::with_capacity(want)));
+        slots.push(Arc::clone(&slot));
         let client = client.clone();
         let url = url.to_string();
         let accept = accept.map(str::to_string);
         let stall = policy.stall;
-        tasks.push(tokio::spawn(async move {
-            fetch_segment(&client, &url, accept.as_deref(), from, to, stall).await
-        }));
+        let delivered = Arc::clone(&delivered);
+        join_set.spawn(async move {
+            (
+                idx,
+                fetch_segment(
+                    &client,
+                    &url,
+                    accept.as_deref(),
+                    (from, to),
+                    stall,
+                    slot,
+                    delivered,
+                )
+                .await,
+            )
+        });
     }
-    let mut parts = Vec::new();
-    for task in tasks {
-        parts.push(task.await.map_err(|e| e.to_string())?);
-    }
-    let mut appended = 0usize;
-    let mut contiguous = true;
-    let mut failure: Option<String> = None;
-    for part in parts {
-        match part {
-            Ok(bytes) if contiguous => {
-                appended += bytes.len();
-                buf.extend_from_slice(&bytes);
+
+    let mut errors: Vec<Option<String>> = vec![None; segments.len()];
+    let mut too_slow_rate: Option<u64> = None;
+    let mut timed_out = false;
+    let mut window_start = begun + policy.warmup;
+    let mut window_base = 0u64;
+    let tick_step = policy.window.max(Duration::from_millis(50));
+
+    while !join_set.is_empty() {
+        let wait = if !patient && begun.elapsed() < policy.warmup {
+            (policy.warmup - begun.elapsed()).min(tick_step)
+        } else {
+            tick_step
+        };
+        tokio::select! {
+            joined = join_set.join_next() => {
+                match joined {
+                    Some(Ok((idx, Err(err)))) => errors[idx] = Some(err),
+                    Some(Ok((_idx, Ok(())))) => {}
+                    Some(Err(err)) => {
+                        if !err.is_cancelled() {
+                            errors[0].get_or_insert_with(|| err.to_string());
+                        }
+                    }
+                    None => break,
+                }
             }
-            Ok(_) => {}
-            Err(error) => {
-                contiguous = false;
-                failure.get_or_insert(error);
+            () = tokio::time::sleep(wait) => {}
+        }
+
+        let now_bytes = delivered.load(Ordering::Relaxed);
+        progress(start as usize + now_bytes as usize);
+
+        if begun.elapsed() > policy.overall {
+            timed_out = true;
+            join_set.abort_all();
+            break;
+        }
+        if !patient && Instant::now() >= window_start {
+            let elapsed_win = Instant::now().saturating_duration_since(window_start);
+            if elapsed_win >= policy.window {
+                let gained = now_bytes.saturating_sub(window_base);
+                if gained < policy.min_per_window {
+                    let secs = elapsed_win.as_secs_f64().max(0.001);
+                    too_slow_rate = Some((gained as f64 / secs) as u64);
+                    join_set.abort_all();
+                    break;
+                }
+                window_start = Instant::now();
+                window_base = now_bytes;
             }
         }
     }
+
+    let mut appended = 0usize;
+    let mut failure: Option<String> = None;
+    for (idx, &(from, to)) in segments.iter().enumerate() {
+        let want = (to.saturating_sub(from)) as usize;
+        let bytes = slots[idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !bytes.is_empty() {
+            appended += bytes.len();
+            buf.extend_from_slice(&bytes);
+        }
+        if bytes.len() < want {
+            if let Some(err) = errors[idx].take() {
+                failure.get_or_insert(err);
+            }
+            break;
+        }
+    }
     progress(buf.len());
+
     if buf.len() as u64 == total {
         return Ok(Parallel::Done);
     }
+    if let Some(rate) = too_slow_rate {
+        return Ok(Parallel::TooSlow(rate));
+    }
+    if timed_out {
+        return Err(format!(
+            "ranged download exceeded {}s at {} of {total} bytes",
+            policy.overall.as_secs(),
+            buf.len()
+        ));
+    }
     let seconds = begun.elapsed().as_secs_f64().max(0.001);
     let rate = (appended as f64 / seconds) as u64;
-    let floor = policy.min_per_window / policy.window.as_secs().max(1);
+    let floor = (policy.min_per_window as f64 / policy.window.as_secs_f64().max(0.001)) as u64;
     if !patient && rate < floor {
         return Ok(Parallel::TooSlow(rate));
     }
@@ -778,5 +868,40 @@ mod tests {
             "the streaming path should finish"
         );
         assert_eq!(&buf[..], &body[..]);
+    }
+
+    /// Large (>= PARALLEL_FLOOR) assets on a throttled primary route must fail
+    /// over after one window instead of awaiting all eight range tasks to
+    /// completion, while keeping segment 0's prefix for the fast fallback.
+    #[tokio::test]
+    async fn a_crawling_parallel_route_fails_over_within_a_window_and_resumes() {
+        let body: Arc<Vec<u8>> = Arc::new((0..2_400_000u32).map(|i| (i % 251) as u8).collect());
+        // 256 bytes every 80 ms per stream (~3.2 KB/s * 8 = ~25.6 KB/s, ~7.6 KB
+        // per 300 ms window < 20 KB floor; finishing on slow would take ~90 s).
+        let (slow, _) = serve(body.clone(), 256, Duration::from_millis(80), false).await;
+        let (fast, fast_start) = serve(body.clone(), 64 * 1024, Duration::ZERO, false).await;
+        let mut notes = Vec::new();
+        let started = Instant::now();
+        let got = download(
+            &[url("slow-cdn", slow), url("fast-mirror", fast)],
+            &[direct()],
+            &fast_policy(),
+            |_| {},
+            |n| notes.push(n.to_string()),
+        )
+        .await
+        .expect("fast mirror finishes the >=2 MiB asset");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "parallel slow route must fail over promptly, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(got.len(), body.len());
+        assert_eq!(got, *body);
+        assert!(
+            fast_start.load(Ordering::SeqCst) > 0,
+            "fast route should resume after the contiguous prefix kept from segment 0"
+        );
+        assert!(notes.iter().any(|n| n.contains("too slow")), "{notes:?}");
     }
 }
