@@ -80,7 +80,24 @@ function proxyFor(target) {
   const value = target.protocol === 'https:'
     ? (process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy)
     : (process.env.HTTP_PROXY || process.env.http_proxy);
-  return value ? new URL(value) : null;
+  if (!value) return null;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (_) {
+    const error = new InstallError(`invalid proxy URL "${value}"`, 'INVALID_PROXY');
+    error.retryable = false;
+    throw error;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    const error = new InstallError(
+      `unsupported proxy protocol "${parsed.protocol}" (expected http:// or https://)`,
+      'UNSUPPORTED_PROXY'
+    );
+    error.retryable = false;
+    throw error;
+  }
+  return parsed;
 }
 
 function requestDirect(target) {
@@ -233,24 +250,27 @@ function detectMusl() {
   let interpreter;
   try {
     const fd = fs.openSync('/proc/self/exe', 'r');
-    const hdr = Buffer.alloc(64);
-    fs.readSync(fd, hdr, 0, 64, 0);
-    const ePhOff = hdr.readBigUInt64LE(0x20);
-    const ePhEntSize = hdr.readUInt16LE(0x36);
-    const ePhNum = hdr.readUInt16LE(0x38);
-    for (let i = 0; i < ePhNum; i++) {
-      const ph = Buffer.alloc(ePhEntSize);
-      fs.readSync(fd, ph, 0, ePhEntSize, Number(ePhOff) + i * ePhEntSize);
-      if (ph.readUInt32LE(0) === 3) {
-        const offset = Number(ph.readBigUInt64LE(0x08));
-        const size = Number(ph.readBigUInt64LE(0x20));
-        const value = Buffer.alloc(size);
-        fs.readSync(fd, value, 0, size, offset);
-        interpreter = value.toString('ascii').replace(/\0/g, '').trim();
-        break;
+    try {
+      const hdr = Buffer.alloc(64);
+      fs.readSync(fd, hdr, 0, 64, 0);
+      const ePhOff = hdr.readBigUInt64LE(0x20);
+      const ePhEntSize = hdr.readUInt16LE(0x36);
+      const ePhNum = hdr.readUInt16LE(0x38);
+      for (let i = 0; i < ePhNum; i++) {
+        const ph = Buffer.alloc(ePhEntSize);
+        fs.readSync(fd, ph, 0, ePhEntSize, Number(ePhOff) + i * ePhEntSize);
+        if (ph.readUInt32LE(0) === 3) {
+          const offset = Number(ph.readBigUInt64LE(0x08));
+          const size = Number(ph.readBigUInt64LE(0x20));
+          const value = Buffer.alloc(size);
+          fs.readSync(fd, value, 0, size, offset);
+          interpreter = value.toString('ascii').replace(/\0/g, '').trim();
+          break;
+        }
       }
+    } finally {
+      try { fs.closeSync(fd); } catch (_) {}
     }
-    fs.closeSync(fd);
   } catch (_) {
     interpreter = undefined;
   }
@@ -422,7 +442,14 @@ async function install(opts = {}) {
     // never expose a half-written one. The stamp goes last: a crash
     // before it leaves no stamp, and the next run re-downloads.
     for (const name of entries) {
-      fs.renameSync(path.join(extractDir, name), path.join(binDir, name));
+      const src = path.join(extractDir, name);
+      const dst = path.join(binDir, name);
+      try {
+        if (fs.lstatSync(dst).isDirectory()) {
+          fs.rmSync(dst, { recursive: true, force: true });
+        }
+      } catch (_) {}
+      fs.renameSync(src, dst);
     }
     fs.rmSync(extractDir, { recursive: true, force: true });
     if (platform !== 'win32') fs.chmodSync(binaryPath, 0o755);

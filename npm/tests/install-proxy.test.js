@@ -243,3 +243,32 @@ test('NO_PROXY naming the release host keeps the download direct', async (t) => 
   assert.deepEqual(s.proxy.tunnels, [], 'the proxy must see nothing');
   assert.equal(s.mirror.hits.length, 2, s.out);
 });
+
+
+test('malformed or non-HTTP proxy URLs fail immediately without retry backoff', async (t) => {
+  if (skip()) return t.skip(skip());
+  for (const badProxy of ['not-a-valid-url', 'socks5://127.0.0.1:1080']) {
+    const root = h.scratch('proxy-invalid');
+    const pkg = h.stagePkg(join(root, 'pkg'));
+    const home = join(root, 'home');
+    const tools = join(root, 'tools');
+    mkdirSync(home, { recursive: true });
+    mkdirSync(tools, { recursive: true });
+    for (const tool of ['tar', 'gzip']) symlinkSync(h.toolPath(tool), join(tools, tool));
+    const env = h.cleanEnv({
+      path: [tools],
+      home,
+      extra: {
+        DONSETCH_RELEASES_BASE: 'https://127.0.0.1:9',
+        DONSETCH_INSTALL_TAG: TAG,
+        HTTPS_PROXY: badProxy,
+      },
+    });
+    const started = Date.now();
+    const r = await h.spawnNode([join(pkg, 'install.js')], { env, timeout: 10_000 });
+    const elapsed = Date.now() - started;
+    assert.equal(r.code, 1, r.stderr);
+    assert.match(r.stderr, /donsetch: install failed: (invalid proxy URL|unsupported proxy protocol)/);
+    assert.ok(elapsed < 3000, `non-retryable proxy config took ${elapsed}ms: ${r.stderr}`);
+  }
+});
