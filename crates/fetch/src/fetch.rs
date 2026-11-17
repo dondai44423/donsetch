@@ -689,13 +689,14 @@ impl Worker {
                         }
                         let text_chars: usize =
                             items.iter().map(|item| item.title.chars().count()).sum();
+                        let rendered = crate::mine::render(host, &items);
                         return Some(Outcome {
                             url: url.to_string(),
                             cache: None,
                             host: host.to_string(),
-                            // The caller asked for the document; the API it
-                            // names is an implementation of that answer.
-                            final_url: url.to_string(),
+                            // Preserve any redirect the document followed,
+                            // while keeping the internal API URL private.
+                            final_url: document.url.clone(),
                             class: Class::Content,
                             identity: Some(identity.name.to_string()),
                             status: response.status,
@@ -731,8 +732,8 @@ impl Worker {
                                 .filter_map(|item| item.url.clone())
                                 .take(5)
                                 .collect(),
-                            body_text: crate::mine::render(host, &items),
-                            body: None,
+                            body: options.capture_body.then(|| rendered.clone()),
+                            body_text: rendered,
                             headers: Vec::new(),
                             bytes: None,
                         });
@@ -790,17 +791,23 @@ impl Worker {
         // Replay a mined contract before any JavaScript: the app's own request,
         // as plain HTTP, on the identity and jar that mined it. A break falls
         // through to the lane, which mines a fresh contract when it passes.
-        if let Some(outcome) = self.replay_contract(
-            url,
-            host,
-            response,
-            options,
-            started,
-            first_ms,
-            attempts,
-            spent_state,
-        ) {
-            return Some(outcome);
+        let has_custom_predicates = contract.title_contains.is_some()
+            || contract.text_contains.is_some()
+            || contract.selectors.is_some()
+            || contract.allowed_origins.is_some();
+        if !has_custom_predicates {
+            if let Some(outcome) = self.replay_contract(
+                url,
+                host,
+                response,
+                options,
+                started,
+                first_ms,
+                attempts,
+                spent_state,
+            ) {
+                return Some(outcome);
+            }
         }
         let lane_started = Instant::now();
         // The lane spends what the encounter has left, never more: an encounter

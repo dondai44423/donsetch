@@ -103,24 +103,34 @@ impl MinedContract {
     /// in, or `None` when the URL does not match the contract's shape.
     pub fn materialize(&self, url: &str, document_url: &str) -> Option<RequestParts> {
         let values = self.fill(url)?;
-        let fill = |text: &str| -> String {
-            let mut out = text.replace("{{doc}}", document_url);
-            for (index, value) in values.iter().enumerate() {
-                out = out.replace(&format!("{{{{{index}}}}}"), value);
-            }
-            out
-        };
-        let request_url = fill(&self.url);
-        let headers = self
+        let request_url = fill_url(&self.url, document_url, &values);
+        let safe_doc: String = document_url
+            .chars()
+            .filter(|c| *c != '\r' && *c != '\n')
+            .collect();
+        let headers: Vec<(String, String)> = self
             .headers
             .iter()
-            .map(|(name, value)| (name.clone(), fill(value)))
+            .map(|(name, value)| {
+                let mut out = value.replace("{{doc}}", &safe_doc);
+                for (index, slot) in values.iter().enumerate() {
+                    let clean: String = slot.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                    out = out.replace(&format!("{{{{{index}}}}}"), &clean);
+                }
+                (name.clone(), out)
+            })
             .collect();
+        let is_form = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && value
+                    .to_ascii_lowercase()
+                    .contains("application/x-www-form-urlencoded")
+        });
         let body = self.body.as_ref().map(|body| {
             if self.body_b64 {
                 crate::http::unbase64(body).unwrap_or_default()
             } else {
-                fill(body).into_bytes()
+                fill_body(body, document_url, &values, is_form).into_bytes()
             }
         });
         Some((request_url, headers, body))
@@ -261,10 +271,87 @@ impl UrlParts {
 }
 
 fn percent_decode(text: &str) -> String {
-    url::form_urlencoded::parse(format!("v={text}").as_bytes())
-        .next()
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_else(|| text.to_string())
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[index + 1]), hex_val(bytes[index + 2])) {
+                out.push((hi << 4) | lo);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_decode(text: &str) -> String {
+    percent_decode(&text.replace('+', " "))
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn encode_uri_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn escape_json_str(text: &str) -> String {
+    match serde_json::to_string(text) {
+        Ok(quoted) if quoted.len() >= 2 => quoted[1..quoted.len() - 1].to_string(),
+        _ => text.to_string(),
+    }
+}
+
+fn fill_url(template_url: &str, document_url: &str, values: &[String]) -> String {
+    let mut out = if let Some(rest) = template_url.strip_prefix("{{doc}}") {
+        format!("{document_url}{rest}")
+    } else {
+        template_url.to_string()
+    };
+    if out.contains("{{doc}}") {
+        out = out.replace("{{doc}}", &encode_uri_component(document_url));
+    }
+    for (index, value) in values.iter().enumerate() {
+        out = out.replace(&format!("{{{{{index}}}}}"), &encode_uri_component(value));
+    }
+    out
+}
+
+fn fill_body(template_body: &str, document_url: &str, values: &[String], is_form: bool) -> String {
+    let trimmed = template_body.trim_start();
+    let is_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    let encode = |raw: &str| -> String {
+        if is_json {
+            escape_json_str(raw)
+        } else if is_form {
+            encode_uri_component(raw)
+        } else {
+            raw.to_string()
+        }
+    };
+    let mut out = template_body.replace("{{doc}}", &encode(document_url));
+    for (index, value) in values.iter().enumerate() {
+        out = out.replace(&format!("{{{{{index}}}}}"), &encode(value));
+    }
+    out
 }
 
 /// The document's shape, with the components that appear in the app's request
@@ -285,27 +372,19 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
         .as_ref()
         .and_then(|body| crate::http::unbase64(body))
         .unwrap_or_default();
-    let body_text = String::from_utf8(request_body.clone()).ok();
-    let header_text: String = entry
-        .request_headers
-        .iter()
-        .map(|(name, value)| format!("{name}: {value}\n"))
-        .collect();
+    let body_text = String::from_utf8(request_body).ok();
 
-    // Which document components are variable? A query value is the caller's
-    // question; a path segment has to look like an identifier (a digit, a
-    // separator or a long token) so a word like `about` stays a literal.
+    // Which document components actually parameterize the app's request? Only
+    // components whose substitution changes the request URL, kept headers, or
+    // UTF-8 body become `*` wildcards in `shape`; otherwise static endpoints on
+    // parameterized pages (e.g. `GET /api/featured` on `/products/12345`) would
+    // wildcard `12345` with zero `{{n}}` slots and poison `/products/99999`.
     let mut values: Vec<String> = Vec::new();
     let mut path_shape: Vec<String> = Vec::new();
     for segment in &doc.path {
-        let seen = appears(
-            entry,
-            &request_body,
-            body_text.as_deref(),
-            &header_text,
-            segment,
-        );
-        if seen && distinctive(segment) {
+        if distinctive(segment)
+            && component_substitutes(entry, document_url, body_text.as_deref(), segment)
+        {
             path_shape.push("*".into());
             if !values.contains(segment) {
                 values.push(segment.clone());
@@ -316,14 +395,9 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
     }
     let mut query_shape: Vec<(String, String)> = Vec::new();
     for (key, value) in &doc.query {
-        let seen = appears(
-            entry,
-            &request_body,
-            body_text.as_deref(),
-            &header_text,
-            value,
-        );
-        if seen && value.chars().count() >= 2 {
+        if value.chars().count() >= 2
+            && component_substitutes(entry, document_url, body_text.as_deref(), value)
+        {
             query_shape.push((key.clone(), "*".into()));
             if !values.contains(value) {
                 values.push(value.clone());
@@ -376,7 +450,12 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
             text = text.replace(document_url, "{{doc}}");
             for (index, component) in values.iter().enumerate() {
                 if component.chars().count() >= 3 {
-                    text = text.replace(component, &format!("{{{{{index}}}}}"));
+                    let slot = format!("{{{{{index}}}}}");
+                    text = text.replace(component, &slot);
+                    let escaped = escape_json_str(component);
+                    if escaped != *component {
+                        text = text.replace(&escaped, &slot);
+                    }
                 }
             }
             (Some(text), false)
@@ -395,27 +474,37 @@ fn template(document_url: &str, entry: &TranscriptEntry) -> Option<Templated> {
     })
 }
 
-fn appears(
+fn component_substitutes(
     entry: &TranscriptEntry,
-    request_body: &[u8],
+    document_url: &str,
     body_text: Option<&str>,
-    header_text: &str,
     value: &str,
 ) -> bool {
     if value.chars().count() < 2 {
         return false;
     }
-    if entry.url.contains(value) {
+    let base_url = entry.url.replace(document_url, "{{doc}}");
+    if replace_component(&base_url, value, "\x00SLOT\x00") != base_url {
         return true;
     }
-    if header_text.contains(value) {
-        return true;
+    if value.chars().count() >= 3 {
+        if entry.request_headers.iter().any(|(name, header_val)| {
+            keep_header(name) && header_val.replace(document_url, "{{doc}}").contains(value)
+        }) {
+            return true;
+        }
+        if let Some(text) = body_text {
+            let scrubbed = text.replace(document_url, "{{doc}}");
+            if scrubbed.contains(value) {
+                return true;
+            }
+            let escaped = escape_json_str(value);
+            if escaped != value && scrubbed.contains(&escaped) {
+                return true;
+            }
+        }
     }
-    body_text.is_some_and(|text| text.contains(value)) || {
-        // A binary body is not searched; it cannot carry a document component
-        // in a form this contract can fill.
-        request_body.is_empty()
-    }
+    false
 }
 
 fn distinctive(value: &str) -> bool {
@@ -462,7 +551,7 @@ fn replace_component(url: &str, value: &str, placeholder: &str) -> String {
             &query
                 .split('&')
                 .map(|pair| match pair.split_once('=') {
-                    Some((key, raw)) if percent_decode(raw) == value => {
+                    Some((key, raw)) if query_decode(raw) == value => {
                         format!("{key}={placeholder}")
                     }
                     _ => pair.to_string(),
@@ -1051,5 +1140,80 @@ mod tests {
             contract.fill("https://bsky.app/profile/alice/replies"),
             None
         );
+    }
+
+    #[test]
+    fn get_request_without_component_keeps_literal_shape_instead_of_wildcarding() {
+        let body = r#"{"items":[{"title":"Featured item shown on every page","url":"https://shop.example/f1"},{"title":"Second featured item on every page","url":"https://shop.example/f2"}]}"#;
+        let document = r#"<html><body><a href="https://shop.example/f1">Featured item shown on every page</a><a href="https://shop.example/f2">Second featured item on every page</a></body></html>"#;
+        let transcript = vec![entry(
+            "GET",
+            "https://shop.example/api/featured.json",
+            body,
+            None,
+        )];
+        let contract = mine(
+            document,
+            "https://shop.example/products/12345?tab=reviews",
+            "chrome",
+            &transcript,
+        )
+        .expect("mined");
+        assert_eq!(
+            contract.shape, "/products/12345?tab=reviews",
+            "unrelated GET must not wildcard path or query components"
+        );
+        assert!(
+            contract
+                .fill("https://shop.example/products/99999?tab=specs")
+                .is_none(),
+            "distinct product URL must not match a static endpoint contract"
+        );
+    }
+
+    #[test]
+    fn path_plus_and_ampersand_round_trip_and_materialize_escapes_url_and_json() {
+        let body = r#"{"hits":[{"title":"C++ R&D reference guide","url":"https://example.com/cpp"},{"title":"Async Rust systems guide","url":"https://example.com/rust"}]}"#;
+        let document = r#"<html><body><a href="https://example.com/cpp">C++ R&D reference guide</a><a href="https://example.com/rust">Async Rust systems guide</a></body></html>"#;
+        let transcript = vec![entry(
+            "POST",
+            "https://api.example.com/lang/c++/r%26d?q=rust%20async",
+            body,
+            Some(r#"{"topic":"c++","sub":"r&d","query":"rust async"}"#),
+        )];
+        let contract = mine(
+            document,
+            "https://site.example/lang/c++/r%26d?q=rust+async",
+            "chrome",
+            &transcript,
+        )
+        .expect("mined");
+        assert_eq!(contract.shape, "/lang/*/*?q=*");
+        let (req_url, _headers, req_body) = contract
+            .materialize(
+                "https://site.example/lang/f%23/a%2Fb?q=hello+world%26admin%3D1%23frag",
+                "https://site.example/lang/f%23/a%2Fb?q=hello+world%26admin%3D1%23frag",
+            )
+            .expect("materialized");
+        assert_eq!(
+            req_url,
+            "https://api.example.com/lang/f%23/a%2Fb?q=hello%20world%26admin%3D1%23frag"
+        );
+        let parsed: Value =
+            serde_json::from_slice(&req_body.expect("json body")).expect("valid json");
+        assert_eq!(parsed["topic"], "f#");
+        assert_eq!(parsed["sub"], "a/b");
+        assert_eq!(parsed["query"], "hello world&admin=1#frag");
+
+        // Quotes and newlines in filled values keep JSON body valid.
+        let (_, _, quoted_body) = contract
+            .materialize(
+                "https://site.example/lang/c++/r%26d?q=say+%22hi%22%0Anow",
+                "https://site.example/lang/c++/r%26d?q=say+%22hi%22%0Anow",
+            )
+            .expect("materialized quoted");
+        let parsed_q: Value = serde_json::from_slice(&quoted_body.expect("json body"))
+            .expect("valid json with quotes");
+        assert_eq!(parsed_q["query"], "say \"hi\"\nnow");
     }
 }
