@@ -148,6 +148,23 @@ fn a_shell_run_mines_a_contract_and_the_next_fetch_replays_it() {
         "{:?}",
         third.sample
     );
+    assert_eq!(
+        third.body.as_deref(),
+        Some(third.body_text.as_str()),
+        "capture_body must populate Outcome.body on replay"
+    );
+
+    // A non-generic caller contract requires DOM verification and must not be
+    // short-circuited by generic item replay.
+    let mut strict = options();
+    let mut custom = crate::Contract::generic();
+    custom.text_contains = Some(vec!["nonexistent-sentinel-token".into()]);
+    strict.contract = Some(custom);
+    let fourth = worker.fetch(&url, &strict);
+    assert_ne!(
+        fourth.transport, "replay",
+        "explicit caller contract must run through DOM verification, not replay"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
