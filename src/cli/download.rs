@@ -176,10 +176,18 @@ fn total_from_content_range(value: &str) -> Option<u64> {
 /// tens of KB/s on some networks (measured: 4-28 KB/s while the same file came
 /// down at 200+ KB/s over sixteen connections); parallel ranges are the
 /// difference between a 25-minute upgrade and a three-minute one.
-const PARALLEL_CHUNKS: usize = 8;
+pub(crate) const PARALLEL_CHUNKS: usize = 8;
 /// Assets below this go down the streaming path: range setup would cost more
 /// than it saves.
 const PARALLEL_FLOOR: u64 = 2 * 1024 * 1024;
+
+/// Live download telemetry passed to UI progress consumers.
+pub struct Progress<'a> {
+    pub bytes: usize,
+    pub total: Option<u64>,
+    pub lanes: Option<[f32; PARALLEL_CHUNKS]>,
+    pub route: &'a str,
+}
 
 enum Parallel {
     Done,
@@ -199,9 +207,13 @@ async fn fetch_segment(
     range: (u64, u64),
     stall: Duration,
     slot: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    delivered: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    counters: (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ),
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
+    let (delivered, lane_got) = counters;
     let (from, to) = range;
     let want = (to.saturating_sub(from)) as usize;
     let mut got = 0usize;
@@ -233,6 +245,7 @@ async fn fetch_segment(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(&chunk[..take]);
                 got += take;
+                lane_got.store(got as u64, Ordering::Relaxed);
                 delivered.fetch_add(take as u64, Ordering::Relaxed);
             }
             if got >= want {
@@ -247,14 +260,16 @@ async fn fetch_segment(
 /// across connections, monitor aggregate throughput per `policy.window`, and
 /// append only the contiguous completed prefix so `buf` stays resumable for the
 /// next route.
+#[allow(clippy::too_many_arguments)]
 async fn attempt_parallel(
     client: &reqwest::Client,
     url: &str,
     accept: Option<&str>,
+    route_label: &str,
     buf: &mut Vec<u8>,
     policy: &Policy,
     patient: bool,
-    progress: &mut impl FnMut(usize),
+    progress: &mut impl FnMut(Progress<'_>),
 ) -> Result<Parallel, String> {
     use std::sync::{
         Arc, Mutex,
@@ -297,11 +312,15 @@ async fn attempt_parallel(
     let begun = Instant::now();
     let delivered = Arc::new(AtomicU64::new(0));
     let mut slots: Vec<Arc<Mutex<Vec<u8>>>> = Vec::with_capacity(segments.len());
+    let mut lane_bytes: Vec<(Arc<AtomicU64>, u64)> = Vec::with_capacity(segments.len());
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, &(from, to)) in segments.iter().enumerate() {
-        let want = (to.saturating_sub(from)) as usize;
+        let want_u64 = to.saturating_sub(from);
+        let want = want_u64 as usize;
         let slot = Arc::new(Mutex::new(Vec::with_capacity(want)));
+        let lane_got = Arc::new(AtomicU64::new(0));
         slots.push(Arc::clone(&slot));
+        lane_bytes.push((Arc::clone(&lane_got), want_u64.max(1)));
         let client = client.clone();
         let url = url.to_string();
         let accept = accept.map(str::to_string);
@@ -317,19 +336,35 @@ async fn attempt_parallel(
                     (from, to),
                     stall,
                     slot,
-                    delivered,
+                    (delivered, lane_got),
                 )
                 .await,
             )
         });
     }
 
+    let snapshot_lanes = |lane_bytes: &[(Arc<AtomicU64>, u64)]| -> [f32; PARALLEL_CHUNKS] {
+        let mut out = [1.0f32; PARALLEL_CHUNKS];
+        for (i, slot) in out.iter_mut().enumerate() {
+            if let Some((got, want)) = lane_bytes.get(i) {
+                *slot = (got.load(Ordering::Relaxed) as f32 / *want as f32).clamp(0.0, 1.0);
+            } else if !lane_bytes.is_empty() {
+                *slot = 1.0;
+            } else {
+                *slot = 0.0;
+            }
+        }
+        out
+    };
+
     let mut errors: Vec<Option<String>> = vec![None; segments.len()];
     let mut too_slow_rate: Option<u64> = None;
     let mut timed_out = false;
     let mut window_start = begun + policy.warmup;
     let mut window_base = 0u64;
-    let tick_step = policy.window.max(Duration::from_millis(50));
+    // Wake every ~60ms for smooth live UI telemetry while checking throughput
+    // windows against `window_start + policy.window`.
+    let tick_step = Duration::from_millis(60).min(policy.window.max(Duration::from_millis(25)));
 
     while !join_set.is_empty() {
         let wait = if !patient && begun.elapsed() < policy.warmup {
@@ -354,7 +389,12 @@ async fn attempt_parallel(
         }
 
         let now_bytes = delivered.load(Ordering::Relaxed);
-        progress(start as usize + now_bytes as usize);
+        progress(Progress {
+            bytes: start as usize + now_bytes as usize,
+            total: Some(total),
+            lanes: Some(snapshot_lanes(&lane_bytes)),
+            route: route_label,
+        });
 
         if begun.elapsed() > policy.overall {
             timed_out = true;
@@ -395,7 +435,12 @@ async fn attempt_parallel(
             break;
         }
     }
-    progress(buf.len());
+    progress(Progress {
+        bytes: buf.len(),
+        total: Some(total),
+        lanes: Some(snapshot_lanes(&lane_bytes)),
+        route: route_label,
+    });
 
     if buf.len() as u64 == total {
         return Ok(Parallel::Done);
@@ -423,15 +468,27 @@ async fn attempt_parallel(
 async fn attempt(
     client: &reqwest::Client,
     source: &Source,
+    route_label: &str,
     buf: &mut Vec<u8>,
     policy: &Policy,
     patient: bool,
-    progress: &mut impl FnMut(usize),
+    progress: &mut impl FnMut(Progress<'_>),
 ) -> Result<Attempt, String> {
     let (url, accept) = source.resolve(client).await?;
     // Parallel ranges first: a single stream is throttled per connection on some
     // networks, and that is the shape that made upgrades crawl.
-    match attempt_parallel(client, &url, accept, buf, policy, patient, progress).await? {
+    match attempt_parallel(
+        client,
+        &url,
+        accept,
+        route_label,
+        buf,
+        policy,
+        patient,
+        progress,
+    )
+    .await?
+    {
         Parallel::Done => return Ok(Attempt::Done),
         Parallel::TooSlow(rate) => return Ok(Attempt::TooSlow(rate)),
         Parallel::Unsupported => {}
@@ -440,8 +497,9 @@ async fn attempt(
     if let Some(accept) = accept {
         request = request.header("Accept", accept);
     }
-    if !buf.is_empty() {
-        request = request.header("Range", format!("bytes={}-", buf.len()));
+    let resumed_from = buf.len() as u64;
+    if resumed_from > 0 {
+        request = request.header("Range", format!("bytes={resumed_from}-"));
     }
     let mut response = request.send().await.map_err(|e| e.to_string())?;
     let total = match response.status().as_u16() {
@@ -476,7 +534,12 @@ async fn attempt(
         };
         let Some(chunk) = next else { break };
         buf.extend_from_slice(&chunk);
-        progress(buf.len());
+        progress(Progress {
+            bytes: buf.len(),
+            total,
+            lanes: None,
+            route: route_label,
+        });
         if patient || started.elapsed() < policy.warmup {
             continue;
         }
@@ -504,7 +567,7 @@ pub(crate) async fn download(
     sources: &[Source],
     routes: &[Route],
     policy: &Policy,
-    mut progress: impl FnMut(usize),
+    mut progress: impl FnMut(Progress<'_>),
     mut note: impl FnMut(&str),
 ) -> Result<Vec<u8>, String> {
     let begun = Instant::now();
@@ -528,7 +591,17 @@ pub(crate) async fn download(
                         continue;
                     }
                 };
-                match attempt(&client, source, &mut buf, policy, patient, &mut progress).await {
+                match attempt(
+                    &client,
+                    source,
+                    &route.label,
+                    &mut buf,
+                    policy,
+                    patient,
+                    &mut progress,
+                )
+                .await
+                {
                     Ok(Attempt::Done) => return Ok(buf),
                     Ok(Attempt::TooSlow(rate)) => {
                         note(&format!(
@@ -824,14 +897,21 @@ mod tests {
         let client = client_for(&direct(), &policy).unwrap();
         let mut buf = Vec::new();
         let mut reported = 0;
+        let mut saw_lanes = false;
         let outcome = attempt_parallel(
             &client,
             &url_text,
             None,
+            "direct",
             &mut buf,
             &policy,
             false,
-            &mut |n| reported = n,
+            &mut |p| {
+                reported = p.bytes;
+                if p.lanes.is_some() {
+                    saw_lanes = true;
+                }
+            },
         )
         .await
         .unwrap();
@@ -842,6 +922,7 @@ mod tests {
         assert_eq!(buf.len(), body.len());
         assert_eq!(&buf[..], &body[..], "the segments assemble in order");
         assert_eq!(reported, buf.len(), "progress reports what is held");
+        assert!(saw_lanes, "parallel download exposes live lane telemetry");
     }
 
     /// A server that ignores `Range` is streamed instead: the ranged path steps
@@ -856,6 +937,7 @@ mod tests {
         let outcome = attempt(
             &client,
             &url("direct", url_text),
+            "direct",
             &mut buf,
             &policy,
             false,

@@ -5,44 +5,75 @@
 //! receipts. Read-only: never touches the network, never spawns
 //! anything. The `<command> --help` text lives at the bottom.
 
+use crate::DISPLAY_NAME;
 use crate::adapters;
 use crate::adapters::plugins;
+use crate::cli;
 
 pub fn run(args: &[String]) {
     crate::cli::args::Spec::new("adapters", "donsetch adapters", &[]).reject(&args[2..]);
+    cli::init();
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Adapters"),
+        "rewrite & extraction registry",
+    );
+
     if !crate::config::cfg().fetch.adapters {
-        println!("Adapter registry is OFF (fetch.adapters is false).");
-        println!("Everything below stays loaded in memory but never fires.");
         println!();
+        cli::check_warn(
+            "adapter registry OFF",
+            "fetch.adapters = false (loaded in memory, never fires)",
+        );
     }
-    println!("Bundled rewrite adapters (first match wins, builtins before user plugins):");
+
+    cli::print_section("Bundled Rewrite Adapters (first match wins)");
     for b in adapters::builtins() {
-        println!("  {:22} {}", b.via, b.description);
+        let padded = format!("{:<22}", b.via);
+        println!("  {} {}", cli::cyan(&padded), cli::dim(b.description));
     }
-    println!();
 
     let dir = crate::paths::cache_dir().join("adapters");
     let rows = plugins::catalog();
     let (_, skips) = plugins::catalog_stats();
-    println!("User rewrite adapters: {}", dir.display());
+    cli::print_section("User Rewrite Plugins");
+    cli::print_kv("directory", &cli::dim(&dir.display().to_string()));
     if rows.is_empty() && skips == 0 {
-        println!("  (empty: drop *.json plugin files here, see `donsetch adapters --help`)");
+        println!(
+            "  {}",
+            cli::dim("(empty · drop *.json plugin files here; see `donsetch adapters --help`)")
+        );
     } else {
         for row in rows {
             let hosts = row.plugin.hosts.join(",");
             let prefix = row.plugin.path_prefix.as_deref().unwrap_or("/");
+            let padded = format!("{:<22}", row.via);
             println!(
-                "  {:22} hosts={hosts} prefix={prefix} target={}",
-                row.via, row.plugin.target
+                "  {} {}",
+                cli::cyan(&padded),
+                cli::dim(&format!(
+                    "hosts={hosts} prefix={prefix} target={}",
+                    row.plugin.target
+                ))
             );
         }
         if skips > 0 {
-            println!("  skipped files: {skips} (see the [adapters] receipts above)");
+            cli::check_warn(
+                "skipped plugins",
+                &format!("{skips} invalid file(s) ignored (see [adapters] receipts above)"),
+            );
         }
     }
+
+    cli::print_section("Bundled Extract Adapters");
+    println!(
+        "  {}",
+        cli::dim(
+            "github issues · stackexchange · wikipedia infoboxes · docs outlines · reddit json · package registries"
+        )
+    );
     println!();
-    println!("Extract adapters (bundled only in v1): github issues, stackexchange,");
-    println!("wikipedia infoboxes, docs outlines, reddit json, package registries.");
+    cli::print_footer();
+    cli::print_nav(&[("donsetch adapters --help", "plugin schema")]);
 }
 
 /// Usage text for `donsetch adapters --help` and `help adapters`.

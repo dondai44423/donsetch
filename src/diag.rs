@@ -25,19 +25,20 @@
 #[macro_export]
 macro_rules! diag {
     ($($arg:tt)*) => {{
-        // `as _`: the trait comes into scope for the write without
-        // an unused-import warning where the call site already has it.
         use ::std::io::Write as _;
         let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
     }};
 }
 
 /// [`diag!`] without the trailing newline: a line a caller rewrites in
-/// place with `\r` (the CLI progress spinner).
+/// place with `\r` (kinetic CLI progress indicators). Locks and flushes
+/// stderr as one frame so escape sequences never interleave or buffer.
 #[macro_export]
 macro_rules! diag_raw {
     ($($arg:tt)*) => {{
         use ::std::io::Write as _;
-        let _ = ::std::write!(::std::io::stderr(), $($arg)*);
+        let mut err = ::std::io::stderr().lock();
+        let _ = ::std::write!(err, $($arg)*);
+        let _ = err.flush();
     }};
 }

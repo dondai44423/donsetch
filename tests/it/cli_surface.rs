@@ -217,6 +217,13 @@ fn the_two_help_routes_cannot_drift() {
         "adapters",
         "rules",
         "search-bench",
+        "update",
+        "rollback",
+        "version",
+        "stop",
+        "config",
+        "mcp",
+        "tools",
     ] {
         let routed = sb.run(&["help", cmd]);
         let direct = sb.run(&[cmd, "--help"]);

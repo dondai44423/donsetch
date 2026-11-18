@@ -221,3 +221,38 @@ test('--print-file keeps stdout empty and puts the path in the file', (t) => {
   assert.equal(r.stdout, '', 'stdout must stay free for an inheriting caller');
   assert.equal(readFileSync(outFile, 'utf8').trim(), join(pkg, 'binaries', 'donsetch'));
 });
+
+test('a stale stamped package binary upgrades to package.json version, while a newer self-updated binary stays untouched', async (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const root = h.scratch('stamp-upgrade');
+  const pkg = h.stagePkg(join(root, 'pkg'), {
+    binaries: {
+      donsetch: '#!/bin/sh\necho OLD-STAMPED\n',
+      'donsetch.version': '0.0.1\n',
+    },
+  });
+  const m = await h.firstRunMirror(root);
+  if (!m) return t.skip('unsupported test platform');
+  t.after(() => m.server.close());
+
+  const r1 = await h.spawnNode(
+    [join(pkg, 'resolve-binary.js'), '--print', '--pkg-dir', pkg],
+    { env: m.env }
+  );
+  assert.equal(r1.code, 0, r1.stderr);
+  assert.equal(readFileSync(join(pkg, 'binaries', 'donsetch'), 'utf8'), h.TARBALL_BINARY);
+
+  // Now simulate `donsetch update` advancing the local binary ahead of package.json:
+  // resolve-binary.js must keep the newer binary offline without downgrading it.
+  writeFileSync(join(pkg, 'binaries', 'donsetch'), '#!/bin/sh\necho NEWER-SELF-UPDATED\n');
+  chmodSync(join(pkg, 'binaries', 'donsetch'), 0o755);
+  writeFileSync(join(pkg, 'binaries', 'donsetch.version'), '99.0.0\n');
+  const hitsBefore = m.server.hits.length;
+  const r2 = await h.spawnNode(
+    [join(pkg, 'resolve-binary.js'), '--print', '--pkg-dir', pkg],
+    { env: m.env }
+  );
+  assert.equal(r2.code, 0, r2.stderr);
+  assert.equal(m.server.hits.length, hitsBefore, 'newer self-updated binary must not re-download');
+  assert.equal(readFileSync(join(pkg, 'binaries', 'donsetch'), 'utf8'), '#!/bin/sh\necho NEWER-SELF-UPDATED\n');
+});

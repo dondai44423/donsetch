@@ -34,6 +34,7 @@ async function main() {
     resolved = await resolveBinary({
       pkgDir: join(__dirname, '..'),
       self: __filename,
+      stream: process.stderr.isTTY ? process.stderr : null,
       onOutput: (chunk) => process.stderr.write(chunk),
     });
   } catch (err) {

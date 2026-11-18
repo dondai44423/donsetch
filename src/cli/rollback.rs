@@ -16,29 +16,68 @@ use std::path::{Path, PathBuf};
 use crate::DISPLAY_NAME;
 use crate::cli;
 
+pub fn help() {
+    cli::init();
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Rollback"),
+        "atomic binary & runtime swap",
+    );
+    println!();
+    println!(
+        "  {} {}",
+        cli::dim("Usage:"),
+        cli::bold("donsetch rollback [--check]")
+    );
+    println!("         {}", cli::dim("alias: donsetch --rollback"));
+    println!();
+    println!("  Options");
+    cli::print_opt(
+        "--check, -c",
+        "Inspect the stored backup version and size without modifying disk",
+    );
+    println!();
+    println!(
+        "  {}",
+        cli::dim(
+            "Swaps the active binary (and any sibling runtime libraries) with the `.bak` saved\n  by `donsetch update`. Running `donsetch rollback` again rolls forward."
+        )
+    );
+    println!();
+    cli::print_nav(&[
+        ("donsetch update", "fetch newest release"),
+        ("donsetch version", "check active binary"),
+    ]);
+}
+
 #[allow(clippy::needless_borrows_for_generic_args)]
 pub fn run(args: &[String]) {
-    crate::cli::args::Spec::new("rollback", "donsetch rollback", &[]).reject(&args[2..]);
+    crate::cli::args::Spec::new(
+        "rollback",
+        "donsetch rollback [--check]",
+        &["--check", "-c"],
+    )
+    .reject(&args[2..]);
+    let check_only = args[2..].iter().any(|a| a == "--check" || a == "-c");
+
     cli::init();
-    cli::print_title(&format!("{DISPLAY_NAME} Rollback"));
+    cli::print_header(&format!("{DISPLAY_NAME} Rollback"), "backup swap");
+    println!();
 
     let current = env!("CARGO_PKG_VERSION");
-    cli::print_kv("current", current);
+    cli::print_kv("installed", &cli::bold(current));
 
-    // ── Binary path ──────────────────────────────────────────
+    // ── Binary path (canonicalized so symlinks remain intact) ─
 
     let exe = match std::env::current_exe() {
-        Ok(p) => p,
+        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
         Err(e) => {
-            println!("\n  {} Cannot determine binary path: {e}", cli::icon_fail());
+            cli::check_fail("binary path", &e.to_string(), "");
             std::process::exit(1);
         }
     };
 
     let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
-
-    // Borrow as &Path for fs operations : &Path is Copy, so it
-    // won't move and won't trigger clippy::needless_borrows.
+    cli::print_kv("location", &cli::dim(&exe.display().to_string()));
 
     // ── Locate backup ────────────────────────────────────────
 
@@ -60,8 +99,11 @@ pub fn run(args: &[String]) {
 
     if !bak_path.exists() {
         println!();
-        println!("  {} No backup found.", cli::icon_fail());
-        println!("    Run `donsetch -u` to update first; a backup is saved automatically.");
+        cli::check_fail(
+            "no backup found",
+            &bak_path.display().to_string(),
+            "Run `donsetch update` first; a rollback backup is saved automatically.",
+        );
         std::process::exit(1);
     }
 
@@ -74,16 +116,23 @@ pub fn run(args: &[String]) {
 
     if bak_ver.is_empty() {
         cli::print_kv("backup", "unknown version");
-    } else if bak_ver == current {
+    } else if bak_ver == current && !check_only {
         println!();
-        println!(
-            "  {} Backup is the same version ({current}).",
-            cli::icon_warn()
+        cli::check_warn(
+            "same version",
+            &format!("backup holds {current}; nothing to roll back to"),
         );
-        println!("    Nothing to roll back to.");
         std::process::exit(1);
     } else {
-        cli::print_kv("backup", &bak_ver);
+        cli::print_kv(
+            "backup",
+            &format!(
+                "{} {} {}",
+                cli::dim(current),
+                cli::crimson("\u{21BA}"),
+                cli::green(&bak_ver)
+            ),
+        );
     }
 
     // ── Integrity check ──────────────────────────────────────
@@ -91,113 +140,119 @@ pub fn run(args: &[String]) {
     let bak_meta = match std::fs::metadata(&bak_path) {
         Ok(m) => m,
         Err(e) => {
-            println!("\n  {} Cannot read backup: {e}", cli::icon_fail());
+            println!();
+            cli::check_fail("backup metadata", &e.to_string(), "");
             std::process::exit(1);
         }
     };
 
     if bak_meta.len() < 1_000_000 {
-        println!(
-            "\n  {} Backup appears corrupt ({} bytes).",
-            cli::icon_fail(),
-            bak_meta.len(),
+        println!();
+        cli::check_fail(
+            "backup corrupt",
+            &format!("{} bytes", bak_meta.len()),
+            "Run `donsetch update --force` to download a fresh copy.",
         );
-        println!("    Run `donsetch -u` to download a fresh copy.");
         std::process::exit(1);
+    }
+
+    cli::print_kv("backup size", &cli::format_bytes(bak_meta.len()));
+
+    if check_only {
+        println!();
+        cli::check_pass(
+            "backup ready",
+            &format!(
+                "{} ({})",
+                if bak_ver.is_empty() {
+                    "previous version"
+                } else {
+                    &bak_ver
+                },
+                cli::format_bytes(bak_meta.len())
+            ),
+        );
+        println!();
+        cli::print_footer();
+        return;
     }
 
     // ── Swap ──────────────────────────────────────────────────
 
-    println!();
+    cli::print_section("Swap");
 
     #[cfg(unix)]
     {
         match swap_unix(&exe, &bak_path, &bak_ver_path, current) {
-            Ok(Some(warning)) => println!("  {} {warning}", cli::icon_warn()),
+            Ok(Some(warning)) => cli::check_warn("roll-forward backup", &warning),
             Ok(None) => {}
             Err(e) => {
-                println!("  {} {e}", cli::icon_fail());
-                if e.contains("Permission")
+                let hint = if e.contains("Permission")
                     || e.contains("denied")
                     || e.contains("access")
                     || e.contains("read-only")
                 {
-                    println!("    Try: sudo donsetch --rollback");
-                }
+                    "Try: sudo donsetch rollback"
+                } else {
+                    ""
+                };
+                cli::check_fail("swap failed", &e, hint);
                 std::process::exit(1);
             }
         }
 
-        // The previous binary gets its previous runtime back
-        // (update keeps each sibling as `<name>.bak`). Not fatal:
-        // the binary rollback above already succeeded.
         restore_sibling_libs(exe_dir);
     }
 
     #[cfg(windows)]
     {
-        // Windows: rename running .exe to .rollback.tmp (allowed),
-        // copy .bak to .exe, then rename .rollback.tmp to .bak.
         let tmp = exe_dir.join(".donsetch.rollback.tmp");
-
-        // Recover (or drop) the stale temp from an interrupted
-        // rollback. Between the two steps below the binary lives ONLY
-        // at `.donsetch.rollback.tmp`; a crash there must not have the
-        // next rollback delete that last copy.
         recover_stale_rollback_tmp(&exe, &tmp);
 
-        // Rename current running exe to temp.
         if let Err(e) = std::fs::rename(&exe, &tmp).map_err(|e| e.to_string()) {
-            println!("  {} Rename current failed: {e}", cli::icon_fail());
+            cli::check_fail("rename current", &e, "");
             std::process::exit(1);
         }
 
-        // Copy backup to exe path.
         if let Err(e) = std::fs::copy(&bak_path, &exe).map_err(|e| {
-            // Restore on failure.
             let _ = std::fs::rename(&tmp, &exe);
             e.to_string()
         }) {
-            println!("  {} Copy backup failed: {e}", cli::icon_fail());
-            // A plain `return` here reported success (exit 0) for
-            // a rollback that did not happen.
+            cli::check_fail("copy backup", &e, "");
             std::process::exit(1);
         }
 
-        // Rename old current to .bak (new backup for roll-forward).
         match std::fs::rename(&tmp, &bak_path) {
-            // Write new backup version.
             Ok(()) => {
                 let _ = std::fs::write(&bak_ver_path, current);
             }
             Err(e) => {
-                // Not fatal : the rollback succeeded, we just couldn't
-                // save the roll-forward backup. `.bak.ver` is left as
-                // is: it still describes what `.bak` holds.
-                println!(
-                    "  {} Rollback OK, but could not save roll-forward backup: {e}",
-                    cli::icon_warn()
+                cli::check_warn(
+                    "roll-forward backup",
+                    &format!("rollback OK, could not save roll-forward backup: {e}"),
                 );
             }
         }
 
-        // The previous binary gets its previous runtime back
-        // (update keeps each sibling as `<name>.bak`). Not fatal:
-        // the binary rollback above already succeeded.
         restore_sibling_libs(exe_dir);
     }
 
-    println!("  {} rolled back", cli::icon_pass());
     if !bak_ver.is_empty() {
-        println!("  {} {} -> {}", cli::icon_pass(), current, bak_ver);
+        crate::cli::update::sync_npm_version_stamp(&exe, &bak_ver);
     }
+    crate::cli::update::clear_macos_quarantine(&exe);
+
+    cli::check_pass(
+        "binary swapped",
+        "previous version restored; current saved for roll-forward",
+    );
 
     println!();
     cli::print_footer();
     if !bak_ver.is_empty() {
-        println!("  Rolled back {current} -> {bak_ver}");
+        println!("  {} Rolled back {current} -> {bak_ver}", cli::icon_pass());
     } else {
-        println!("  Rolled back to previous version");
+        println!("  {} Rolled back to previous version", cli::icon_pass());
     }
 }
 

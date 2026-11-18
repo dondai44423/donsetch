@@ -1,5 +1,59 @@
 # Changelog
 
+## [5.5.5] - 2026-11-18
+
+### Changed
+
+- **Crimson-Noir CLI design, live multi-lane telemetry, and navigation.** Management and
+  diagnostic commands (`help`, `update`, `rollback`, `status`, `doctor`, `version`, `proxy`,
+  `adapters`, `stop`, `config`, `mcp`, `tools`) and first-run `npm` bootstrap share a
+  cross-platform visual hierarchy with adaptive 24-bit TrueColor / 256-color / 16-color palettes,
+  Windows UTF-8 + Virtual Terminal setup, segmented health meters, and contextual next-command
+  hints. Interactive sessions show a live comet scanner during probes/tool runs and an 8-lane
+  parallel range conduit bar during `donsetch update`, degrading to zero-escape plain text when
+  piped or under `NO_COLOR` / `--json` / `-q` and restoring cursor visibility on `Ctrl+C`.
+- **Update and rollback inspection flags.** `donsetch update` adds `--check` (`-c`) to report
+  release availability without downloading and `--force` (`-f`) to refresh the current binary and
+  sibling runtime libraries in place; `donsetch rollback` adds `--check` (`-c`) to inspect the
+  saved backup before swapping.
+
+### Fixed
+
+- **Zero-tool in-process archive extraction and resilient first-run downloads.** `npm/install.js`
+  extracts `.tar.gz` archives directly through Node's built-in `zlib` and an in-process ustar /
+  PAX / GNU LongLink tar reader (with path-traversal guards), removing external `tar`/`gzip`
+  requirements on minimal containers and avoiding Windows GNU-tar drive-letter failures. First-run
+  downloads verify the `.sha256` manifest upfront, resume interrupted transfers via HTTP `Range`
+  requests, boost throttled multi-MB streams across parallel range connections, fall back to the
+  GitHub Releases API mirror, and fail immediately without retry backoff on malformed/non-HTTP
+  proxies (#455), HTTP 407 proxy auth errors, or invalid TLS certificates.
+- **Race-free runtime staging, Windows locked-binary upgrades, and version-stamp sync.** The npm
+  installer stages companion `.so`/`.dylib`/`.dll` libraries before exposing `donsetch(.exe)`,
+  replaces pre-existing subdirectories cleanly (#455), moves locked Windows binaries aside when
+  upgrading alongside a running MCP server, and closes `/proc/self/exe` reliably (#455).
+  `resolve-binary.js` upgrades stale stamped package binaries after `npm update` without
+  downgrading newer self-updated installs, while `donsetch update` and `donsetch rollback`
+  canonicalize symlinks, keep npm `.version` stamps in sync, and clear macOS quarantine attributes.
+- **Parallel range download throughput window and deadline enforcement.** `donsetch update`'s
+  8-lane range downloader monitors aggregate window throughput and overall deadlines while
+  segments are in flight instead of awaiting all eight tasks first, failing over promptly from
+  throttled routes while keeping the contiguous prefix for resume (#454).
+- **Mined request contract templating and replay fidelity.** `mine::template` only wildcards URL
+  path segments and query values that actually parameterize the mined request, preserves `+` and
+  `%26` when decoding paths, escapes filled URL and JSON body slots in `materialize`, and honors
+  caller `Contract` predicates, redirect `final_url`, and `capture_body` on replay (#451).
+- **Embedded V8 `TextEncoder.encodeInto` UTF-8 boundaries.** Truncated destination buffers stop
+  cleanly on codepoint boundaries and report exact consumed UTF-16 code units in `read` (#452).
+- **Crawl quality gating, seed host normalization, and multi-line code fences in digests.**
+  `crawl` checks `min_quality` before charging `max_total_chars` or recording duplicate signatures
+  and parses seed hosts via `url::Url` (#453). Digest card splitting, boilerplate deduplication,
+  and truncation keep fenced code blocks containing blank lines or shared imports intact instead
+  of splitting fences and flattening code onto one line.
+- **Fast offline `status` and complete `doctor` rows.** `donsetch status` bounds release-feed
+  checks to 1.8 s and honors `DONSETCH_NO_UPDATE_CHECK` / `CI`, and `donsetch doctor` renders
+  the `Search model` and `MCP output` rows in its human report so displayed checks match the
+  summary tally.
+
 ## [5.5.4] - 2026-11-16
 
 ### Fixed

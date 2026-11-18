@@ -209,6 +209,9 @@ async fn run() {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
     }
+    if cmd != "mcp" {
+        cli::init();
+    }
 
     // `--help`/`-h` right after a command name always means HELP, never a
     // run. The spec-driven tools plus keys/proxy/adapters carry their
@@ -406,95 +409,102 @@ async fn route_help(cmd: &str) {
         "proxy" => cli::proxy::help(),
         "--help" | "-h" => cli::tool::print_top_help(),
         "config" => {
-            println!("Usage: donsetch config show [--markdown] [--legacy]");
+            cli::print_header(
+                &format!("{} Config", donsetch::DISPLAY_NAME),
+                "layered configuration inspector",
+            );
             println!();
-            println!("  show            Print every knob, its current value and where");
-            println!("                  it came from (default / env / file / legacy env).");
-            println!("  --markdown      Print the full knob reference table as markdown");
-            println!("                  (the source of truth for the README).");
-            println!("  --legacy        Print the legacy env var -> key mapping.");
+            println!(
+                "  {} {}",
+                cli::dim("Usage:"),
+                cli::bold("donsetch config show [--markdown] [--legacy]")
+            );
             println!();
-            println!("  File layer: <config-dir>/donsetch/donsetch.toml, or the path in");
-            println!("  DONSETCH_CONFIG. Skip the file layer with DONSETCH_NO_CONFIG_FILE=1.");
+            println!("  Options");
+            cli::print_opt(
+                "show",
+                "Print every setting, its value, and the layer it came from",
+            );
+            cli::print_opt(
+                "--markdown",
+                "Print the full supported setting reference table as Markdown",
+            );
+            cli::print_opt(
+                "--legacy",
+                "Print the legacy environment variable -> config key map",
+            );
+            println!();
+            println!(
+                "  {}",
+                cli::dim(
+                    "Precedence: defaults < legacy env < donsetch.toml (<config-dir>/donsetch/donsetch.toml\n  or DONSETCH_CONFIG) < DONSETCH_<SECTION>__<KEY>. Skip file with DONSETCH_NO_CONFIG_FILE=1."
+                )
+            );
+            println!();
+            cli::print_nav(&[
+                ("donsetch status", "active summary"),
+                ("donsetch doctor", "validate posture"),
+            ]);
         }
-        "doctor" => {
-            println!("Usage: donsetch doctor [--deep] [--fix] [--json] [--improve] [--mcp]");
-            println!();
-            println!("  Health checks: binary, network, TLS, browser, browser launch,");
-            println!("  auth profile, cache, permissions, PDFium, OCR models,");
-            println!("  egress lanes, local rules.");
-            println!("  Auto-fixes what it can. Reports issues with instructions.");
-            println!("  --deep     live egress-lane and provider probes");
-            println!("  --improve  explain the local self-improvement loop + receipts");
-            println!("  --fix      apply safe mechanical repairs");
-            println!("  --json     structured output for agents/CI");
-        }
-        "update" => {
-            println!("Usage: donsetch update [--yes]");
-            println!();
-            println!("  Checks for a new release and downloads the platform-correct binary");
-            println!("  from GitHub Releases. Verifies SHA256, replaces in place, saves backup.");
-            println!("  A major version prints what it changes and asks first; --yes answers");
-            println!("  for an unattended run.");
-        }
-        "rollback" => {
-            println!("Usage: donsetch rollback");
-            println!();
-            println!("  Reverts to the previous binary version (saved by `donsetch update`).");
-            println!("  Can be run again to roll forward.");
-        }
-        "version" => {
-            println!("Usage: donsetch version");
-            println!();
-            println!("  Shows build info and checks for updates.");
-        }
+        "doctor" | "--doctor" => cli::doctor::help(),
+        "update" | "-u" | "--update" => cli::update::help(),
+        "rollback" | "--rollback" => cli::rollback::help(),
+        "version" | "-v" | "-V" | "--version" => cli::version::help(),
         "mcp" => {
-            println!("Usage: donsetch mcp [--http] [--host HOST] [--port PORT] [--supervised]");
+            cli::print_header(
+                &format!("{} MCP Server", donsetch::DISPLAY_NAME),
+                "Model Context Protocol daemon",
+            );
             println!();
-            println!("  Starts the MCP server (stdio or HTTP mode).");
+            println!(
+                "  {} {}",
+                cli::dim("Usage:"),
+                cli::bold("donsetch mcp [--http] [--host HOST] [--port PORT] [--supervised]")
+            );
             println!();
-            println!("Options:");
-            println!("  --http              Start HTTP server instead of stdio");
-            println!("  --host HOST         Bind to this address (default: 127.0.0.1)");
-            println!("  --port PORT         Listen on this port (default: 8765)");
-            println!("  --supervised        Run with crash-recovery supervisor (stdio only)");
+            println!("  Options");
+            cli::print_opt(
+                "--supervised",
+                "Run with crash-recovery supervisor (recommended for stdio)",
+            );
+            cli::print_opt("--http", "Serve Streamable HTTP on /mcp instead of stdio");
+            cli::print_opt(
+                "--host HOST",
+                "Bind address for HTTP mode (default: 127.0.0.1)",
+            );
+            cli::print_opt("--port PORT", "Listen port for HTTP mode (default: 8765)");
             println!();
-            println!("Config: layered config = defaults < legacy env < donsetch.toml");
-            println!("(<config-dir>/donsetch/donsetch.toml or DONSETCH_CONFIG=...) <");
-            println!("DONSETCH_<SECTION>__<KEY>. `donsetch config show` prints the");
-            println!("resolved table, `donsetch config show --markdown` the full knob");
-            println!("reference, `donsetch config show --legacy` the old-name map.");
+            println!("  Environment Overrides");
+            println!("    DONSETCH_TRANSPORT__KIND=http      Same as --http");
+            println!("    DONSETCH_TRANSPORT__HOST=HOST      Same as --host");
+            println!("    DONSETCH_TRANSPORT__PORT=PORT      Same as --port");
+            println!("    DONSETCH_TRANSPORT__TOKEN=TOKEN    Require Bearer token on /mcp");
+            println!("    DONSETCH_TRANSPORT__TIMEOUT_SECS=N Per-request timeout (default 300)");
+            println!("    DONSETCH_TRANSPORT__CORS=1         Allow cross-origin requests");
             println!();
-            println!("Stdio mode (default): JSON-RPC over stdin/stdout");
-            println!("HTTP mode: JSON-RPC POST at http://HOST:PORT/mcp (plus the");
-            println!("            GET SSE stream and DELETE session end required by");
-            println!("            streamable-HTTP clients)");
-            println!();
-            println!("Environment (flags win over the config):");
-            println!("  DONSETCH_TRANSPORT__KIND=http Same as --http (stdio is the default)");
-            println!("  DONSETCH_TRANSPORT__HOST=HOST Same as --host");
-            println!("  DONSETCH_TRANSPORT__PORT=PORT Same as --port");
-            println!("  DONSETCH_TRANSPORT__TOKEN=TOKEN");
-            println!("                                Require Authorization: Bearer TOKEN on /mcp");
-            println!("  DONSETCH_TRANSPORT__TIMEOUT_SECS=N  Per-request timeout (default 300)");
-            println!("  DONSETCH_TRANSPORT__CORS=1    Allow cross-origin requests (default off)");
-            println!();
-            println!("Legacy names (DONSETCH_TRANSPORT, DONSETCH_HTTP_*, ...) still");
-            println!("work and map to the keys above; `donsetch doctor` lists them.");
+            cli::print_nav(&[
+                ("donsetch doctor --mcp", "client config snippets"),
+                ("donsetch tools", "inspect tool schemas"),
+            ]);
         }
         "tools" => {
-            println!("Usage: donsetch tools [--json]");
+            cli::print_header(
+                &format!("{} Tools", donsetch::DISPLAY_NAME),
+                "MCP JSON schema dump",
+            );
             println!();
-            println!("  Prints the tool schemas as JSON (same as MCP tools/list).");
-            println!("  --json is accepted and redundant: this output is always JSON.");
-        }
-        "stop" => {
-            println!("Usage: donsetch stop");
+            println!(
+                "  {} {}",
+                cli::dim("Usage:"),
+                cli::bold("donsetch tools [--json]")
+            );
             println!();
-            println!("  Kills orphaned browser instances and cleans stale locks and");
-            println!("  temp profiles. Run after a hard interrupt; harmless when there is");
-            println!("  nothing to clean.");
+            println!(
+                "  {}",
+                cli::dim("Prints the four MCP tool schemas as JSON (identical to `tools/list`).")
+            );
         }
+        "stop" => cli::stop::help(),
         _ => cli::args::unknown_command(cmd, KNOWN_COMMANDS),
     }
 }

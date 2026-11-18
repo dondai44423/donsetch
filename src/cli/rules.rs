@@ -198,7 +198,16 @@ fn render_winner(out: &mut String, winner: &CompiledRule, origin: &Origin<'_>) {
 
 /// Usage text for `donsetch rules --help` and `help rules`.
 pub fn help() {
-    println!("Usage: donsetch rules test <url>");
+    crate::cli::print_header(
+        &format!("{} Rules", crate::DISPLAY_NAME),
+        "offline URL policy inspector",
+    );
+    println!();
+    println!(
+        "  {} {}",
+        crate::cli::dim("Usage:"),
+        crate::cli::bold("donsetch rules test <url>")
+    );
     println!();
     println!("  Explain what the local DonSeTch rules ([rules] in donsetch.toml) do");
     println!("  with one URL, offline: every matching rule, most specific first, the");
@@ -209,6 +218,11 @@ pub fn help() {
     println!("  one, action included). Rules are switched off by [rules] mode = \"off\",");
     println!("  DONSETCH_RULES__MODE=off, or `--ignore-rules` on fetch, crawl and");
     println!("  screenshot.");
+    println!();
+    crate::cli::print_nav(&[
+        ("donsetch config show", "inspect active rules layer"),
+        ("donsetch status", "active summary"),
+    ]);
 }
 
 #[cfg(test)]

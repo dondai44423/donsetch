@@ -453,13 +453,33 @@ pub fn build(result: &CrawlResult) -> Digest {
     d
 }
 
-/// Remove every body block that repeats across cards. This is the last
-/// gate against a source header or shared footer that survived the page-level
-/// frequency pass. Card headings and the `H:` line are never touched.
+/// Opening fence backtick run (`>= 3`), or `0` when `line` is not a fence.
+fn fence_open_ticks(line: &str) -> usize {
+    let t = line.trim_start();
+    let n = t.bytes().take_while(|&b| b == b'`').count();
+    if n >= 3 { n } else { 0 }
+}
+
+/// True when `line` closes a fence opened with `open_ticks` backticks.
+fn fence_closes(line: &str, open_ticks: usize) -> bool {
+    let t = line.trim_start();
+    let n = t.bytes().take_while(|&b| b == b'`').count();
+    n >= open_ticks && t[n..].trim().is_empty()
+}
+
+fn is_fenced_block(block: &str) -> bool {
+    fence_open_ticks(block.lines().next().unwrap_or("")) >= 3
+}
+
+/// Remove every prose body block that repeats across cards. Fenced code blocks,
+/// card headings, and the `H:` line are never touched.
 fn dedupe_cards(pages: &mut [DigestPage], removed: &mut usize) {
     let mut freq: HashMap<String, usize> = HashMap::new();
     for p in pages.iter() {
         for block in card_body(&p.card).1 {
+            if is_fenced_block(&block) {
+                continue;
+            }
             let n = norm(&block);
             if n.chars().count() >= 40 {
                 *freq.entry(n).or_default() += 1;
@@ -479,7 +499,7 @@ fn dedupe_cards(pages: &mut [DigestPage], removed: &mut usize) {
         let before = blocks.len();
         let kept: Vec<String> = blocks
             .into_iter()
-            .filter(|b| !repeated.contains(&norm(b)))
+            .filter(|b| is_fenced_block(b) || !repeated.contains(&norm(b)))
             .collect();
         *removed += before.saturating_sub(kept.len());
         p.card = if kept.is_empty() {
@@ -493,15 +513,20 @@ fn dedupe_cards(pages: &mut [DigestPage], removed: &mut usize) {
 
 /// A repeated source header can share a paragraph with a url/quote, so the
 /// block pass sees a different paragraph on each page. Remove repeated long
-/// lines too; headings and the `H:` line remain.
+/// prose lines too; fenced code blocks, headings, and the `H:` line remain.
 fn dedupe_lines(pages: &mut [DigestPage], removed: &mut usize) {
     let mut freq: HashMap<String, usize> = HashMap::new();
     for p in pages.iter() {
         let (_, blocks) = card_body(&p.card);
-        for line in blocks.iter().flat_map(|b| b.lines()) {
-            let n = norm(line);
-            if n.chars().count() >= 40 {
-                *freq.entry(n).or_default() += 1;
+        for block in &blocks {
+            if is_fenced_block(block) {
+                continue;
+            }
+            for line in block.lines() {
+                let n = norm(line);
+                if n.chars().count() >= 40 {
+                    *freq.entry(n).or_default() += 1;
+                }
             }
         }
     }
@@ -518,6 +543,10 @@ fn dedupe_lines(pages: &mut [DigestPage], removed: &mut usize) {
         let mut kept: Vec<String> = Vec::new();
         let mut dropped = 0usize;
         for block in blocks {
+            if is_fenced_block(&block) {
+                kept.push(block);
+                continue;
+            }
             let lines: Vec<&str> = block
                 .lines()
                 .filter(|line| {
@@ -545,29 +574,105 @@ fn dedupe_lines(pages: &mut [DigestPage], removed: &mut usize) {
     }
 }
 
+/// Split card body into blocks on blank lines while keeping fenced code blocks
+/// (` ``` ... \n\n ... ``` `) intact as a single block.
 fn card_body(card: &str) -> (String, Vec<String>) {
-    match card.split_once("\n\n") {
-        Some((header, body)) => (
-            header.to_string(),
-            body.split("\n\n")
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        None => (card.to_string(), Vec::new()),
+    let Some((header, body)) = card.split_once("\n\n") else {
+        return (card.to_string(), Vec::new());
+    };
+    let mut blocks = Vec::new();
+    let mut cur = String::new();
+    let mut open_ticks = 0usize;
+
+    for line in body.lines() {
+        if open_ticks > 0 {
+            if !cur.is_empty() {
+                cur.push('\n');
+            }
+            cur.push_str(line);
+            if fence_closes(line, open_ticks) {
+                open_ticks = 0;
+                let trimmed = cur.trim();
+                if !trimmed.is_empty() {
+                    blocks.push(trimmed.to_string());
+                }
+                cur.clear();
+            }
+            continue;
+        }
+        let ticks = fence_open_ticks(line);
+        if ticks >= 3 {
+            let trimmed = cur.trim();
+            if !trimmed.is_empty() {
+                blocks.push(trimmed.to_string());
+            }
+            cur.clear();
+            open_ticks = ticks;
+            cur.push_str(line);
+            continue;
+        }
+        if line.trim().is_empty() {
+            let trimmed = cur.trim();
+            if !trimmed.is_empty() {
+                blocks.push(trimmed.to_string());
+            }
+            cur.clear();
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(line);
     }
+    let trimmed = cur.trim();
+    if !trimmed.is_empty() {
+        blocks.push(trimmed.to_string());
+    }
+    (header.to_string(), blocks)
+}
+
+fn unclosed_fence_ticks(s: &str) -> usize {
+    let mut open = 0usize;
+    for line in s.lines() {
+        if open > 0 {
+            if fence_closes(line, open) {
+                open = 0;
+            }
+        } else {
+            let ticks = fence_open_ticks(line);
+            if ticks >= 3 {
+                open = ticks;
+            }
+        }
+    }
+    open
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
     let mut out: String = s.chars().take(max).collect();
-    if let Some(i) = out.rfind(char::is_whitespace) {
+    if let Some(i) = out.rfind('\n').filter(|&i| i > 0) {
+        out.truncate(i);
+    } else if let Some(i) = out.rfind(char::is_whitespace) {
         out.truncate(i);
     }
-    out.push('…');
+    let open = unclosed_fence_ticks(&out);
+    if open > 0 {
+        let closing = "`".repeat(open);
+        // If only the opening ```lang line fit, omit the empty stub fence cleanly.
+        if !out.contains('\n') {
+            return String::new();
+        }
+        out.push_str("\n\u{2026}\n");
+        out.push_str(&closing);
+    } else {
+        out.push('\u{2026}');
+    }
     out
 }
 
@@ -792,5 +897,61 @@ mod tests {
             "a zero denominator is a display bug, got {text}"
         );
         assert!(text.contains("3 of 18 inventory pages planned"));
+    }
+
+    #[test]
+    fn fenced_code_with_blank_lines_and_shared_imports_stays_fenced_in_digest_cards() {
+        let md_a = "# Async Support\n\nUse `AsyncClient` to send concurrent requests:\n\n```python\nimport asyncio\nimport httpx\n\nasync def main():\n    async with httpx.AsyncClient() as client:\n        r = await client.get('https://www.example.com/')\n        print(r)\n\nasyncio.run(main())\n```\n";
+        let md_b = "# Timeouts\n\nConfigure explicit timeouts on `AsyncClient`:\n\n```python\nimport asyncio\nimport httpx\n\nasync def main():\n    async with httpx.AsyncClient(timeout=10.0) as client:\n        r = await client.get('https://www.example.com/slow')\n        print(r.status_code)\n\nasyncio.run(main())\n```\n";
+        let result = CrawlResult {
+            inventory: InventoryStatus::default(),
+            seed: "https://www.python-httpx.org/".into(),
+            pages: vec![
+                page(
+                    "https://www.python-httpx.org/async/",
+                    "Async Support",
+                    md_a,
+                    false,
+                ),
+                page(
+                    "https://www.python-httpx.org/timeouts/",
+                    "Timeouts",
+                    md_b,
+                    false,
+                ),
+            ],
+            queued: Vec::new(),
+            depth_cut: Vec::new(),
+            filtered_out: 0,
+            skipped: Vec::new(),
+            stop: StopReason::FrontierEmpty,
+            elapsed: Duration::ZERO,
+            map: Vec::new(),
+            crawl_delay: None,
+            resume: None,
+            denied: DeniedLog::default(),
+            seed_failure: None,
+            model: None,
+            plan: None,
+            run: None,
+            inventory_urls: Vec::new(),
+            delta: None,
+        };
+        let d = build(&result);
+        assert_eq!(d.pages.len(), 2);
+        for p in &d.pages {
+            assert!(
+                p.card
+                    .contains("```python\nimport asyncio\nimport httpx\n\nasync def main():"),
+                "code block lost opening fence or internal newlines:\n{}",
+                p.card
+            );
+            assert_eq!(
+                unclosed_fence_ticks(&p.card),
+                0,
+                "card left an unclosed code fence:\n{}",
+                p.card
+            );
+        }
     }
 }

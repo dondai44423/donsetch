@@ -188,11 +188,11 @@ For development, use the [contributor build ladder](../CONTRIBUTING.md#developme
 | Installed with `--ignore-scripts` or strict script policy | No extra step: run `donsetch doctor` or start Pi. DonSeTch has no install scripts. |
 | `npm install -g` fails with `EACCES` | Use `npx -y donsetch doctor`, or create `~/.local/lib` with `mkdir -p ~/.local/lib`, run `npm install -g --prefix "$HOME/.local" donsetch`, then `~/.local/bin/donsetch doctor`. Add `~/.local/bin` to your shell's `PATH` for later use. |
 | Package directory is read-only at runtime | The launcher downloads into your user cache automatically. `DONSETCH_BINARY` can select an existing binary; `PATH` and `~/.cargo/bin` are fallback locations. |
-| Download needs a proxy | Set `HTTPS_PROXY` or `HTTP_PROXY` to an HTTP CONNECT proxy. |
-| GitHub Releases is inaccessible | Set `DONSETCH_RELEASES_BASE` to a mirror with `<tag>/<asset>` paths. |
-| Windows cannot extract the asset | Ensure `tar` is available; Windows 10 1803 and later include it. |
+| Download needs a proxy | Set `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` to an HTTP CONNECT proxy. |
+| GitHub Releases is inaccessible | Set `DONSETCH_RELEASES_BASE` to a mirror with `<tag>/<asset>` paths; default installs also fall back automatically to the GitHub Releases API mirror. |
+| Interrupted or throttled first-run download | Re-running resumes automatically via HTTP `Range` requests, boosts throttled multi-MB streams across parallel connections, and extracts in-process without external `tar` or `gzip`. |
 | Screenshot cannot launch | Run `doctor`, install Chromium/Chrome/Edge, or set `browser.chromium_path`. |
 | Search or egress is degraded | Run `doctor --deep`; inspect source status and [proxy checks](proxies.md#troubleshooting). |
 | A client still runs the old binary | Restart its MCP process after updating. |
 
-`donsetch doctor --fix` repairs mechanical problems it can identify. `--json` adds machine-readable checks. `donsetch update` installs a release; `donsetch rollback` restores the previous binary. A major-version update asks for explicit confirmation; `--yes` is the unattended opt-in.
+`donsetch doctor --fix` repairs mechanical problems it can identify. `--json` adds machine-readable checks. `donsetch update` (`--check`, `--force`) installs or refreshes a release; `donsetch rollback` (`--check`) restores the previous binary. A major-version update asks for explicit confirmation; `--yes` is the unattended opt-in.

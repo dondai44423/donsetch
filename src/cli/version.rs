@@ -12,32 +12,55 @@ use crate::fetch::client::Fetcher;
 use crate::profile::BrowserProfile;
 use std::time::Duration;
 
+pub fn help() {
+    cli::init();
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Version"),
+        "build identity & release check",
+    );
+    println!();
+    println!("  {} {}", cli::dim("Usage:"), cli::bold("donsetch version"));
+    println!(
+        "         {}",
+        cli::dim("aliases: donsetch -V  ·  donsetch -v  ·  donsetch --version")
+    );
+    println!();
+    println!(
+        "  {}",
+        cli::dim(
+            "Prints binary path, target triple, active wire profile, compiled features,\n  PDFium build, git revision, and live release status (skip with DONSETCH_NO_UPDATE_CHECK=1)."
+        )
+    );
+    println!();
+    cli::print_nav(&[
+        ("donsetch update", "upgrade binary"),
+        ("donsetch status", "runtime overview"),
+    ]);
+}
+
 pub async fn run(args: &[String]) {
     crate::cli::args::Spec::new("version", "donsetch version", &[]).reject(&args[2..]);
     crate::cli::init();
 
     let current = env!("CARGO_PKG_VERSION");
-    cli::print_title(&format!("{DISPLAY_NAME} {current}"));
+    let target = option_env!("DONSETCH_TARGET").unwrap_or("local");
+    cli::print_header(&format!("{DISPLAY_NAME} {current}"), target);
+    println!();
 
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    cli::print_kv("binary", &exe);
-    cli::print_kv(
-        "target",
-        option_env!("DONSETCH_TARGET").unwrap_or("unknown"),
-    );
-    // The label must name the Chrome this build actually presents. The UA
-    // and the client hints follow the detected browser, so a literal here
-    // mislabelled every build (and every recorded stealth baseline) as the
-    // version the tables were captured from. When no browser can be
-    // detected the profile falls back to the capture version, and that is
-    // said out loud instead of presented as a fact about the host.
+    cli::print_kv("binary", &cli::dim(&exe));
+    cli::print_kv("target", target);
     let profile = BrowserProfile::host_default();
     let label = match crate::profile::probe_installed() {
-        Some(_) => format!("{} (detected)", profile.name),
-        None => format!("{} (fallback: no installed browser detected)", profile.name),
+        Some(_) => format!("{} {}", cli::cyan(&profile.name), cli::dim("(detected)")),
+        None => format!(
+            "{} {}",
+            cli::cyan(&profile.name),
+            cli::dim("(fallback: no installed browser detected)")
+        ),
     };
     cli::print_kv("profile", &label);
     cli::print_kv(
@@ -51,34 +74,35 @@ pub async fn run(args: &[String]) {
     cli::print_kv("git", option_env!("DONSETCH_GIT_HASH").unwrap_or("unknown"));
 
     // ── Update check (atom feed : no API, no rate limits) ─────
-    //
-    // Fetches the GitHub releases.atom feed (a regular web page,
-    // not the API : no 60-req/hour limit). The verdict comes from
-    // update::check_feed, the one `donsetch update` acts on.
 
     let skip_update_check =
         std::env::var_os("DONSETCH_NO_UPDATE_CHECK").is_some() || std::env::var_os("CI").is_some();
     let feed = if skip_update_check {
         None
     } else {
+        let spin = cli::Spinner::new_tty_only("Checking latest release\u{2026}");
         let fetcher = Fetcher::new(BrowserProfile::host_default());
-        match fetcher {
+        let fetched = match fetcher {
             Ok(f) => tokio::time::timeout(Duration::from_secs(3), update::fetch_feed(&f))
                 .await
                 .ok()
                 .and_then(Result::ok),
             Err(_) => None,
-        }
+        };
+        spin.stop();
+        fetched
     };
 
     println!();
 
     if skip_update_check {
-        println!("  (update check skipped)");
+        println!("  {}", cli::dim("(update check skipped)"));
         return;
     }
 
     println!("{}", update_report(current, feed.as_deref()));
+    println!();
+    cli::print_footer();
 }
 
 /// The update lines `version` prints for an install at `current`,

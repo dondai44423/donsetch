@@ -30,51 +30,93 @@ use crate::profile::BrowserProfile;
 
 const REPO: &str = "dondai44423/donsetch";
 
-pub async fn run(args: &[String]) {
-    crate::cli::args::Spec::new("update", "donsetch update [--yes]", &["--yes", "-y"])
-        .reject(&args[2..]);
+pub fn help() {
     cli::init();
-    cli::print_title(&format!("{DISPLAY_NAME} Update"));
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Update"),
+        "self-update from GitHub Releases",
+    );
+    println!();
+    println!(
+        "  {} {}",
+        cli::dim("Usage:"),
+        cli::bold("donsetch update [--yes] [--check] [--force]")
+    );
+    println!(
+        "         {}",
+        cli::dim("aliases: donsetch -u  ·  donsetch --update")
+    );
+    println!();
+    println!("  Options");
+    cli::print_opt(
+        "--check, -c",
+        "Check whether a newer release is available without downloading",
+    );
+    cli::print_opt(
+        "--force, -f",
+        "Re-download and refresh the binary + sibling runtimes in place",
+    );
+    cli::print_opt(
+        "--yes, -y",
+        "Confirm major-version upgrades in unattended scripts",
+    );
+    println!();
+    println!(
+        "  {}",
+        cli::dim(
+            "Downloads over 8 parallel range streams with automatic mirror failover, verifies\n  SHA-256 before unpacking, swaps atomically, and saves a backup for `donsetch rollback`."
+        )
+    );
+    println!();
+    cli::print_nav(&[
+        ("donsetch rollback", "revert to backup"),
+        ("donsetch version", "build identity"),
+    ]);
+}
 
+pub async fn run(args: &[String]) {
+    crate::cli::args::Spec::new(
+        "update",
+        "donsetch update [--yes] [--check] [--force]",
+        &["--yes", "-y", "--check", "-c", "--force", "-f"],
+    )
+    .reject(&args[2..]);
+    let check_only = args[2..].iter().any(|a| a == "--check" || a == "-c");
+    let force = args[2..].iter().any(|a| a == "--force" || a == "-f");
+
+    cli::init();
     let current = env!("CARGO_PKG_VERSION");
-    cli::print_kv("current", current);
+    let arch_badge = platform_asset_name().unwrap_or(std::env::consts::ARCH);
+    cli::print_header(&format!("{DISPLAY_NAME} Update"), arch_badge);
+    println!();
 
-    // ── Binary path ──────────────────────────────────────────
+    // ── Binary path (canonicalized so symlinks stay intact) ──
 
     let exe = match std::env::current_exe() {
-        Ok(p) => p,
+        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
         Err(e) => {
-            println!("\n  {} Cannot determine binary path: {e}", cli::icon_fail());
+            cli::check_fail("binary path", &e.to_string(), "");
             std::process::exit(1);
         }
     };
 
-    // Clean up leftovers from a previous interrupted update.
-    cleanup_previous(&exe);
-
-    // One update at a time: two runs would race the shared extract
-    // workspace, the staging names and the .bak backups.
-    let _update_lock = match acquire_update_lock() {
-        Ok(f) => f,
-        Err(e) => {
-            println!("  {} {e}", cli::icon_fail());
-            std::process::exit(1);
-        }
-    };
+    cli::print_kv("installed", &cli::bold(current));
+    cli::print_kv("location", &cli::dim(&exe.display().to_string()));
 
     // ── Fetcher ──────────────────────────────────────────────
 
     let fetcher = match Fetcher::new(BrowserProfile::host_default()) {
         Ok(f) => f,
         Err(e) => {
-            println!("\n  {} Fetcher init failed: {e}", cli::icon_fail());
+            println!();
+            cli::check_fail("fetcher init", &e.to_string(), "");
             std::process::exit(1);
         }
     };
 
     // ── Latest version (atom feed : no API, no rate limits) ──
 
-    let spinner = cli::Spinner::new("checking for updates...");
+    let spinner = cli::Spinner::new("Checking GitHub release feed\u{2026}");
     let checked = match fetch_feed(&fetcher).await {
         Ok(body) => check_feed(&body, current),
         Err(e) => Err(e),
@@ -83,47 +125,111 @@ pub async fn run(args: &[String]) {
         Ok(v) => v,
         Err(e) => {
             spinner.stop();
-            println!("  {} Could not check for updates: {e}", cli::icon_fail());
-            println!("    Check your network connection and try again.");
+            println!();
+            cli::check_fail(
+                "release feed",
+                &e,
+                "Check your network connection or proxy configuration (`donsetch doctor`).",
+            );
             std::process::exit(1);
         }
     };
     spinner.stop();
-    cli::print_kv("latest", &latest);
-    println!();
-
-    // ── Version comparison ───────────────────────────────────
 
     match offer {
-        Offer::UpToDate => {
-            println!("  Already up to date.");
-            return;
-        }
-        Offer::Ahead => {
-            println!(
-                "  {} You are ahead of the latest release ({current} > {latest}).",
-                cli::icon_warn(),
+        Offer::UpToDate if !force => {
+            cli::print_kv(
+                "latest",
+                &format!("{} {}", cli::green(&latest), cli::dim("(up to date)")),
             );
-            println!("  No update needed.");
+            println!();
+            cli::check_pass("up to date", &format!("running latest release v{current}"));
+            println!();
+            cli::print_footer();
+            cli::print_nav(&[
+                ("donsetch update --force", "reinstall current"),
+                ("donsetch status", "system overview"),
+            ]);
             return;
         }
-        Offer::Prerelease => {
-            println!(
-                "  {} Latest published is a prerelease ({latest}); staying on {current}.",
-                cli::icon_warn()
+        Offer::Ahead if !force => {
+            cli::print_kv("latest", &latest);
+            println!();
+            cli::check_warn(
+                "ahead of release",
+                &format!("installed {current} is newer than published {latest}"),
             );
-            println!("    Install a prerelease explicitly if you want one.");
+            println!();
+            cli::print_footer();
             return;
         }
-        Offer::Newer => {}
+        Offer::Prerelease if !force => {
+            cli::print_kv("latest", &format!("{latest} (prerelease)"));
+            println!();
+            cli::check_warn(
+                "prerelease skipped",
+                &format!("staying on stable {current}; pass --force only to reinstall"),
+            );
+            println!();
+            cli::print_footer();
+            return;
+        }
+        _ => {}
     }
 
+    let target_version = match offer {
+        Offer::Prerelease if force => current.to_string(),
+        _ => latest.clone(),
+    };
+
+    if target_version == current {
+        cli::print_kv(
+            "target",
+            &format!(
+                "{} {}",
+                cli::cyan(&target_version),
+                cli::dim("(force refresh)")
+            ),
+        );
+    } else {
+        cli::print_kv(
+            "available",
+            &format!(
+                "{} {} {}",
+                cli::dim(current),
+                cli::crimson("\u{2192}"),
+                cli::green(&target_version)
+            ),
+        );
+    }
+
+    if check_only {
+        println!();
+        cli::check_warn(
+            "update available",
+            &format!("v{current} -> v{target_version} (run `donsetch update` to install)"),
+        );
+        println!();
+        cli::print_footer();
+        return;
+    }
+
+    // Clean up leftovers from a previous interrupted update and take the lock
+    // now that we know we are modifying disk.
+    cleanup_previous(&exe);
+    let _update_lock = match acquire_update_lock() {
+        Ok(f) => f,
+        Err(e) => {
+            println!();
+            cli::check_fail("update lock", &e, "");
+            std::process::exit(1);
+        }
+    };
+
     // ── Major-version guard ──────────────────────────────────
-    // A major release is a different fetch engine, not a patch: the v5
-    // update retires v4's browser tier, its login vault and its tier
-    // model. Warn before the download touches the install, and never
-    // install one unattended without --yes.
-    if is_major_jump(current, &latest) && !confirm_major_update(current, &latest, args) {
+    if is_major_jump(current, &target_version)
+        && !confirm_major_update(current, &target_version, args)
+    {
         println!("  Update cancelled.");
         std::process::exit(1);
     }
@@ -133,54 +239,56 @@ pub async fn run(args: &[String]) {
     let asset = match platform_asset_name() {
         Some(a) => a,
         None => {
-            println!(
-                "  {} Unsupported platform: {} {}",
-                cli::icon_fail(),
-                std::env::consts::OS,
-                std::env::consts::ARCH,
+            println!();
+            cli::check_fail(
+                "platform",
+                &format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+                "Build from source: cargo install --path .",
             );
             std::process::exit(1);
         }
     };
 
-    let tag = format!("v{latest}");
+    let tag = format!("v{target_version}");
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
     let tarball_url = format!("{base}/donsetch-{asset}.tar.gz");
     let sha256_url = format!("{base}/donsetch-{asset}.tar.gz.sha256");
-
     let asset_label = format!("donsetch-{asset}.tar.gz");
-    cli::print_kv("asset", &asset_label);
-    println!();
 
-    // ── Checksum first: a few bytes, and a release without one is refused
-    //    before the big download starts ─────────────────────────────────────
+    cli::print_kv("package", &asset_label);
+    cli::print_section("Pipeline");
 
+    // ── 1. Checksum manifest first ───────────────────────────
+
+    let sha_spin = cli::Spinner::new("Fetching SHA-256 manifest\u{2026}");
     let sha256_text = match fetcher.fetch(&sha256_url).await {
         Ok(out) if out.status == 200 => String::from_utf8_lossy(&out.body).to_string(),
         Ok(out) => {
-            println!(
-                "  {} Could not download SHA256: HTTP {}",
-                cli::icon_fail(),
-                out.status,
-            );
+            sha_spin.stop();
+            cli::check_fail("checksum manifest", &format!("HTTP {}", out.status), "");
             std::process::exit(1);
         }
         Err(e) => {
-            println!("  {} Could not download SHA256: {e}", cli::icon_fail());
+            sha_spin.stop();
+            cli::check_fail("checksum manifest", &e.to_string(), "");
             std::process::exit(1);
         }
     };
+    sha_spin.stop();
     let expected = sha256_text
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_string();
+    let short_expected = if expected.len() >= 16 {
+        format!("{}…{}", &expected[..8], &expected[expected.len() - 8..])
+    } else {
+        expected.clone()
+    };
+    cli::check_pass("checksum manifest", &format!("sha256 · {short_expected}"));
 
-    // ── Download tarball ─────────────────────────────────────
-    // Rate-watched and resumable (src/cli/download.rs): a route that crawls is
-    // abandoned for the next one, which continues from the same byte.
+    // ── 2. Download tarball (8-lane parallel ConduitBar) ─────
 
-    println!("  downloading {asset_label}");
     let sources = vec![
         download::Source::Url {
             label: "GitHub release".into(),
@@ -194,120 +302,172 @@ pub async fn run(args: &[String]) {
     ];
     let routes = download::configured_routes();
     let switched = std::cell::Cell::new(false);
-    let note = |n: &str| {
-        switched.set(true);
-        println!("  {} {n}", cli::icon_warn());
-    };
+    let bar = std::cell::RefCell::new(cli::ConduitBar::new(&format!(
+        "downloading {asset_label}\u{2026}"
+    )));
     let mut tarball = match download::download(
         &sources,
         &routes,
         &download::Policy::standard(),
-        |_| {},
-        note,
+        |p| bar.borrow_mut().update(&p),
+        |n| {
+            switched.set(true);
+            bar.borrow_mut().warn(n);
+        },
     )
     .await
     {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("  {} Download failed: {e}", cli::icon_fail());
-            if e.contains("HTTP 404") {
-                println!(
-                    "    No prebuilt binary for {} {}.",
+            bar.borrow_mut().finish();
+            let hint = if e.contains("HTTP 404") {
+                format!(
+                    "No prebuilt binary for {} {}. Build from source: cargo install --path .",
                     std::env::consts::OS,
-                    std::env::consts::ARCH,
-                );
-                println!("    Build from source: cargo install --path .");
-            }
+                    std::env::consts::ARCH
+                )
+            } else {
+                String::new()
+            };
+            cli::check_fail("download", &e, &hint);
             std::process::exit(1);
         }
     };
-    // Bytes spliced from two routes that disagree with the checksum are not
-    // trusted: one more try, from the first route only and without a rate floor.
+    let mut dl_elapsed = bar.borrow_mut().finish();
+
+    // Bytes spliced from two routes that disagree with the checksum are retried
+    // in one uninterrupted pass from the primary source.
     if switched.get() && !expected.is_empty() && sha256_hex(&tarball) != expected {
-        println!(
-            "  {} checksum differs after switching routes; downloading again in one piece",
-            cli::icon_warn()
+        cli::check_warn(
+            "route splice mismatch",
+            "re-downloading in a single pass from primary source",
         );
         let patient = download::Policy {
             min_per_window: 0,
             ..download::Policy::standard()
         };
-        tarball =
-            match download::download(&sources[..1], &routes[..1], &patient, |_| {}, |_| {}).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    println!("  {} Download failed: {e}", cli::icon_fail());
-                    std::process::exit(1);
-                }
-            };
-    }
-    let mb = tarball.len() / 1_000_000;
-    let kb = tarball.len() / 1_000;
-    if mb > 0 {
-        println!("  {} downloaded ({mb}MB)", cli::icon_pass());
-    } else {
-        println!("  {} downloaded ({kb}KB)", cli::icon_pass());
+        let retry_bar = std::cell::RefCell::new(cli::ConduitBar::new(&format!(
+            "re-downloading {asset_label}\u{2026}"
+        )));
+        tarball = match download::download(
+            &sources[..1],
+            &routes[..1],
+            &patient,
+            |p| retry_bar.borrow_mut().update(&p),
+            |n| retry_bar.borrow_mut().warn(n),
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                retry_bar.borrow_mut().finish();
+                cli::check_fail("download", &e, "");
+                std::process::exit(1);
+            }
+        };
+        dl_elapsed = retry_bar.borrow_mut().finish();
     }
 
-    // ── Verify SHA256 ────────────────────────────────────────
+    let dl_secs = dl_elapsed.as_secs_f64().max(0.001);
+    let rate_str = cli::format_bytes((tarball.len() as f64 / dl_secs) as u64);
+    cli::check_pass(
+        "downloaded",
+        &format!(
+            "{} in {:.1}s ({rate_str}/s)",
+            cli::format_bytes(tarball.len() as u64),
+            dl_secs
+        ),
+    );
+
+    // ── 3. Verify SHA-256 ────────────────────────────────────
 
     let actual = sha256_hex(&tarball);
-
     if expected.is_empty() || expected != actual {
-        println!("  {} SHA256 mismatch", cli::icon_fail());
-        if !expected.is_empty() {
-            println!("    expected: {expected}");
-            println!("    actual:   {actual}");
-        }
+        let detail = if expected.is_empty() {
+            "empty published digest".to_string()
+        } else {
+            format!("expected {expected}, got {actual}")
+        };
+        cli::check_fail("integrity check", "SHA-256 mismatch", &detail);
         std::process::exit(1);
     }
-    println!("  {} SHA256 verified", cli::icon_pass());
+    cli::check_pass("integrity verified", "SHA-256 digest matches release");
 
-    // ── Extract ──────────────────────────────────────────────
+    // ── 4. Extract archive ───────────────────────────────────
 
     let temp_dir = paths::cache_dir().join("update-tmp");
     if let Err(e) = prepare_temp_dir(&temp_dir) {
-        println!("  {} {}", cli::icon_fail(), e);
-        println!("    Check that the cache directory is writable.");
+        cli::check_fail(
+            "workspace",
+            &e,
+            "Check that the DonSeTch cache directory is writable.",
+        );
         std::process::exit(1);
     }
 
+    let ex_spin = cli::Spinner::new("Extracting runtime payload\u{2026}");
     let files = match extract_tarball(&tarball, &temp_dir) {
         Ok(f) => f,
         Err(e) => {
-            println!("  {} Extraction failed: {e}", cli::icon_fail());
+            ex_spin.stop();
+            cli::check_fail("extract", &e, "");
             let _ = std::fs::remove_dir_all(&temp_dir);
             std::process::exit(1);
         }
     };
-    for f in &files {
-        println!("  {} extracted {f}", cli::icon_pass());
-    }
+    ex_spin.stop();
+    cli::check_pass(
+        "extracted",
+        &format!(
+            "{} ({} file{})",
+            files.join(", "),
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ),
+    );
 
-    // ── Replace binary ───────────────────────────────────────
+    // ── 5. Atomic binary + runtime replacement ───────────────
 
     match replace_binary(&exe, &temp_dir) {
-        Ok(()) => println!("  {} updated in place", cli::icon_pass()),
+        Ok(()) => {
+            sync_npm_version_stamp(&exe, &target_version);
+            clear_macos_quarantine(&exe);
+            cli::check_pass(
+                "installed in place",
+                "backup saved (`donsetch rollback` ready)",
+            );
+        }
         Err(e) => {
-            println!("  {} Binary replacement failed: {e}", cli::icon_fail());
-            if e.contains("Permission")
+            let hint = if e.contains("Permission")
                 || e.contains("denied")
                 || e.contains("access")
                 || e.contains("read-only")
             {
-                println!("    {}", permission_advice(&exe));
-            }
+                permission_advice(&exe)
+            } else {
+                String::new()
+            };
+            cli::check_fail("replace binary", &e, &hint);
             let _ = std::fs::remove_dir_all(&temp_dir);
             std::process::exit(1);
         }
     }
 
-    // ── Clean up ─────────────────────────────────────────────
+    // ── Clean up & summary ───────────────────────────────────
 
     let _ = std::fs::remove_dir_all(&temp_dir);
     println!();
     cli::print_footer();
-    println!("  Updated {current} -> {latest}");
+    println!(
+        "  {} Updated {current} -> {target_version}",
+        cli::icon_pass()
+    );
+    println!(
+        "  {}",
+        cli::dim(
+            "Restart any running `donsetch mcp` server so active agent sessions pick up the new binary."
+        )
+    );
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -598,13 +758,56 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<Vec<String>, String> {
     for entry in archive.entries().map_err(|e| format!("entries: {e}"))? {
         let mut entry = entry.map_err(|e| format!("entry: {e}"))?;
         let path = entry.path().unwrap_or_default().display().to_string();
-        entry
+        let unpacked = entry
             .unpack_in(dest)
             .map_err(|e| format!("unpack {path}: {e}"))?;
+        if !unpacked {
+            return Err(format!("refusing unsafe archive path: {path}"));
+        }
         files.push(path);
     }
 
     Ok(files)
+}
+
+/// Keep npm's `<binary>.version` stamp in step when `donsetch update` or
+/// `donsetch rollback` swaps a binary inside an npm-managed directory.
+pub(crate) fn sync_npm_version_stamp(exe: &Path, version: &str) {
+    if version.trim().is_empty() {
+        return;
+    }
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let stamp = exe.with_file_name(format!("{name}.version"));
+    if !stamp.exists() {
+        return;
+    }
+    let tmp = exe.with_file_name(format!(".{name}.version.tmp"));
+    if std::fs::write(&tmp, format!("{version}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, &stamp);
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// Best-effort removal of `com.apple.quarantine` on macOS so Gatekeeper never
+/// terminates a freshly unpacked binary or `.dylib` with SIGKILL.
+pub(crate) fn clear_macos_quarantine(exe: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(dir) = exe.parent() {
+            let _ = std::process::Command::new("xattr")
+                .args(["-dr", "com.apple.quarantine"])
+                .arg(dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe;
+    }
 }
 
 /// Replace the running binary with the extracted one.
@@ -1616,6 +1819,24 @@ pub(crate) mod tests {
         assert!(note.contains("cannot be locked"), "{note}");
         assert!(note.contains(&cause.to_string()), "{note}");
         assert!(note.ends_with(';'), "{note}");
+    }
+
+    #[test]
+    fn sync_npm_version_stamp_updates_only_existing_stamps() {
+        let dir = scratch("npm-stamp-sync");
+        let exe = dir.join(bin_name());
+        std::fs::write(&exe, "bin").unwrap();
+        let stamp = dir.join(format!("{}.version", bin_name()));
+
+        // Standalone installs without a `.version` file do not sprout one.
+        sync_npm_version_stamp(&exe, "5.5.5");
+        assert!(!stamp.exists());
+
+        // npm-managed installs update their stamp atomically.
+        std::fs::write(&stamp, "5.5.4\n").unwrap();
+        sync_npm_version_stamp(&exe, "5.5.5");
+        assert_eq!(read(&stamp).trim(), "5.5.5");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

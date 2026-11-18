@@ -139,17 +139,33 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             .map(|u| u.cloned().collect())
             .unwrap_or_default();
         if urls.len() > 1 {
-            let code = run_bulk_fetch(&daemon, tool, &base_args, &urls, json_mode, quiet).await;
+            let spin = (!quiet && !json_mode).then(|| {
+                crate::cli::Spinner::new_tty_only(&format!("Fetching {} URLs\u{2026}", urls.len()))
+            });
+            let code =
+                run_bulk_fetch(&daemon, tool, &base_args, &urls, json_mode, quiet, spin).await;
             daemon.shutdown().await;
             return code;
         }
     }
 
-    // Single call.
+    // Single call with interactive TTY progress (silent on pipes, --json, or -q).
+    let spin = (!quiet && !json_mode).then(|| {
+        let label = tool_activity_label(cmd, &base_args);
+        crate::cli::Spinner::new_tty_only(&label)
+    });
     let params = json!({"name": tool.name, "arguments": base_args});
     let result = match server::call_tool(&daemon, &params).await {
-        Ok(v) => v,
+        Ok(v) => {
+            if let Some(s) = spin {
+                s.stop();
+            }
+            v
+        }
         Err((code, msg)) => {
+            if let Some(s) = spin {
+                s.stop();
+            }
             crate::diag!("[{cmd}] error (code {code}): {msg}");
             daemon.shutdown().await;
             return EXIT_PERMANENT;
@@ -209,6 +225,7 @@ async fn run_bulk_fetch(
     urls: &[String],
     json_mode: bool,
     quiet: bool,
+    spin: Option<crate::cli::Spinner>,
 ) -> u8 {
     let futures: Vec<_> = urls
         .iter()
@@ -224,6 +241,9 @@ async fn run_bulk_fetch(
         .collect();
 
     let results = futures_util::future::join_all(futures).await;
+    if let Some(s) = spin {
+        s.stop();
+    }
     if json_mode {
         let mut out = Vec::new();
         let mut worst = EXIT_OK;
@@ -355,10 +375,96 @@ fn render_result(result: &Value, json_mode: bool, quiet: bool, cmd: &str) -> u8 
     }
 
     if !quiet && !is_error {
-        crate::diag!("{}", stats_line(cmd, result, content.len()));
+        let plain = stats_line(cmd, result, content.len());
+        crate::diag!("{}", style_stats_err(&plain));
     }
 
     exit
+}
+
+fn short_host_or_text(raw: &str, max_chars: usize) -> String {
+    if let Ok(u) = url::Url::parse(raw)
+        && let Some(host) = u.host_str()
+    {
+        let path = u.path();
+        let combined = if path == "/" || path.is_empty() {
+            host.to_string()
+        } else {
+            format!("{host}{path}")
+        };
+        if combined.chars().count() <= max_chars {
+            return combined;
+        }
+        let head: String = combined.chars().take(max_chars.saturating_sub(1)).collect();
+        return format!("{head}\u{2026}");
+    }
+    if raw.chars().count() <= max_chars {
+        return raw.to_string();
+    }
+    let head: String = raw.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{head}\u{2026}")
+}
+
+fn tool_activity_label(cmd: &str, args: &Value) -> String {
+    match cmd {
+        "fetch" => {
+            let target = args
+                .get("url")
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.as_array().and_then(|a| a.first()).and_then(Value::as_str))
+                })
+                .unwrap_or("target");
+            format!("Fetching {}\u{2026}", short_host_or_text(target, 42))
+        }
+        "search" => {
+            let q = args.get("query").and_then(Value::as_str).unwrap_or("");
+            if q.is_empty() {
+                "Searching sources\u{2026}".to_string()
+            } else {
+                format!("Searching \"{}\"\u{2026}", short_host_or_text(q, 38))
+            }
+        }
+        "crawl" => {
+            let mode = args.get("mode").and_then(Value::as_str).unwrap_or("full");
+            let url = args.get("url").and_then(Value::as_str).unwrap_or("");
+            if url.is_empty() {
+                format!("Running crawl ({mode})\u{2026}")
+            } else {
+                format!("Crawling {} ({mode})\u{2026}", short_host_or_text(url, 36))
+            }
+        }
+        "screenshot" => {
+            let url = args.get("url").and_then(Value::as_str).unwrap_or("page");
+            format!(
+                "Capturing screenshot · {}\u{2026}",
+                short_host_or_text(url, 36)
+            )
+        }
+        _ => format!("Running {cmd}\u{2026}"),
+    }
+}
+
+fn style_stats_err(plain: &str) -> String {
+    if !crate::cli::colours_err() {
+        return plain.to_string();
+    }
+    if let Some((head, tail)) = plain.split_once(" \u{00B7} ") {
+        let styled_head = if head.ends_with("] ok") {
+            crate::cli::green_err(head)
+        } else if head.contains("thin:") {
+            crate::cli::yellow_err(head)
+        } else {
+            crate::cli::cyan_err(head)
+        };
+        format!(
+            "{styled_head} {} {}",
+            crate::cli::dim_err("\u{00B7}"),
+            crate::cli::dim_err(tail)
+        )
+    } else {
+        crate::cli::dim_err(plain)
+    }
 }
 
 /// Read a field from model state first, then from the client-only
@@ -644,53 +750,130 @@ fn machine_meta(result: &Value, sc: &Value) -> Value {
 
 /// Print top-level help (when no subcommand given or --help).
 pub fn print_top_help() {
-    println!("{DISPLAY_NAME} · web research for AI agents: fetch, search, crawl");
+    use crate::cli;
+    cli::init();
+    cli::print_header(
+        &format!("{DISPLAY_NAME} v{}", env!("CARGO_PKG_VERSION")),
+        "web tools for AI agents · search, fetch, crawl, screenshot",
+    );
     println!();
-    println!("USAGE: donsetch <command> [args]");
-    println!();
-    println!("AGENT TOOLS:");
-    for tool in spec::TOOLS {
-        println!("  {:10} {}", tool.cli_cmd, tool.summary);
+    println!(
+        "  {} {}",
+        cli::dim("Usage:"),
+        cli::bold("donsetch <command> [options]")
+    );
+
+    cli::print_section("Quick Start");
+    for (cmd_ex, note) in [
+        (
+            "donsetch search \"rust async\" --intent code",
+            "# ranked web sources",
+        ),
+        (
+            "donsetch fetch https://example.com --focus \"api\"",
+            "# focused passages",
+        ),
+        (
+            "donsetch crawl https://docs.python.org/3/ --topic io",
+            "# planned digest + handles",
+        ),
+    ] {
+        let padded = format!("{:<54}", cmd_ex);
+        println!("    {}  {}", cli::cyan(&padded), cli::dim(note));
     }
+
+    cli::print_section("Agent Tools");
+    for tool in spec::TOOLS {
+        let padded = format!("{:<14}", tool.cli_cmd);
+        println!("    {} {}", cli::cyan(&padded), tool.summary);
+    }
+
+    cli::print_section("Discovery & Diagnostics");
+    let disc: &[(&str, &str)] = &[
+        (
+            "status",
+            "Fast overview of version, keys, proxies, cache, and memory",
+        ),
+        (
+            "doctor",
+            "Full health suite with live probes (--deep) and repairs (--fix)",
+        ),
+        (
+            "tools",
+            "Print MCP tool schemas as JSON (same as tools/list)",
+        ),
+        (
+            "search --doctor",
+            "Verify search sources (--sources, --doctor, --explain <query>)",
+        ),
+    ];
+    for (name, summary) in disc {
+        let padded = format!("{:<16}", name);
+        println!("    {} {}", cli::cyan(&padded), summary);
+    }
+
+    cli::print_section("Configuration & Upkeep");
+    let mgmt: &[(&str, &str)] = &[
+        (
+            "mcp",
+            "Start MCP server on stdio (--supervised) or HTTP (--http)",
+        ),
+        (
+            "config",
+            "Inspect layered settings (config show [--markdown])",
+        ),
+        (
+            "proxy",
+            "Manage SOCKS5/HTTP proxy pool (add, list, check, fetch, crawl)",
+        ),
+        (
+            "keys",
+            "Manage optional BYOK search & unlocker keys and plugins",
+        ),
+        (
+            "rules",
+            "Trace local per-host policy rules offline (rules test <url>)",
+        ),
+        (
+            "adapters",
+            "Inspect built-in URL rewrite adapters and user plugins",
+        ),
+        (
+            "stop",
+            "Terminate orphaned browser processes and sweep stale locks",
+        ),
+        (
+            "update",
+            "Self-update over 8-lane parallel HTTP (-u, --check, --force)",
+        ),
+        (
+            "rollback",
+            "Atomically swap back to previous version (--check)",
+        ),
+        (
+            "version",
+            "Show build target, wire profile, and release status (-V)",
+        ),
+    ];
+    for (name, summary) in mgmt {
+        let padded = format!("{:<16}", name);
+        println!("    {} {}", cli::cyan(&padded), summary);
+    }
+
     println!();
-    println!("DISCOVERY:");
+    cli::print_footer();
     println!(
-        "  {:10} Print tool schemas as JSON (same as MCP tools/list)",
-        "tools"
+        "  {} {}  \u{00B7}  {}  \u{00B7}  {}",
+        cli::dim("Help:"),
+        cli::cyan("donsetch <command> --help"),
+        cli::cyan("donsetch help <command>"),
+        cli::cyan("donsetch -V")
     );
     println!(
-        "  {:10} Where every search source stands (--sources); run the canary battery (--doctor);\n  {:10} why each result ranks where it does (--explain <query>)",
-        "search", ""
-    );
-    println!();
-    println!("MANAGEMENT:");
-    println!("  {:10} Start MCP server (JSON-RPC on stdio)", "mcp");
-    println!("  {:10} Manage BYOK search provider keys", "keys");
-    println!("  {:10} Manage proxy configuration", "proxy");
-    println!(
-        "  {:10} Explain what the local rules do with a URL (rules test <url>)",
-        "rules"
-    );
-    println!("  {:10} Quick status overview", "status");
-    println!(
-        "  {:10} Show the adapter registry + user plugins",
-        "adapters"
-    );
-    println!(
-        "  {:10} Kill orphaned Chrome instances + clean stale locks",
-        "stop"
-    );
-    println!("  {:10} Health check with auto-fix", "doctor");
-    println!("  {:10} Self-update from GitHub Releases", "update");
-    println!("  {:10} Revert to previous version", "rollback");
-    println!("  {:10} Show version and build info", "version");
-    println!();
-    println!("Run `donsetch <command> --help` for parameters.");
-    println!("Run `donsetch help <command>` for detailed help on a command.");
-    println!("Run `donsetch -V` for the version block.");
-    println!();
-    println!(
-        "Exit codes: 0 success · 1 permanent error · 2 transient (retry) · 3 walled (try different source)"
+        "  {}",
+        cli::dim(
+            "Exit codes: 0 success · 1 permanent error · 2 transient (retry) · 3 walled (try different source)"
+        )
     );
 }
 

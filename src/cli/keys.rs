@@ -835,9 +835,9 @@ fn cmd_clear() {
 /// Usage text, shared by `donsetch keys --help`, `donsetch help keys`
 /// and the bare `donsetch keys`.
 pub fn help() {
-    println!(
-        "{}",
-        bold("donsetch keys : BYOK search provider management")
+    super::print_header(
+        &format!("{DISPLAY_NAME} Keys"),
+        "BYOK search & solver provider vault",
     );
     println!();
     println!("  {}", bold("Commands:"));
@@ -925,4 +925,9 @@ pub fn help() {
         dim("donsetch keys add plugin myprovider --cmd 'python3 ~/adapter.py' --test")
     );
     println!("    Any language works: shell, python, a compiled binary.");
+    println!();
+    super::print_nav(&[
+        ("donsetch keys list", "inspect provider vault"),
+        ("donsetch status", "active routing summary"),
+    ]);
 }

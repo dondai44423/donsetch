@@ -2,6 +2,29 @@
 //! stale lock files and crash-leftover profiles. Use after a crash or
 //! when browser processes from a previous session are still resident.
 
+pub fn help() {
+    crate::cli::init();
+    crate::cli::print_header(
+        &format!("{} Stop", crate::DISPLAY_NAME),
+        "browser cleanup & lock sweep",
+    );
+    println!();
+    println!(
+        "  {} {}",
+        crate::cli::dim("Usage:"),
+        crate::cli::bold("donsetch stop")
+    );
+    println!();
+    println!(
+        "  {}",
+        crate::cli::dim(
+            "Terminates orphaned screenshot browser instances and sweeps stale profile locks\n  and dead-PID temporary directories. Safe to run at any time."
+        )
+    );
+    println!();
+    crate::cli::print_nav(&[("donsetch status", "check runtime")]);
+}
+
 pub fn run(args: &[String]) {
     crate::cli::args::Spec::new("stop", "donsetch stop", &[]).reject(&args[2..]);
 

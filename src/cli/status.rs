@@ -22,28 +22,64 @@ use serde_json::json;
 
 /// Usage text, shared by `donsetch status --help` and `donsetch help status`.
 pub fn help() {
-    println!("Usage: donsetch status [--json]");
+    cli::init();
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Status"),
+        "fast runtime & configuration overview",
+    );
     println!();
-    println!("  Shows a quick overview: version, search config, proxies, cache, health.");
-    println!("  No probes, no browser launch : fast.");
-    println!("  For full diagnostics, run `donsetch doctor`.");
+    println!(
+        "  {} {}",
+        cli::dim("Usage:"),
+        cli::bold("donsetch status [--json]")
+    );
     println!();
-    println!("  --json   The same data as one JSON object on stdout, for scripts");
-    println!("           and agents (the human view renders the same fields).");
+    println!("  Options");
+    cli::print_opt(
+        "--json",
+        "Emit one structured JSON object on stdout for scripts and agents",
+    );
+    println!();
+    println!(
+        "  {}",
+        cli::dim(
+            "Reports version, search routing, MCP posture, proxy pool, cache footprint,\n  screenshot browser readiness, and local route-memory telemetry without launching a browser."
+        )
+    );
+    println!();
+    cli::print_nav(&[
+        ("donsetch doctor", "full health checks"),
+        ("donsetch config show", "layered config"),
+    ]);
 }
 
 pub async fn run(args: &[String]) {
     cli::args::Spec::new("status", "donsetch status [--json]", &["--json"]).reject(&args[2..]);
     let as_json = args[2..].iter().any(|a| a == "--json");
-    cli::init();
+    if !as_json {
+        cli::init();
+    }
     let current = env!("CARGO_PKG_VERSION");
 
-    // ── Version + update ────────────────────────────────────
+    // ── Version + update (bounded timeout so blackhole networks stay fast) ──
 
-    let fetcher = Fetcher::new(BrowserProfile::host_default());
-    let feed = match &fetcher {
-        Ok(f) => update::fetch_feed(f).await.ok(),
-        Err(_) => None,
+    let spin = (!as_json).then(|| cli::Spinner::new_tty_only("Gathering status\u{2026}"));
+    let skip_update_check =
+        std::env::var_os("DONSETCH_NO_UPDATE_CHECK").is_some() || std::env::var_os("CI").is_some();
+    let feed = if skip_update_check {
+        None
+    } else {
+        let fetcher = Fetcher::new(BrowserProfile::host_default());
+        match &fetcher {
+            Ok(f) => tokio::time::timeout(
+                std::time::Duration::from_millis(1_800),
+                update::fetch_feed(f),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok),
+            Err(_) => None,
+        }
     };
 
     // "update state" is the machine value; the human line renders it.
@@ -245,6 +281,10 @@ pub async fn run(args: &[String]) {
         )
     };
 
+    if let Some(s) = spin {
+        s.stop();
+    }
+
     if as_json {
         let doc = json!({
             "status": {
@@ -291,29 +331,34 @@ pub async fn run(args: &[String]) {
         return;
     }
 
-    cli::print_title(&format!("{DISPLAY_NAME} {current} : Status"));
-    println!();
+    cli::print_header(&format!("{DISPLAY_NAME} Status"), &format!("v{current}"));
+
+    cli::print_section("Runtime");
     cli::print_kv("version", &version_human);
-    cli::print_kv("search", &search_human);
-    cli::print_kv("MCP output", &cli::mcp_output_summary());
-    cli::print_kv("proxies", &proxies_human);
-    cli::print_kv("cache", &cache_human);
-    cli::print_kv("browser", &browser_human);
     cli::print_kv("health", &health_human);
+    cli::print_kv("browser", &browser_human);
+    cli::print_kv("cache", &cache_human);
+
+    cli::print_section("Routing & Search");
+    cli::print_kv("search", &search_human);
+    cli::print_kv("proxies", &proxies_human);
+    cli::print_kv("MCP output", &cli::mcp_output_summary());
+
+    cli::print_section("Adaptive Memory");
     cli::print_kv("route memory", &route_line);
     cli::print_kv("improve", &improve_human);
     cli::print_kv(
         "deep fingerprint",
-        "not probed (run `donsetch doctor --deep`)",
+        &cli::dim("not probed (run `donsetch doctor --deep`)"),
     );
 
     println!();
-    println!(
-        "  {} Run {} for full diagnostics.",
-        cli::dim("tip:"),
-        cli::bold("donsetch doctor")
-    );
     cli::print_footer();
+    cli::print_nav(&[
+        ("donsetch doctor", "diagnostics"),
+        ("donsetch config show", "settings"),
+        ("donsetch update", "upgrade"),
+    ]);
 }
 
 // ── Helpers ──────────────────────────────────────────────────

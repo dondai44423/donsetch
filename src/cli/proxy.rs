@@ -252,9 +252,19 @@ async fn cmd_add(args: &[String]) {
         .collect();
 
     let probe_results = if check && !new_proxies.is_empty() {
-        let spinner = cli::Spinner::new(&format!("Probing {} proxies...", new_proxies.len()));
-        let results = probe_all(&new_proxies).await;
-        spinner.stop();
+        let total = new_proxies.len();
+        let spinner = std::sync::Arc::new(cli::Spinner::new(&format!(
+            "Probing [0/{total}] proxies\u{2026}"
+        )));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = probe_all_progress(&new_proxies, |id| {
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            spinner.set_message(&format!("Probing [{n}/{total}] · {id}"));
+        })
+        .await;
+        if let Ok(s) = std::sync::Arc::try_unwrap(spinner) {
+            s.stop();
+        }
         results
     } else {
         Vec::new()
@@ -455,9 +465,19 @@ async fn cmd_check() {
         return;
     }
 
-    let spinner = cli::Spinner::new(&format!("Probing {} proxies...", proxies.len()));
-    let results = probe_all(&proxies).await;
-    spinner.stop();
+    let total = proxies.len();
+    let spinner = std::sync::Arc::new(cli::Spinner::new(&format!(
+        "Probing [0/{total}] proxies\u{2026}"
+    )));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let results = probe_all_progress(&proxies, |id| {
+        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        spinner.set_message(&format!("Probing [{n}/{total}] · {id}"));
+    })
+    .await;
+    if let Ok(s) = std::sync::Arc::try_unwrap(spinner) {
+        s.stop();
+    }
 
     let mut alive = 0u32;
     let mut dead = 0u32;
@@ -502,6 +522,7 @@ async fn cmd_check() {
     }
 
     println!();
+    let bar = cli::meter_bar(alive.saturating_sub(slow), slow, dead, 20);
     let mut parts = Vec::new();
     if alive > 0 {
         parts.push(format!("{} alive", cli::green(&alive.to_string())));
@@ -513,7 +534,7 @@ async fn cmd_check() {
         parts.push(format!("{} slow", cli::yellow(&slow.to_string())));
     }
     parts.push(format!("{} total", proxies.len()));
-    println!("  {}", parts.join(", "));
+    println!("  {bar}  {}", parts.join(" \u{00B7} "));
     cli::print_footer();
 
     if dead > 0 {
@@ -819,10 +840,25 @@ async fn probe_proxy(px: &Proxy) -> ProbeResult {
     }
 }
 
-/// Probe all proxies in parallel.
-pub(crate) async fn probe_all(proxies: &[Proxy]) -> Vec<ProbeResult> {
-    let futures: Vec<_> = proxies.iter().map(probe_proxy).collect();
+/// Probe all proxies in parallel, notifying `on_each` as each finishes.
+async fn probe_all_progress<F: Fn(&str) + Sync>(proxies: &[Proxy], on_each: F) -> Vec<ProbeResult> {
+    let futures: Vec<_> = proxies
+        .iter()
+        .map(|p| {
+            let on_each = &on_each;
+            async move {
+                let res = probe_proxy(p).await;
+                on_each(&p.id());
+                res
+            }
+        })
+        .collect();
     futures_util::future::join_all(futures).await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn probe_all(proxies: &[Proxy]) -> Vec<ProbeResult> {
+    probe_all_progress(proxies, |_| {}).await
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -881,43 +917,85 @@ fn format_probe_detail(r: &ProbeResult) -> String {
 /// drift apart (the copy that used to sit in main.rs knew nothing of
 /// `proxy fetch|crawl on|off`).
 pub fn help() {
-    println!("Usage: donsetch proxy <subcommand> [args]");
-    println!();
-    println!("Subcommands:");
-    println!("  add <url> [url...] [--no-check]  Add proxies (validated, optionally probed)");
-    println!("  remove <id> [id...]              Remove by index (1, 2, ...) or host:port / URL");
-    println!("  list                             Show all configured proxies");
-    println!("  check                            Probe all proxies (connectivity + exit IP)");
-    println!("  clear                            Remove all proxies");
-    println!("  fetch on|off                     web_fetch rides pool lanes (opt-in; default off)");
-    println!(
-        "  crawl on|off                     crawl rides pool lanes (default on; off = home IP)"
+    cli::print_header(
+        &format!("{DISPLAY_NAME} Proxy"),
+        "SOCKS5 / HTTP CONNECT lane pool manager",
     );
-    println!("  test <url>                       Test a proxy without adding it");
-    println!("  import <file>                    Import from file (one URL per line)");
-    println!("  export [file]                    Export to file (default: stdout)");
     println!();
-    println!("Proxy URL format:");
-    println!("  socks5://user:pass@host:port     SOCKS5 with auth (remote DNS, no leak)");
-    println!("  socks5://host:port               SOCKS5 without auth");
-    println!("  http://user:pass@host:port       HTTP CONNECT with auth");
-    println!("  http://host:port                 HTTP CONNECT without auth");
-    println!("  user:pass@host:port              Bare = HTTP CONNECT (backward compat)");
-    println!("  host:port                        No auth, HTTP CONNECT");
+    println!(
+        "  {} {}",
+        cli::dim("Usage:"),
+        cli::bold("donsetch proxy <subcommand> [args]")
+    );
+
+    cli::print_section("Subcommands");
+    println!(
+        "    {}  Add proxies (validated, optionally probed)",
+        cli::cyan("add <url> [url...] [--no-check]")
+    );
+    println!(
+        "    {}              Remove by index (1, 2, ...) or host:port / URL",
+        cli::cyan("remove <id> [id...]")
+    );
+    println!(
+        "    {}                             Show all configured proxies",
+        cli::cyan("list")
+    );
+    println!(
+        "    {}                            Probe all proxies (connectivity + exit IP)",
+        cli::cyan("check")
+    );
+    println!(
+        "    {}                            Remove all proxies",
+        cli::cyan("clear")
+    );
+    println!(
+        "    {}                     web_fetch rides pool lanes (opt-in; default off)",
+        cli::cyan("fetch on|off")
+    );
+    println!(
+        "    {}                     crawl rides pool lanes (default on; off = home IP)",
+        cli::cyan("crawl on|off")
+    );
+    println!(
+        "    {}                       Test a proxy without adding it",
+        cli::cyan("test <url>")
+    );
+    println!(
+        "    {}                    Import from file (one URL per line)",
+        cli::cyan("import <file>")
+    );
+    println!(
+        "    {}                    Export to file (default: stdout)",
+        cli::cyan("export [file]")
+    );
+
+    cli::print_section("Proxy URL Format");
+    println!("    socks5://user:pass@host:port     SOCKS5 with auth (remote DNS, no leak)");
+    println!("    socks5://host:port               SOCKS5 without auth");
+    println!("    http://user:pass@host:port       HTTP CONNECT with auth");
+    println!("    http://host:port                 HTTP CONNECT without auth");
+    println!("    user:pass@host:port              Bare = HTTP CONNECT (backward compat)");
+    println!("    host:port                        No auth, HTTP CONNECT");
+
+    cli::print_section("Examples");
+    println!("    donsetch proxy add socks5://user:pass@1.2.3.4:1080");
+    println!("    donsetch proxy list");
+    println!("    donsetch proxy remove 1          # remove first proxy from list");
+    println!("    donsetch proxy check");
+    println!("    donsetch proxy fetch on          # opt web_fetch into the pool");
+    println!("    donsetch proxy crawl off         # keep crawl on your IP");
     println!();
-    println!("Examples:");
-    println!("  donsetch proxy add socks5://user:pass@1.2.3.4:1080");
-    println!("  donsetch proxy list");
-    println!("  donsetch proxy remove 1          # remove first proxy from list");
-    println!("  donsetch proxy remove 1.2.3.4:1080");
-    println!("  donsetch proxy check");
-    println!("  donsetch proxy fetch on           # opt web_fetch into the pool");
-    println!("  donsetch proxy crawl off          # keep crawl on your IP");
-    println!();
-    println!("Config: cache_dir/proxies.txt (one URL per line, # comments)");
-    println!("Env:   DONSEEK_PROXIES (comma-separated, overrides config for same host:port)");
-    println!();
-    println!("Pool use: search and crawl ride the lanes; fetch opts in (`fetch on`);");
-    println!("          `crawl off` leaves crawl on your IP. Written to donsetch.toml.");
+    println!(
+        "  {}",
+        cli::dim(
+            "Config: cache_dir/proxies.txt  ·  Env: DONSEEK_PROXIES (comma-separated)\n  Pool use: search and crawl ride the lanes; fetch opts in (`fetch on`); `crawl off` stays on home IP."
+        )
+    );
     crate::cli::sponsor::print();
+    println!();
+    cli::print_nav(&[
+        ("donsetch proxy check", "probe latency & exit IPs"),
+        ("donsetch status", "active routing summary"),
+    ]);
 }

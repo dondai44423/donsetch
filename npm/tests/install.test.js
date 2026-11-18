@@ -259,3 +259,144 @@ test('re-installing over an existing directory entry in binaries replaces it cle
   assert.equal(readFileSync(join(pkg, 'binaries', 'lib', 'runtime.so'), 'utf8'), LIB_BODY);
   assert.ok(!existsSync(join(pkg, 'binaries', 'lib', 'stale.so')), 'stale directory contents replaced');
 });
+
+test('installs with an empty PATH (no external tar or gzip required) and rejects path traversal', async (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const { root, pkg } = scaffold('pure-js-tar');
+  const m = await mirror(root, pkg);
+  if (!m) return t.skip('unsupported test platform');
+  t.after(() => m.server.close());
+
+  // Wipe PATH completely: neither `tar` nor `gzip` is reachable.
+  const noToolsEnv = { ...m.env, PATH: '' };
+  const r = await h.spawnNode([join(pkg, 'install.js')], { env: noToolsEnv });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(readFileSync(join(pkg, 'binaries', 'donsetch'), 'utf8'), BIN_BODY);
+
+  // Negative test: archive entry with `..` traversal must be refused.
+  const { extractTarGz } = require(join(pkg, 'install.js'));
+  const zlib = require('zlib');
+  const header = Buffer.alloc(512, 0);
+  Buffer.from('../escaped.txt', 'utf8').copy(header, 0);
+  Buffer.from('0000644\0', 'ascii').copy(header, 100);
+  Buffer.from('00000000004\0', 'ascii').copy(header, 124);
+  header[156] = '0'.charCodeAt(0);
+  Buffer.from('ustar\0', 'ascii').copy(header, 257);
+  const body = Buffer.alloc(512, 0);
+  Buffer.from('evil', 'utf8').copy(body, 0);
+  const badTarGz = join(root, 'traversal.tar.gz');
+  writeFileSync(badTarGz, zlib.gzipSync(Buffer.concat([header, body, Buffer.alloc(1024, 0)])));
+  assert.throws(
+    () => extractTarGz(badTarGz, join(root, 'extract-safe')),
+    /unsafe path traversal/
+  );
+  assert.ok(!existsSync(join(root, 'escaped.txt')), 'traversal file must never be written');
+});
+
+test('resumes an interrupted download from the partial byte offset via HTTP Range', async (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const { root, pkg } = scaffold('range-resume');
+  const asset = h.assetName();
+  if (!asset) return t.skip('unsupported test platform');
+  const tls = h.makeTlsFixture(root);
+  const tarball = h.makeTarball(root, { donsetch: BIN_BODY, 'libonnxruntime.so': LIB_BODY.repeat(500) });
+  const fullBytes = readFileSync(tarball);
+  const sha = h.sha256File(tarball);
+  const cut = Math.floor(fullBytes.length / 2);
+  let assetCalls = 0;
+  let sawRange = null;
+
+  const https = require('https');
+  const server = https.createServer(
+    { key: readFileSync(tls.keyPath), cert: readFileSync(tls.certPath) },
+    (req, res) => {
+      if (req.url === `/${TAG}/${asset}.sha256`) {
+        res.writeHead(200);
+        res.end(`${sha}\n`);
+        return;
+      }
+      if (req.url === `/${TAG}/${asset}`) {
+        assetCalls += 1;
+        if (assetCalls === 1) {
+          res.writeHead(200, { 'Content-Length': String(fullBytes.length), 'Accept-Ranges': 'bytes' });
+          res.write(fullBytes.subarray(0, cut), () => {
+            setTimeout(() => res.destroy(), 20);
+          });
+          return;
+        }
+        sawRange = req.headers.range || null;
+        const start = Number(/^bytes=(\d+)-$/.exec(sawRange || '')?.[1] || 0);
+        const rest = fullBytes.subarray(start);
+        res.writeHead(206, {
+          'Content-Length': String(rest.length),
+          'Content-Range': `bytes ${start}-${fullBytes.length - 1}/${fullBytes.length}`,
+        });
+        res.end(rest);
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    }
+  );
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+
+  const env = h.cleanEnv({
+    path: [],
+    home: join(root, 'home'),
+    extra: {
+      DONSETCH_RELEASES_BASE: `https://127.0.0.1:${server.address().port}`,
+      DONSETCH_INSTALL_TAG: TAG,
+      NODE_EXTRA_CA_CERTS: tls.certPath,
+    },
+  });
+  const r = await h.spawnNode([join(pkg, 'install.js')], { env });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(sawRange, `bytes=${cut}-`, 'second attempt must resume from partial byte offset');
+  assert.equal(readFileSync(join(pkg, 'binaries', 'donsetch'), 'utf8'), BIN_BODY);
+});
+
+test('interactive TTY stream renders kinetic progress and restores cursor visibility', async (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const { root, pkg } = scaffold('tty-ui');
+  const m = await mirror(root, pkg);
+  if (!m) return t.skip('unsupported test platform');
+  t.after(() => m.server.close());
+
+  const { install } = require(join(pkg, 'install.js'));
+  let ttyOut = '';
+  const fakeTty = {
+    isTTY: true,
+    columns: 96,
+    write(chunk) {
+      ttyOut += String(chunk);
+      return true;
+    },
+  };
+  process.env.DONSETCH_INSTALL_TAG = TAG;
+  t.after(() => { delete process.env.DONSETCH_INSTALL_TAG; });
+
+  // Use NODE_EXTRA_CA_CERTS in child so TLS trusts local mirror while exercising stream.isTTY.
+  const driver = join(root, 'tty-driver.js');
+  writeFileSync(
+    driver,
+    `const { install } = require(${JSON.stringify(join(pkg, 'install.js'))});
+let out = '';
+const stream = { isTTY: true, columns: 96, write(c) { out += String(c); return true; } };
+install({ binDir: ${JSON.stringify(join(pkg, 'binaries'))}, stream }).then(() => {
+  process.stdout.write(JSON.stringify({ hasBanner: out.includes('Bootstrap'), hasDone: out.includes('Installed'), cursorRestored: out.includes('\\x1b[?25h') }));
+});
+`
+  );
+  const r = await h.spawnNode([driver], { env: m.env });
+  assert.equal(r.code, 0, r.stderr);
+  const parsed = JSON.parse(r.stdout);
+  assert.equal(parsed.hasBanner, true);
+  assert.equal(parsed.hasDone, true);
+  assert.equal(parsed.cursorRestored, true);
+  void fakeTty;
+  void ttyOut;
+});
