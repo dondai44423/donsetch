@@ -4,36 +4,38 @@ Recorded results, their conditions, and what they establish. [Back to the README
 
 ## Defended-site fetch corpus
 
-Recorded 15 November 2026 from a home IP. The corpus has 28 defended targets.
+Recorded 18 November 2026 from a home IP on the 5.5.6 build. The corpus has 28 defended targets.
 
-| Protocol | Content | Median | p95 |
-|---|---:|---:|---:|
-| Cold process · up to 3 attempts · 2 rounds | 49/56 | 1.18 s | 2.87 s |
-| Paired curl · same cold measurement window | 21/56 | — | — |
-| Learned state · no page cache · 3 s deadline · 3 rounds | 69/84 | 0.98 s | 3.03 s |
+| Protocol | Content | Standing | Median | p95 |
+|---|---:|---:|---:|---:|
+| Cold process · up to 3 attempts (`--discover`) · 2 rounds | 46/56 | 23/28 | 1.16 s | 3.01 s |
+| Paired curl · same cold measurement window | 20/56 | — | — | — |
+| Learned state · no page cache · 3 s deadline · 3 rounds | 71/84 | 24/28 | 0.76 s | 2.69 s |
+
+Standing counts each target once, by its last round; the content column counts every round. A first-round discovery miss that later rounds solved is not a wall.
 
 The cold and learned rows use different protocols. Their medians are not a controlled measure of learning's speedup. The learned run has no paired curl measurement.
 
-Both runs used the identity/interface/challenge routes; no row used `transport: program` or `replay`. These numbers do not establish the content lane's success rate.
+The runs used the identity/interface/challenge routes. The content lane ran on the app-shell rows (TikTok, Instagram) and returned no content there; these numbers are not a claim about the content lane's success rate.
 
 ### What failed
 
-| Cold run · 7 non-content outcomes | Count |
+| Cold run · 10 non-content outcomes | Count |
 |---|---:|
 | Shell | 4 |
-| Human-interaction wall | 2 |
-| Network | 1 |
+| Human-interaction wall | 4 |
+| Program wall | 2 |
 
-The learned run's 15 non-content outcomes were six shells, five interaction walls, two incomplete documents, one program wall, and one network failure. TikTok and Instagram supplied the six shells. AliExpress and WSJ were incomplete. Product Hunt supplied the program/network failures.
+The learned run's 13 non-content outcomes were six shells, four identity refusals, and three interaction walls. TikTok and Instagram supplied the six shells, Indeed three refusals and LinkedIn one, WSJ the three interaction walls. Standing (last round per target): TikTok and Instagram shells, Indeed identity, WSJ interaction — 24/28 content.
 
 These outcomes stay in the denominator. A wall or shell is not scored as content.
 
 ### Evidence
 
-[Aggregate receipts](benchmarks/fetch-2026-11-15.json) retain the original summary values and SHA256 hashes of the local source artifacts:
+[Aggregate receipts](benchmarks/fetch-2026-11-18.json) retain the original summary values and SHA256 hashes of the local source artifacts:
 
-- `m6-hard-cold.json`
-- `m6-hard-learned.json`
+- `m7-hard-cold.json`
+- `m7-hard-learned.json`
 
 The full run files and private corpus are not distributed with the repository. The receipts are summaries of those saved measurements, not a new run or a public reproduction package. Egress, site changes, prior state, timeouts, and corpus composition all affect results.
 

@@ -867,9 +867,24 @@ fn summarize(reports: &[TargetReport], curl_rows: &[serde_json::Value]) -> serde
         }
     }
     ratios.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    // Standing is per target, not per row: a round that missed and a round that
+    // passed is one target whose steady state is what its last round measured.
+    // Rows stay the raw record; this block is what a release claim quotes.
+    let mut standing = serde_json::Map::new();
+    for report in reports {
+        standing.insert(report.id.clone(), serde_json::json!(report.class));
+    }
+    let standing_targets = standing.len();
+    let standing_content = standing
+        .values()
+        .filter(|class| class.as_str() == Some("content"))
+        .count();
     serde_json::json!({
         "fetches": reports.len(),
         "content": ok,
+        "standing": standing,
+        "standing_content": standing_content,
+        "standing_targets": standing_targets,
         "classes": by_class,
         "content_rate": if reports.is_empty() { 0.0 } else { ok as f64 / reports.len() as f64 },
         "ms_p50": percentile(0.5),
@@ -892,6 +907,11 @@ fn print_summary(summary: &serde_json::Value) {
         summary["ms_p95"].as_f64().unwrap_or(0.0),
         summary["ms_max"].as_f64().unwrap_or(0.0),
         summary["classes"],
+    );
+    println!(
+        "standing content {}/{} (the last round of each target)",
+        summary["standing_content"].as_u64().unwrap_or(0),
+        summary["standing_targets"].as_u64().unwrap_or(0),
     );
     if summary["curl_fetches"].as_u64().unwrap_or(0) > 0 {
         println!(
