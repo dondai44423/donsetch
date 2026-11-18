@@ -786,6 +786,27 @@ async function submitSolve(nonce) { await fetch("/_pow/solve", {method: "POST"})
     fn managed_challenge_is_the_page_program() {
         let body = "<script>window._cf_chl_opt={cvId:'3'}</script>";
         assert_eq!(class_of(403, body, false), Class::WallProgram);
+        // The same payload on a 200 is still the challenge, not a page.
+        assert_eq!(class_of(200, body, false), Class::WallProgram);
+    }
+
+    #[test]
+    fn a_passive_cloudflare_beacon_on_a_served_page_is_not_a_wall() {
+        // Cloudflare injects its JS-detections loader into ordinary 200 pages.
+        let served = format!(
+            "<title>Bundlephobia</title><p>{}</p>\
+             <script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script>",
+            "A paragraph of real documentation text that a reader came for. ".repeat(6)
+        );
+        let served = served.as_str();
+        assert_eq!(class_of(200, served, false), Class::Incomplete);
+        // The loader plus the interstitial title is the challenge, at any status.
+        let challenge =
+            "<title>Just a moment...</title><p>Enable JavaScript and cookies to continue</p>\
+                         <script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script>";
+        assert_eq!(class_of(200, challenge, false), Class::WallProgram);
+        // A 403 carrying only the loader is the edge's refusal, not a served page.
+        assert_eq!(class_of(403, served, false), Class::WallProgram);
     }
 
     #[test]

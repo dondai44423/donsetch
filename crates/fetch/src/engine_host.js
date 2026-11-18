@@ -4407,6 +4407,11 @@
       toString() { return parts.href; },
       valueOf() { return parts.href; },
     };
+    // Chrome exposes the Location interface object on the window; app routers
+    // read it (`instanceof Location`, `Location.prototype`) even though it
+    // cannot be constructed. The document's own location is its one instance.
+    function Location() { throw new TypeError("Illegal constructor"); }
+    Object.setPrototypeOf(location, Location.prototype);
 
     // The tree parser is Rust (html5ever). The host materializes its tree format
     // (`[tag, attrs, ...children]`, text as a string, `#comment` inside templates) into live nodes.
@@ -5501,6 +5506,7 @@
 
     // window.location = "..." is a navigation, as in a browser.
     Object.defineProperty(win, "location", { configurable: true, get() { return location; }, set(value) { navigateTo(String(value)); } });
+    win.Location = Location;
     Object.defineProperty(doc, "defaultView", { configurable: true, get() { return win; } });
 
     win.XMLHttpRequest = class extends EventTargetShim {

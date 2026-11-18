@@ -592,6 +592,32 @@ fn a_challenge_that_never_ends_costs_one_wall_clock_and_is_then_left_alone() {
 }
 
 #[test]
+fn a_mint_under_a_short_deadline_stops_at_the_measured_floor_not_the_envelope() {
+    let server = hostile_origin("for (;;) {}");
+    let mut session = Worker::new(false);
+    let mut bounded = options();
+    // A generous engine ceiling, a short encounter: the 5 s floor wins over
+    // the 10 s envelope, so the row costs seconds instead of ten.
+    bounded.engine.wall = Duration::from_secs(10);
+    bounded.deadline = Duration::from_millis(2_500);
+    let started = Instant::now();
+    let outcome = session.fetch(&server.url("/"), &bounded);
+    let took = started.elapsed();
+    assert_eq!(outcome.class, Class::WallProgram);
+    assert!(
+        took < Duration::from_millis(6_000),
+        "a 2.5 s deadline produced {took:?}"
+    );
+    let note = outcome
+        .attempts
+        .iter()
+        .filter_map(|attempt| attempt.note.as_deref())
+        .find(|note| note.starts_with("engine:") && note.contains("wall-clock cap"))
+        .expect("the engine ran and was terminated at the encounter's remaining budget");
+    assert!(note.contains("wall-clock cap"), "{note}");
+}
+
+#[test]
 fn a_challenge_that_exhausts_memory_is_a_wall_not_a_crash() {
     let server = hostile_origin("var keep = []; for (;;) keep.push(new Array(100000).fill(1.5));");
     let mut session = Worker::new(false);

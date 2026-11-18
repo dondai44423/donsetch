@@ -103,7 +103,7 @@ One V8 isolate mode for challenge credentials, a second data-plane DOM mode for 
 
 | Resource | Mint limit | Content-lane limit | Enforcement |
 |---|---|---|---|
-| Wall clock | 10 s (`V5_ENGINE_WALL_MS`) | 5 s (`V5_CONTENT_WALL_MS`, clamped to deadline) | Watchdog `terminate_execution` |
+| Wall clock | 10 s (`V5_ENGINE_WALL_MS`), clamped to the encounter deadline with a 5 s measured-mint floor | 5 s (`V5_CONTENT_WALL_MS`, clamped to deadline) | Watchdog `terminate_execution` |
 | Memory | 256 MB JS heap · 128 MB typed arrays · 128 MB Wasm | Same | V8 heap callback, custom allocator, Wasm page cap + OS RSS backstop |
 | Execution | 96 ops | 256 ops (`V5_CONTENT_OPS`) | Rust op counter + wall-clock pump bound |
 | Network | `http(s)` public IPs, `<= 5` redirects, 1 MB req, 8 MB/resp, 32 MB total | Same guards, 16 MB/resp, 64 MB total | Enforced in Rust ops; `Deno` global deleted before page code |
@@ -136,7 +136,7 @@ One V8 isolate mode for challenge credentials, a second data-plane DOM mode for 
 
 ## Target notes, measured negatives & environment
 
-- **Current target standing:** AWS WAF (IMDb, Booking, Trustpilot), Akamai no-JS (Amazon), SiteGround, NCBI PubMed, Reddit, AliExpress/Instagram (`chrome*`), Cloudflare via `okhttp`/`chrome-win` (Glassdoor, Indeed, npm, Medium), and `HTTP 200` client-rendered SPAs (React/Next, Angular, Vue/Nuxt, Svelte, Vite, Mastodon, Ashby, Swagger, Registry/Docs SPAs) deliver content. DataDome captchas (Etsy, Yelp, WSJ), active `HTTP 403` Cloudflare challenge / Turnstile / reCAPTCHA gates (Product Hunt, OpenReview, Federal Register), PerimeterX press-and-hold (intermittent on Bloomberg), and TikTok's edge-gated shell API remain open/declared identity or interaction walls.
+- **Current target standing:** AWS WAF (IMDb, Booking, Trustpilot), Akamai no-JS (Amazon), SiteGround, NCBI PubMed, Reddit, AliExpress/Instagram (`chrome*`), Cloudflare via `okhttp`/`chrome-win` (Product Hunt, Glassdoor, Indeed, npm, Medium), and `HTTP 200` client-rendered SPAs (React/Next, Angular, Vue/Nuxt, Svelte, Vite, Mastodon, Ashby, Swagger, Registry/Docs SPAs) deliver content. DataDome captchas (Etsy, Yelp, WSJ), active `HTTP 403` Cloudflare challenge / Turnstile / reCAPTCHA gates (OpenReview, Federal Register), PerimeterX press-and-hold (intermittent on Bloomberg), and TikTok's edge-gated shell API remain open/declared identity or interaction walls.
 - **Do not rebuild:** static bundle endpoint scraping (defended stubs carry zero endpoints; modern SPA bundles assemble URLs at runtime — use V8 content-lane mining instead) and default origin warm-up/`--arrival` (0 class wins across 16 targets for +1 request).
 - **TLS, bodies & deps:** Mozilla roots + OS trust store + `SSL_CERT_FILE`/`SSL_CERT_DIR` + `[tls]` config (never altering ClientHello); streaming reads capped at 64 MiB preserving raw non-UTF-8 bytes; crates restricted to `wreq`/`wreq-util`, `btls`, V8, `tokio`, `futures-util`, `scraper`, `serde`, `url`, `getrandom`, `webpki-root-certs`, `rustls-native-certs`. For LLD linker notes, see [setup.md](../../docs/setup.md#build-from-source).
 

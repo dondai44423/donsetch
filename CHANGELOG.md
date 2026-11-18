@@ -14,7 +14,8 @@
   `<base href>` concurrently over multiplexed HTTP/2 (`WireHandle::call_async`, 256 content ops /
   64 MB ceiling) against expanded data-plane DOM surfaces (`<template>`, comment hydration anchors,
   SVG geometry, `DOMParser`, `NodeIterator`/`TreeWalker`, `customElements`, `CSSStyleSheet`,
-  `MessageChannel`, async `XMLHttpRequest`, and CSP-style Worker fallback). `synthesize.rs` fuses
+  `MessageChannel`, async `XMLHttpRequest`, the `Location` interface object, and CSP-style Worker
+  fallback). `synthesize.rs` fuses
   verified `2xx` OpenAPI, npm dependency-graph, GraphQL Relay, Entity JSON, and HTML-fragment wire
   responses when the live DOM is graphical or collapsed, and `mine.rs` extends zero-JS HTTP replay
   from collections to single-entity JSON and HTML documentation fragments with middle-segment and
@@ -26,6 +27,15 @@
 
 ### Fixed
 
+- **Challenge mint bounded by the encounter deadline.** A Cloudflare or AWS WAF interstitial reached
+  on the last allowed attempt ran V8 to the envelope's 10 s ceiling even when the fetch held a 3 s
+  budget, so a wall could cost 10.3 s (Product Hunt, Indeed). The mint now receives
+  `min(envelope wall, max(remaining encounter time, 5 s measured floor))` and is skipped with a
+  declared attempt below 500 ms: the floor covers the measured 1-3 s AWS WAF mint, the envelope
+  still caps a hostile program, and a walled fetch no longer spends ten seconds.
+- **Bench standing is per target, not per row.** `bench` reports a `standing` block (each target's
+  last round) beside the raw row counts, so a first-round discovery miss that later rounds solved is
+  no longer read as a permanent wall.
 - **Passive Cloudflare beacon script on HTTP 200 app shells.** `classify.rs` no longer misclassifies
   normal `200 OK` application shells carrying Cloudflare's passive `/cdn-cgi/challenge-platform/`
   script as active challenge walls when no interstitial marker or `cf-mitigated` header is present.

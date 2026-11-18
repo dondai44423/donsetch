@@ -2820,235 +2820,267 @@ impl Worker {
                     if gate.is_ok() && is_program_page(program_vendor, &engine_body) {
                         let cookie = self.state.cookie_header_for(url, engine_identity.name);
                         let mut failure_reason: Option<String> = None;
-                        match crate::engine::mint_within_via_policy(
-                            &options.engine,
-                            &engine_url,
-                            &engine_body,
-                            engine_identity,
-                            cookie.as_deref(),
-                            self.proxy.as_deref(),
-                            options.allow_private,
-                        ) {
-                            Ok(mint) => {
-                                // The challenge's own host: the asked one, or where a
-                                // redirect (a short link) took the document.
-                                let page_host = url::Url::parse(&engine_url)
-                                    .ok()
-                                    .and_then(|parsed| {
-                                        parsed.host_str().map(str::to_ascii_lowercase)
-                                    })
-                                    .unwrap_or_else(|| host.clone());
-                                // The retry must spend what the mint produced, even
-                                // when state is not persisted to disk.
-                                self.state.store_cookies(
-                                    &page_host,
-                                    engine_identity.name,
-                                    mint.cookies.clone(),
-                                );
-                                self.state.mint_recorded(
-                                    &host,
-                                    engine_identity.name,
-                                    program_vendor,
-                                    &mint.cookies,
-                                    crate::state::now_unix(),
-                                );
-
-                                let budget = options
-                                    .deadline
-                                    .max(Duration::from_millis(8000))
-                                    .saturating_sub(started.elapsed());
-                                // Follow the navigation the page itself chose (it may
-                                // be relative), but only on the challenge's own host:
-                                // never an off-site redirect.
-                                let retry_url: String = mint
-                                    .redirect
-                                    .as_deref()
-                                    .and_then(|next| {
-                                        url::Url::parse(next)
-                                            .or_else(|_| {
-                                                url::Url::parse(&engine_url)
-                                                    .and_then(|base| base.join(next))
-                                            })
-                                            .ok()
-                                    })
-                                    .filter(|parsed| {
-                                        parsed.host_str().map(str::to_ascii_lowercase).as_deref()
-                                            == Some(page_host.as_str())
-                                    })
-                                    .map(|parsed| parsed.to_string())
-                                    .unwrap_or_else(|| url.to_string());
-                                let retry_cookie = self
-                                    .state
-                                    .cookie_header_for(&retry_url, engine_identity.name);
-                                // The credential is spent through the fetcher's own
-                                // client, as the identity that minted it.
-                                let retry: Option<Result<crate::http::Response, String>> =
-                                    if budget.as_millis() >= 800 {
-                                        match self.wire(engine_identity) {
-                                            Ok(wire) => Some(wire.get(
-                                                &retry_url,
-                                                retry_cookie.as_deref(),
-                                                engine_identity,
-                                                budget,
-                                            )),
-                                            Err(_) => None,
-                                        }
-                                    } else {
-                                        None
-                                    };
-                                let solved_url = retry
-                                    .as_ref()
-                                    .and_then(|retry| retry.as_ref().ok())
-                                    .map(|retry| retry.url.clone());
-                                let retry = retry.map(|retry| {
-                                    retry.map(|retry| {
-                                        self.follow_page_navigation(
-                                            retry,
-                                            engine_identity,
-                                            &host,
-                                            options,
-                                            started,
-                                        )
-                                    })
-                                });
-                                if let Some(Ok(retry)) = retry {
-                                    if std::env::var("V5_ENGINE_LOG").is_ok() {
-                                        eprintln!(
-                                            "[engine] retry {} cookie={} -> {} ({}B)",
-                                            retry_url,
-                                            retry_cookie.is_some(),
-                                            retry.status,
-                                            retry.body.len()
-                                        );
-                                    }
-                                    // Inspection only: the answer the mint was spent on,
-                                    // beside the requests the page made.
-                                    if let Some(directory) = std::env::var_os("V5_ENGINE_DUMP_DIR")
-                                    {
-                                        let _ = std::fs::write(
-                                            std::path::Path::new(&directory)
-                                                .join(format!("spend-{}.html", retry.status)),
-                                            &retry.body,
-                                        );
-                                    }
-                                    let content = verify_response(
-                                        retry.status,
-                                        &retry.headers,
-                                        &retry.body,
-                                        &retry.url,
-                                        &contract,
-                                        generic,
+                        // The mint spends what the encounter has left, never more
+                        // (the same rule the content lane follows): the engine's
+                        // own ceiling is for a fetch that has the time, and an
+                        // encounter with no budget must not start one. An AWS WAF
+                        // mint is 1-3 s and the challenge's own program can stretch
+                        // it, so a budget below the floor would silently turn the
+                        // class into a wall. The floor is the measured cost with
+                        // headroom; the envelope still caps a hostile run.
+                        const MINT_FLOOR: Duration = Duration::from_millis(5_000);
+                        let remaining = options.deadline.saturating_sub(started.elapsed());
+                        let mut limits = options.engine.clone();
+                        limits.wall = limits.wall.min(remaining.max(MINT_FLOOR));
+                        if remaining < Duration::from_millis(500) {
+                            // The engine did not run: the status is the wall's own.
+                            attempts.push(Attempt {
+                                identity: engine_identity.name.to_string(),
+                                transport: "document".to_string(),
+                                class: Class::WallProgram,
+                                status: response.status,
+                                ms: 0.0,
+                                bytes: 0,
+                                version: String::new(),
+                                title: String::new(),
+                                note: Some("engine: the encounter had no budget left".to_string()),
+                            });
+                            failure_reason = Some("the encounter had no budget left".to_string());
+                        } else {
+                            match crate::engine::mint_within_via_policy(
+                                &limits,
+                                &engine_url,
+                                &engine_body,
+                                engine_identity,
+                                cookie.as_deref(),
+                                self.proxy.as_deref(),
+                                options.allow_private,
+                            ) {
+                                Ok(mint) => {
+                                    // The challenge's own host: the asked one, or where a
+                                    // redirect (a short link) took the document.
+                                    let page_host = url::Url::parse(&engine_url)
+                                        .ok()
+                                        .and_then(|parsed| {
+                                            parsed.host_str().map(str::to_ascii_lowercase)
+                                        })
+                                        .unwrap_or_else(|| host.clone());
+                                    // The retry must spend what the mint produced, even
+                                    // when state is not persisted to disk.
+                                    self.state.store_cookies(
+                                        &page_host,
+                                        engine_identity.name,
+                                        mint.cookies.clone(),
                                     );
-                                    let verdict2 = classify(Evidence {
-                                        status: retry.status,
-                                        body: &retry.body,
-                                        content_ok: content.passed,
-                                        headers: &retry.headers,
+                                    self.state.mint_recorded(
+                                        &host,
+                                        engine_identity.name,
+                                        program_vendor,
+                                        &mint.cookies,
+                                        crate::state::now_unix(),
+                                    );
+
+                                    let budget = options
+                                        .deadline
+                                        .max(Duration::from_millis(8000))
+                                        .saturating_sub(started.elapsed());
+                                    // Follow the navigation the page itself chose (it may
+                                    // be relative), but only on the challenge's own host:
+                                    // never an off-site redirect.
+                                    let retry_url: String = mint
+                                        .redirect
+                                        .as_deref()
+                                        .and_then(|next| {
+                                            url::Url::parse(next)
+                                                .or_else(|_| {
+                                                    url::Url::parse(&engine_url)
+                                                        .and_then(|base| base.join(next))
+                                                })
+                                                .ok()
+                                        })
+                                        .filter(|parsed| {
+                                            parsed
+                                                .host_str()
+                                                .map(str::to_ascii_lowercase)
+                                                .as_deref()
+                                                == Some(page_host.as_str())
+                                        })
+                                        .map(|parsed| parsed.to_string())
+                                        .unwrap_or_else(|| url.to_string());
+                                    let retry_cookie = self
+                                        .state
+                                        .cookie_header_for(&retry_url, engine_identity.name);
+                                    // The credential is spent through the fetcher's own
+                                    // client, as the identity that minted it.
+                                    let retry: Option<Result<crate::http::Response, String>> =
+                                        if budget.as_millis() >= 800 {
+                                            match self.wire(engine_identity) {
+                                                Ok(wire) => Some(wire.get(
+                                                    &retry_url,
+                                                    retry_cookie.as_deref(),
+                                                    engine_identity,
+                                                    budget,
+                                                )),
+                                                Err(_) => None,
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                    let solved_url = retry
+                                        .as_ref()
+                                        .and_then(|retry| retry.as_ref().ok())
+                                        .map(|retry| retry.url.clone());
+                                    let retry = retry.map(|retry| {
+                                        retry.map(|retry| {
+                                            self.follow_page_navigation(
+                                                retry,
+                                                engine_identity,
+                                                &host,
+                                                options,
+                                                started,
+                                            )
+                                        })
                                     });
+                                    if let Some(Ok(retry)) = retry {
+                                        if std::env::var("V5_ENGINE_LOG").is_ok() {
+                                            eprintln!(
+                                                "[engine] retry {} cookie={} -> {} ({}B)",
+                                                retry_url,
+                                                retry_cookie.is_some(),
+                                                retry.status,
+                                                retry.body.len()
+                                            );
+                                        }
+                                        // Inspection only: the answer the mint was spent on,
+                                        // beside the requests the page made.
+                                        if let Some(directory) =
+                                            std::env::var_os("V5_ENGINE_DUMP_DIR")
+                                        {
+                                            let _ = std::fs::write(
+                                                std::path::Path::new(&directory)
+                                                    .join(format!("spend-{}.html", retry.status)),
+                                                &retry.body,
+                                            );
+                                        }
+                                        let content = verify_response(
+                                            retry.status,
+                                            &retry.headers,
+                                            &retry.body,
+                                            &retry.url,
+                                            &contract,
+                                            generic,
+                                        );
+                                        let verdict2 = classify(Evidence {
+                                            status: retry.status,
+                                            body: &retry.body,
+                                            content_ok: content.passed,
+                                            headers: &retry.headers,
+                                        });
+                                        attempts.push(Attempt {
+                                            identity: engine_identity.name.to_string(),
+                                            transport: "document".to_string(),
+                                            class: verdict2.class,
+                                            status: retry.status,
+                                            ms: retry.elapsed_ms,
+                                            bytes: retry.body.len(),
+                                            version: retry.version.clone(),
+                                            title: content.title.clone(),
+                                            note: Some(format!(
+                                                "engine: {} cookies, {} surfaces, {} ms",
+                                                mint.cookies.len(),
+                                                mint.surfaces.len(),
+                                                mint.ms.round()
+                                            )),
+                                        });
+                                        if verdict2.class == Class::Content {
+                                            let now = crate::state::now_unix();
+                                            self.state.mint_succeeded(&host);
+                                            self.state.credential_verdict(
+                                                &host,
+                                                engine_identity.name,
+                                                true,
+                                                now,
+                                            );
+                                            // The answer to a spent challenge is
+                                            // itself state: the session it opens
+                                            // (cookies on the retry) is carried, so
+                                            // the next read of this origin is one
+                                            // request.
+                                            let spent: Vec<StoredCookie> =
+                                                retry.cookies.iter().map(stored).collect();
+                                            self.state.store_cookies(
+                                                &host,
+                                                engine_identity.name,
+                                                spent,
+                                            );
+                                            if self.persist {
+                                                self.state.record(
+                                                    &host,
+                                                    engine_identity.name,
+                                                    "content",
+                                                    true,
+                                                    retry.elapsed_ms,
+                                                );
+                                                self.save_state();
+                                            }
+                                            return Outcome {
+                                                // The document the challenge stood in
+                                                // front of, or where the page then
+                                                // navigated. A challenge hand-off is a
+                                                // handshake, not a redirect: its solved
+                                                // URL carries a single-use token and is
+                                                // not the page's identity.
+                                                final_url: if solved_url.as_deref()
+                                                    == Some(retry.url.as_str())
+                                                {
+                                                    engine_url.clone()
+                                                } else {
+                                                    retry.url.clone()
+                                                },
+                                                title: content.title,
+                                                text_chars: content.text_chars,
+                                                evidence: vec![format!(
+                                                    "engine: minted in {} ms",
+                                                    mint.ms.round()
+                                                )],
+                                                ..answer(
+                                                    url,
+                                                    host,
+                                                    &retry,
+                                                    Class::Content,
+                                                    engine_identity.name,
+                                                    Ended {
+                                                        started,
+                                                        first_ms,
+                                                        attempts,
+                                                        spent_state: true,
+                                                        capture: options.capture_body,
+                                                    },
+                                                )
+                                            };
+                                        }
+                                        failure_reason = Some(format!(
+                                            "origin answered {} to the minted credential",
+                                            retry.status
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    failure_reason = Some(error.to_string());
+                                    // The engine did not finish: the status is the
+                                    // wall's own, not a made-up zero.
                                     attempts.push(Attempt {
                                         identity: engine_identity.name.to_string(),
                                         transport: "document".to_string(),
-                                        class: verdict2.class,
-                                        status: retry.status,
-                                        ms: retry.elapsed_ms,
-                                        bytes: retry.body.len(),
-                                        version: retry.version.clone(),
-                                        title: content.title.clone(),
-                                        note: Some(format!(
-                                            "engine: {} cookies, {} surfaces, {} ms",
-                                            mint.cookies.len(),
-                                            mint.surfaces.len(),
-                                            mint.ms.round()
-                                        )),
+                                        class: Class::WallProgram,
+                                        status: response.status,
+                                        ms: 0.0,
+                                        bytes: 0,
+                                        version: String::new(),
+                                        title: String::new(),
+                                        note: Some(format!("engine: {error}")),
                                     });
-                                    if verdict2.class == Class::Content {
-                                        let now = crate::state::now_unix();
-                                        self.state.mint_succeeded(&host);
-                                        self.state.credential_verdict(
-                                            &host,
-                                            engine_identity.name,
-                                            true,
-                                            now,
-                                        );
-                                        // The answer to a spent challenge is
-                                        // itself state: the session it opens
-                                        // (cookies on the retry) is carried, so
-                                        // the next read of this origin is one
-                                        // request.
-                                        let spent: Vec<StoredCookie> =
-                                            retry.cookies.iter().map(stored).collect();
-                                        self.state.store_cookies(
-                                            &host,
-                                            engine_identity.name,
-                                            spent,
-                                        );
-                                        if self.persist {
-                                            self.state.record(
-                                                &host,
-                                                engine_identity.name,
-                                                "content",
-                                                true,
-                                                retry.elapsed_ms,
-                                            );
-                                            self.save_state();
-                                        }
-                                        return Outcome {
-                                            // The document the challenge stood in
-                                            // front of, or where the page then
-                                            // navigated. A challenge hand-off is a
-                                            // handshake, not a redirect: its solved
-                                            // URL carries a single-use token and is
-                                            // not the page's identity.
-                                            final_url: if solved_url.as_deref()
-                                                == Some(retry.url.as_str())
-                                            {
-                                                engine_url.clone()
-                                            } else {
-                                                retry.url.clone()
-                                            },
-                                            title: content.title,
-                                            text_chars: content.text_chars,
-                                            evidence: vec![format!(
-                                                "engine: minted in {} ms",
-                                                mint.ms.round()
-                                            )],
-                                            ..answer(
-                                                url,
-                                                host,
-                                                &retry,
-                                                Class::Content,
-                                                engine_identity.name,
-                                                Ended {
-                                                    started,
-                                                    first_ms,
-                                                    attempts,
-                                                    spent_state: true,
-                                                    capture: options.capture_body,
-                                                },
-                                            )
-                                        };
-                                    }
-                                    failure_reason = Some(format!(
-                                        "origin answered {} to the minted credential",
-                                        retry.status
-                                    ));
                                 }
-                            }
-                            Err(error) => {
-                                failure_reason = Some(error.to_string());
-                                // The engine did not finish: the status is the
-                                // wall's own, not a made-up zero.
-                                attempts.push(Attempt {
-                                    identity: engine_identity.name.to_string(),
-                                    transport: "document".to_string(),
-                                    class: Class::WallProgram,
-                                    status: response.status,
-                                    ms: 0.0,
-                                    bytes: 0,
-                                    version: String::new(),
-                                    title: String::new(),
-                                    note: Some(format!("engine: {error}")),
-                                });
                             }
                         }
                         // Reaching here means the mint did not end in content (the
