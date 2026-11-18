@@ -49,6 +49,14 @@ pub struct FetchOutcome {
     /// The fetch layer read this body against a content contract and found
     /// content, not a wall: later bot-wall markers in it are passive scripts.
     pub verified: bool,
+    /// What the fetch layer's contract made of the answer. The product's own
+    /// extractor can still find data the visible text does not carry (a shell
+    /// with server-rendered JSON), so the class travels beside `verified`.
+    pub class: donsetch_fetch::Class,
+    /// The contract failed because the origin served a gate (a JS-required
+    /// notice, a country chooser, a locale picker), not because the page was
+    /// merely short.
+    pub gate: bool,
 }
 
 /// Pre-navigation redirect policy (v4.6): consulted for every

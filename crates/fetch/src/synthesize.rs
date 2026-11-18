@@ -384,6 +384,39 @@ fn synthesize_openapi(json: &Value, source_url: &str) -> Option<(usize, String, 
     ))
 }
 
+/// Whether a JSON object carries a page: a named field, a nested structure, or
+/// enough prose. A flat map of metrics (a WAF quota reply) does not.
+fn page_like_object(map: &serde_json::Map<String, Value>) -> bool {
+    const PAGE_LIKE_KEYS: &[&str] = &[
+        "display_name",
+        "displayName",
+        "name",
+        "title",
+        "headline",
+        "description",
+        "summary",
+        "readme",
+        "content",
+        "body",
+        "markdown",
+        "text",
+        "author",
+        "byline",
+        "slug",
+    ];
+    let named = PAGE_LIKE_KEYS.iter().any(|key| {
+        map.get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    let structured = map
+        .values()
+        .any(|value| value.is_array() || value.is_object());
+    // Ids and counters inflate a byte count without being a page; only a named
+    // field or a nested structure makes an object page-like.
+    named || structured
+}
+
 pub fn synthesize_json_payload(
     json: &Value,
     request_url: &str,
@@ -394,6 +427,27 @@ pub fn synthesize_json_payload(
 
     // Case A: Array of domain items (e.g. Mastodon statuses, search hits, trends).
     if let Value::Array(items) = target {
+        // A short array of flat telemetry rows (WAF quota/config pairs) is not
+        // a document. A collection earns a page through its size or through a
+        // page-like field; a list of ids alone does not.
+        let named = items
+            .iter()
+            .filter_map(Value::as_object)
+            .any(|item| page_like_object(item));
+        let text_volume: usize = items
+            .iter()
+            .filter_map(Value::as_object)
+            .flat_map(|item| item.values())
+            .filter_map(Value::as_str)
+            .map(|value| value.trim().chars().count())
+            .sum();
+        let _ = text_volume;
+        // A collection is a page through its fields (title/name/description/
+        // content), never through its size: five WAF quota rows are still five
+        // rows of ids and counters.
+        if !named {
+            return None;
+        }
         return render_json_array(items, request_url, page_url);
     }
 
@@ -419,6 +473,30 @@ pub fn synthesize_json_payload(
                 return Some(built);
             }
         }
+    }
+
+    // A collection under a name this module does not know is still a page: a
+    // wrapper object with an array of records (Bsky's labeler services) renders
+    // like the named wrappers above. Only scalar-only configuration objects are
+    // refused below.
+    for (_key, value) in map {
+        if let Value::Array(items) = value {
+            if items.len() >= 3
+                && items.iter().all(Value::is_object)
+                && items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .any(page_like_object)
+            {
+                if let Some(built) = render_json_array(items, request_url, page_url) {
+                    return Some(built);
+                }
+            }
+        }
+    }
+
+    if !page_like_object(map) {
+        return None;
     }
 
     // Case B: Single rich entity object (Bundlephobia package stats, ArtifactHub package,
@@ -1000,6 +1078,36 @@ fn render_inline_markdown(text: &str, base: Option<&url::Url>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_telemetry_object_is_not_fused_as_the_page() {
+        let quota = serde_json::json!({
+            "user_id": "85bc5744-77f3-d04f-2ed3-54edabbc644f",
+            "quota_rate": 1,
+            "timestamp": 1_795_009_798_808u64,
+            "refresh_after": 86_400,
+            "updated_at": 1_793_675_972_000u64,
+        });
+        assert!(
+            synthesize_json_payload(&quota, "https://mcs.test/v1/list", "https://a.test/")
+                .is_none(),
+            "a WAF quota reply is not a document"
+        );
+        let package = serde_json::json!({
+            "name": "react",
+            "version": "19.0.0",
+            "description": "A JavaScript library for building user interfaces"
+        });
+        assert!(
+            synthesize_json_payload(
+                &package,
+                "https://registry.test/react",
+                "https://bundlephobia.com/package/react"
+            )
+            .is_some(),
+            "a named package entity is a document"
+        );
+    }
 
     fn transcript_entry(url: &str, body: &str) -> TranscriptEntry {
         TranscriptEntry {

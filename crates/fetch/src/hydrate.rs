@@ -632,7 +632,38 @@ pub fn materialize_inline_state(html: &str, page_url: &str) -> Option<InlineMate
             }
         }
     }
-    best.map(|(_, m)| m)
+    // A materialized state is only a page when it reads like one: a metrics or
+    // config blob (a WAF quota reply in TikTok's universal data) is not the
+    // document, and materializing it hides the real page behind a table.
+    best.filter(|(_, materialized)| inline_document_has_substance(&materialized.html))
+        .map(|(_, materialized)| materialized)
+}
+
+/// Whether a materialized document carries prose a reader came for. A sentence
+/// (a period followed by a space) or quoted text is prose; a key/value table of
+/// ids and counters is not.
+fn inline_document_has_substance(html: &str) -> bool {
+    let document = Html::parse_document(html);
+    let count = |selector: &str| {
+        Selector::parse(selector)
+            .ok()
+            .map(|selector| document.select(&selector).count())
+            .unwrap_or(0)
+    };
+    let text = document
+        .root_element()
+        .text()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    // A list or a paragraph is a page even when it is short (a few job rows).
+    // Without either, a metrics blob materializes as tables of ids and
+    // counters: two or more tables and no prose is not the document.
+    if count("li") + count("p") > 0 {
+        return text.chars().count() >= 60;
+    }
+    text.chars().count() >= 200 && count("table") < 2
 }
 
 /// Scan inline JS for `window.X = {...}`, `globalThis.X = {...}`, `self.X = {...}`,

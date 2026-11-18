@@ -1299,7 +1299,10 @@ async fn fetch_single_inner(
             ..opts.clone()
         };
         match extract::extract_off_worker(&o.body, &ct, &o.url, &read_opts).await {
-            Ok(e) => {
+            Ok(mut e) => {
+                if not_the_page(&e.markdown, o) {
+                    e.thin = true;
+                }
                 final_url = o.url.clone();
                 final_ex = Some(e);
             }
@@ -1344,6 +1347,7 @@ async fn fetch_single_inner(
         lopts.include_links = true;
         if let Ok(e3) = extract::extract_off_worker(&o.body, &ct, &o.url, &lopts).await
             && !e3.thin
+            && !not_the_page(&e3.markdown, o)
         {
             final_ex = Some(e3);
             trace.step("local", "links-extract", "ok", 0);
@@ -2063,6 +2067,24 @@ fn looks_like_shell_text(markdown: &str) -> bool {
 /// content. Returns the honest failure for the extracted shape, or
 /// None when the text is real content. A `verified` body (the fetch layer's
 /// contract found content) is not failed on bot-wall words alone.
+/// The page a failed fetch class or a locale picker really is. The extractor
+/// can read data the visible page does not carry (a shell's server-rendered
+/// JSON), so a shell whose extraction is a real document stays content; a
+/// short shell or a failed contract is not the page, and neither is a
+/// country/currency picker the site served instead.
+fn not_the_page(markdown: &str, outcome: &crate::fetch::client::FetchOutcome) -> bool {
+    let chars = markdown.chars().count();
+    // A shell whose extraction carries a real document (server-rendered JSON)
+    // is content; a shell with a short extraction is not. A failed contract is
+    // only a gate when the contract named one, so a short ordinary page keeps
+    // its own (thin) verdict.
+    let short_shell = outcome.class == donsetch_fetch::Class::Shell && chars < 800;
+    outcome.gate
+        || short_shell
+        || crate::extract::metric_table(markdown)
+        || donsetch_fetch::contract::locale_picker_text(markdown)
+}
+
 fn content_fail(
     markdown: &str,
     url: &str,

@@ -127,6 +127,148 @@ pub fn refusal_page(body: &str) -> Option<&'static str> {
     refusal_title(&first("title"), &first("h1"))
 }
 
+/// Titles of a page an origin serves *instead of* the document: a script
+/// gate, a country chooser, a language prompt. A short page whose title names
+/// one of these is not the page, whatever its visible length.
+const GATE_TITLES: &[&str] = &[
+    "select your country",
+    "select your location",
+    "select your region",
+    "choose your country",
+    "choose your location",
+    "choose your region",
+    "javascript is required",
+    "javascript required",
+    "enable javascript",
+    "javascript must be enabled",
+    "please enable javascript",
+    "this site requires javascript",
+    "trouble accessing",
+];
+
+/// The same gates in a short page's text. `enablejs` is the retry route a
+/// JS-less client is handed; the rest are the sentence a gate prints.
+const GATE_TEXT: &[&str] = &[
+    "enable javascript",
+    "javascript is disabled",
+    "javascript must be enabled",
+    "javascript is required",
+    "please enable javascript",
+    "requires javascript",
+    "you need to enable javascript",
+    "trouble accessing",
+    "enablejs",
+];
+
+/// Currency names a locale picker prints beside its countries. Word matches
+/// only: `sol` is not `solution`.
+const CURRENCY_NAMES: &[&str] = &[
+    "dollar",
+    "euro",
+    "pound",
+    "franc",
+    "peso",
+    "rupee",
+    "yen",
+    "yuan",
+    "krone",
+    "krona",
+    "guilder",
+    "dirham",
+    "rial",
+    "riyal",
+    "lira",
+    "ruble",
+    "zloty",
+    "forint",
+    "kip",
+    "dong",
+    "baht",
+    "ringgit",
+    "rupiah",
+    "shekel",
+    "rand",
+    "naira",
+    "cedi",
+    "birr",
+    "kwacha",
+    "escudo",
+    "dinar",
+    "lek",
+    "lev",
+    "kuna",
+    "denar",
+    "taka",
+    "afghani",
+    "bolivar",
+    "colon",
+    "cordoba",
+    "lempira",
+    "quetzal",
+    "balboa",
+    "guarani",
+    "sol",
+    "sucre",
+    "ouguiya",
+    "loti",
+    "lilangeni",
+    "ariary",
+    "rufiyaa",
+    "marka",
+    "koruna",
+    "pula",
+    "manat",
+    "som",
+    "tenge",
+    "hryvnia",
+    "lari",
+    "dram",
+];
+
+/// A locale/currency picker's text: a short page with no prose sentence,
+/// countries joined by "and", and at least three currencies. A page with a
+/// sentence is prose; a picker is names. This is the gate sites serve a fresh
+/// client instead of the page, and the extractor reads it from embedded JSON.
+pub fn locale_picker_text(text: &str) -> bool {
+    let body = fold_quotes(&text.to_lowercase());
+    let prose = body.matches(". ").count() + usize::from(body.trim_end().ends_with('.'));
+    // A picker may end with a footer sentence or two; its country list still
+    // carries many "and"s (Trinidad and Tobago, Saint Kitts and Nevis...).
+    if text.chars().count() > 6_000 || prose > 3 || body.matches(" and ").count() < 6 {
+        return false;
+    }
+    let words: Vec<&str> = body.split(|c: char| !c.is_alphanumeric()).collect();
+    CURRENCY_NAMES
+        .iter()
+        .filter(|name| words.iter().any(|word| word == *name))
+        .count()
+        >= 3
+}
+
+/// The gate a short page is, read from its title and text. A locale picker has
+/// no sentence punctuation, joins country names with "and", and prints at
+/// least three currencies: a page with a period is prose, a picker is names.
+fn gate_page(title: &str, text: &str) -> Option<&'static str> {
+    let title = fold_quotes(&title.to_lowercase());
+    if let Some(phrase) = GATE_TITLES.iter().find(|phrase| title.contains(**phrase)) {
+        return Some(*phrase);
+    }
+    let body = fold_quotes(&text.to_lowercase());
+    // A gate sentence is a short-page fact; a long article may quote it.
+    if text.chars().count() <= HUMAN_ASK_TEXT_MAX {
+        if let Some(phrase) = GATE_TEXT.iter().find(|phrase| body.contains(**phrase)) {
+            return Some(*phrase);
+        }
+    }
+    // A locale picker lists every country, so it can run past the interstitial
+    // length; it is still names, not prose: no period, "and" between countries,
+    // and currencies beside them.
+    if locale_picker_text(text) {
+        return Some("locale/currency picker");
+    }
+    None
+}
+
 /// Typographic quotes as their ASCII forms, so `you’re` matches `you're`.
 pub(crate) fn fold_quotes(text: &str) -> String {
     text.replace(['\u{2019}', '\u{2018}', '\u{02bc}'], "'")
@@ -275,6 +417,13 @@ pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
                 failures.push(format!("refusal page: {refusal:?}"));
             }
         }
+    }
+    // A gate the origin serves instead of the document. The generic contract's
+    // 200-character floor accepted Google's notice, Instagram's locale picker,
+    // and Best Buy's country chooser as content; the page is not content under
+    // any contract, so the gate check is unconditional.
+    if let Some(gate) = gate_page(&title, &text) {
+        failures.push(format!("gate page: {gate}"));
     }
     if let Some(rules) = &contract.selectors {
         for rule in rules {
@@ -526,6 +675,46 @@ mod tests {
             )
             .passed
         );
+    }
+
+    #[test]
+    fn a_gate_page_is_not_content_whatever_its_length() {
+        let generic = Contract::generic();
+        // Best Buy's country chooser: 760 characters, so it passed the floor.
+        let bestbuy = "<html><head><title>Best Buy International: Select your Country - Best Buy</title></head>\
+            <body><p>Hello! Choose a country. Canada United States Shopping in the U.S.?</p></body></html>";
+        let content = verify(bestbuy, "https://www.bestbuy.com/", &generic);
+        assert!(!content.passed);
+        assert!(
+            content
+                .failures
+                .iter()
+                .any(|failure| failure.contains("gate page")),
+            "{:?}",
+            content.failures
+        );
+        // Instagram's locale/currency picker after scripts run: no sentences,
+        // countries joined by "and", and currencies beside them.
+        let instagram = format!(
+            "<html><body><p>{}</p></body></html>",
+            "Bonaire, Sint Eustatius and Saba Trinidad and Tobago Saint Kitts and Nevis \
+             Antigua and Barbuda Sao Tome and Principe Bosnia and Herzegovina Turks and Caicos \
+             Wallis and Futuna Saint Vincent and the Grenadines Netherlands Antillean Guilder \
+             Trinidad and Tobago Dollar Venezuelan Sovereign Bolivar"
+        );
+        let content = verify(&instagram, "https://www.instagram.com/", &generic);
+        assert!(!content.passed, "{:?}", content.failures);
+        // A JS-required notice.
+        let google = "<html><head><title>Google Search</title></head>\
+            <body><p>Please enable JavaScript to continue.</p></body></html>";
+        assert!(!verify(google, "https://www.google.com/", &generic).passed);
+        // The same words inside a real article are content.
+        let article = format!(
+            "<html><body><p>{}</p></body></html>",
+            "A short guide explains that you should enable JavaScript to use some sites. "
+                .repeat(30)
+        );
+        assert!(verify(&article, "https://example.test/", &generic).passed);
     }
 
     #[test]

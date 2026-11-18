@@ -411,6 +411,8 @@ impl LayerFetcher {
             verdict,
             elapsed: started.elapsed(),
             verified: false,
+            class: donsetch_fetch::Class::Content,
+            gate: false,
         })
     }
 
@@ -739,6 +741,23 @@ fn into_outcome(
         outcome.wall.as_ref().map(|wall| wall.vendor.as_str()),
         walls::detect(outcome.status, &headers, &body),
     );
+    if std::env::var("V5_ENGINE_LOG").is_ok() {
+        eprintln!(
+            "[engine] outcome class={:?} status={} transport={} body={} text_chars={} verdict={:?}",
+            outcome.class,
+            outcome.status,
+            outcome.transport,
+            body.len(),
+            outcome.text_chars,
+            verdict
+        );
+        for attempt in &outcome.attempts {
+            eprintln!(
+                "[engine] attempt {} {} {:?} {}ms {:?}",
+                attempt.identity, attempt.transport, attempt.class, attempt.ms, attempt.note
+            );
+        }
+    }
     Ok(FetchOutcome {
         route,
         url: outcome.final_url,
@@ -760,6 +779,11 @@ fn into_outcome(
         verdict,
         elapsed: Duration::from_secs_f64(outcome.ms_total.max(0.0) / 1000.0),
         verified: outcome.class == donsetch_fetch::Class::Content && verdict == Verdict::ContentOk,
+        class: outcome.class,
+        gate: outcome
+            .failures
+            .iter()
+            .any(|failure| failure.contains("gate page")),
     })
 }
 

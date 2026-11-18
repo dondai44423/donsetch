@@ -923,7 +923,11 @@ impl Worker {
             return None;
         }
         let mut limits = options.content.clone();
-        limits.wall = limits.wall.min(remaining);
+        // The ceiling is not a delay: a lane that finishes quiescent stops at
+        // once, and a lane that needs a moment past the 5 s default (an app's
+        // last data request) is not cut at the boundary. The encounter's own
+        // budget still wins.
+        limits.wall = limits.wall.max(Duration::from_secs(8)).min(remaining);
         let cookie = self.state.cookie_header_for(&response.url, identity.name);
         let mut lane = match crate::engine::content_within_via_policy(
             &limits,

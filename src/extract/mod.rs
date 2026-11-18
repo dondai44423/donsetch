@@ -29,6 +29,36 @@ pub mod render;
 pub mod score;
 pub mod view;
 
+/// Rows of identifiers and numbers with almost no prose: a metrics/config
+/// table (a WAF quota reply), not a document. A page of records carries names,
+/// sentences or repeated prose; this does not.
+pub(crate) fn metric_table(markdown: &str) -> bool {
+    let mut prose = 0usize;
+    let mut keys = 0usize;
+    for line in markdown.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('|') {
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+            // A vertical key/value table: `| user_id | <uuid> |`, one snake_case
+            // metric per row. A record table has a header row and more columns.
+            if cells.len() == 2
+                && cells[0]
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && cells[0].chars().any(|c| c == '_')
+            {
+                keys += 1;
+            }
+        } else if !line.starts_with('-') && !line.starts_with('>') {
+            prose += 1;
+        }
+    }
+    keys >= 4 && prose <= 3 && markdown.chars().count() < 1_200
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -636,7 +666,9 @@ pub fn extract(
                 _ => page.verdict,
             }
         };
-        js.thin = !verdict.is_content();
+        // A table of ids and counters is not prose, whatever its line count:
+        // a WAF quota/config blob mined out of a page is not the page.
+        js.thin = !verdict.is_content() || metric_table(&js.markdown);
         js.page = Some(verdict);
         return Ok(js);
     }
