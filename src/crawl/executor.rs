@@ -703,8 +703,15 @@ pub async fn execute(
             let mut chars = md.chars().count();
             let mut next_offset = r.next_offset;
             let mut budget_after = false;
-            let duplicate = !sigs.insert(page_sig(r.title.as_deref().unwrap_or(""), &md));
+            let sig = page_sig(r.title.as_deref().unwrap_or(""), &md);
+            let duplicate = sigs.contains(&sig);
+            if !duplicate && r.quality < opts.min_quality {
+                job.skipped
+                    .push((page.url.clone(), format!("low quality ({:.2})", r.quality)));
+                break 'fetch;
+            }
             if !duplicate {
+                sigs.insert(sig);
                 let remaining = opts.max_total_chars.saturating_sub(used_chars);
                 if remaining == 0 {
                     job.skipped
@@ -747,13 +754,6 @@ pub async fn execute(
                 fetched_at: unix_now(),
                 fingerprint: r.fingerprint,
             };
-            if !duplicate && page.quality < opts.min_quality {
-                job.skipped.push((
-                    page.url.clone(),
-                    format!("low quality ({:.2})", page.quality),
-                ));
-                break 'fetch;
-            }
             job.pages.push(StoredPage::from_page(&page));
             done += 1;
             job.stop = None;
@@ -802,6 +802,21 @@ pub async fn execute(
     Ok(finish(job, started))
 }
 
+fn seed_host(seed: &str) -> String {
+    let trimmed = seed.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let parsed = if trimmed.contains("://") {
+        url::Url::parse(trimmed).ok()
+    } else {
+        url::Url::parse(&format!("https://{trimmed}")).ok()
+    };
+    parsed
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default()
+}
+
 fn finish(job: Job, started: Instant) -> CrawlResult {
     // The dossier is the delta memory: record every completed page's
     // fingerprint/lastmod here, after the bytes are safely in the job.
@@ -809,15 +824,7 @@ fn finish(job: Job, started: Instant) -> CrawlResult {
         .model
         .as_ref()
         .map(|m| m.host.clone())
-        .unwrap_or_else(|| {
-            job.plan
-                .seed
-                .split("://")
-                .nth(1)
-                .and_then(|s| s.split('/').next())
-                .unwrap_or("")
-                .to_string()
-        });
+        .unwrap_or_else(|| seed_host(&job.plan.seed));
     let updates: Vec<super::model::dossier::PageUpdate> = job
         .pages
         .iter()
@@ -1133,5 +1140,62 @@ mod tests {
         assert_eq!(result.pages[0].url, "https://ex.com/docs/s0/reserve-a");
         assert!(result.skipped.iter().any(|(u, _)| u == first));
         assert_eq!(hits.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn skipped_low_quality_pages_do_not_spend_the_char_budget() {
+        let low_url = "https://ex.com/docs/s0/page";
+        let good_url = "https://ex.com/docs/s1/page";
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let nav_noise: String = (0..60)
+            .map(|i| format!("<a href=\"/nav/{i}\">Link {i}</a> "))
+            .collect();
+        let low_html = format!(
+            "<html><head><title>Nav</title></head><body><nav>{nav_noise}</nav></body></html>"
+        );
+        let good_html = "<html><head><title>Architecture Guide</title></head><body><main><article><h1>Architecture Guide</h1><p>This guide explains the request pipeline, connection pooling, retry semantics, and structured extraction guarantees in complete detail for operators.</p><p>Each stage enforces deterministic memory, wall-clock, and byte ceilings so long-running crawls stay predictable across thousands of pages.</p></article></main></body></html>";
+        let fetch = mock(hits, move |url| {
+            if url == low_url {
+                page(url, 200, Verdict::ContentOk, &low_html)
+            } else {
+                page(url, 200, Verdict::ContentOk, good_html)
+            }
+        });
+        let store = temp_store("low-quality-budget");
+        let job = store
+            .create("https://ex.com/", fixture_plan(2), None)
+            .unwrap();
+        let mut opts = options();
+        opts.min_quality = 0.35;
+        opts.max_total_chars = 350;
+        let result = execute(fetch, governor(), &opts, &store, job)
+            .await
+            .unwrap();
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|(u, why)| u == low_url && why.starts_with("low quality")),
+            "expected low-quality skip on first page, got {:?}",
+            result.skipped
+        );
+        assert_eq!(
+            result.pages.len(),
+            1,
+            "second high-quality page must still fit in max_total_chars; skipped={:?}",
+            result.skipped
+        );
+        assert_eq!(result.pages[0].url, good_url);
+    }
+
+    #[test]
+    fn seed_host_parses_authority_without_port_or_query() {
+        assert_eq!(seed_host("https://Example.COM:8443?foo=1"), "example.com");
+        assert_eq!(
+            seed_host("https://docs.example.org/guide"),
+            "docs.example.org"
+        );
+        assert_eq!(seed_host("ex.com:8080/path"), "ex.com");
+        assert_eq!(seed_host(""), "");
     }
 }
