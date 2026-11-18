@@ -25,14 +25,23 @@
     return out;
   }
   function atob(input) {
-    const clean = String(input).replace(/[^A-Za-z0-9+/=]/g, "");
+    // Browsers accept unpadded base64 (length mod 4 of 2 or 3), and WAF
+    // challenges carry their payload that way. A missing character is zero
+    // bits, not "the rest of the group": the old decoder emitted two junk
+    // bytes after the JSON and every JSON.parse of a challenge payload threw.
+    const raw = String(input).replace(/[\t\n\f\r ]/g, "");
+    if (raw.length % 4 === 1) {
+      throw new Error("InvalidCharacterError: The string to be decoded is not correctly encoded.");
+    }
+    const clean = raw.replace(/=+$/, "");
+    const value = (index) => (index < clean.length ? B64.indexOf(clean[index]) : -1);
     let out = "";
     for (let i = 0; i < clean.length; i += 4) {
-      const n = (B64.indexOf(clean[i]) << 18) | (B64.indexOf(clean[i + 1]) << 12) |
-        ((B64.indexOf(clean[i + 2]) & 63) << 6) | (B64.indexOf(clean[i + 3]) & 63);
+      const c0 = value(i), c1 = value(i + 1), c2 = value(i + 2), c3 = value(i + 3);
+      const n = (c0 << 18) | (c1 << 12) | ((c2 & 63) << 6) | (c3 & 63);
       out += String.fromCharCode((n >> 16) & 255);
-      if (clean[i + 2] !== "=") out += String.fromCharCode((n >> 8) & 255);
-      if (clean[i + 3] !== "=") out += String.fromCharCode(n & 255);
+      if (c2 >= 0) out += String.fromCharCode((n >> 8) & 255);
+      if (c3 >= 0) out += String.fromCharCode(n & 255);
     }
     return out;
   }
@@ -4403,7 +4412,7 @@
       get password() { return parts.password; },
       assign(value) { navigateTo(value); },
       replace(value) { navigateTo(value); },
-      reload() { note("log", "reload (not performed in the lane)"); },
+      reload() { M.navigate = parts.href; note("log", "reload"); },
       toString() { return parts.href; },
       valueOf() { return parts.href; },
     };
@@ -5392,6 +5401,32 @@
       "HTMLTableCellElement", "HTMLTableColElement", "HTMLTableElement", "HTMLTableRowElement",
       "HTMLTableSectionElement", "HTMLTemplateElement", "HTMLTextAreaElement", "HTMLTimeElement",
       "HTMLTitleElement", "HTMLTrackElement", "HTMLUListElement", "HTMLUnknownElement", "HTMLVideoElement",
+    ]) {
+      if (!(name in win)) win[name] = VElement;
+    }
+    // The SVG interface names. TikTok's app reads SVGSVGElement during boot
+    // (a measured finding: the page died on the name, not on the element), and
+    // the same over-approximation as the HTML names above keeps vector-heavy
+    // app shells alive instead of failing on a constructor they never build.
+    for (const name of [
+      "SVGAElement", "SVGAnimateElement", "SVGAnimateMotionElement", "SVGAnimateTransformElement",
+      "SVGAnimationElement", "SVGCircleElement", "SVGClipPathElement", "SVGDefsElement",
+      "SVGDescElement", "SVGEllipseElement", "SVGFEBlendElement", "SVGFEColorMatrixElement",
+      "SVGFEComponentTransferElement", "SVGFECompositeElement", "SVGFEConvolveMatrixElement",
+      "SVGFEDiffuseLightingElement", "SVGFEDisplacementMapElement", "SVGFEDistantLightElement",
+      "SVGFEDropShadowElement", "SVGFEFloodElement", "SVGFEFuncAElement", "SVGFEFuncBElement",
+      "SVGFEFuncGElement", "SVGFEFuncRElement", "SVGFEGaussianBlurElement", "SVGFEImageElement",
+      "SVGFEMergeElement", "SVGFEMergeNodeElement", "SVGFEMorphologyElement", "SVGFEOffsetElement",
+      "SVGFEPointLightElement", "SVGFESpecularLightingElement", "SVGFESpotLightElement",
+      "SVGFETileElement", "SVGFETurbulenceElement", "SVGFilterElement", "SVGForeignObjectElement",
+      "SVGGElement", "SVGGeometryElement", "SVGGradientElement", "SVGGraphicsElement",
+      "SVGImageElement", "SVGLineElement", "SVGLinearGradientElement", "SVGMPathElement",
+      "SVGMarkerElement", "SVGMaskElement", "SVGMetadataElement", "SVGPathElement",
+      "SVGPatternElement", "SVGPolygonElement", "SVGPolylineElement", "SVGRadialGradientElement",
+      "SVGRectElement", "SVGSVGElement", "SVGScriptElement", "SVGSetElement", "SVGStopElement",
+      "SVGStyleElement", "SVGSwitchElement", "SVGSymbolElement", "SVGTSpanElement",
+      "SVGTextContentElement", "SVGTextElement", "SVGTextPathElement", "SVGTextPositioningElement",
+      "SVGTitleElement", "SVGUseElement", "SVGViewElement",
     ]) {
       if (!(name in win)) win[name] = VElement;
     }

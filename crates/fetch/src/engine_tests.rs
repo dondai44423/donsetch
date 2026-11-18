@@ -72,6 +72,23 @@ fn quiet() -> Server {
 // ---- the program itself --------------------------------------------------------
 
 #[test]
+fn unpadded_base64_decodes_to_the_bytes_a_browser_produces() {
+    // A WAF challenge carries unpadded base64 JSON in an attribute (TikTok's
+    // `cs` class is 234 characters, length mod 4 of 2); JSON.parse must see no
+    // extra bytes.
+    let script = r#"
+        var short = JSON.parse(atob("eyJ2IjoxLCJzIjoiYWJjIn0"));
+        if (short.v !== 1 || short.s !== "abc") throw new Error("atob short mismatch");
+        var padded = JSON.parse(atob("eyJhIjoxfQ=="));
+        if (padded.a !== 1) throw new Error("atob padded mismatch");
+        document.cookie = "atob=ok; Path=/";
+    "#;
+    let mint =
+        run("https://challenge.test/", script, &limits()).expect("the page program should run");
+    assert_eq!(cookie(&mint, "atob").as_deref(), Some("ok"));
+}
+
+#[test]
 fn a_benign_challenge_mints_inside_the_envelope() {
     let server = Server::start(|request| match request.path.as_str() {
         "/challenge.js" => Reply::ok("document.cookie = 'half=1; Path=/';"),

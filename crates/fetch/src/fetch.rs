@@ -925,7 +925,7 @@ impl Worker {
         let mut limits = options.content.clone();
         limits.wall = limits.wall.min(remaining);
         let cookie = self.state.cookie_header_for(&response.url, identity.name);
-        let lane = match crate::engine::content_within_via_policy(
+        let mut lane = match crate::engine::content_within_via_policy(
             &limits,
             &response.url,
             &response.body,
@@ -951,6 +951,104 @@ impl Worker {
                 return None;
             }
         };
+        // A program that installs a clearance cookie and reloads has not
+        // finished: the browser would request the URL again with that cookie,
+        // and the origin answers with the page. One hop, same URL, bounded by
+        // the encounter. This is the shape of most JS challenge gates (a
+        // proof of work writes a cookie, then reloads); without it the lane
+        // can only ever see the waiting page.
+        let mut reload_note: Option<String> = None;
+        if std::env::var("V5_ENGINE_LOG").is_ok() {
+            eprintln!(
+                "[engine] reload check: navigate={:?} cookies={} url={}",
+                lane.navigate,
+                lane.cookies.len(),
+                response.url
+            );
+        }
+        // Only a waiting page hops: a lane that already produced text has the
+        // document it came for, and a router's own navigation is not a gate.
+        if lane.text_chars < 200
+            && lane
+                .navigate
+                .as_deref()
+                .is_some_and(|next| same_url(next, &response.url))
+            && !lane.cookies.is_empty()
+        {
+            let budget = options.deadline.saturating_sub(started.elapsed());
+            if budget.as_millis() >= 800 {
+                let reload_cookie = lane
+                    .cookies
+                    .iter()
+                    .map(|stored| format!("{}={}", stored.name, stored.value))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let reloaded = match self.wire(identity) {
+                    Ok(wire) => wire
+                        .get(&response.url, Some(&reload_cookie), identity, budget)
+                        .ok(),
+                    Err(_) => None,
+                };
+                if let Some(reloaded) = reloaded {
+                    if std::env::var("V5_ENGINE_LOG").is_ok() {
+                        eprintln!(
+                            "[engine] reload -> {} {}B",
+                            reloaded.status,
+                            reloaded.body.len()
+                        );
+                    }
+                    // The reloaded answer is the real document, not the gate:
+                    // a heavy app needs longer to settle than the lane's own
+                    // 5 s, and the encounter has the time once the challenge
+                    // is spent. Still bounded, still one hop.
+                    let mut second_limits = options.content.clone();
+                    second_limits.wall = options
+                        .deadline
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_secs(20));
+                    if (200..300).contains(&reloaded.status)
+                        && second_limits.wall.as_millis() >= 500
+                    {
+                        match crate::engine::content_within_via_policy(
+                            &second_limits,
+                            &reloaded.url,
+                            &reloaded.body,
+                            identity,
+                            Some(&reload_cookie),
+                            self.proxy.as_deref(),
+                            200,
+                            options.allow_private,
+                        ) {
+                            Ok(second) => {
+                                if std::env::var("V5_ENGINE_LOG").is_ok() {
+                                    eprintln!(
+                                        "[engine] reload lane stop={} text={} chars",
+                                        second.stop, second.text_chars
+                                    );
+                                }
+                                self.state.store_cookies(
+                                    host,
+                                    identity.name,
+                                    second.cookies.clone(),
+                                );
+                                reload_note = Some(format!(
+                                    "reload {} -> {} ({}B) as the cookie allows",
+                                    response.status,
+                                    reloaded.status,
+                                    reloaded.body.len()
+                                ));
+                                lane = second;
+                            }
+                            Err(error) => {
+                                if std::env::var("V5_ENGINE_LOG").is_ok() {
+                                    eprintln!("[engine] reload lane error: {error}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let lane_ms = lane.ms.max(lane_started.elapsed().as_secs_f64() * 1000.0);
         // What the program stored is the identity's own state, bound to it.
         self.state
@@ -994,10 +1092,14 @@ impl Worker {
             version: String::new(),
             title: content.title.clone(),
             note: Some(format!(
-                "content lane: stop={} {} text chars, {} requests{}{}",
+                "content lane: stop={} {} text chars, {} requests{}{}{}",
                 lane.stop,
                 content.text_chars,
                 lane.transcript.len(),
+                reload_note
+                    .as_deref()
+                    .map(|n| format!("; {n}"))
+                    .unwrap_or_default(),
                 synth_note
                     .as_deref()
                     .map(|n| format!(" ({n})"))
