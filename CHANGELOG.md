@@ -1,5 +1,38 @@
 # Changelog
 
+## [5.5.6] - 2026-11-18
+
+### Changed
+
+- **Browserless causal hydration, native ES module runtime, and universal blueprint replay.**
+  `donsetch-fetch` separates `<main>`/`<article>` content from navigation chrome (`hydrate.rs`) so
+  partial-HTML app shells and null-prop SSR wrappers enter hydration with zero false triggers on
+  static or server-rendered pages. Before starting V8, a zero-JS inline state materializer renders
+  embedded `window.*`, `data-page`/`data-props`, `<script type="application/json">`, and normalized
+  Apollo/Relay entity caches in under a millisecond. When JavaScript execution is required, V8 now
+  loads ES module graphs, dynamic `import()` route chunks, `import.meta.resolve`, import maps, and
+  `<base href>` concurrently over multiplexed HTTP/2 (`WireHandle::call_async`, 256 content ops /
+  64 MB ceiling) against expanded data-plane DOM surfaces (`<template>`, comment hydration anchors,
+  SVG geometry, `DOMParser`, `NodeIterator`/`TreeWalker`, `customElements`, `CSSStyleSheet`,
+  `MessageChannel`, async `XMLHttpRequest`, and CSP-style Worker fallback). `synthesize.rs` fuses
+  verified `2xx` OpenAPI, npm dependency-graph, GraphQL Relay, Entity JSON, and HTML-fragment wire
+  responses when the live DOM is graphical or collapsed, and `mine.rs` extends zero-JS HTTP replay
+  from collections to single-entity JSON and HTML documentation fragments with middle-segment and
+  filename-affix `{{n}}` URL templating.
+- **SPA-aware `crawl` redirect scoping and sitemap-index seed fallback.** `crawl --mode map` and
+  inventory collection adopt canonical cross-domain redirect hosts (`material.angular.io` →
+  `material.angular.dev`) so hydrated links remain in scope, and execute the promised 1-request
+  hydrated seed fallback when a `<sitemapindex>` exhausts its probe budget with zero in-scope URLs.
+
+### Fixed
+
+- **Passive Cloudflare beacon script on HTTP 200 app shells.** `classify.rs` no longer misclassifies
+  normal `200 OK` application shells carrying Cloudflare's passive `/cdn-cgi/challenge-platform/`
+  script as active challenge walls when no interstitial marker or `cf-mitigated` header is present.
+- **Origin/Referer domain collisions in mined contracts.** `mine.rs` excludes `origin`, `referer`,
+  and fetch-metadata headers from route-parameter wildcarding so handles matching the site hostname
+  do not corrupt replay headers.
+
 ## [5.5.5] - 2026-11-18
 
 ### Changed

@@ -703,14 +703,21 @@ fn into_outcome(
         ));
     }
     // A data-path or embedded answer is the records, not the document they came
-    // from (an API body, or a shell): hand over the rendered records as text.
+    // from (an API body, or a shell): hand over the rendered records as text,
+    // or as HTML when a replayed blueprint emitted semantic HTML.
     let records = outcome.transport != "document" && !outcome.body_text.is_empty();
     let (headers, body) = if records {
+        let trimmed = outcome.body_text.trim_start();
+        let content_type = if trimmed.starts_with("<!DOCTYPE html")
+            || trimmed.starts_with("<!doctype html")
+            || trimmed.starts_with("<html")
+        {
+            "text/html; charset=utf-8"
+        } else {
+            "text/plain; charset=utf-8"
+        };
         (
-            vec![(
-                "content-type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
+            vec![("content-type".to_string(), content_type.to_string())],
             outcome.body_text.into_bytes(),
         )
     } else {
@@ -718,7 +725,14 @@ fn into_outcome(
             Some(bytes) => bytes,
             None => outcome.body.unwrap_or_default().into_bytes(),
         };
-        (outcome.headers, body)
+        let mut headers = outcome.headers;
+        if headers.is_empty() && body.starts_with(b"<") {
+            headers.push((
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ));
+        }
+        (headers, body)
     };
     let verdict = verdict_for(
         outcome.class,

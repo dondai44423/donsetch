@@ -207,7 +207,18 @@ pub fn verify_response(
             },
         };
     }
-    verify(body, final_url, contract)
+    let mut content = verify(body, final_url, contract);
+    if generic && content.passed && !headers.is_empty() {
+        let shell = crate::hydrate::assess_html_shell(body, final_url);
+        if shell.is_unhydrated_shell {
+            content.passed = false;
+            content.failures.push(format!(
+                "unhydrated app shell ({})",
+                shell.reason.unwrap_or("hydration deficit")
+            ));
+        }
+    }
+    content
 }
 
 /// Verify a document against a contract.

@@ -59,6 +59,8 @@
     }
     static canParse(input, base) { try { new URLShim(input, base); return true; } catch (e) { return false; } }
     static parse(input, base) { try { return new URLShim(input, base); } catch (e) { return null; } }
+    static createObjectURL() { return "blob:null/" + ops.op_random(8); }
+    static revokeObjectURL() {}
     get searchParams() {
       const state = URL_STATE.get(this);
       if (!state.query) { state.query = new URLSearchParamsShim(state.parts.search); QUERY_OWNER.set(state.query, this); }
@@ -1988,15 +1990,19 @@
   // ----- serialization and visible text -----
   // Module scope: the pump and the content entry read these; the tree they walk
   // is whatever document is handed in.
-  function serializeInto(node, write, depth) {
-    if (depth > 500) return;
+  function serializeInto(node, write, depth, includeShadow) {
+    if (depth > 500 || !node) return;
     if (node.nodeType === 3) {
       const parentTag = node.parentNode && node.parentNode.tagName ? node.parentNode.tagName.toLowerCase() : "";
       write(RAW_TEXT_TAGS.has(parentTag) ? node.nodeValue : escapeText(node.nodeValue));
       return;
     }
+    if (node.nodeType === 8) {
+      write("<!--" + String(node.nodeValue || "").replace(/--/g, "- -") + "-->");
+      return;
+    }
     if (node.nodeType !== 1) {
-      for (const child of node.childNodes) serializeInto(child, write, depth + 1);
+      for (const child of node.childNodes) serializeInto(child, write, depth + 1, includeShadow);
       return;
     }
     const tag = node.tagName.toLowerCase();
@@ -2004,15 +2010,27 @@
     for (const [name, value] of node._attrs) write(" " + name + (value === "" ? "" : "=\"" + escapeAttr(value) + "\""));
     write(">");
     if (VOID_TAGS.has(tag)) return;
-    for (const child of node.childNodes) serializeInto(child, write, depth + 1);
+    if (tag === "template" && node._templateContent) {
+      for (const child of node._templateContent.childNodes) serializeInto(child, write, depth + 1, includeShadow);
+      write("</" + tag + ">");
+      return;
+    }
+    for (const child of node.childNodes) serializeInto(child, write, depth + 1, includeShadow);
+    if (includeShadow && node._shadowRoot && node._shadowRoot.childNodes.length) {
+      for (const child of node._shadowRoot.childNodes) {
+        if (child.nodeType === 1 && child.tagName === "STYLE") continue;
+        serializeInto(child, write, depth + 1, includeShadow);
+      }
+    }
     write("</" + tag + ">");
   }
 
   function visibleText(root) {
     const out = [];
     (function walk(node, depth) {
-      if (depth > 500) return;
-      for (const child of node.childNodes) {
+      if (depth > 500 || !node) return;
+      const list = node.childNodes || [];
+      for (const child of list) {
         if (child.nodeType === 3) { out.push(child.nodeValue); continue; }
         if (child.nodeType !== 1) continue;
         const tag = child.tagName;
@@ -2023,8 +2041,45 @@
         const visibility = child.style && String(child.style.visibility || "").toLowerCase();
         if (display === "none" || visibility === "hidden") continue;
         walk(child, depth + 1);
+        if (child._shadowRoot && child._shadowRoot.childNodes.length) {
+          walk(child._shadowRoot, depth + 1);
+        }
       }
     })(root, 0);
+    return out.join(" ").replace(/[\s\u00a0]+/g, " ").trim();
+  }
+
+  const CHROME_TAGS = new Set(["HEAD", "TITLE", "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "NAV", "HEADER", "FOOTER", "ASIDE", "MAT-TOOLBAR", "MAT-SIDENAV"]);
+  const CHROME_ROLES = new Set(["navigation", "banner", "contentinfo", "complementary", "menubar", "toolbar"]);
+  function isChromeNode(el) {
+    if (CHROME_TAGS.has(el.tagName)) return true;
+    const role = (el._attrs.get("role") || "").trim().toLowerCase();
+    if (role && CHROME_ROLES.has(role)) return true;
+    const cls = ((el._attrs.get("id") || "") + " " + (el._attrs.get("class") || "")).toLowerCase();
+    return /\b(navbar|nav-bar|topbar|sidenav|sidebar|footer|masthead|cookie-banner)\b/.test(cls);
+  }
+
+  function mainVisibleText(docOrRoot) {
+    const start = (docOrRoot && docOrRoot.nodeType === 9 && docOrRoot.body) ? docOrRoot.body : docOrRoot;
+    const out = [];
+    (function walk(node, depth) {
+      if (depth > 500 || !node) return;
+      const list = node.childNodes || [];
+      for (const child of list) {
+        if (child.nodeType === 3) { out.push(child.nodeValue); continue; }
+        if (child.nodeType !== 1) continue;
+        if (isChromeNode(child)) continue;
+        if (child._attrs.has("hidden")) continue;
+        if (child._attrs.get("aria-hidden") === "true") continue;
+        const display = child.style && String(child.style.display || "").toLowerCase();
+        const visibility = child.style && String(child.style.visibility || "").toLowerCase();
+        if (display === "none" || visibility === "hidden") continue;
+        walk(child, depth + 1);
+        if (child._shadowRoot && child._shadowRoot.childNodes.length) {
+          walk(child._shadowRoot, depth + 1);
+        }
+      }
+    })(start, 0);
     return out.join(" ").replace(/[\s\u00a0]+/g, " ").trim();
   }
 
@@ -2903,6 +2958,146 @@
     return evaluateModuleSource(parsed.body, url);
   }
 
+  // Async non-blocking network fetch for Content Mode: multiplexes over HTTP/2
+  // on the same identity wire while V8 timers, Promises, and ES modules advance.
+  async function netFetchAsync(url, opts) {
+    opts = opts || {};
+    const input = url && url.url ? url.url : (url && url.href ? url.href : url);
+    const baseHref = (M && M.doc && M.doc.baseURI) || (M && M.page && M.page.baseUrl) || M.page.url;
+    let absolute = String(input);
+    try { absolute = new URL(absolute, baseHref).href; } catch (e) { /* keep as given */ }
+    const headers = {};
+    const given = opts.headers || (url && url.headers) || {};
+    if (given._m instanceof Map) for (const [k, v] of given._m) headers[k] = v;
+    else if (Array.isArray(given)) for (const [k, v] of given) headers[String(k)] = String(v);
+    else for (const k of Object.keys(given)) headers[k] = String(given[k]);
+    const has = (name) => Object.keys(headers).some((key) => key.toLowerCase() === name);
+    const method = String(opts.method || (url && url.method) || "GET").toUpperCase();
+    const dest = opts.__dest || "empty";
+    const mode = String(opts.mode || (url && url.mode) || (dest === "script" ? "no-cors" : "cors"));
+    const credentials = String(opts.credentials || (url && url.credentials) || "same-origin");
+    let sameOrigin = true;
+    try {
+      const pageUrl = new URL(M.page.url);
+      const target = new URL(absolute);
+      sameOrigin = target.origin === pageUrl.origin;
+      const meta = fetchMetadata(pageUrl, target, method, dest, mode, credentials);
+      for (const [name, value] of meta) if (!has(name)) headers[name] = value;
+    } catch (e) { /* non-absolute URL */ }
+    if (!has("accept")) headers["accept"] = "*/*";
+    const cache = String(opts.cache || (url && url.cache) || "default");
+    if ((cache === "no-store" || cache === "reload") && !has("pragma")) headers["pragma"] = "no-cache";
+    if ((cache === "no-store" || cache === "reload") && !has("cache-control")) headers["cache-control"] = "no-cache";
+    if (cache === "no-cache" && !has("cache-control")) headers["cache-control"] = "max-age=0";
+    const encoded = encodeBody(opts.body !== undefined ? opts.body : (url && url.body));
+    if (encoded.type) {
+      if (encoded.type.startsWith("multipart/")) {
+        for (const key of Object.keys(headers)) if (/^content-type$/i.test(key)) delete headers[key];
+        headers["content-type"] = encoded.type;
+      } else if (!has("content-type")) {
+        headers["content-type"] = encoded.type;
+      }
+    }
+    const bodyBytes = encoded.bytes || new Uint8Array(0);
+    let targetHost = "";
+    try { targetHost = new URL(absolute).hostname; } catch (e) {}
+    const sendCookies = credentials === "include" || (credentials === "same-origin" && sameOrigin) || mode === "no-cors" || mode === "navigate";
+    const jarCookie = sendCookies ? cookieHeader(targetHost) : "-";
+    M.inFlight = (M.inFlight || 0) + 1;
+    let res;
+    try {
+      const raw = await ops.op_fetch_async(
+        method,
+        absolute,
+        JSON.stringify(Object.entries(headers)),
+        bodyBytes,
+        jarCookie || (sendCookies ? "" : "-"),
+        "subresource",
+        1,
+      );
+      res = JSON.parse(raw);
+    } finally {
+      M.inFlight = Math.max(0, (M.inFlight || 1) - 1);
+    }
+    const responseBytes = () => (res.body_b64 !== undefined ? base64ToBytes(res.body_b64) : core.encode(res.body || ""));
+    note("log", "net " + method + " " + String(absolute).slice(0, 100) + " -> " + (res.error || res.status));
+    if (M.transcript && !res.shortCircuited && dest !== "script" && dest !== "style") {
+      const text = String(res.body || "");
+      const ctHeader = ((res.headers || []).find(([k]) => String(k).toLowerCase() === "content-type") || [])[1] || "";
+      const ct = String(ctHeader).toLowerCase();
+      const isJs = ct.includes("javascript") || ct.includes("ecmascript") || /\.m?js(\?|$)/i.test(absolute);
+      const isDataLike = !isJs && (
+        /^\s*[\[{<]/.test(text) ||
+        ct.includes("json") ||
+        ct.includes("html") ||
+        ct.includes("markdown") ||
+        ct.includes("yaml") ||
+        ct.includes("text/plain")
+      );
+      let kept = null;
+      if (isDataLike && text.length <= 2097152 && M.transcriptBytes + text.length <= 8388608) {
+        kept = text;
+        M.transcriptBytes += text.length;
+      }
+      let keptRequest = null;
+      if (bodyBytes.length && bodyBytes.length <= 65536 && M.transcriptRequestBytes + bodyBytes.length <= 524288) {
+        keptRequest = bytesToBase64(bodyBytes);
+        M.transcriptRequestBytes += bodyBytes.length;
+      }
+      M.transcript.push({
+        method, url: String(absolute), status: res.status, bytes: text.length, kind: dest, body: kept,
+        reqHeaders: Object.entries(headers), reqBody: keptRequest,
+      });
+    }
+    if (res.error) throw new TypeError("Failed to fetch (" + res.error + ")");
+    try { absorb(new URL(absolute).hostname, res.headers || []); } catch (e) { note("log", "absorb: " + (e && e.message)); }
+    const visible = (res.headers || []).filter(([k]) => !/^set-cookie2?$/i.test(k));
+    const ResponseCtor = (M && M.env && M.env.win && M.env.win.Response) || null;
+    if (ResponseCtor) {
+      const built = new ResponseCtor(res.body || "", {
+        status: res.status,
+        statusText: "",
+        headers: visible,
+        url: res.url || absolute,
+        redirected: Boolean(res.url && res.url !== absolute),
+        rawBytes: res.body_b64 !== undefined ? base64ToBytes(res.body_b64) : null,
+      });
+      built.rawHeaders = visible;
+      built.textSync = res.body || "";
+      built.bytesSync = responseBytes;
+      return built;
+    }
+    return {
+      ok: res.status >= 200 && res.status < 300,
+      status: res.status,
+      statusText: "",
+      url: res.url || absolute,
+      redirected: Boolean(res.url && res.url !== absolute),
+      type: "basic",
+      headers: { get: () => null, has: () => false, forEach: () => {} },
+      text: () => Promise.resolve(res.body || ""),
+      textSync: res.body || "",
+      bytesSync: responseBytes,
+      rawHeaders: visible,
+      json: () => Promise.resolve().then(() => JSON.parse(res.body || "null")),
+      arrayBuffer: () => Promise.resolve(responseBytes().slice().buffer),
+      clone() { return this; },
+    };
+  }
+
+  async function loadScriptAsync(src) {
+    try {
+      const response = await netFetchAsync(src, { __dest: "script", mode: "no-cors", credentials: "include" });
+      return {
+        status: response.status,
+        body: response.status >= 200 && response.status < 300 ? response.textSync : "",
+        error: response.status >= 400 ? "status " + response.status : null,
+      };
+    } catch (e) {
+      return { error: String(e && e.message) };
+    }
+  }
+
   function makeContentEnvironment(page) {
     const host = new URL(page.url).hostname;
     const ident = IDENTITY = page.identity;
@@ -3085,8 +3280,14 @@
         if (this.ownerDocument && this.ownerDocument._record) {
           this.ownerDocument._record({ type: "childList", target: this, addedNodes: [node], removedNodes: [] });
         }
-        if (node.nodeType === 1 && node.tagName === "SCRIPT" && this.isConnected && this._contentEnv && this._contentEnv.armed) {
-          this._contentEnv.runScript(node);
+        if (node.nodeType === 1 && this.isConnected && this._contentEnv && this._contentEnv.armed) {
+          if (node.tagName === "SCRIPT") {
+            this._contentEnv.runScript(node);
+          } else if (node.tagName === "LINK" && /\bstylesheet\b/i.test(node.getAttribute("rel") || "")) {
+            Promise.resolve().then(() => {
+              try { node.dispatchEvent(new EventShim("load", { bubbles: false })); } catch (e) {}
+            });
+          }
         }
         return node;
       }
@@ -3114,6 +3315,19 @@
           this.insertBefore(child, reference);
         }
       }
+      before(...nodes) {
+        if (!this.parentNode) return;
+        for (const node of nodes) {
+          this.parentNode.insertBefore(typeof node === "string" ? this.ownerDocument.createTextNode(node) : node, this);
+        }
+      }
+      after(...nodes) {
+        if (!this.parentNode) return;
+        const reference = this.nextSibling;
+        for (const node of nodes) {
+          this.parentNode.insertBefore(typeof node === "string" ? this.ownerDocument.createTextNode(node) : node, reference);
+        }
+      }
       remove() { if (this.parentNode) this.parentNode.removeChild(this); }
       replaceWith(...nodes) {
         if (!this.parentNode) return;
@@ -3122,13 +3336,28 @@
         parent.removeChild(this);
         for (const node of nodes) parent.insertBefore(typeof node === "string" ? parent.ownerDocument.createTextNode(node) : node, reference);
       }
+      replaceChildren(...nodes) {
+        for (const child of this.childNodes) child.parentNode = null;
+        this.childNodes = [];
+        this._addMany(nodes, null);
+      }
+      normalize() {}
+      isSameNode(other) { return this === other; }
+      isEqualNode(other) { return this === other; }
+      compareDocumentPosition(other) {
+        if (this === other) return 0;
+        if (!other) return 1;
+        if (this.contains(other)) return 16 + 4;
+        if (other.contains && other.contains(this)) return 8 + 2;
+        return 4;
+      }
       get textContent() {
-        if (this.nodeType === 3) return this.nodeValue;
+        if (this.nodeType === 3 || this.nodeType === 8) return this.nodeValue;
         let out = "";
         (function walk(node) {
           for (const child of node.childNodes) {
             if (child.nodeType === 3) out += child.nodeValue;
-            else walk(child);
+            else if (child.nodeType === 1 || child.nodeType === 11 || child.nodeType === 9) walk(child);
           }
         })(this);
         return out;
@@ -3139,6 +3368,29 @@
         if (value !== "" && value != null) this.insertBefore(this.ownerDocument.createTextNode(String(value)), null);
       }
     }
+    Object.assign(VNode, {
+      ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
+      PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
+      DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+      DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2,
+      DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8,
+      DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
+    });
+    Object.assign(VNode.prototype, {
+      ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
+      PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
+      DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+      DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2,
+      DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8,
+      DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
+    });
+
+    const NodeFilterShim = {
+      FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+      SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4,
+      SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128,
+      SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024,
+    };
 
     // Dispatch along the path a browser takes: the target, its ancestors, the
     // document, the window; capture phase is not modeled (nothing measured needs
@@ -3150,7 +3402,7 @@
       const path = [target];
       let node = target;
       while (node && node.parentNode) { node = node.parentNode; path.push(node); }
-      if (target !== win) {
+      if (target !== win && target !== globalThis) {
         if (path[path.length - 1] !== doc) path.push(doc);
         path.push(win);
       }
@@ -3160,20 +3412,24 @@
       event.stopImmediatePropagation = function () { stopped = true; };
       if (!event.preventDefault) event.preventDefault = function () { this.defaultPrevented = true; };
       for (const current of path) {
-        event.currentTarget = current;
+        event.currentTarget = current === win ? globalThis : current;
         const map = listeners.get(current);
         const list = map && map.get(event.type);
         if (list) {
           for (const entry of list.slice()) {
-            try { entry.handler.handleEvent ? entry.handler.handleEvent.call(entry.handler, event) : entry.handler.call(current, event); }
+            try { entry.handler.handleEvent ? entry.handler.handleEvent.call(entry.handler, event) : entry.handler.call(event.currentTarget, event); }
             catch (error) { note("log", "handler " + event.type + ": " + (error && error.message)); }
             if (entry.once) current.removeEventListener(event.type, entry.handler);
             if (stopped) break;
           }
         }
-        const inline = current["on" + event.type];
+        const prop = "on" + event.type;
+        const inline = current[prop];
         if (typeof inline === "function" && !stopped) {
-          try { inline.call(current, event); } catch (error) { note("log", "inline " + event.type + ": " + (error && error.message)); }
+          try { inline.call(event.currentTarget, event); } catch (error) { note("log", "inline " + event.type + ": " + (error && error.message)); }
+        }
+        if (current === win && !stopped && globalThis[prop] !== inline && typeof globalThis[prop] === "function") {
+          try { globalThis[prop].call(globalThis, event); } catch (error) { note("log", "global inline " + event.type + ": " + (error && error.message)); }
         }
         if (stopped) break;
       }
@@ -3200,6 +3456,24 @@
       get textContent() { return this._data; }
       set textContent(value) { this.nodeValue = value; }
       get length() { return this._data.length; }
+      cloneNode() { return new VText(this.ownerDocument, this._data); }
+    }
+
+    class VComment extends VNode {
+      constructor(ownerDocument, data) {
+        super(ownerDocument);
+        this.nodeType = 8;
+        this.nodeName = "#comment";
+        this._data = String(data == null ? "" : data);
+      }
+      get nodeValue() { return this._data; }
+      set nodeValue(value) { this._data = String(value == null ? "" : value); }
+      get data() { return this._data; }
+      set data(value) { this.nodeValue = value; }
+      get textContent() { return this._data; }
+      set textContent(value) { this.nodeValue = value; }
+      get length() { return this._data.length; }
+      cloneNode() { return new VComment(this.ownerDocument, this._data); }
     }
 
     class VFragment extends VNode {
@@ -3207,6 +3481,27 @@
         super(ownerDocument);
         this.nodeType = 11;
         this.nodeName = "#document-fragment";
+      }
+      querySelector(selector) { return collectSelect(this.ownerDocument, this, selector)[0] || null; }
+      querySelectorAll(selector) { return collectSelect(this.ownerDocument, this, selector); }
+      getElementById(id) {
+        const wanted = String(id);
+        return allElements(this).find((element) => element.getAttribute("id") === wanted) || null;
+      }
+      get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
+      get firstElementChild() { return this.children[0] || null; }
+      get lastElementChild() { const list = this.children; return list[list.length - 1] || null; }
+      get childElementCount() { return this.children.length; }
+      cloneNode(deep) {
+        const copy = new VFragment(this.ownerDocument);
+        if (deep) {
+          for (const child of this.childNodes) {
+            const cloned = child.cloneNode(true);
+            cloned.parentNode = copy;
+            copy.childNodes.push(cloned);
+          }
+        }
+        return copy;
       }
     }
 
@@ -3219,6 +3514,7 @@
         super(host.ownerDocument);
         this.host = host;
         this.mode = mode === "closed" ? "closed" : "open";
+        this.adoptedStyleSheets = [];
       }
     }
 
@@ -3234,19 +3530,26 @@
     const BOOLEAN_ATTRS = ["hidden", "disabled", "checked", "selected", "async", "defer", "noModule",
       "readOnly", "required", "multiple", "autofocus", "open", "playsInline", "muted", "loop", "controls"];
 
+    const customRegistry = new Map();
+    const customPromises = new Map();
+
     class VElement extends VNode {
       constructor(ownerDocument, tag) {
-        super(ownerDocument);
+        const resolvedOwner = ownerDocument || (typeof doc !== "undefined" ? doc : null);
+        const resolvedTag = tag || (new.target && new.target._customTag) || "div";
+        super(resolvedOwner);
         this.nodeType = 1;
-        this.tagName = String(tag).toUpperCase();
+        this.tagName = String(resolvedTag).toUpperCase();
         this.nodeName = this.tagName;
-        this.localName = String(tag).toLowerCase();
+        this.localName = String(resolvedTag).toLowerCase();
         this.namespaceURI = "http://www.w3.org/1999/xhtml";
         this._attrs = new Map();
         this.style = this._makeStyle();
         this.dataset = this._makeDataset();
         this.classList = this._makeClassList();
         this._contentEnv = null;
+        this._templateContent = this.tagName === "TEMPLATE" ? new VFragment(ownerDocument) : null;
+        if (this.tagName === "AUDIO" || this.tagName === "VIDEO") this.canPlayType = canPlayType;
         if (this.tagName === "CANVAS") {
           const canvas = this;
           canvas.width = 300;
@@ -3281,6 +3584,17 @@
             },
             replace(text) { this.replaceSync(text); return Promise.resolve(); },
           };
+          if (this.tagName === "LINK") {
+            this.relList = {
+              supports: (token) => {
+                const t = String(token || "").toLowerCase();
+                return t === "modulepreload" || t === "preload" || t === "preconnect" || t === "dns-prefetch" || t === "stylesheet";
+              },
+              contains: (token) => String(owner.getAttribute("rel") || "").split(/\s+/).includes(String(token)),
+              add: () => {},
+              remove: () => {},
+            };
+          }
         }
       }
       _makeStyle() {
@@ -3425,6 +3739,25 @@
         return want;
       }
       getAttributeNames() { return Array.from(this._attrs.keys()); }
+      getAttributeNode(name) {
+        const key = String(name).toLowerCase();
+        if (!this._attrs.has(key)) return null;
+        const val = this._attrs.get(key);
+        return { name: key, localName: key, value: val, nodeValue: val, namespaceURI: null, specified: true, ownerElement: this };
+      }
+      get attributes() {
+        const list = [];
+        for (const [name, value] of this._attrs) {
+          const attr = { name, localName: name, value, nodeValue: value, namespaceURI: null, specified: true, ownerElement: this };
+          list.push(attr);
+          if (!(name in list)) list[name] = attr;
+        }
+        list.item = (index) => list[index] || null;
+        list.getNamedItem = (name) => list.find((a) => a.name === String(name).toLowerCase()) || null;
+        list.getNamedItemNS = (_ns, name) => list.getNamedItem(name);
+        return list;
+      }
+      get content() { return this._templateContent || undefined; }
       get children() { return this.childNodes.filter((node) => node.nodeType === 1); }
       get firstElementChild() { return this.children[0] || null; }
       get lastElementChild() { const list = this.children; return list[list.length - 1] || null; }
@@ -3441,27 +3774,30 @@
       }
       get innerHTML() {
         let out = "";
-        for (const child of this.childNodes) serializeInto(child, (text) => { out += text; }, 0);
+        const target = this._templateContent || this;
+        for (const child of target.childNodes) serializeInto(child, (text) => { out += text; }, 0, false);
         return out;
       }
       set innerHTML(value) {
-        const tree = JSON.parse(ops.op_parse_html(String(value), "fragment"));
+        const isTpl = this.tagName === "TEMPLATE" && this._templateContent;
+        const tree = JSON.parse(ops.op_parse_html(String(value), isTpl ? "template" : "fragment"));
         if (tree && tree.error) throw new Error(tree.error);
-        for (const child of this.childNodes) child.parentNode = null;
-        this.childNodes = [];
+        const target = isTpl ? this._templateContent : this;
+        for (const child of target.childNodes) child.parentNode = null;
+        target.childNodes = [];
         // Scripts inserted through innerHTML never execute, as in a browser.
         const env = this._contentEnv;
         const wasArmed = env ? env.armed : false;
         if (env) env.armed = false;
         try {
           for (const spec of tree) {
-            const child = buildSpec(spec);
-            if (child) { child.parentNode = this; this.childNodes.push(child); }
+            const child = buildSpecForDoc(this.ownerDocument || doc, spec);
+            if (child) { child.parentNode = target; target.childNodes.push(child); }
           }
         } finally {
           if (env) env.armed = wasArmed;
         }
-        if (this.ownerDocument && this.ownerDocument._record) {
+        if (!isTpl && this.ownerDocument && this.ownerDocument._record) {
           this.ownerDocument._record({ type: "childList", target: this, addedNodes: [], removedNodes: [] });
         }
       }
@@ -3549,6 +3885,29 @@
       click() { note("log", "click " + this.tagName + " (not dispatched: no interaction in the lane)"); }
       scrollIntoView() {}
       animate() { return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {}, onfinish: null }; }
+      _svgMatrix() {
+        const m = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+        m.inverse = () => m;
+        m.multiply = () => m;
+        m.translate = () => m;
+        m.scale = () => m;
+        m.scaleNonUniform = () => m;
+        m.rotate = () => m;
+        m.flipX = () => m;
+        m.flipY = () => m;
+        return m;
+      }
+      getScreenCTM() { return this._svgMatrix(); }
+      getCTM() { return this._svgMatrix(); }
+      getBBox() { return { x: 0, y: 0, width: 100, height: 20, top: 0, left: 0, right: 100, bottom: 20 }; }
+      createSVGMatrix() { return this._svgMatrix(); }
+      createSVGPoint() {
+        const pt = { x: 0, y: 0 };
+        pt.matrixTransform = () => ({ x: pt.x, y: pt.y });
+        return pt;
+      }
+      getTotalLength() { return 100; }
+      getPointAtLength() { return { x: 0, y: 0 }; }
       attachShadow(init) {
         note("surface", "element.attachShadow");
         if (!this._shadowRoot) this._shadowRoot = new VShadowRoot(this, init && init.mode);
@@ -3556,11 +3915,19 @@
       }
       get shadowRoot() { return this._shadowRoot || null; }
       cloneNode(deep) {
-        const copy = this.ownerDocument.createElement(this.localName);
+        const owner = this.ownerDocument || doc;
+        const copy = owner.createElement(this.localName);
         for (const [name, value] of this._attrs) copy._attrs.set(name, value);
         if (deep) {
+          if (this._templateContent && copy._templateContent) {
+            for (const child of this._templateContent.childNodes) {
+              const cloned = child.cloneNode(true);
+              cloned.parentNode = copy._templateContent;
+              copy._templateContent.childNodes.push(cloned);
+            }
+          }
           for (const child of this.childNodes) {
-            const cloned = child.nodeType === 3 ? this.ownerDocument.createTextNode(child.nodeValue) : child.cloneNode(true);
+            const cloned = child.nodeType === 3 ? owner.createTextNode(child.nodeValue) : child.nodeType === 8 ? owner.createComment(child.nodeValue) : child.cloneNode(true);
             cloned.parentNode = copy;
             copy.childNodes.push(cloned);
           }
@@ -3570,6 +3937,31 @@
       getContext() { return null; }
       set src(value) { this.setAttribute("src", String(value)); }
       get src() { return this.getAttribute("src") || ""; }
+      set href(value) { this.setAttribute("href", String(value)); }
+      get href() {
+        const raw = this.getAttribute("href");
+        if (raw === null) return "";
+        if (this.tagName === "A" || this.tagName === "AREA" || this.tagName === "BASE" || this.tagName === "LINK") {
+          const base = (this.ownerDocument && this.ownerDocument.baseURI) || page.url;
+          const resolved = urlParse(raw, base);
+          return resolved ? resolved.href : raw;
+        }
+        return raw;
+      }
+      _anchorParts() {
+        if (this.tagName !== "A" && this.tagName !== "AREA") return null;
+        const raw = this.getAttribute("href");
+        if (raw === null) return null;
+        return urlParse(raw, (this.ownerDocument && this.ownerDocument.baseURI) || page.url);
+      }
+      get origin() { const p = this._anchorParts(); return p ? p.origin : ""; }
+      get protocol() { const p = this._anchorParts(); return p ? p.protocol : ":"; }
+      get host() { const p = this._anchorParts(); return p ? p.host : ""; }
+      get hostname() { const p = this._anchorParts(); return p ? p.hostname : ""; }
+      get port() { const p = this._anchorParts(); return p ? p.port : ""; }
+      get pathname() { const p = this._anchorParts(); return p ? p.pathname : ""; }
+      get search() { const p = this._anchorParts(); return p ? p.search : ""; }
+      get hash() { const p = this._anchorParts(); return p ? p.hash : ""; }
     }
 
     for (const key of Object.keys(REFLECTED)) {
@@ -3629,6 +4021,174 @@
       TAG_CLASS_NAMES.set(tag, tagClassFor(tag));
     }
 
+    function matchesWhatToShow(node, whatToShow) {
+      const mask = whatToShow === undefined ? 0xFFFFFFFF : (whatToShow >>> 0);
+      if (mask === 0xFFFFFFFF) return true;
+      const nt = node && node.nodeType;
+      if (!nt || nt < 1 || nt > 12) return false;
+      return ((mask >>> (nt - 1)) & 1) !== 0;
+    }
+
+    function applyNodeFilter(node, whatToShow, filter) {
+      if (!matchesWhatToShow(node, whatToShow)) return NodeFilterShim.FILTER_SKIP;
+      if (!filter) return NodeFilterShim.FILTER_ACCEPT;
+      try {
+        const fn = typeof filter === "function" ? filter : (typeof filter.acceptNode === "function" ? (n) => filter.acceptNode(n) : null);
+        return fn ? fn(node) : NodeFilterShim.FILTER_ACCEPT;
+      } catch (e) {
+        return NodeFilterShim.FILTER_ACCEPT;
+      }
+    }
+
+    class VTreeWalker {
+      constructor(root, whatToShow, filter) {
+        this.root = root;
+        this.whatToShow = whatToShow === undefined ? 0xFFFFFFFF : (whatToShow >>> 0);
+        this.filter = filter || null;
+        this.currentNode = root;
+      }
+      parentNode() {
+        let node = this.currentNode;
+        while (node && node !== this.root) {
+          node = node.parentNode;
+          if (node && applyNodeFilter(node, this.whatToShow, this.filter) === NodeFilterShim.FILTER_ACCEPT) {
+            this.currentNode = node;
+            return node;
+          }
+        }
+        return null;
+      }
+      firstChild() { return this._traverseChildren(true); }
+      lastChild() { return this._traverseChildren(false); }
+      _traverseChildren(first) {
+        let node = first ? (this.currentNode && this.currentNode.firstChild) : (this.currentNode && this.currentNode.lastChild);
+        while (node) {
+          const res = applyNodeFilter(node, this.whatToShow, this.filter);
+          if (res === NodeFilterShim.FILTER_ACCEPT) { this.currentNode = node; return node; }
+          if (res === NodeFilterShim.FILTER_SKIP) {
+            const child = first ? node.firstChild : node.lastChild;
+            if (child) { node = child; continue; }
+          }
+          while (node) {
+            const sib = first ? node.nextSibling : node.previousSibling;
+            if (sib) { node = sib; break; }
+            const parent = node.parentNode;
+            if (!parent || parent === this.root || parent === this.currentNode) return null;
+            node = parent;
+          }
+        }
+        return null;
+      }
+      nextSibling() { return this._traverseSiblings(true); }
+      previousSibling() { return this._traverseSiblings(false); }
+      _traverseSiblings(next) {
+        let node = this.currentNode;
+        if (!node || node === this.root) return null;
+        while (node) {
+          let sib = next ? node.nextSibling : node.previousSibling;
+          while (sib) {
+            const res = applyNodeFilter(sib, this.whatToShow, this.filter);
+            if (res === NodeFilterShim.FILTER_ACCEPT) { this.currentNode = sib; return sib; }
+            const child = next ? sib.firstChild : sib.lastChild;
+            if (res !== NodeFilterShim.FILTER_REJECT && child) { sib = child; continue; }
+            sib = next ? sib.nextSibling : sib.previousSibling;
+          }
+          node = node.parentNode;
+          if (!node || node === this.root) return null;
+          if (applyNodeFilter(node, this.whatToShow, this.filter) === NodeFilterShim.FILTER_ACCEPT) return null;
+        }
+        return null;
+      }
+      nextNode() {
+        let node = this.currentNode;
+        let res = NodeFilterShim.FILTER_ACCEPT;
+        for (;;) {
+          while (res !== NodeFilterShim.FILTER_REJECT && node && node.firstChild) {
+            node = node.firstChild;
+            res = applyNodeFilter(node, this.whatToShow, this.filter);
+            if (res === NodeFilterShim.FILTER_ACCEPT) { this.currentNode = node; return node; }
+          }
+          let cur = node;
+          node = null;
+          while (cur && cur !== this.root) {
+            if (cur.nextSibling) { node = cur.nextSibling; break; }
+            cur = cur.parentNode;
+          }
+          if (!node) return null;
+          res = applyNodeFilter(node, this.whatToShow, this.filter);
+          if (res === NodeFilterShim.FILTER_ACCEPT) { this.currentNode = node; return node; }
+        }
+      }
+      previousNode() {
+        let node = this.currentNode;
+        while (node && node !== this.root) {
+          let sib = node.previousSibling;
+          while (sib) {
+            node = sib;
+            let res = applyNodeFilter(node, this.whatToShow, this.filter);
+            while (res !== NodeFilterShim.FILTER_REJECT && node.lastChild) {
+              node = node.lastChild;
+              res = applyNodeFilter(node, this.whatToShow, this.filter);
+            }
+            if (res === NodeFilterShim.FILTER_ACCEPT) { this.currentNode = node; return node; }
+            sib = node.previousSibling;
+          }
+          if (!node || node === this.root) break;
+          node = node.parentNode;
+          if (!node) break;
+          if (applyNodeFilter(node, this.whatToShow, this.filter) === NodeFilterShim.FILTER_ACCEPT) {
+            this.currentNode = node;
+            return node;
+          }
+        }
+        return null;
+      }
+    }
+
+    class VNodeIterator {
+      constructor(root, whatToShow, filter) {
+        this.root = root;
+        this.whatToShow = whatToShow === undefined ? 0xFFFFFFFF : (whatToShow >>> 0);
+        this.filter = filter || null;
+        this.referenceNode = root;
+        this.pointerBeforeReferenceNode = true;
+        const nodes = [];
+        (function collect(n) {
+          if (!n) return;
+          nodes.push(n);
+          const list = n.childNodes || [];
+          for (const c of list) collect(c);
+        })(root);
+        this._nodes = nodes;
+        this._index = 0;
+      }
+      nextNode() {
+        while (this._index < this._nodes.length) {
+          const n = this._nodes[this._index++];
+          if (n !== this.root && !(this.root && this.root.contains && this.root.contains(n))) continue;
+          if (applyNodeFilter(n, this.whatToShow, this.filter) === NodeFilterShim.FILTER_ACCEPT) {
+            this.referenceNode = n;
+            this.pointerBeforeReferenceNode = false;
+            return n;
+          }
+        }
+        return null;
+      }
+      previousNode() {
+        while (this._index > 0) {
+          const n = this._nodes[--this._index];
+          if (n !== this.root && !(this.root && this.root.contains && this.root.contains(n))) continue;
+          if (applyNodeFilter(n, this.whatToShow, this.filter) === NodeFilterShim.FILTER_ACCEPT) {
+            this.referenceNode = n;
+            this.pointerBeforeReferenceNode = true;
+            return n;
+          }
+        }
+        return null;
+      }
+      detach() {}
+    }
+
     class VDocument extends VNode {
       constructor(url) {
         super(null);
@@ -3657,6 +4217,17 @@
         this.characterSet = "UTF-8";
         this.charset = "UTF-8";
         this.contentType = "text/html";
+        this.adoptedStyleSheets = [];
+      }
+      get baseURI() {
+        if (this.head) {
+          const baseEl = this.head.childNodes.find((n) => n.nodeType === 1 && n.tagName === "BASE" && n.hasAttribute("href"));
+          if (baseEl) {
+            const resolved = urlParse(baseEl.getAttribute("href"), this === doc ? parts.href : this.url);
+            if (resolved) return resolved.href;
+          }
+        }
+        return this === doc ? parts.href : (page.baseUrl || this.url);
       }
       _record(record) {
         this._mutations++;
@@ -3688,15 +4259,32 @@
         if (key) storeCookie(key, cookie);
         else if (cookie) note("log", "cookie rejected " + cookie.name + " for " + host);
       }
-      createElement(tag) {
-        const element = createRawElement(tag);
-        return element;
-      }
+      createElement(tag) { return createRawElementForDoc(this, tag); }
       createElementNS(_namespace, tag) { return this.createElement(tag); }
       createTextNode(data) { return new VText(this, data); }
-      createComment(data) { return new VText(this, data); }
+      createComment(data) { return new VComment(this, data); }
       createDocumentFragment() { return new VFragment(this); }
-      createAttribute(name) { return { name: String(name), value: "", ownerElement: null }; }
+      createAttribute(name) { return { name: String(name), localName: String(name).toLowerCase(), value: "", nodeValue: "", ownerElement: null }; }
+      createTreeWalker(root, whatToShow, filter) { return new VTreeWalker(root, whatToShow, filter); }
+      createNodeIterator(root, whatToShow, filter) { return new VNodeIterator(root, whatToShow, filter); }
+      createRange() { return new win.Range(); }
+      adoptNode(node) {
+        if (!node) return node;
+        if (node.parentNode) node.parentNode.removeChild(node);
+        const owner = this;
+        (function reown(n) {
+          if (!n) return;
+          n.ownerDocument = owner;
+          if (n._templateContent) reown(n._templateContent);
+          if (n.childNodes) for (const c of n.childNodes) reown(c);
+        })(node);
+        return node;
+      }
+      importNode(node, deep) {
+        if (!node) return node;
+        const cloned = node.cloneNode(!!deep);
+        return this.adoptNode(cloned);
+      }
       createEvent(_type) {
         const event = { type: "", bubbles: false, cancelable: false, defaultPrevented: false, target: null, currentTarget: null, timeStamp: now(), preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, stopImmediatePropagation() {} };
         event.initEvent = function (type, bubbles, cancelable) { this.type = type; this.bubbles = !!bubbles; this.cancelable = !!cancelable; };
@@ -3726,9 +4314,28 @@
       get styleSheets() { return allElements(this).filter((element) => (element.tagName === "STYLE" || element.tagName === "LINK") && element.sheet).map((element) => element.sheet); }
       get implementation() {
         return {
-          createHTMLDocument: (title) => { const scratch = new VDocument(page.url); if (title) scratch.title = String(title); return scratch; },
-          createDocument: () => new VDocument(page.url),
-          createDocumentType: () => ({}),
+          createHTMLDocument: (title) => {
+            const scratch = new VDocument(doc.baseURI || page.url);
+            const htmlEl = scratch.createElement("html");
+            const headEl = scratch.createElement("head");
+            const bodyEl = scratch.createElement("body");
+            if (title !== undefined) {
+              const titleEl = scratch.createElement("title");
+              titleEl.textContent = String(title);
+              headEl.appendChild(titleEl);
+              scratch.title = String(title);
+            }
+            htmlEl.appendChild(headEl);
+            htmlEl.appendChild(bodyEl);
+            scratch.documentElement = htmlEl;
+            htmlEl.parentNode = scratch;
+            scratch.childNodes = [htmlEl];
+            scratch.head = headEl;
+            scratch.body = bodyEl;
+            return scratch;
+          },
+          createDocument: () => new VDocument(doc.baseURI || page.url),
+          createDocumentType: () => ({ nodeType: 10, nodeName: "html", name: "html", publicId: "", systemId: "" }),
           hasFeature: () => true,
         };
       }
@@ -3802,23 +4409,42 @@
     };
 
     // The tree parser is Rust (html5ever). The host materializes its tree format
-    // (`[tag, attrs, ...children]`, text as a string) into live nodes.
-    function createRawElement(tag) {
-      const element = new VElement(doc, tag);
+    // (`[tag, attrs, ...children]`, text as a string, `#comment` inside templates) into live nodes.
+    function createRawElementForDoc(ownerDoc, tag) {
+      const lower = String(tag).toLowerCase();
+      let element = null;
+      if (customRegistry.has(lower)) {
+        const Ctor = customRegistry.get(lower);
+        try {
+          element = new Ctor();
+          element.ownerDocument = ownerDoc;
+        } catch (e) {
+          element = null;
+        }
+      }
+      if (!element) element = new VElement(ownerDoc, tag);
       element._contentEnv = env;
       return new Proxy(element, elementStub);
     }
-    function buildSpec(spec) {
-      if (typeof spec === "string") return new VText(doc, spec);
+    function createRawElement(tag) {
+      return createRawElementForDoc(doc, tag);
+    }
+    function buildSpecForDoc(ownerDoc, spec) {
+      if (typeof spec === "string") return new VText(ownerDoc, spec);
       const tag = String(spec[0]);
+      if (tag === "#comment") return new VComment(ownerDoc, spec[2] !== undefined ? spec[2] : "");
       const attributes = spec[1] || {};
-      const element = createRawElement(tag);
+      const element = createRawElementForDoc(ownerDoc, tag);
       for (const name of Object.keys(attributes)) element._attrs.set(name, String(attributes[name]));
+      const target = element._templateContent || element;
       for (let index = 2; index < spec.length; index++) {
-        const child = buildSpec(spec[index]);
-        if (child) { child.parentNode = element; element.childNodes.push(child); }
+        const child = buildSpecForDoc(ownerDoc, spec[index]);
+        if (child) { child.parentNode = target; target.childNodes.push(child); }
       }
       return element;
+    }
+    function buildSpec(spec) {
+      return buildSpecForDoc(doc, spec);
     }
 
     const env = { armed: false, timers, rafs, host, win: null, doc, runScript: null };
@@ -4373,7 +4999,7 @@
         },
         subtle: SUBTLE,
       },
-      fetch: (input, init) => thenable(netFetch(input, init)),
+      fetch: (input, init) => netFetchAsync(input, init),
       atob, btoa,
       structuredClone: (value) => { try { return JSON.parse(JSON.stringify(value)); } catch (error) { return value; } },
       matchMedia,
@@ -4407,9 +5033,60 @@
         supports: () => true,
         escape: (value) => String(value).replace(/[^a-zA-Z0-9_\u00A0-\uFFFF-]/g, (ch) => "\\" + ch),
       },
+      CSSStyleSheet: class {
+        constructor() { this.cssRules = []; }
+        replaceSync(text) {
+          this.cssRules = String(text || "").split("}").filter((s) => s.trim()).map((s) => ({ cssText: s + "}" }));
+        }
+        replace(text) { this.replaceSync(text); return Promise.resolve(this); }
+        insertRule(rule, index) {
+          const at = index === undefined ? this.cssRules.length : Math.max(0, Math.min(index, this.cssRules.length));
+          this.cssRules.splice(at, 0, { cssText: String(rule) });
+          return at;
+        }
+        deleteRule(index) { this.cssRules.splice(index, 1); }
+      },
       Worker: class {
-        constructor(url) { note("surface", "Worker"); this._url = String(url); }
-        postMessage() {} terminate() {} addEventListener() {} removeEventListener() {}
+        constructor(url) {
+          note("surface", "Worker");
+          throw new DOMExceptionShim("Failed to construct 'Worker': Script at '" + String(url) + "' cannot be accessed from origin.", "SecurityError");
+        }
+      },
+      SharedWorker: class {
+        constructor(url) {
+          note("surface", "SharedWorker");
+          throw new DOMExceptionShim("Failed to construct 'SharedWorker': Script at '" + String(url) + "' cannot be accessed from origin.", "SecurityError");
+        }
+      },
+      MessageChannel: class {
+        constructor() {
+          const makePort = (peerGetter) => {
+            const port = new EventTargetShim();
+            port.onmessage = null;
+            port.onmessageerror = null;
+            port.start = () => {};
+            port.close = () => {};
+            port.postMessage = (data) => {
+              Promise.resolve().then(() => {
+                const peer = peerGetter();
+                if (!peer) return;
+                const ev = new EventShim("message", { bubbles: false });
+                ev.data = data;
+                if (typeof peer.onmessage === "function") {
+                  try { peer.onmessage(ev); } catch (err) { note("log", "MessageChannel: " + (err && err.message)); }
+                }
+                peer.dispatchEvent(ev);
+              });
+            };
+            return port;
+          };
+          let p1 = null;
+          let p2 = null;
+          p1 = makePort(() => p2);
+          p2 = makePort(() => p1);
+          this.port1 = p1;
+          this.port2 = p2;
+        }
       },
       BroadcastChannel: class {
         constructor(name) { this.name = String(name); }
@@ -4431,20 +5108,41 @@
         removeEventListener() {},
       },
       reportError: (error) => { note("log", "reportError: " + (error && (error.message || String(error)))); },
-      // WHATWG Streams, minimal but real enough to construct and wire. The lane's
-      // model is synchronous: a reader that truly streams gets an immediate end,
-      // and the surface is logged when touched.
       ReadableStream: class {
-        constructor(source) { this._source = source || null; this.locked = false; note("surface", "ReadableStream"); }
+        constructor(source) {
+          this._source = source || null;
+          this._bytes = source && source.__bytes ? source.__bytes : null;
+          this._consumed = false;
+          this.locked = false;
+          note("surface", "ReadableStream");
+        }
         getReader() {
           this.locked = true;
-          return { read: () => Promise.resolve({ done: true, value: undefined }), releaseLock: () => { this.locked = false; }, cancel: () => Promise.resolve(), closed: Promise.resolve() };
+          const self = this;
+          return {
+            read: () => {
+              if (self._bytes && !self._consumed) {
+                self._consumed = true;
+                return Promise.resolve({ done: false, value: self._bytes });
+              }
+              return Promise.resolve({ done: true, value: undefined });
+            },
+            releaseLock: () => { self.locked = false; },
+            cancel: () => { self._consumed = true; return Promise.resolve(); },
+            closed: Promise.resolve(),
+          };
         }
-        cancel() { return Promise.resolve(); }
-        tee() { return [new win.ReadableStream(), new win.ReadableStream()]; }
+        cancel() { this._consumed = true; return Promise.resolve(); }
+        tee() {
+          const copy = this._bytes ? new Uint8Array(this._bytes) : null;
+          return [new win.ReadableStream(copy ? { __bytes: copy } : null), new win.ReadableStream(copy ? { __bytes: copy } : null)];
+        }
         pipeTo() { return Promise.resolve(); }
         pipeThrough(transform) { return transform && transform.readable ? transform.readable : new win.ReadableStream(); }
-        [Symbol.asyncIterator]() { return { next: () => Promise.resolve({ done: true, value: undefined }) }; }
+        [Symbol.asyncIterator]() {
+          const reader = this.getReader();
+          return { next: () => reader.read() };
+        }
       },
       WritableStream: class {
         constructor(sink) { this._sink = sink || null; this.locked = false; note("surface", "WritableStream"); }
@@ -4473,18 +5171,45 @@
       Response: class {
         constructor(body, init) {
           init = init || {};
-          this.body = body == null ? "" : body;
+          this._text = body == null ? "" : String(body);
+          this._rawBytes = init.rawBytes || null;
+          const bytes = this._rawBytes || core.encode(this._text);
+          this.body = body == null ? null : new win.ReadableStream({ __bytes: bytes });
+          this.bodyUsed = false;
           this.status = init.status || 200;
           this.ok = this.status >= 200 && this.status < 300;
           this.statusText = init.statusText || "";
           this.headers = new HeadersShim(init.headers || {});
           this.url = init.url || "";
+          this.redirected = !!init.redirected;
           this.type = "basic";
         }
-        text() { return Promise.resolve(String(this.body)); }
-        json() { return Promise.resolve(JSON.parse(String(this.body || "null"))); }
-        arrayBuffer() { return Promise.resolve(new TextEncoder().encode(String(this.body)).buffer); }
-        clone() { return new win.Response(this.body, { status: this.status, headers: this.headers, url: this.url }); }
+        text() { this.bodyUsed = true; return Promise.resolve(this._text); }
+        json() { this.bodyUsed = true; return Promise.resolve().then(() => JSON.parse(this._text || "null")); }
+        arrayBuffer() {
+          this.bodyUsed = true;
+          const bytes = this._rawBytes || core.encode(this._text);
+          return Promise.resolve(bytes.slice().buffer);
+        }
+        bytes() {
+          this.bodyUsed = true;
+          return Promise.resolve((this._rawBytes || core.encode(this._text)).slice());
+        }
+        blob() {
+          this.bodyUsed = true;
+          const bytes = this._rawBytes || core.encode(this._text);
+          return Promise.resolve(new BlobShim([bytes], { type: this.headers.get("content-type") || "" }));
+        }
+        clone() {
+          return new win.Response(this._text, {
+            status: this.status,
+            statusText: this.statusText,
+            headers: this.headers,
+            url: this.url,
+            redirected: this.redirected,
+            rawBytes: this._rawBytes,
+          });
+        }
       },
       AbortSignal: class {
         constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._listeners = []; }
@@ -4509,20 +5234,25 @@
           for (const handler of this.signal._listeners) { try { handler({ type: "abort" }); } catch (error) { /* as Chrome */ } }
         }
       },
-      Image: class {
-        constructor() { this.width = 0; this.height = 0; this.complete = true; this.naturalWidth = 0; this.naturalHeight = 0; }
-        set src(value) { this._src = String(value); win.setTimeout(() => { if (typeof this.onload === "function") { try { this.onload({ type: "load", target: this }); } catch (error) { /* as Chrome */ } } }, 0); }
-        get src() { return this._src || ""; }
-        addEventListener() {}
-        removeEventListener() {}
-        decode() { return Promise.resolve(); }
+      Image: function Image(w, h) {
+        const img = doc.createElement("img");
+        if (w !== undefined) img.width = Number(w) || 0;
+        if (h !== undefined) img.height = Number(h) || 0;
+        img.complete = true;
+        img.naturalWidth = img.width;
+        img.naturalHeight = img.height;
+        img.decode = () => Promise.resolve();
+        return img;
       },
-      Audio: class {
-        constructor() { this.duration = 0; this.currentTime = 0; this.paused = true; }
-        play() { this.paused = false; return Promise.resolve(); }
-        pause() { this.paused = true; }
-        canPlayType(type) { return canPlayType(type); }
-        addEventListener() {}
+      Audio: function Audio(src) {
+        const audio = doc.createElement("audio");
+        audio.duration = 0;
+        audio.currentTime = 0;
+        audio.paused = true;
+        audio.play = function () { this.paused = false; return Promise.resolve(); };
+        audio.pause = function () { this.paused = true; };
+        if (src !== undefined) audio.src = String(src);
+        return audio;
       },
       MediaSource: MediaSourceShim,
       AudioContext: class {
@@ -4559,25 +5289,53 @@
       },
       createImageBitmap: () => Promise.resolve({ width: 1, height: 1, close() {} }),
       FontFace: class { constructor(family, source) { this.family = family; this.status = "loaded"; } load() { return Promise.resolve(this); } },
-      Screen: class {}, Navigator: class {}, Document: class {}, Window: class {},
+      Screen: class {}, Navigator: class {}, Document: VDocument, HTMLDocument: VDocument, Window: class {},
       EventTarget: EventTargetShim, CSSStyleDeclaration: class {},
-      Node: VNode, Element: VElement, HTMLElement: VElement, Text: VText, CharacterData: VText, DocumentFragment: VFragment, ShadowRoot: VShadowRoot,
+      Node: VNode, Element: VElement, HTMLElement: VElement, Text: VText, Comment: VComment, CharacterData: VText, DocumentFragment: VFragment, ShadowRoot: VShadowRoot,
+      NodeFilter: NodeFilterShim, TreeWalker: VTreeWalker, NodeIterator: VNodeIterator,
       HTMLCanvasElement: VElement, SVGElement: VElement, HTMLImageElement: VElement,
       HTMLScriptElement: VElement, HTMLTemplateElement: VElement,
-      customElements: { define() {}, get() { return undefined; }, whenDefined: () => Promise.resolve(), upgrade() {} },
+      customElements: {
+        define(name, ctor) {
+          const lower = String(name).toLowerCase();
+          if (customRegistry.has(lower)) return;
+          if (typeof ctor === "function") {
+            try { ctor._customTag = lower; } catch (e) {}
+            customRegistry.set(lower, ctor);
+          }
+          const pending = customPromises.get(lower);
+          if (pending) {
+            customPromises.delete(lower);
+            for (const resolve of pending) { try { resolve(ctor); } catch (e) {} }
+          }
+        },
+        get(name) { return customRegistry.get(String(name).toLowerCase()); },
+        whenDefined(name) {
+          const lower = String(name).toLowerCase();
+          if (customRegistry.has(lower)) return Promise.resolve(customRegistry.get(lower));
+          return new Promise((resolve) => {
+            if (!customPromises.has(lower)) customPromises.set(lower, []);
+            customPromises.get(lower).push(resolve);
+          });
+        },
+        upgrade() {},
+      },
       DOMParser: class {
         constructor() { note("surface", "DOMParser"); }
-        parseFromString(text, type) {
+        parseFromString(text, _type) {
           const parsed = JSON.parse(ops.op_parse_html(String(text), "document"));
-          if (parsed && parsed.error) return doc;
-          const scratch = new VDocument(page.url);
-          const body = buildSpec(parsed);
-          scratch.documentElement = body;
-          scratch.body = body;
+          if (parsed && parsed.error) return doc.implementation.createHTMLDocument("");
+          const scratch = new VDocument(doc.baseURI || page.url);
+          const htmlEl = buildSpecForDoc(scratch, parsed);
+          scratch.documentElement = htmlEl;
+          htmlEl.parentNode = scratch;
+          scratch.childNodes = [htmlEl];
+          scratch.head = htmlEl.childNodes.find((n) => n.nodeType === 1 && n.tagName === "HEAD") || scratch.createElement("head");
+          scratch.body = htmlEl.childNodes.find((n) => n.nodeType === 1 && n.tagName === "BODY") || scratch.createElement("body");
           return scratch;
         }
       },
-      XMLSerializer: class { serializeToString(node) { let out = ""; serializeInto(node, (text) => { out += text; }, 0); return out; } },
+      XMLSerializer: class { serializeToString(node) { let out = ""; serializeInto(node, (text) => { out += text; }, 0, false); return out; } },
       TextEncoder: TextEncoderShim,
       TextDecoder: TextDecoderShim,
       URL: URLShim,
@@ -4745,86 +5503,212 @@
     Object.defineProperty(win, "location", { configurable: true, get() { return location; }, set(value) { navigateTo(String(value)); } });
     Object.defineProperty(doc, "defaultView", { configurable: true, get() { return win; } });
 
-    win.XMLHttpRequest = class {
-      constructor() { this.readyState = 0; this.status = 0; this.responseText = ""; this._headers = {}; this.onreadystatechange = null; this.onload = null; this.onerror = null; this.responseType = ""; this.withCredentials = false; }
-      open(method, url) { this._method = method; this._url = url; this.readyState = 1; }
-      setRequestHeader(name, value) { this._headers[name] = value; }
-      addEventListener(type, handler) { this["on" + type] = handler; }
-      send(body) {
-        try {
-          const response = netFetch(this._url, { method: this._method, headers: this._headers, body, credentials: this.withCredentials ? "include" : "same-origin" });
-          this.status = response.status;
-          this.responseText = response.textSync;
-          this._responseHeaders = response.rawHeaders;
-          this.responseURL = response.url;
-          this.readyState = 4;
-          if (this.responseType === "json") { try { this.response = JSON.parse(this.responseText); } catch (error) { this.response = null; } }
-          else if (this.responseType === "arraybuffer") { this.response = response.bytesSync().slice().buffer; }
-          else if (this.responseType === "blob") { this.response = new BlobShim([response.bytesSync()], { type: response.headers.get("content-type") || "" }); }
-          else { this.response = this.responseText; }
-          if (this.onreadystatechange) this.onreadystatechange();
-          if (this.onload) this.onload();
-        } catch (error) {
-          this.readyState = 4;
-          this.status = 0;
-          if (this.onerror) this.onerror();
-        }
+    win.XMLHttpRequest = class extends EventTargetShim {
+      constructor() {
+        super();
+        this.readyState = 0;
+        this.status = 0;
+        this.statusText = "";
+        this.responseText = "";
+        this.response = "";
+        this.responseURL = "";
+        this._headers = {};
+        this._responseHeaders = [];
+        this._async = true;
+        this.onreadystatechange = null;
+        this.onload = null;
+        this.onloadstart = null;
+        this.onloadend = null;
+        this.onprogress = null;
+        this.onerror = null;
+        this.onabort = null;
+        this.ontimeout = null;
+        this.timeout = 0;
+        this.responseType = "";
+        this.withCredentials = false;
+        this.upload = new EventTargetShim();
       }
-      abort() {}
+      open(method, url, isAsync) {
+        this._method = method;
+        this._url = url;
+        this._async = isAsync !== false;
+        this.readyState = 1;
+      }
+      setRequestHeader(name, value) { this._headers[name] = value; }
+      overrideMimeType() {}
+      _applyResponse(response) {
+        this.status = response.status;
+        this.statusText = response.statusText || "";
+        this.responseText = response.textSync || "";
+        this._responseHeaders = response.rawHeaders || [];
+        this.responseURL = response.url || "";
+        this.readyState = 4;
+        if (this.responseType === "json") {
+          try { this.response = JSON.parse(this.responseText); } catch (error) { this.response = null; }
+        } else if (this.responseType === "arraybuffer") {
+          this.response = response.bytesSync().slice().buffer;
+        } else if (this.responseType === "blob") {
+          const ct = this.getResponseHeader("content-type") || "";
+          this.response = new BlobShim([response.bytesSync()], { type: ct });
+        } else if (this.responseType === "document") {
+          this.response = new win.DOMParser().parseFromString(this.responseText, "text/html");
+        } else {
+          this.response = this.responseText;
+        }
+        this.dispatchEvent(new EventShim("readystatechange", { bubbles: false }));
+        this.dispatchEvent(new EventShim("load", { bubbles: false }));
+        this.dispatchEvent(new EventShim("loadend", { bubbles: false }));
+      }
+      _applyError() {
+        this.readyState = 4;
+        this.status = 0;
+        this.dispatchEvent(new EventShim("readystatechange", { bubbles: false }));
+        this.dispatchEvent(new EventShim("error", { bubbles: false }));
+        this.dispatchEvent(new EventShim("loadend", { bubbles: false }));
+      }
+      send(body) {
+        const reqOpts = {
+          method: this._method,
+          headers: this._headers,
+          body,
+          credentials: this.withCredentials ? "include" : "same-origin",
+        };
+        if (!this._async) {
+          try {
+            const response = netFetch(this._url, reqOpts);
+            this._applyResponse(response);
+          } catch (error) {
+            this._applyError();
+          }
+          return;
+        }
+        netFetchAsync(this._url, reqOpts).then(
+          (response) => { this._applyResponse(response); },
+          (_error) => { this._applyError(); },
+        );
+      }
+      abort() {
+        this.readyState = 0;
+        this.dispatchEvent(new EventShim("abort", { bubbles: false }));
+        this.dispatchEvent(new EventShim("loadend", { bubbles: false }));
+      }
       getResponseHeader(name) {
         const header = (this._responseHeaders || []).find(([key]) => String(key).toLowerCase() === String(name).toLowerCase());
         return header ? header[1] : null;
       }
       getAllResponseHeaders() { return (this._responseHeaders || []).map(([key, value]) => key + ": " + value).join("\r\n"); }
     };
+    Object.assign(win.XMLHttpRequest, { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 });
+    Object.assign(win.XMLHttpRequest.prototype, { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 });
     // Attach the content environment to every node created from here on.
     env.win = win;
 
     return env;
   }
 
-  // The pump: settle microtasks, run timers due inside a small real-time window,
-  // flush animation frames, and decide from the contract. The run ends on
-  // content (visible text at the target), quiescence (nothing mutating, no timer
-  // due soon), or the lane's wall clock. Never on a guess about rendering.
-  function contentPump(env) {
+  // Async event-loop pump for Content Mode: settles microtasks, yields via
+  // non-blocking `op_sleep_async` so concurrent HTTP/2 fetches and ES module
+  // graph loads make progress, runs due timers and animation frames, and stops
+  // as soon as substantive content arrives or the app reaches quiescence.
+  function isEngineBusy() {
+    const activeMods = typeof ops.op_active_loads === "function" ? ops.op_active_loads() : 0;
+    return (M.inFlight || 0) + activeMods > 0;
+  }
+
+  async function contentPumpAsync(env, effectiveTarget) {
     const doc = env.doc;
-    const target = Math.max(1, Number(M.page.textTarget) || 200);
+    const target = Math.max(1, Number(effectiveTarget) || Number(M.page.textTarget) || 200);
     const deadline = Math.max(200, Number(M.page.deadlineMs) || 2500);
     const overBudget = () => ops.op_now() - M.started >= deadline;
     let quiet = 0;
-    for (let round = 0; round < 600; round++) {
-      if (overBudget()) return "budget";
+    let postTargetQuiet = 0;
+    let postTargetBusyTicks = 0;
+    while (!overBudget()) {
       const mutationsBefore = doc._mutations;
       const requestsBefore = M.transcript.length;
       settle();
-      runTimers(env);
+      await Promise.resolve();
+      await runTimersAsync(env, target);
       flushFrames(env);
       settle();
-      if (visibleText(doc).length >= target) return "content";
+      await Promise.resolve();
+      const busy = isEngineBusy();
       const mutated = doc._mutations !== mutationsBefore || M.transcript.length !== requestsBefore;
-      const dueSoon = env.timers.some((timer) => !timer.cancelled && timer.at - ops.op_now() <= 1000);
-      if (!mutated && !dueSoon) {
-        if (++quiet >= 3) return "quiescent";
-      } else quiet = 0;
+      const textLen = mainVisibleText(doc).length;
+      if (textLen >= target) {
+        if (!busy) {
+          if (target < 200 || textLen >= 1200) {
+            return "content";
+          }
+          if (!mutated && ++postTargetQuiet >= 2) {
+            return "content";
+          }
+          if (mutated) postTargetQuiet = 0;
+          await ops.op_sleep_async(15);
+          continue;
+        }
+        if (++postTargetBusyTicks >= 24) {
+          return "content";
+        }
+        await ops.op_sleep_async(25);
+        continue;
+      }
+      postTargetQuiet = 0;
+      if (busy) {
+        quiet = 0;
+        await ops.op_sleep_async(15);
+        continue;
+      }
+      const now = ops.op_now();
+      let nextDueWait = null;
+      for (const timer of env.timers) {
+        if (!timer.cancelled && !timer.repeat) {
+          const wait = timer.at - now;
+          if (wait <= 1000 && (nextDueWait === null || wait < nextDueWait)) {
+            nextDueWait = wait;
+          }
+        }
+      }
+      if (!mutated && nextDueWait === null) {
+        if (++quiet >= 4) return "quiescent";
+        await ops.op_sleep_async(8);
+      } else {
+        quiet = 0;
+        const sleepMs = nextDueWait !== null && !mutated
+          ? Math.min(50, Math.max(5, Math.ceil(nextDueWait)))
+          : 4;
+        await ops.op_sleep_async(sleepMs);
+      }
     }
     return "budget";
   }
 
-  function runTimers(env) {
-    for (let fired = 0; fired < 500; fired++) {
+  async function runTimersAsync(env, target) {
+    const sliceStart = ops.op_now();
+    const firedRepeats = new Set();
+    for (let fired = 0; fired < 120; fired++) {
       if (ops.op_now() - M.started >= (Number(M.page.deadlineMs) || 2500)) return;
-      const live = env.timers.filter((timer) => !timer.cancelled).sort((a, b) => a.at - b.at);
+      if (ops.op_now() - sliceStart >= 80) return;
+      if (target && mainVisibleText(env.doc).length >= (target < 200 ? target : Math.max(target, 1200)) && !isEngineBusy()) return;
+      const live = env.timers.filter((timer) => !timer.cancelled && !(timer.repeat && firedRepeats.has(timer.id))).sort((a, b) => a.at - b.at);
       if (!live.length) return;
       const next = live[0];
       const wait = next.at - ops.op_now();
-      if (wait > 250) return;
-      if (wait > 0) ops.op_sleep(Math.ceil(wait));
-      const due = env.timers.filter((timer) => !timer.cancelled && timer.at <= ops.op_now() + 0.5);
+      if (wait > 120) return;
+      if (wait > 0) await ops.op_sleep_async(Math.ceil(wait));
+      const due = env.timers.filter((timer) => !timer.cancelled && !(timer.repeat && firedRepeats.has(timer.id)) && timer.at <= ops.op_now() + 0.5);
       for (const timer of due) {
-        if (timer.repeat) timer.at = ops.op_now() + timer.every;
-        else timer.cancelled = true;
-        try { timer.fn.apply(null, timer.args); } catch (error) { note("log", "timer: " + (error && (error.stack || error.message))); }
+        if (timer.repeat) {
+          firedRepeats.add(timer.id);
+          timer.at = ops.op_now() + timer.every;
+        } else {
+          timer.cancelled = true;
+        }
+        try {
+          if (typeof timer.fn === "function") timer.fn.apply(null, timer.args);
+        } catch (error) {
+          note("log", "timer: " + (error && (error.stack || error.message)));
+        }
         settle();
       }
     }
@@ -4838,15 +5722,22 @@
     }
   }
 
-  globalThis.__v5Content = function () {
+  globalThis.__v5ContentAsync = async function () {
     try {
+      if (typeof core.setUnhandledPromiseRejectionHandler === "function") {
+        core.setUnhandledPromiseRejectionHandler((_promise, reason) => {
+          note("log", "unhandled rejection: " + (reason && (reason.stack || reason.message || reason)));
+          return true;
+        });
+      }
       try { delete globalThis.Deno; } catch (error) { /* checked below */ }
       if (typeof globalThis.Deno !== "undefined") throw new Error("engine: Deno is reachable from the page");
       const page = JSON.parse(ops.op_page());
       guardWebAssembly(page.wasmBudget || 128 * 1024 * 1024);
       M = {
         jar: new Map(), surfaces: new Set(), logs: [], loader: null, loaded: new Set(),
-        started: ops.op_now(), page, mode: "content", transcript: [], transcriptBytes: 0, transcriptRequestBytes: 0,
+        started: ops.op_now(), page, mode: "content", inFlight: 0,
+        transcript: [], transcriptBytes: 0, transcriptRequestBytes: 0,
       };
       try {
         const pageHost = new URL(page.url).hostname;
@@ -4857,37 +5748,87 @@
       } catch (error) { note("log", "seed jar: " + (error && error.message)); }
 
       const env = makeContentEnvironment(page);
+      M.env = env;
       M.doc = env.doc;
-      // The preload pass runs on the lane's own threads, underneath this run;
-      // the host waits per URL through op_prefetch_wait.
       M.prefetch = !!page.prefetch;
       note("log", "prefetch " + (M.prefetch ? "on" : "off"));
-      env.runScript = (element) => {
-        const type = (element.getAttribute("type") || "").toLowerCase();
+
+      const fireScriptLoad = (element) => {
+        try {
+          element.dispatchEvent(new env.win.Event("load", { bubbles: false }));
+        } catch (error) {
+          note("log", "script onload: " + (error && error.message));
+        }
+      };
+
+      const runScriptElementAsync = async (element) => {
+        const type = (element.getAttribute("type") || "").toLowerCase().trim();
+        const baseHref = env.doc.baseURI || page.baseUrl || M.page.url;
         if (type === "module") {
           note("surface", "script.module");
           const src = element.getAttribute("src");
           if (src) {
             let absolute = src;
-            try { absolute = new URL(src, M.page.url).href; } catch (error) { /* as given */ }
-            importAbsolute(absolute);
-          } else if ((element.textContent || "").trim()) {
-            evaluateModuleSource(element.textContent, M.page.url + "#module-" + (++INLINE_MODULE));
+            try { absolute = new URL(src, baseHref).href; } catch (error) { /* as given */ }
+            M.inFlight = (M.inFlight || 0) + 1;
+            try {
+              await import(absolute);
+            } catch (error) {
+              const msg = String((error && (error.message || error)) || "");
+              note("log", "module " + String(absolute).slice(0, 100) + ": " + msg);
+              if (error && (error.name === "SyntaxError" || msg.indexOf("export") >= 0)) {
+                importAbsolute(absolute);
+              }
+            } finally {
+              M.inFlight = Math.max(0, (M.inFlight || 1) - 1);
+            }
+          } else {
+            const inlineCode = (element.textContent || "").trim();
+            if (inlineCode) {
+              let inlineUrl = M.page.url + "#__v5_inline_" + (++INLINE_MODULE);
+              try {
+                inlineUrl = new URL("__v5_inline_" + INLINE_MODULE + ".mjs", baseHref).href;
+              } catch (e) {}
+              ops.op_register_inline_module(inlineUrl, inlineCode);
+              M.inFlight = (M.inFlight || 0) + 1;
+              try {
+                await import(inlineUrl);
+              } catch (error) {
+                const msg = String((error && (error.message || error)) || "");
+                note("log", "inline module: " + msg);
+                if (error && (error.name === "SyntaxError" || msg.indexOf("export") >= 0)) {
+                  evaluateModuleSource(inlineCode, inlineUrl);
+                }
+              } finally {
+                M.inFlight = Math.max(0, (M.inFlight || 1) - 1);
+              }
+            }
           }
-          if (element.onload) { try { element.onload(); } catch (error) { note("log", "script onload: " + (error && error.message)); } }
+          fireScriptLoad(element);
           return;
         }
-        if (type && !/^(text|application)\/(javascript|ecmascript)$/.test(type)) { note("log", "script type " + type + " skipped"); return; }
+        if (element.hasAttribute("nomodule")) {
+          note("log", "script nomodule skipped");
+          return;
+        }
+        if (type && !/^(text|application)\/(javascript|ecmascript|x-javascript)$/.test(type)) {
+          note("log", "script type " + type + " skipped");
+          return;
+        }
         const src = element.getAttribute("src");
         if (src) {
           let absolute = src;
-          try { absolute = new URL(src, M.page.url).href; } catch (error) { /* as given */ }
+          try { absolute = new URL(src, baseHref).href; } catch (error) { /* as given */ }
           if (M.loaded.has(absolute)) return;
           M.loaded.add(absolute);
-          const parsed = loadScript(absolute);
+          const parsed = await loadScriptAsync(absolute);
           note("log", "script " + absolute.slice(0, 70) + " -> " + (parsed.error || parsed.status) + " " + String(parsed.body || "").length);
-          if (!parsed.error) { M.doc.currentScript = element; runScript(parsed.body, absolute); M.doc.currentScript = null; }
-          if (element.onload) { try { element.onload(); } catch (error) { note("log", "script onload: " + (error && error.message)); } }
+          if (!parsed.error) {
+            M.doc.currentScript = element;
+            runScript(parsed.body, absolute);
+            M.doc.currentScript = null;
+          }
+          fireScriptLoad(element);
         } else if ((element.textContent || "").trim()) {
           M.doc.currentScript = element;
           runScript(element.textContent, M.page.url);
@@ -4895,23 +5836,39 @@
         }
       };
 
+      env.runScript = (element) => {
+        runScriptElementAsync(element).catch((error) => {
+          note("log", "dynamic script: " + (error && error.message));
+        });
+      };
+
       // Build the document tree (html5ever parsed it on the Rust side).
       const tree = JSON.parse(ops.op_parse_html(page.html, "document"));
       if (tree && tree.error) throw new Error(tree.error);
-      const build = (spec) => {
-        if (typeof spec === "string") return env.doc.createTextNode(spec);
-        const element = env.doc.createElement(spec[0]);
-        const attributes = spec[1] || {};
-        for (const name of Object.keys(attributes)) element._attrs.set(name, String(attributes[name]));
-        for (let index = 2; index < spec.length; index++) {
-          const child = build(spec[index]);
-          if (child) { child.parentNode = element; element.childNodes.push(child); }
-        }
-        return element;
-      };
-      const html = build(tree);
-      if (html.tagName !== "HTML") throw new Error("engine: parsed document has no html element");
       const doc = env.doc;
+      const html = doc.createElement(tree[0]);
+      const rootAttrs = tree[1] || {};
+      for (const name of Object.keys(rootAttrs)) html._attrs.set(name, String(rootAttrs[name]));
+      for (let index = 2; index < tree.length; index++) {
+        const child = doc.adoptNode(
+          (function buildInitial(spec) {
+            if (typeof spec === "string") return doc.createTextNode(spec);
+            const tag = String(spec[0]);
+            if (tag === "#comment") return doc.createComment(spec[2] !== undefined ? spec[2] : "");
+            const el = doc.createElement(tag);
+            const attrs = spec[1] || {};
+            for (const k of Object.keys(attrs)) el._attrs.set(k, String(attrs[k]));
+            const target = el._templateContent || el;
+            for (let i = 2; i < spec.length; i++) {
+              const ch = buildInitial(spec[i]);
+              if (ch) { ch.parentNode = target; target.childNodes.push(ch); }
+            }
+            return el;
+          })(tree[index]),
+        );
+        if (child) { child.parentNode = html; html.childNodes.push(child); }
+      }
+      if (html.tagName !== "HTML") throw new Error("engine: parsed document has no html element");
       doc.documentElement = html;
       html.parentNode = doc;
       doc.childNodes = [html];
@@ -4963,67 +5920,58 @@
       globalThis.ResizeObserver = env.win.ResizeObserver;
       globalThis.Event = env.win.Event;
       globalThis.CustomEvent = env.win.CustomEvent;
+      globalThis.MessageChannel = env.win.MessageChannel;
+      globalThis.Worker = env.win.Worker;
+      globalThis.console = env.win.console;
       globalThis.chrome = env.win.chrome;
+      try {
+        Object.defineProperty(globalThis, "constructor", { value: env.win.Window, writable: true, configurable: true });
+      } catch (e) {}
 
-      // The contract decides before any program runs: a document whose own text
-      // already passes needs no JS, and every request it would have made is a
-      // cost paid for nothing.
+      const initialMainLen = mainVisibleText(doc).length;
       const startTarget = Math.max(1, Number(page.textTarget) || 200);
+      const mustRun = !!page.forceHydrate || initialMainLen < startTarget;
+      const effectiveTarget = (page.forceHydrate && initialMainLen >= startTarget)
+        ? initialMainLen + 120
+        : startTarget;
       let stop;
-      if (visibleText(doc).length >= startTarget) {
+      if (!mustRun) {
         stop = "content";
         note("log", "contract met on the served document, no program run");
       } else {
-      // Run the initial document's own scripts in document order; stylesheets
-      // are requested where a browser would request them (before the scripts
-      // that follow). Module scripts are the measured M2 gap: logged, not run.
-      const order = [];
-      (function walk(node) {
-        for (const child of node.childNodes) {
-          if (child.nodeType !== 1) continue;
-          const tag = child.tagName;
-          if (tag === "LINK") {
-            const rel = (child.getAttribute("rel") || "").toLowerCase();
-            if (rel.split(/\s+/).includes("stylesheet") && child.getAttribute("href")) order.push({ kind: "style", element: child });
-          } else if (tag === "SCRIPT") {
-            order.push({ kind: "script", element: child });
+        const classicQueue = [];
+        const deferQueue = [];
+        const moduleQueue = [];
+        for (const scriptEl of doc.scripts.slice()) {
+          const type = (scriptEl.getAttribute("type") || "").toLowerCase().trim();
+          if (type === "module") {
+            moduleQueue.push(scriptEl);
+          } else if (scriptEl.hasAttribute("src") && scriptEl.hasAttribute("defer") && !scriptEl.hasAttribute("async")) {
+            deferQueue.push(scriptEl);
+          } else {
+            classicQueue.push(scriptEl);
           }
-          walk(child);
         }
-      })(html);
-      env.armed = true;
-      // Module scripts are deferred by the spec: classic scripts run first, then
-      // the module graph in document order (this whole run is post-parse, so
-      // deferral is just which queue runs last).
-      const moduleQueue = [];
-      for (const item of order) {
-        if (item.kind === "style") {
-          const href = item.element.getAttribute("href");
-          try {
-            const response = netFetch(href, { __dest: "style", mode: "no-cors", credentials: "include", headers: { accept: "text/css,*/*;q=0.1" } });
-            note("log", "style " + String(href).slice(0, 70) + " -> " + response.status);
-          } catch (error) { note("log", "style " + String(href).slice(0, 70) + ": " + (error && error.message)); }
-        } else if ((item.element.getAttribute("type") || "").toLowerCase() === "module") {
-          moduleQueue.push(item.element);
-        } else {
-          env.runScript(item.element);
-        }
-      }
-      for (const element of moduleQueue) env.runScript(element);
-      settle();
-      doc.readyState = "interactive";
-      doc.dispatchEvent({ type: "readystatechange", bubbles: false });
-      doc.dispatchEvent({ type: "DOMContentLoaded", bubbles: true });
-      doc.readyState = "complete";
-      env.win.dispatchEvent({ type: "load", bubbles: false });
-      env.win.dispatchEvent({ type: "pageshow", bubbles: false });
+        env.armed = true;
+        for (const element of classicQueue) await runScriptElementAsync(element);
+        for (const element of deferQueue) await runScriptElementAsync(element);
+        for (const element of moduleQueue) await runScriptElementAsync(element);
+        settle();
+        await Promise.resolve();
+        doc.readyState = "interactive";
+        doc.dispatchEvent(new env.win.Event("readystatechange", { bubbles: false }));
+        doc.dispatchEvent(new env.win.Event("DOMContentLoaded", { bubbles: true }));
+        doc.readyState = "complete";
+        doc.dispatchEvent(new env.win.Event("readystatechange", { bubbles: false }));
+        env.win.dispatchEvent(new env.win.Event("load", { bubbles: false }));
+        env.win.dispatchEvent(new env.win.PageTransitionEvent("pageshow", { bubbles: false, persisted: false }));
 
-      stop = contentPump(env);
-      settle();
+        stop = await contentPumpAsync(env, effectiveTarget);
+        settle();
+        await Promise.resolve();
       }
 
-      // Serialize the tree the program built. Past the cap the run is an honest
-      // failure, never a truncated document.
+      // Serialize the tree the program built (including Shadow DOM content).
       const cap = Number(M.page.documentCap) || 16 * 1024 * 1024;
       const pieces = ["<!DOCTYPE html>"];
       let size = 0;
@@ -5033,7 +5981,7 @@
         size += text.length;
         if (size > cap) { tooLarge = true; return; }
         pieces.push(text);
-      }, 0);
+      }, 0, true);
       if (tooLarge) {
         ops.op_result(JSON.stringify({ error: "document exceeds the lane cap of " + (cap >> 20) + " MB", stop: "error" }));
         return;
@@ -5063,4 +6011,5 @@
       } catch (inner) { /* the op refused or V8 is being torn down */ }
     }
   };
+  globalThis.__v5Content = globalThis.__v5ContentAsync;
 })();

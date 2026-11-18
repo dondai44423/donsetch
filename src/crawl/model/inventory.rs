@@ -66,6 +66,7 @@ pub async fn collect(fetch: &PageFetcher, opts: &InventoryOptions<'_>) -> Invent
     let mut c = Collector {
         fetch,
         opts,
+        redirected_seed: None,
         urls: BTreeMap::new(),
         sources: BTreeMap::new(),
         requests: 0,
@@ -117,6 +118,7 @@ pub async fn collect(fetch: &PageFetcher, opts: &InventoryOptions<'_>) -> Invent
 struct Collector<'a> {
     fetch: &'a PageFetcher,
     opts: &'a InventoryOptions<'a>,
+    redirected_seed: Option<Url>,
     urls: BTreeMap<String, InvUrl>,
     sources: BTreeMap<String, usize>,
     requests: usize,
@@ -191,7 +193,13 @@ impl<'a> Collector<'a> {
             return false;
         }
         let u = frontier::canonical_scheme(&u, self.opts.seed);
-        if self.opts.same_host && !same_host(&u, self.opts.seed) {
+        if self.opts.same_host
+            && !same_host(&u, self.opts.seed)
+            && !self
+                .redirected_seed
+                .as_ref()
+                .is_some_and(|redir| same_host(&u, redir))
+        {
             self.filtered.other += 1;
             return false;
         }
@@ -416,6 +424,28 @@ impl<'a> Collector<'a> {
             Some(p) => p.clone(),
             None if add_missing => match self.get(self.opts.seed.as_str()).await {
                 Some(p) => p,
+                None if Instant::now() < self.opts.deadline && !self.deadline_hit => {
+                    // When a sitemap index spent the probing budget without
+                    // yielding any in-scope URLs, still grant the 1 seed
+                    // fallback fetch promised by the inventory model.
+                    self.requests += 1;
+                    let page = (self.fetch)(
+                        self.opts.seed.as_str().to_string(),
+                        "direct".to_string(),
+                        None,
+                        None,
+                    )
+                    .await;
+                    if page
+                        .error_hint
+                        .as_deref()
+                        .is_some_and(|e| e.contains("deadline"))
+                        || Instant::now() >= self.opts.deadline
+                    {
+                        self.deadline_hit = true;
+                    }
+                    page
+                }
                 None => return,
             },
             // A label pass never spends an inventory request.
@@ -431,6 +461,11 @@ impl<'a> Collector<'a> {
         }
         let html = text_of(&page);
         let base = Url::parse(&page.url).unwrap_or_else(|_| self.opts.seed.clone());
+        if base.host_str() != self.opts.seed.host_str()
+            && crate::fetch::guards::validate_url_basic(&page.url).is_ok()
+        {
+            self.redirected_seed = Some(base.clone());
+        }
         // Scraper's Html/Selector are not Send: extract every href inside a
         // synchronous block and drop the document before the feed await.
         let (links, feed_href) = {

@@ -571,7 +571,17 @@ impl Worker {
         attempts: &mut Vec<Attempt>,
         spent_state: bool,
     ) -> Option<Outcome> {
-        let (contract, _values) = self.state.contract_any(host, &document.url)?;
+        let doc_host = url::Url::parse(&document.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_else(|| host.to_string());
+        let (contract_host, contract) =
+            if let Some((c, _)) = self.state.contract_any(&doc_host, &document.url) {
+                (doc_host, c)
+            } else {
+                let (c, _) = self.state.contract_any(host, &document.url)?;
+                (host.to_string(), c)
+            };
         // The contract is bound to the identity that mined it: the document may
         // have been fetched by another client, but the app's own request is
         // replayed on the wire and jar that witnessed it.
@@ -582,8 +592,11 @@ impl Worker {
         }
         let (request_url, headers, body) = contract.materialize(&document.url, &document.url)?;
         let limits = options.content.clone();
-        let guard =
-            crate::envelope::Guard::with_policy(limits.clone(), host, options.allow_private);
+        let guard = crate::envelope::Guard::with_policy(
+            limits.clone(),
+            &contract_host,
+            options.allow_private,
+        );
         if let Err(error) = guard.check_url(&request_url) {
             attempts.push(Attempt {
                 identity: identity.name.to_string(),
@@ -597,7 +610,7 @@ impl Worker {
                 note: Some(format!("replay: {error}")),
             });
             self.state
-                .drop_contract(host, identity.name, &contract.shape);
+                .drop_contract(&contract_host, identity.name, &contract.shape);
             return None;
         }
         let Ok(wire) = Wire::guarded(identity, &guard, self.proxy.as_deref()) else {
@@ -658,8 +671,13 @@ impl Worker {
         match response {
             Ok(response) if (200..300).contains(&response.status) => {
                 let body_text = &response.body;
-                match contract.extract(body_text, &request_url) {
-                    Some(items) => {
+                match contract.extract_payload(
+                    body_text,
+                    &request_url,
+                    &document.url,
+                    &contract_host,
+                ) {
+                    Some(payload) => {
                         attempts.push(Attempt {
                             identity: identity.name.to_string(),
                             transport: "replay".to_string(),
@@ -668,28 +686,29 @@ impl Worker {
                             ms,
                             bytes: response.body.len(),
                             version: response.version.clone(),
-                            title: items
-                                .first()
-                                .map(|item| item.title.clone())
-                                .unwrap_or_default(),
+                            title: payload.title.clone(),
                             note: Some(format!(
-                                "replay: {} items (min {}) from {} {safe_url}, shape {}",
-                                items.len(),
+                                "replay ({:?}): {} items (min {}) from {} {safe_url}, shape {}",
+                                contract.kind,
+                                payload.items,
                                 contract.min_items,
                                 contract.method,
                                 contract.shape
                             )),
                         });
                         if self.persist {
-                            self.state.record(host, identity.name, "content", true, ms);
                             self.state
-                                .record_contract(host, identity.name, &contract.shape, true);
-                            self.state.origin_mut(host).route = Some("replay".into());
+                                .record(&contract_host, identity.name, "content", true, ms);
+                            self.state.record_contract(
+                                &contract_host,
+                                identity.name,
+                                &contract.shape,
+                                true,
+                            );
+                            self.state.origin_mut(&contract_host).route = Some("replay".into());
                             self.save_state();
                         }
-                        let text_chars: usize =
-                            items.iter().map(|item| item.title.chars().count()).sum();
-                        let rendered = crate::mine::render(host, &items);
+                        let rendered = payload.html;
                         return Some(Outcome {
                             url: url.to_string(),
                             cache: None,
@@ -703,13 +722,13 @@ impl Worker {
                             ms_total: started.elapsed().as_secs_f64() * 1000.0,
                             ms_first: first_ms,
                             attempts: std::mem::take(attempts),
-                            title: format!("replay {host}"),
-                            text_chars,
+                            title: payload.title,
+                            text_chars: payload.text_chars,
                             wall: None,
                             evidence: vec![
                                 format!(
                                     "replay: {} items from {} {safe_url} (mined contract, shape {})",
-                                    items.len(),
+                                    payload.items,
                                     contract.method,
                                     contract.shape
                                 ),
@@ -721,20 +740,15 @@ impl Worker {
                             failures: Vec::new(),
                             spent_state: spent_state || cookie.is_some(),
                             transport: "replay".to_string(),
-                            items: items.len(),
-                            sample: items
-                                .iter()
-                                .take(5)
-                                .map(|item| item.title.clone())
-                                .collect(),
-                            sample_urls: items
-                                .iter()
-                                .filter_map(|item| item.url.clone())
-                                .take(5)
-                                .collect(),
+                            items: payload.items,
+                            sample: payload.sample,
+                            sample_urls: payload.sample_urls,
                             body: options.capture_body.then(|| rendered.clone()),
                             body_text: rendered,
-                            headers: Vec::new(),
+                            headers: vec![(
+                                "content-type".to_string(),
+                                "text/html; charset=utf-8".to_string(),
+                            )],
                             bytes: None,
                         });
                     }
@@ -745,7 +759,7 @@ impl Worker {
                             break_note("the answer no longer has the mined shape".into()),
                         );
                         self.state
-                            .drop_contract(host, identity.name, &contract.shape);
+                            .drop_contract(&contract_host, identity.name, &contract.shape);
                     }
                 }
             }
@@ -756,12 +770,12 @@ impl Worker {
                     break_note(format!("status {} broke the contract", response.status)),
                 );
                 self.state
-                    .drop_contract(host, identity.name, &contract.shape);
+                    .drop_contract(&contract_host, identity.name, &contract.shape);
             }
             Err(error) => {
                 fail(attempts, 0, break_note(format!("request failed: {error}")));
                 self.state
-                    .drop_contract(host, identity.name, &contract.shape);
+                    .drop_contract(&contract_host, identity.name, &contract.shape);
             }
         }
         None
@@ -807,6 +821,86 @@ impl Worker {
                 spent_state,
             ) {
                 return Some(outcome);
+            }
+            // Stage 0: Zero-JS Universal Inline State Materializer.
+            // When the shell HTML already embeds full structured state (such as
+            // `window.__appData`, `data-page`, or populated script JSON), render
+            // semantic HTML directly in sub-millisecond time without booting V8.
+            let inline_started = Instant::now();
+            if let Some(inline) =
+                crate::hydrate::materialize_inline_state(&response.body, &response.url)
+            {
+                let content = crate::contract::verify_response(
+                    200,
+                    &[],
+                    &inline.html,
+                    &response.url,
+                    contract,
+                    generic,
+                );
+                if content.passed {
+                    let inline_ms = inline_started.elapsed().as_secs_f64() * 1000.0;
+                    let html_headers = vec![(
+                        "content-type".to_string(),
+                        "text/html; charset=utf-8".to_string(),
+                    )];
+                    attempts.push(Attempt {
+                        identity: identity.name.to_string(),
+                        transport: "program".to_string(),
+                        class: Class::Content,
+                        status: 200,
+                        ms: inline_ms,
+                        bytes: inline.html.len(),
+                        version: String::new(),
+                        title: content.title.clone(),
+                        note: Some(format!(
+                            "inline state ({}): {} text chars, 0 JS",
+                            inline.source_name, content.text_chars
+                        )),
+                    });
+                    if self.persist {
+                        self.state
+                            .record(host, identity.name, "content", true, inline_ms);
+                        self.save_state();
+                    }
+                    let cookie = self.state.cookie_header_for(&response.url, identity.name);
+                    self.captured = Some(Captured {
+                        identity: identity.name,
+                        final_url: response.url.clone(),
+                        status: 200,
+                        headers: html_headers.clone(),
+                        bytes: inline.html.clone().into_bytes(),
+                        cookie,
+                        revalidated: None,
+                    });
+                    let mut outcome = answer(
+                        url,
+                        host.to_string(),
+                        response,
+                        Class::Content,
+                        identity.name,
+                        Ended {
+                            started,
+                            first_ms,
+                            attempts: std::mem::take(attempts),
+                            spent_state,
+                            capture: options.capture_body,
+                        },
+                    );
+                    outcome.title = content.title;
+                    outcome.text_chars = content.text_chars;
+                    outcome.transport = "program".to_string();
+                    outcome.evidence.push(format!(
+                        "inline state materialized from {} in {:.2} ms ({} text chars, 0 V8)",
+                        inline.source_name, inline_ms, content.text_chars
+                    ));
+                    if options.capture_body {
+                        outcome.body = Some(inline.html);
+                        outcome.headers = html_headers;
+                        outcome.bytes = None;
+                    }
+                    return Some(outcome);
+                }
             }
         }
         let lane_started = Instant::now();
@@ -861,12 +955,27 @@ impl Worker {
         // What the program stored is the identity's own state, bound to it.
         self.state
             .store_cookies(host, identity.name, lane.cookies.clone());
+        // Dual-Plane Fusion: when the rendered DOM is graphical/collapsed/partial
+        // (e.g. SVG dependency graphs, collapsed OpenAPI specs, or unmounted
+        // fragments), fuse verified 2xx data responses from the wire transcript.
+        let (produced_document, synth_note) = if !has_custom_predicates {
+            match crate::synthesize::fuse_dom_and_transcript(
+                &lane.document,
+                &response.url,
+                &lane.transcript,
+            ) {
+                Some(fused) => (fused.html, Some(fused.note)),
+                None => (lane.document.clone(), None),
+            }
+        } else {
+            (lane.document.clone(), None)
+        };
         // The produced document is verified by the same contract a network
         // document answers, with no header facts to lean on.
         let content = crate::contract::verify_response(
             200,
             &[],
-            &lane.document,
+            &produced_document,
             &response.url,
             contract,
             generic,
@@ -881,14 +990,18 @@ impl Worker {
             },
             status: 200,
             ms: lane_ms,
-            bytes: lane.document.len(),
+            bytes: produced_document.len(),
             version: String::new(),
             title: content.title.clone(),
             note: Some(format!(
-                "content lane: stop={} {} text chars, {} requests{}",
+                "content lane: stop={} {} text chars, {} requests{}{}",
                 lane.stop,
-                lane.text_chars,
+                content.text_chars,
                 lane.transcript.len(),
+                synth_note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default(),
                 if content.passed {
                     String::new()
                 } else {
@@ -913,14 +1026,15 @@ impl Worker {
         // that assembled it so every later encounter answers without JS. The
         // request URL is not printed: it may carry the app's own key.
         let mined = crate::mine::mine(
-            &lane.document,
+            &produced_document,
             &response.url,
             identity.name,
             &lane.transcript,
         );
         let mined_note = mined.as_ref().map(|contract| {
             format!(
-                "mined replay contract: {} ({} response, shape {}), at least {} items",
+                "mined replay contract ({:?}): {} ({} response, shape {}), at least {} items",
+                contract.kind,
                 contract.method,
                 contract.array_path.join("."),
                 contract.shape,
@@ -928,23 +1042,31 @@ impl Worker {
             )
         });
         let mined_ok = mined.is_some();
+        let mined_host = mined.as_ref().map(|c| c.host.clone());
         if let Some(contract) = mined {
             self.state.store_contract(contract);
         }
+        let html_headers = vec![(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
         // The page cache keeps the produced page under the identity and egress
         // that produced it, through the same capture the network path uses.
         self.captured = Some(Captured {
             identity: identity.name,
             final_url: response.url.clone(),
             status: 200,
-            headers: Vec::new(),
-            bytes: lane.document.clone().into_bytes(),
+            headers: html_headers.clone(),
+            bytes: produced_document.clone().into_bytes(),
             cookie: cookie.clone(),
             revalidated: None,
         });
         if self.persist {
             if let Some(origin) = self.state.origins.get_mut(host).map(Arc::make_mut) {
                 origin.route = mined_ok.then(|| "replay".to_string());
+            }
+            if let Some(mh) = mined_host.as_deref().filter(|mh| *mh != host) {
+                self.state.origin_mut(mh).route = Some("replay".to_string());
             }
             self.save_state();
         }
@@ -971,10 +1093,13 @@ impl Worker {
         ));
         outcome.evidence.push(format!(
             "produced document: {} text chars, {} B, {} requests",
-            lane.text_chars,
-            lane.document.len(),
+            content.text_chars,
+            produced_document.len(),
             lane.transcript.len()
         ));
+        if let Some(note) = synth_note {
+            outcome.evidence.push(note);
+        }
         if let Some(note) = mined_note {
             outcome.evidence.push(note);
         }
@@ -985,8 +1110,8 @@ impl Worker {
         }
         if options.capture_body {
             // The body a caller inspects is the produced document, not the shell.
-            outcome.body = Some(lane.document);
-            outcome.headers = Vec::new();
+            outcome.body = Some(produced_document);
+            outcome.headers = html_headers;
             outcome.bytes = None;
         }
         Some(outcome)

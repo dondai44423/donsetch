@@ -388,3 +388,50 @@ fn filter_counts_add_up() {
     };
     assert_eq!(f.total(), 21);
 }
+
+#[tokio::test]
+async fn a_sitemap_index_with_zero_in_scope_urls_falls_back_to_the_seed() {
+    let seed = "https://registry.example/providers/aws/docs";
+    let idx = "https://registry.example/sitemap.xml";
+    let s1 = "https://registry.example/sitemaps/1.xml";
+    let s2 = "https://registry.example/sitemaps/2.xml";
+    let s3 = "https://registry.example/sitemaps/3.xml";
+    let s4 = "https://registry.example/sitemaps/4.xml";
+    let seed_html = r#"<html><body>
+        <a href="/providers/aws/docs/overview">Overview</a>
+        <a href="/providers/aws/docs/guides/vpc">VPC Guide</a>
+    </body></html>"#;
+    let map = pages(&[
+        (
+            "https://registry.example/providers/aws/llms.txt",
+            404,
+            "not found",
+        ),
+        ("https://registry.example/llms.txt", 404, "not found"),
+        (idx, 200, &index(&[s1, s2, s3, s4])),
+        (
+            s1,
+            200,
+            &urlset(&["https://registry.example/modules/other/a"]),
+        ),
+        (
+            s2,
+            200,
+            &urlset(&["https://registry.example/modules/other/b"]),
+        ),
+        (
+            s3,
+            200,
+            &urlset(&["https://registry.example/modules/other/c"]),
+        ),
+        (
+            s4,
+            200,
+            &urlset(&["https://registry.example/modules/other/d"]),
+        ),
+        (seed, 200, seed_html),
+    ]);
+    let (out, _hits) = run(seed, map, robots(&[idx]), options()).await;
+    assert_eq!(out.inventory.source, "seed-links");
+    assert_eq!(out.summary.urls, 2, "{:?}", out.summary);
+}

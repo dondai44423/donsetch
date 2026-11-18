@@ -35,9 +35,9 @@ Each profile bundles TLS, HTTP/2 settings, header set/order, and client hints. W
 | Challenge | Runs a challenge page's scripts on the same wire identity | Minted credential or form navigation to spend and re-classify |
 | Content | Runs an app shell's scripts against a data-plane DOM (skipped if the HTML already passes) | Assembled HTML verified against the content contract |
 
-No browser process, CSS cascade, layout, or raster runs here. When a content run passes, `mine.rs` extracts the underlying JSON request whose records appear in the assembled page and saves a URL-templated contract per `(host, identity, URL shape)`. Subsequent visits replay that HTTP request before touching V8, dropping and re-mining on schema drift or refusal.
+No browser process, CSS cascade, layout, or raster runs here. Before booting V8 on an app shell (`hydrate.rs`), Stage 0 extracts inline JSON/attribute/Apollo state directly into semantic HTML without JavaScript. When V8 runs, native ES module loading and multiplexed HTTP/2 subresource calls execute the app's bundle, `synthesize.rs` fuses verified `2xx` wire payloads into graphical or collapsed DOMs, and `mine.rs` learns `Collection`, `EntityJson`, or `HtmlFragment` request blueprints per `(host, identity, URL shape)` so sibling visits replay plain HTTP without touching V8.
 
-Outside page code, `envelope.rs` enforces hard limits: 256 MB JS heap, 128 MB typed-array store, 128 MB WebAssembly memory, 96 ops, one active V8 isolate per process, 10 s mint / 5 s content wall ceilings, and full URL/DNS/redirect/size guards.
+Outside page code, `envelope.rs` enforces hard limits: 256 MB JS heap, 128 MB typed-array store, 128 MB WebAssembly memory, 96 mint / 256 content ops, one active V8 isolate per process, 10 s mint / 5 s content wall ceilings, and full URL/DNS/redirect/size guards.
 
 ### State & caching
 

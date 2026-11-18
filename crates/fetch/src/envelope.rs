@@ -96,19 +96,9 @@ impl Limits {
             // is the ceiling for a heavy first boot, not a target: the stop rule is
             // the contract, and the replay removes the cost after the first visit.
             wall: Duration::from_millis(5_000),
-            // Ops are the lane's own host calls, not just network requests: the
-            // same heavy shell spent 70 of them. Under the old 64-op budget its own
-            // requests were refused six short of that, the page stalled, and the run
-            // ended on the wall reporting `budget`; the refusal itself names the cap
-            // in the log. 96 covers the heaviest measured boot with room, and a
-            // content-free shell still stops on the contract long before it.
-            ops_max: 96,
-            // A modern app bundle is the page's own program: the measured
-            // Bluesky Expo bundle is 9.7 MB in one response, over the mint's
-            // 8 MB ceiling. The lane's total stays the same; one response may
-            // be larger because a first boot pays for the program once.
+            ops_max: 256,
             response_body_max: 16 * 1024 * 1024,
-            total_response_max: 48 * 1024 * 1024,
+            total_response_max: 64 * 1024 * 1024,
             ..Self::default()
         }
     }

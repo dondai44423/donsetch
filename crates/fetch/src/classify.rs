@@ -389,11 +389,28 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
     }
 
     for signature in SIGNATURES {
-        if let Some(marker) = signature
-            .markers
-            .iter()
-            .find(|marker| lower.contains(&marker.to_ascii_lowercase()))
-        {
+        if let Some(marker) = signature.markers.iter().find(|marker| {
+            let m_low = marker.to_ascii_lowercase();
+            if !lower.contains(&m_low) {
+                return false;
+            }
+            // Cloudflare injects passive JS Detections (`/cdn-cgi/challenge-platform/scripts/jsd/`)
+            // at the bottom of ordinary 200 OK application pages (including SPAs like Bundlephobia).
+            // Only treat `/cdn-cgi/challenge-platform/` as a challenge on 2xx when real interstitial
+            // markers (`cf_chl_opt`, `__cf_chl`, `/h/`, `just a moment`) are also present.
+            if signature.vendor == "cloudflare"
+                && **marker == "/cdn-cgi/challenge-platform/"
+                && (200..300).contains(&evidence.status)
+                && !lower.contains("/cdn-cgi/challenge-platform/h/")
+                && !lower.contains("cf_chl_opt")
+                && !lower.contains("__cf_chl")
+                && !lower.contains("<title>just a moment")
+                && !lower.contains("performing security verification")
+            {
+                return false;
+            }
+            true
+        }) {
             found.push(format!("{}:{}", signature.vendor, marker));
             if wall.is_none() {
                 let (asks, class) = asks(signature.vendor, &lower);
@@ -525,6 +542,20 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
     let text = text_chars(&lower);
     if scripts >= 3 && text < 400 {
         found.push(format!("shell:scripts={scripts},text={text}"));
+        return Verdict {
+            class: Class::Shell,
+            wall: None,
+            evidence: found,
+        };
+    }
+    let shd = crate::hydrate::assess_html_shell(evidence.body, "");
+    if shd.is_unhydrated_shell {
+        found.push(format!(
+            "shell:{},app_scripts={},main_text={}",
+            shd.reason.unwrap_or("shd"),
+            shd.app_scripts,
+            shd.main_text_chars
+        ));
         return Verdict {
             class: Class::Shell,
             wall: None,

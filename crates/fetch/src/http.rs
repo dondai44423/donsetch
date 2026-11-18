@@ -60,6 +60,27 @@ pub struct Call<'a> {
     pub kind: Kind,
 }
 
+/// Owned request description for concurrent async subresource/module calls.
+pub struct OwnedCall {
+    pub method: String,
+    pub url: String,
+    pub cookie: Option<String>,
+    pub timeout: Duration,
+    pub extra: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub cap: Option<usize>,
+    pub kind: Kind,
+}
+
+/// Cloneable async handle to a `Wire`'s underlying pooled HTTP/2 client.
+#[derive(Clone)]
+pub struct WireHandle {
+    client: wreq::Client,
+    max_body: Option<usize>,
+    guarded: bool,
+    policy: Policy,
+}
+
 /// Chrome's header order for a subresource on HTTP/2, measured from the
 /// reference browser (scripts, `fetch` and XHR). Author headers sit after
 /// `sec-ch-ua-platform`; `origin` sits before the fetch metadata on a request
@@ -689,6 +710,21 @@ impl Wire {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
     }
 
+    /// Cloneable async handle sharing this wire's pooled client and policy.
+    pub fn handle(&self) -> WireHandle {
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        WireHandle {
+            client: self.client.clone(),
+            max_body: self.max_body,
+            guarded: self.guarded,
+            policy,
+        }
+    }
+
     pub fn get(
         &self,
         url: &str,
@@ -915,7 +951,6 @@ impl Wire {
         Err(format!("redirect: more than {REDIRECTS_MAX} redirects"))
     }
 
-    /// One request on the wire, no redirect followed by us.
     /// One request. `timeout` bounds the wait for the response's head and
     /// any silence while its body arrives; `budget` (never less than
     /// `timeout`) bounds the whole exchange.
@@ -925,278 +960,314 @@ impl Wire {
         call: Call<'_>,
         budget: Duration,
     ) -> Result<Response, String> {
-        let Call {
-            method,
-            url,
-            cookie: cookie_header,
-            timeout,
-            extra,
-            body,
-            cap,
-            kind,
-        } = call;
-        let started = Instant::now();
-        let mut headers = HeaderMap::new();
-        let put = |headers: &mut HeaderMap, name: &str, value: &str| {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                headers.insert(name, value);
-            }
-        };
-        let emulation = identity.emulation();
-        // A Chrome subresource is written out whole, in Chrome's order: the
-        // client's defaults are a navigation's header set.
-        let explicit =
-            kind == Kind::Subresource && identity.name.starts_with("chrome") && emulation.is_some();
-        let mut order: Option<wreq::header::OrigHeaderMap> = None;
-        if explicit {
-            let defaults = &emulation.as_ref().expect("checked").headers;
-            for name in [
-                "user-agent",
-                "sec-ch-ua",
-                "sec-ch-ua-mobile",
-                "sec-ch-ua-platform",
-                "accept-language",
-            ] {
-                if let Some(value) = defaults.get(name).and_then(|value| value.to_str().ok()) {
-                    put(&mut headers, name, value);
-                }
-            }
-            put(&mut headers, "accept-encoding", "gzip, deflate, br, zstd");
-            put(&mut headers, "accept", "*/*");
-            put(&mut headers, "priority", "u=1, i");
-            for (name, value) in extra {
-                put(&mut headers, name, value);
-            }
-            // Chrome adds Origin on a CORS GET after the fetch metadata, and on
-            // any request with a body before it.
-            let late_origin =
-                method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
-            let known: Vec<&str> = CHROME_SUBRESOURCE_HEAD
-                .iter()
-                .chain(CHROME_SUBRESOURCE_TAIL.iter())
-                .copied()
-                .collect();
-            let mut ordered = wreq::header::OrigHeaderMap::new();
-            for name in CHROME_SUBRESOURCE_HEAD {
-                ordered.insert(*name);
-            }
-            // Author headers (anything Chrome does not add itself) come next.
-            for (name, _) in extra {
-                let lower = name.to_ascii_lowercase();
-                if !known.contains(&lower.as_str()) && !lower.starts_with("sec-fetch-") {
-                    ordered.insert(lower);
-                }
-            }
-            for name in CHROME_SUBRESOURCE_TAIL {
-                if *name == "origin" && late_origin {
-                    continue;
-                }
-                ordered.insert(*name);
-                if *name == "sec-fetch-dest" && late_origin {
-                    ordered.insert("origin");
-                }
-            }
-            order = Some(ordered);
-        } else {
-            for (name, value) in identity.headers() {
-                if kind == Kind::Subresource && NAVIGATION_ONLY.contains(&name) {
-                    continue;
-                }
-                put(&mut headers, name, value);
-            }
-            for (name, value) in extra {
-                put(&mut headers, name, value);
-            }
-        }
-        if let Some(cookies) = cookie_header {
-            put(&mut headers, "cookie", cookies);
-        }
-        let mut request = self
-            .client
-            .request(
-                wreq::Method::from_bytes(method.as_bytes())
-                    .map_err(|error| format!("request: {error}"))?,
-                url,
-            )
-            .headers(headers)
-            // A backstop only: the exchange below is bounded by `budget` on
-            // its own clock, which says how far a cut transfer got. Equal
-            // ceilings raced, and wreq's (started first) could win with a
-            // bare "operation timed out".
-            .timeout(budget.max(timeout) + WIRE_BACKSTOP_SLACK);
-        if let Some(order) = order {
-            request = request.default_headers(false).orig_headers(order);
-        }
-        if let Some(body) = body {
-            request = request.body(body.to_vec()).header(
-                HeaderName::from_bytes(b"content-length").unwrap(),
-                HeaderValue::from_str(&body.len().to_string()).unwrap(),
-            );
-        }
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let request = prepare_request(&self.client, identity, &call, budget)?;
         let runtime = self
             .runtime
             .as_ref()
             .expect("a wire's runtime lives until drop");
-        let cancel = self
-            .policy
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .cancel
-            .clone();
-        if cancel.as_ref().is_some_and(Cancel::is_cancelled) {
-            return Err(CANCELLED.to_string());
+        let url_owned = call.url.to_string();
+        let timeout = call.timeout;
+        let cap = call.cap;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let client_fut =
+                execute_prepared_request(request, url_owned, timeout, budget, cap, policy);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| runtime.block_on(client_fut))
+                    .join()
+                    .unwrap_or_else(|_| Err("request: sync worker panicked".to_string()))
+            })
+        } else {
+            runtime.block_on(execute_prepared_request(
+                request, url_owned, timeout, budget, cap, policy,
+            ))
         }
-        let budget = budget.max(timeout);
-        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let progress = std::sync::Arc::clone(&received);
-        let request_start = self
-            .policy
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .request_start
-            .clone();
-        let response_head = self
-            .policy
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .response_head
-            .clone();
-        let exchange = async move {
-            if request_start.is_some_and(|start| !start(url)) {
-                return Err("budget: request ceiling reached".to_string());
+    }
+}
+
+impl WireHandle {
+    /// Execute a guarded subresource/module request asynchronously on the caller's
+    /// Tokio runtime, sharing the wire's pooled HTTP/2 connections concurrently.
+    pub async fn call_async(
+        &self,
+        identity: &Identity,
+        call: OwnedCall,
+    ) -> Result<Response, String> {
+        let budget = call.timeout;
+        let timeout = call.timeout.min(self.policy.request_max);
+        let extra_refs: Vec<(&str, &str)> = call
+            .extra
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let borrowed = Call {
+            method: &call.method,
+            url: &call.url,
+            cookie: call.cookie.as_deref(),
+            timeout,
+            extra: &extra_refs,
+            body: call.body.as_deref(),
+            cap: call.cap.or(self.max_body),
+            kind: call.kind,
+        };
+        let _ = self.guarded;
+        let request = prepare_request(&self.client, identity, &borrowed, budget)?;
+        let cap = borrowed.cap;
+        execute_prepared_request(request, call.url, timeout, budget, cap, self.policy.clone()).await
+    }
+}
+
+fn prepare_request(
+    client: &wreq::Client,
+    identity: &Identity,
+    call: &Call<'_>,
+    budget: Duration,
+) -> Result<wreq::RequestBuilder, String> {
+    let Call {
+        method,
+        url,
+        cookie: cookie_header,
+        timeout,
+        extra,
+        body,
+        cap: _,
+        kind,
+    } = *call;
+    let mut headers = HeaderMap::new();
+    let put = |headers: &mut HeaderMap, name: &str, value: &str| {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    };
+    let emulation = identity.emulation();
+    let explicit =
+        kind == Kind::Subresource && identity.name.starts_with("chrome") && emulation.is_some();
+    let mut order: Option<wreq::header::OrigHeaderMap> = None;
+    if explicit {
+        let defaults = &emulation.as_ref().expect("checked").headers;
+        for name in [
+            "user-agent",
+            "sec-ch-ua",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-platform",
+            "accept-language",
+        ] {
+            if let Some(value) = defaults.get(name).and_then(|value| value.to_str().ok()) {
+                put(&mut headers, name, value);
             }
-            let response = tokio::time::timeout(timeout, request.send())
-                .await
-                .map_err(|_| "timeout: operation timed out".to_string())?
-                .map_err(|error| describe(&error))?;
-            if let Some(info) = response.extensions().get::<wreq::tls::TlsInfo>() {
-                if let Some(chain) = info.peer_certificate_chain() {
-                    if chain.into_iter().any(crate::ca_blocklist::blocked_der) {
-                        return Err(
-                            "tls: the certificate chain uses a CA key publicly known to be compromised"
-                                .to_string(),
-                        );
-                    }
+        }
+        put(&mut headers, "accept-encoding", "gzip, deflate, br, zstd");
+        put(&mut headers, "accept", "*/*");
+        put(&mut headers, "priority", "u=1, i");
+        for (name, value) in extra {
+            put(&mut headers, name, value);
+        }
+        let late_origin = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+        let known: Vec<&str> = CHROME_SUBRESOURCE_HEAD
+            .iter()
+            .chain(CHROME_SUBRESOURCE_TAIL.iter())
+            .copied()
+            .collect();
+        let mut ordered = wreq::header::OrigHeaderMap::new();
+        for name in CHROME_SUBRESOURCE_HEAD {
+            ordered.insert(*name);
+        }
+        for (name, _) in extra {
+            let lower = name.to_ascii_lowercase();
+            if !known.contains(&lower.as_str()) && !lower.starts_with("sec-fetch-") {
+                ordered.insert(lower);
+            }
+        }
+        for name in CHROME_SUBRESOURCE_TAIL {
+            if *name == "origin" && late_origin {
+                continue;
+            }
+            ordered.insert(*name);
+            if *name == "sec-fetch-dest" && late_origin {
+                ordered.insert("origin");
+            }
+        }
+        order = Some(ordered);
+    } else {
+        for (name, value) in identity.headers() {
+            if kind == Kind::Subresource && NAVIGATION_ONLY.contains(&name) {
+                continue;
+            }
+            put(&mut headers, name, value);
+        }
+        for (name, value) in extra {
+            put(&mut headers, name, value);
+        }
+    }
+    if let Some(cookies) = cookie_header {
+        put(&mut headers, "cookie", cookies);
+    }
+    let mut request = client
+        .request(
+            wreq::Method::from_bytes(method.as_bytes())
+                .map_err(|error| format!("request: {error}"))?,
+            url,
+        )
+        .headers(headers)
+        .timeout(budget.max(timeout) + WIRE_BACKSTOP_SLACK);
+    if let Some(order) = order {
+        request = request.default_headers(false).orig_headers(order);
+    }
+    if let Some(body) = body {
+        request = request.body(body.to_vec()).header(
+            HeaderName::from_bytes(b"content-length").unwrap(),
+            HeaderValue::from_str(&body.len().to_string()).unwrap(),
+        );
+    }
+    Ok(request)
+}
+
+async fn execute_prepared_request(
+    request: wreq::RequestBuilder,
+    url: String,
+    timeout: Duration,
+    budget: Duration,
+    cap: Option<usize>,
+    policy: Policy,
+) -> Result<Response, String> {
+    let started = Instant::now();
+    let cancel = policy.cancel.clone();
+    if cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+        return Err(CANCELLED.to_string());
+    }
+    let budget = budget.max(timeout);
+    let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let progress = std::sync::Arc::clone(&received);
+    let request_start = policy.request_start.clone();
+    let response_head = policy.response_head.clone();
+    let exchange = async move {
+        if request_start.is_some_and(|start| !start(&url)) {
+            return Err("budget: request ceiling reached".to_string());
+        }
+        let response = tokio::time::timeout(timeout, request.send())
+            .await
+            .map_err(|_| "timeout: operation timed out".to_string())?
+            .map_err(|error| describe(&error))?;
+        if let Some(info) = response.extensions().get::<wreq::tls::TlsInfo>() {
+            if let Some(chain) = info.peer_certificate_chain() {
+                if chain.into_iter().any(crate::ca_blocklist::blocked_der) {
+                    return Err(
+                        "tls: the certificate chain uses a CA key publicly known to be compromised"
+                            .to_string(),
+                    );
                 }
             }
-            let status = response.status().as_u16();
-            let version = format!("{:?}", response.version());
-            let url = response.uri().to_string();
-            let cookies: Vec<SetCookie> = response
-                .cookies()
-                .map(|cookie| SetCookie {
-                    name: cookie.name().to_string(),
-                    value: cookie.value().to_string(),
-                    domain: cookie.domain().map(str::to_string),
-                    path: cookie.path().map(str::to_string),
-                    // Max-Age wins over Expires (RFC 6265 §5.3 step 3); zero or
-                    // less is a deletion, an expiry already past.
-                    expires_unix: match cookie.max_age() {
-                        Some(age) => Some(unix_now().saturating_add(age.as_secs() as i64)),
-                        None => cookie.expires().map(|time| {
-                            time.duration_since(std::time::UNIX_EPOCH)
-                                .map(|delta| delta.as_secs() as i64)
-                                .unwrap_or(0)
-                        }),
-                    },
-                    secure: cookie.secure(),
-                    http_only: cookie.http_only(),
-                })
-                .collect();
-            let headers: Vec<(String, String)> = response
-                .headers()
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_string(), value.to_string()))
-                })
-                .collect();
-            if let Some(observe) = response_head {
-                observe(status, &url, &headers);
-            }
-            // Every body is read incrementally against a cap, so a server cannot
-            // fill memory inside the timeout; the document path's cap is the
-            // product's (64 MiB), the engine's is its envelope's.
-            let cap = cap.unwrap_or(DOCUMENT_BODY_MAX);
-            if response
-                .content_length()
-                .is_some_and(|len| len > cap as u64)
-            {
+        }
+        let status = response.status().as_u16();
+        let version = format!("{:?}", response.version());
+        let final_url = response.uri().to_string();
+        let cookies: Vec<SetCookie> = response
+            .cookies()
+            .map(|cookie| SetCookie {
+                name: cookie.name().to_string(),
+                value: cookie.value().to_string(),
+                domain: cookie.domain().map(str::to_string),
+                path: cookie.path().map(str::to_string),
+                expires_unix: match cookie.max_age() {
+                    Some(age) => Some(unix_now().saturating_add(age.as_secs() as i64)),
+                    None => cookie.expires().map(|time| {
+                        time.duration_since(std::time::UNIX_EPOCH)
+                            .map(|delta| delta.as_secs() as i64)
+                            .unwrap_or(0)
+                    }),
+                },
+                secure: cookie.secure(),
+                http_only: cookie.http_only(),
+            })
+            .collect();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
+        if let Some(observe) = response_head {
+            observe(status, &final_url, &headers);
+        }
+        let cap = cap.unwrap_or(DOCUMENT_BODY_MAX);
+        if response
+            .content_length()
+            .is_some_and(|len| len > cap as u64)
+        {
+            return Err(format!("body: response larger than {cap} bytes"));
+        }
+        let mut stream = response.bytes_stream();
+        let mut collected: Vec<u8> = Vec::new();
+        loop {
+            let Ok(next) = tokio::time::timeout(timeout, stream.next()).await else {
+                return Err(format!(
+                    "timeout: the response went silent after {} bytes",
+                    collected.len()
+                ));
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = chunk.map_err(|error| describe(&error))?;
+            if collected.len() + chunk.len() > cap {
                 return Err(format!("body: response larger than {cap} bytes"));
             }
-            let mut stream = response.bytes_stream();
-            let mut collected: Vec<u8> = Vec::new();
-            loop {
-                let Ok(next) = tokio::time::timeout(timeout, stream.next()).await else {
-                    return Err(format!(
-                        "timeout: the response went silent after {} bytes",
-                        collected.len()
-                    ));
-                };
-                let Some(chunk) = next else {
-                    break;
-                };
-                let chunk = chunk.map_err(|error| describe(&error))?;
-                if collected.len() + chunk.len() > cap {
-                    return Err(format!("body: response larger than {cap} bytes"));
-                }
-                collected.extend_from_slice(&chunk);
-                progress.store(collected.len(), std::sync::atomic::Ordering::Relaxed);
-            }
-            // Text stays text; anything else keeps its own bytes beside a lossy
-            // reading (classification reads text, callers may want the bytes).
-            let (body, raw) = match String::from_utf8(collected) {
-                Ok(text) => (text, None),
-                Err(error) => {
-                    let bytes = error.into_bytes();
-                    (String::from_utf8_lossy(&bytes).into_owned(), Some(bytes))
-                }
-            };
-            Ok::<_, String>((status, version, url, headers, body, cookies, raw))
-        };
-        // wreq starts the request's timeout again for the body, so a slow body
-        // could run to twice the budget; the whole exchange is bounded here.
-        // A transfer cut while it was still arriving says how far it got.
-        let exchange = async move {
-            tokio::time::timeout(budget, exchange)
-                .await
-                .unwrap_or_else(
-                    |_| match received.load(std::sync::atomic::Ordering::Relaxed) {
-                        0 => Err("timeout: operation timed out".to_string()),
-                        bytes => Err(format!(
-                            "timeout: the transfer was still arriving after {bytes} bytes"
-                        )),
-                    },
-                )
-        };
-        let outcome = runtime.block_on(async move {
-            match cancel {
-                Some(cancel) => tokio::select! {
-                    outcome = exchange => outcome,
-                    () = cancel.cancelled() => Err(CANCELLED.to_string()),
-                },
-                None => exchange.await,
-            }
-        });
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        match outcome {
-            Ok((status, version, url, headers, body, cookies, raw)) => Ok(Response {
-                status,
-                version,
-                headers,
-                body,
-                url,
-                elapsed_ms,
-                cookies,
-                raw,
-            }),
-            Err(error) => Err(error),
+            collected.extend_from_slice(&chunk);
+            progress.store(collected.len(), std::sync::atomic::Ordering::Relaxed);
         }
+        let (body, raw) = match String::from_utf8(collected) {
+            Ok(text) => (text, None),
+            Err(error) => {
+                let bytes = error.into_bytes();
+                (String::from_utf8_lossy(&bytes).into_owned(), Some(bytes))
+            }
+        };
+        Ok::<_, String>((status, version, final_url, headers, body, cookies, raw))
+    };
+    let exchange = async move {
+        tokio::time::timeout(budget, exchange)
+            .await
+            .unwrap_or_else(
+                |_| match received.load(std::sync::atomic::Ordering::Relaxed) {
+                    0 => Err("timeout: operation timed out".to_string()),
+                    bytes => Err(format!(
+                        "timeout: the transfer was still arriving after {bytes} bytes"
+                    )),
+                },
+            )
+    };
+    let outcome = match cancel {
+        Some(cancel) => tokio::select! {
+            outcome = exchange => outcome,
+            () = cancel.cancelled() => Err(CANCELLED.to_string()),
+        },
+        None => exchange.await,
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match outcome {
+        Ok((status, version, url, headers, body, cookies, raw)) => Ok(Response {
+            status,
+            version,
+            headers,
+            body,
+            url,
+            elapsed_ms,
+            cookies,
+            raw,
+        }),
+        Err(error) => Err(error),
     }
 }
 

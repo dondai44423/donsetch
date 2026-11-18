@@ -855,10 +855,27 @@ impl Crawler {
                 let robots = sitemap::robots_for_origin(page.status, &page.body, &origin);
                 self.governor
                     .set_host_crawl_delay(&seed_host, robots.crawl_delay);
-                buffered
+                let mut map_guard = buffered
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(robots_url, page.clone());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                map_guard.insert(robots_url, page.clone());
+                if map_mode
+                    && (200..300).contains(&page.status)
+                    && let Ok(resolved_robots) = Url::parse(&page.url)
+                    && resolved_robots.path() == "/robots.txt"
+                    && resolved_robots.host_str() != seed_url.host_str()
+                    && crate::fetch::guards::validate_url_basic(&page.url).is_ok()
+                {
+                    let mut redirected = seed_url.clone();
+                    let _ = redirected.set_scheme(resolved_robots.scheme());
+                    let _ = redirected.set_host(resolved_robots.host_str());
+                    let _ = redirected.set_port(resolved_robots.port());
+                    let new_origin = sitemap::origin_of(&redirected);
+                    map_guard.insert(format!("{new_origin}/robots.txt"), page.clone());
+                    seed = redirected.to_string();
+                    seed_url = redirected;
+                }
+                drop(map_guard);
                 let allowed = robots.allows_url(&seed_url);
                 if !allowed {
                     preflight = Some(SeedPreflight {

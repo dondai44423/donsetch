@@ -478,3 +478,44 @@ fn the_body_fill_of_a_real_page_crosses_the_contract() {
     assert!(content.text_chars >= 200);
     assert!(content.ms < 4_000.0, "text arrived in {:.0} ms", content.ms);
 }
+
+#[test]
+fn native_es_modules_dynamic_import_meta_resolve_and_streaming_suspense_hydrate() {
+    let text = filler();
+    let server = Server::start(move |request| match request.path.as_str() {
+        "/entry.mjs" => Reply::ok(
+            r#"
+            const chunkUrl = import.meta.resolve('./lazy.mjs');
+            import(chunkUrl).then((m) => m.mount());
+            "#,
+        ),
+        "/lazy.mjs" => Reply::ok(format!(
+            r#"
+            export function mount() {{
+                const sheet = new CSSStyleSheet();
+                sheet.replaceSync('p {{ color: black; }}');
+                document.adoptedStyleSheets = [sheet];
+                const tpl = document.getElementById('B:0');
+                const hidden = document.getElementById('S:0');
+                if (tpl && hidden && tpl.previousSibling && tpl.previousSibling.nodeType === 8) {{
+                    const frag = document.createElement('section');
+                    while (hidden.firstChild) frag.appendChild(hidden.firstChild);
+                    tpl.parentNode.replaceChild(frag, tpl);
+                    hidden.remove();
+                }}
+                const extra = document.createElement('p');
+                extra.textContent = {text:?};
+                document.body.appendChild(extra);
+            }}
+            "#
+        )),
+        _ => Reply::ok("ok"),
+    });
+    let html = r#"<!doctype html><html><head><script type="module" src="/entry.mjs"></script></head>
+        <body><!--$?--><template id="B:0"></template><p>Loading...</p><!--/$-->
+        <div hidden id="S:0"><h1>Streamed Heading</h1></div></body></html>"#;
+    let content = render(&server, html, 200).expect("esm + suspense content run");
+    assert_eq!(content.stop, "content");
+    assert!(content.document.contains("Streamed Heading"));
+    assert!(content.text_chars >= 200);
+}

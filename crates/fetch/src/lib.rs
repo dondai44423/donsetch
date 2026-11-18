@@ -19,9 +19,11 @@ pub mod engine;
 pub mod envelope;
 pub mod fetch;
 mod http;
+pub mod hydrate;
 pub mod identity;
 mod mine;
 pub mod state;
+mod synthesize;
 mod webcrypto;
 
 #[cfg(test)]

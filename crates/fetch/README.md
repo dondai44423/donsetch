@@ -35,13 +35,14 @@ sh scripts/budget.sh cargo nextest run --cargo-profile fast --locked -p donsetch
 | `src/identity.rs` | Eight coherent client profiles + built-in `personas/chrome-local.json` |
 | `src/http.rs`, `src/ca_blocklist.rs` | Wire transport (`wreq`/BoringSSL), header order, cookies, compromised-CA blocklist |
 | `src/classify.rs`, `src/contract.rs` | Vendor-first classification into nine outcome classes; content predicates |
+| `src/hydrate.rs`, `src/synthesize.rs` | Structural hydration-deficit shell gate, zero-JS inline state materializer, and wire-transcript DOM fusion |
 | `src/state.rs` | Origin scores, vendor priors, sticky routes, pacing clocks, `(host, identity)` cookie jars, credentials, mined contracts (`<= 4,096` origins LRU, file-locked atomic merge) |
 | `src/cache.rs` | Strict RFC 9111 private cache (`<= 8 MiB`/entry, `256 MiB` LRU, validator audits) |
 | `src/fetch.rs` | `Worker` encounter state machine (steps 0–9 below) |
 | `src/challenge.rs` | Native non-JS challenges: Akamai `bm-verify`, SiteGround SHA-1 PoW, NCBI SHA-256 PoW |
 | `src/datapath.rs` | Seven public site interface contracts (Reddit, Stack Overflow, 4chan, Twitch, NYT, WSJ, crates.io) |
-| `src/mine.rs` | Request-contract mining (`{{n}}` URL templates) and structural HTTP replay |
-| `src/engine.rs`, `src/engine_host.js` | Embedded V8 isolate, watchdog, worker-thread asset preloader, challenge host, and data-plane content DOM |
+| `src/mine.rs` | Request-contract mining (`{{n}}` URL/affix templates) and structural HTTP replay (`Collection`, `EntityJson`, `HtmlFragment`) |
+| `src/engine.rs`, `src/engine_host.js` | Embedded V8 isolate, watchdog, native ES module loader, multiplexed async subresource I/O, challenge host, and data-plane content DOM |
 | `src/webcrypto.rs`, `src/envelope.rs` | BoringSSL WebCrypto ops; hard wall-clock, heap, Wasm, RSS, op-count, and network guards |
 | `src/surface_probe.html`, `src/surface_reference.json` | Real Chromium 157 headed surface capture enforced by `surface_tests.rs` |
 | `src/testkit.rs`, `src/*_tests.rs` | Offline hostile-origin server and unit/contract suites |
@@ -94,8 +95,9 @@ Answered without V8 inside the encounter deadline:
 One V8 isolate mode for challenge credentials, a second data-plane DOM mode for JS shell applications (`transport: "program"`). Worker threads prefetch script/style assets in parallel during V8 bootstrap (`op_prefetch_wait`) over the same identity wire.
 
 - **Challenge mints:** passes all three AWS WAF shapes (`goku`, legacy inline, interstitial) and Reddit's inline token-form GET gate. Cloudflare managed challenges mint `__cf_bm` on the final allowed attempt and stop honestly at Turnstile/iframe boundaries (answered via `okhttp`/`chrome-win` identity instead; no `cf_clearance` claimed). Never invent vendor globals on `window` (e.g. `awsWafCookieDomainList`).
-- **Measured host surfaces:** BoringSSL WebCrypto (`SHA`, `HMAC`, `AES-GCM/CBC/CTR/KW`, `PBKDF2`, `HKDF`), `Blob`, `FileReader`, multipart `FormData`, Worker/Blob URLs, RFC 6265 `document.cookie`, WHATWG `URL`/`URLSearchParams`, Chrome-resolution clock, `document.forms` GET submission, html5ever `innerHTML`/`outerHTML`, host selector matching, batched observers (reporting ratio `1` so lazy loaders fire), persona `matchMedia`/screen/window geometry, inline `px` boxes with `0` positions (`elementFromPoint` = `null`), and statement-level ESM modules. Unimplemented methods log on touch and are never guessed; `surface_tests` enforces parity against `surface_reference.json`.
-- **Mined request contracts (`mine.rs`):** when a content-lane run passes the contract, `mine.rs` locates the transcript JSON array matching rendered titles/URLs and stores a `{{n}}`-templated request contract per `(host, identity, URL shape)` (`<= 8`/origin). Subsequent encounters replay it as plain HTTP before V8 (`transport: "replay"`), checking structure + `min_items`, and drop/re-mine on HTTP error or schema drift.
+- **Measured host surfaces:** BoringSSL WebCrypto (`SHA`, `HMAC`, `AES-GCM/CBC/CTR/KW`, `PBKDF2`, `HKDF`), `Blob`, `FileReader`, multipart `FormData`, Worker/Blob URLs, RFC 6265 `document.cookie`, WHATWG `URL`/`URLSearchParams`, Chrome-resolution clock, `document.forms` GET submission, html5ever `innerHTML`/`outerHTML`/`<template>`, host selector matching, `DOMParser`/`NodeIterator`/`TreeWalker`/`customElements`/`CSSStyleSheet`/`MessageChannel`, SVG geometry stubs, batched observers (reporting ratio `1` so lazy loaders fire), persona `matchMedia`/screen/window geometry, inline `px` boxes with `0` positions (`elementFromPoint` = `null`), and native V8 ES modules (`import`, dynamic `import()`, `import.meta.resolve`, import maps, `<base href>`, speculative child pre-warming). Unimplemented methods log on touch and are never guessed; `surface_tests` enforces parity against `surface_reference.json`.
+- **Hydration gate, Stage-0 inline state & Dual-Plane fusion (`hydrate.rs`, `synthesize.rs`):** `assess_html_shell` separates `<main>`/`<article>` content from frame chrome (`<nav>`, `<header>`, `<footer>`, `<aside>`) and detects unhydrated framework payloads (such as null Next.js `pageProps`) with zero false triggers when no application script exists. Before booting V8, `materialize_inline_state` extracts structured collections, normalized Apollo/Relay caches, or rich entities embedded directly in HTML (`window.__appData`, `data-page`, `data-props`, `<script type="application/json">`). After V8 runs, `fuse_dom_and_transcript` combines graphical/collapsed DOMs with verified `2xx` JSON, OpenAPI, dependency-graph, and HTML-fragment wire responses.
+- **Mined request contracts (`mine.rs`):** when a content-lane run passes the contract, `mine.rs` learns `Collection`, `EntityJson`, or `HtmlFragment` endpoints and stores a `{{n}}`-templated request contract (including middle-segment and filename-affix placeholders) per `(host, identity, URL shape)` (`<= 8`/origin). Subsequent encounters replay it as plain HTTP before V8 (`transport: "replay"`), checking structure + `min_items`, and drop/re-mine on HTTP error or schema drift.
 
 ### 7 · Engine envelope (`envelope.rs`)
 
@@ -103,8 +105,8 @@ One V8 isolate mode for challenge credentials, a second data-plane DOM mode for 
 |---|---|---|---|
 | Wall clock | 10 s (`V5_ENGINE_WALL_MS`) | 5 s (`V5_CONTENT_WALL_MS`, clamped to deadline) | Watchdog `terminate_execution` |
 | Memory | 256 MB JS heap · 128 MB typed arrays · 128 MB Wasm | Same | V8 heap callback, custom allocator, Wasm page cap + OS RSS backstop |
-| Execution | 96 ops | 96 ops (`V5_CONTENT_OPS`) · 600 pump rounds | Rust op counter + pump cap |
-| Network | `http(s)` public IPs, `<= 5` redirects, 1 MB req, 8 MB/resp, 32 MB total | Same guards, 16 MB/resp, 48 MB total | Enforced in Rust ops; `Deno` global deleted before page code |
+| Execution | 96 ops | 256 ops (`V5_CONTENT_OPS`) | Rust op counter + wall-clock pump bound |
+| Network | `http(s)` public IPs, `<= 5` redirects, 1 MB req, 8 MB/resp, 32 MB total | Same guards, 16 MB/resp, 64 MB total | Enforced in Rust ops; `Deno` global deleted before page code |
 | Concurrency | 1 active V8 engine per process | Same | Process-wide permit |
 
 ## Encounter lifecycle & outcome classes
@@ -134,7 +136,7 @@ One V8 isolate mode for challenge credentials, a second data-plane DOM mode for 
 
 ## Target notes, measured negatives & environment
 
-- **Current target standing:** AWS WAF (IMDb, Booking, Trustpilot), Akamai no-JS (Amazon), SiteGround, NCBI PubMed, Reddit, AliExpress/Instagram (`chrome*`), and Cloudflare via `okhttp`/`chrome-win` (Glassdoor, Indeed, npm, Medium) deliver content. DataDome captchas (Etsy, Yelp, WSJ), Turnstile/reCAPTCHA (OpenReview, Federal Register), PerimeterX press-and-hold (intermittent on Bloomberg), and TikTok's edge-gated shell API remain declared identity/interaction walls.
+- **Current target standing:** AWS WAF (IMDb, Booking, Trustpilot), Akamai no-JS (Amazon), SiteGround, NCBI PubMed, Reddit, AliExpress/Instagram (`chrome*`), Cloudflare via `okhttp`/`chrome-win` (Glassdoor, Indeed, npm, Medium), and `HTTP 200` client-rendered SPAs (React/Next, Angular, Vue/Nuxt, Svelte, Vite, Mastodon, Ashby, Swagger, Registry/Docs SPAs) deliver content. DataDome captchas (Etsy, Yelp, WSJ), active `HTTP 403` Cloudflare challenge / Turnstile / reCAPTCHA gates (Product Hunt, OpenReview, Federal Register), PerimeterX press-and-hold (intermittent on Bloomberg), and TikTok's edge-gated shell API remain open/declared identity or interaction walls.
 - **Do not rebuild:** static bundle endpoint scraping (defended stubs carry zero endpoints; modern SPA bundles assemble URLs at runtime — use V8 content-lane mining instead) and default origin warm-up/`--arrival` (0 class wins across 16 targets for +1 request).
 - **TLS, bodies & deps:** Mozilla roots + OS trust store + `SSL_CERT_FILE`/`SSL_CERT_DIR` + `[tls]` config (never altering ClientHello); streaming reads capped at 64 MiB preserving raw non-UTF-8 bytes; crates restricted to `wreq`/`wreq-util`, `btls`, V8, `tokio`, `futures-util`, `scraper`, `serde`, `url`, `getrandom`, `webpki-root-certs`, `rustls-native-certs`. For LLD linker notes, see [setup.md](../../docs/setup.md#build-from-source).
 
@@ -143,5 +145,5 @@ One V8 isolate mode for challenge credentials, a second data-plane DOM mode for 
 | `V5_STATE` | State JSON path (default `<os-cache>/donsetch/v5/state.json`; empty disables disk persistence) |
 | `V5_PERSONA` | Override built-in `personas/chrome-local.json` |
 | `V5_ENGINE_LOG` / `V5_ENGINE_DUMP_DIR` | Print touched V8 surfaces/cookies (`1`) or dump engine HTTP transcripts for inspection |
-| `V5_ENGINE_WALL_MS` / `V5_CONTENT_WALL_MS` / `V5_CONTENT_OPS` | Override mint timeout (`10000`), content-lane timeout (`5000`), or content op cap (`96`) |
+| `V5_ENGINE_WALL_MS` / `V5_CONTENT_WALL_MS` / `V5_CONTENT_OPS` | Override mint timeout (`10000`), content-lane timeout (`5000`), or content op cap (`256`) |
 | `RUSTY_V8_ARCHIVE` / `SSL_CERT_FILE` / `SSL_CERT_DIR` | Offline prebuilt V8 static archive; extra PEM trust roots |
