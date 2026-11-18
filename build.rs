@@ -700,17 +700,28 @@ fn fetch_pdfium(os: &str, arch: &str, vendored: &Path) {
 struct OnnxTarget {
     url: &'static str,
     sha256: &'static str,
-    /// Path of the real shared library inside the archive.
+    /// Path of the real shared library inside the GitHub release archive.
     inner_lib: &'static str,
+    /// Official Microsoft NuGet `.nupkg` carrying the identical signed binary
+    /// (`microsoft/onnxruntime` on GitHub returned 404 across CI on 2026-11-18).
+    nuget_url: &'static str,
+    /// Inclusive byte range (`start-end`) of the raw DEFLATE stream for
+    /// `nuget_inner_lib` inside the immutable `.nupkg` (5–11 MB vs 124 MB).
+    nuget_range: &'static str,
+    /// Entry path inside the `.nupkg` zip if a proxy ignores `Range`.
+    nuget_inner_lib: &'static str,
+    /// Pinned SHA-256 of the extracted shared library itself (identical across
+    /// Microsoft's NuGet `.nupkg` and GitHub release archives).
+    lib_sha256: &'static str,
     /// File name we ship it as, next to the binary.
     shared_name: &'static str,
-    /// How Microsoft packaged this target's release.
+    /// How Microsoft packaged this target's GitHub release.
     archive: OnnxArchive,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OnnxArchive {
-    /// `.tgz` (Linux): a gzip'd tar.
+    /// `.tgz` (Linux/macOS): a gzip'd tar.
     Tgz,
     /// `.zip` (Windows).
     Zip,
@@ -722,24 +733,35 @@ enum OnnxArchive {
 /// Linux aarch64 is deliberately absent (the official aarch64 prebuilt
 /// deadlocks in the loader; see the NOTE in the match below).
 fn onnx_target_info(os: &str, arch: &str) -> Option<OnnxTarget> {
-    let (url, sha256, inner_lib, shared_name, archive) = match (os, arch) {
-        ("linux", "x86_64") => (
-            "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
-            "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
-            "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
-            "libonnxruntime.so",
-            OnnxArchive::Tgz,
-        ),
+    const NUGET_1242: &str = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg";
+    const NUGET_1232: &str = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.23.2/microsoft.ml.onnxruntime.1.23.2.nupkg";
+
+    match (os, arch) {
+        ("linux", "x86_64") => Some(OnnxTarget {
+            url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-linux-x64-1.24.2.tgz",
+            sha256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6",
+            inner_lib: "onnxruntime-linux-x64-1.24.2/lib/libonnxruntime.so.1.24.2",
+            nuget_url: NUGET_1242,
+            nuget_range: "96401271-104317083",
+            nuget_inner_lib: "runtimes/linux-x64/native/libonnxruntime.so",
+            lib_sha256: "ffc84d48e845cf0b562ba4ea5ca32aaafc0d4069019fef4f63095b307d0270ad",
+            shared_name: "libonnxruntime.so",
+            archive: OnnxArchive::Tgz,
+        }),
         // Windows x64: the same release, Microsoft's CPU-only build
         // (no DirectML import). Loaded at runtime like the Linux .so
         // (#277, #298); the exe no longer links ONNX statically.
-        ("windows", "x86_64") => (
-            "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
-            "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
-            "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
-            "onnxruntime.dll",
-            OnnxArchive::Zip,
-        ),
+        ("windows", "x86_64") => Some(OnnxTarget {
+            url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip",
+            sha256: "8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0",
+            inner_lib: "onnxruntime-win-x64-1.24.2/lib/onnxruntime.dll",
+            nuget_url: NUGET_1242,
+            nuget_range: "119169064-124414267",
+            nuget_inner_lib: "runtimes/win-x64/native/onnxruntime.dll",
+            lib_sha256: "114947d633e6844ce3c4b51ef6678f776628571d08a5763859c61642c8dcca9c",
+            shared_name: "onnxruntime.dll",
+            archive: OnnxArchive::Zip,
+        }),
         // macOS (#316), both arches: Microsoft's last signed mac
         // builds. 1.24.2+ mac tarballs exist but are ad-hoc signed
         // only and raise the minimum to macOS 14; 1.23.2 is the last
@@ -747,20 +769,28 @@ fn onnx_target_info(os: &str, arch: &str) -> Option<OnnxTarget> {
         // review: CMS blob, Microsoft Corporation UBF8T346G9). The
         // crate's api-23 floor serves it, the GetApi table is
         // append-only.
-        ("macos", "aarch64") => (
-            "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-arm64-1.23.2.tgz",
-            "b4d513ab2b26f088c66891dbbc1408166708773d7cc4163de7bdca0e9bbb7856",
-            "onnxruntime-osx-arm64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
-            "libonnxruntime.dylib",
-            OnnxArchive::Tgz,
-        ),
-        ("macos", "x86_64") => (
-            "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-x86_64-1.23.2.tgz",
-            "d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6",
-            "onnxruntime-osx-x86_64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
-            "libonnxruntime.dylib",
-            OnnxArchive::Tgz,
-        ),
+        ("macos", "aarch64") => Some(OnnxTarget {
+            url: "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-arm64-1.23.2.tgz",
+            sha256: "b4d513ab2b26f088c66891dbbc1408166708773d7cc4163de7bdca0e9bbb7856",
+            inner_lib: "onnxruntime-osx-arm64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
+            nuget_url: NUGET_1232,
+            nuget_range: "90931007-100752057",
+            nuget_inner_lib: "runtimes/osx-arm64/native/libonnxruntime.dylib",
+            lib_sha256: "d306d2bc768540766c7ed8a1e0ff05d2870c77a934ebeee4a7bafa1b732ef299",
+            shared_name: "libonnxruntime.dylib",
+            archive: OnnxArchive::Tgz,
+        }),
+        ("macos", "x86_64") => Some(OnnxTarget {
+            url: "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-x86_64-1.23.2.tgz",
+            sha256: "d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6",
+            inner_lib: "onnxruntime-osx-x86_64-1.23.2/lib/libonnxruntime.1.23.2.dylib",
+            nuget_url: NUGET_1232,
+            nuget_range: "100752132-112250237",
+            nuget_inner_lib: "runtimes/osx-x64/native/libonnxruntime.dylib",
+            lib_sha256: "8c9c78de65ea3786f987c0d980e9c1b13a3a5fbc6b3e2965ba05b450e6e4c054",
+            shared_name: "libonnxruntime.dylib",
+            archive: OnnxArchive::Tgz,
+        }),
         // NOTE: onnxruntime-linux-aarch64-1.24.2 exists but dlopen'ing
         // it from this binary deadlocks inside the loader on native
         // aarch64 (proven by the CI payload probe timing out at its
@@ -768,15 +798,129 @@ fn onnx_target_info(os: &str, arch: &str) -> Option<OnnxTarget> {
         // family as pykeio/ort #579. ARM64 therefore ships without
         // OCR (doctor reports "not compiled"; the honest
         // guard message explains it where relevant).
-        _ => return None,
-    };
-    Some(OnnxTarget {
-        url,
-        sha256,
-        inner_lib,
-        shared_name,
-        archive,
-    })
+        _ => None,
+    }
+}
+
+/// Acquire the pinned ONNX Runtime shared library bytes, trying:
+///   1. Official Microsoft NuGet `.nupkg` byte-range slice (5–11 MB DEFLATE),
+///   2. Full Microsoft NuGet `.nupkg` zip download if a proxy strips `Range`,
+///   3. Official `microsoft/onnxruntime` GitHub Releases archive.
+///
+/// Every path verifies `info.lib_sha256` on the extracted library.
+fn acquire_onnx_lib_bytes(info: &OnnxTarget, vendored: &Path) -> Vec<u8> {
+    let slice_path = vendored.join("onnx.nuget.slice");
+    let _ = fs::remove_file(&slice_path);
+
+    // 1. Fast byte-range fetch of just the target's compressed ZIP entry from NuGet.
+    eprintln!(
+        "donsetch build: fetching ONNX Runtime ({}) from {}",
+        info.shared_name, info.nuget_url
+    );
+    let range_ok = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--retry",
+            "3",
+            "-r",
+            info.nuget_range,
+            "-o",
+        ])
+        .arg(&slice_path)
+        .arg(info.nuget_url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if range_ok && let Ok(raw) = fs::read(&slice_path) {
+        let _ = fs::remove_file(&slice_path);
+        let decoded = if raw.starts_with(b"PK\x03\x04") {
+            extract_zip_entry(&raw, info.nuget_inner_lib)
+        } else {
+            let mut out = Vec::with_capacity(24 * 1024 * 1024);
+            flate2::read::DeflateDecoder::new(&raw[..])
+                .read_to_end(&mut out)
+                .ok()
+                .map(|_| out)
+        };
+        if let Some(entry) = decoded
+            && sha256_hex(&entry) == info.lib_sha256
+        {
+            return entry;
+        }
+        eprintln!(
+            "donsetch build: NuGet range slice did not match expected digest; trying full package"
+        );
+    }
+    let _ = fs::remove_file(&slice_path);
+
+    // 2. Full NuGet `.nupkg` fallback (when an intermediate proxy strips Range).
+    let nupkg_path = vendored.join("onnx.nupkg");
+    let _ = fs::remove_file(&nupkg_path);
+    let full_ok = Command::new("curl")
+        .args([
+            "-fSL",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--retry",
+            "3",
+            "-o",
+        ])
+        .arg(&nupkg_path)
+        .arg(info.nuget_url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if full_ok && let Ok(raw) = fs::read(&nupkg_path) {
+        let _ = fs::remove_file(&nupkg_path);
+        if let Some(entry) = extract_zip_entry(&raw, info.nuget_inner_lib)
+            && sha256_hex(&entry) == info.lib_sha256
+        {
+            return entry;
+        }
+    }
+    let _ = fs::remove_file(&nupkg_path);
+
+    // 3. GitHub Releases fallback (`microsoft/onnxruntime`).
+    let tarball = vendored.join(match info.archive {
+        OnnxArchive::Tgz => "onnx.tgz",
+        OnnxArchive::Zip => "onnx.zip",
+    });
+    let _ = fs::remove_file(&tarball);
+    eprintln!(
+        "donsetch build: falling back to GitHub release {}",
+        info.url
+    );
+    if !download_release_asset(&tarball, info.url) {
+        panic!(
+            "ONNX: download failed from both NuGet ({}) and GitHub ({})",
+            info.nuget_url, info.url
+        );
+    }
+
+    let mut f = fs::File::open(&tarball).expect("ONNX: cannot open tarball");
+    let mut buf = Vec::with_capacity(16 * 1024 * 1024);
+    f.read_to_end(&mut buf).expect("ONNX: cannot read tarball");
+    let _ = fs::remove_file(&tarball);
+    let got = sha256_hex(&buf);
+    assert_eq!(
+        got, info.sha256,
+        "ONNX: archive sha256 mismatch (expected {}, got {})",
+        info.sha256, got
+    );
+
+    match info.archive {
+        OnnxArchive::Tgz => extract_tarball_entry(&buf, info.inner_lib),
+        OnnxArchive::Zip => extract_zip_entry(&buf, info.inner_lib),
+    }
+    .unwrap_or_else(|| panic!("ONNX: {} not found in archive", info.inner_lib))
 }
 
 /// Download the official ONNX Runtime prebuilt, verify its SHA256, and
@@ -800,36 +944,13 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
         return;
     }
 
-    // 1. Download the archive.
-    let tarball = vendored.join(match info.archive {
-        OnnxArchive::Tgz => "onnx.tgz",
-        OnnxArchive::Zip => "onnx.zip",
-    });
-    // A stale archive (an older pin, a partial download) must never be
-    // extracted under a new hash: start from nothing and re-fetch.
-    let _ = fs::remove_file(&tarball);
-    eprintln!("donsetch build: fetching ONNX Runtime from {}", info.url);
-    if !download_release_asset(&tarball, info.url) {
-        panic!("ONNX: download failed for {}", info.url);
-    }
-
-    // 2. Verify SHA-256.
-    let mut f = fs::File::open(&tarball).expect("ONNX: cannot open tarball");
-    let mut buf = Vec::with_capacity(16 * 1024 * 1024);
-    f.read_to_end(&mut buf).expect("ONNX: cannot read tarball");
-    let got = sha256_hex(&buf);
+    let entry = acquire_onnx_lib_bytes(&info, &vendored);
+    let got_lib = sha256_hex(&entry);
     assert_eq!(
-        got, info.sha256,
-        "ONNX: sha256 mismatch (expected {}, got {})",
-        info.sha256, got
+        got_lib, info.lib_sha256,
+        "ONNX: extracted shared lib sha256 mismatch (expected {}, got {})",
+        info.lib_sha256, got_lib
     );
-
-    // 3. Extract the shared library from the archive.
-    let entry = match info.archive {
-        OnnxArchive::Tgz => extract_tarball_entry(&buf, info.inner_lib),
-        OnnxArchive::Zip => extract_zip_entry(&buf, info.inner_lib),
-    }
-    .unwrap_or_else(|| panic!("ONNX: {} not found in archive", info.inner_lib));
     fs::write(&shared_path, &entry).expect("ONNX: cannot write shared lib");
 
     // 4. Sanity: the file must be a plausible shared library of its
@@ -857,8 +978,6 @@ fn fetch_onnx_prebuilt(info: OnnxTarget, manifest: &Path) {
         _ => &entry[..4] == b"\x7fELF",
     };
     assert!(magic_ok, "ONNX: extracted file is not a shared library");
-
-    let _ = fs::remove_file(&tarball);
 
     // 5. Copy to output directories.
     copy_onnx_shared_lib(&shared_path);

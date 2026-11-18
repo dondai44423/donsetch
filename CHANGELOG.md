@@ -53,6 +53,10 @@
   checks to 1.8 s and honors `DONSETCH_NO_UPDATE_CHECK` / `CI`, and `donsetch doctor` renders
   the `Search model` and `MCP output` rows in its human report so displayed checks match the
   summary tally.
+- **Resilient ONNX Runtime build acquisition.** `build.rs` fetches the pinned Microsoft ONNX
+  Runtime shared libraries (`1.24.2` on Linux/Windows, Developer-ID-signed `1.23.2` on macOS) via
+  byte-range slices of Microsoft's immutable NuGet packages before falling back to full `.nupkg`
+  and GitHub Release archives, verifying the extracted shared library's SHA-256 on every path.
 
 ## [5.5.4] - 2026-11-16
 
