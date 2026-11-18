@@ -890,3 +890,35 @@ fn media_and_plugins_answer_as_desktop_chrome() {
     assert_eq!(get("plugins").as_deref(), Some("5,2,true"));
     assert_eq!(get("plugin").as_deref(), Some("PDF Viewer|application/pdf"));
 }
+
+#[test]
+fn text_encoder_encode_into_stops_at_utf8_codepoint_boundaries() {
+    let server = quiet();
+    let script = r#"
+      const set = (k, v) => { document.cookie = k + "=" + encodeURIComponent(v) + "; Path=/"; };
+      const enc = new TextEncoder();
+      const s = "é😀hello";
+      const b3 = new Uint8Array(3);
+      const r3 = enc.encodeInto(s, b3);
+      set("r3", r3.read + "," + r3.written + ":" + Array.from(b3).join("."));
+      const b6 = new Uint8Array(6);
+      const r6 = enc.encodeInto(s, b6);
+      set("r6", r6.read + "," + r6.written + ":" + Array.from(b6).join("."));
+      const full = new Uint8Array(32);
+      const rf = enc.encodeInto(s, full);
+      set("rf", rf.read + "," + rf.written + ":" + new TextDecoder().decode(full.subarray(0, rf.written)));
+    "#;
+    let mint = run(&server.url("/"), script, &limits()).expect("mint");
+    let dec = |name: &str| {
+        cookie(&mint, name).map(|v| {
+            url::form_urlencoded::parse(format!("v={v}").as_bytes())
+                .next()
+                .unwrap()
+                .1
+                .into_owned()
+        })
+    };
+    assert_eq!(dec("r3").as_deref(), Some("1,2:195.169.0"));
+    assert_eq!(dec("r6").as_deref(), Some("3,6:195.169.240.159.152.128"));
+    assert_eq!(dec("rf").as_deref(), Some("8,11:é😀hello"));
+}
