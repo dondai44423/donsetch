@@ -212,3 +212,50 @@ test('the npm package has no install lifecycle scripts to approve', () => {
     assert.ok(!pkg.scripts[name], `${name} would bring back install-script blocking`);
   }
 });
+
+
+test('re-installing over an existing directory entry in binaries replaces it cleanly', async (t) => {
+  if (!h.IS_POSIX) return t.skip('posix-only fixture');
+  const { root, pkg } = scaffold('upgrade-dir');
+  const asset = h.assetName();
+  if (!asset) return t.skip('unsupported test platform');
+
+  // Build an archive containing both `donsetch` and a non-empty `lib/` directory.
+  const stage = join(root, 'dir-stage');
+  mkdirSync(join(stage, 'lib'), { recursive: true });
+  writeFileSync(join(stage, 'donsetch'), BIN_BODY);
+  writeFileSync(join(stage, 'lib', 'runtime.so'), LIB_BODY);
+  const tarPath = join(root, 'dir-asset.tar.gz');
+  require('child_process').execFileSync('tar', ['czf', tarPath, '-C', stage, 'donsetch', 'lib']);
+  const tls = h.makeTlsFixture(root);
+  const server = await h.startReleaseServer(tls, {
+    tag: TAG,
+    asset,
+    tarballPath: tarPath,
+    sha: h.sha256File(tarPath),
+  });
+  t.after(() => server.close());
+
+  const tools = join(root, 'tools');
+  mkdirSync(tools, { recursive: true });
+  for (const tool of ['tar', 'gzip']) symlinkSync(h.toolPath(tool), join(tools, tool));
+  const env = h.cleanEnv({
+    path: [tools],
+    home: join(root, 'home'),
+    extra: {
+      DONSETCH_RELEASES_BASE: `https://127.0.0.1:${server.port}`,
+      DONSETCH_INSTALL_TAG: TAG,
+      NODE_EXTRA_CA_CERTS: tls.certPath,
+    },
+  });
+
+  // Pre-seed a non-empty `binaries/lib` directory from a previous install.
+  mkdirSync(join(pkg, 'binaries', 'lib'), { recursive: true });
+  writeFileSync(join(pkg, 'binaries', 'lib', 'stale.so'), 'old');
+  writeFileSync(join(pkg, 'binaries', 'donsetch.version'), '0.0.0-old\n');
+
+  const r = await h.spawnNode([join(pkg, 'install.js')], { env });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(readFileSync(join(pkg, 'binaries', 'lib', 'runtime.so'), 'utf8'), LIB_BODY);
+  assert.ok(!existsSync(join(pkg, 'binaries', 'lib', 'stale.so')), 'stale directory contents replaced');
+});
